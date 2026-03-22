@@ -10,6 +10,7 @@ use ratatui::{
     Frame,
 };
 
+use crate::event::EventType;
 use crate::state::{AppState, SessionState, SessionStatus, SharedState};
 
 impl fmt::Display for crate::event::AgentType {
@@ -28,10 +29,12 @@ pub fn run_tui(state: SharedState) -> std::io::Result<()> {
     }));
 
     let mut terminal = ratatui::init();
+    let mut tick: u64 = 0;
 
     loop {
         let snapshot = state.blocking_read().clone();
-        terminal.draw(|frame| render_frame(frame, &snapshot))?;
+        terminal.draw(|frame| render_frame(frame, &snapshot, tick))?;
+        tick = tick.wrapping_add(1);
 
         if crossterm::event::poll(std::time::Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
@@ -49,7 +52,7 @@ pub fn run_tui(state: SharedState) -> std::io::Result<()> {
     Ok(())
 }
 
-fn render_frame(frame: &mut Frame, state: &AppState) {
+fn render_frame(frame: &mut Frame, state: &AppState, tick: u64) {
     let area = frame.area();
 
     if state.sessions.is_empty() {
@@ -87,7 +90,7 @@ fn render_frame(frame: &mut Frame, state: &AppState) {
 
     let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
     for _ in &sessions {
-        constraints.push(Constraint::Length(6));
+        constraints.push(Constraint::Length(9));
     }
     constraints.push(Constraint::Min(0)); // filler
 
@@ -96,11 +99,11 @@ fn render_frame(frame: &mut Frame, state: &AppState) {
     frame.render_widget(title, chunks[0]);
 
     for (i, session) in sessions.iter().enumerate() {
-        render_session_card(frame, chunks[i + 1], session);
+        render_session_card(frame, chunks[i + 1], session, tick);
     }
 }
 
-fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState) {
+fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState, tick: u64) {
     let (status_label, status_style) = status_style(&session.status);
 
     // Truncate session_id to 11 chars
@@ -112,13 +115,15 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState) {
 
     let title_left = format!(" {} · {} ", session.agent_type, id_display);
 
+    let dot = flash_dot(&session.status, tick);
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Gray))
         .title(Span::styled(title_left, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)))
         .title_alignment(ratatui::layout::Alignment::Left)
         .title(Line::from(Span::styled(
-            format!(" {} {} ", "●", status_label),
+            format!(" {} {} ", dot, status_label),
             status_style,
         )).alignment(ratatui::layout::Alignment::Right));
 
@@ -132,7 +137,7 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState) {
 
     let elapsed = format_elapsed(session.last_activity);
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("Dir:  ", Style::default().fg(Color::Gray)),
             Span::raw(cwd_display),
@@ -159,12 +164,52 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState) {
         ]),
         Line::from(vec![
             Span::styled("Last: ", Style::default().fg(Color::Gray)),
-            Span::raw(elapsed),
+            Span::raw(format!("{}  ", elapsed)),
+            Span::styled("Tools: ", Style::default().fg(Color::Gray)),
+            Span::raw(session.tool_count.to_string()),
         ]),
+        Line::from(""),
     ];
+
+    lines.extend(recent_tool_lines(session));
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
+}
+
+fn flash_dot(status: &SessionStatus, tick: u64) -> &'static str {
+    if *status == SessionStatus::WaitingForInput && tick % 2 == 1 {
+        " "
+    } else {
+        "●"
+    }
+}
+
+fn recent_tool_lines(session: &SessionState) -> Vec<Line<'static>> {
+    let tool_events: Vec<_> = session
+        .recent_events
+        .iter()
+        .rev()
+        .filter(|e| e.event_type == EventType::ToolStart)
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    tool_events
+        .into_iter()
+        .map(|e| {
+            let name = e.tool_name.as_deref().unwrap_or("?");
+            let detail = e.tool_detail.as_deref().unwrap_or("");
+            let text = if detail.is_empty() {
+                format!("  {}", name)
+            } else {
+                format!("  {} — {}", name, detail)
+            };
+            Line::styled(text, Style::default().fg(Color::DarkGray))
+        })
+        .collect()
 }
 
 fn status_style(status: &SessionStatus) -> (&str, Style) {
@@ -250,13 +295,13 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let state = AppState::default();
         terminal
-            .draw(|frame| render_frame(frame, &state))
+            .draw(|frame| render_frame(frame, &state, 0))
             .unwrap();
     }
 
     #[test]
     fn test_render_with_sessions() {
-        let backend = TestBackend::new(80, 24);
+        let backend = TestBackend::new(80, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut state = AppState::default();
@@ -293,7 +338,57 @@ mod tests {
         state.apply_event(event2);
 
         terminal
-            .draw(|frame| render_frame(frame, &state))
+            .draw(|frame| render_frame(frame, &state, 0))
             .unwrap();
+    }
+
+    #[test]
+    fn test_recent_tool_lines() {
+        use crate::state::SessionState;
+        use std::collections::VecDeque;
+
+        let mut events = VecDeque::new();
+        for (name, detail) in [("Read", "src/main.rs"), ("Write", "out.txt"), ("Bash", ""), ("Grep", "pattern")] {
+            events.push_back(AgentEvent {
+                session_id: "s1".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::ToolStart,
+                tool_name: Some(name.to_string()),
+                tool_detail: if detail.is_empty() { None } else { Some(detail.to_string()) },
+                cwd: None,
+                timestamp: Utc::now(),
+                metadata: HashMap::new(),
+            });
+        }
+
+        let session = SessionState {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            cwd: None,
+            status: crate::state::SessionStatus::Idle,
+            active_tool: None,
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+            recent_events: events,
+            tool_count: 0,
+        };
+
+        let lines = recent_tool_lines(&session);
+        assert_eq!(lines.len(), 3);
+        // Should be the last 3 ToolStart events in chronological order
+        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(text[0], "  Write — out.txt");
+        assert_eq!(text[1], "  Bash");
+        assert_eq!(text[2], "  Grep — pattern");
+    }
+
+    #[test]
+    fn test_flash_dot() {
+        assert_eq!(flash_dot(&crate::state::SessionStatus::WaitingForInput, 0), "●");
+        assert_eq!(flash_dot(&crate::state::SessionStatus::WaitingForInput, 1), " ");
+        assert_eq!(flash_dot(&crate::state::SessionStatus::WaitingForInput, 2), "●");
+        assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 0), "●");
+        assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 1), "●");
+        assert_eq!(flash_dot(&crate::state::SessionStatus::Idle, 1), "●");
     }
 }

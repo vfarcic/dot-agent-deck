@@ -32,6 +32,7 @@ pub struct SessionState {
     pub started_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
     pub recent_events: VecDeque<AgentEvent>,
+    pub tool_count: u32,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -60,6 +61,7 @@ impl AppState {
                 started_at: event.timestamp,
                 last_activity: event.timestamp,
                 recent_events: VecDeque::new(),
+                tool_count: 0,
             });
 
         session.last_activity = event.timestamp;
@@ -83,6 +85,7 @@ impl AppState {
             EventType::ToolEnd => {
                 session.status = SessionStatus::Idle;
                 session.active_tool = None;
+                session.tool_count += 1;
             }
             EventType::WaitingForInput => {
                 session.status = SessionStatus::WaitingForInput;
@@ -198,6 +201,27 @@ mod tests {
         state.apply_event(make_event("s1", EventType::WaitingForInput));
         assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
         assert!(state.sessions["s1"].active_tool.is_none());
+    }
+
+    #[test]
+    fn tool_count_increments_on_tool_end() {
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+        assert_eq!(state.sessions["s1"].tool_count, 0);
+
+        let mut tool_start = make_event("s1", EventType::ToolStart);
+        tool_start.tool_name = Some("Read".to_string());
+        state.apply_event(tool_start);
+        assert_eq!(state.sessions["s1"].tool_count, 0);
+
+        state.apply_event(make_event("s1", EventType::ToolEnd));
+        assert_eq!(state.sessions["s1"].tool_count, 1);
+
+        let mut tool_start2 = make_event("s1", EventType::ToolStart);
+        tool_start2.tool_name = Some("Write".to_string());
+        state.apply_event(tool_start2);
+        state.apply_event(make_event("s1", EventType::ToolEnd));
+        assert_eq!(state.sessions["s1"].tool_count, 2);
     }
 
     #[test]
