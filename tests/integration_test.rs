@@ -15,6 +15,13 @@ fn event_json(session_id: &str, event_type: &str) -> String {
     )
 }
 
+fn prompt_event_json(session_id: &str, prompt: &str) -> String {
+    format!(
+        r#"{{"session_id":"{}","agent_type":"claude_code","event_type":"thinking","user_prompt":"{}","timestamp":"2026-03-22T10:00:00Z"}}"#,
+        session_id, prompt
+    )
+}
+
 fn tool_event_json(session_id: &str, tool_name: &str) -> String {
     format!(
         r#"{{"session_id":"{}","agent_type":"claude_code","event_type":"tool_start","tool_name":"{}","timestamp":"2026-03-22T10:00:00Z"}}"#,
@@ -67,7 +74,7 @@ async fn single_session_lifecycle() {
 
     {
         let s = state.read().await;
-        assert_eq!(s.sessions["s1"].status, SessionStatus::Idle);
+        assert_eq!(s.sessions["s1"].status, SessionStatus::Working);
     }
 
     // Send session end
@@ -208,6 +215,56 @@ async fn malformed_json_resilience() {
     {
         let s = state.read().await;
         assert!(s.sessions.contains_key("s1"));
+    }
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn user_prompt_flows_through_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("test.sock");
+    let state = Arc::new(RwLock::new(AppState::default()));
+
+    let daemon_state = state.clone();
+    let daemon_sock = sock_path.clone();
+    let handle = tokio::spawn(async move {
+        run_daemon(&daemon_sock, daemon_state).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = UnixStream::connect(&sock_path).await.unwrap();
+
+    // Start session then send thinking event with prompt
+    let msg = format!(
+        "{}\n{}\n",
+        event_json("s1", "session_start"),
+        prompt_event_json("s1", "fix the login bug")
+    );
+    stream.write_all(msg.as_bytes()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    {
+        let s = state.read().await;
+        assert_eq!(s.sessions["s1"].status, SessionStatus::Thinking);
+        assert_eq!(
+            s.sessions["s1"].last_user_prompt.as_deref(),
+            Some("fix the login bug")
+        );
+    }
+
+    // Send another event without prompt — prompt should persist
+    let msg = format!("{}\n", event_json("s1", "idle"));
+    stream.write_all(msg.as_bytes()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    {
+        let s = state.read().await;
+        assert_eq!(
+            s.sessions["s1"].last_user_prompt.as_deref(),
+            Some("fix the login bug")
+        );
     }
 
     handle.abort();

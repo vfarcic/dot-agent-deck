@@ -10,7 +10,9 @@ const MAX_RECENT_EVENTS: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
+    Thinking,
     Working,
+    Compacting,
     WaitingForInput,
     Idle,
     Error,
@@ -33,6 +35,7 @@ pub struct SessionState {
     pub last_activity: DateTime<Utc>,
     pub recent_events: VecDeque<AgentEvent>,
     pub tool_count: u32,
+    pub last_user_prompt: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -62,6 +65,7 @@ impl AppState {
                 last_activity: event.timestamp,
                 recent_events: VecDeque::new(),
                 tool_count: 0,
+                last_user_prompt: None,
             });
 
         session.last_activity = event.timestamp;
@@ -70,9 +74,17 @@ impl AppState {
             session.cwd.clone_from(&event.cwd);
         }
 
+        if event.user_prompt.is_some() {
+            session.last_user_prompt.clone_from(&event.user_prompt);
+        }
+
         match event.event_type {
             EventType::SessionStart => {
                 session.status = SessionStatus::Idle;
+                session.active_tool = None;
+            }
+            EventType::Thinking => {
+                session.status = SessionStatus::Thinking;
                 session.active_tool = None;
             }
             EventType::ToolStart => {
@@ -83,7 +95,9 @@ impl AppState {
                 });
             }
             EventType::ToolEnd => {
-                session.status = SessionStatus::Idle;
+                if session.status == SessionStatus::WaitingForInput {
+                    session.status = SessionStatus::Working;
+                }
                 session.active_tool = None;
                 session.tool_count += 1;
             }
@@ -94,6 +108,13 @@ impl AppState {
             EventType::Idle => {
                 session.status = SessionStatus::Idle;
                 session.active_tool = None;
+            }
+            EventType::Compacting => {
+                session.status = SessionStatus::Compacting;
+                session.active_tool = None;
+            }
+            EventType::SubagentStart | EventType::SubagentStop => {
+                // Informational — recorded in recent_events but no status change
             }
             EventType::Error => {
                 session.status = SessionStatus::Error;
@@ -106,6 +127,7 @@ impl AppState {
             session.recent_events.pop_front();
         }
     }
+
 }
 
 #[cfg(test)]
@@ -124,6 +146,7 @@ mod tests {
             tool_detail: None,
             cwd: Some("/tmp".to_string()),
             timestamp: Utc::now(),
+            user_prompt: None,
             metadata: HashMap::new(),
         }
     }
@@ -146,7 +169,7 @@ mod tests {
         );
 
         state.apply_event(make_event("s1", EventType::ToolEnd));
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Idle);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
         assert!(state.sessions["s1"].active_tool.is_none());
 
         state.apply_event(make_event("s1", EventType::SessionEnd));
@@ -231,4 +254,36 @@ mod tests {
         state.apply_event(make_event("s1", EventType::Error));
         assert_eq!(state.sessions["s1"].status, SessionStatus::Error);
     }
+
+    #[test]
+    fn last_user_prompt_set_and_persists() {
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+        assert!(state.sessions["s1"].last_user_prompt.is_none());
+
+        let mut prompt_event = make_event("s1", EventType::Thinking);
+        prompt_event.user_prompt = Some("fix the bug".to_string());
+        state.apply_event(prompt_event);
+        assert_eq!(
+            state.sessions["s1"].last_user_prompt.as_deref(),
+            Some("fix the bug")
+        );
+
+        // Subsequent event without prompt should not clear it
+        state.apply_event(make_event("s1", EventType::ToolEnd));
+        assert_eq!(
+            state.sessions["s1"].last_user_prompt.as_deref(),
+            Some("fix the bug")
+        );
+
+        // New prompt replaces old one
+        let mut prompt_event2 = make_event("s1", EventType::Thinking);
+        prompt_event2.user_prompt = Some("add tests".to_string());
+        state.apply_event(prompt_event2);
+        assert_eq!(
+            state.sessions["s1"].last_user_prompt.as_deref(),
+            Some("add tests")
+        );
+    }
+
 }

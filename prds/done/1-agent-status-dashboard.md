@@ -1,6 +1,6 @@
 # PRD #1: Agent Status Dashboard
 
-**Status**: In Progress
+**Status**: Complete (2026-03-22)
 **Priority**: High
 **GitHub Issue**: [#1](https://github.com/vfarcic/dot-agent-deck/issues/1)
 **Related**: PRD #2 (Pane Control via Zellij Integration)
@@ -66,15 +66,14 @@ Per-agent cards showing:
 - **Status indicator**: working (yellow), waiting for input (red/flashing), idle (green), error (red)
 - **Progress**: tasks completed / total (when available from agent)
 - **Recent output**: last 3-5 lines of relevant output
+- **Last user prompt**: the most recent user input that triggered the current work
 - **Time since last activity**
 
 ### Keyboard Navigation
 
-- `j`/`k` or arrow keys: navigate between agent cards
-- `Enter`: switch to selected agent's pane (requires PRD #2 — Pane Control)
-- `n`: create new agent pane (requires PRD #2)
 - `q`: quit dashboard
-- `/`: filter/search sessions
+
+All interactive keybindings (j/k navigation, Enter, n, / filter) are implemented in PRD #2 (Pane Control) alongside pane management.
 
 ## Technical Stack
 
@@ -96,7 +95,8 @@ Per-agent cards showing:
 - [x] Claude Code adapter: Built into binary — `dot-agent-deck hook` reads stdin, transforms, sends to socket; `hooks install/uninstall` manages ~/.claude/settings.json
 - [x] Basic dashboard rendering: Agent cards with status, current tool, working directory
 - [x] Rich dashboard: Tool count, recent tool activity lines, status flash animation
-- [ ] Keyboard navigation: j/k navigation, filtering, card selection
+- [x] Last user prompt: capture and display the most recent user prompt per session
+- [~] ~~Keyboard navigation~~ — moved to PRD #2 (Pane Control)
 
 ## Relationship to PRD #2
 

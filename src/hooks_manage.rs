@@ -2,13 +2,17 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-/// Hook types that don't need a SessionEnd (Claude Code doesn't have one).
 const HOOK_TYPES: &[&str] = &[
     "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
     "Notification",
     "Stop",
+    "PreCompact",
+    "SubagentStart",
+    "SubagentStop",
 ];
 
 fn settings_path() -> PathBuf {
@@ -98,9 +102,18 @@ fn has_valid_new_format_rule(rules: &[Value]) -> bool {
 fn install_impl(settings: &mut Value, binary_path: &str) -> (Vec<&'static str>, Vec<&'static str>) {
     let hooks_obj = ensure_hooks_object(settings);
 
-    // Clean up stale SessionEnd entries (Claude Code has no SessionEnd hook)
-    if let Some(arr) = hooks_obj.get_mut("SessionEnd").and_then(|v| v.as_array_mut()) {
-        arr.retain(|rule| !rule_contains_dot_agent_deck(rule));
+    // Clean up dot-agent-deck entries for hook types no longer in HOOK_TYPES
+    let all_keys: Vec<String> = hooks_obj.keys().cloned().collect();
+    for key in all_keys {
+        if !HOOK_TYPES.contains(&key.as_str()) {
+            if let Some(arr) = hooks_obj.get_mut(&key).and_then(|v| v.as_array_mut()) {
+                arr.retain(|rule| !rule_contains_dot_agent_deck(rule));
+            }
+            // Remove the key entirely if the array is now empty
+            if hooks_obj.get(&key).and_then(|v| v.as_array()).is_some_and(|a| a.is_empty()) {
+                hooks_obj.remove(&key);
+            }
+        }
     }
 
     let mut installed = Vec::new();
@@ -389,9 +402,10 @@ mod tests {
             assert!(rules[0].get("hooks").is_some(), "Expected new format for {hook_type}");
         }
 
-        // SessionEnd should have been cleaned up
+        // SessionEnd old-format entry should have been upgraded to new format
         let session_end = settings["hooks"]["SessionEnd"].as_array().unwrap();
-        assert_eq!(session_end.len(), 0, "SessionEnd should be empty after cleanup");
+        assert_eq!(session_end.len(), 1, "SessionEnd should have 1 upgraded rule");
+        assert!(session_end[0].get("hooks").is_some(), "SessionEnd should be new format");
     }
 
     #[test]

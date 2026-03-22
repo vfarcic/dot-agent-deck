@@ -18,6 +18,7 @@ struct ClaudeCodeHookInput {
     cwd: Option<String>,
     tool_name: Option<String>,
     tool_input: Option<Value>,
+    prompt: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
 }
@@ -57,11 +58,17 @@ fn read_stdin() -> Option<String> {
 fn map_event_type(hook_event_name: &str) -> Option<EventType> {
     match hook_event_name {
         "SessionStart" => Some(EventType::SessionStart),
+        "SessionEnd" => Some(EventType::SessionEnd),
+        "UserPromptSubmit" => Some(EventType::Thinking),
         "PreToolUse" => Some(EventType::ToolStart),
         "PostToolUse" => Some(EventType::ToolEnd),
         "Notification" => Some(EventType::WaitingForInput),
         "Stop" => Some(EventType::Idle),
-        "SessionEnd" => Some(EventType::SessionEnd),
+        "StopFailure" => Some(EventType::Error),
+        "PreCompact" => Some(EventType::Compacting),
+        "PostCompact" => Some(EventType::Thinking),
+        "SubagentStart" => Some(EventType::SubagentStart),
+        "SubagentStop" => Some(EventType::SubagentStop),
         _ => None,
     }
 }
@@ -107,6 +114,8 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
         input.tool_input.as_ref(),
     );
 
+    let user_prompt = input.prompt.map(|p| truncate(&p, 200));
+
     Some(AgentEvent {
         session_id: input.session_id,
         agent_type: AgentType::ClaudeCode,
@@ -115,6 +124,7 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
         tool_detail,
         cwd: input.cwd,
         timestamp: Utc::now(),
+        user_prompt,
         metadata: HashMap::new(),
     })
 }
@@ -245,6 +255,7 @@ mod tests {
             cwd: Some("/tmp".into()),
             tool_name: None,
             tool_input: None,
+            prompt: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -252,6 +263,7 @@ mod tests {
         assert_eq!(event.event_type, EventType::SessionStart);
         assert_eq!(event.cwd.as_deref(), Some("/tmp"));
         assert!(event.tool_name.is_none());
+        assert!(event.user_prompt.is_none());
     }
 
     #[test]
@@ -262,6 +274,7 @@ mod tests {
             cwd: None,
             tool_name: Some("Read".into()),
             tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
+            prompt: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -278,9 +291,44 @@ mod tests {
             cwd: None,
             tool_name: None,
             tool_input: None,
+            prompt: None,
             _extra: HashMap::new(),
         };
         assert!(build_event(input).is_none());
+    }
+
+    #[test]
+    fn build_event_user_prompt_submit_extracts_prompt() {
+        let input = ClaudeCodeHookInput {
+            session_id: "test-123".into(),
+            hook_event_name: "UserPromptSubmit".into(),
+            cwd: None,
+            tool_name: None,
+            tool_input: None,
+            prompt: Some("fix the login bug".into()),
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        assert_eq!(event.event_type, EventType::Thinking);
+        assert_eq!(event.user_prompt.as_deref(), Some("fix the login bug"));
+    }
+
+    #[test]
+    fn build_event_prompt_truncated_to_200() {
+        let long_prompt = "x".repeat(300);
+        let input = ClaudeCodeHookInput {
+            session_id: "test-123".into(),
+            hook_event_name: "UserPromptSubmit".into(),
+            cwd: None,
+            tool_name: None,
+            tool_input: None,
+            prompt: Some(long_prompt),
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        let prompt = event.user_prompt.unwrap();
+        assert!(prompt.len() <= 204); // 200 + "…" (3 bytes)
+        assert!(prompt.ends_with('…'));
     }
 
     #[test]

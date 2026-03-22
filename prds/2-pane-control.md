@@ -46,14 +46,24 @@ The dashboard needs to map agent sessions (identified by `session_id` from hook 
 PANE_ID=$(printenv ZELLIJ_PANE_ID 2>/dev/null || echo "unknown")
 ```
 
-### Dashboard Keybindings (wired to PRD #1)
+### Dashboard Keybindings
 
+#### Navigation (moved from PRD #1)
+- `Up`/`Down` arrow keys or `j`/`k`: navigate between agent cards
+- `/`: filter/search sessions by name, directory, or status
+- `r`: rename/label the selected session (set a friendly display name)
+
+#### Pane Control
 - `Enter`: focus the selected agent's terminal pane in zellij
 - `n`: create a new zellij pane and optionally start `claude` in it
 - `d`: close/delete the selected agent's pane (with confirmation)
 - `f`: toggle the selected pane to fullscreen
 - `s`: split and create a new pane (horizontal/vertical)
 - `Esc` or `Tab`: return focus to the dashboard pane
+
+#### General
+- `?`: show/hide keybindings help overlay
+- `q`: quit dashboard
 
 ### Return-to-Dashboard
 
@@ -78,6 +88,8 @@ After switching to an agent pane, the user needs a way to return to the dashboar
 
 ## Milestones
 
+- [ ] Keyboard navigation: Up/Down/j/k card selection, `/` filter, `?` help overlay
+- [ ] Session rename: `r` to set a friendly display name for a session
 - [ ] Multiplexer detection and `PaneController` trait definition
 - [ ] Pane-session mapping: link session_ids to zellij pane IDs via adapter
 - [ ] Focus switching: `Enter` to switch to agent pane, return-to-dashboard mechanism

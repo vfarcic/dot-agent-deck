@@ -24,7 +24,7 @@ impl fmt::Display for crate::event::AgentType {
 pub fn run_tui(state: SharedState) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = ratatui::restore();
+        ratatui::restore();
         original_hook(info);
     }));
 
@@ -36,15 +36,13 @@ pub fn run_tui(state: SharedState) -> std::io::Result<()> {
         terminal.draw(|frame| render_frame(frame, &snapshot, tick))?;
         tick = tick.wrapping_add(1);
 
-        if crossterm::event::poll(std::time::Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q')
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL))
-                {
-                    break;
-                }
-            }
+        if crossterm::event::poll(std::time::Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+            && (key.code == KeyCode::Char('q')
+                || (key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+        {
+            break;
         }
     }
 
@@ -88,23 +86,47 @@ fn render_frame(frame: &mut Frame, state: &AppState, tick: u64) {
         ),
     ]));
 
+    let cols = grid_columns(area.width);
+    let card_height = 8;
+
+    // Group sessions into rows of `cols`
+    let rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
+
     let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
-    for _ in &sessions {
-        constraints.push(Constraint::Length(9));
+    for _ in &rows {
+        constraints.push(Constraint::Length(card_height));
     }
     constraints.push(Constraint::Min(0)); // filler
 
-    let chunks = Layout::vertical(constraints).split(area);
+    let row_chunks = Layout::vertical(constraints).split(area);
 
-    frame.render_widget(title, chunks[0]);
+    frame.render_widget(title, row_chunks[0]);
 
-    for (i, session) in sessions.iter().enumerate() {
-        render_session_card(frame, chunks[i + 1], session, tick);
+    for (row_idx, row) in rows.iter().enumerate() {
+        let col_constraints: Vec<Constraint> = (0..cols)
+            .map(|_| Constraint::Ratio(1, cols as u32))
+            .collect();
+        let col_chunks = Layout::horizontal(col_constraints).split(row_chunks[row_idx + 1]);
+
+        for (col_idx, session) in row.iter().enumerate() {
+            render_session_card(frame, col_chunks[col_idx], session, tick);
+        }
+    }
+}
+
+fn grid_columns(width: u16) -> usize {
+    if width >= 180 {
+        3
+    } else if width >= 100 {
+        2
+    } else {
+        1
     }
 }
 
 fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState, tick: u64) {
     let (status_label, status_style) = status_style(&session.status);
+    let status_color = status_style.fg.unwrap_or(Color::Gray);
 
     // Truncate session_id to 11 chars
     let id_display = if session.session_id.len() > 11 {
@@ -119,7 +141,7 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState, ti
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray))
+        .border_style(Style::default().fg(status_color))
         .title(Span::styled(title_left, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)))
         .title_alignment(ratatui::layout::Alignment::Left)
         .title(Line::from(Span::styled(
@@ -130,6 +152,9 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState, ti
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let w = inner.width as usize;
+    let wide = w >= 60;
+
     let cwd_display = session
         .cwd
         .as_deref()
@@ -137,44 +162,74 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState, ti
 
     let elapsed = format_elapsed(session.last_activity);
 
-    let mut lines = vec![
-        Line::from(vec![
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    if wide {
+        // Dir + stats on one line
+        lines.push(padded_line(
+            vec![
+                Span::styled("Dir:  ", Style::default().fg(Color::Gray)),
+                Span::raw(cwd_display),
+            ],
+            vec![
+                Span::styled("Last: ", Style::default().fg(Color::Gray)),
+                Span::raw(format!("{}  ", elapsed)),
+                Span::styled("Tools: ", Style::default().fg(Color::Gray)),
+                Span::raw(session.tool_count.to_string()),
+            ],
+            w,
+        ));
+    } else {
+        lines.push(Line::from(vec![
             Span::styled("Dir:  ", Style::default().fg(Color::Gray)),
             Span::raw(cwd_display),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                if session.active_tool.is_some() {
-                    "Tool: "
-                } else {
-                    "Status: "
-                },
-                Style::default().fg(Color::Gray),
-            ),
-            Span::raw(if let Some(ref tool) = session.active_tool {
-                let detail = tool.detail.as_deref().unwrap_or("");
-                if detail.is_empty() {
-                    tool.name.clone()
-                } else {
-                    format!("{} — {}", tool.name, detail)
-                }
-            } else {
-                status_label.to_string()
-            }),
-        ]),
-        Line::from(vec![
+        ]));
+    }
+
+    // Prompt line
+    if let Some(ref prompt) = session.last_user_prompt {
+        let max_prompt = w.saturating_sub(6); // 6 = "Prmt: "
+        let display = if prompt.len() > max_prompt {
+            format!("{}…", &prompt[..max_prompt])
+        } else {
+            prompt.clone()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Prmt: ", Style::default().fg(Color::Gray)),
+            Span::raw(display),
+        ]));
+    }
+
+    // In narrow mode, stats are a separate line
+    if !wide {
+        lines.push(Line::from(vec![
             Span::styled("Last: ", Style::default().fg(Color::Gray)),
             Span::raw(format!("{}  ", elapsed)),
             Span::styled("Tools: ", Style::default().fg(Color::Gray)),
             Span::raw(session.tool_count.to_string()),
-        ]),
-        Line::from(""),
-    ];
+        ]));
+    }
 
+    lines.push(Line::from(""));
     lines.extend(recent_tool_lines(session));
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
+}
+
+/// Build a single line with left-aligned and right-aligned span groups,
+/// padded with spaces to fill `width`.
+fn padded_line<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Line<'a> {
+    let left_len: usize = left.iter().map(|s| s.width()).sum();
+    let right_len: usize = right.iter().map(|s| s.width()).sum();
+    let gap = width.saturating_sub(left_len + right_len);
+
+    let mut spans = left;
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+    }
+    spans.extend(right);
+    Line::from(spans)
 }
 
 fn flash_dot(status: &SessionStatus, tick: u64) -> &'static str {
@@ -207,14 +262,16 @@ fn recent_tool_lines(session: &SessionState) -> Vec<Line<'static>> {
             } else {
                 format!("  {} — {}", name, detail)
             };
-            Line::styled(text, Style::default().fg(Color::DarkGray))
+            Line::styled(text, Style::default().fg(Color::Rgb(140, 140, 140)))
         })
         .collect()
 }
 
 fn status_style(status: &SessionStatus) -> (&str, Style) {
     match status {
+        SessionStatus::Thinking => ("Thinking", Style::default().fg(Color::Cyan)),
         SessionStatus::Working => ("Working", Style::default().fg(Color::Yellow)),
+        SessionStatus::Compacting => ("Compacting", Style::default().fg(Color::Blue)),
         SessionStatus::WaitingForInput => (
             "Needs Input",
             Style::default()
@@ -274,6 +331,10 @@ mod tests {
 
     #[test]
     fn test_status_style() {
+        let (label, style) = status_style(&SessionStatus::Thinking);
+        assert_eq!(label, "Thinking");
+        assert_eq!(style.fg, Some(Color::Cyan));
+
         let (label, style) = status_style(&SessionStatus::Working);
         assert_eq!(label, "Working");
         assert_eq!(style.fg, Some(Color::Yellow));
@@ -315,6 +376,7 @@ mod tests {
             tool_detail: None,
             cwd: Some("/home/user/project".to_string()),
             timestamp: Utc::now(),
+            user_prompt: None,
             metadata: HashMap::new(),
         };
         state.apply_event(event1.clone());
@@ -333,6 +395,7 @@ mod tests {
             tool_detail: None,
             cwd: Some("/home/user/other".to_string()),
             timestamp: Utc::now(),
+            user_prompt: None,
             metadata: HashMap::new(),
         };
         state.apply_event(event2);
@@ -357,6 +420,7 @@ mod tests {
                 tool_detail: if detail.is_empty() { None } else { Some(detail.to_string()) },
                 cwd: None,
                 timestamp: Utc::now(),
+                user_prompt: None,
                 metadata: HashMap::new(),
             });
         }
@@ -371,6 +435,7 @@ mod tests {
             last_activity: Utc::now(),
             recent_events: events,
             tool_count: 0,
+            last_user_prompt: None,
         };
 
         let lines = recent_tool_lines(&session);
@@ -383,6 +448,41 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_display_in_card() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        let mut event = AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+        };
+        state.apply_event(event.clone());
+
+        // Send a thinking event with a prompt
+        event.event_type = EventType::Thinking;
+        event.user_prompt = Some("fix the login bug".to_string());
+        state.apply_event(event);
+
+        // Should render without panic and session should have prompt
+        assert_eq!(
+            state.sessions["s1"].last_user_prompt.as_deref(),
+            Some("fix the login bug")
+        );
+
+        terminal
+            .draw(|frame| render_frame(frame, &state, 0))
+            .unwrap();
+    }
+
+    #[test]
     fn test_flash_dot() {
         assert_eq!(flash_dot(&crate::state::SessionStatus::WaitingForInput, 0), "●");
         assert_eq!(flash_dot(&crate::state::SessionStatus::WaitingForInput, 1), " ");
@@ -390,5 +490,43 @@ mod tests {
         assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 0), "●");
         assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 1), "●");
         assert_eq!(flash_dot(&crate::state::SessionStatus::Idle, 1), "●");
+    }
+
+    #[test]
+    fn test_grid_columns() {
+        assert_eq!(grid_columns(79), 1);
+        assert_eq!(grid_columns(99), 1);
+        assert_eq!(grid_columns(100), 2);
+        assert_eq!(grid_columns(150), 2);
+        assert_eq!(grid_columns(179), 2);
+        assert_eq!(grid_columns(180), 3);
+        assert_eq!(grid_columns(250), 3);
+    }
+
+    #[test]
+    fn test_render_wide_grid_layout() {
+        // 120 wide = 2 columns, 2 sessions should render in one row
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        for id in ["s1", "s2", "s3"] {
+            state.apply_event(AgentEvent {
+                session_id: id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: Some("/tmp".to_string()),
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+            });
+        }
+
+        // 3 sessions at 2 cols = 2 rows, needs 1 (title) + 10 + 10 = 21, we have 20 — still renders
+        terminal
+            .draw(|frame| render_frame(frame, &state, 0))
+            .unwrap();
     }
 }

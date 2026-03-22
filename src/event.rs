@@ -7,6 +7,10 @@ use std::collections::HashMap;
 pub enum EventType {
     ToolStart,
     ToolEnd,
+    Thinking,
+    Compacting,
+    SubagentStart,
+    SubagentStop,
     WaitingForInput,
     Idle,
     Error,
@@ -32,6 +36,8 @@ pub struct AgentEvent {
     #[serde(default)]
     pub cwd: Option<String>,
     pub timestamp: DateTime<Utc>,
+    #[serde(default)]
+    pub user_prompt: Option<String>,
     #[serde(default)]
     pub metadata: HashMap<String, String>,
 }
@@ -72,6 +78,31 @@ mod tests {
         assert!(event.tool_detail.is_none());
         assert!(event.cwd.is_none());
         assert!(event.metadata.is_empty());
+    }
+
+    #[test]
+    fn parse_event_with_user_prompt() {
+        let json = r#"{
+            "session_id": "abc-123",
+            "agent_type": "claude_code",
+            "event_type": "thinking",
+            "user_prompt": "fix the login bug",
+            "timestamp": "2026-03-22T10:00:00Z"
+        }"#;
+        let event: AgentEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.user_prompt.as_deref(), Some("fix the login bug"));
+    }
+
+    #[test]
+    fn parse_event_without_user_prompt() {
+        let json = r#"{
+            "session_id": "abc-123",
+            "agent_type": "claude_code",
+            "event_type": "tool_start",
+            "timestamp": "2026-03-22T10:00:00Z"
+        }"#;
+        let event: AgentEvent = serde_json::from_str(json).unwrap();
+        assert!(event.user_prompt.is_none());
     }
 
     #[test]
