@@ -93,9 +93,9 @@ Per-agent cards showing:
 ## Milestones
 
 - [x] Event daemon: Unix socket listener, event schema, in-memory state per session
-- [ ] Claude Code adapter: Hook scripts that translate Claude Code events to common protocol
+- [x] Claude Code adapter: Built into binary — `dot-agent-deck hook` reads stdin, transforms, sends to socket; `hooks install/uninstall` manages ~/.claude/settings.json
 - [x] Basic dashboard rendering: Agent cards with status, current tool, working directory
-- [ ] Rich dashboard: Progress bars, recent output lines, time tracking, colored status indicators
+- [ ] Rich dashboard: Progress bars, recent output lines (time tracking and colored status indicators are done)
 - [ ] Keyboard navigation: j/k navigation, filtering, card selection
 
 ## Relationship to PRD #2

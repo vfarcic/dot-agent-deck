@@ -54,7 +54,7 @@ fn render_frame(frame: &mut Frame, state: &AppState) {
 
     if state.sessions.is_empty() {
         let msg = Paragraph::new("No active sessions. Waiting for connections...")
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(Color::Gray))
             .centered();
         // Center vertically
         let vertical = Layout::vertical([
@@ -81,7 +81,7 @@ fn render_frame(frame: &mut Frame, state: &AppState) {
         ),
         Span::styled(
             format!("— {} session(s)", sessions.len()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ),
     ]));
 
@@ -114,8 +114,8 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(title_left)
+        .border_style(Style::default().fg(Color::Gray))
+        .title(Span::styled(title_left, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)))
         .title_alignment(ratatui::layout::Alignment::Left)
         .title(Line::from(Span::styled(
             format!(" {} {} ", "●", status_label),
@@ -134,7 +134,7 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState) {
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("Dir:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Dir:  ", Style::default().fg(Color::Gray)),
             Span::raw(cwd_display),
         ]),
         Line::from(vec![
@@ -144,7 +144,7 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState) {
                 } else {
                     "Status: "
                 },
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             ),
             Span::raw(if let Some(ref tool) = session.active_tool {
                 let detail = tool.detail.as_deref().unwrap_or("");
@@ -158,7 +158,7 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState) {
             }),
         ]),
         Line::from(vec![
-            Span::styled("Last: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Last: ", Style::default().fg(Color::Gray)),
             Span::raw(elapsed),
         ]),
     ];
