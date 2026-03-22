@@ -1,6 +1,6 @@
 # PRD #1: Agent Status Dashboard
 
-**Status**: Draft
+**Status**: In Progress
 **Priority**: High
 **GitHub Issue**: [#1](https://github.com/vfarcic/dot-agent-deck/issues/1)
 **Related**: PRD #2 (Pane Control via Zellij Integration)
@@ -92,7 +92,7 @@ Per-agent cards showing:
 
 ## Milestones
 
-- [ ] Event daemon: Unix socket listener, event schema, in-memory state per session
+- [x] Event daemon: Unix socket listener, event schema, in-memory state per session
 - [ ] Claude Code adapter: Hook scripts that translate Claude Code events to common protocol
 - [ ] Basic dashboard rendering: Agent cards with status, current tool, working directory
 - [ ] Rich dashboard: Progress bars, recent output lines, time tracking, colored status indicators
