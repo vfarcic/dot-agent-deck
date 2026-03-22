@@ -3,3 +3,4 @@ pub mod daemon;
 pub mod error;
 pub mod event;
 pub mod state;
+pub mod ui;

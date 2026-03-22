@@ -1,45 +1,49 @@
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::info;
 
 use dot_agent_deck::config::socket_path;
 use dot_agent_deck::daemon::run_daemon;
 use dot_agent_deck::state::AppState;
+use dot_agent_deck::ui::run_tui;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("dot_agent_deck=info".parse().unwrap()),
-        )
-        .init();
+    // Optional file-based logging when DOT_AGENT_DECK_LOG is set
+    if std::env::var("DOT_AGENT_DECK_LOG").is_ok() {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive("dot_agent_deck=info".parse().unwrap()),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+    }
 
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();
-
-    info!("Starting dot-agent-deck daemon");
 
     let daemon_state = state.clone();
     let daemon_path = path.clone();
     let daemon_handle = tokio::spawn(async move {
         if let Err(e) = run_daemon(&daemon_path, daemon_state).await {
-            tracing::error!("Daemon error: {e}");
+            eprintln!("Daemon error: {e}");
         }
     });
 
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for ctrl-c");
+    let tui_state = state.clone();
+    let tui_result = tokio::task::spawn_blocking(move || run_tui(tui_state)).await;
 
-    info!("Shutting down...");
+    // TUI exited — clean up
     daemon_handle.abort();
 
-    // Clean up socket file
     if path.exists() {
         let _ = std::fs::remove_file(&path);
     }
 
-    info!("Goodbye.");
+    if let Err(e) = tui_result {
+        eprintln!("TUI task error: {e}");
+    } else if let Ok(Err(e)) = tui_result {
+        eprintln!("TUI error: {e}");
+    }
 }

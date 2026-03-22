@@ -94,7 +94,7 @@ Per-agent cards showing:
 
 - [x] Event daemon: Unix socket listener, event schema, in-memory state per session
 - [ ] Claude Code adapter: Hook scripts that translate Claude Code events to common protocol
-- [ ] Basic dashboard rendering: Agent cards with status, current tool, working directory
+- [x] Basic dashboard rendering: Agent cards with status, current tool, working directory
 - [ ] Rich dashboard: Progress bars, recent output lines, time tracking, colored status indicators
 - [ ] Keyboard navigation: j/k navigation, filtering, card selection
 

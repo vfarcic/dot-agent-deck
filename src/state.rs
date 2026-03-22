@@ -34,7 +34,7 @@ pub struct SessionState {
     pub recent_events: VecDeque<AgentEvent>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
 }
