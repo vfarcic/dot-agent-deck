@@ -82,8 +82,10 @@ async fn run_dashboard() {
         }
     });
 
+    let pane_controller = dot_agent_deck::pane::detect_multiplexer();
     let tui_state = state.clone();
-    let tui_result = tokio::task::spawn_blocking(move || run_tui(tui_state)).await;
+    let tui_result =
+        tokio::task::spawn_blocking(move || run_tui(tui_state, pane_controller)).await;
 
     // TUI exited — clean up
     daemon_handle.abort();

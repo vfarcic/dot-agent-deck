@@ -12,6 +12,7 @@ use ratatui::{
 };
 
 use crate::event::EventType;
+use crate::pane::PaneController;
 use crate::state::{AppState, SessionState, SessionStatus, SharedState};
 
 impl fmt::Display for crate::event::AgentType {
@@ -275,7 +276,7 @@ fn handle_rename_key(
 // TUI entry point
 // ---------------------------------------------------------------------------
 
-pub fn run_tui(state: SharedState) -> std::io::Result<()> {
+pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         ratatui::restore();
@@ -300,8 +301,9 @@ pub fn run_tui(state: SharedState) -> std::io::Result<()> {
 
         ui.columns = grid_columns(terminal.get_frame().area().width);
 
+        let has_pane_control = pane.is_available();
         terminal.draw(|frame| {
-            render_frame(frame, &snapshot, &ui, &filtered, tick);
+            render_frame(frame, &snapshot, &ui, &filtered, tick, has_pane_control);
         })?;
         tick = tick.wrapping_add(1);
 
@@ -340,6 +342,7 @@ fn render_frame(
     ui: &UiState,
     filtered: &[(&String, &SessionState)],
     tick: u64,
+    has_pane_control: bool,
 ) {
     let area = frame.area();
 
@@ -406,7 +409,7 @@ fn render_frame(
         .split(vertical[1]);
         frame.render_widget(msg, inner[1]);
 
-        render_bottom_bar(frame, ui, vertical[2]);
+        render_bottom_bar(frame, ui, vertical[2], has_pane_control);
         return;
     }
 
@@ -443,15 +446,15 @@ fn render_frame(
 
     // Bottom bar
     let bottom_area = row_chunks[row_chunks.len() - 1];
-    render_bottom_bar(frame, ui, bottom_area);
+    render_bottom_bar(frame, ui, bottom_area, has_pane_control);
 
     // Help overlay (drawn last, on top)
     if ui.mode == UiMode::Help {
-        render_help_overlay(frame);
+        render_help_overlay(frame, has_pane_control);
     }
 }
 
-fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect) {
+fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_control: bool) {
     match ui.mode {
         UiMode::Filter => {
             let line = Line::from(vec![
@@ -479,10 +482,11 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect) {
         }
         _ => {
             // Status bar with hints
-            let hints = if ui.filter_text.is_empty() {
-                "q: quit  /: filter  ?: help  hjkl/arrows: navigate  r: rename"
-            } else {
-                "q: quit  Esc: clear filter  ?: help  hjkl/arrows: navigate  r: rename"
+            let hints = match (ui.filter_text.is_empty(), has_pane_control) {
+                (true, true) => "q: quit  /: filter  ?: help  hjkl: navigate  r: rename  Enter: focus  n: new pane",
+                (true, false) => "q: quit  /: filter  ?: help  hjkl/arrows: navigate  r: rename",
+                (false, true) => "q: quit  Esc: clear filter  ?: help  hjkl: navigate  Enter: focus  n: new pane",
+                (false, false) => "q: quit  Esc: clear filter  ?: help  hjkl/arrows: navigate  r: rename",
             };
             let line = Line::styled(hints, Style::default().fg(Color::DarkGray));
             frame.render_widget(Paragraph::new(line), area);
@@ -490,17 +494,18 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect) {
     }
 }
 
-fn render_help_overlay(frame: &mut Frame) {
+fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     let area = frame.area();
     let popup_width = 52.min(area.width.saturating_sub(4));
-    let popup_height = 16.min(area.height.saturating_sub(4));
+    let base_height: u16 = if has_pane_control { 24 } else { 16 };
+    let popup_height = base_height.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
-    let help_text = vec![
+    let mut help_text = vec![
         Line::styled(
             "  Keybindings",
             Style::default()
@@ -517,12 +522,29 @@ fn render_help_overlay(frame: &mut Frame) {
         Line::from("  ?             Toggle this help"),
         Line::from("  Esc           Clear filter"),
         Line::from("  q             Quit"),
-        Line::from(""),
-        Line::styled(
-            "  Press ? or Esc to close",
-            Style::default().fg(Color::DarkGray),
-        ),
     ];
+
+    if has_pane_control {
+        help_text.push(Line::from(""));
+        help_text.push(Line::styled(
+            "  Pane Control",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        help_text.push(Line::from(""));
+        help_text.push(Line::from("  Enter         Focus agent pane"));
+        help_text.push(Line::from("  n             New pane"));
+        help_text.push(Line::from("  d             Close pane"));
+        help_text.push(Line::from("  f             Fullscreen toggle"));
+        help_text.push(Line::from("  s             Split pane"));
+    }
+
+    help_text.push(Line::from(""));
+    help_text.push(Line::styled(
+        "  Press ? or Esc to close",
+        Style::default().fg(Color::DarkGray),
+    ));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -800,7 +822,7 @@ mod tests {
         let ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0))
+            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0, false))
             .unwrap();
     }
 
@@ -821,6 +843,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
+            pane_id: None,
         };
         state.apply_event(event1.clone());
 
@@ -839,13 +862,14 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
+            pane_id: None,
         };
         state.apply_event(event2);
 
         let ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0))
+            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0, false))
             .unwrap();
     }
 
@@ -875,6 +899,7 @@ mod tests {
                 timestamp: Utc::now(),
                 user_prompt: None,
                 metadata: HashMap::new(),
+                pane_id: None,
             });
         }
 
@@ -889,6 +914,7 @@ mod tests {
             recent_events: events,
             tool_count: 0,
             last_user_prompt: None,
+            pane_id: None,
         };
 
         let lines = recent_tool_lines(&session);
@@ -915,6 +941,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
+            pane_id: None,
         };
         state.apply_event(event.clone());
 
@@ -930,7 +957,7 @@ mod tests {
         let ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0))
+            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0, false))
             .unwrap();
     }
 
@@ -981,13 +1008,14 @@ mod tests {
                 timestamp: Utc::now(),
                 user_prompt: None,
                 metadata: HashMap::new(),
+                pane_id: None,
             });
         }
 
         let ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0))
+            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0, false))
             .unwrap();
     }
 
@@ -1070,6 +1098,7 @@ mod tests {
                 timestamp: Utc::now(),
                 user_prompt: None,
                 metadata: HashMap::new(),
+                pane_id: None,
             });
         }
 
@@ -1092,6 +1121,7 @@ mod tests {
                 timestamp: Utc::now(),
                 user_prompt: None,
                 metadata: HashMap::new(),
+                pane_id: None,
             });
         }
 
@@ -1115,6 +1145,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
+            pane_id: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -1126,6 +1157,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
+            pane_id: None,
         });
 
         let mut ui = default_ui();
@@ -1148,6 +1180,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
+            pane_id: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -1159,6 +1192,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
+            pane_id: None,
         });
 
         let mut ui = default_ui();
@@ -1183,6 +1217,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
+            pane_id: None,
         });
 
         let mut ui = default_ui();

@@ -92,8 +92,8 @@ After switching to an agent pane, the user needs a way to return to the dashboar
 
 - [x] Keyboard navigation: arrow keys + h/j/k/l grid selection, `/` filter, `?` help overlay, status bar
 - [x] Session rename: `r` to set a friendly display name for a session
-- [ ] Multiplexer detection and `PaneController` trait definition
-- [ ] Pane-session mapping: link session_ids to zellij pane IDs via adapter
+- [x] Multiplexer detection and `PaneController` trait definition
+- [x] Pane-session mapping: link session_ids to zellij pane IDs via adapter
 - [ ] Focus switching: `Enter` to switch to agent pane, return-to-dashboard mechanism
 - [ ] Pane creation: `n` to create new pane with `claude` (or custom command)
 - [ ] Pane management: close, resize, fullscreen from dashboard

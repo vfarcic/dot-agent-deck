@@ -36,6 +36,7 @@ pub struct SessionState {
     pub recent_events: VecDeque<AgentEvent>,
     pub tool_count: u32,
     pub last_user_prompt: Option<String>,
+    pub pane_id: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -66,6 +67,7 @@ impl AppState {
                 recent_events: VecDeque::new(),
                 tool_count: 0,
                 last_user_prompt: None,
+                pane_id: event.pane_id.clone(),
             });
 
         session.last_activity = event.timestamp;
@@ -76,6 +78,10 @@ impl AppState {
 
         if event.user_prompt.is_some() {
             session.last_user_prompt.clone_from(&event.user_prompt);
+        }
+
+        if event.pane_id.is_some() {
+            session.pane_id.clone_from(&event.pane_id);
         }
 
         match event.event_type {
@@ -148,6 +154,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
+            pane_id: None,
         }
     }
 
