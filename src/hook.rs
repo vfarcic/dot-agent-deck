@@ -1,0 +1,373 @@
+use std::collections::HashMap;
+use std::io::Read as _;
+use std::io::Write as _;
+use std::os::unix::net::UnixStream;
+use std::process::ExitCode;
+
+use chrono::Utc;
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::config::socket_path;
+use crate::event::{AgentEvent, AgentType, EventType};
+
+#[derive(Debug, Deserialize)]
+struct ClaudeCodeHookInput {
+    session_id: String,
+    hook_event_name: String,
+    cwd: Option<String>,
+    tool_name: Option<String>,
+    tool_input: Option<Value>,
+    prompt: Option<String>,
+    #[serde(flatten)]
+    _extra: HashMap<String, Value>,
+}
+
+pub fn handle_hook() -> ExitCode {
+    let input = match read_stdin() {
+        Some(s) if !s.is_empty() => s,
+        _ => return ExitCode::SUCCESS,
+    };
+
+    let hook_input: ClaudeCodeHookInput = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(_) => return ExitCode::SUCCESS,
+    };
+
+    let event = match build_event(hook_input) {
+        Some(e) => e,
+        None => return ExitCode::SUCCESS,
+    };
+
+    let json = match serde_json::to_string(&event) {
+        Ok(j) => j,
+        Err(_) => return ExitCode::SUCCESS,
+    };
+
+    let _ = send_to_socket(&json);
+
+    ExitCode::SUCCESS
+}
+
+fn read_stdin() -> Option<String> {
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf).ok()?;
+    Some(buf)
+}
+
+fn map_event_type(hook_event_name: &str) -> Option<EventType> {
+    match hook_event_name {
+        "SessionStart" => Some(EventType::SessionStart),
+        "SessionEnd" => Some(EventType::SessionEnd),
+        "UserPromptSubmit" => Some(EventType::Thinking),
+        "PreToolUse" => Some(EventType::ToolStart),
+        "PostToolUse" => Some(EventType::ToolEnd),
+        "Notification" => Some(EventType::WaitingForInput),
+        "Stop" => Some(EventType::Idle),
+        "StopFailure" => Some(EventType::Error),
+        "PreCompact" => Some(EventType::Compacting),
+        "PostCompact" => Some(EventType::Thinking),
+        "SubagentStart" => Some(EventType::SubagentStart),
+        "SubagentStop" => Some(EventType::SubagentStop),
+        _ => None,
+    }
+}
+
+fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> Option<String> {
+    let input = tool_input?.as_object()?;
+    let detail = match tool_name? {
+        "Bash" => {
+            let cmd = input.get("command")?.as_str()?;
+            let first_line = cmd.lines().next().unwrap_or(cmd);
+            truncate(first_line, 120)
+        }
+        "Read" | "Edit" | "Write" => {
+            input.get("file_path")?.as_str()?.to_string()
+        }
+        "Grep" | "Glob" => {
+            input.get("pattern")?.as_str()?.to_string()
+        }
+        "Agent" => {
+            input.get("description")?.as_str()?.to_string()
+        }
+        _ => {
+            // First string-valued key
+            let val = input.values().find_map(|v| v.as_str())?;
+            truncate(val, 80)
+        }
+    };
+    Some(detail)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max])
+    }
+}
+
+fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
+    let event_type = map_event_type(&input.hook_event_name)?;
+    let tool_detail = extract_tool_detail(
+        input.tool_name.as_deref(),
+        input.tool_input.as_ref(),
+    );
+
+    let user_prompt = input.prompt.map(|p| truncate(&p, 200));
+
+    Some(AgentEvent {
+        session_id: input.session_id,
+        agent_type: AgentType::ClaudeCode,
+        event_type,
+        tool_name: input.tool_name,
+        tool_detail,
+        cwd: input.cwd,
+        timestamp: Utc::now(),
+        user_prompt,
+        metadata: HashMap::new(),
+    })
+}
+
+fn send_to_socket(json: &str) -> Option<()> {
+    let path = socket_path();
+    let mut stream = UnixStream::connect(path).ok()?;
+    let msg = format!("{json}\n");
+    stream.write_all(msg.as_bytes()).ok()?;
+    stream.flush().ok()?;
+    Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_session_start() {
+        assert_eq!(map_event_type("SessionStart"), Some(EventType::SessionStart));
+    }
+
+    #[test]
+    fn map_pre_tool_use() {
+        assert_eq!(map_event_type("PreToolUse"), Some(EventType::ToolStart));
+    }
+
+    #[test]
+    fn map_post_tool_use() {
+        assert_eq!(map_event_type("PostToolUse"), Some(EventType::ToolEnd));
+    }
+
+    #[test]
+    fn map_notification() {
+        assert_eq!(map_event_type("Notification"), Some(EventType::WaitingForInput));
+    }
+
+    #[test]
+    fn map_stop() {
+        assert_eq!(map_event_type("Stop"), Some(EventType::Idle));
+    }
+
+    #[test]
+    fn map_session_end() {
+        assert_eq!(map_event_type("SessionEnd"), Some(EventType::SessionEnd));
+    }
+
+    #[test]
+    fn map_unknown_returns_none() {
+        assert_eq!(map_event_type("SomethingElse"), None);
+    }
+
+    #[test]
+    fn tool_detail_bash_command() {
+        let input: Value = serde_json::json!({"command": "ls -la\necho hello"});
+        let detail = extract_tool_detail(Some("Bash"), Some(&input));
+        assert_eq!(detail.as_deref(), Some("ls -la"));
+    }
+
+    #[test]
+    fn tool_detail_bash_truncates_long_command() {
+        let long_cmd = "x".repeat(200);
+        let input: Value = serde_json::json!({"command": long_cmd});
+        let detail = extract_tool_detail(Some("Bash"), Some(&input)).unwrap();
+        assert!(detail.len() <= 124); // 120 + "…" (3 bytes)
+    }
+
+    #[test]
+    fn tool_detail_read_file_path() {
+        let input: Value = serde_json::json!({"file_path": "/src/main.rs"});
+        let detail = extract_tool_detail(Some("Read"), Some(&input));
+        assert_eq!(detail.as_deref(), Some("/src/main.rs"));
+    }
+
+    #[test]
+    fn tool_detail_edit_file_path() {
+        let input: Value = serde_json::json!({"file_path": "/src/lib.rs", "old_string": "a", "new_string": "b"});
+        let detail = extract_tool_detail(Some("Edit"), Some(&input));
+        assert_eq!(detail.as_deref(), Some("/src/lib.rs"));
+    }
+
+    #[test]
+    fn tool_detail_grep_pattern() {
+        let input: Value = serde_json::json!({"pattern": "fn main"});
+        let detail = extract_tool_detail(Some("Grep"), Some(&input));
+        assert_eq!(detail.as_deref(), Some("fn main"));
+    }
+
+    #[test]
+    fn tool_detail_glob_pattern() {
+        let input: Value = serde_json::json!({"pattern": "**/*.rs"});
+        let detail = extract_tool_detail(Some("Glob"), Some(&input));
+        assert_eq!(detail.as_deref(), Some("**/*.rs"));
+    }
+
+    #[test]
+    fn tool_detail_agent_description() {
+        let input: Value = serde_json::json!({"description": "explore codebase"});
+        let detail = extract_tool_detail(Some("Agent"), Some(&input));
+        assert_eq!(detail.as_deref(), Some("explore codebase"));
+    }
+
+    #[test]
+    fn tool_detail_unknown_tool_uses_first_string() {
+        let input: Value = serde_json::json!({"query": "SELECT 1", "timeout": 30});
+        let detail = extract_tool_detail(Some("SQL"), Some(&input));
+        assert_eq!(detail.as_deref(), Some("SELECT 1"));
+    }
+
+    #[test]
+    fn tool_detail_none_when_no_input() {
+        let detail = extract_tool_detail(Some("Bash"), None);
+        assert!(detail.is_none());
+    }
+
+    #[test]
+    fn tool_detail_none_when_no_tool_name() {
+        let input: Value = serde_json::json!({"command": "ls"});
+        let detail = extract_tool_detail(None, Some(&input));
+        assert!(detail.is_none());
+    }
+
+    #[test]
+    fn build_event_session_start() {
+        let input = ClaudeCodeHookInput {
+            session_id: "test-123".into(),
+            hook_event_name: "SessionStart".into(),
+            cwd: Some("/tmp".into()),
+            tool_name: None,
+            tool_input: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        assert_eq!(event.session_id, "test-123");
+        assert_eq!(event.event_type, EventType::SessionStart);
+        assert_eq!(event.cwd.as_deref(), Some("/tmp"));
+        assert!(event.tool_name.is_none());
+        assert!(event.user_prompt.is_none());
+    }
+
+    #[test]
+    fn build_event_tool_start_with_detail() {
+        let input = ClaudeCodeHookInput {
+            session_id: "test-123".into(),
+            hook_event_name: "PreToolUse".into(),
+            cwd: None,
+            tool_name: Some("Read".into()),
+            tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        assert_eq!(event.event_type, EventType::ToolStart);
+        assert_eq!(event.tool_name.as_deref(), Some("Read"));
+        assert_eq!(event.tool_detail.as_deref(), Some("/src/main.rs"));
+    }
+
+    #[test]
+    fn build_event_unknown_hook_returns_none() {
+        let input = ClaudeCodeHookInput {
+            session_id: "test-123".into(),
+            hook_event_name: "UnknownHook".into(),
+            cwd: None,
+            tool_name: None,
+            tool_input: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        assert!(build_event(input).is_none());
+    }
+
+    #[test]
+    fn build_event_user_prompt_submit_extracts_prompt() {
+        let input = ClaudeCodeHookInput {
+            session_id: "test-123".into(),
+            hook_event_name: "UserPromptSubmit".into(),
+            cwd: None,
+            tool_name: None,
+            tool_input: None,
+            prompt: Some("fix the login bug".into()),
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        assert_eq!(event.event_type, EventType::Thinking);
+        assert_eq!(event.user_prompt.as_deref(), Some("fix the login bug"));
+    }
+
+    #[test]
+    fn build_event_prompt_truncated_to_200() {
+        let long_prompt = "x".repeat(300);
+        let input = ClaudeCodeHookInput {
+            session_id: "test-123".into(),
+            hook_event_name: "UserPromptSubmit".into(),
+            cwd: None,
+            tool_name: None,
+            tool_input: None,
+            prompt: Some(long_prompt),
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        let prompt = event.user_prompt.unwrap();
+        assert!(prompt.len() <= 204); // 200 + "…" (3 bytes)
+        assert!(prompt.ends_with('…'));
+    }
+
+    #[test]
+    fn send_to_missing_socket_returns_none() {
+        // With no daemon running, send should silently fail
+        // SAFETY: This test runs single-threaded; no other thread reads this env var concurrently.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_SOCKET", "/tmp/nonexistent-test-socket.sock");
+        }
+        let result = send_to_socket(r#"{"test": true}"#);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn deserialize_claude_code_hook_input() {
+        let json = r#"{
+            "session_id": "abc-123",
+            "hook_event_name": "PreToolUse",
+            "cwd": "/home/user",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls -la"},
+            "source": "claude_code"
+        }"#;
+        let input: ClaudeCodeHookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id, "abc-123");
+        assert_eq!(input.hook_event_name, "PreToolUse");
+        assert_eq!(input.tool_name.as_deref(), Some("Bash"));
+    }
+
+    #[test]
+    fn deserialize_minimal_hook_input() {
+        let json = r#"{
+            "session_id": "abc-123",
+            "hook_event_name": "SessionStart"
+        }"#;
+        let input: ClaudeCodeHookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id, "abc-123");
+        assert!(input.cwd.is_none());
+        assert!(input.tool_name.is_none());
+        assert!(input.tool_input.is_none());
+    }
+}

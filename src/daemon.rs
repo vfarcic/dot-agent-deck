@@ -1,0 +1,50 @@
+use std::path::Path;
+
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::UnixListener;
+use tracing::{error, info, warn};
+
+use crate::error::DaemonError;
+use crate::event::AgentEvent;
+use crate::state::SharedState;
+
+pub async fn run_daemon(socket_path: &Path, state: SharedState) -> Result<(), DaemonError> {
+    // Clean up stale socket file
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path)?;
+    }
+
+    let listener = UnixListener::bind(socket_path)?;
+    info!("Daemon listening on {}", socket_path.display());
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let reader = BufReader::new(stream);
+                    let mut lines = reader.lines();
+
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        match serde_json::from_str::<AgentEvent>(&line) {
+                            Ok(event) => {
+                                info!(
+                                    session_id = %event.session_id,
+                                    event_type = ?event.event_type,
+                                    "Received event"
+                                );
+                                state.write().await.apply_event(event);
+                            }
+                            Err(e) => {
+                                warn!("Malformed event: {e} — input: {line}");
+                            }
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Failed to accept connection: {e}");
+            }
+        }
+    }
+}
