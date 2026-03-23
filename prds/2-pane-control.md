@@ -94,7 +94,7 @@ After switching to an agent pane, the user needs a way to return to the dashboar
 - [x] Session rename: `r` to set a friendly display name for a session
 - [x] Multiplexer detection and `PaneController` trait definition
 - [x] Pane-session mapping: link session_ids to zellij pane IDs via adapter
-- [ ] Focus switching: `Enter` to switch to agent pane, return-to-dashboard mechanism
+- [x] Focus switching: `Enter` to switch to agent pane, return-to-dashboard mechanism
 - [ ] Pane creation: `n` to create new pane with `claude` (or custom command)
 - [ ] Pane management: close, resize, fullscreen from dashboard
 

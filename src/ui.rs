@@ -42,6 +42,7 @@ struct UiState {
     rename_text: String,
     display_names: HashMap<String, String>,
     columns: usize,
+    status_message: Option<(String, std::time::Instant)>,
 }
 
 impl Default for UiState {
@@ -53,6 +54,7 @@ impl Default for UiState {
             rename_text: String::new(),
             display_names: HashMap::new(),
             columns: 1,
+            status_message: None,
         }
     }
 }
@@ -153,6 +155,7 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
 enum KeyResult {
     Continue,
     Quit,
+    Focus,
 }
 
 fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
@@ -193,6 +196,7 @@ fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult
             ui.rename_text.clear();
             KeyResult::Continue
         }
+        KeyCode::Enter if total > 0 => KeyResult::Focus,
         KeyCode::Esc => {
             if !ui.filter_text.is_empty() {
                 ui.filter_text.clear();
@@ -288,6 +292,13 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>) -> std::io::Re
     let mut ui = UiState::default();
 
     loop {
+        // Expire stale status messages
+        if let Some((_, created)) = &ui.status_message
+            && created.elapsed() > std::time::Duration::from_secs(3)
+        {
+            ui.status_message = None;
+        }
+
         let snapshot = state.blocking_read().clone();
         let filtered = filter_sessions(&snapshot, &ui);
         let total = filtered.len();
@@ -321,8 +332,31 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>) -> std::io::Re
                     }
                 };
 
-                if matches!(result, KeyResult::Quit) {
-                    break;
+                match result {
+                    KeyResult::Quit => break,
+                    KeyResult::Focus => {
+                        if let Some(ref sid) = selected_id
+                            && let Some(session) = snapshot.sessions.get(sid)
+                        {
+                            if let Some(ref pane_id) = session.pane_id {
+                                match pane.focus_pane(pane_id) {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        ui.status_message = Some((
+                                            format!("Focus failed: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                ui.status_message = Some((
+                                    format!("No pane linked to session {sid}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                    KeyResult::Continue => {}
                 }
             }
         }
@@ -481,15 +515,19 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
             frame.set_cursor_position(Position::new(cursor_x, area.y));
         }
         _ => {
-            // Status bar with hints
-            let hints = match (ui.filter_text.is_empty(), has_pane_control) {
-                (true, true) => "q: quit  /: filter  ?: help  hjkl: navigate  r: rename  Enter: focus  n: new pane",
-                (true, false) => "q: quit  /: filter  ?: help  hjkl/arrows: navigate  r: rename",
-                (false, true) => "q: quit  Esc: clear filter  ?: help  hjkl: navigate  Enter: focus  n: new pane",
-                (false, false) => "q: quit  Esc: clear filter  ?: help  hjkl/arrows: navigate  r: rename",
-            };
-            let line = Line::styled(hints, Style::default().fg(Color::DarkGray));
-            frame.render_widget(Paragraph::new(line), area);
+            if let Some((ref msg, _)) = ui.status_message {
+                let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
+                frame.render_widget(Paragraph::new(line), area);
+            } else {
+                let hints = match (ui.filter_text.is_empty(), has_pane_control) {
+                    (true, true) => "q: quit  /: filter  ?: help  hjkl: navigate  r: rename  Enter: focus  n: new pane",
+                    (true, false) => "q: quit  /: filter  ?: help  hjkl/arrows: navigate  r: rename",
+                    (false, true) => "q: quit  Esc: clear filter  ?: help  hjkl: navigate  Enter: focus  n: new pane",
+                    (false, false) => "q: quit  Esc: clear filter  ?: help  hjkl/arrows: navigate  r: rename",
+                };
+                let line = Line::styled(hints, Style::default().fg(Color::DarkGray));
+                frame.render_widget(Paragraph::new(line), area);
+            }
         }
     }
 }

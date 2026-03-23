@@ -1,5 +1,6 @@
 use std::process::Command;
 
+use serde::Deserialize;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -89,8 +90,31 @@ impl ZellijController {
 
 impl PaneController for ZellijController {
     fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
-        self.run_zellij(&["action", "focus-terminal-pane", "--pane-id", pane_id])?;
-        Ok(())
+        // Zellij has no direct "focus pane by ID" command.
+        // Cycle through panes with focus-next-pane until the target is focused.
+        let panes = self.list_panes()?;
+        let total = panes.len();
+        if total == 0 {
+            return Err(PaneError::CommandFailed("No panes found".into()));
+        }
+
+        // Check if already focused
+        if panes.iter().any(|p| p.pane_id == pane_id && p.is_focused) {
+            return Ok(());
+        }
+
+        // Cycle through panes (at most total times to avoid infinite loop)
+        for _ in 0..total {
+            self.run_zellij(&["action", "focus-next-pane"])?;
+            let current = self.list_panes()?;
+            if current.iter().any(|p| p.pane_id == pane_id && p.is_focused) {
+                return Ok(());
+            }
+        }
+
+        Err(PaneError::CommandFailed(format!(
+            "Pane {pane_id} not found after cycling all panes"
+        )))
     }
 
     fn create_pane(&self, command: Option<&str>) -> Result<String, PaneError> {
@@ -122,8 +146,9 @@ impl PaneController for ZellijController {
     }
 
     fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError> {
-        let output = self.run_zellij(&["action", "list-panes"])?;
-        parse_list_panes(&output)
+        let output =
+            self.run_zellij(&["action", "list-panes", "--state", "--command", "--json"])?;
+        parse_list_panes_json(&output)
     }
 
     fn resize_pane(
@@ -197,12 +222,33 @@ pub fn detect_multiplexer() -> Box<dyn PaneController> {
 // Parsing helpers
 // ---------------------------------------------------------------------------
 
-/// Parse `zellij action list-panes` output.
-///
-/// Each line is tab-separated with fields:
-/// `tab_name\tpane_id\tpane_title\tis_focused\tcommand\t...`
-///
-/// We extract the fields we need and skip unparseable lines.
+/// JSON structure returned by `zellij action list-panes --json --state --command`.
+#[derive(Debug, Deserialize)]
+struct ZellijPane {
+    id: u32,
+    title: Option<String>,
+    #[serde(default)]
+    is_focused: bool,
+    #[serde(default)]
+    command: Option<String>,
+}
+
+/// Parse JSON output from `zellij action list-panes --json --state --command`.
+fn parse_list_panes_json(output: &str) -> Result<Vec<PaneInfo>, PaneError> {
+    let raw: Vec<ZellijPane> = serde_json::from_str(output)
+        .map_err(|e| PaneError::ParseError(format!("JSON parse error: {e}\nOutput: {output}")))?;
+    Ok(raw
+        .into_iter()
+        .map(|p| PaneInfo {
+            pane_id: p.id.to_string(),
+            title: p.title.unwrap_or_default(),
+            is_focused: p.is_focused,
+            command: p.command,
+        })
+        .collect())
+}
+
+/// Parse tab-separated `zellij action list-panes` output (legacy fallback).
 fn parse_list_panes(output: &str) -> Result<Vec<PaneInfo>, PaneError> {
     let mut panes = Vec::new();
     for line in output.lines() {
@@ -235,7 +281,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_list_panes_typical_output() {
+    fn parse_list_panes_json_typical() {
+        let json = r#"[
+            {"id": 42, "title": "my-shell", "is_focused": true, "command": "bash"},
+            {"id": 43, "title": "editor", "is_focused": false, "command": "vim"}
+        ]"#;
+        let panes = parse_list_panes_json(json).unwrap();
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].pane_id, "42");
+        assert_eq!(panes[0].title, "my-shell");
+        assert!(panes[0].is_focused);
+        assert_eq!(panes[0].command.as_deref(), Some("bash"));
+        assert_eq!(panes[1].pane_id, "43");
+        assert!(!panes[1].is_focused);
+    }
+
+    #[test]
+    fn parse_list_panes_json_empty() {
+        let panes = parse_list_panes_json("[]").unwrap();
+        assert!(panes.is_empty());
+    }
+
+    #[test]
+    fn parse_list_panes_json_minimal_fields() {
+        let json = r#"[{"id": 1}]"#;
+        let panes = parse_list_panes_json(json).unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_id, "1");
+        assert!(!panes[0].is_focused);
+        assert!(panes[0].command.is_none());
+    }
+
+    #[test]
+    fn parse_list_panes_tsv_typical_output() {
         let output = "Tab #1\t42\tmy-shell\ttrue\tbash\n\
                        Tab #1\t43\teditor\tfalse\tvim\n";
         let panes = parse_list_panes(output).unwrap();
@@ -249,13 +327,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_list_panes_empty_output() {
+    fn parse_list_panes_tsv_empty_output() {
         let panes = parse_list_panes("").unwrap();
         assert!(panes.is_empty());
     }
 
     #[test]
-    fn parse_list_panes_skips_short_lines() {
+    fn parse_list_panes_tsv_skips_short_lines() {
         let output = "incomplete\tdata\n\
                        Tab #1\t42\tshell\ttrue\tbash\n";
         let panes = parse_list_panes(output).unwrap();
@@ -264,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_list_panes_no_command_field() {
+    fn parse_list_panes_tsv_no_command_field() {
         let output = "Tab #1\t42\tshell\tfalse\n";
         let panes = parse_list_panes(output).unwrap();
         assert_eq!(panes.len(), 1);
