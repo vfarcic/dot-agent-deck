@@ -1,6 +1,6 @@
 # PRD #2: Pane Control via Zellij Integration
 
-**Status**: Draft
+**Status**: In Progress
 **Priority**: High
 **GitHub Issue**: [#2](https://github.com/vfarcic/dot-agent-deck/issues/2)
 **Depends on**: PRD #1 (Agent Status Dashboard)
@@ -49,9 +49,11 @@ PANE_ID=$(printenv ZELLIJ_PANE_ID 2>/dev/null || echo "unknown")
 ### Dashboard Keybindings
 
 #### Navigation (moved from PRD #1)
-- `Up`/`Down` arrow keys or `j`/`k`: navigate between agent cards
+- `Up`/`Down` arrow keys or `j`/`k`: navigate vertically between agent cards
+- `Left`/`Right` arrow keys or `h`/`l`: navigate horizontally across grid columns
 - `/`: filter/search sessions by name, directory, or status
 - `r`: rename/label the selected session (set a friendly display name)
+- `Esc`: clear active filter
 
 #### Pane Control
 - `Enter`: focus the selected agent's terminal pane in zellij
@@ -88,8 +90,8 @@ After switching to an agent pane, the user needs a way to return to the dashboar
 
 ## Milestones
 
-- [ ] Keyboard navigation: Up/Down/j/k card selection, `/` filter, `?` help overlay
-- [ ] Session rename: `r` to set a friendly display name for a session
+- [x] Keyboard navigation: arrow keys + h/j/k/l grid selection, `/` filter, `?` help overlay, status bar
+- [x] Session rename: `r` to set a friendly display name for a session
 - [ ] Multiplexer detection and `PaneController` trait definition
 - [ ] Pane-session mapping: link session_ids to zellij pane IDs via adapter
 - [ ] Focus switching: `Enter` to switch to agent pane, return-to-dashboard mechanism

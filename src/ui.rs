@@ -1,12 +1,13 @@
+use std::collections::HashMap;
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -21,6 +22,259 @@ impl fmt::Display for crate::event::AgentType {
     }
 }
 
+// ---------------------------------------------------------------------------
+// UI state types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UiMode {
+    Normal,
+    Filter,
+    Help,
+    Rename,
+}
+
+struct UiState {
+    mode: UiMode,
+    selected_index: usize,
+    filter_text: String,
+    rename_text: String,
+    display_names: HashMap<String, String>,
+    columns: usize,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            mode: UiMode::Normal,
+            selected_index: 0,
+            filter_text: String::new(),
+            rename_text: String::new(),
+            display_names: HashMap::new(),
+            columns: 1,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grid navigation
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+fn navigate_grid(current: usize, dir: Direction, columns: usize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    let row = current / columns;
+    let col = current % columns;
+    let total_rows = (total + columns - 1) / columns;
+
+    match dir {
+        Direction::Up => {
+            if row > 0 {
+                (row - 1) * columns + col
+            } else {
+                current
+            }
+        }
+        Direction::Down => {
+            let new_idx = (row + 1) * columns + col;
+            if row + 1 < total_rows && new_idx < total {
+                new_idx
+            } else if row + 1 < total_rows {
+                // Last row has fewer items; go to last item
+                total - 1
+            } else {
+                current
+            }
+        }
+        Direction::Left => {
+            if col > 0 {
+                current - 1
+            } else {
+                current
+            }
+        }
+        Direction::Right => {
+            if col + 1 < columns && current + 1 < total {
+                current + 1
+            } else {
+                current
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session filtering
+// ---------------------------------------------------------------------------
+
+fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
+    let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
+    sessions.sort_by_key(|(_, s)| s.started_at);
+
+    if ui.filter_text.is_empty() {
+        return sessions;
+    }
+
+    let query = ui.filter_text.to_lowercase();
+    sessions.retain(|(id, s)| {
+        let id_match = id.to_lowercase().contains(&query);
+        let cwd_match = s
+            .cwd
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains(&query);
+        let status_str = format!("{:?}", s.status).to_lowercase();
+        let status_match = status_str.contains(&query);
+        let name_match = ui
+            .display_names
+            .get(*id)
+            .map(|n| n.to_lowercase().contains(&query))
+            .unwrap_or(false);
+        id_match || cwd_match || status_match || name_match
+    });
+    sessions
+}
+
+// ---------------------------------------------------------------------------
+// Key handling
+// ---------------------------------------------------------------------------
+
+enum KeyResult {
+    Continue,
+    Quit,
+}
+
+fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return KeyResult::Quit;
+    }
+    match key.code {
+        KeyCode::Char('q') => KeyResult::Quit,
+        KeyCode::Char('j') | KeyCode::Down => {
+            ui.selected_index = navigate_grid(ui.selected_index, Direction::Down, ui.columns, total);
+            KeyResult::Continue
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            ui.selected_index = navigate_grid(ui.selected_index, Direction::Up, ui.columns, total);
+            KeyResult::Continue
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            ui.selected_index =
+                navigate_grid(ui.selected_index, Direction::Left, ui.columns, total);
+            KeyResult::Continue
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            ui.selected_index =
+                navigate_grid(ui.selected_index, Direction::Right, ui.columns, total);
+            KeyResult::Continue
+        }
+        KeyCode::Char('/') => {
+            ui.mode = UiMode::Filter;
+            ui.filter_text.clear();
+            KeyResult::Continue
+        }
+        KeyCode::Char('?') => {
+            ui.mode = UiMode::Help;
+            KeyResult::Continue
+        }
+        KeyCode::Char('r') if total > 0 => {
+            ui.mode = UiMode::Rename;
+            ui.rename_text.clear();
+            KeyResult::Continue
+        }
+        KeyCode::Esc => {
+            if !ui.filter_text.is_empty() {
+                ui.filter_text.clear();
+            }
+            KeyResult::Continue
+        }
+        _ => KeyResult::Continue,
+    }
+}
+
+fn handle_filter_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return KeyResult::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            ui.filter_text.clear();
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Enter => {
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Backspace => {
+            ui.filter_text.pop();
+        }
+        KeyCode::Char(c) => {
+            ui.filter_text.push(c);
+        }
+        _ => {}
+    }
+    KeyResult::Continue
+}
+
+fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    match key.code {
+        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+            ui.mode = UiMode::Normal;
+        }
+        _ => {}
+    }
+    KeyResult::Continue
+}
+
+fn handle_rename_key(
+    key: KeyEvent,
+    ui: &mut UiState,
+    selected_session_id: Option<&str>,
+) -> KeyResult {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return KeyResult::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            ui.rename_text.clear();
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Enter => {
+            if let Some(id) = selected_session_id {
+                if ui.rename_text.is_empty() {
+                    ui.display_names.remove(id);
+                } else {
+                    ui.display_names
+                        .insert(id.to_string(), ui.rename_text.clone());
+                }
+            }
+            ui.rename_text.clear();
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Backspace => {
+            ui.rename_text.pop();
+        }
+        KeyCode::Char(c) => {
+            ui.rename_text.push(c);
+        }
+        _ => {}
+    }
+    KeyResult::Continue
+}
+
+// ---------------------------------------------------------------------------
+// TUI entry point
+// ---------------------------------------------------------------------------
+
 pub fn run_tui(state: SharedState) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -30,19 +284,45 @@ pub fn run_tui(state: SharedState) -> std::io::Result<()> {
 
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
+    let mut ui = UiState::default();
 
     loop {
         let snapshot = state.blocking_read().clone();
-        terminal.draw(|frame| render_frame(frame, &snapshot, tick))?;
+        let filtered = filter_sessions(&snapshot, &ui);
+        let total = filtered.len();
+
+        // Clamp selection
+        if total > 0 {
+            ui.selected_index = ui.selected_index.min(total - 1);
+        } else {
+            ui.selected_index = 0;
+        }
+
+        ui.columns = grid_columns(terminal.get_frame().area().width);
+
+        terminal.draw(|frame| {
+            render_frame(frame, &snapshot, &ui, &filtered, tick);
+        })?;
         tick = tick.wrapping_add(1);
 
-        if crossterm::event::poll(std::time::Duration::from_millis(250))?
-            && let Event::Key(key) = event::read()?
-            && (key.code == KeyCode::Char('q')
-                || (key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)))
-        {
-            break;
+        if crossterm::event::poll(std::time::Duration::from_millis(250))? {
+            if let Event::Key(key) = event::read()? {
+                let selected_id: Option<String> =
+                    filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+
+                let result = match ui.mode {
+                    UiMode::Normal => handle_normal_key(key, &mut ui, total),
+                    UiMode::Filter => handle_filter_key(key, &mut ui),
+                    UiMode::Help => handle_help_key(key, &mut ui),
+                    UiMode::Rename => {
+                        handle_rename_key(key, &mut ui, selected_id.as_deref())
+                    }
+                };
+
+                if matches!(result, KeyResult::Quit) {
+                    break;
+                }
+            }
         }
     }
 
@@ -50,14 +330,23 @@ pub fn run_tui(state: SharedState) -> std::io::Result<()> {
     Ok(())
 }
 
-fn render_frame(frame: &mut Frame, state: &AppState, tick: u64) {
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+fn render_frame(
+    frame: &mut Frame,
+    state: &AppState,
+    ui: &UiState,
+    filtered: &[(&String, &SessionState)],
+    tick: u64,
+) {
     let area = frame.area();
 
     if state.sessions.is_empty() {
         let msg = Paragraph::new("No active sessions. Waiting for connections...")
             .style(Style::default().fg(Color::Gray))
             .centered();
-        // Center vertically
         let vertical = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Length(1),
@@ -68,11 +357,24 @@ fn render_frame(frame: &mut Frame, state: &AppState, tick: u64) {
         return;
     }
 
-    // Sort sessions by started_at
-    let mut sessions: Vec<&SessionState> = state.sessions.values().collect();
-    sessions.sort_by_key(|s| s.started_at);
+    let sessions: Vec<&SessionState> = filtered.iter().map(|(_, s)| *s).collect();
+    let session_ids: Vec<&String> = filtered.iter().map(|(id, _)| *id).collect();
+
+    let cols = grid_columns(area.width);
+    let card_height = 8;
+
+    // Determine if we need a bottom bar (status/filter/rename)
+    let has_bottom_bar = true; // always show status bar
+    let bottom_height: u16 = if has_bottom_bar { 1 } else { 0 };
 
     // Title bar
+    let total_sessions = state.sessions.len();
+    let showing = sessions.len();
+    let title_text = if showing < total_sessions {
+        format!("— {}/{} session(s)", showing, total_sessions)
+    } else {
+        format!("— {} session(s)", total_sessions)
+    };
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
             " dot-agent-deck ",
@@ -80,23 +382,43 @@ fn render_frame(frame: &mut Frame, state: &AppState, tick: u64) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!("— {} session(s)", sessions.len()),
-            Style::default().fg(Color::Gray),
-        ),
+        Span::styled(title_text, Style::default().fg(Color::Gray)),
     ]));
 
-    let cols = grid_columns(area.width);
-    let card_height = 8;
+    if sessions.is_empty() {
+        // All filtered out
+        let vertical = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(bottom_height),
+        ])
+        .split(area);
+        frame.render_widget(title, vertical[0]);
 
-    // Group sessions into rows of `cols`
+        let msg = Paragraph::new("No sessions match filter.")
+            .style(Style::default().fg(Color::Gray))
+            .centered();
+        let inner = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(vertical[1]);
+        frame.render_widget(msg, inner[1]);
+
+        render_bottom_bar(frame, ui, vertical[2]);
+        return;
+    }
+
     let rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
+    let row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
 
     let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
     for _ in &rows {
         constraints.push(Constraint::Length(card_height));
     }
     constraints.push(Constraint::Min(0)); // filler
+    constraints.push(Constraint::Length(bottom_height)); // bottom bar
 
     let row_chunks = Layout::vertical(constraints).split(area);
 
@@ -109,9 +431,105 @@ fn render_frame(frame: &mut Frame, state: &AppState, tick: u64) {
         let col_chunks = Layout::horizontal(col_constraints).split(row_chunks[row_idx + 1]);
 
         for (col_idx, session) in row.iter().enumerate() {
-            render_session_card(frame, col_chunks[col_idx], session, tick);
+            let flat_index = row_idx * cols + col_idx;
+            let is_selected = flat_index == ui.selected_index;
+            let display_name = row_ids
+                .get(row_idx)
+                .and_then(|ids| ids.get(col_idx))
+                .and_then(|id| ui.display_names.get(*id));
+            render_session_card(frame, col_chunks[col_idx], session, tick, is_selected, display_name);
         }
     }
+
+    // Bottom bar
+    let bottom_area = row_chunks[row_chunks.len() - 1];
+    render_bottom_bar(frame, ui, bottom_area);
+
+    // Help overlay (drawn last, on top)
+    if ui.mode == UiMode::Help {
+        render_help_overlay(frame);
+    }
+}
+
+fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect) {
+    match ui.mode {
+        UiMode::Filter => {
+            let line = Line::from(vec![
+                Span::styled("/ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw(&ui.filter_text),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            // Show cursor
+            let cursor_x = area.x + 2 + ui.filter_text.len() as u16;
+            frame.set_cursor_position(Position::new(cursor_x, area.y));
+        }
+        UiMode::Rename => {
+            let line = Line::from(vec![
+                Span::styled(
+                    "Rename: ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&ui.rename_text),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            let cursor_x = area.x + 8 + ui.rename_text.len() as u16;
+            frame.set_cursor_position(Position::new(cursor_x, area.y));
+        }
+        _ => {
+            // Status bar with hints
+            let hints = if ui.filter_text.is_empty() {
+                "q: quit  /: filter  ?: help  hjkl/arrows: navigate  r: rename"
+            } else {
+                "q: quit  Esc: clear filter  ?: help  hjkl/arrows: navigate  r: rename"
+            };
+            let line = Line::styled(hints, Style::default().fg(Color::DarkGray));
+            frame.render_widget(Paragraph::new(line), area);
+        }
+    }
+}
+
+fn render_help_overlay(frame: &mut Frame) {
+    let area = frame.area();
+    let popup_width = 52.min(area.width.saturating_sub(4));
+    let popup_height = 16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let help_text = vec![
+        Line::styled(
+            "  Keybindings",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+        Line::from("  j / Down      Move down"),
+        Line::from("  k / Up        Move up"),
+        Line::from("  h / Left      Move left"),
+        Line::from("  l / Right     Move right"),
+        Line::from("  /             Filter sessions"),
+        Line::from("  r             Rename session"),
+        Line::from("  ?             Toggle this help"),
+        Line::from("  Esc           Clear filter"),
+        Line::from("  q             Quit"),
+        Line::from(""),
+        Line::styled(
+            "  Press ? or Esc to close",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Help ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let paragraph = Paragraph::new(help_text).block(block);
+    frame.render_widget(paragraph, popup_area);
 }
 
 fn grid_columns(width: u16) -> usize {
@@ -124,30 +542,56 @@ fn grid_columns(width: u16) -> usize {
     }
 }
 
-fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState, tick: u64) {
+fn render_session_card(
+    frame: &mut Frame,
+    area: Rect,
+    session: &SessionState,
+    tick: u64,
+    is_selected: bool,
+    display_name: Option<&String>,
+) {
     let (status_label, status_style) = status_style(&session.status);
     let status_color = status_style.fg.unwrap_or(Color::Gray);
 
-    // Truncate session_id to 11 chars
     let id_display = if session.session_id.len() > 11 {
         &session.session_id[..11]
     } else {
         &session.session_id
     };
 
-    let title_left = format!(" {} · {} ", session.agent_type, id_display);
+    let title_left = if let Some(name) = display_name {
+        format!(" {} ", name)
+    } else {
+        format!(" {} · {} ", session.agent_type, id_display)
+    };
 
     let dot = flash_dot(&session.status, tick);
 
+    let border_style = if is_selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(status_color)
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(status_color))
-        .title(Span::styled(title_left, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)))
+        .border_style(border_style)
+        .title(Span::styled(
+            title_left,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ))
         .title_alignment(ratatui::layout::Alignment::Left)
-        .title(Line::from(Span::styled(
-            format!(" {} {} ", dot, status_label),
-            status_style,
-        )).alignment(ratatui::layout::Alignment::Right));
+        .title(
+            Line::from(Span::styled(
+                format!(" {} {} ", dot, status_label),
+                status_style,
+            ))
+            .alignment(ratatui::layout::Alignment::Right),
+        );
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -155,17 +599,13 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState, ti
     let w = inner.width as usize;
     let wide = w >= 60;
 
-    let cwd_display = session
-        .cwd
-        .as_deref()
-        .unwrap_or("—");
+    let cwd_display = session.cwd.as_deref().unwrap_or("—");
 
     let elapsed = format_elapsed(session.last_activity);
 
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     if wide {
-        // Dir + stats on one line
         lines.push(padded_line(
             vec![
                 Span::styled("Dir:  ", Style::default().fg(Color::Gray)),
@@ -186,9 +626,8 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState, ti
         ]));
     }
 
-    // Prompt line
     if let Some(ref prompt) = session.last_user_prompt {
-        let max_prompt = w.saturating_sub(6); // 6 = "Prmt: "
+        let max_prompt = w.saturating_sub(6);
         let display = if prompt.len() > max_prompt {
             format!("{}…", &prompt[..max_prompt])
         } else {
@@ -200,7 +639,6 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState, ti
         ]));
     }
 
-    // In narrow mode, stats are a separate line
     if !wide {
         lines.push(Line::from(vec![
             Span::styled("Last: ", Style::default().fg(Color::Gray)),
@@ -318,6 +756,10 @@ mod tests {
     use ratatui::Terminal;
     use std::collections::HashMap;
 
+    fn default_ui() -> UiState {
+        UiState::default()
+    }
+
     #[test]
     fn test_format_elapsed() {
         let now = Utc::now();
@@ -355,8 +797,10 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let state = AppState::default();
+        let ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, 0))
+            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0))
             .unwrap();
     }
 
@@ -367,7 +811,6 @@ mod tests {
 
         let mut state = AppState::default();
 
-        // Session 1: working with a tool
         let mut event1 = AgentEvent {
             session_id: "session-abc-123".to_string(),
             agent_type: AgentType::ClaudeCode,
@@ -386,7 +829,6 @@ mod tests {
         event1.tool_detail = Some("src/main.rs".to_string());
         state.apply_event(event1);
 
-        // Session 2: idle
         let event2 = AgentEvent {
             session_id: "session-def-456".to_string(),
             agent_type: AgentType::ClaudeCode,
@@ -400,8 +842,10 @@ mod tests {
         };
         state.apply_event(event2);
 
+        let ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, 0))
+            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0))
             .unwrap();
     }
 
@@ -411,13 +855,22 @@ mod tests {
         use std::collections::VecDeque;
 
         let mut events = VecDeque::new();
-        for (name, detail) in [("Read", "src/main.rs"), ("Write", "out.txt"), ("Bash", ""), ("Grep", "pattern")] {
+        for (name, detail) in [
+            ("Read", "src/main.rs"),
+            ("Write", "out.txt"),
+            ("Bash", ""),
+            ("Grep", "pattern"),
+        ] {
             events.push_back(AgentEvent {
                 session_id: "s1".to_string(),
                 agent_type: AgentType::ClaudeCode,
                 event_type: EventType::ToolStart,
                 tool_name: Some(name.to_string()),
-                tool_detail: if detail.is_empty() { None } else { Some(detail.to_string()) },
+                tool_detail: if detail.is_empty() {
+                    None
+                } else {
+                    Some(detail.to_string())
+                },
                 cwd: None,
                 timestamp: Utc::now(),
                 user_prompt: None,
@@ -440,7 +893,6 @@ mod tests {
 
         let lines = recent_tool_lines(&session);
         assert_eq!(lines.len(), 3);
-        // Should be the last 3 ToolStart events in chronological order
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert_eq!(text[0], "  Write — out.txt");
         assert_eq!(text[1], "  Bash");
@@ -466,27 +918,36 @@ mod tests {
         };
         state.apply_event(event.clone());
 
-        // Send a thinking event with a prompt
         event.event_type = EventType::Thinking;
         event.user_prompt = Some("fix the login bug".to_string());
         state.apply_event(event);
 
-        // Should render without panic and session should have prompt
         assert_eq!(
             state.sessions["s1"].last_user_prompt.as_deref(),
             Some("fix the login bug")
         );
 
+        let ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, 0))
+            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0))
             .unwrap();
     }
 
     #[test]
     fn test_flash_dot() {
-        assert_eq!(flash_dot(&crate::state::SessionStatus::WaitingForInput, 0), "●");
-        assert_eq!(flash_dot(&crate::state::SessionStatus::WaitingForInput, 1), " ");
-        assert_eq!(flash_dot(&crate::state::SessionStatus::WaitingForInput, 2), "●");
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 0),
+            "●"
+        );
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 1),
+            " "
+        );
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 2),
+            "●"
+        );
         assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 0), "●");
         assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 1), "●");
         assert_eq!(flash_dot(&crate::state::SessionStatus::Idle, 1), "●");
@@ -505,7 +966,6 @@ mod tests {
 
     #[test]
     fn test_render_wide_grid_layout() {
-        // 120 wide = 2 columns, 2 sessions should render in one row
         let backend = TestBackend::new(120, 20);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -524,9 +984,372 @@ mod tests {
             });
         }
 
-        // 3 sessions at 2 cols = 2 rows, needs 1 (title) + 10 + 10 = 21, we have 20 — still renders
+        let ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, 0))
+            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0))
             .unwrap();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Navigation tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_navigate_grid_single_column() {
+        // 5 items, 1 column
+        assert_eq!(navigate_grid(0, Direction::Down, 1, 5), 1);
+        assert_eq!(navigate_grid(4, Direction::Down, 1, 5), 4); // at bottom
+        assert_eq!(navigate_grid(0, Direction::Up, 1, 5), 0); // at top
+        assert_eq!(navigate_grid(3, Direction::Up, 1, 5), 2);
+        // Left/Right are no-ops in single column
+        assert_eq!(navigate_grid(2, Direction::Left, 1, 5), 2);
+        assert_eq!(navigate_grid(2, Direction::Right, 1, 5), 2);
+    }
+
+    #[test]
+    fn test_navigate_grid_two_columns() {
+        // 5 items, 2 columns:
+        // [0] [1]
+        // [2] [3]
+        // [4]
+        assert_eq!(navigate_grid(0, Direction::Right, 2, 5), 1);
+        assert_eq!(navigate_grid(1, Direction::Left, 2, 5), 0);
+        assert_eq!(navigate_grid(0, Direction::Down, 2, 5), 2);
+        assert_eq!(navigate_grid(2, Direction::Up, 2, 5), 0);
+        // Down from col 1 row 1 to col 1 row 2 — but index 5 doesn't exist, clamp to 4
+        assert_eq!(navigate_grid(3, Direction::Down, 2, 5), 4);
+        // Right from last item
+        assert_eq!(navigate_grid(4, Direction::Right, 2, 5), 4);
+        // Left from first col
+        assert_eq!(navigate_grid(0, Direction::Left, 2, 5), 0);
+    }
+
+    #[test]
+    fn test_navigate_grid_three_columns() {
+        // 7 items, 3 columns:
+        // [0] [1] [2]
+        // [3] [4] [5]
+        // [6]
+        assert_eq!(navigate_grid(1, Direction::Down, 3, 7), 4);
+        assert_eq!(navigate_grid(4, Direction::Up, 3, 7), 1);
+        assert_eq!(navigate_grid(5, Direction::Down, 3, 7), 6); // col 2 row 2 -> last item
+        assert_eq!(navigate_grid(6, Direction::Up, 3, 7), 3);
+        assert_eq!(navigate_grid(2, Direction::Right, 3, 7), 2); // at right edge
+    }
+
+    #[test]
+    fn test_navigate_grid_empty() {
+        assert_eq!(navigate_grid(0, Direction::Down, 2, 0), 0);
+        assert_eq!(navigate_grid(0, Direction::Up, 2, 0), 0);
+    }
+
+    #[test]
+    fn test_navigate_grid_single_item() {
+        assert_eq!(navigate_grid(0, Direction::Down, 2, 1), 0);
+        assert_eq!(navigate_grid(0, Direction::Up, 2, 1), 0);
+        assert_eq!(navigate_grid(0, Direction::Left, 2, 1), 0);
+        assert_eq!(navigate_grid(0, Direction::Right, 2, 1), 0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Filter tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_sessions_no_filter() {
+        let mut state = AppState::default();
+        for id in ["a", "b", "c"] {
+            state.apply_event(AgentEvent {
+                session_id: id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+            });
+        }
+
+        let ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn test_filter_sessions_by_id() {
+        let mut state = AppState::default();
+        for id in ["alpha", "beta", "gamma"] {
+            state.apply_event(AgentEvent {
+                session_id: id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+            });
+        }
+
+        let mut ui = default_ui();
+        ui.filter_text = "bet".to_string();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "beta");
+    }
+
+    #[test]
+    fn test_filter_sessions_by_cwd() {
+        let mut state = AppState::default();
+        state.apply_event(AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/home/user/myproject".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+        });
+        state.apply_event(AgentEvent {
+            session_id: "s2".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp/other".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+        });
+
+        let mut ui = default_ui();
+        ui.filter_text = "myproject".to_string();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "s1");
+    }
+
+    #[test]
+    fn test_filter_sessions_by_display_name() {
+        let mut state = AppState::default();
+        state.apply_event(AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+        });
+        state.apply_event(AgentEvent {
+            session_id: "s2".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+        });
+
+        let mut ui = default_ui();
+        ui.display_names
+            .insert("s1".to_string(), "frontend".to_string());
+        ui.filter_text = "front".to_string();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "s1");
+    }
+
+    #[test]
+    fn test_filter_sessions_case_insensitive() {
+        let mut state = AppState::default();
+        state.apply_event(AgentEvent {
+            session_id: "MySession".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+        });
+
+        let mut ui = default_ui();
+        ui.filter_text = "mysess".to_string();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Mode transition tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_mode_transitions() {
+        let mut ui = default_ui();
+        assert_eq!(ui.mode, UiMode::Normal);
+
+        // Normal -> Filter
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+        );
+        assert_eq!(ui.mode, UiMode::Filter);
+
+        // Filter -> Normal (Esc)
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
+
+        // Normal -> Help
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+        );
+        assert_eq!(ui.mode, UiMode::Help);
+
+        // Help -> Normal
+        handle_help_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
+
+        // Normal -> Rename
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+        );
+        assert_eq!(ui.mode, UiMode::Rename);
+
+        // Rename -> Normal (Esc)
+        handle_rename_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+            Some("s1"),
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
+    }
+
+    #[test]
+    fn test_rename_commits_on_enter() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::Rename;
+        ui.rename_text = "my-agent".to_string();
+
+        handle_rename_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            Some("session-123"),
+        );
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert_eq!(
+            ui.display_names.get("session-123"),
+            Some(&"my-agent".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_empty_removes_name() {
+        let mut ui = default_ui();
+        ui.display_names
+            .insert("s1".to_string(), "old-name".to_string());
+        ui.mode = UiMode::Rename;
+        ui.rename_text.clear();
+
+        handle_rename_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            Some("s1"),
+        );
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(!ui.display_names.contains_key("s1"));
+    }
+
+    #[test]
+    fn test_filter_typing() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::Filter;
+
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.filter_text, "ab");
+
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.filter_text, "a");
+
+        // Enter keeps filter
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert_eq!(ui.filter_text, "a");
+    }
+
+    #[test]
+    fn test_filter_esc_clears() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::Filter;
+        ui.filter_text = "hello".to_string();
+
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.filter_text.is_empty());
+    }
+
+    #[test]
+    fn test_normal_esc_clears_filter() {
+        let mut ui = default_ui();
+        ui.filter_text = "active-filter".to_string();
+
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+            5,
+        );
+        assert!(ui.filter_text.is_empty());
+    }
+
+    #[test]
+    fn test_rename_not_available_when_empty() {
+        let mut ui = default_ui();
+        // total = 0, rename should not activate
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut ui,
+            0,
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
     }
 }
