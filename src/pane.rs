@@ -44,7 +44,7 @@ pub struct PaneInfo {
 
 pub trait PaneController: Send + Sync {
     fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError>;
-    fn create_pane(&self, command: Option<&str>) -> Result<String, PaneError>;
+    fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError>;
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError>;
     fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError>;
     fn resize_pane(
@@ -117,13 +117,30 @@ impl PaneController for ZellijController {
         )))
     }
 
-    fn create_pane(&self, command: Option<&str>) -> Result<String, PaneError> {
+    fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError> {
         let before = self.list_panes()?;
 
+        // Build args for new-pane. The swap layout automatically stacks panes in the right column.
+        let default_shell =
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut args = vec!["action", "new-pane"];
+        let cwd_val;
+        if let Some(dir) = cwd {
+            args.push("--cwd");
+            cwd_val = dir.to_string();
+            args.push(&cwd_val);
+        }
         match command {
-            Some(cmd) => self.run_zellij(&["action", "new-pane", "--", cmd])?,
-            None => self.run_zellij(&["action", "new-pane"])?,
-        };
+            Some(cmd) => {
+                args.push("--");
+                args.push(cmd);
+            }
+            None => {
+                args.push("--");
+                args.push(&default_shell);
+            }
+        }
+        self.run_zellij(&args)?;
 
         let after = self.list_panes()?;
         let before_ids: std::collections::HashSet<&str> =
@@ -186,7 +203,7 @@ impl PaneController for NoopController {
     fn focus_pane(&self, _: &str) -> Result<(), PaneError> {
         Err(PaneError::NotAvailable)
     }
-    fn create_pane(&self, _: Option<&str>) -> Result<String, PaneError> {
+    fn create_pane(&self, _: Option<&str>, _: Option<&str>) -> Result<String, PaneError> {
         Err(PaneError::NotAvailable)
     }
     fn close_pane(&self, _: &str) -> Result<(), PaneError> {
@@ -355,7 +372,7 @@ mod tests {
         assert!(!ctrl.is_available());
         assert_eq!(ctrl.name(), "none");
         assert!(ctrl.focus_pane("1").is_err());
-        assert!(ctrl.create_pane(None).is_err());
+        assert!(ctrl.create_pane(None, None).is_err());
         assert!(ctrl.close_pane("1").is_err());
         assert!(ctrl.list_panes().is_err());
         assert!(ctrl

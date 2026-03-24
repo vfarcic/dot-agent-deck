@@ -147,8 +147,8 @@ fn maybe_exec_zellij() -> Option<ExitCode> {
         let _ = std::fs::set_permissions(shell_path, std::fs::Permissions::from_mode(0o755));
     }
 
-    // Layout: initial pane runs our shell wrapper (the dashboard).
-    // default_tab_template excludes tab-bar and status-bar.
+    // Layout: two-column split — dashboard (1/3) + stacked agent panes (2/3).
+    // Swap layouts define how additional panes are arranged (stacked on the right).
     let layout = format!(
         r#"layout {{
     default_tab_template {{
@@ -156,6 +156,22 @@ fn maybe_exec_zellij() -> Option<ExitCode> {
     }}
     tab {{
         pane borderless=true command="{shell_path}"
+    }}
+
+    swap_tiled_layout name="dashboard" {{
+        tab max_panes=1 {{
+            pane borderless=true
+        }}
+        tab split_direction="vertical" max_panes=2 {{
+            pane borderless=true size="33%"
+            pane size="67%"
+        }}
+        tab split_direction="vertical" {{
+            pane borderless=true size="33%"
+            pane stacked=true size="67%" {{
+                children
+            }}
+        }}
     }}
 }}
 "#
@@ -170,7 +186,7 @@ fn maybe_exec_zellij() -> Option<ExitCode> {
     // Config: suppress Zellij UI chrome and the welcome/tips popup.
     let config = format!(
         r#"simplified_ui true
-pane_frames false
+pane_frames true
 show_release_notes false
 disable_session_metadata true
 plugins {{
@@ -186,9 +202,12 @@ load_plugins {{
 }}
 keybinds clear-defaults=true {{
     normal {{
-        bind "Alt n" {{ NewPane; }}
-        bind "Alt h" "Alt Left"  {{ MoveFocus "Left"; }}
+        bind "Alt n" {{ MoveFocus "Right"; NewPane "Down"; }}
+        bind "Alt h" "Alt Left" "Alt d" {{ MoveFocus "Left"; }}
         bind "Alt l" "Alt Right" {{ MoveFocus "Right"; }}
+
+        bind "Alt w" {{ CloseFocus; }}
+        bind "Alt q" {{ Quit; }}
         bind "Alt j" "Alt Down"  {{ MoveFocus "Down"; }}
         bind "Alt k" "Alt Up"    {{ MoveFocus "Up"; }}
     }}
@@ -204,8 +223,24 @@ keybinds clear-defaults=true {{
         return Some(ExitCode::FAILURE);
     }
 
+    // Kill and delete any stale session from a previous run so we always start fresh.
+    // kill-session stops it; delete-session removes it so --layout won't reattach.
+    let _ = std::process::Command::new("zellij")
+        .args(["kill-session", "dot-agent-deck"])
+        .output();
+    let _ = std::process::Command::new("zellij")
+        .args(["delete-session", "dot-agent-deck", "--force"])
+        .output();
+
     let err = std::process::Command::new("zellij")
-        .args(["--layout", layout_path, "--config-dir", config_dir])
+        .args([
+            "--session",
+            "dot-agent-deck",
+            "--new-session-with-layout",
+            layout_path,
+            "--config-dir",
+            config_dir,
+        ])
         .exec();
 
     // exec() only returns on error

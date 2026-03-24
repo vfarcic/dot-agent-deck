@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -33,6 +34,70 @@ enum UiMode {
     Filter,
     Help,
     Rename,
+    DirPicker,
+}
+
+struct DirPickerState {
+    current_dir: PathBuf,
+    entries: Vec<PathBuf>,
+    selected: usize,
+    scroll_offset: usize,
+}
+
+impl DirPickerState {
+    fn new(start: PathBuf) -> Self {
+        let mut state = Self {
+            current_dir: start,
+            entries: Vec::new(),
+            selected: 0,
+            scroll_offset: 0,
+        };
+        state.refresh();
+        state
+    }
+
+    fn refresh(&mut self) {
+        self.entries.clear();
+        // Add parent directory entry if not at root
+        if self.current_dir.parent().is_some() {
+            self.entries.push(PathBuf::from(".."));
+        }
+        if let Ok(read_dir) = std::fs::read_dir(&self.current_dir) {
+            let mut dirs: Vec<PathBuf> = read_dir
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+                .filter(|e| {
+                    !e.file_name()
+                        .to_str()
+                        .map(|n| n.starts_with('.'))
+                        .unwrap_or(false)
+                })
+                .map(|e| e.path())
+                .collect();
+            dirs.sort();
+            self.entries.extend(dirs);
+        }
+        self.selected = 0;
+        self.scroll_offset = 0;
+    }
+
+    fn enter_selected(&mut self) {
+        if let Some(path) = self.entries.get(self.selected) {
+            if path == &PathBuf::from("..") {
+                self.go_up();
+                return;
+            }
+            self.current_dir = path.clone();
+            self.refresh();
+        }
+    }
+
+    fn go_up(&mut self) {
+        if let Some(parent) = self.current_dir.parent() {
+            self.current_dir = parent.to_path_buf();
+            self.refresh();
+        }
+    }
 }
 
 struct UiState {
@@ -43,6 +108,7 @@ struct UiState {
     display_names: HashMap<String, String>,
     columns: usize,
     status_message: Option<(String, std::time::Instant)>,
+    dir_picker: Option<DirPickerState>,
 }
 
 impl Default for UiState {
@@ -55,6 +121,7 @@ impl Default for UiState {
             display_names: HashMap::new(),
             columns: 1,
             status_message: None,
+            dir_picker: None,
         }
     }
 }
@@ -156,6 +223,8 @@ enum KeyResult {
     Continue,
     Quit,
     Focus,
+    NewPaneInDir(PathBuf),
+    ClosePane,
 }
 
 fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
@@ -196,6 +265,13 @@ fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult
             ui.rename_text.clear();
             KeyResult::Continue
         }
+        KeyCode::Char('n') => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            ui.dir_picker = Some(DirPickerState::new(cwd));
+            ui.mode = UiMode::DirPicker;
+            KeyResult::Continue
+        }
+        KeyCode::Char('d') if total > 0 => KeyResult::ClosePane,
         KeyCode::Enter if total > 0 => KeyResult::Focus,
         KeyCode::Esc => {
             if !ui.filter_text.is_empty() {
@@ -276,6 +352,55 @@ fn handle_rename_key(
     KeyResult::Continue
 }
 
+fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return KeyResult::Quit;
+    }
+    let picker = match ui.dir_picker.as_mut() {
+        Some(p) => p,
+        None => {
+            ui.mode = UiMode::Normal;
+            return KeyResult::Continue;
+        }
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            ui.dir_picker = None;
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !picker.entries.is_empty() {
+                picker.selected = (picker.selected + 1).min(picker.entries.len() - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            picker.selected = picker.selected.saturating_sub(1);
+        }
+        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+            // If no subdirs, select current directory
+            if picker.entries.is_empty() {
+                let dir = picker.current_dir.clone();
+                ui.dir_picker = None;
+                ui.mode = UiMode::Normal;
+                return KeyResult::NewPaneInDir(dir);
+            }
+            picker.enter_selected();
+        }
+        KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+            picker.go_up();
+        }
+        KeyCode::Char(' ') => {
+            // Space selects the current directory
+            let dir = picker.current_dir.clone();
+            ui.dir_picker = None;
+            ui.mode = UiMode::Normal;
+            return KeyResult::NewPaneInDir(dir);
+        }
+        _ => {}
+    }
+    KeyResult::Continue
+}
+
 // ---------------------------------------------------------------------------
 // TUI entry point
 // ---------------------------------------------------------------------------
@@ -330,6 +455,7 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>) -> std::io::Re
                     UiMode::Rename => {
                         handle_rename_key(key, &mut ui, selected_id.as_deref())
                     }
+                    UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
                 };
 
                 match result {
@@ -344,6 +470,52 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>) -> std::io::Re
                                     Err(e) => {
                                         ui.status_message = Some((
                                             format!("Focus failed: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                ui.status_message = Some((
+                                    format!("No pane linked to session {sid}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                    KeyResult::NewPaneInDir(dir) => {
+                        if pane.is_available() {
+                            let dir_str = dir.display().to_string();
+                            match pane.create_pane(None, Some(&dir_str)) {
+                                Ok(new_id) => {
+                                    ui.status_message = Some((
+                                        format!("Created pane {new_id} in {dir_str}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    ui.status_message = Some((
+                                        format!("New pane failed: {e}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    KeyResult::ClosePane => {
+                        if let Some(ref sid) = selected_id
+                            && let Some(session) = snapshot.sessions.get(sid)
+                        {
+                            if let Some(ref pane_id) = session.pane_id {
+                                match pane.close_pane(pane_id) {
+                                    Ok(()) => {
+                                        ui.status_message = Some((
+                                            format!("Closed pane {pane_id}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        ui.status_message = Some((
+                                            format!("Close failed: {e}"),
                                             std::time::Instant::now(),
                                         ));
                                     }
@@ -381,16 +553,28 @@ fn render_frame(
     let area = frame.area();
 
     if state.sessions.is_empty() {
-        let msg = Paragraph::new("No active sessions. Waiting for connections...")
-            .style(Style::default().fg(Color::Gray))
-            .centered();
+        let bar_height = if has_pane_control { 2 } else { 1 };
         let vertical = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Length(1),
             Constraint::Fill(1),
+            Constraint::Length(bar_height),
         ])
         .split(area);
+        let msg = Paragraph::new("No active sessions. Press n to create a pane.")
+            .style(Style::default().fg(Color::Gray))
+            .centered();
         frame.render_widget(msg, vertical[1]);
+        render_bottom_bar(frame, ui, vertical[3], has_pane_control);
+
+        if ui.mode == UiMode::Help {
+            render_help_overlay(frame, has_pane_control);
+        }
+        if ui.mode == UiMode::DirPicker {
+            if let Some(ref picker) = ui.dir_picker {
+                render_dir_picker(frame, picker);
+            }
+        }
         return;
     }
 
@@ -402,7 +586,13 @@ fn render_frame(
 
     // Determine if we need a bottom bar (status/filter/rename)
     let has_bottom_bar = true; // always show status bar
-    let bottom_height: u16 = if has_bottom_bar { 1 } else { 0 };
+    let bottom_height: u16 = if has_bottom_bar && has_pane_control {
+        2
+    } else if has_bottom_bar {
+        1
+    } else {
+        0
+    };
 
     // Title bar
     let total_sessions = state.sessions.len();
@@ -482,9 +672,14 @@ fn render_frame(
     let bottom_area = row_chunks[row_chunks.len() - 1];
     render_bottom_bar(frame, ui, bottom_area, has_pane_control);
 
-    // Help overlay (drawn last, on top)
+    // Overlays (drawn last, on top)
     if ui.mode == UiMode::Help {
         render_help_overlay(frame, has_pane_control);
+    }
+    if ui.mode == UiMode::DirPicker {
+        if let Some(ref picker) = ui.dir_picker {
+            render_dir_picker(frame, picker);
+        }
     }
 }
 
@@ -518,14 +713,36 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
             if let Some((ref msg, _)) = ui.status_message {
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
-            } else {
-                let hints = match (ui.filter_text.is_empty(), has_pane_control) {
-                    (true, true) => "q: quit  /: filter  ?: help  hjkl: navigate  r: rename  Enter: focus  n: new pane",
-                    (true, false) => "q: quit  /: filter  ?: help  hjkl/arrows: navigate  r: rename",
-                    (false, true) => "q: quit  Esc: clear filter  ?: help  hjkl: navigate  Enter: focus  n: new pane",
-                    (false, false) => "q: quit  Esc: clear filter  ?: help  hjkl/arrows: navigate  r: rename",
+            } else if has_pane_control {
+                let w = area.width as usize;
+                let line1 = if w >= 80 {
+                    if ui.filter_text.is_empty() {
+                        "?: help  hjkl: nav  /: filter  r: rename  Enter: focus  n: new  d: close  q: quit"
+                    } else {
+                        "?: help  hjkl: nav  Esc: clear  Enter: focus  n: new  d: close  q: quit"
+                    }
+                } else if ui.filter_text.is_empty() {
+                    "? hjkl / r Enter n d q"
+                } else {
+                    "? hjkl Esc Enter n d q"
                 };
-                let line = Line::styled(hints, Style::default().fg(Color::DarkGray));
+                let line2 = if w >= 60 {
+                    "A-d: dashboard  A-j/k: panes  A-w: close  A-q: quit all"
+                } else {
+                    "A-d A-j/k A-w A-q"
+                };
+                let text = vec![
+                    Line::styled(line1, Style::default().fg(Color::Gray)),
+                    Line::styled(line2, Style::default().fg(Color::Gray)),
+                ];
+                frame.render_widget(Paragraph::new(text), area);
+            } else {
+                let hints = if ui.filter_text.is_empty() {
+                    "q: quit  /: filter  ?: help  hjkl: navigate  r: rename"
+                } else {
+                    "q: quit  Esc: clear  ?: help  hjkl: navigate  r: rename"
+                };
+                let line = Line::styled(hints, Style::default().fg(Color::Gray));
                 frame.render_widget(Paragraph::new(line), area);
             }
         }
@@ -535,7 +752,7 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
 fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     let area = frame.area();
     let popup_width = 52.min(area.width.saturating_sub(4));
-    let base_height: u16 = if has_pane_control { 24 } else { 16 };
+    let base_height: u16 = if has_pane_control { 29 } else { 16 };
     let popup_height = base_height.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -572,16 +789,26 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
         ));
         help_text.push(Line::from(""));
         help_text.push(Line::from("  Enter         Focus agent pane"));
-        help_text.push(Line::from("  n             New pane"));
-        help_text.push(Line::from("  d             Close pane"));
-        help_text.push(Line::from("  f             Fullscreen toggle"));
-        help_text.push(Line::from("  s             Split pane"));
+        help_text.push(Line::from("  n             New pane (dir picker)"));
+        help_text.push(Line::from("  d             Close agent pane"));
+        help_text.push(Line::from(""));
+        help_text.push(Line::styled(
+            "  Zellij (works from any pane)",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        help_text.push(Line::from(""));
+        help_text.push(Line::from("  Alt+h         Go to dashboard"));
+        help_text.push(Line::from("  Alt+j/k       Navigate stacked panes"));
+        help_text.push(Line::from("  Alt+w         Close current pane"));
+        help_text.push(Line::from("  Alt+q         Quit all"));
     }
 
     help_text.push(Line::from(""));
     help_text.push(Line::styled(
         "  Press ? or Esc to close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Gray),
     ));
 
     let block = Block::default()
@@ -589,6 +816,78 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
         .title(" Help ")
         .border_style(Style::default().fg(Color::Cyan));
     let paragraph = Paragraph::new(help_text).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_dir_picker(frame: &mut Frame, picker: &DirPickerState) {
+    let area = frame.area();
+    let popup_width = 60.min(area.width.saturating_sub(4));
+    let popup_height = 20u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    // Reserve lines: title(1) + current_dir(1) + blank(1) + footer(2) = 5
+    let max_visible = (popup_height as usize).saturating_sub(5);
+
+    let mut lines = vec![
+        Line::styled(
+            format!("  {}", picker.current_dir.display()),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+    ];
+
+    if picker.entries.is_empty() {
+        lines.push(Line::styled(
+            "  (no subdirectories)",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        // Adjust scroll offset to keep selected visible
+        let scroll = if picker.selected >= max_visible {
+            picker.selected - max_visible + 1
+        } else {
+            0
+        };
+
+        for (i, entry) in picker.entries.iter().enumerate().skip(scroll).take(max_visible) {
+            let name = if entry == &PathBuf::from("..") {
+                "..".to_string()
+            } else {
+                entry
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            };
+            let prefix = if i == picker.selected { "> " } else { "  " };
+            let style = if i == picker.selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let suffix = if name == ".." { "" } else { "/" };
+            lines.push(Line::styled(format!("{prefix}{name}{suffix}"), style));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "  Space: select dir  Enter/l: open  h/BS: up  Esc: cancel",
+        Style::default().fg(Color::Gray),
+    ));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Select Directory ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
