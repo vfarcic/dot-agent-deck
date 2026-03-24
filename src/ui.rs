@@ -12,6 +12,7 @@ use ratatui::{
     Frame,
 };
 
+use crate::config::DashboardConfig;
 use crate::event::EventType;
 use crate::pane::PaneController;
 use crate::state::{AppState, SessionState, SessionStatus, SharedState};
@@ -35,6 +36,7 @@ enum UiMode {
     Help,
     Rename,
     DirPicker,
+    NewPaneForm,
 }
 
 struct DirPickerState {
@@ -100,6 +102,19 @@ impl DirPickerState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormField {
+    Name,
+    Command,
+}
+
+struct NewPaneFormState {
+    dir: PathBuf,
+    name: String,
+    command: String,
+    focused: FormField,
+}
+
 struct UiState {
     mode: UiMode,
     selected_index: usize,
@@ -107,12 +122,15 @@ struct UiState {
     rename_text: String,
     display_names: HashMap<String, String>,
     columns: usize,
+    scroll_offset: usize,
     status_message: Option<(String, std::time::Instant)>,
     dir_picker: Option<DirPickerState>,
+    new_pane_form: Option<NewPaneFormState>,
+    config: DashboardConfig,
 }
 
-impl Default for UiState {
-    fn default() -> Self {
+impl UiState {
+    fn new(config: DashboardConfig) -> Self {
         Self {
             mode: UiMode::Normal,
             selected_index: 0,
@@ -120,9 +138,18 @@ impl Default for UiState {
             rename_text: String::new(),
             display_names: HashMap::new(),
             columns: 1,
+            scroll_offset: 0,
             status_message: None,
             dir_picker: None,
+            new_pane_form: None,
+            config,
         }
+    }
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self::new(DashboardConfig::default())
     }
 }
 
@@ -219,11 +246,17 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
 // Key handling
 // ---------------------------------------------------------------------------
 
+struct NewPaneRequest {
+    dir: PathBuf,
+    name: String,
+    command: String,
+}
+
 enum KeyResult {
     Continue,
     Quit,
     Focus,
-    NewPaneInDir(PathBuf),
+    NewPane(NewPaneRequest),
     ClosePane,
 }
 
@@ -379,10 +412,8 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
             // If no subdirs, select current directory
             if picker.entries.is_empty() {
-                let dir = picker.current_dir.clone();
-                ui.dir_picker = None;
-                ui.mode = UiMode::Normal;
-                return KeyResult::NewPaneInDir(dir);
+                transition_to_form(ui);
+                return KeyResult::Continue;
             }
             picker.enter_selected();
         }
@@ -390,11 +421,85 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             picker.go_up();
         }
         KeyCode::Char(' ') => {
-            // Space selects the current directory
-            let dir = picker.current_dir.clone();
-            ui.dir_picker = None;
+            transition_to_form(ui);
+            return KeyResult::Continue;
+        }
+        _ => {}
+    }
+    KeyResult::Continue
+}
+
+fn transition_to_form(ui: &mut UiState) {
+    let dir = ui
+        .dir_picker
+        .as_ref()
+        .map(|p| p.current_dir.clone())
+        .unwrap_or_default();
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let command = ui.config.default_command.clone();
+    ui.dir_picker = None;
+    ui.new_pane_form = Some(NewPaneFormState {
+        dir,
+        name,
+        command,
+        focused: FormField::Name,
+    });
+    ui.mode = UiMode::NewPaneForm;
+}
+
+fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return KeyResult::Quit;
+    }
+    let form = match ui.new_pane_form.as_mut() {
+        Some(f) => f,
+        None => {
             ui.mode = UiMode::Normal;
-            return KeyResult::NewPaneInDir(dir);
+            return KeyResult::Continue;
+        }
+    };
+    match key.code {
+        KeyCode::Esc => {
+            ui.new_pane_form = None;
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            form.focused = match form.focused {
+                FormField::Name => FormField::Command,
+                FormField::Command => FormField::Name,
+            };
+        }
+        KeyCode::Enter => match form.focused {
+            FormField::Name => {
+                form.focused = FormField::Command;
+            }
+            FormField::Command => {
+                let req = NewPaneRequest {
+                    dir: form.dir.clone(),
+                    name: form.name.clone(),
+                    command: form.command.clone(),
+                };
+                ui.new_pane_form = None;
+                ui.mode = UiMode::Normal;
+                return KeyResult::NewPane(req);
+            }
+        },
+        KeyCode::Backspace => {
+            let field = match form.focused {
+                FormField::Name => &mut form.name,
+                FormField::Command => &mut form.command,
+            };
+            field.pop();
+        }
+        KeyCode::Char(c) => {
+            let field = match form.focused {
+                FormField::Name => &mut form.name,
+                FormField::Command => &mut form.command,
+            };
+            field.push(c);
         }
         _ => {}
     }
@@ -405,7 +510,7 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
 // TUI entry point
 // ---------------------------------------------------------------------------
 
-pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>) -> std::io::Result<()> {
+pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>, config: DashboardConfig) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         ratatui::restore();
@@ -414,7 +519,7 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>) -> std::io::Re
 
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
-    let mut ui = UiState::default();
+    let mut ui = UiState::new(config);
 
     loop {
         // Expire stale status messages
@@ -439,7 +544,7 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>) -> std::io::Re
 
         let has_pane_control = pane.is_available();
         terminal.draw(|frame| {
-            render_frame(frame, &snapshot, &ui, &filtered, tick, has_pane_control);
+            render_frame(frame, &snapshot, &mut ui, &filtered, tick, has_pane_control);
         })?;
         tick = tick.wrapping_add(1);
 
@@ -456,6 +561,7 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>) -> std::io::Re
                         handle_rename_key(key, &mut ui, selected_id.as_deref())
                     }
                     UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
+                    UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
                 };
 
                 match result {
@@ -482,11 +588,19 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>) -> std::io::Re
                             }
                         }
                     }
-                    KeyResult::NewPaneInDir(dir) => {
+                    KeyResult::NewPane(req) => {
                         if pane.is_available() {
-                            let dir_str = dir.display().to_string();
-                            match pane.create_pane(None, Some(&dir_str)) {
+                            let dir_str = req.dir.display().to_string();
+                            let cmd = if req.command.is_empty() {
+                                None
+                            } else {
+                                Some(req.command.as_str())
+                            };
+                            match pane.create_pane(cmd, Some(&dir_str)) {
                                 Ok(new_id) => {
+                                    if !req.name.is_empty() {
+                                        let _ = pane.rename_pane(&new_id, &req.name);
+                                    }
                                     ui.status_message = Some((
                                         format!("Created pane {new_id} in {dir_str}"),
                                         std::time::Instant::now(),
@@ -545,7 +659,7 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>) -> std::io::Re
 fn render_frame(
     frame: &mut Frame,
     state: &AppState,
-    ui: &UiState,
+    ui: &mut UiState,
     filtered: &[(&String, &SessionState)],
     tick: u64,
     has_pane_control: bool,
@@ -575,6 +689,11 @@ fn render_frame(
                 render_dir_picker(frame, picker);
             }
         }
+        if ui.mode == UiMode::NewPaneForm {
+            if let Some(ref form) = ui.new_pane_form {
+                render_new_pane_form(frame, form);
+            }
+        }
         return;
     }
 
@@ -586,13 +705,7 @@ fn render_frame(
 
     // Determine if we need a bottom bar (status/filter/rename)
     let has_bottom_bar = true; // always show status bar
-    let bottom_height: u16 = if has_bottom_bar && has_pane_control {
-        2
-    } else if has_bottom_bar {
-        1
-    } else {
-        0
-    };
+    let bottom_height: u16 = if has_bottom_bar { 1 } else { 0 };
 
     // Title bar
     let total_sessions = state.sessions.len();
@@ -637,11 +750,28 @@ fn render_frame(
         return;
     }
 
-    let rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
-    let row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
+    let all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
+    let all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
+    let total_rows = all_rows.len();
+
+    // Calculate how many rows fit in the available area (title + bottom bar take space)
+    let available = area.height.saturating_sub(1 + bottom_height);
+    let visible_rows = (available / card_height).max(1) as usize;
+
+    // Adjust scroll offset to keep selected row visible
+    let selected_row = ui.selected_index / cols;
+    if selected_row < ui.scroll_offset {
+        ui.scroll_offset = selected_row;
+    } else if selected_row >= ui.scroll_offset + visible_rows {
+        ui.scroll_offset = selected_row + 1 - visible_rows;
+    }
+
+    let end = (ui.scroll_offset + visible_rows).min(total_rows);
+    let rows = &all_rows[ui.scroll_offset..end];
+    let row_ids = &all_row_ids[ui.scroll_offset..end];
 
     let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
-    for _ in &rows {
+    for _ in rows {
         constraints.push(Constraint::Length(card_height));
     }
     constraints.push(Constraint::Min(0)); // filler
@@ -651,18 +781,17 @@ fn render_frame(
 
     frame.render_widget(title, row_chunks[0]);
 
-    for (row_idx, row) in rows.iter().enumerate() {
+    for (vi, (row, ids)) in rows.iter().zip(row_ids.iter()).enumerate() {
         let col_constraints: Vec<Constraint> = (0..cols)
             .map(|_| Constraint::Ratio(1, cols as u32))
             .collect();
-        let col_chunks = Layout::horizontal(col_constraints).split(row_chunks[row_idx + 1]);
+        let col_chunks = Layout::horizontal(col_constraints).split(row_chunks[vi + 1]);
 
         for (col_idx, session) in row.iter().enumerate() {
-            let flat_index = row_idx * cols + col_idx;
+            let flat_index = (ui.scroll_offset + vi) * cols + col_idx;
             let is_selected = flat_index == ui.selected_index;
-            let display_name = row_ids
-                .get(row_idx)
-                .and_then(|ids| ids.get(col_idx))
+            let display_name = ids
+                .get(col_idx)
                 .and_then(|id| ui.display_names.get(*id));
             render_session_card(frame, col_chunks[col_idx], session, tick, is_selected, display_name);
         }
@@ -679,6 +808,11 @@ fn render_frame(
     if ui.mode == UiMode::DirPicker {
         if let Some(ref picker) = ui.dir_picker {
             render_dir_picker(frame, picker);
+        }
+    }
+    if ui.mode == UiMode::NewPaneForm {
+        if let Some(ref form) = ui.new_pane_form {
+            render_new_pane_form(frame, form);
         }
     }
 }
@@ -713,34 +847,11 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
             if let Some((ref msg, _)) = ui.status_message {
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
-            } else if has_pane_control {
-                let w = area.width as usize;
-                let line1 = if w >= 80 {
-                    if ui.filter_text.is_empty() {
-                        "?: help  hjkl: nav  /: filter  r: rename  Enter: focus  n: new  d: close  q: quit"
-                    } else {
-                        "?: help  hjkl: nav  Esc: clear  Enter: focus  n: new  d: close  q: quit"
-                    }
-                } else if ui.filter_text.is_empty() {
-                    "? hjkl / r Enter n d q"
-                } else {
-                    "? hjkl Esc Enter n d q"
-                };
-                let line2 = if w >= 60 {
-                    "A-d: dashboard  A-j/k: panes  A-w: close  A-q: quit all"
-                } else {
-                    "A-d A-j/k A-w A-q"
-                };
-                let text = vec![
-                    Line::styled(line1, Style::default().fg(Color::Gray)),
-                    Line::styled(line2, Style::default().fg(Color::Gray)),
-                ];
-                frame.render_widget(Paragraph::new(text), area);
             } else {
-                let hints = if ui.filter_text.is_empty() {
-                    "q: quit  /: filter  ?: help  hjkl: navigate  r: rename"
+                let hints = if has_pane_control {
+                    "?: help  Alt+q: quit all  Alt+d: dashboard"
                 } else {
-                    "q: quit  Esc: clear  ?: help  hjkl: navigate  r: rename"
+                    "?: help  q: quit"
                 };
                 let line = Line::styled(hints, Style::default().fg(Color::Gray));
                 frame.render_widget(Paragraph::new(line), area);
@@ -789,7 +900,7 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
         ));
         help_text.push(Line::from(""));
         help_text.push(Line::from("  Enter         Focus agent pane"));
-        help_text.push(Line::from("  n             New pane (dir picker)"));
+        help_text.push(Line::from("  n             New pane (dir + name + cmd)"));
         help_text.push(Line::from("  d             Close agent pane"));
         help_text.push(Line::from(""));
         help_text.push(Line::styled(
@@ -889,6 +1000,87 @@ fn render_dir_picker(frame: &mut Frame, picker: &DirPickerState) {
         .border_style(Style::default().fg(Color::Cyan));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
+}
+
+fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
+    let area = frame.area();
+    let popup_width = 56.min(area.width.saturating_sub(4));
+    let popup_height = 12u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let inner_width = popup_width.saturating_sub(4) as usize;
+
+    let name_style = if form.focused == FormField::Name {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let cmd_style = if form.focused == FormField::Command {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+
+    let dir_display = form.dir.display().to_string();
+    let lines = vec![
+        Line::styled(
+            format!("  Dir: {dir_display}"),
+            Style::default().fg(Color::Yellow),
+        ),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Name:    ", name_style),
+            Span::styled(
+                format!("{:<width$}", form.name, width = inner_width.saturating_sub(11)),
+                if form.focused == FormField::Name {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Command: ", cmd_style),
+            Span::styled(
+                format!("{:<width$}", form.command, width = inner_width.saturating_sub(11)),
+                if form.focused == FormField::Command {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            ),
+        ]),
+        Line::from(""),
+        Line::from(""),
+        Line::styled(
+            "  Tab: switch field  Enter: next/confirm  Esc: cancel",
+            Style::default().fg(Color::Gray),
+        ),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" New Pane ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+
+    // Show cursor in the active field
+    let cursor_y = match form.focused {
+        FormField::Name => popup_area.y + 3,
+        FormField::Command => popup_area.y + 5,
+    };
+    let field_text = match form.focused {
+        FormField::Name => &form.name,
+        FormField::Command => &form.command,
+    };
+    let cursor_x = popup_area.x + 12 + field_text.len() as u16;
+    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
 fn grid_columns(width: u16) -> usize {
@@ -1156,10 +1348,10 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let state = AppState::default();
-        let ui = default_ui();
+        let mut ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0, false))
+            .draw(|frame| render_frame(frame, &state, &mut ui, &filtered, 0, false))
             .unwrap();
     }
 
@@ -1203,10 +1395,10 @@ mod tests {
         };
         state.apply_event(event2);
 
-        let ui = default_ui();
+        let mut ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0, false))
+            .draw(|frame| render_frame(frame, &state, &mut ui, &filtered, 0, false))
             .unwrap();
     }
 
@@ -1291,10 +1483,10 @@ mod tests {
             Some("fix the login bug")
         );
 
-        let ui = default_ui();
+        let mut ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0, false))
+            .draw(|frame| render_frame(frame, &state, &mut ui, &filtered, 0, false))
             .unwrap();
     }
 
@@ -1349,10 +1541,10 @@ mod tests {
             });
         }
 
-        let ui = default_ui();
+        let mut ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, &ui, &filtered, 0, false))
+            .draw(|frame| render_frame(frame, &state, &mut ui, &filtered, 0, false))
             .unwrap();
     }
 
@@ -1439,7 +1631,7 @@ mod tests {
             });
         }
 
-        let ui = default_ui();
+        let mut ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         assert_eq!(filtered.len(), 3);
     }

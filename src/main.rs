@@ -88,10 +88,11 @@ async fn run_dashboard() {
         }
     });
 
+    let config = dot_agent_deck::config::DashboardConfig::load();
     let pane_controller = dot_agent_deck::pane::detect_multiplexer();
     let tui_state = state.clone();
     let tui_result =
-        tokio::task::spawn_blocking(move || run_tui(tui_state, pane_controller)).await;
+        tokio::task::spawn_blocking(move || run_tui(tui_state, pane_controller, config)).await;
 
     // TUI exited — clean up
     daemon_handle.abort();
@@ -202,14 +203,11 @@ load_plugins {{
 }}
 keybinds clear-defaults=true {{
     normal {{
-        bind "Alt n" {{ MoveFocus "Right"; NewPane "Down"; }}
         bind "Alt h" "Alt Left" "Alt d" {{ MoveFocus "Left"; }}
-        bind "Alt l" "Alt Right" {{ MoveFocus "Right"; }}
-
-        bind "Alt w" {{ CloseFocus; }}
-        bind "Alt q" {{ Quit; }}
         bind "Alt j" "Alt Down"  {{ MoveFocus "Down"; }}
         bind "Alt k" "Alt Up"    {{ MoveFocus "Up"; }}
+        bind "Alt w" {{ CloseFocus; }}
+        bind "Alt q" {{ Quit; }}
     }}
 }}
 "#

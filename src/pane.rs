@@ -53,6 +53,7 @@ pub trait PaneController: Send + Sync {
         direction: PaneDirection,
         amount: u16,
     ) -> Result<(), PaneError>;
+    fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError>;
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
 }
@@ -131,6 +132,12 @@ impl PaneController for ZellijController {
             args.push(&cwd_val);
         }
         match command {
+            Some(cmd) if cmd.contains(' ') => {
+                args.push("--");
+                args.push(&default_shell);
+                args.push("-c");
+                args.push(cmd);
+            }
             Some(cmd) => {
                 args.push("--");
                 args.push(cmd);
@@ -184,6 +191,17 @@ impl PaneController for ZellijController {
         Ok(())
     }
 
+    fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError> {
+        self.run_zellij(&[
+            "action",
+            "rename-pane",
+            name,
+            "--pane-id",
+            pane_id,
+        ])?;
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "zellij"
     }
@@ -213,6 +231,9 @@ impl PaneController for NoopController {
         Err(PaneError::NotAvailable)
     }
     fn resize_pane(&self, _: &str, _: PaneDirection, _: u16) -> Result<(), PaneError> {
+        Err(PaneError::NotAvailable)
+    }
+    fn rename_pane(&self, _: &str, _: &str) -> Result<(), PaneError> {
         Err(PaneError::NotAvailable)
     }
     fn name(&self) -> &str {
