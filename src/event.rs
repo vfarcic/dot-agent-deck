@@ -40,6 +40,8 @@ pub struct AgentEvent {
     pub user_prompt: Option<String>,
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+    #[serde(default)]
+    pub pane_id: Option<String>,
 }
 
 #[cfg(test)]

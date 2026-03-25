@@ -1,16 +1,20 @@
+use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
+use crate::config::DashboardConfig;
 use crate::event::EventType;
+use crate::pane::PaneController;
 use crate::state::{AppState, SessionState, SessionStatus, SharedState};
 
 impl fmt::Display for crate::event::AgentType {
@@ -21,7 +25,500 @@ impl fmt::Display for crate::event::AgentType {
     }
 }
 
-pub fn run_tui(state: SharedState) -> std::io::Result<()> {
+// ---------------------------------------------------------------------------
+// Platform-aware modifier key label
+// ---------------------------------------------------------------------------
+
+const MOD_KEY: &str = if cfg!(target_os = "macos") { "Opt" } else { "Alt" };
+
+// ---------------------------------------------------------------------------
+// UI state types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UiMode {
+    Normal,
+    Filter,
+    Help,
+    Rename,
+    DirPicker,
+    NewPaneForm,
+}
+
+struct DirPickerState {
+    current_dir: PathBuf,
+    entries: Vec<PathBuf>,
+    selected: usize,
+    scroll_offset: usize,
+}
+
+impl DirPickerState {
+    fn new(start: PathBuf) -> Self {
+        let mut state = Self {
+            current_dir: start,
+            entries: Vec::new(),
+            selected: 0,
+            scroll_offset: 0,
+        };
+        state.refresh();
+        state
+    }
+
+    fn refresh(&mut self) {
+        self.entries.clear();
+        // Add parent directory entry if not at root
+        if self.current_dir.parent().is_some() {
+            self.entries.push(PathBuf::from(".."));
+        }
+        if let Ok(read_dir) = std::fs::read_dir(&self.current_dir) {
+            let mut dirs: Vec<PathBuf> = read_dir
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+                .filter(|e| {
+                    !e.file_name()
+                        .to_str()
+                        .map(|n| n.starts_with('.'))
+                        .unwrap_or(false)
+                })
+                .map(|e| e.path())
+                .collect();
+            dirs.sort();
+            self.entries.extend(dirs);
+        }
+        self.selected = 0;
+        self.scroll_offset = 0;
+    }
+
+    fn enter_selected(&mut self) {
+        if let Some(path) = self.entries.get(self.selected) {
+            if path == &PathBuf::from("..") {
+                self.go_up();
+                return;
+            }
+            self.current_dir = path.clone();
+            self.refresh();
+        }
+    }
+
+    fn go_up(&mut self) {
+        if let Some(parent) = self.current_dir.parent() {
+            self.current_dir = parent.to_path_buf();
+            self.refresh();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormField {
+    Name,
+    Command,
+}
+
+struct NewPaneFormState {
+    dir: PathBuf,
+    name: String,
+    command: String,
+    focused: FormField,
+}
+
+struct UiState {
+    mode: UiMode,
+    selected_index: usize,
+    filter_text: String,
+    rename_text: String,
+    display_names: HashMap<String, String>,
+    columns: usize,
+    scroll_offset: usize,
+    status_message: Option<(String, std::time::Instant)>,
+    dir_picker: Option<DirPickerState>,
+    new_pane_form: Option<NewPaneFormState>,
+    pane_names: HashMap<String, String>,
+    config: DashboardConfig,
+}
+
+impl UiState {
+    fn new(config: DashboardConfig) -> Self {
+        Self {
+            mode: UiMode::Normal,
+            selected_index: 0,
+            filter_text: String::new(),
+            rename_text: String::new(),
+            display_names: HashMap::new(),
+            columns: 1,
+            scroll_offset: 0,
+            status_message: None,
+            dir_picker: None,
+            new_pane_form: None,
+            pane_names: HashMap::new(),
+            config,
+        }
+    }
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self::new(DashboardConfig::default())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grid navigation
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+fn navigate_grid(current: usize, dir: Direction, columns: usize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    let row = current / columns;
+    let col = current % columns;
+    let total_rows = (total + columns - 1) / columns;
+
+    match dir {
+        Direction::Up => {
+            if row > 0 {
+                (row - 1) * columns + col
+            } else {
+                current
+            }
+        }
+        Direction::Down => {
+            let new_idx = (row + 1) * columns + col;
+            if row + 1 < total_rows && new_idx < total {
+                new_idx
+            } else if row + 1 < total_rows {
+                // Last row has fewer items; go to last item
+                total - 1
+            } else {
+                current
+            }
+        }
+        Direction::Left => {
+            if col > 0 {
+                current - 1
+            } else {
+                current
+            }
+        }
+        Direction::Right => {
+            if col + 1 < columns && current + 1 < total {
+                current + 1
+            } else {
+                current
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session filtering
+// ---------------------------------------------------------------------------
+
+fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
+    let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
+    sessions.sort_by_key(|(_, s)| s.started_at);
+
+    if ui.filter_text.is_empty() {
+        return sessions;
+    }
+
+    let query = ui.filter_text.to_lowercase();
+    sessions.retain(|(id, s)| {
+        let id_match = id.to_lowercase().contains(&query);
+        let cwd_match = s
+            .cwd
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains(&query);
+        let status_str = format!("{:?}", s.status).to_lowercase();
+        let status_match = status_str.contains(&query);
+        let name_match = ui
+            .display_names
+            .get(*id)
+            .map(|n| n.to_lowercase().contains(&query))
+            .unwrap_or(false);
+        id_match || cwd_match || status_match || name_match
+    });
+    sessions
+}
+
+// ---------------------------------------------------------------------------
+// Key handling
+// ---------------------------------------------------------------------------
+
+struct NewPaneRequest {
+    dir: PathBuf,
+    name: String,
+    command: String,
+}
+
+enum KeyResult {
+    Continue,
+    Quit,
+    Focus,
+    NewPane(NewPaneRequest),
+    ClosePane,
+}
+
+fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return KeyResult::Quit;
+    }
+    match key.code {
+        KeyCode::Char('q') => KeyResult::Quit,
+        KeyCode::Char('j') | KeyCode::Down => {
+            ui.selected_index = navigate_grid(ui.selected_index, Direction::Down, ui.columns, total);
+            KeyResult::Continue
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            ui.selected_index = navigate_grid(ui.selected_index, Direction::Up, ui.columns, total);
+            KeyResult::Continue
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            ui.selected_index =
+                navigate_grid(ui.selected_index, Direction::Left, ui.columns, total);
+            KeyResult::Continue
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            ui.selected_index =
+                navigate_grid(ui.selected_index, Direction::Right, ui.columns, total);
+            KeyResult::Continue
+        }
+        KeyCode::Char('/') => {
+            ui.mode = UiMode::Filter;
+            ui.filter_text.clear();
+            KeyResult::Continue
+        }
+        KeyCode::Char('?') => {
+            ui.mode = UiMode::Help;
+            KeyResult::Continue
+        }
+        KeyCode::Char('r') if total > 0 => {
+            ui.mode = UiMode::Rename;
+            ui.rename_text.clear();
+            KeyResult::Continue
+        }
+        KeyCode::Char('n') => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            ui.dir_picker = Some(DirPickerState::new(cwd));
+            ui.mode = UiMode::DirPicker;
+            KeyResult::Continue
+        }
+        KeyCode::Char('d') if total > 0 => KeyResult::ClosePane,
+        KeyCode::Enter if total > 0 => KeyResult::Focus,
+        KeyCode::Esc => {
+            if !ui.filter_text.is_empty() {
+                ui.filter_text.clear();
+            }
+            KeyResult::Continue
+        }
+        _ => KeyResult::Continue,
+    }
+}
+
+fn handle_filter_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return KeyResult::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            ui.filter_text.clear();
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Enter => {
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Backspace => {
+            ui.filter_text.pop();
+        }
+        KeyCode::Char(c) => {
+            ui.filter_text.push(c);
+        }
+        _ => {}
+    }
+    KeyResult::Continue
+}
+
+fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    match key.code {
+        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+            ui.mode = UiMode::Normal;
+        }
+        _ => {}
+    }
+    KeyResult::Continue
+}
+
+fn handle_rename_key(
+    key: KeyEvent,
+    ui: &mut UiState,
+    selected_session_id: Option<&str>,
+) -> KeyResult {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return KeyResult::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            ui.rename_text.clear();
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Enter => {
+            if let Some(id) = selected_session_id {
+                if ui.rename_text.is_empty() {
+                    ui.display_names.remove(id);
+                } else {
+                    ui.display_names
+                        .insert(id.to_string(), ui.rename_text.clone());
+                }
+            }
+            ui.rename_text.clear();
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Backspace => {
+            ui.rename_text.pop();
+        }
+        KeyCode::Char(c) => {
+            ui.rename_text.push(c);
+        }
+        _ => {}
+    }
+    KeyResult::Continue
+}
+
+fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return KeyResult::Quit;
+    }
+    let picker = match ui.dir_picker.as_mut() {
+        Some(p) => p,
+        None => {
+            ui.mode = UiMode::Normal;
+            return KeyResult::Continue;
+        }
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            ui.dir_picker = None;
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !picker.entries.is_empty() {
+                picker.selected = (picker.selected + 1).min(picker.entries.len() - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            picker.selected = picker.selected.saturating_sub(1);
+        }
+        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+            // If no subdirs, select current directory
+            if picker.entries.is_empty() {
+                transition_to_form(ui);
+                return KeyResult::Continue;
+            }
+            picker.enter_selected();
+        }
+        KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+            picker.go_up();
+        }
+        KeyCode::Char(' ') => {
+            transition_to_form(ui);
+            return KeyResult::Continue;
+        }
+        _ => {}
+    }
+    KeyResult::Continue
+}
+
+fn transition_to_form(ui: &mut UiState) {
+    let dir = ui
+        .dir_picker
+        .as_ref()
+        .map(|p| p.current_dir.clone())
+        .unwrap_or_default();
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let command = ui.config.default_command.clone();
+    ui.dir_picker = None;
+    ui.new_pane_form = Some(NewPaneFormState {
+        dir,
+        name,
+        command,
+        focused: FormField::Name,
+    });
+    ui.mode = UiMode::NewPaneForm;
+}
+
+fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return KeyResult::Quit;
+    }
+    let form = match ui.new_pane_form.as_mut() {
+        Some(f) => f,
+        None => {
+            ui.mode = UiMode::Normal;
+            return KeyResult::Continue;
+        }
+    };
+    match key.code {
+        KeyCode::Esc => {
+            ui.new_pane_form = None;
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            form.focused = match form.focused {
+                FormField::Name => FormField::Command,
+                FormField::Command => FormField::Name,
+            };
+        }
+        KeyCode::Enter => match form.focused {
+            FormField::Name => {
+                form.focused = FormField::Command;
+            }
+            FormField::Command => {
+                let req = NewPaneRequest {
+                    dir: form.dir.clone(),
+                    name: form.name.clone(),
+                    command: form.command.clone(),
+                };
+                ui.new_pane_form = None;
+                ui.mode = UiMode::Normal;
+                return KeyResult::NewPane(req);
+            }
+        },
+        KeyCode::Backspace => {
+            let field = match form.focused {
+                FormField::Name => &mut form.name,
+                FormField::Command => &mut form.command,
+            };
+            field.pop();
+        }
+        KeyCode::Char(c) => {
+            let field = match form.focused {
+                FormField::Name => &mut form.name,
+                FormField::Command => &mut form.command,
+            };
+            field.push(c);
+        }
+        _ => {}
+    }
+    KeyResult::Continue
+}
+
+// ---------------------------------------------------------------------------
+// TUI entry point
+// ---------------------------------------------------------------------------
+
+pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>, config: DashboardConfig) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         ratatui::restore();
@@ -30,19 +527,145 @@ pub fn run_tui(state: SharedState) -> std::io::Result<()> {
 
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
+    let mut ui = UiState::new(config);
 
     loop {
+        // Expire stale status messages
+        if let Some((_, created)) = &ui.status_message
+            && created.elapsed() > std::time::Duration::from_secs(3)
+        {
+            ui.status_message = None;
+        }
+
         let snapshot = state.blocking_read().clone();
-        terminal.draw(|frame| render_frame(frame, &snapshot, tick))?;
+
+        // Apply pending pane names to sessions that have appeared
+        if !ui.pane_names.is_empty() {
+            for (sid, session) in &snapshot.sessions {
+                if let Some(ref pane_id) = session.pane_id {
+                    if let Some(name) = ui.pane_names.remove(pane_id) {
+                        ui.display_names.insert(sid.clone(), name);
+                    }
+                }
+            }
+        }
+
+        let filtered = filter_sessions(&snapshot, &ui);
+        let total = filtered.len();
+
+        // Clamp selection
+        if total > 0 {
+            ui.selected_index = ui.selected_index.min(total - 1);
+        } else {
+            ui.selected_index = 0;
+        }
+
+        ui.columns = grid_columns(terminal.get_frame().area().width);
+
+        let has_pane_control = pane.is_available();
+        terminal.draw(|frame| {
+            render_frame(frame, &snapshot, &mut ui, &filtered, tick, has_pane_control);
+        })?;
         tick = tick.wrapping_add(1);
 
-        if crossterm::event::poll(std::time::Duration::from_millis(250))?
-            && let Event::Key(key) = event::read()?
-            && (key.code == KeyCode::Char('q')
-                || (key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)))
-        {
-            break;
+        if crossterm::event::poll(std::time::Duration::from_millis(250))? {
+            if let Event::Key(key) = event::read()? {
+                let selected_id: Option<String> =
+                    filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+
+                let result = match ui.mode {
+                    UiMode::Normal => handle_normal_key(key, &mut ui, total),
+                    UiMode::Filter => handle_filter_key(key, &mut ui),
+                    UiMode::Help => handle_help_key(key, &mut ui),
+                    UiMode::Rename => {
+                        handle_rename_key(key, &mut ui, selected_id.as_deref())
+                    }
+                    UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
+                    UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
+                };
+
+                match result {
+                    KeyResult::Quit => break,
+                    KeyResult::Focus => {
+                        if let Some(ref sid) = selected_id
+                            && let Some(session) = snapshot.sessions.get(sid)
+                        {
+                            if let Some(ref pane_id) = session.pane_id {
+                                match pane.focus_pane(pane_id) {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        ui.status_message = Some((
+                                            format!("Focus failed: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                ui.status_message = Some((
+                                    format!("No pane linked to session {sid}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                    KeyResult::NewPane(req) => {
+                        if pane.is_available() {
+                            let dir_str = req.dir.display().to_string();
+                            let cmd = if req.command.is_empty() {
+                                None
+                            } else {
+                                Some(req.command.as_str())
+                            };
+                            match pane.create_pane(cmd, Some(&dir_str)) {
+                                Ok(new_id) => {
+                                    if !req.name.is_empty() {
+                                        let _ = pane.rename_pane(&new_id, &req.name);
+                                        ui.pane_names.insert(new_id.clone(), req.name);
+                                    }
+                                    ui.status_message = Some((
+                                        format!("Created pane {new_id} in {dir_str}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    ui.status_message = Some((
+                                        format!("New pane failed: {e}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    KeyResult::ClosePane => {
+                        if let Some(ref sid) = selected_id
+                            && let Some(session) = snapshot.sessions.get(sid)
+                        {
+                            if let Some(ref pane_id) = session.pane_id {
+                                match pane.close_pane(pane_id) {
+                                    Ok(()) => {
+                                        ui.status_message = Some((
+                                            format!("Closed pane {pane_id}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        ui.status_message = Some((
+                                            format!("Close failed: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                ui.status_message = Some((
+                                    format!("No pane linked to session {sid}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                    KeyResult::Continue => {}
+                }
+            }
         }
     }
 
@@ -50,29 +673,69 @@ pub fn run_tui(state: SharedState) -> std::io::Result<()> {
     Ok(())
 }
 
-fn render_frame(frame: &mut Frame, state: &AppState, tick: u64) {
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+fn render_frame(
+    frame: &mut Frame,
+    state: &AppState,
+    ui: &mut UiState,
+    filtered: &[(&String, &SessionState)],
+    tick: u64,
+    has_pane_control: bool,
+) {
     let area = frame.area();
 
     if state.sessions.is_empty() {
-        let msg = Paragraph::new("No active sessions. Waiting for connections...")
-            .style(Style::default().fg(Color::Gray))
-            .centered();
-        // Center vertically
+        let bar_height = if has_pane_control { 2 } else { 1 };
         let vertical = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Length(1),
             Constraint::Fill(1),
+            Constraint::Length(bar_height),
         ])
         .split(area);
+        let msg = Paragraph::new("No active sessions. Press n to create a pane.")
+            .style(Style::default().fg(Color::Gray))
+            .centered();
         frame.render_widget(msg, vertical[1]);
+        render_bottom_bar(frame, ui, vertical[3], has_pane_control);
+
+        if ui.mode == UiMode::Help {
+            render_help_overlay(frame, has_pane_control);
+        }
+        if ui.mode == UiMode::DirPicker {
+            if let Some(ref picker) = ui.dir_picker {
+                render_dir_picker(frame, picker);
+            }
+        }
+        if ui.mode == UiMode::NewPaneForm {
+            if let Some(ref form) = ui.new_pane_form {
+                render_new_pane_form(frame, form);
+            }
+        }
         return;
     }
 
-    // Sort sessions by started_at
-    let mut sessions: Vec<&SessionState> = state.sessions.values().collect();
-    sessions.sort_by_key(|s| s.started_at);
+    let sessions: Vec<&SessionState> = filtered.iter().map(|(_, s)| *s).collect();
+    let session_ids: Vec<&String> = filtered.iter().map(|(id, _)| *id).collect();
+
+    let cols = grid_columns(area.width);
+    let card_height = 8;
+
+    // Determine if we need a bottom bar (status/filter/rename)
+    let has_bottom_bar = true; // always show status bar
+    let bottom_height: u16 = if has_bottom_bar { 1 } else { 0 };
 
     // Title bar
+    let total_sessions = state.sessions.len();
+    let showing = sessions.len();
+    let title_text = if showing < total_sessions {
+        format!("— {}/{} session(s)", showing, total_sessions)
+    } else {
+        format!("— {} session(s)", total_sessions)
+    };
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
             " dot-agent-deck ",
@@ -80,38 +743,365 @@ fn render_frame(frame: &mut Frame, state: &AppState, tick: u64) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!("— {} session(s)", sessions.len()),
-            Style::default().fg(Color::Gray),
-        ),
+        Span::styled(title_text, Style::default().fg(Color::Gray)),
     ]));
 
-    let cols = grid_columns(area.width);
-    let card_height = 8;
+    if sessions.is_empty() {
+        // All filtered out
+        let vertical = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(bottom_height),
+        ])
+        .split(area);
+        frame.render_widget(title, vertical[0]);
 
-    // Group sessions into rows of `cols`
-    let rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
+        let msg = Paragraph::new("No sessions match filter.")
+            .style(Style::default().fg(Color::Gray))
+            .centered();
+        let inner = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(vertical[1]);
+        frame.render_widget(msg, inner[1]);
+
+        render_bottom_bar(frame, ui, vertical[2], has_pane_control);
+        return;
+    }
+
+    let all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
+    let all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
+    let total_rows = all_rows.len();
+
+    // Calculate how many rows fit in the available area (title + bottom bar take space)
+    let available = area.height.saturating_sub(1 + bottom_height);
+    let visible_rows = (available / card_height).max(1) as usize;
+
+    // Adjust scroll offset to keep selected row visible
+    let selected_row = ui.selected_index / cols;
+    if selected_row < ui.scroll_offset {
+        ui.scroll_offset = selected_row;
+    } else if selected_row >= ui.scroll_offset + visible_rows {
+        ui.scroll_offset = selected_row + 1 - visible_rows;
+    }
+
+    let end = (ui.scroll_offset + visible_rows).min(total_rows);
+    let rows = &all_rows[ui.scroll_offset..end];
+    let row_ids = &all_row_ids[ui.scroll_offset..end];
 
     let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
-    for _ in &rows {
+    for _ in rows {
         constraints.push(Constraint::Length(card_height));
     }
     constraints.push(Constraint::Min(0)); // filler
+    constraints.push(Constraint::Length(bottom_height)); // bottom bar
 
     let row_chunks = Layout::vertical(constraints).split(area);
 
     frame.render_widget(title, row_chunks[0]);
 
-    for (row_idx, row) in rows.iter().enumerate() {
+    for (vi, (row, ids)) in rows.iter().zip(row_ids.iter()).enumerate() {
         let col_constraints: Vec<Constraint> = (0..cols)
             .map(|_| Constraint::Ratio(1, cols as u32))
             .collect();
-        let col_chunks = Layout::horizontal(col_constraints).split(row_chunks[row_idx + 1]);
+        let col_chunks = Layout::horizontal(col_constraints).split(row_chunks[vi + 1]);
 
         for (col_idx, session) in row.iter().enumerate() {
-            render_session_card(frame, col_chunks[col_idx], session, tick);
+            let flat_index = (ui.scroll_offset + vi) * cols + col_idx;
+            let is_selected = flat_index == ui.selected_index;
+            let display_name = ids
+                .get(col_idx)
+                .and_then(|id| ui.display_names.get(*id));
+            render_session_card(frame, col_chunks[col_idx], session, tick, is_selected, display_name);
         }
     }
+
+    // Bottom bar
+    let bottom_area = row_chunks[row_chunks.len() - 1];
+    render_bottom_bar(frame, ui, bottom_area, has_pane_control);
+
+    // Overlays (drawn last, on top)
+    if ui.mode == UiMode::Help {
+        render_help_overlay(frame, has_pane_control);
+    }
+    if ui.mode == UiMode::DirPicker {
+        if let Some(ref picker) = ui.dir_picker {
+            render_dir_picker(frame, picker);
+        }
+    }
+    if ui.mode == UiMode::NewPaneForm {
+        if let Some(ref form) = ui.new_pane_form {
+            render_new_pane_form(frame, form);
+        }
+    }
+}
+
+fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_control: bool) {
+    match ui.mode {
+        UiMode::Filter => {
+            let line = Line::from(vec![
+                Span::styled("/ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw(&ui.filter_text),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            // Show cursor
+            let cursor_x = area.x + 2 + ui.filter_text.len() as u16;
+            frame.set_cursor_position(Position::new(cursor_x, area.y));
+        }
+        UiMode::Rename => {
+            let line = Line::from(vec![
+                Span::styled(
+                    "Rename: ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&ui.rename_text),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            let cursor_x = area.x + 8 + ui.rename_text.len() as u16;
+            frame.set_cursor_position(Position::new(cursor_x, area.y));
+        }
+        _ => {
+            if let Some((ref msg, _)) = ui.status_message {
+                let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
+                frame.render_widget(Paragraph::new(line), area);
+            } else {
+                let hints = if has_pane_control {
+                    format!("?: help  {MOD_KEY}+q: quit all  {MOD_KEY}+d: dashboard")
+                } else {
+                    "?: help  q: quit".to_string()
+                };
+                let line = Line::styled(hints, Style::default().fg(Color::Gray));
+                frame.render_widget(Paragraph::new(line), area);
+            }
+        }
+    }
+}
+
+fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
+    let area = frame.area();
+    let popup_width = 52.min(area.width.saturating_sub(4));
+    let base_height: u16 = if has_pane_control { 29 } else { 16 };
+    let popup_height = base_height.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let mut help_text = vec![
+        Line::styled(
+            "  Keybindings",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+        Line::from("  j / Down      Move down"),
+        Line::from("  k / Up        Move up"),
+        Line::from("  h / Left      Move left"),
+        Line::from("  l / Right     Move right"),
+        Line::from("  /             Filter sessions"),
+        Line::from("  r             Rename session"),
+        Line::from("  ?             Toggle this help"),
+        Line::from("  Esc           Clear filter"),
+        Line::from("  q             Quit"),
+    ];
+
+    if has_pane_control {
+        help_text.push(Line::from(""));
+        help_text.push(Line::styled(
+            "  Pane Control",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        help_text.push(Line::from(""));
+        help_text.push(Line::from("  Enter         Focus agent pane"));
+        help_text.push(Line::from("  n             New pane (dir + name + cmd)"));
+        help_text.push(Line::from("  d             Close agent pane"));
+        help_text.push(Line::from(""));
+        help_text.push(Line::styled(
+            "  Zellij (works from any pane)",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        help_text.push(Line::from(""));
+        help_text.push(Line::from(format!("  {MOD_KEY}+h         Go to dashboard")));
+        help_text.push(Line::from(format!("  {MOD_KEY}+j/k       Navigate stacked panes")));
+        help_text.push(Line::from(format!("  {MOD_KEY}+w         Close current pane")));
+        help_text.push(Line::from(format!("  {MOD_KEY}+q         Quit all")));
+    }
+
+    help_text.push(Line::from(""));
+    help_text.push(Line::styled(
+        "  Press ? or Esc to close",
+        Style::default().fg(Color::Gray),
+    ));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Help ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let paragraph = Paragraph::new(help_text).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_dir_picker(frame: &mut Frame, picker: &DirPickerState) {
+    let area = frame.area();
+    let popup_width = 60.min(area.width.saturating_sub(4));
+    let popup_height = 20u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    // Reserve lines: title(1) + current_dir(1) + blank(1) + footer(2) = 5
+    let max_visible = (popup_height as usize).saturating_sub(5);
+
+    let mut lines = vec![
+        Line::styled(
+            format!("  {}", picker.current_dir.display()),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+    ];
+
+    if picker.entries.is_empty() {
+        lines.push(Line::styled(
+            "  (no subdirectories)",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        // Adjust scroll offset to keep selected visible
+        let scroll = if picker.selected >= max_visible {
+            picker.selected - max_visible + 1
+        } else {
+            0
+        };
+
+        for (i, entry) in picker.entries.iter().enumerate().skip(scroll).take(max_visible) {
+            let name = if entry == &PathBuf::from("..") {
+                "..".to_string()
+            } else {
+                entry
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            };
+            let prefix = if i == picker.selected { "> " } else { "  " };
+            let style = if i == picker.selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let suffix = if name == ".." { "" } else { "/" };
+            lines.push(Line::styled(format!("{prefix}{name}{suffix}"), style));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "  Space: select dir  Enter/l: open  h/BS: up  Esc: cancel",
+        Style::default().fg(Color::Gray),
+    ));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Select Directory ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
+    let area = frame.area();
+    let popup_width = 56.min(area.width.saturating_sub(4));
+    let popup_height = 12u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let inner_width = popup_width.saturating_sub(4) as usize;
+
+    let name_style = if form.focused == FormField::Name {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let cmd_style = if form.focused == FormField::Command {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+
+    let dir_display = form.dir.display().to_string();
+    let lines = vec![
+        Line::styled(
+            format!("  Dir: {dir_display}"),
+            Style::default().fg(Color::Yellow),
+        ),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Name:    ", name_style),
+            Span::styled(
+                format!("{:<width$}", form.name, width = inner_width.saturating_sub(11)),
+                if form.focused == FormField::Name {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Command: ", cmd_style),
+            Span::styled(
+                format!("{:<width$}", form.command, width = inner_width.saturating_sub(11)),
+                if form.focused == FormField::Command {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            ),
+        ]),
+        Line::from(""),
+        Line::from(""),
+        Line::styled(
+            "  Tab: switch field  Enter: next/confirm  Esc: cancel",
+            Style::default().fg(Color::Gray),
+        ),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" New Pane ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+
+    // Show cursor in the active field
+    let cursor_y = match form.focused {
+        FormField::Name => popup_area.y + 3,
+        FormField::Command => popup_area.y + 5,
+    };
+    let field_text = match form.focused {
+        FormField::Name => &form.name,
+        FormField::Command => &form.command,
+    };
+    let cursor_x = popup_area.x + 12 + field_text.len() as u16;
+    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
 fn grid_columns(width: u16) -> usize {
@@ -124,30 +1114,56 @@ fn grid_columns(width: u16) -> usize {
     }
 }
 
-fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState, tick: u64) {
+fn render_session_card(
+    frame: &mut Frame,
+    area: Rect,
+    session: &SessionState,
+    tick: u64,
+    is_selected: bool,
+    display_name: Option<&String>,
+) {
     let (status_label, status_style) = status_style(&session.status);
     let status_color = status_style.fg.unwrap_or(Color::Gray);
 
-    // Truncate session_id to 11 chars
     let id_display = if session.session_id.len() > 11 {
         &session.session_id[..11]
     } else {
         &session.session_id
     };
 
-    let title_left = format!(" {} · {} ", session.agent_type, id_display);
+    let title_left = if let Some(name) = display_name {
+        format!(" {} ", name)
+    } else {
+        format!(" {} · {} ", session.agent_type, id_display)
+    };
 
     let dot = flash_dot(&session.status, tick);
 
+    let border_style = if is_selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(status_color)
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(status_color))
-        .title(Span::styled(title_left, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)))
+        .border_style(border_style)
+        .title(Span::styled(
+            title_left,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ))
         .title_alignment(ratatui::layout::Alignment::Left)
-        .title(Line::from(Span::styled(
-            format!(" {} {} ", dot, status_label),
-            status_style,
-        )).alignment(ratatui::layout::Alignment::Right));
+        .title(
+            Line::from(Span::styled(
+                format!(" {} {} ", dot, status_label),
+                status_style,
+            ))
+            .alignment(ratatui::layout::Alignment::Right),
+        );
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -158,14 +1174,15 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState, ti
     let cwd_display = session
         .cwd
         .as_deref()
-        .unwrap_or("—");
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_else(|| "—".into());
 
     let elapsed = format_elapsed(session.last_activity);
 
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     if wide {
-        // Dir + stats on one line
         lines.push(padded_line(
             vec![
                 Span::styled("Dir:  ", Style::default().fg(Color::Gray)),
@@ -186,9 +1203,8 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState, ti
         ]));
     }
 
-    // Prompt line
     if let Some(ref prompt) = session.last_user_prompt {
-        let max_prompt = w.saturating_sub(6); // 6 = "Prmt: "
+        let max_prompt = w.saturating_sub(6);
         let display = if prompt.len() > max_prompt {
             format!("{}…", &prompt[..max_prompt])
         } else {
@@ -200,7 +1216,6 @@ fn render_session_card(frame: &mut Frame, area: Rect, session: &SessionState, ti
         ]));
     }
 
-    // In narrow mode, stats are a separate line
     if !wide {
         lines.push(Line::from(vec![
             Span::styled("Last: ", Style::default().fg(Color::Gray)),
@@ -318,6 +1333,10 @@ mod tests {
     use ratatui::Terminal;
     use std::collections::HashMap;
 
+    fn default_ui() -> UiState {
+        UiState::default()
+    }
+
     #[test]
     fn test_format_elapsed() {
         let now = Utc::now();
@@ -355,8 +1374,10 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let state = AppState::default();
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, 0))
+            .draw(|frame| render_frame(frame, &state, &mut ui, &filtered, 0, false))
             .unwrap();
     }
 
@@ -367,7 +1388,6 @@ mod tests {
 
         let mut state = AppState::default();
 
-        // Session 1: working with a tool
         let mut event1 = AgentEvent {
             session_id: "session-abc-123".to_string(),
             agent_type: AgentType::ClaudeCode,
@@ -378,6 +1398,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
+            pane_id: None,
         };
         state.apply_event(event1.clone());
 
@@ -386,7 +1407,6 @@ mod tests {
         event1.tool_detail = Some("src/main.rs".to_string());
         state.apply_event(event1);
 
-        // Session 2: idle
         let event2 = AgentEvent {
             session_id: "session-def-456".to_string(),
             agent_type: AgentType::ClaudeCode,
@@ -397,11 +1417,14 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
+            pane_id: None,
         };
         state.apply_event(event2);
 
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, 0))
+            .draw(|frame| render_frame(frame, &state, &mut ui, &filtered, 0, false))
             .unwrap();
     }
 
@@ -411,17 +1434,27 @@ mod tests {
         use std::collections::VecDeque;
 
         let mut events = VecDeque::new();
-        for (name, detail) in [("Read", "src/main.rs"), ("Write", "out.txt"), ("Bash", ""), ("Grep", "pattern")] {
+        for (name, detail) in [
+            ("Read", "src/main.rs"),
+            ("Write", "out.txt"),
+            ("Bash", ""),
+            ("Grep", "pattern"),
+        ] {
             events.push_back(AgentEvent {
                 session_id: "s1".to_string(),
                 agent_type: AgentType::ClaudeCode,
                 event_type: EventType::ToolStart,
                 tool_name: Some(name.to_string()),
-                tool_detail: if detail.is_empty() { None } else { Some(detail.to_string()) },
+                tool_detail: if detail.is_empty() {
+                    None
+                } else {
+                    Some(detail.to_string())
+                },
                 cwd: None,
                 timestamp: Utc::now(),
                 user_prompt: None,
                 metadata: HashMap::new(),
+                pane_id: None,
             });
         }
 
@@ -436,11 +1469,11 @@ mod tests {
             recent_events: events,
             tool_count: 0,
             last_user_prompt: None,
+            pane_id: None,
         };
 
         let lines = recent_tool_lines(&session);
         assert_eq!(lines.len(), 3);
-        // Should be the last 3 ToolStart events in chronological order
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert_eq!(text[0], "  Write — out.txt");
         assert_eq!(text[1], "  Bash");
@@ -463,30 +1496,40 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
+            pane_id: None,
         };
         state.apply_event(event.clone());
 
-        // Send a thinking event with a prompt
         event.event_type = EventType::Thinking;
         event.user_prompt = Some("fix the login bug".to_string());
         state.apply_event(event);
 
-        // Should render without panic and session should have prompt
         assert_eq!(
             state.sessions["s1"].last_user_prompt.as_deref(),
             Some("fix the login bug")
         );
 
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, 0))
+            .draw(|frame| render_frame(frame, &state, &mut ui, &filtered, 0, false))
             .unwrap();
     }
 
     #[test]
     fn test_flash_dot() {
-        assert_eq!(flash_dot(&crate::state::SessionStatus::WaitingForInput, 0), "●");
-        assert_eq!(flash_dot(&crate::state::SessionStatus::WaitingForInput, 1), " ");
-        assert_eq!(flash_dot(&crate::state::SessionStatus::WaitingForInput, 2), "●");
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 0),
+            "●"
+        );
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 1),
+            " "
+        );
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 2),
+            "●"
+        );
         assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 0), "●");
         assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 1), "●");
         assert_eq!(flash_dot(&crate::state::SessionStatus::Idle, 1), "●");
@@ -505,7 +1548,6 @@ mod tests {
 
     #[test]
     fn test_render_wide_grid_layout() {
-        // 120 wide = 2 columns, 2 sessions should render in one row
         let backend = TestBackend::new(120, 20);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -521,12 +1563,383 @@ mod tests {
                 timestamp: Utc::now(),
                 user_prompt: None,
                 metadata: HashMap::new(),
+                pane_id: None,
             });
         }
 
-        // 3 sessions at 2 cols = 2 rows, needs 1 (title) + 10 + 10 = 21, we have 20 — still renders
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, 0))
+            .draw(|frame| render_frame(frame, &state, &mut ui, &filtered, 0, false))
             .unwrap();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Navigation tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_navigate_grid_single_column() {
+        // 5 items, 1 column
+        assert_eq!(navigate_grid(0, Direction::Down, 1, 5), 1);
+        assert_eq!(navigate_grid(4, Direction::Down, 1, 5), 4); // at bottom
+        assert_eq!(navigate_grid(0, Direction::Up, 1, 5), 0); // at top
+        assert_eq!(navigate_grid(3, Direction::Up, 1, 5), 2);
+        // Left/Right are no-ops in single column
+        assert_eq!(navigate_grid(2, Direction::Left, 1, 5), 2);
+        assert_eq!(navigate_grid(2, Direction::Right, 1, 5), 2);
+    }
+
+    #[test]
+    fn test_navigate_grid_two_columns() {
+        // 5 items, 2 columns:
+        // [0] [1]
+        // [2] [3]
+        // [4]
+        assert_eq!(navigate_grid(0, Direction::Right, 2, 5), 1);
+        assert_eq!(navigate_grid(1, Direction::Left, 2, 5), 0);
+        assert_eq!(navigate_grid(0, Direction::Down, 2, 5), 2);
+        assert_eq!(navigate_grid(2, Direction::Up, 2, 5), 0);
+        // Down from col 1 row 1 to col 1 row 2 — but index 5 doesn't exist, clamp to 4
+        assert_eq!(navigate_grid(3, Direction::Down, 2, 5), 4);
+        // Right from last item
+        assert_eq!(navigate_grid(4, Direction::Right, 2, 5), 4);
+        // Left from first col
+        assert_eq!(navigate_grid(0, Direction::Left, 2, 5), 0);
+    }
+
+    #[test]
+    fn test_navigate_grid_three_columns() {
+        // 7 items, 3 columns:
+        // [0] [1] [2]
+        // [3] [4] [5]
+        // [6]
+        assert_eq!(navigate_grid(1, Direction::Down, 3, 7), 4);
+        assert_eq!(navigate_grid(4, Direction::Up, 3, 7), 1);
+        assert_eq!(navigate_grid(5, Direction::Down, 3, 7), 6); // col 2 row 2 -> last item
+        assert_eq!(navigate_grid(6, Direction::Up, 3, 7), 3);
+        assert_eq!(navigate_grid(2, Direction::Right, 3, 7), 2); // at right edge
+    }
+
+    #[test]
+    fn test_navigate_grid_empty() {
+        assert_eq!(navigate_grid(0, Direction::Down, 2, 0), 0);
+        assert_eq!(navigate_grid(0, Direction::Up, 2, 0), 0);
+    }
+
+    #[test]
+    fn test_navigate_grid_single_item() {
+        assert_eq!(navigate_grid(0, Direction::Down, 2, 1), 0);
+        assert_eq!(navigate_grid(0, Direction::Up, 2, 1), 0);
+        assert_eq!(navigate_grid(0, Direction::Left, 2, 1), 0);
+        assert_eq!(navigate_grid(0, Direction::Right, 2, 1), 0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Filter tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_sessions_no_filter() {
+        let mut state = AppState::default();
+        for id in ["a", "b", "c"] {
+            state.apply_event(AgentEvent {
+                session_id: id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: None,
+            });
+        }
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn test_filter_sessions_by_id() {
+        let mut state = AppState::default();
+        for id in ["alpha", "beta", "gamma"] {
+            state.apply_event(AgentEvent {
+                session_id: id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: None,
+            });
+        }
+
+        let mut ui = default_ui();
+        ui.filter_text = "bet".to_string();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "beta");
+    }
+
+    #[test]
+    fn test_filter_sessions_by_cwd() {
+        let mut state = AppState::default();
+        state.apply_event(AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/home/user/myproject".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+        });
+        state.apply_event(AgentEvent {
+            session_id: "s2".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp/other".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+        });
+
+        let mut ui = default_ui();
+        ui.filter_text = "myproject".to_string();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "s1");
+    }
+
+    #[test]
+    fn test_filter_sessions_by_display_name() {
+        let mut state = AppState::default();
+        state.apply_event(AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+        });
+        state.apply_event(AgentEvent {
+            session_id: "s2".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+        });
+
+        let mut ui = default_ui();
+        ui.display_names
+            .insert("s1".to_string(), "frontend".to_string());
+        ui.filter_text = "front".to_string();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "s1");
+    }
+
+    #[test]
+    fn test_filter_sessions_case_insensitive() {
+        let mut state = AppState::default();
+        state.apply_event(AgentEvent {
+            session_id: "MySession".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+        });
+
+        let mut ui = default_ui();
+        ui.filter_text = "mysess".to_string();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Mode transition tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_mode_transitions() {
+        let mut ui = default_ui();
+        assert_eq!(ui.mode, UiMode::Normal);
+
+        // Normal -> Filter
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+        );
+        assert_eq!(ui.mode, UiMode::Filter);
+
+        // Filter -> Normal (Esc)
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
+
+        // Normal -> Help
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+        );
+        assert_eq!(ui.mode, UiMode::Help);
+
+        // Help -> Normal
+        handle_help_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
+
+        // Normal -> Rename
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+        );
+        assert_eq!(ui.mode, UiMode::Rename);
+
+        // Rename -> Normal (Esc)
+        handle_rename_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+            Some("s1"),
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
+    }
+
+    #[test]
+    fn test_rename_commits_on_enter() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::Rename;
+        ui.rename_text = "my-agent".to_string();
+
+        handle_rename_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            Some("session-123"),
+        );
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert_eq!(
+            ui.display_names.get("session-123"),
+            Some(&"my-agent".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_empty_removes_name() {
+        let mut ui = default_ui();
+        ui.display_names
+            .insert("s1".to_string(), "old-name".to_string());
+        ui.mode = UiMode::Rename;
+        ui.rename_text.clear();
+
+        handle_rename_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            Some("s1"),
+        );
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(!ui.display_names.contains_key("s1"));
+    }
+
+    #[test]
+    fn test_filter_typing() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::Filter;
+
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.filter_text, "ab");
+
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.filter_text, "a");
+
+        // Enter keeps filter
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert_eq!(ui.filter_text, "a");
+    }
+
+    #[test]
+    fn test_filter_esc_clears() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::Filter;
+        ui.filter_text = "hello".to_string();
+
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.filter_text.is_empty());
+    }
+
+    #[test]
+    fn test_normal_esc_clears_filter() {
+        let mut ui = default_ui();
+        ui.filter_text = "active-filter".to_string();
+
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+            5,
+        );
+        assert!(ui.filter_text.is_empty());
+    }
+
+    #[test]
+    fn test_rename_not_available_when_empty() {
+        let mut ui = default_ui();
+        // total = 0, rename should not activate
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut ui,
+            0,
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
     }
 }

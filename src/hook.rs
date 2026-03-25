@@ -115,6 +115,7 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
     );
 
     let user_prompt = input.prompt.map(|p| truncate(&p, 200));
+    let pane_id = std::env::var("ZELLIJ_PANE_ID").ok();
 
     Some(AgentEvent {
         session_id: input.session_id,
@@ -126,6 +127,7 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
         timestamp: Utc::now(),
         user_prompt,
         metadata: HashMap::new(),
+        pane_id,
     })
 }
 
