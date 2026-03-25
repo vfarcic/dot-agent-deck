@@ -33,10 +33,11 @@ This design means users never "leave" the dashboard — they always see both the
 ```rust
 trait PaneController {
     fn focus_pane(&self, pane_id: &str) -> Result<()>;
-    fn create_pane(&self, command: Option<&str>) -> Result<String>;  // returns pane_id
+    fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String>;
     fn close_pane(&self, pane_id: &str) -> Result<()>;
     fn list_panes(&self) -> Result<Vec<PaneInfo>>;
     fn resize_pane(&self, pane_id: &str, direction: Direction, amount: u16) -> Result<()>;
+    fn rename_pane(&self, pane_id: &str, name: &str) -> Result<()>;
 }
 ```
 
@@ -88,15 +89,13 @@ PANE_ID=$(printenv ZELLIJ_PANE_ID 2>/dev/null || echo "unknown")
 
 #### Pane Control
 - `Enter`: expand and focus the selected agent's pane in the stacked area (2/3 right column)
-- `n`: open directory picker, then create a new pane in the selected directory
+- `n`: open directory picker → name/command form → create pane (name defaults to dir basename, command defaults to config `default_command`)
 - `d`: close the selected agent's pane
 
 #### Zellij Shortcuts (work from any pane)
 - `Alt+h` / `Alt+d`: go to dashboard
 - `Alt+j` / `Alt+k`: navigate between stacked panes
-- `Alt+l`: go to agent pane area
 - `Alt+w`: close current pane
-- `Alt+n`: create new pane (via Zellij)
 - `Alt+q`: quit all (exit Zellij session)
 
 #### General
@@ -112,6 +111,11 @@ PANE_ID=$(printenv ZELLIJ_PANE_ID 2>/dev/null || echo "unknown")
 - **IPC to zellij**: Shell out to `zellij` CLI via `std::process::Command`
 - **Pane detection**: Parse `zellij action list-panes` output or use zellij pipe protocol
 - **Multiplexer detection**: Check `$ZELLIJ` env var (set when running inside zellij). Future: check `$TMUX` for tmux support.
+- **Multi-word commands**: Wrapped via `$SHELL -c "cmd"` so pipes, `&&`, etc. work correctly
+- **Configuration**: `~/.config/dot-agent-deck/config.toml` with `default_command` for new panes
+- **Platform labels**: Modifier key shown as `Opt` on macOS, `Alt` on Linux (compile-time detection)
+- **Card scrolling**: Dashboard scrolls vertically when session cards exceed terminal height
+- **Pane naming**: New pane name applied to both Zellij pane title and dashboard display name
 
 ## Non-Goals (v1)
 
@@ -130,9 +134,12 @@ PANE_ID=$(printenv ZELLIJ_PANE_ID 2>/dev/null || echo "unknown")
 - [x] Pane-session mapping: link session_ids to zellij pane IDs via adapter
 - [x] Focus switching: `Enter` to switch to agent pane, return-to-dashboard mechanism
 - [x] Two-column stacked layout: dashboard (1/3) + stacked agent panes (2/3) via swap layouts
-- [x] Pane creation: `n` opens directory picker, creates pane in selected dir
+- [x] Pane creation: `n` opens directory picker → name/command form → creates pane
 - [x] Focus switching update: `Enter` expands the selected agent in the stacked area
 - [x] Pane management: `d` closes selected pane, `Alt+w` closes current pane from anywhere
+- [x] UI polish: vertical scrolling, simplified legend, platform-aware key labels, dir basename in cards
+- [x] New pane form: name (defaults to dir basename) + command (defaults to config), pane rename via Zellij
+- [x] Configuration: `~/.config/dot-agent-deck/config.toml` with `default_command` setting
 
 ## Future: tmux Support
 

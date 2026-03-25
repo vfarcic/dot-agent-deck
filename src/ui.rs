@@ -26,6 +26,12 @@ impl fmt::Display for crate::event::AgentType {
 }
 
 // ---------------------------------------------------------------------------
+// Platform-aware modifier key label
+// ---------------------------------------------------------------------------
+
+const MOD_KEY: &str = if cfg!(target_os = "macos") { "Opt" } else { "Alt" };
+
+// ---------------------------------------------------------------------------
 // UI state types
 // ---------------------------------------------------------------------------
 
@@ -126,6 +132,7 @@ struct UiState {
     status_message: Option<(String, std::time::Instant)>,
     dir_picker: Option<DirPickerState>,
     new_pane_form: Option<NewPaneFormState>,
+    pane_names: HashMap<String, String>,
     config: DashboardConfig,
 }
 
@@ -142,6 +149,7 @@ impl UiState {
             status_message: None,
             dir_picker: None,
             new_pane_form: None,
+            pane_names: HashMap::new(),
             config,
         }
     }
@@ -530,6 +538,18 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>, config: Dashbo
         }
 
         let snapshot = state.blocking_read().clone();
+
+        // Apply pending pane names to sessions that have appeared
+        if !ui.pane_names.is_empty() {
+            for (sid, session) in &snapshot.sessions {
+                if let Some(ref pane_id) = session.pane_id {
+                    if let Some(name) = ui.pane_names.remove(pane_id) {
+                        ui.display_names.insert(sid.clone(), name);
+                    }
+                }
+            }
+        }
+
         let filtered = filter_sessions(&snapshot, &ui);
         let total = filtered.len();
 
@@ -600,6 +620,7 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>, config: Dashbo
                                 Ok(new_id) => {
                                     if !req.name.is_empty() {
                                         let _ = pane.rename_pane(&new_id, &req.name);
+                                        ui.pane_names.insert(new_id.clone(), req.name);
                                     }
                                     ui.status_message = Some((
                                         format!("Created pane {new_id} in {dir_str}"),
@@ -849,9 +870,9 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
                 frame.render_widget(Paragraph::new(line), area);
             } else {
                 let hints = if has_pane_control {
-                    "?: help  Alt+q: quit all  Alt+d: dashboard"
+                    format!("?: help  {MOD_KEY}+q: quit all  {MOD_KEY}+d: dashboard")
                 } else {
-                    "?: help  q: quit"
+                    "?: help  q: quit".to_string()
                 };
                 let line = Line::styled(hints, Style::default().fg(Color::Gray));
                 frame.render_widget(Paragraph::new(line), area);
@@ -910,10 +931,10 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
                 .add_modifier(Modifier::BOLD),
         ));
         help_text.push(Line::from(""));
-        help_text.push(Line::from("  Alt+h         Go to dashboard"));
-        help_text.push(Line::from("  Alt+j/k       Navigate stacked panes"));
-        help_text.push(Line::from("  Alt+w         Close current pane"));
-        help_text.push(Line::from("  Alt+q         Quit all"));
+        help_text.push(Line::from(format!("  {MOD_KEY}+h         Go to dashboard")));
+        help_text.push(Line::from(format!("  {MOD_KEY}+j/k       Navigate stacked panes")));
+        help_text.push(Line::from(format!("  {MOD_KEY}+w         Close current pane")));
+        help_text.push(Line::from(format!("  {MOD_KEY}+q         Quit all")));
     }
 
     help_text.push(Line::from(""));
@@ -1150,7 +1171,12 @@ fn render_session_card(
     let w = inner.width as usize;
     let wide = w >= 60;
 
-    let cwd_display = session.cwd.as_deref().unwrap_or("—");
+    let cwd_display = session
+        .cwd
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_else(|| "—".into());
 
     let elapsed = format_elapsed(session.last_activity);
 
