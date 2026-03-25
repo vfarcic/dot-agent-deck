@@ -15,7 +15,7 @@ Create comprehensive user-facing documentation that covers the full user journey
 
 ### Documentation Structure
 
-```
+```text
 README.md                      # Project overview, quick start, badges, links
 docs/
   installation.md              # Prerequisites, build from source, binary install

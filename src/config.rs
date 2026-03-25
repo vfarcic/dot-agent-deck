@@ -32,8 +32,18 @@ impl DashboardConfig {
     pub fn load() -> Self {
         let path = config_path();
         match std::fs::read_to_string(&path) {
-            Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
-            Err(_) => Self::default(),
+            Ok(contents) => match toml::from_str(&contents) {
+                Ok(config) => config,
+                Err(err) => {
+                    eprintln!("Invalid config at {}: {err}", path.display());
+                    Self::default()
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => {
+                eprintln!("Failed to read config at {}: {err}", path.display());
+                Self::default()
+            }
         }
     }
 }

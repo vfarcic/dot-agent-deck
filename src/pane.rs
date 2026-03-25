@@ -118,6 +118,9 @@ impl PaneController for ZellijController {
         )))
     }
 
+    // Note: Zellij's `new-pane` doesn't return the created pane ID, so we diff
+    // list_panes() before/after. This has a theoretical race if another pane is
+    // created concurrently, but in practice the dashboard is the only pane creator.
     fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError> {
         let before = self.list_panes()?;
 

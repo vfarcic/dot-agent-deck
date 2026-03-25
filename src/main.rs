@@ -122,11 +122,19 @@ fn maybe_exec_zellij() -> Option<ExitCode> {
         .output()
         .is_err()
     {
-        eprintln!("Zellij is required but not found on PATH.");
-        eprintln!("Install it with one of:");
+        eprintln!("Warning: Zellij not found on PATH. Running dashboard without pane control.");
+        eprintln!("Install Zellij for full functionality:");
         eprintln!("  brew install zellij");
         eprintln!("  cargo install zellij");
         eprintln!("  https://zellij.dev/documentation/installation");
+        // Fall through to run_dashboard() with NoopController
+        return None;
+    }
+
+    // Create a private per-process runtime directory for launcher files.
+    let runtime_dir = std::env::temp_dir().join(format!("dot-agent-deck-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&runtime_dir) {
+        eprintln!("Failed to create runtime directory: {e}");
         return Some(ExitCode::FAILURE);
     }
 
@@ -137,15 +145,16 @@ fn maybe_exec_zellij() -> Option<ExitCode> {
     // Write a shell wrapper that Zellij will start as the pane "shell".
     // This is more reliable than layout `command` which Zellij sometimes ignores.
     let shell_script = format!("#!/bin/sh\nexec \"{self_path}\"\n");
-    let shell_path = "/tmp/dot-agent-deck-shell.sh";
-    if let Err(e) = std::fs::write(shell_path, &shell_script) {
+    let shell_path = runtime_dir.join("shell.sh");
+    let shell_path_str = shell_path.display().to_string();
+    if let Err(e) = std::fs::write(&shell_path, &shell_script) {
         eprintln!("Failed to write shell script: {e}");
         return Some(ExitCode::FAILURE);
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(shell_path, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(&shell_path, std::fs::Permissions::from_mode(0o755));
     }
 
     // Layout: two-column split — dashboard (1/3) + stacked agent panes (2/3).
@@ -156,7 +165,7 @@ fn maybe_exec_zellij() -> Option<ExitCode> {
         children
     }}
     tab {{
-        pane borderless=true command="{shell_path}"
+        pane borderless=true command="{shell_path_str}"
     }}
 
     swap_tiled_layout name="dashboard" {{
@@ -178,8 +187,9 @@ fn maybe_exec_zellij() -> Option<ExitCode> {
 "#
     );
 
-    let layout_path = "/tmp/dot-agent-deck-layout.kdl";
-    if let Err(e) = std::fs::write(layout_path, layout) {
+    let layout_path = runtime_dir.join("layout.kdl");
+    let layout_path_str = layout_path.display().to_string();
+    if let Err(e) = std::fs::write(&layout_path, layout) {
         eprintln!("Failed to write layout file: {e}");
         return Some(ExitCode::FAILURE);
     }
@@ -213,31 +223,39 @@ keybinds clear-defaults=true {{
 "#
     );
 
-    let config_dir = "/tmp/dot-agent-deck-zellij";
-    let _ = std::fs::create_dir_all(config_dir);
-    let config_path = format!("{config_dir}/config.kdl");
+    let config_dir = runtime_dir.join("zellij-config");
+    let config_dir_str = config_dir.display().to_string();
+    let _ = std::fs::create_dir_all(&config_dir);
+    let config_path = config_dir.join("config.kdl");
     if let Err(e) = std::fs::write(&config_path, &config) {
         eprintln!("Failed to write config file: {e}");
         return Some(ExitCode::FAILURE);
     }
 
-    // Kill and delete any stale session from a previous run so we always start fresh.
-    // kill-session stops it; delete-session removes it so --layout won't reattach.
-    let _ = std::process::Command::new("zellij")
-        .args(["kill-session", "dot-agent-deck"])
-        .output();
-    let _ = std::process::Command::new("zellij")
-        .args(["delete-session", "dot-agent-deck", "--force"])
-        .output();
+    // Check if a session already exists and attach to it instead of destroying it.
+    let session_name = "dot-agent-deck";
+    if let Ok(output) = std::process::Command::new("zellij")
+        .args(["list-sessions", "--short"])
+        .output()
+    {
+        let sessions = String::from_utf8_lossy(&output.stdout);
+        if sessions.lines().any(|line| line.trim() == session_name) {
+            let err = std::process::Command::new("zellij")
+                .args(["attach", session_name])
+                .exec();
+            eprintln!("Failed to attach to zellij session: {err}");
+            return Some(ExitCode::FAILURE);
+        }
+    }
 
     let err = std::process::Command::new("zellij")
         .args([
             "--session",
-            "dot-agent-deck",
+            session_name,
             "--new-session-with-layout",
-            layout_path,
+            &layout_path_str,
             "--config-dir",
-            config_dir,
+            &config_dir_str,
         ])
         .exec();
 
