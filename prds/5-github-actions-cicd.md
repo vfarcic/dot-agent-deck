@@ -1,6 +1,6 @@
 # PRD #5: GitHub Actions CI/CD Workflows
 
-**Status**: Not Started
+**Status**: Complete
 **Priority**: High
 **GitHub Issue**: [#5](https://github.com/vfarcic/dot-agent-deck/issues/5)
 **Reference**: Follows similar patterns to [dot-ai CI/CD workflows](https://github.com/vfarcic/dot-ai)
@@ -93,12 +93,12 @@ Following dot-ai's approach:
 
 ## Milestones
 
-- [ ] CI workflow: cargo fmt, clippy, build, and test on PRs
-- [ ] Security workflow: cargo audit for dependency vulnerabilities
-- [ ] Changelog infrastructure: `changelog.d/` fragments and assembly script
-- [ ] Release workflow: multi-platform binary builds on tag push
-- [ ] Release workflow: GitHub release creation with changelog and binary attachments
-- [ ] Supporting workflows: PR labeler and stale issue/PR management
+- [x] CI workflow: cargo fmt, clippy, build, and test on PRs
+- [x] Security workflow: cargo audit for dependency vulnerabilities
+- [x] Changelog infrastructure: `changelog.d/` fragments and assembly script
+- [x] Release workflow: multi-platform binary builds on tag push
+- [x] Release workflow: GitHub release creation with changelog and binary attachments
+- [x] Supporting workflows: PR labeler and stale issue/PR management
 
 ## Success Criteria
 
