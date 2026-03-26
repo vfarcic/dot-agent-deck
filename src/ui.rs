@@ -272,6 +272,16 @@ enum KeyResult {
     ClosePane,
 }
 
+/// Detect Alt+1 … Alt+9 and return the digit (1–9).
+fn alt_digit(key: KeyEvent) -> Option<u8> {
+    if key.modifiers.contains(KeyModifiers::ALT)
+        && let KeyCode::Char(c @ '1'..='9') = key.code
+    {
+        return Some(c as u8 - b'0');
+    }
+    None
+}
+
 fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return KeyResult::Quit;
@@ -579,6 +589,36 @@ pub fn run_tui(
 
         if crossterm::event::poll(std::time::Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
+                // Alt+1..9: jump to card N and focus its pane (works from any mode)
+                if let Some(card_num) = alt_digit(key) {
+                    let idx = (card_num as usize).saturating_sub(1);
+                    if idx < total {
+                        ui.selected_index = idx;
+                        ui.mode = UiMode::Normal;
+                        if let Some((sid, _)) = filtered.get(idx)
+                            && let Some(session) = snapshot.sessions.get(*sid)
+                        {
+                            if let Some(ref pane_id) = session.pane_id {
+                                match pane.focus_pane(pane_id) {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        ui.status_message = Some((
+                                            format!("Focus failed: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                ui.status_message = Some((
+                                    format!("No pane linked to session {sid}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 let selected_id: Option<String> =
                     filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
 
@@ -819,6 +859,10 @@ fn render_frame(
             let flat_index = (ui.scroll_offset + vi) * cols + col_idx;
             let is_selected = flat_index == ui.selected_index;
             let display_name = ids.get(col_idx).and_then(|id| ui.display_names.get(*id));
+            let card_number = {
+                let n = flat_index + 1;
+                if n <= 9 { Some(n as u8) } else { None }
+            };
             render_session_card(
                 frame,
                 col_chunks[col_idx],
@@ -826,6 +870,7 @@ fn render_frame(
                 tick,
                 is_selected,
                 display_name,
+                card_number,
             );
         }
     }
@@ -887,9 +932,11 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
                 frame.render_widget(Paragraph::new(line), area);
             } else {
                 let hints = if has_pane_control {
-                    format!("?: help  {MOD_KEY}+q: quit all  {MOD_KEY}+d: dashboard")
+                    format!(
+                        "?: help  {MOD_KEY}+1-9: jump  {MOD_KEY}+q: quit all  {MOD_KEY}+d: dashboard"
+                    )
                 } else {
-                    "?: help  q: quit".to_string()
+                    format!("?: help  {MOD_KEY}+1-9: jump  q: quit")
                 };
                 let line = Line::styled(hints, Style::default().fg(Color::Gray));
                 frame.render_widget(Paragraph::new(line), area);
@@ -901,7 +948,7 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
 fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     let area = frame.area();
     let popup_width = 52.min(area.width.saturating_sub(4));
-    let base_height: u16 = if has_pane_control { 29 } else { 16 };
+    let base_height: u16 = if has_pane_control { 30 } else { 17 };
     let popup_height = base_height.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -921,6 +968,7 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
         Line::from("  k / Up        Move up"),
         Line::from("  h / Left      Move left"),
         Line::from("  l / Right     Move right"),
+        Line::from(format!("  {MOD_KEY}+1-9       Jump to card N")),
         Line::from("  /             Filter sessions"),
         Line::from("  r             Rename session"),
         Line::from("  ?             Toggle this help"),
@@ -1160,6 +1208,7 @@ fn render_session_card(
     tick: u64,
     is_selected: bool,
     display_name: Option<&String>,
+    card_number: Option<u8>,
 ) {
     let (status_label, status_style) = status_style(&session.status);
     let status_color = status_style.fg.unwrap_or(Color::Gray);
@@ -1170,10 +1219,14 @@ fn render_session_card(
         &session.session_id
     };
 
+    let num_prefix = match card_number {
+        Some(n) => format!("{n} "),
+        None => String::new(),
+    };
     let title_left = if let Some(name) = display_name {
-        format!(" {} ", name)
+        format!(" {num_prefix}{} ", name)
     } else {
-        format!(" {} · {} ", session.agent_type, id_display)
+        format!(" {num_prefix}{} · {} ", session.agent_type, id_display)
     };
 
     let dot = flash_dot(&session.status, tick);
@@ -1962,5 +2015,31 @@ mod tests {
             0,
         );
         assert_eq!(ui.mode, UiMode::Normal);
+    }
+
+    #[test]
+    fn test_alt_digit_detects_alt_1_through_9() {
+        for c in '1'..='9' {
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+            assert_eq!(alt_digit(key), Some(c as u8 - b'0'));
+        }
+    }
+
+    #[test]
+    fn test_alt_digit_ignores_non_alt() {
+        let key = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE);
+        assert_eq!(alt_digit(key), None);
+    }
+
+    #[test]
+    fn test_alt_digit_ignores_non_digit() {
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT);
+        assert_eq!(alt_digit(key), None);
+    }
+
+    #[test]
+    fn test_alt_digit_ignores_zero() {
+        let key = KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT);
+        assert_eq!(alt_digit(key), None);
     }
 }
