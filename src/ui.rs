@@ -137,6 +137,8 @@ struct UiState {
     dir_picker: Option<DirPickerState>,
     new_pane_form: Option<NewPaneFormState>,
     pane_names: HashMap<String, String>,
+    /// Maps pane_id → display name; survives session restarts (e.g. /clear).
+    pane_display_names: HashMap<String, String>,
     config: DashboardConfig,
 }
 
@@ -154,6 +156,7 @@ impl UiState {
             dir_picker: None,
             new_pane_form: None,
             pane_names: HashMap::new(),
+            pane_display_names: HashMap::new(),
             config,
         }
     }
@@ -563,6 +566,19 @@ pub fn run_tui(
             for (sid, session) in &snapshot.sessions {
                 if let Some(ref pane_id) = session.pane_id {
                     if let Some(name) = ui.pane_names.remove(pane_id) {
+                        ui.pane_display_names.insert(pane_id.clone(), name.clone());
+                        ui.display_names.insert(sid.clone(), name);
+                    }
+                }
+            }
+        }
+
+        // Restore display names for sessions whose pane already has a name
+        // (handles session restart after /clear)
+        for (sid, session) in &snapshot.sessions {
+            if let Some(ref pane_id) = session.pane_id {
+                if !ui.display_names.contains_key(sid) {
+                    if let Some(name) = ui.pane_display_names.get(pane_id).cloned() {
                         ui.display_names.insert(sid.clone(), name);
                     }
                 }
@@ -667,6 +683,8 @@ pub fn run_tui(
                                 Ok(new_id) => {
                                     if !req.name.is_empty() {
                                         let _ = pane.rename_pane(&new_id, &req.name);
+                                        ui.pane_display_names
+                                            .insert(new_id.clone(), req.name.clone());
                                         ui.pane_names.insert(new_id.clone(), req.name);
                                     }
                                     ui.status_message = Some((
@@ -711,6 +729,19 @@ pub fn run_tui(
                         }
                     }
                     KeyResult::Continue => {}
+                }
+
+                // Keep pane_display_names in sync with display_names
+                // so renames persist across session restarts.
+                for (sid, session) in &snapshot.sessions {
+                    if let Some(ref pane_id) = session.pane_id {
+                        if let Some(name) = ui.display_names.get(sid) {
+                            ui.pane_display_names
+                                .insert(pane_id.clone(), name.clone());
+                        } else {
+                            ui.pane_display_names.remove(pane_id);
+                        }
+                    }
                 }
             }
         }
@@ -1747,7 +1778,7 @@ mod tests {
             });
         }
 
-        let mut ui = default_ui();
+        let ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         assert_eq!(filtered.len(), 3);
     }
