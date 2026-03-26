@@ -736,8 +736,7 @@ pub fn run_tui(
                 for (sid, session) in &snapshot.sessions {
                     if let Some(ref pane_id) = session.pane_id {
                         if let Some(name) = ui.display_names.get(sid) {
-                            ui.pane_display_names
-                                .insert(pane_id.clone(), name.clone());
+                            ui.pane_display_names.insert(pane_id.clone(), name.clone());
                         } else {
                             ui.pane_display_names.remove(pane_id);
                         }
