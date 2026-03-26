@@ -125,8 +125,7 @@ impl PaneController for ZellijController {
         let before = self.list_panes()?;
 
         // Build args for new-pane. The swap layout automatically stacks panes in the right column.
-        let default_shell =
-            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let mut args = vec!["action", "new-pane"];
         let cwd_val;
         if let Some(dir) = cwd {
@@ -184,24 +183,12 @@ impl PaneController for ZellijController {
         direction: PaneDirection,
         _amount: u16,
     ) -> Result<(), PaneError> {
-        self.run_zellij(&[
-            "action",
-            "resize",
-            direction.as_str(),
-            "--pane-id",
-            pane_id,
-        ])?;
+        self.run_zellij(&["action", "resize", direction.as_str(), "--pane-id", pane_id])?;
         Ok(())
     }
 
     fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError> {
-        self.run_zellij(&[
-            "action",
-            "rename-pane",
-            name,
-            "--pane-id",
-            pane_id,
-        ])?;
+        self.run_zellij(&["action", "rename-pane", name, "--pane-id", pane_id])?;
         Ok(())
     }
 
@@ -399,9 +386,7 @@ mod tests {
         assert!(ctrl.create_pane(None, None).is_err());
         assert!(ctrl.close_pane("1").is_err());
         assert!(ctrl.list_panes().is_err());
-        assert!(ctrl
-            .resize_pane("1", PaneDirection::Up, 1)
-            .is_err());
+        assert!(ctrl.resize_pane("1", PaneDirection::Up, 1).is_err());
     }
 
     #[test]

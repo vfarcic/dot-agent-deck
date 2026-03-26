@@ -43,9 +43,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout main
           git add CHANGELOG.md changelog.d/
           git diff --cached --quiet || git commit -m "docs: update changelog for v${{ steps.version.outputs.version }}"
-          git push origin HEAD:main
+          git push origin main
 
   build:
     needs: prepare
@@ -133,8 +134,12 @@ jobs:
       - name: Generate Homebrew formula
         run: task homebrew-formula VERSION=v${{ needs.prepare.outputs.version }}
       - name: Publish Homebrew formula
-        run: task homebrew-publish VERSION=v${{ needs.prepare.outputs.version }} HOMEBREW_TAP_TOKEN=${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: task homebrew-publish VERSION=v${{ needs.prepare.outputs.version }}
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
       - name: Generate Scoop manifest
         run: task scoop-manifest VERSION=v${{ needs.prepare.outputs.version }}
       - name: Publish Scoop manifest
-        run: task scoop-publish VERSION=v${{ needs.prepare.outputs.version }} SCOOP_BUCKET_TOKEN=${{ secrets.SCOOP_BUCKET_TOKEN }}
+        run: task scoop-publish VERSION=v${{ needs.prepare.outputs.version }}
+        env:
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}

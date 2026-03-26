@@ -25,6 +25,14 @@ tasks:
         sh: grep 'dot-agent-deck-linux-amd64$' dist/checksums.txt | awk '{print $1}'
     cmds:
       - |
+        for var in "SHA_DARWIN_ARM64:{{.SHA_DARWIN_ARM64}}" "SHA_DARWIN_AMD64:{{.SHA_DARWIN_AMD64}}" "SHA_LINUX_ARM64:{{.SHA_LINUX_ARM64}}" "SHA_LINUX_AMD64:{{.SHA_LINUX_AMD64}}"; do
+          name="${var%%:*}"
+          value="${var#*:}"
+          if [ -z "$value" ]; then
+            echo "Error: $name is empty — check dist/checksums.txt" >&2
+            exit 1
+          fi
+        done
         cat > dist/dot-agent-deck.rb << 'FORMULA'
         class DotAgentDeck < Formula
           desc "TUI dashboard for monitoring AI agent sessions"
@@ -66,13 +74,17 @@ tasks:
   homebrew-publish:
     desc: Push Homebrew formula to the tap repository
     requires:
-      vars: [VERSION, HOMEBREW_TAP_TOKEN]
+      vars: [VERSION]
     cmds:
       - |
+        if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+          echo "Error: HOMEBREW_TAP_TOKEN environment variable is required"
+          exit 1
+        fi
         WORK_DIR=$(mktemp -d)
         trap 'rm -rf "$WORK_DIR"' EXIT
         cd "$WORK_DIR"
-        git clone --quiet "https://x-access-token:{{.HOMEBREW_TAP_TOKEN}}@github.com/vfarcic/homebrew-tap.git" .
+        git clone --quiet "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/vfarcic/homebrew-tap.git" .
         mkdir -p Formula
         cp {{.TASKFILE_DIR}}/dist/dot-agent-deck.rb Formula/dot-agent-deck.rb
         git add Formula/dot-agent-deck.rb
@@ -121,13 +133,17 @@ tasks:
   scoop-publish:
     desc: Push Scoop manifest to the bucket repository
     requires:
-      vars: [VERSION, SCOOP_BUCKET_TOKEN]
+      vars: [VERSION]
     cmds:
       - |
+        if [ -z "$SCOOP_BUCKET_TOKEN" ]; then
+          echo "Error: SCOOP_BUCKET_TOKEN environment variable is required"
+          exit 1
+        fi
         WORK_DIR=$(mktemp -d)
         trap 'rm -rf "$WORK_DIR"' EXIT
         cd "$WORK_DIR"
-        git clone --quiet "https://x-access-token:{{.SCOOP_BUCKET_TOKEN}}@github.com/vfarcic/scoop-bucket.git" .
+        git clone --quiet "https://x-access-token:$SCOOP_BUCKET_TOKEN@github.com/vfarcic/scoop-bucket.git" .
         cp {{.TASKFILE_DIR}}/dist/dot-agent-deck.json dot-agent-deck.json
         git add dot-agent-deck.json
         git config user.name "github-actions[bot]"

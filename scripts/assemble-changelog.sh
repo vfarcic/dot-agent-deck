@@ -15,6 +15,7 @@ declare -A TYPE_HEADERS=(
 )
 
 section=""
+processed_files=()
 
 for type in added changed fixed removed; do
   fragments=()
@@ -25,6 +26,7 @@ for type in added changed fixed removed; do
   if [ ${#fragments[@]} -gt 0 ]; then
     section+="### ${TYPE_HEADERS[$type]}"$'\n\n'
     for f in "${fragments[@]}"; do
+      processed_files+=("$f")
       while IFS= read -r line; do
         section+="- $line"$'\n'
       done < "$f"
@@ -44,13 +46,21 @@ release_section="## [$VERSION] - $DATE"$'\n\n'"$section"
 # Output to stdout (used by release workflow for release notes)
 echo "$release_section"
 
-# Prepend to CHANGELOG.md
+# Prepend to CHANGELOG.md, preserving the header if present
 if [ -f "$CHANGELOG_FILE" ]; then
-  existing=$(cat "$CHANGELOG_FILE")
-  printf '%s\n\n%s\n' "$release_section" "$existing" > "$CHANGELOG_FILE"
+  first_line=$(head -n 1 "$CHANGELOG_FILE")
+  if [[ "$first_line" =~ ^#\ Changelog ]]; then
+    rest=$(tail -n +2 "$CHANGELOG_FILE" | sed '/./,$!d')
+    printf '%s\n\n%s\n\n%s\n' "$first_line" "$release_section" "$rest" > "$CHANGELOG_FILE"
+  else
+    existing=$(cat "$CHANGELOG_FILE")
+    printf '%s\n\n%s\n' "$release_section" "$existing" > "$CHANGELOG_FILE"
+  fi
 else
   printf '# Changelog\n\n%s\n' "$release_section" > "$CHANGELOG_FILE"
 fi
 
-# Remove processed fragments (keep .gitkeep)
-find "$CHANGELOG_DIR" -name "*.md" ! -name ".gitkeep" -delete
+# Remove only processed fragments (keep .gitkeep and unprocessed files)
+for f in "${processed_files[@]}"; do
+  rm -f "$f"
+done
