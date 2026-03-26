@@ -290,6 +290,7 @@ fn parse_list_panes_json(output: &str) -> Result<Vec<PaneInfo>, PaneError> {
 }
 
 /// Parse tab-separated `zellij action list-panes` output (legacy fallback).
+#[cfg(test)]
 fn parse_list_panes(output: &str) -> Result<Vec<PaneInfo>, PaneError> {
     let mut panes = Vec::new();
     for line in output.lines() {
