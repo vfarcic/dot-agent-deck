@@ -195,12 +195,11 @@ fn maybe_exec_zellij() -> Option<ExitCode> {
     }
 
     // Config: suppress Zellij UI chrome and the welcome/tips popup.
-    let config = format!(
-        r#"simplified_ui true
+    let config = r#"simplified_ui true
 pane_frames true
 show_release_notes false
 disable_session_metadata true
-plugins {{
+plugins {
     tab-bar location="zellij:tab-bar"
     status-bar location="zellij:status-bar"
     strider location="zellij:strider"
@@ -208,20 +207,20 @@ plugins {{
     session-manager location="zellij:session-manager"
     configuration location="zellij:configuration"
     plugin-manager location="zellij:plugin-manager"
-}}
-load_plugins {{
-}}
-keybinds clear-defaults=true {{
-    normal {{
-        bind "Alt h" "Alt Left" "Alt d" {{ MoveFocus "Left"; }}
-        bind "Alt j" "Alt Down"  {{ MoveFocus "Down"; }}
-        bind "Alt k" "Alt Up"    {{ MoveFocus "Up"; }}
-        bind "Alt w" {{ CloseFocus; }}
-        bind "Alt q" {{ Quit; }}
-    }}
-}}
+}
+load_plugins {
+}
+keybinds clear-defaults=true {
+    normal {
+        bind "Alt h" "Alt Left" "Alt d" { MoveFocus "Left"; }
+        bind "Alt j" "Alt Down"  { MoveFocus "Down"; }
+        bind "Alt k" "Alt Up"    { MoveFocus "Up"; }
+        bind "Alt w" { CloseFocus; }
+        bind "Alt q" { Quit; }
+    }
+}
 "#
-    );
+    .to_string();
 
     let config_dir = runtime_dir.join("zellij-config");
     let config_dir_str = config_dir.display().to_string();

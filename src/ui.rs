@@ -186,7 +186,7 @@ fn navigate_grid(current: usize, dir: Direction, columns: usize, total: usize) -
     }
     let row = current / columns;
     let col = current % columns;
-    let total_rows = (total + columns - 1) / columns;
+    let total_rows = total.div_ceil(columns);
 
     match dir {
         Direction::Up => {
@@ -564,11 +564,11 @@ pub fn run_tui(
         // Apply pending pane names to sessions that have appeared
         if !ui.pane_names.is_empty() {
             for (sid, session) in &snapshot.sessions {
-                if let Some(ref pane_id) = session.pane_id {
-                    if let Some(name) = ui.pane_names.remove(pane_id) {
-                        ui.pane_display_names.insert(pane_id.clone(), name.clone());
-                        ui.display_names.insert(sid.clone(), name);
-                    }
+                if let Some(ref pane_id) = session.pane_id
+                    && let Some(name) = ui.pane_names.remove(pane_id)
+                {
+                    ui.pane_display_names.insert(pane_id.clone(), name.clone());
+                    ui.display_names.insert(sid.clone(), name);
                 }
             }
         }
@@ -576,12 +576,11 @@ pub fn run_tui(
         // Restore display names for sessions whose pane already has a name
         // (handles session restart after /clear)
         for (sid, session) in &snapshot.sessions {
-            if let Some(ref pane_id) = session.pane_id {
-                if !ui.display_names.contains_key(sid) {
-                    if let Some(name) = ui.pane_display_names.get(pane_id).cloned() {
-                        ui.display_names.insert(sid.clone(), name);
-                    }
-                }
+            if let Some(ref pane_id) = session.pane_id
+                && !ui.display_names.contains_key(sid)
+                && let Some(name) = ui.pane_display_names.get(pane_id).cloned()
+            {
+                ui.display_names.insert(sid.clone(), name);
             }
         }
 
@@ -603,143 +602,143 @@ pub fn run_tui(
         })?;
         tick = tick.wrapping_add(1);
 
-        if crossterm::event::poll(std::time::Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                // Alt+1..9: jump to card N and focus its pane (works from any mode)
-                if let Some(card_num) = alt_digit(key) {
-                    let idx = (card_num as usize).saturating_sub(1);
-                    if idx < total {
-                        ui.selected_index = idx;
-                        ui.mode = UiMode::Normal;
-                        if let Some((sid, _)) = filtered.get(idx)
-                            && let Some(session) = snapshot.sessions.get(*sid)
-                        {
-                            if let Some(ref pane_id) = session.pane_id {
-                                match pane.focus_pane(pane_id) {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        ui.status_message = Some((
-                                            format!("Focus failed: {e}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                }
-                            } else {
-                                ui.status_message = Some((
-                                    format!("No pane linked to session {sid}"),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                let selected_id: Option<String> =
-                    filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
-
-                let result = match ui.mode {
-                    UiMode::Normal => handle_normal_key(key, &mut ui, total),
-                    UiMode::Filter => handle_filter_key(key, &mut ui),
-                    UiMode::Help => handle_help_key(key, &mut ui),
-                    UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
-                    UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
-                    UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
-                };
-
-                match result {
-                    KeyResult::Quit => break,
-                    KeyResult::Focus => {
-                        if let Some(ref sid) = selected_id
-                            && let Some(session) = snapshot.sessions.get(sid)
-                        {
-                            if let Some(ref pane_id) = session.pane_id {
-                                match pane.focus_pane(pane_id) {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        ui.status_message = Some((
-                                            format!("Focus failed: {e}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                }
-                            } else {
-                                ui.status_message = Some((
-                                    format!("No pane linked to session {sid}"),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                        }
-                    }
-                    KeyResult::NewPane(req) => {
-                        if pane.is_available() {
-                            let dir_str = req.dir.display().to_string();
-                            let cmd = if req.command.is_empty() {
-                                None
-                            } else {
-                                Some(req.command.as_str())
-                            };
-                            match pane.create_pane(cmd, Some(&dir_str)) {
-                                Ok(new_id) => {
-                                    if !req.name.is_empty() {
-                                        let _ = pane.rename_pane(&new_id, &req.name);
-                                        ui.pane_display_names
-                                            .insert(new_id.clone(), req.name.clone());
-                                        ui.pane_names.insert(new_id.clone(), req.name);
-                                    }
+        if crossterm::event::poll(std::time::Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+        {
+            // Alt+1..9: jump to card N and focus its pane (works from any mode)
+            if let Some(card_num) = alt_digit(key) {
+                let idx = (card_num as usize).saturating_sub(1);
+                if idx < total {
+                    ui.selected_index = idx;
+                    ui.mode = UiMode::Normal;
+                    if let Some((sid, _)) = filtered.get(idx)
+                        && let Some(session) = snapshot.sessions.get(*sid)
+                    {
+                        if let Some(ref pane_id) = session.pane_id {
+                            match pane.focus_pane(pane_id) {
+                                Ok(()) => {}
+                                Err(e) => {
                                     ui.status_message = Some((
-                                        format!("Created pane {new_id} in {dir_str}"),
+                                        format!("Focus failed: {e}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                            }
+                        } else {
+                            ui.status_message = Some((
+                                format!("No pane linked to session {sid}"),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let selected_id: Option<String> =
+                filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+
+            let result = match ui.mode {
+                UiMode::Normal => handle_normal_key(key, &mut ui, total),
+                UiMode::Filter => handle_filter_key(key, &mut ui),
+                UiMode::Help => handle_help_key(key, &mut ui),
+                UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
+                UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
+                UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
+            };
+
+            match result {
+                KeyResult::Quit => break,
+                KeyResult::Focus => {
+                    if let Some(ref sid) = selected_id
+                        && let Some(session) = snapshot.sessions.get(sid)
+                    {
+                        if let Some(ref pane_id) = session.pane_id {
+                            match pane.focus_pane(pane_id) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    ui.status_message = Some((
+                                        format!("Focus failed: {e}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                            }
+                        } else {
+                            ui.status_message = Some((
+                                format!("No pane linked to session {sid}"),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                }
+                KeyResult::NewPane(req) => {
+                    if pane.is_available() {
+                        let dir_str = req.dir.display().to_string();
+                        let cmd = if req.command.is_empty() {
+                            None
+                        } else {
+                            Some(req.command.as_str())
+                        };
+                        match pane.create_pane(cmd, Some(&dir_str)) {
+                            Ok(new_id) => {
+                                if !req.name.is_empty() {
+                                    let _ = pane.rename_pane(&new_id, &req.name);
+                                    ui.pane_display_names
+                                        .insert(new_id.clone(), req.name.clone());
+                                    ui.pane_names.insert(new_id.clone(), req.name);
+                                }
+                                ui.status_message = Some((
+                                    format!("Created pane {new_id} in {dir_str}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                            Err(e) => {
+                                ui.status_message = Some((
+                                    format!("New pane failed: {e}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                KeyResult::ClosePane => {
+                    if let Some(ref sid) = selected_id
+                        && let Some(session) = snapshot.sessions.get(sid)
+                    {
+                        if let Some(ref pane_id) = session.pane_id {
+                            match pane.close_pane(pane_id) {
+                                Ok(()) => {
+                                    ui.status_message = Some((
+                                        format!("Closed pane {pane_id}"),
                                         std::time::Instant::now(),
                                     ));
                                 }
                                 Err(e) => {
                                     ui.status_message = Some((
-                                        format!("New pane failed: {e}"),
+                                        format!("Close failed: {e}"),
                                         std::time::Instant::now(),
                                     ));
                                 }
                             }
-                        }
-                    }
-                    KeyResult::ClosePane => {
-                        if let Some(ref sid) = selected_id
-                            && let Some(session) = snapshot.sessions.get(sid)
-                        {
-                            if let Some(ref pane_id) = session.pane_id {
-                                match pane.close_pane(pane_id) {
-                                    Ok(()) => {
-                                        ui.status_message = Some((
-                                            format!("Closed pane {pane_id}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        ui.status_message = Some((
-                                            format!("Close failed: {e}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                }
-                            } else {
-                                ui.status_message = Some((
-                                    format!("No pane linked to session {sid}"),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                        }
-                    }
-                    KeyResult::Continue => {}
-                }
-
-                // Keep pane_display_names in sync with display_names
-                // so renames persist across session restarts.
-                for (sid, session) in &snapshot.sessions {
-                    if let Some(ref pane_id) = session.pane_id {
-                        if let Some(name) = ui.display_names.get(sid) {
-                            ui.pane_display_names.insert(pane_id.clone(), name.clone());
                         } else {
-                            ui.pane_display_names.remove(pane_id);
+                            ui.status_message = Some((
+                                format!("No pane linked to session {sid}"),
+                                std::time::Instant::now(),
+                            ));
                         }
+                    }
+                }
+                KeyResult::Continue => {}
+            }
+
+            // Keep pane_display_names in sync with display_names
+            // so renames persist across session restarts.
+            for (sid, session) in &snapshot.sessions {
+                if let Some(ref pane_id) = session.pane_id {
+                    if let Some(name) = ui.display_names.get(sid) {
+                        ui.pane_display_names.insert(pane_id.clone(), name.clone());
+                    } else {
+                        ui.pane_display_names.remove(pane_id);
                     }
                 }
             }
@@ -782,15 +781,15 @@ fn render_frame(
         if ui.mode == UiMode::Help {
             render_help_overlay(frame, has_pane_control);
         }
-        if ui.mode == UiMode::DirPicker {
-            if let Some(ref picker) = ui.dir_picker {
-                render_dir_picker(frame, picker);
-            }
+        if ui.mode == UiMode::DirPicker
+            && let Some(ref picker) = ui.dir_picker
+        {
+            render_dir_picker(frame, picker);
         }
-        if ui.mode == UiMode::NewPaneForm {
-            if let Some(ref form) = ui.new_pane_form {
-                render_new_pane_form(frame, form);
-            }
+        if ui.mode == UiMode::NewPaneForm
+            && let Some(ref form) = ui.new_pane_form
+        {
+            render_new_pane_form(frame, form);
         }
         return;
     }
@@ -913,15 +912,15 @@ fn render_frame(
     if ui.mode == UiMode::Help {
         render_help_overlay(frame, has_pane_control);
     }
-    if ui.mode == UiMode::DirPicker {
-        if let Some(ref picker) = ui.dir_picker {
-            render_dir_picker(frame, picker);
-        }
+    if ui.mode == UiMode::DirPicker
+        && let Some(ref picker) = ui.dir_picker
+    {
+        render_dir_picker(frame, picker);
     }
-    if ui.mode == UiMode::NewPaneForm {
-        if let Some(ref form) = ui.new_pane_form {
-            render_new_pane_form(frame, form);
-        }
+    if ui.mode == UiMode::NewPaneForm
+        && let Some(ref form) = ui.new_pane_form
+    {
+        render_new_pane_form(frame, form);
     }
 }
 

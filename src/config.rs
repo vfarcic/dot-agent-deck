@@ -16,16 +16,9 @@ pub fn socket_path() -> PathBuf {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct DashboardConfig {
     pub default_command: String,
-}
-
-impl Default for DashboardConfig {
-    fn default() -> Self {
-        Self {
-            default_command: String::new(),
-        }
-    }
 }
 
 impl DashboardConfig {
