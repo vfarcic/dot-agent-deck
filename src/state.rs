@@ -133,7 +133,6 @@ impl AppState {
             session.recent_events.pop_front();
         }
     }
-
 }
 
 #[cfg(test)]
@@ -292,5 +291,4 @@ mod tests {
             Some("add tests")
         );
     }
-
 }

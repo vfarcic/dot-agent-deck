@@ -58,7 +58,9 @@ fn make_rule(binary_path: &str, hook_type: &str) -> Value {
 
 /// Ensure `settings["hooks"]` is an object and return a mutable reference to it.
 fn ensure_hooks_object(settings: &mut Value) -> &mut serde_json::Map<String, Value> {
-    let obj = settings.as_object_mut().expect("settings must be an object");
+    let obj = settings
+        .as_object_mut()
+        .expect("settings must be an object");
     if !obj.contains_key("hooks") || !obj["hooks"].is_object() {
         obj.insert("hooks".into(), json!({}));
     }
@@ -110,7 +112,11 @@ fn install_impl(settings: &mut Value, binary_path: &str) -> (Vec<&'static str>, 
                 arr.retain(|rule| !rule_contains_dot_agent_deck(rule));
             }
             // Remove the key entirely if the array is now empty
-            if hooks_obj.get(&key).and_then(|v| v.as_array()).is_some_and(|a| a.is_empty()) {
+            if hooks_obj
+                .get(&key)
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| a.is_empty())
+            {
                 hooks_obj.remove(&key);
             }
         }
@@ -268,10 +274,7 @@ mod tests {
 
         // Notification rule should have a string matcher
         let notif_rule = &hooks["Notification"].as_array().unwrap()[0];
-        assert_eq!(
-            notif_rule["matcher"].as_str(),
-            Some("permission_prompt")
-        );
+        assert_eq!(notif_rule["matcher"].as_str(), Some("permission_prompt"));
     }
 
     #[test]
@@ -304,10 +307,12 @@ mod tests {
             Some("my-other-tool start")
         );
         // Second rule is ours
-        assert!(session_start[1]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .contains("dot-agent-deck"));
+        assert!(
+            session_start[1]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("dot-agent-deck")
+        );
     }
 
     #[test]
@@ -399,13 +404,23 @@ mod tests {
             let rules = settings["hooks"][*hook_type].as_array().unwrap();
             assert_eq!(rules.len(), 1, "Expected 1 rule for {hook_type}");
             // Must be new format (has "hooks" key)
-            assert!(rules[0].get("hooks").is_some(), "Expected new format for {hook_type}");
+            assert!(
+                rules[0].get("hooks").is_some(),
+                "Expected new format for {hook_type}"
+            );
         }
 
         // SessionEnd old-format entry should have been upgraded to new format
         let session_end = settings["hooks"]["SessionEnd"].as_array().unwrap();
-        assert_eq!(session_end.len(), 1, "SessionEnd should have 1 upgraded rule");
-        assert!(session_end[0].get("hooks").is_some(), "SessionEnd should be new format");
+        assert_eq!(
+            session_end.len(),
+            1,
+            "SessionEnd should have 1 upgraded rule"
+        );
+        assert!(
+            session_end[0].get("hooks").is_some(),
+            "SessionEnd should be new format"
+        );
     }
 
     #[test]

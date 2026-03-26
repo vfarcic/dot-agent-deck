@@ -81,15 +81,9 @@ fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> O
             let first_line = cmd.lines().next().unwrap_or(cmd);
             truncate(first_line, 120)
         }
-        "Read" | "Edit" | "Write" => {
-            input.get("file_path")?.as_str()?.to_string()
-        }
-        "Grep" | "Glob" => {
-            input.get("pattern")?.as_str()?.to_string()
-        }
-        "Agent" => {
-            input.get("description")?.as_str()?.to_string()
-        }
+        "Read" | "Edit" | "Write" => input.get("file_path")?.as_str()?.to_string(),
+        "Grep" | "Glob" => input.get("pattern")?.as_str()?.to_string(),
+        "Agent" => input.get("description")?.as_str()?.to_string(),
         _ => {
             // First string-valued key
             let val = input.values().find_map(|v| v.as_str())?;
@@ -109,10 +103,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
     let event_type = map_event_type(&input.hook_event_name)?;
-    let tool_detail = extract_tool_detail(
-        input.tool_name.as_deref(),
-        input.tool_input.as_ref(),
-    );
+    let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
 
     let user_prompt = input.prompt.map(|p| truncate(&p, 200));
     let pane_id = std::env::var("ZELLIJ_PANE_ID").ok();
@@ -146,7 +137,10 @@ mod tests {
 
     #[test]
     fn map_session_start() {
-        assert_eq!(map_event_type("SessionStart"), Some(EventType::SessionStart));
+        assert_eq!(
+            map_event_type("SessionStart"),
+            Some(EventType::SessionStart)
+        );
     }
 
     #[test]
@@ -161,7 +155,10 @@ mod tests {
 
     #[test]
     fn map_notification() {
-        assert_eq!(map_event_type("Notification"), Some(EventType::WaitingForInput));
+        assert_eq!(
+            map_event_type("Notification"),
+            Some(EventType::WaitingForInput)
+        );
     }
 
     #[test]
@@ -203,7 +200,8 @@ mod tests {
 
     #[test]
     fn tool_detail_edit_file_path() {
-        let input: Value = serde_json::json!({"file_path": "/src/lib.rs", "old_string": "a", "new_string": "b"});
+        let input: Value =
+            serde_json::json!({"file_path": "/src/lib.rs", "old_string": "a", "new_string": "b"});
         let detail = extract_tool_detail(Some("Edit"), Some(&input));
         assert_eq!(detail.as_deref(), Some("/src/lib.rs"));
     }
