@@ -1,0 +1,136 @@
+version: "3"
+
+tasks:
+  checksums:
+    desc: Generate SHA256 checksums for release binaries
+    dir: dist
+    cmds:
+      - shasum -a 256 dot-agent-deck-* > checksums.txt
+
+  homebrew-formula:
+    desc: Generate Homebrew formula from release binaries
+    requires:
+      vars: [VERSION]
+    vars:
+      VERSION_NO_V:
+        sh: echo "{{.VERSION}}" | sed 's/^v//'
+      BASE_URL: https://github.com/vfarcic/dot-agent-deck/releases/download/{{.VERSION}}
+      SHA_DARWIN_ARM64:
+        sh: grep 'dot-agent-deck-darwin-arm64$' dist/checksums.txt | awk '{print $1}'
+      SHA_DARWIN_AMD64:
+        sh: grep 'dot-agent-deck-darwin-amd64$' dist/checksums.txt | awk '{print $1}'
+      SHA_LINUX_ARM64:
+        sh: grep 'dot-agent-deck-linux-arm64$' dist/checksums.txt | awk '{print $1}'
+      SHA_LINUX_AMD64:
+        sh: grep 'dot-agent-deck-linux-amd64$' dist/checksums.txt | awk '{print $1}'
+    cmds:
+      - |
+        cat > dist/dot-agent-deck.rb << 'FORMULA'
+        class DotAgentDeck < Formula
+          desc "TUI dashboard for monitoring AI agent sessions"
+          homepage "https://github.com/vfarcic/dot-agent-deck"
+          version "{{.VERSION_NO_V}}"
+          license "MIT"
+
+          on_macos do
+            if Hardware::CPU.arm?
+              url "{{.BASE_URL}}/dot-agent-deck-darwin-arm64"
+              sha256 "{{.SHA_DARWIN_ARM64}}"
+            else
+              url "{{.BASE_URL}}/dot-agent-deck-darwin-amd64"
+              sha256 "{{.SHA_DARWIN_AMD64}}"
+            end
+          end
+
+          on_linux do
+            if Hardware::CPU.arm?
+              url "{{.BASE_URL}}/dot-agent-deck-linux-arm64"
+              sha256 "{{.SHA_LINUX_ARM64}}"
+            else
+              url "{{.BASE_URL}}/dot-agent-deck-linux-amd64"
+              sha256 "{{.SHA_LINUX_AMD64}}"
+            end
+          end
+
+          def install
+            bin.install Dir["dot-agent-deck-*"].first => "dot-agent-deck"
+          end
+
+          test do
+            assert_match "dot-agent-deck", shell_output("#{bin}/dot-agent-deck --help")
+          end
+        end
+        FORMULA
+        sed -i.bak -e 's/^        //' dist/dot-agent-deck.rb && rm -f dist/dot-agent-deck.rb.bak
+
+  homebrew-publish:
+    desc: Push Homebrew formula to the tap repository
+    requires:
+      vars: [VERSION, HOMEBREW_TAP_TOKEN]
+    cmds:
+      - |
+        WORK_DIR=$(mktemp -d)
+        trap 'rm -rf "$WORK_DIR"' EXIT
+        cd "$WORK_DIR"
+        git clone --quiet "https://x-access-token:{{.HOMEBREW_TAP_TOKEN}}@github.com/vfarcic/homebrew-tap.git" .
+        mkdir -p Formula
+        cp {{.TASKFILE_DIR}}/dist/dot-agent-deck.rb Formula/dot-agent-deck.rb
+        git add Formula/dot-agent-deck.rb
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git diff --cached --quiet || git commit -m "Update dot-agent-deck formula to {{.VERSION}}"
+        git push origin main
+
+  scoop-manifest:
+    desc: Generate Scoop manifest from release binaries
+    requires:
+      vars: [VERSION]
+    vars:
+      VERSION_NO_V:
+        sh: echo "{{.VERSION}}" | sed 's/^v//'
+      BASE_URL: https://github.com/vfarcic/dot-agent-deck/releases/download/{{.VERSION}}
+      SHA_WINDOWS_AMD64:
+        sh: grep 'dot-agent-deck-windows-amd64.exe$' dist/checksums.txt | awk '{print $1}'
+    cmds:
+      - |
+        cat > dist/dot-agent-deck.json << MANIFEST
+        {
+            "version": "{{.VERSION_NO_V}}",
+            "description": "TUI dashboard for monitoring AI agent sessions",
+            "homepage": "https://github.com/vfarcic/dot-agent-deck",
+            "license": "MIT",
+            "architecture": {
+                "64bit": {
+                    "url": "{{.BASE_URL}}/dot-agent-deck-windows-amd64.exe",
+                    "hash": "{{.SHA_WINDOWS_AMD64}}"
+                }
+            },
+            "bin": [["dot-agent-deck-windows-amd64.exe", "dot-agent-deck"]],
+            "checkver": "github",
+            "autoupdate": {
+                "architecture": {
+                    "64bit": {
+                        "url": "https://github.com/vfarcic/dot-agent-deck/releases/download/v\$version/dot-agent-deck-windows-amd64.exe"
+                    }
+                }
+            }
+        }
+        MANIFEST
+        sed -i.bak -e 's/^        //' dist/dot-agent-deck.json && rm -f dist/dot-agent-deck.json.bak
+
+  scoop-publish:
+    desc: Push Scoop manifest to the bucket repository
+    requires:
+      vars: [VERSION, SCOOP_BUCKET_TOKEN]
+    cmds:
+      - |
+        WORK_DIR=$(mktemp -d)
+        trap 'rm -rf "$WORK_DIR"' EXIT
+        cd "$WORK_DIR"
+        git clone --quiet "https://x-access-token:{{.SCOOP_BUCKET_TOKEN}}@github.com/vfarcic/scoop-bucket.git" .
+        cp {{.TASKFILE_DIR}}/dist/dot-agent-deck.json dot-agent-deck.json
+        git add dot-agent-deck.json
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git diff --cached --quiet || git commit -m "Update dot-agent-deck manifest to {{.VERSION}}"
+        git push origin main

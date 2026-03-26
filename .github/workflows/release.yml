@@ -56,18 +56,27 @@ jobs:
             os: ubuntu-latest
             artifact_suffix: linux-amd64
             use_cross: false
+            binary_ext: ""
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact_suffix: linux-arm64
             use_cross: true
+            binary_ext: ""
           - target: x86_64-apple-darwin
             os: macos-latest
-            artifact_suffix: macos-amd64
+            artifact_suffix: darwin-amd64
             use_cross: false
+            binary_ext: ""
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact_suffix: macos-arm64
+            artifact_suffix: darwin-arm64
             use_cross: false
+            binary_ext: ""
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+            artifact_suffix: windows-amd64
+            use_cross: true
+            binary_ext: .exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -89,30 +98,43 @@ jobs:
           fi
       - name: Package
         run: |
-          ARTIFACT="dot-agent-deck-${{ needs.prepare.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz"
-          mkdir -p staging
-          cp target/${{ matrix.target }}/release/dot-agent-deck staging/
-          cd staging
-          tar czf "../$ARTIFACT" dot-agent-deck
-          echo "ARTIFACT=$ARTIFACT" >> "$GITHUB_ENV"
+          BINARY_NAME="dot-agent-deck-${{ matrix.artifact_suffix }}${{ matrix.binary_ext }}"
+          cp "target/${{ matrix.target }}/release/dot-agent-deck${{ matrix.binary_ext }}" "$BINARY_NAME"
+          echo "BINARY_NAME=$BINARY_NAME" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:
           name: dot-agent-deck-${{ matrix.artifact_suffix }}
-          path: ${{ env.ARTIFACT }}
+          path: ${{ env.BINARY_NAME }}
 
   finalize:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: dist
           merge-multiple: true
+      - name: Generate checksums
+        run: task checksums
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.prepare.outputs.version }}
           name: v${{ needs.prepare.outputs.version }}
           body: ${{ needs.prepare.outputs.changelog }}
-          files: artifacts/*.tar.gz
+          files: |
+            dist/dot-agent-deck-*
+            dist/checksums.txt
           fail_on_unmatched_files: true
+      - name: Generate Homebrew formula
+        run: task homebrew-formula VERSION=v${{ needs.prepare.outputs.version }}
+      - name: Publish Homebrew formula
+        run: task homebrew-publish VERSION=v${{ needs.prepare.outputs.version }} HOMEBREW_TAP_TOKEN=${{ secrets.HOMEBREW_TAP_TOKEN }}
+      - name: Generate Scoop manifest
+        run: task scoop-manifest VERSION=v${{ needs.prepare.outputs.version }}
+      - name: Publish Scoop manifest
+        run: task scoop-publish VERSION=v${{ needs.prepare.outputs.version }} SCOOP_BUCKET_TOKEN=${{ secrets.SCOOP_BUCKET_TOKEN }}

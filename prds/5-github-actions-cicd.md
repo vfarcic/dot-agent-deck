@@ -44,15 +44,16 @@ Create GitHub Actions workflows following the dot-ai project's approach, adapted
   - Commit and push changelog updates to main
 
 - **build**: Build release binaries for multiple platforms
-  - Build matrix: `linux-amd64`, `linux-arm64`, `macos-amd64` (Intel), `macos-arm64` (Apple Silicon)
-  - Use `cross` or native runners for cross-compilation
-  - Create tarballs: `dot-agent-deck-{version}-{target}.tar.gz`
-  - Upload binaries as artifacts
+  - Build matrix: `linux-amd64`, `linux-arm64`, `darwin-amd64` (Intel), `darwin-arm64` (Apple Silicon), `windows-amd64`
+  - Use `cross` for cross-arch Linux and Windows builds, native runners for macOS
+  - Upload raw binaries as artifacts (e.g., `dot-agent-deck-linux-amd64`, `dot-agent-deck-windows-amd64.exe`)
 
-- **finalize**: Create GitHub release
+- **finalize**: Create GitHub release and publish packages
   - Download all binary artifacts
-  - Create GitHub release with changelog notes and binary attachments
-  - Update version in `Cargo.toml` on main
+  - Generate SHA256 checksums (`checksums.txt`)
+  - Create GitHub release with changelog notes, binaries, and checksums
+  - Generate and publish Homebrew formula to `vfarcic/homebrew-tap`
+  - Generate and publish Scoop manifest to `vfarcic/scoop-bucket`
 
 ### PR Labeler (`.github/workflows/labeler.yml`)
 
@@ -89,7 +90,6 @@ Following dot-ai's approach:
 - Helm chart publishing (not a Kubernetes-deployed app)
 - npm/crate publishing (evaluate later)
 - Fork PR testing workflow (can add when external contributors appear)
-- Cross-compilation for Windows
 
 ## Milestones
 
@@ -99,11 +99,19 @@ Following dot-ai's approach:
 - [x] Release workflow: multi-platform binary builds on tag push
 - [x] Release workflow: GitHub release creation with changelog and binary attachments
 - [x] Supporting workflows: PR labeler and stale issue/PR management
+- [x] Release workflow: Windows binary build (`x86_64-pc-windows-gnu`)
+- [x] Release workflow: SHA256 checksums for all binaries
+- [x] Release workflow: Homebrew formula generation and publish to `vfarcic/homebrew-tap`
+- [x] Release workflow: Scoop manifest generation and publish to `vfarcic/scoop-bucket`
+- [x] Taskfile.yml with distribution tasks (checksums, homebrew, scoop)
 
 ## Success Criteria
 
 - Every PR runs lint + build + test automatically; broken PRs are clearly flagged
-- Pushing a `v*` tag produces a GitHub release with binaries for Linux and macOS (amd64 + arm64)
+- Pushing a `v*` tag produces a GitHub release with binaries for Linux, macOS, and Windows (amd64 + arm64 where applicable)
+- Release includes SHA256 checksums for all binaries
 - Release notes are auto-generated from changelog fragments
+- Homebrew formula published to `vfarcic/homebrew-tap` on each release
+- Scoop manifest published to `vfarcic/scoop-bucket` on each release
 - Stale issues/PRs are automatically managed
 - PRs are auto-labeled based on changed files
