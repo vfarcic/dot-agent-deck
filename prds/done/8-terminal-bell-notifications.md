@@ -1,6 +1,6 @@
 # PRD #8: Terminal Bell Notifications
 
-**Status**: In Progress
+**Status**: Complete
 **Priority**: Medium
 **GitHub Issue**: [#8](https://github.com/vfarcic/dot-agent-deck/issues/8)
 
