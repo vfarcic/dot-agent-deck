@@ -1,6 +1,6 @@
 # PRD #4: Comprehensive Documentation
 
-**Status**: Not Started
+**Status**: In Progress
 **Priority**: Medium
 **GitHub Issue**: [#4](https://github.com/vfarcic/dot-agent-deck/issues/4)
 **Depends on**: PRD #1 (Agent Status Dashboard), PRD #2 (Pane Control)
@@ -12,6 +12,10 @@ The project has only a one-line README. New users have no way to understand how 
 ## Solution
 
 Create comprehensive user-facing documentation that covers the full user journey: from installation through daily usage, plus contributor guidance. Documentation lives in the repository as markdown files, with the README as the primary entry point linking to detailed docs.
+
+### Design Decision: Single-File Documentation
+
+All user-facing documentation is consolidated into a single `README.md` instead of the originally planned multi-file structure. The project is focused enough that separate `docs/` files would add navigation overhead without value. Architecture and contributor docs are intentionally omitted to keep the README user-facing.
 
 ### Documentation Structure
 
@@ -91,11 +95,11 @@ The README should serve as the landing page:
 
 ## Milestones
 
-- [ ] README rewrite with project overview, quick start, feature highlights, and doc links
-- [ ] Installation and getting-started guides covering full first-run experience
-- [ ] Configuration and architecture documentation
-- [ ] Keyboard shortcuts reference (dashboard + Zellij)
-- [ ] CONTRIBUTING.md with development setup, testing, and PR guidelines
+- [x] README rewrite with project overview, quick start, feature highlights, and doc links
+- [x] Installation and getting-started guides covering full first-run experience
+- [x] Configuration and architecture documentation
+- [x] Keyboard shortcuts reference (dashboard + Zellij)
+- [~] CONTRIBUTING.md with development setup, testing, and PR guidelines (deferred — README kept user-facing only)
 - [ ] Terminal screenshot or asciinema recording embedded in README
 
 ## Success Criteria
