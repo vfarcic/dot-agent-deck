@@ -657,8 +657,9 @@ pub fn run_tui(
                             match pane.focus_pane(pane_id) {
                                 Ok(()) => {}
                                 Err(e) => {
+                                    state.blocking_write().sessions.remove(*sid);
                                     ui.status_message = Some((
-                                        format!("Focus failed: {e}"),
+                                        format!("Removed stale session: {e}"),
                                         std::time::Instant::now(),
                                     ));
                                 }
@@ -696,8 +697,9 @@ pub fn run_tui(
                             match pane.focus_pane(pane_id) {
                                 Ok(()) => {}
                                 Err(e) => {
+                                    state.blocking_write().sessions.remove(sid);
                                     ui.status_message = Some((
-                                        format!("Focus failed: {e}"),
+                                        format!("Removed stale session: {e}"),
                                         std::time::Instant::now(),
                                     ));
                                 }
@@ -747,14 +749,16 @@ pub fn run_tui(
                         if let Some(ref pane_id) = session.pane_id {
                             match pane.close_pane(pane_id) {
                                 Ok(()) => {
+                                    state.blocking_write().sessions.remove(sid);
                                     ui.status_message = Some((
                                         format!("Closed pane {pane_id}"),
                                         std::time::Instant::now(),
                                     ));
                                 }
                                 Err(e) => {
+                                    state.blocking_write().sessions.remove(sid);
                                     ui.status_message = Some((
-                                        format!("Close failed: {e}"),
+                                        format!("Removed stale session: {e}"),
                                         std::time::Instant::now(),
                                     ));
                                 }
