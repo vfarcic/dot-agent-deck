@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 
-use dot_agent_deck::config::socket_path;
+use dot_agent_deck::config::{socket_path, DashboardConfig};
 use dot_agent_deck::daemon::run_daemon;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::hooks_manage;
@@ -32,6 +32,11 @@ enum Commands {
         #[command(subcommand)]
         action: HooksAction,
     },
+    /// Get or set configuration values
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -40,6 +45,22 @@ enum HooksAction {
     Install,
     /// Remove hooks from ~/.claude/settings.json
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Get a configuration value
+    Get {
+        /// Configuration key (e.g., default_command)
+        key: String,
+    },
+    /// Set a configuration value
+    Set {
+        /// Configuration key (e.g., default_command)
+        key: String,
+        /// Value to set
+        value: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -61,6 +82,33 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Some(Commands::Config { action }) => match action {
+            ConfigAction::Get { key } => {
+                let config = DashboardConfig::load();
+                match config.get_field(&key) {
+                    Ok(value) => {
+                        println!("{value}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            ConfigAction::Set { key, value } => {
+                let mut config = DashboardConfig::load();
+                if let Err(e) = config.set_field(&key, &value) {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+                if let Err(e) = config.save() {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+                ExitCode::SUCCESS
+            }
+        },
     }
 }
 

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub fn socket_path() -> PathBuf {
     if let Ok(path) = std::env::var("DOT_AGENT_DECK_SOCKET") {
@@ -14,7 +14,7 @@ pub fn socket_path() -> PathBuf {
     PathBuf::from("/tmp/dot-agent-deck.sock")
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
 pub struct DashboardConfig {
@@ -37,6 +37,35 @@ impl DashboardConfig {
                 eprintln!("Failed to read config at {}: {err}", path.display());
                 Self::default()
             }
+        }
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let path = config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create config directory: {e}"))?;
+        }
+        let contents =
+            toml::to_string_pretty(self).map_err(|e| format!("Failed to serialize config: {e}"))?;
+        std::fs::write(&path, contents)
+            .map_err(|e| format!("Failed to write config at {}: {e}", path.display()))
+    }
+
+    pub fn get_field(&self, key: &str) -> Result<String, String> {
+        match key {
+            "default_command" => Ok(self.default_command.clone()),
+            _ => Err(format!("Unknown config key: {key}")),
+        }
+    }
+
+    pub fn set_field(&mut self, key: &str, value: &str) -> Result<(), String> {
+        match key {
+            "default_command" => {
+                self.default_command = value.to_string();
+                Ok(())
+            }
+            _ => Err(format!("Unknown config key: {key}")),
         }
     }
 }
