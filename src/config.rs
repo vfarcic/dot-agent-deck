@@ -50,20 +50,11 @@ impl BellConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct DashboardConfig {
     pub default_command: String,
     pub bell: BellConfig,
-}
-
-impl Default for DashboardConfig {
-    fn default() -> Self {
-        Self {
-            default_command: String::new(),
-            bell: BellConfig::default(),
-        }
-    }
 }
 
 impl DashboardConfig {

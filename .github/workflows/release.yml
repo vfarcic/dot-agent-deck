@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.2.0)'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Assemble changelog
+        id: changelog
+        run: |
+          chmod +x scripts/assemble-changelog.sh
+          CHANGELOG=$(scripts/assemble-changelog.sh "${{ steps.version.outputs.version }}")
+          {
+            echo "changelog<<CHANGELOG_EOF"
+            echo "$CHANGELOG"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Commit changelog updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md changelog.d/
+          git stash
+          git checkout main
+          git stash pop || true
+          git add CHANGELOG.md changelog.d/
+          git diff --cached --quiet || git commit -m "docs: update changelog for v${{ steps.version.outputs.version }}"
+          git push origin main
+
+  build:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact_suffix: linux-amd64
+            use_cross: false
+            binary_ext: ""
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact_suffix: linux-arm64
+            use_cross: true
+            binary_ext: ""
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact_suffix: darwin-amd64
+            use_cross: false
+            binary_ext: ""
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact_suffix: darwin-arm64
+            use_cross: false
+            binary_ext: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked
+      - name: Build
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+      - name: Package
+        run: |
+          BINARY_NAME="dot-agent-deck-${{ matrix.artifact_suffix }}${{ matrix.binary_ext }}"
+          cp "target/${{ matrix.target }}/release/dot-agent-deck${{ matrix.binary_ext }}" "$BINARY_NAME"
+          echo "BINARY_NAME=$BINARY_NAME" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dot-agent-deck-${{ matrix.artifact_suffix }}
+          path: ${{ env.BINARY_NAME }}
+
+  finalize:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: task checksums
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: v${{ needs.prepare.outputs.version }}
+          body: ${{ needs.prepare.outputs.changelog }}
+          files: |
+            dist/dot-agent-deck-*
+            dist/checksums.txt
+          fail_on_unmatched_files: true
+      - name: Generate Homebrew formula
+        run: task homebrew-formula VERSION=v${{ needs.prepare.outputs.version }}
+      - name: Publish Homebrew formula
+        run: task homebrew-publish VERSION=v${{ needs.prepare.outputs.version }}
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      - name: Generate Scoop manifest
+        run: task scoop-manifest VERSION=v${{ needs.prepare.outputs.version }}
+      - name: Publish Scoop manifest
+        run: task scoop-publish VERSION=v${{ needs.prepare.outputs.version }}
+        env:
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}

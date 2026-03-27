@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
-    Frame,
 };
 
 use crate::config::{BellConfig, DashboardConfig};
@@ -29,7 +29,11 @@ impl fmt::Display for crate::event::AgentType {
 // Platform-aware modifier key label
 // ---------------------------------------------------------------------------
 
-const MOD_KEY: &str = if cfg!(target_os = "macos") { "Opt" } else { "Alt" };
+const MOD_KEY: &str = if cfg!(target_os = "macos") {
+    "Opt"
+} else {
+    "Alt"
+};
 
 // ---------------------------------------------------------------------------
 // UI state types
@@ -185,7 +189,7 @@ fn navigate_grid(current: usize, dir: Direction, columns: usize, total: usize) -
     }
     let row = current / columns;
     let col = current % columns;
-    let total_rows = (total + columns - 1) / columns;
+    let total_rows = total.div_ceil(columns);
 
     match dir {
         Direction::Up => {
@@ -317,7 +321,8 @@ fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult
     match key.code {
         KeyCode::Char('q') => KeyResult::Quit,
         KeyCode::Char('j') | KeyCode::Down => {
-            ui.selected_index = navigate_grid(ui.selected_index, Direction::Down, ui.columns, total);
+            ui.selected_index =
+                navigate_grid(ui.selected_index, Direction::Down, ui.columns, total);
             KeyResult::Continue
         }
         KeyCode::Char('k') | KeyCode::Up => {
@@ -560,7 +565,11 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
 // TUI entry point
 // ---------------------------------------------------------------------------
 
-pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>, config: DashboardConfig) -> std::io::Result<()> {
+pub fn run_tui(
+    state: SharedState,
+    pane: Box<dyn PaneController>,
+    config: DashboardConfig,
+) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         ratatui::restore();
@@ -584,11 +593,11 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>, config: Dashbo
         // Apply pending pane names to sessions that have appeared
         if !ui.pane_names.is_empty() {
             for (sid, session) in &snapshot.sessions {
-                if let Some(ref pane_id) = session.pane_id {
-                    if let Some(name) = ui.pane_names.remove(pane_id) {
-                        ui.pane_display_names.insert(pane_id.clone(), name.clone());
-                        ui.display_names.insert(sid.clone(), name);
-                    }
+                if let Some(ref pane_id) = session.pane_id
+                    && let Some(name) = ui.pane_names.remove(pane_id)
+                {
+                    ui.pane_display_names.insert(pane_id.clone(), name.clone());
+                    ui.display_names.insert(sid.clone(), name);
                 }
             }
         }
@@ -596,12 +605,11 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>, config: Dashbo
         // Restore display names for sessions whose pane already has a name
         // (handles session restart after /clear)
         for (sid, session) in &snapshot.sessions {
-            if let Some(ref pane_id) = session.pane_id {
-                if !ui.display_names.contains_key(sid) {
-                    if let Some(name) = ui.pane_display_names.get(pane_id).cloned() {
-                        ui.display_names.insert(sid.clone(), name);
-                    }
-                }
+            if let Some(ref pane_id) = session.pane_id
+                && !ui.display_names.contains_key(sid)
+                && let Some(name) = ui.pane_display_names.get(pane_id).cloned()
+            {
+                ui.display_names.insert(sid.clone(), name);
             }
         }
 
@@ -636,146 +644,143 @@ pub fn run_tui(state: SharedState, pane: Box<dyn PaneController>, config: Dashbo
             let _ = std::io::stdout().flush();
         }
 
-        if crossterm::event::poll(std::time::Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                // Alt+1..9: jump to card N and focus its pane (works from any mode)
-                if let Some(card_num) = alt_digit(key) {
-                    let idx = (card_num as usize).saturating_sub(1);
-                    if idx < total {
-                        ui.selected_index = idx;
-                        ui.mode = UiMode::Normal;
-                        if let Some((sid, _)) = filtered.get(idx)
-                            && let Some(session) = snapshot.sessions.get(*sid)
-                        {
-                            if let Some(ref pane_id) = session.pane_id {
-                                match pane.focus_pane(pane_id) {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        ui.status_message = Some((
-                                            format!("Focus failed: {e}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                }
-                            } else {
-                                ui.status_message = Some((
-                                    format!("No pane linked to session {sid}"),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                let selected_id: Option<String> =
-                    filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
-
-                let result = match ui.mode {
-                    UiMode::Normal => handle_normal_key(key, &mut ui, total),
-                    UiMode::Filter => handle_filter_key(key, &mut ui),
-                    UiMode::Help => handle_help_key(key, &mut ui),
-                    UiMode::Rename => {
-                        handle_rename_key(key, &mut ui, selected_id.as_deref())
-                    }
-                    UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
-                    UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
-                };
-
-                match result {
-                    KeyResult::Quit => break,
-                    KeyResult::Focus => {
-                        if let Some(ref sid) = selected_id
-                            && let Some(session) = snapshot.sessions.get(sid)
-                        {
-                            if let Some(ref pane_id) = session.pane_id {
-                                match pane.focus_pane(pane_id) {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        ui.status_message = Some((
-                                            format!("Focus failed: {e}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                }
-                            } else {
-                                ui.status_message = Some((
-                                    format!("No pane linked to session {sid}"),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                        }
-                    }
-                    KeyResult::NewPane(req) => {
-                        if pane.is_available() {
-                            let dir_str = req.dir.display().to_string();
-                            let cmd = if req.command.is_empty() {
-                                None
-                            } else {
-                                Some(req.command.as_str())
-                            };
-                            match pane.create_pane(cmd, Some(&dir_str)) {
-                                Ok(new_id) => {
-                                    if !req.name.is_empty() {
-                                        let _ = pane.rename_pane(&new_id, &req.name);
-                                        ui.pane_display_names
-                                            .insert(new_id.clone(), req.name.clone());
-                                        ui.pane_names.insert(new_id.clone(), req.name);
-                                    }
+        if crossterm::event::poll(std::time::Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+        {
+            // Alt+1..9: jump to card N and focus its pane (works from any mode)
+            if let Some(card_num) = alt_digit(key) {
+                let idx = (card_num as usize).saturating_sub(1);
+                if idx < total {
+                    ui.selected_index = idx;
+                    ui.mode = UiMode::Normal;
+                    if let Some((sid, _)) = filtered.get(idx)
+                        && let Some(session) = snapshot.sessions.get(*sid)
+                    {
+                        if let Some(ref pane_id) = session.pane_id {
+                            match pane.focus_pane(pane_id) {
+                                Ok(()) => {}
+                                Err(e) => {
                                     ui.status_message = Some((
-                                        format!("Created pane {new_id} in {dir_str}"),
+                                        format!("Focus failed: {e}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                            }
+                        } else {
+                            ui.status_message = Some((
+                                format!("No pane linked to session {sid}"),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let selected_id: Option<String> =
+                filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+
+            let result = match ui.mode {
+                UiMode::Normal => handle_normal_key(key, &mut ui, total),
+                UiMode::Filter => handle_filter_key(key, &mut ui),
+                UiMode::Help => handle_help_key(key, &mut ui),
+                UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
+                UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
+                UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
+            };
+
+            match result {
+                KeyResult::Quit => break,
+                KeyResult::Focus => {
+                    if let Some(ref sid) = selected_id
+                        && let Some(session) = snapshot.sessions.get(sid)
+                    {
+                        if let Some(ref pane_id) = session.pane_id {
+                            match pane.focus_pane(pane_id) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    ui.status_message = Some((
+                                        format!("Focus failed: {e}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                            }
+                        } else {
+                            ui.status_message = Some((
+                                format!("No pane linked to session {sid}"),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                }
+                KeyResult::NewPane(req) => {
+                    if pane.is_available() {
+                        let dir_str = req.dir.display().to_string();
+                        let cmd = if req.command.is_empty() {
+                            None
+                        } else {
+                            Some(req.command.as_str())
+                        };
+                        match pane.create_pane(cmd, Some(&dir_str)) {
+                            Ok(new_id) => {
+                                if !req.name.is_empty() {
+                                    let _ = pane.rename_pane(&new_id, &req.name);
+                                    ui.pane_display_names
+                                        .insert(new_id.clone(), req.name.clone());
+                                    ui.pane_names.insert(new_id.clone(), req.name);
+                                }
+                                ui.status_message = Some((
+                                    format!("Created pane {new_id} in {dir_str}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                            Err(e) => {
+                                ui.status_message = Some((
+                                    format!("New pane failed: {e}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                KeyResult::ClosePane => {
+                    if let Some(ref sid) = selected_id
+                        && let Some(session) = snapshot.sessions.get(sid)
+                    {
+                        if let Some(ref pane_id) = session.pane_id {
+                            match pane.close_pane(pane_id) {
+                                Ok(()) => {
+                                    ui.status_message = Some((
+                                        format!("Closed pane {pane_id}"),
                                         std::time::Instant::now(),
                                     ));
                                 }
                                 Err(e) => {
                                     ui.status_message = Some((
-                                        format!("New pane failed: {e}"),
+                                        format!("Close failed: {e}"),
                                         std::time::Instant::now(),
                                     ));
                                 }
                             }
-                        }
-                    }
-                    KeyResult::ClosePane => {
-                        if let Some(ref sid) = selected_id
-                            && let Some(session) = snapshot.sessions.get(sid)
-                        {
-                            if let Some(ref pane_id) = session.pane_id {
-                                match pane.close_pane(pane_id) {
-                                    Ok(()) => {
-                                        ui.status_message = Some((
-                                            format!("Closed pane {pane_id}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        ui.status_message = Some((
-                                            format!("Close failed: {e}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                }
-                            } else {
-                                ui.status_message = Some((
-                                    format!("No pane linked to session {sid}"),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                        }
-                    }
-                    KeyResult::Continue => {}
-                }
-
-                // Keep pane_display_names in sync with display_names
-                // so renames persist across session restarts.
-                for (sid, session) in &snapshot.sessions {
-                    if let Some(ref pane_id) = session.pane_id {
-                        if let Some(name) = ui.display_names.get(sid) {
-                            ui.pane_display_names
-                                .insert(pane_id.clone(), name.clone());
                         } else {
-                            ui.pane_display_names.remove(pane_id);
+                            ui.status_message = Some((
+                                format!("No pane linked to session {sid}"),
+                                std::time::Instant::now(),
+                            ));
                         }
+                    }
+                }
+                KeyResult::Continue => {}
+            }
+
+            // Keep pane_display_names in sync with display_names
+            // so renames persist across session restarts.
+            for (sid, session) in &snapshot.sessions {
+                if let Some(ref pane_id) = session.pane_id {
+                    if let Some(name) = ui.display_names.get(sid) {
+                        ui.pane_display_names.insert(pane_id.clone(), name.clone());
+                    } else {
+                        ui.pane_display_names.remove(pane_id);
                     }
                 }
             }
@@ -818,15 +823,15 @@ fn render_frame(
         if ui.mode == UiMode::Help {
             render_help_overlay(frame, has_pane_control);
         }
-        if ui.mode == UiMode::DirPicker {
-            if let Some(ref picker) = ui.dir_picker {
-                render_dir_picker(frame, picker);
-            }
+        if ui.mode == UiMode::DirPicker
+            && let Some(ref picker) = ui.dir_picker
+        {
+            render_dir_picker(frame, picker);
         }
-        if ui.mode == UiMode::NewPaneForm {
-            if let Some(ref form) = ui.new_pane_form {
-                render_new_pane_form(frame, form);
-            }
+        if ui.mode == UiMode::NewPaneForm
+            && let Some(ref form) = ui.new_pane_form
+        {
+            render_new_pane_form(frame, form);
         }
         return;
     }
@@ -924,14 +929,20 @@ fn render_frame(
         for (col_idx, session) in row.iter().enumerate() {
             let flat_index = (ui.scroll_offset + vi) * cols + col_idx;
             let is_selected = flat_index == ui.selected_index;
-            let display_name = ids
-                .get(col_idx)
-                .and_then(|id| ui.display_names.get(*id));
+            let display_name = ids.get(col_idx).and_then(|id| ui.display_names.get(*id));
             let card_number = {
                 let n = flat_index + 1;
                 if n <= 9 { Some(n as u8) } else { None }
             };
-            render_session_card(frame, col_chunks[col_idx], session, tick, is_selected, display_name, card_number);
+            render_session_card(
+                frame,
+                col_chunks[col_idx],
+                session,
+                tick,
+                is_selected,
+                display_name,
+                card_number,
+            );
         }
     }
 
@@ -943,15 +954,15 @@ fn render_frame(
     if ui.mode == UiMode::Help {
         render_help_overlay(frame, has_pane_control);
     }
-    if ui.mode == UiMode::DirPicker {
-        if let Some(ref picker) = ui.dir_picker {
-            render_dir_picker(frame, picker);
-        }
+    if ui.mode == UiMode::DirPicker
+        && let Some(ref picker) = ui.dir_picker
+    {
+        render_dir_picker(frame, picker);
     }
-    if ui.mode == UiMode::NewPaneForm {
-        if let Some(ref form) = ui.new_pane_form {
-            render_new_pane_form(frame, form);
-        }
+    if ui.mode == UiMode::NewPaneForm
+        && let Some(ref form) = ui.new_pane_form
+    {
+        render_new_pane_form(frame, form);
     }
 }
 
@@ -959,7 +970,12 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
     match ui.mode {
         UiMode::Filter => {
             let line = Line::from(vec![
-                Span::styled("/ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "/ ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(&ui.filter_text),
             ]);
             frame.render_widget(Paragraph::new(line), area);
@@ -987,7 +1003,9 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
                 frame.render_widget(Paragraph::new(line), area);
             } else {
                 let hints = if has_pane_control {
-                    format!("?: help  {MOD_KEY}+1-9: jump  {MOD_KEY}+q: quit all  {MOD_KEY}+d: dashboard")
+                    format!(
+                        "?: help  {MOD_KEY}+1-9: jump  {MOD_KEY}+q: quit all  {MOD_KEY}+d: dashboard"
+                    )
                 } else {
                     format!("?: help  {MOD_KEY}+1-9: jump  q: quit")
                 };
@@ -1050,8 +1068,12 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
         ));
         help_text.push(Line::from(""));
         help_text.push(Line::from(format!("  {MOD_KEY}+h         Go to dashboard")));
-        help_text.push(Line::from(format!("  {MOD_KEY}+j/k       Navigate stacked panes")));
-        help_text.push(Line::from(format!("  {MOD_KEY}+w         Close current pane")));
+        help_text.push(Line::from(format!(
+            "  {MOD_KEY}+j/k       Navigate stacked panes"
+        )));
+        help_text.push(Line::from(format!(
+            "  {MOD_KEY}+w         Close current pane"
+        )));
         help_text.push(Line::from(format!("  {MOD_KEY}+q         Quit all")));
     }
 
@@ -1105,7 +1127,13 @@ fn render_dir_picker(frame: &mut Frame, picker: &DirPickerState) {
             0
         };
 
-        for (i, entry) in picker.entries.iter().enumerate().skip(scroll).take(max_visible) {
+        for (i, entry) in picker
+            .entries
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(max_visible)
+        {
             let name = if entry == &PathBuf::from("..") {
                 "..".to_string()
             } else {
@@ -1154,12 +1182,16 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
     let inner_width = popup_width.saturating_sub(4) as usize;
 
     let name_style = if form.focused == FormField::Name {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Gray)
     };
     let cmd_style = if form.focused == FormField::Command {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Gray)
     };
@@ -1174,7 +1206,11 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
         Line::from(vec![
             Span::styled("  Name:    ", name_style),
             Span::styled(
-                format!("{:<width$}", form.name, width = inner_width.saturating_sub(11)),
+                format!(
+                    "{:<width$}",
+                    form.name,
+                    width = inner_width.saturating_sub(11)
+                ),
                 if form.focused == FormField::Name {
                     Style::default().fg(Color::White)
                 } else {
@@ -1186,7 +1222,11 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
         Line::from(vec![
             Span::styled("  Command: ", cmd_style),
             Span::styled(
-                format!("{:<width$}", form.command, width = inner_width.saturating_sub(11)),
+                format!(
+                    "{:<width$}",
+                    form.command,
+                    width = inner_width.saturating_sub(11)
+                ),
                 if form.focused == FormField::Command {
                     Style::default().fg(Color::White)
                 } else {
@@ -1412,9 +1452,7 @@ fn status_style(status: &SessionStatus) -> (&str, Style) {
         SessionStatus::Compacting => ("Compacting", Style::default().fg(Color::Blue)),
         SessionStatus::WaitingForInput => (
             "Needs Input",
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         SessionStatus::Idle => ("Idle", Style::default().fg(Color::Green)),
         SessionStatus::Error => ("Error", Style::default().fg(Color::Red)),
@@ -1452,8 +1490,8 @@ mod tests {
     use super::*;
     use crate::event::{AgentEvent, AgentType, EventType};
     use chrono::{Duration, Utc};
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use std::collections::HashMap;
 
     fn default_ui() -> UiState {
@@ -1922,10 +1960,7 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Filter);
 
         // Filter -> Normal (Esc)
-        handle_filter_key(
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &mut ui,
-        );
+        handle_filter_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
         assert_eq!(ui.mode, UiMode::Normal);
 
         // Normal -> Help
@@ -1937,10 +1972,7 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Help);
 
         // Help -> Normal
-        handle_help_key(
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &mut ui,
-        );
+        handle_help_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
         assert_eq!(ui.mode, UiMode::Normal);
 
         // Normal -> Rename
@@ -2019,10 +2051,7 @@ mod tests {
         assert_eq!(ui.filter_text, "a");
 
         // Enter keeps filter
-        handle_filter_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut ui,
-        );
+        handle_filter_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
         assert_eq!(ui.mode, UiMode::Normal);
         assert_eq!(ui.filter_text, "a");
     }
@@ -2033,10 +2062,7 @@ mod tests {
         ui.mode = UiMode::Filter;
         ui.filter_text = "hello".to_string();
 
-        handle_filter_key(
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &mut ui,
-        );
+        handle_filter_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.filter_text.is_empty());
     }
@@ -2046,11 +2072,7 @@ mod tests {
         let mut ui = default_ui();
         ui.filter_text = "active-filter".to_string();
 
-        handle_normal_key(
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &mut ui,
-            5,
-        );
+        handle_normal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui, 5);
         assert!(ui.filter_text.is_empty());
     }
 
