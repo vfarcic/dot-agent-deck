@@ -143,7 +143,10 @@ on_idle = true
 
     #[test]
     fn should_bell_respects_enabled() {
-        let bc = BellConfig { enabled: false, ..Default::default() };
+        let bc = BellConfig {
+            enabled: false,
+            ..Default::default()
+        };
         assert!(!bc.should_bell(&SessionStatus::WaitingForInput));
         assert!(!bc.should_bell(&SessionStatus::Error));
     }

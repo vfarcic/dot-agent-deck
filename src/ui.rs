@@ -632,11 +632,8 @@ pub fn run_tui(
         tick = tick.wrapping_add(1);
 
         // Bell transition detection
-        let (need_bell, new_bell_status) = compute_bell_needed(
-            &snapshot.sessions,
-            &ui.last_bell_status,
-            &ui.config.bell,
-        );
+        let (need_bell, new_bell_status) =
+            compute_bell_needed(&snapshot.sessions, &ui.last_bell_status, &ui.config.bell);
         ui.last_bell_status = new_bell_status;
         if need_bell {
             use std::io::Write;
@@ -2179,7 +2176,10 @@ mod tests {
         let mut last = HashMap::new();
         last.insert("a".into(), SessionStatus::Working);
 
-        let config = BellConfig { on_idle: true, ..Default::default() };
+        let config = BellConfig {
+            on_idle: true,
+            ..Default::default()
+        };
         let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
         assert!(need_bell);
     }
@@ -2191,7 +2191,10 @@ mod tests {
 
         let last = HashMap::new(); // new session
 
-        let config = BellConfig { enabled: false, ..Default::default() };
+        let config = BellConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
         assert!(!need_bell);
     }
