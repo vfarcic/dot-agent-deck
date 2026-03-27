@@ -1,2 +1,173 @@
 # dot-agent-deck
-A rich terminal dashboard for monitoring and controlling multiple AI coding agent sessions
+
+A terminal dashboard for monitoring and controlling multiple AI coding agent sessions.
+
+[![CI](https://github.com/vfarcic/dot-agent-deck/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/vfarcic/dot-agent-deck/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/vfarcic/dot-agent-deck)](https://github.com/vfarcic/dot-agent-deck/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+<!-- TODO: Add terminal recording (asciinema or GIF) showing the dashboard in action -->
+
+## Features
+
+- **Real-time session monitoring** — see status, active tool, working directory, and last prompt for every agent session
+- **Pane control** — create, focus, close, and rename agent panes without leaving the dashboard
+- **Keyboard-driven interface** — vim-style navigation with single-key actions
+- **Auto-installed hooks** — one command registers all required hooks
+
+Currently supports **Claude Code**. Want support for your favorite TUI agent? [Open an issue](https://github.com/vfarcic/dot-agent-deck/issues/new) and let us know!
+
+## Quick Start
+
+```bash
+# 1. Install Zellij (terminal multiplexer for pane control)
+brew install zellij
+
+# 2. Install dot-agent-deck
+brew tap vfarcic/tap && brew install dot-agent-deck
+
+# 3. Register Claude Code hooks
+dot-agent-deck hooks install
+
+# 4. Launch the dashboard
+dot-agent-deck
+```
+
+## Installation
+
+### Zellij
+
+dot-agent-deck uses [Zellij](https://zellij.dev/) for pane control. Install it first:
+
+```bash
+brew install zellij
+```
+
+See [Zellij installation docs](https://zellij.dev/documentation/installation) for other methods.
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap vfarcic/tap
+brew install dot-agent-deck
+```
+
+### Download Binary
+
+Download the latest binary for your platform from the [Releases](https://github.com/vfarcic/dot-agent-deck/releases/latest) page. Binaries are available for Linux (amd64, arm64) and macOS (amd64, arm64).
+
+### Verify
+
+```bash
+dot-agent-deck --help
+```
+
+## Getting Started
+
+### Hook Setup
+
+Register hooks so Claude Code sends events to the dashboard:
+
+```bash
+dot-agent-deck hooks install
+```
+
+This writes entries into `~/.claude/settings.json` for these hook types: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, PreCompact, SubagentStart, SubagentStop. The command is idempotent — safe to run again.
+
+To remove hooks:
+
+```bash
+dot-agent-deck hooks uninstall
+```
+
+### Launching
+
+Running `dot-agent-deck` auto-launches Zellij with a two-column layout:
+
+- **Left (1/3)** — the dashboard, displaying a card grid of agent sessions
+- **Right (2/3)** — stacked agent panes where Claude Code instances run
+
+The Zellij session is named `dot-agent-deck`. If the session already exists, it reattaches.
+
+### Session Statuses
+
+Each session card shows the agent's current state:
+
+| Status | Meaning |
+|---|---|
+| **Thinking** | Agent is reasoning before acting |
+| **Working** | Agent is executing a tool (tool name shown) |
+| **Compacting** | Context window is being compressed |
+| **WaitingForInput** | Agent needs user approval or input |
+| **Idle** | Agent is between tasks |
+| **Error** | Something went wrong |
+
+Cards also display: session ID, agent type, working directory, tool count, and last user prompt.
+
+### Basic Workflow
+
+1. Launch the dashboard with `dot-agent-deck`
+2. Press `n` to open a new pane (pick a directory, name, and command)
+3. Run Claude Code in the new pane
+4. Watch session statuses update in real-time on the dashboard
+5. Press `Enter` on a card to jump to that agent's pane
+
+## Configuration
+
+### Config File
+
+Location: `~/.config/dot-agent-deck/config.toml`
+
+```toml
+# Command to pre-fill in the new-pane form
+default_command = ""
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DOT_AGENT_DECK_SOCKET` | `$XDG_RUNTIME_DIR/dot-agent-deck.sock` or `/tmp/dot-agent-deck.sock` | Unix socket path for daemon IPC |
+| `DOT_AGENT_DECK_CONFIG` | `~/.config/dot-agent-deck/config.toml` | Config file path |
+| `DOT_AGENT_DECK_LOG` | *(unset)* | Set to any value to enable tracing logs on stderr |
+
+## Keyboard Shortcuts
+
+### Dashboard Navigation
+
+| Key | Action |
+|---|---|
+| `j` / `Down` | Move down |
+| `k` / `Up` | Move up |
+| `h` / `Left` | Move left |
+| `l` / `Right` | Move right |
+| `Alt+1`–`9` | Jump to card N |
+| `/` | Filter sessions |
+| `r` | Rename session |
+| `?` | Toggle help overlay |
+| `Esc` | Clear filter |
+| `q` / `Ctrl+c` | Quit |
+
+### Pane Control
+
+| Key | Action |
+|---|---|
+| `Enter` | Focus selected agent pane |
+| `n` | New pane (directory picker, then name + command form) |
+| `d` | Close selected agent pane |
+
+### Zellij Shortcuts (work from any pane)
+
+| Key | Action |
+|---|---|
+| `Alt+h` / `Alt+Left` | Go to dashboard pane |
+| `Alt+j` / `Alt+Down` | Navigate down in stacked panes |
+| `Alt+k` / `Alt+Up` | Navigate up in stacked panes |
+| `Alt+w` | Close current pane |
+| `Alt+q` | Quit all (exit Zellij) |
+
+> On macOS, `Alt` is the `Opt` key.
+
+## License
+
+[MIT](LICENSE)
