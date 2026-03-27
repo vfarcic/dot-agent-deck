@@ -1,6 +1,6 @@
 # PRD #8: Terminal Bell Notifications
 
-**Status**: Not Started
+**Status**: Complete
 **Priority**: Medium
 **GitHub Issue**: [#8](https://github.com/vfarcic/dot-agent-deck/issues/8)
 
@@ -58,11 +58,11 @@ on_error = true
 
 ## Milestones
 
-- [ ] `BellConfig` struct added to `src/config.rs` with per-state toggles and sensible defaults
-- [ ] Bell tracking state (`last_bell_status`) added to `UiState` in `src/ui.rs`
-- [ ] Pure `compute_bell_needed()` function implemented with transition detection logic
-- [ ] Bell integrated into TUI main loop (fires `\x07` on detected transitions)
-- [ ] Unit tests for bell detection logic (transitions, duplicates, config toggles, cleanup)
+- [x] `BellConfig` struct added to `src/config.rs` with per-state toggles and sensible defaults
+- [x] Bell tracking state (`last_bell_status`) added to `UiState` in `src/ui.rs`
+- [x] Pure `compute_bell_needed()` function implemented with transition detection logic
+- [x] Bell integrated into TUI main loop (fires `\x07` on detected transitions)
+- [x] Unit tests for bell detection logic (transitions, duplicates, config toggles, cleanup)
 - [ ] Manual verification: bell fires in terminal on agent state changes
 
 ## Files to Modify

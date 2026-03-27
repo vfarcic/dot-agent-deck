@@ -12,7 +12,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
-use crate::config::DashboardConfig;
+use crate::config::{BellConfig, DashboardConfig};
 use crate::event::EventType;
 use crate::pane::PaneController;
 use crate::state::{AppState, SessionState, SessionStatus, SharedState};
@@ -140,6 +140,8 @@ struct UiState {
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
     config: DashboardConfig,
+    /// Tracks last-seen status per session for bell transition detection.
+    last_bell_status: HashMap<String, SessionStatus>,
 }
 
 impl UiState {
@@ -158,6 +160,7 @@ impl UiState {
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
             config,
+            last_bell_status: HashMap::new(),
         }
     }
 }
@@ -255,6 +258,32 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
         id_match || cwd_match || status_match || name_match
     });
     sessions
+}
+
+// ---------------------------------------------------------------------------
+// Bell transition detection
+// ---------------------------------------------------------------------------
+
+fn compute_bell_needed(
+    sessions: &HashMap<String, SessionState>,
+    last_bell_status: &HashMap<String, SessionStatus>,
+    bell_config: &BellConfig,
+) -> (bool, HashMap<String, SessionStatus>) {
+    let mut need_bell = false;
+    let mut new_status_map = HashMap::with_capacity(sessions.len());
+
+    for (id, session) in sessions {
+        let current = &session.status;
+        let changed = last_bell_status.get(id) != Some(current);
+
+        if changed && bell_config.should_bell(current) {
+            need_bell = true;
+        }
+
+        new_status_map.insert(id.clone(), current.clone());
+    }
+
+    (need_bell, new_status_map)
 }
 
 // ---------------------------------------------------------------------------
@@ -601,6 +630,16 @@ pub fn run_tui(
             render_frame(frame, &snapshot, &mut ui, &filtered, tick, has_pane_control);
         })?;
         tick = tick.wrapping_add(1);
+
+        // Bell transition detection
+        let (need_bell, new_bell_status) =
+            compute_bell_needed(&snapshot.sessions, &ui.last_bell_status, &ui.config.bell);
+        ui.last_bell_status = new_bell_status;
+        if need_bell {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(b"\x07");
+            let _ = std::io::stdout().flush();
+        }
 
         if crossterm::event::poll(std::time::Duration::from_millis(250))?
             && let Event::Key(key) = event::read()?
@@ -2070,5 +2109,130 @@ mod tests {
     fn test_alt_digit_ignores_zero() {
         let key = KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT);
         assert_eq!(alt_digit(key), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bell transition detection tests
+    // -----------------------------------------------------------------------
+
+    fn make_session(status: SessionStatus) -> SessionState {
+        SessionState {
+            session_id: String::new(),
+            agent_type: AgentType::ClaudeCode,
+            cwd: None,
+            status,
+            active_tool: None,
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+            recent_events: std::collections::VecDeque::new(),
+            tool_count: 0,
+            last_user_prompt: None,
+            pane_id: None,
+        }
+    }
+
+    #[test]
+    fn bell_on_transition_to_waiting() {
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::WaitingForInput));
+
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::Working);
+
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        assert!(need_bell);
+    }
+
+    #[test]
+    fn bell_no_repeat_same_status() {
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::WaitingForInput));
+
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::WaitingForInput);
+
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        assert!(!need_bell);
+    }
+
+    #[test]
+    fn bell_respects_config_toggle_off() {
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::Idle));
+
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::Working);
+
+        // Default config has on_idle = false
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        assert!(!need_bell);
+    }
+
+    #[test]
+    fn bell_respects_config_toggle_on() {
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::Idle));
+
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::Working);
+
+        let config = BellConfig {
+            on_idle: true,
+            ..Default::default()
+        };
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
+        assert!(need_bell);
+    }
+
+    #[test]
+    fn bell_disabled_globally() {
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::WaitingForInput));
+
+        let last = HashMap::new(); // new session
+
+        let config = BellConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
+        assert!(!need_bell);
+    }
+
+    #[test]
+    fn bell_multiple_transitions_single_bool() {
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::WaitingForInput));
+        sessions.insert("b".into(), make_session(SessionStatus::Error));
+
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::Working);
+        last.insert("b".into(), SessionStatus::Working);
+
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        assert!(need_bell);
+    }
+
+    #[test]
+    fn bell_cleanup_removed_sessions() {
+        let sessions = HashMap::new(); // no sessions
+
+        let mut last = HashMap::new();
+        last.insert("gone".into(), SessionStatus::Working);
+
+        let (_, new_map) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        assert!(!new_map.contains_key("gone"));
+    }
+
+    #[test]
+    fn bell_new_session_triggers() {
+        let mut sessions = HashMap::new();
+        sessions.insert("new".into(), make_session(SessionStatus::WaitingForInput));
+
+        let last = HashMap::new(); // empty — session is brand new
+
+        let (need_bell, new_map) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        assert!(need_bell);
+        assert_eq!(new_map.get("new"), Some(&SessionStatus::WaitingForInput));
     }
 }
