@@ -82,11 +82,6 @@ jobs:
             artifact_suffix: darwin-arm64
             use_cross: false
             binary_ext: ""
-          - target: x86_64-pc-windows-gnu
-            os: ubuntu-latest
-            artifact_suffix: windows-amd64
-            use_cross: true
-            binary_ext: .exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
