@@ -112,28 +112,11 @@ Cards also display: session ID, agent type, working directory, tool count, and l
 4. Watch session statuses update in real-time on the dashboard
 5. Press `Enter` on a card to jump to that agent's pane
 
-## Configuration
-
-### Config File
-
-Location: `~/.config/dot-agent-deck/config.toml`
-
-```toml
-# Command to pre-fill in the new-pane form
-default_command = ""
-```
-
-### Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `DOT_AGENT_DECK_SOCKET` | `$XDG_RUNTIME_DIR/dot-agent-deck.sock` or `/tmp/dot-agent-deck.sock` | Unix socket path for daemon IPC |
-| `DOT_AGENT_DECK_CONFIG` | `~/.config/dot-agent-deck/config.toml` | Config file path |
-| `DOT_AGENT_DECK_LOG` | *(unset)* | Set to any value to enable tracing logs on stderr |
+> **Tip:** Press `Alt+d` (`Opt+d` on macOS) from any pane to jump back to the dashboard.
 
 ## Keyboard Shortcuts
 
-### Dashboard Navigation
+### Dashboard Pane (active when the dashboard is focused)
 
 | Key | Action |
 |---|---|
@@ -156,17 +139,54 @@ default_command = ""
 | `n` | New pane (directory picker, then name + command form) |
 | `d` | Close selected agent pane |
 
+### Directory Picker
+
+| Key | Action |
+|---|---|
+| `j` / `Down` | Select next directory |
+| `k` / `Up` | Select previous directory |
+| `l` / `Right` / `Enter` | Enter directory (or confirm if no subdirs) |
+| `h` / `Left` / `Backspace` | Go up one level |
+| `Space` | Confirm current directory |
+| `Esc` / `q` | Cancel |
+
+### New Pane Form
+
+| Key | Action |
+|---|---|
+| `Tab` / `Shift+Tab` | Switch between Name and Command fields |
+| `Enter` | Confirm field / submit form |
+| `Esc` | Cancel |
+
 ### Zellij Shortcuts (work from any pane)
 
 | Key | Action |
 |---|---|
-| `Alt+h` / `Alt+Left` | Go to dashboard pane |
+| `Alt+d` / `Alt+h` / `Alt+Left` | Go to dashboard pane |
 | `Alt+j` / `Alt+Down` | Navigate down in stacked panes |
 | `Alt+k` / `Alt+Up` | Navigate up in stacked panes |
 | `Alt+w` | Close current pane |
 | `Alt+q` | Quit all (exit Zellij) |
 
 > On macOS, `Alt` is the `Opt` key.
+
+## Configuration
+
+```bash
+# Set the default command pre-filled in the new-pane form
+dot-agent-deck config set default_command "claude"
+
+# Read the current value
+dot-agent-deck config get default_command
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DOT_AGENT_DECK_SOCKET` | `$XDG_RUNTIME_DIR/dot-agent-deck.sock` or `/tmp/dot-agent-deck.sock` | Unix socket path for daemon IPC |
+| `DOT_AGENT_DECK_CONFIG` | `~/.config/dot-agent-deck/config.toml` | Config file path |
+| `DOT_AGENT_DECK_LOG` | *(unset)* | Set to any value to enable tracing logs on stderr |
 
 ## License
 
