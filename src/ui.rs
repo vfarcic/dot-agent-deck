@@ -14,7 +14,7 @@ use ratatui::{
 
 use crate::config::{BellConfig, DashboardConfig};
 use crate::event::EventType;
-use crate::pane::PaneController;
+use crate::pane::{PaneController, PaneError};
 use crate::state::{AppState, SessionState, SessionStatus, SharedState};
 
 impl fmt::Display for crate::event::AgentType {
@@ -314,6 +314,20 @@ fn alt_digit(key: KeyEvent) -> Option<u8> {
     None
 }
 
+fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = input.chars().count();
+    if char_count <= max_chars {
+        return input.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = input.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
 /// Select deck at `idx` and focus its pane. Returns `true` if idx was valid.
 fn focus_deck(
     idx: usize,
@@ -334,12 +348,16 @@ fn focus_deck(
         if let Some(ref pane_id) = session.pane_id {
             match pane.focus_pane(pane_id) {
                 Ok(()) => {}
-                Err(e) => {
+                Err(PaneError::CommandFailed(ref msg)) => {
                     state.blocking_write().sessions.remove(*sid);
                     ui.status_message = Some((
-                        format!("Removed stale session: {e}"),
+                        format!("Removed stale session: {msg}"),
                         std::time::Instant::now(),
                     ));
+                }
+                Err(e) => {
+                    ui.status_message =
+                        Some((format!("Pane focus failed: {e}"), std::time::Instant::now()));
                 }
             }
         } else {
@@ -720,10 +738,16 @@ pub fn run_tui(
                         if let Some(ref pane_id) = session.pane_id {
                             match pane.focus_pane(pane_id) {
                                 Ok(()) => {}
-                                Err(e) => {
+                                Err(PaneError::CommandFailed(ref msg)) => {
                                     state.blocking_write().sessions.remove(sid);
                                     ui.status_message = Some((
-                                        format!("Removed stale session: {e}"),
+                                        format!("Removed stale session: {msg}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    ui.status_message = Some((
+                                        format!("Pane focus failed: {e}"),
                                         std::time::Instant::now(),
                                     ));
                                 }
@@ -1328,11 +1352,8 @@ fn render_session_card(
     let dot = flash_dot(&session.status, tick);
     let status_text = format!(" {} {} ", dot, status_label);
     // area.width includes left+right borders (2 chars)
-    let max_title = (area.width as usize).saturating_sub(status_text.len() + 2);
-    if title_left.len() > max_title && max_title > 1 {
-        title_left.truncate(max_title - 1);
-        title_left.push('…');
-    }
+    let max_title = (area.width as usize).saturating_sub(status_text.chars().count() + 2);
+    title_left = truncate_with_ellipsis(&title_left, max_title);
 
     let border_style = if is_selected {
         Style::default()
@@ -1353,11 +1374,8 @@ fn render_session_card(
         ))
         .title_alignment(ratatui::layout::Alignment::Left)
         .title(
-            Line::from(Span::styled(
-                status_text,
-                status_style,
-            ))
-            .alignment(ratatui::layout::Alignment::Right),
+            Line::from(Span::styled(status_text, status_style))
+                .alignment(ratatui::layout::Alignment::Right),
         );
 
     let inner = block.inner(area);
@@ -1388,11 +1406,7 @@ fn render_session_card(
         let dir_label_len = 6; // "Dir:  "
         let max_dir = w.saturating_sub(right_len + dir_label_len + 1);
 
-        let dir_display: String = if cwd_display.len() > max_dir && max_dir > 0 {
-            format!("{}…", &cwd_display[..max_dir])
-        } else {
-            cwd_display.into_owned()
-        };
+        let dir_display = truncate_with_ellipsis(cwd_display.as_ref(), max_dir);
 
         lines.push(padded_line(
             vec![
