@@ -1,6 +1,6 @@
 # PRD #12: Dashboard UI — Dir Truncation & Plain Digit Keybindings
 
-**Status**: Open
+**Status**: Complete (2026-03-29)
 **Priority**: Medium
 **GitHub Issue**: [#12](https://github.com/vfarcic/dot-agent-deck/issues/12)
 
@@ -30,10 +30,10 @@ Add a match arm in `handle_normal_key()` for `KeyCode::Char('1'..='9')` that tri
 
 ## Milestones
 
-- [ ] Dir field truncates with ellipsis when it would overlap Last/Tools in wide layout
-- [ ] Plain digit keys (1-9) select and focus deck in Normal mode
-- [ ] Shared focus logic extracted to avoid duplication between Alt+N and plain digit paths
-- [ ] All existing tests pass; no regressions
+- [x] Dir field truncates with ellipsis when it would overlap Last/Tools in wide layout
+- [x] Plain digit keys (1-9) select and focus deck in Normal mode
+- [x] Shared focus logic extracted to avoid duplication between Alt+N and plain digit paths
+- [x] All existing tests pass; no regressions
 
 ## Success Criteria
 

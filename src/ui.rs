@@ -14,7 +14,7 @@ use ratatui::{
 
 use crate::config::{BellConfig, DashboardConfig};
 use crate::event::EventType;
-use crate::pane::PaneController;
+use crate::pane::{PaneController, PaneError};
 use crate::state::{AppState, SessionState, SessionStatus, SharedState};
 
 impl fmt::Display for crate::event::AgentType {
@@ -312,6 +312,62 @@ fn alt_digit(key: KeyEvent) -> Option<u8> {
         return Some(c as u8 - b'0');
     }
     None
+}
+
+fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = input.chars().count();
+    if char_count <= max_chars {
+        return input.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = input.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+/// Select deck at `idx` and focus its pane. Returns `true` if idx was valid.
+fn focus_deck(
+    idx: usize,
+    ui: &mut UiState,
+    filtered: &[(&String, &SessionState)],
+    snapshot: &AppState,
+    state: &SharedState,
+    pane: &dyn PaneController,
+) -> bool {
+    if idx >= filtered.len() {
+        return false;
+    }
+    ui.selected_index = idx;
+    ui.mode = UiMode::Normal;
+    if let Some((sid, _)) = filtered.get(idx)
+        && let Some(session) = snapshot.sessions.get(*sid)
+    {
+        if let Some(ref pane_id) = session.pane_id {
+            match pane.focus_pane(pane_id) {
+                Ok(()) => {}
+                Err(PaneError::CommandFailed(ref msg)) => {
+                    state.blocking_write().sessions.remove(*sid);
+                    ui.status_message = Some((
+                        format!("Removed stale session: {msg}"),
+                        std::time::Instant::now(),
+                    ));
+                }
+                Err(e) => {
+                    ui.status_message =
+                        Some((format!("Pane focus failed: {e}"), std::time::Instant::now()));
+                }
+            }
+        } else {
+            ui.status_message = Some((
+                format!("No pane linked to session {sid}"),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+    true
 }
 
 fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
@@ -647,31 +703,17 @@ pub fn run_tui(
             // Alt+1..9: jump to card N and focus its pane (works from any mode)
             if let Some(card_num) = alt_digit(key) {
                 let idx = (card_num as usize).saturating_sub(1);
-                if idx < total {
-                    ui.selected_index = idx;
-                    ui.mode = UiMode::Normal;
-                    if let Some((sid, _)) = filtered.get(idx)
-                        && let Some(session) = snapshot.sessions.get(*sid)
-                    {
-                        if let Some(ref pane_id) = session.pane_id {
-                            match pane.focus_pane(pane_id) {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    state.blocking_write().sessions.remove(*sid);
-                                    ui.status_message = Some((
-                                        format!("Removed stale session: {e}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            ui.status_message = Some((
-                                format!("No pane linked to session {sid}"),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                    }
-                }
+                focus_deck(idx, &mut ui, &filtered, &snapshot, &state, &*pane);
+                continue;
+            }
+
+            // Plain 1..9 in Normal mode: jump to card N and focus its pane
+            if ui.mode == UiMode::Normal
+                && let KeyCode::Char(c @ '1'..='9') = key.code
+                && key.modifiers == KeyModifiers::NONE
+            {
+                let idx = (c as usize) - ('1' as usize);
+                focus_deck(idx, &mut ui, &filtered, &snapshot, &state, &*pane);
                 continue;
             }
 
@@ -696,10 +738,16 @@ pub fn run_tui(
                         if let Some(ref pane_id) = session.pane_id {
                             match pane.focus_pane(pane_id) {
                                 Ok(()) => {}
-                                Err(e) => {
+                                Err(PaneError::CommandFailed(ref msg)) => {
                                     state.blocking_write().sessions.remove(sid);
                                     ui.status_message = Some((
-                                        format!("Removed stale session: {e}"),
+                                        format!("Removed stale session: {msg}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    ui.status_message = Some((
+                                        format!("Pane focus failed: {e}"),
                                         std::time::Instant::now(),
                                     ));
                                 }
@@ -1295,13 +1343,17 @@ fn render_session_card(
         Some(n) => format!("{n} "),
         None => String::new(),
     };
-    let title_left = if let Some(name) = display_name {
+    let mut title_left = if let Some(name) = display_name {
         format!(" {num_prefix}{} ", name)
     } else {
         format!(" {num_prefix}{} · {} ", session.agent_type, id_display)
     };
 
     let dot = flash_dot(&session.status, tick);
+    let status_text = format!(" {} {} ", dot, status_label);
+    // area.width includes left+right borders (2 chars)
+    let max_title = (area.width as usize).saturating_sub(status_text.chars().count() + 2);
+    title_left = truncate_with_ellipsis(&title_left, max_title);
 
     let border_style = if is_selected {
         Style::default()
@@ -1322,11 +1374,8 @@ fn render_session_card(
         ))
         .title_alignment(ratatui::layout::Alignment::Left)
         .title(
-            Line::from(Span::styled(
-                format!(" {} {} ", dot, status_label),
-                status_style,
-            ))
-            .alignment(ratatui::layout::Alignment::Right),
+            Line::from(Span::styled(status_text, status_style))
+                .alignment(ratatui::layout::Alignment::Right),
         );
 
     let inner = block.inner(area);
@@ -1347,17 +1396,24 @@ fn render_session_card(
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     if wide {
+        let right_spans = vec![
+            Span::styled("Last: ", Style::default().fg(Color::Gray)),
+            Span::raw(format!("{}  ", elapsed)),
+            Span::styled("Tools: ", Style::default().fg(Color::Gray)),
+            Span::raw(session.tool_count.to_string()),
+        ];
+        let right_len: usize = right_spans.iter().map(|s| s.width()).sum();
+        let dir_label_len = 6; // "Dir:  "
+        let max_dir = w.saturating_sub(right_len + dir_label_len + 1);
+
+        let dir_display = truncate_with_ellipsis(cwd_display.as_ref(), max_dir);
+
         lines.push(padded_line(
             vec![
                 Span::styled("Dir:  ", Style::default().fg(Color::Gray)),
-                Span::raw(cwd_display),
+                Span::raw(dir_display),
             ],
-            vec![
-                Span::styled("Last: ", Style::default().fg(Color::Gray)),
-                Span::raw(format!("{}  ", elapsed)),
-                Span::styled("Tools: ", Style::default().fg(Color::Gray)),
-                Span::raw(session.tool_count.to_string()),
-            ],
+            right_spans,
             w,
         ));
     } else {
