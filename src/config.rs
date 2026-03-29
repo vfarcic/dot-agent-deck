@@ -50,7 +50,7 @@ impl BellConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct DashboardConfig {
     pub default_command: String,
