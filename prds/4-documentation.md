@@ -1,6 +1,6 @@
 # PRD #4: Comprehensive Documentation
 
-**Status**: In Progress
+**Status**: Complete
 **Priority**: Medium
 **GitHub Issue**: [#4](https://github.com/vfarcic/dot-agent-deck/issues/4)
 **Depends on**: PRD #1 (Agent Status Dashboard), PRD #2 (Pane Control)
@@ -100,7 +100,7 @@ The README should serve as the landing page:
 - [x] Configuration and architecture documentation
 - [x] Keyboard shortcuts reference (dashboard + Zellij)
 - [~] CONTRIBUTING.md with development setup, testing, and PR guidelines (deferred — README kept user-facing only)
-- [ ] Terminal screenshot or asciinema recording embedded in README
+- [~] Terminal recording embedded in README (moved to PRD #10)
 
 ## Success Criteria
 
