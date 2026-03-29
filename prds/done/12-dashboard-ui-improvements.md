@@ -1,6 +1,6 @@
 # PRD #12: Dashboard UI — Dir Truncation & Plain Digit Keybindings
 
-**Status**: Open
+**Status**: Complete (2026-03-29)
 **Priority**: Medium
 **GitHub Issue**: [#12](https://github.com/vfarcic/dot-agent-deck/issues/12)
 
