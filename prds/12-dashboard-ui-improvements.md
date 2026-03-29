@@ -30,7 +30,7 @@ Add a match arm in `handle_normal_key()` for `KeyCode::Char('1'..='9')` that tri
 
 ## Milestones
 
-- [ ] Dir field truncates with ellipsis when it would overlap Last/Tools in wide layout
+- [x] Dir field truncates with ellipsis when it would overlap Last/Tools in wide layout
 - [x] Plain digit keys (1-9) select and focus deck in Normal mode
 - [x] Shared focus logic extracted to avoid duplication between Alt+N and plain digit paths
 - [x] All existing tests pass; no regressions

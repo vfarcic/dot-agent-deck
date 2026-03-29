@@ -1319,13 +1319,20 @@ fn render_session_card(
         Some(n) => format!("{n} "),
         None => String::new(),
     };
-    let title_left = if let Some(name) = display_name {
+    let mut title_left = if let Some(name) = display_name {
         format!(" {num_prefix}{} ", name)
     } else {
         format!(" {num_prefix}{} · {} ", session.agent_type, id_display)
     };
 
     let dot = flash_dot(&session.status, tick);
+    let status_text = format!(" {} {} ", dot, status_label);
+    // area.width includes left+right borders (2 chars)
+    let max_title = (area.width as usize).saturating_sub(status_text.len() + 2);
+    if title_left.len() > max_title && max_title > 1 {
+        title_left.truncate(max_title - 1);
+        title_left.push('…');
+    }
 
     let border_style = if is_selected {
         Style::default()
@@ -1347,7 +1354,7 @@ fn render_session_card(
         .title_alignment(ratatui::layout::Alignment::Left)
         .title(
             Line::from(Span::styled(
-                format!(" {} {} ", dot, status_label),
+                status_text,
                 status_style,
             ))
             .alignment(ratatui::layout::Alignment::Right),
@@ -1371,17 +1378,28 @@ fn render_session_card(
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     if wide {
+        let right_spans = vec![
+            Span::styled("Last: ", Style::default().fg(Color::Gray)),
+            Span::raw(format!("{}  ", elapsed)),
+            Span::styled("Tools: ", Style::default().fg(Color::Gray)),
+            Span::raw(session.tool_count.to_string()),
+        ];
+        let right_len: usize = right_spans.iter().map(|s| s.width()).sum();
+        let dir_label_len = 6; // "Dir:  "
+        let max_dir = w.saturating_sub(right_len + dir_label_len + 1);
+
+        let dir_display: String = if cwd_display.len() > max_dir && max_dir > 0 {
+            format!("{}…", &cwd_display[..max_dir])
+        } else {
+            cwd_display.into_owned()
+        };
+
         lines.push(padded_line(
             vec![
                 Span::styled("Dir:  ", Style::default().fg(Color::Gray)),
-                Span::raw(cwd_display),
+                Span::raw(dir_display),
             ],
-            vec![
-                Span::styled("Last: ", Style::default().fg(Color::Gray)),
-                Span::raw(format!("{}  ", elapsed)),
-                Span::styled("Tools: ", Style::default().fg(Color::Gray)),
-                Span::raw(session.tool_count.to_string()),
-            ],
+            right_spans,
             w,
         ));
     } else {
