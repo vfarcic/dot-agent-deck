@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 
-use dot_agent_deck::config::{socket_path, DashboardConfig};
+use dot_agent_deck::config::{DashboardConfig, socket_path};
 use dot_agent_deck::daemon::run_daemon;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::hooks_manage;
