@@ -314,6 +314,44 @@ fn alt_digit(key: KeyEvent) -> Option<u8> {
     None
 }
 
+/// Select deck at `idx` and focus its pane. Returns `true` if idx was valid.
+fn focus_deck(
+    idx: usize,
+    ui: &mut UiState,
+    filtered: &[(&String, &SessionState)],
+    snapshot: &AppState,
+    state: &SharedState,
+    pane: &dyn PaneController,
+) -> bool {
+    if idx >= filtered.len() {
+        return false;
+    }
+    ui.selected_index = idx;
+    ui.mode = UiMode::Normal;
+    if let Some((sid, _)) = filtered.get(idx)
+        && let Some(session) = snapshot.sessions.get(*sid)
+    {
+        if let Some(ref pane_id) = session.pane_id {
+            match pane.focus_pane(pane_id) {
+                Ok(()) => {}
+                Err(e) => {
+                    state.blocking_write().sessions.remove(*sid);
+                    ui.status_message = Some((
+                        format!("Removed stale session: {e}"),
+                        std::time::Instant::now(),
+                    ));
+                }
+            }
+        } else {
+            ui.status_message = Some((
+                format!("No pane linked to session {sid}"),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+    true
+}
+
 fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return KeyResult::Quit;
@@ -647,31 +685,17 @@ pub fn run_tui(
             // Alt+1..9: jump to card N and focus its pane (works from any mode)
             if let Some(card_num) = alt_digit(key) {
                 let idx = (card_num as usize).saturating_sub(1);
-                if idx < total {
-                    ui.selected_index = idx;
-                    ui.mode = UiMode::Normal;
-                    if let Some((sid, _)) = filtered.get(idx)
-                        && let Some(session) = snapshot.sessions.get(*sid)
-                    {
-                        if let Some(ref pane_id) = session.pane_id {
-                            match pane.focus_pane(pane_id) {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    state.blocking_write().sessions.remove(*sid);
-                                    ui.status_message = Some((
-                                        format!("Removed stale session: {e}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            ui.status_message = Some((
-                                format!("No pane linked to session {sid}"),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                    }
-                }
+                focus_deck(idx, &mut ui, &filtered, &snapshot, &state, &*pane);
+                continue;
+            }
+
+            // Plain 1..9 in Normal mode: jump to card N and focus its pane
+            if ui.mode == UiMode::Normal
+                && let KeyCode::Char(c @ '1'..='9') = key.code
+                && key.modifiers == KeyModifiers::NONE
+            {
+                let idx = (c as usize) - ('1' as usize);
+                focus_deck(idx, &mut ui, &filtered, &snapshot, &state, &*pane);
                 continue;
             }
 
