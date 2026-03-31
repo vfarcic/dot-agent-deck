@@ -36,6 +36,52 @@ const MOD_KEY: &str = if cfg!(target_os = "macos") {
 };
 
 // ---------------------------------------------------------------------------
+// Card density (adaptive layout)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardDensity {
+    Compact,  // 6 rows: 1 prompt, 1 tool
+    Normal,   // 8 rows: 1 prompt, 3 tools
+    Spacious, // 10 rows: 3 prompts, 3 tools
+}
+
+impl CardDensity {
+    fn card_height(self) -> u16 {
+        match self {
+            CardDensity::Compact => 6,
+            CardDensity::Normal => 8,
+            CardDensity::Spacious => 10,
+        }
+    }
+
+    fn max_tools(self) -> usize {
+        match self {
+            CardDensity::Compact => 1,
+            _ => 3,
+        }
+    }
+
+    fn max_prompts(self) -> usize {
+        match self {
+            CardDensity::Spacious => 3,
+            _ => 1,
+        }
+    }
+}
+
+fn choose_density(total_cards: usize, cols: usize, available_height: u16) -> CardDensity {
+    let total_card_rows = total_cards.div_ceil(cols);
+    for density in [CardDensity::Spacious, CardDensity::Normal, CardDensity::Compact] {
+        let needed = total_card_rows as u16 * density.card_height();
+        if needed <= available_height {
+            return density;
+        }
+    }
+    CardDensity::Compact
+}
+
+// ---------------------------------------------------------------------------
 // UI state types
 // ---------------------------------------------------------------------------
 
@@ -889,11 +935,15 @@ fn render_frame(
     let session_ids: Vec<&String> = filtered.iter().map(|(id, _)| *id).collect();
 
     let cols = grid_columns(area.width);
-    let card_height = 8;
 
     // Determine if we need a bottom bar (status/filter/rename)
     let has_bottom_bar = true; // always show status bar
     let bottom_height: u16 = if has_bottom_bar { 1 } else { 0 };
+
+    // Choose card density based on available vertical space
+    let available_for_density = area.height.saturating_sub(1 + bottom_height);
+    let density = choose_density(sessions.len(), cols, available_for_density);
+    let card_height = density.card_height();
 
     // Title bar
     let total_sessions = state.sessions.len();
@@ -942,9 +992,8 @@ fn render_frame(
     let all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
     let total_rows = all_rows.len();
 
-    // Calculate how many rows fit in the available area (title + bottom bar take space)
-    let available = area.height.saturating_sub(1 + bottom_height);
-    let visible_rows = (available / card_height).max(1) as usize;
+    // Calculate how many rows fit in the available area
+    let visible_rows = (available_for_density / card_height).max(1) as usize;
 
     // Adjust scroll offset to keep selected row visible
     let selected_row = ui.selected_index / cols;
@@ -991,6 +1040,7 @@ fn render_frame(
                 is_selected,
                 display_name,
                 card_number,
+                density,
             );
         }
     }
@@ -1321,6 +1371,7 @@ fn grid_columns(width: u16) -> usize {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_session_card(
     frame: &mut Frame,
     area: Rect,
@@ -1329,6 +1380,7 @@ fn render_session_card(
     is_selected: bool,
     display_name: Option<&String>,
     card_number: Option<u8>,
+    density: CardDensity,
 ) {
     let (status_label, status_style) = status_style(&session.status);
     let status_color = status_style.fg.unwrap_or(Color::Gray);
@@ -1423,13 +1475,10 @@ fn render_session_card(
         ]));
     }
 
-    if let Some(ref prompt) = session.last_user_prompt {
+    let prompts = collect_recent_prompts(session, density.max_prompts());
+    for prompt in &prompts {
         let max_prompt = w.saturating_sub(6);
-        let display = if prompt.len() > max_prompt {
-            format!("{}…", &prompt[..max_prompt])
-        } else {
-            prompt.clone()
-        };
+        let display = truncate_with_ellipsis(prompt, max_prompt);
         lines.push(Line::from(vec![
             Span::styled("Prmt: ", Style::default().fg(Color::Gray)),
             Span::raw(display),
@@ -1445,8 +1494,10 @@ fn render_session_card(
         ]));
     }
 
-    lines.push(Line::from(""));
-    lines.extend(recent_tool_lines(session));
+    if density != CardDensity::Compact {
+        lines.push(Line::from(""));
+    }
+    lines.extend(recent_tool_lines(session, density.max_tools()));
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
@@ -1475,13 +1526,30 @@ fn flash_dot(status: &SessionStatus, tick: u64) -> &'static str {
     }
 }
 
-fn recent_tool_lines(session: &SessionState) -> Vec<Line<'static>> {
+fn collect_recent_prompts(session: &SessionState, max: usize) -> Vec<String> {
+    let mut prompts: Vec<String> = session
+        .recent_events
+        .iter()
+        .rev()
+        .filter_map(|e| e.user_prompt.as_ref())
+        .take(max)
+        .cloned()
+        .collect();
+    prompts.reverse();
+
+    if prompts.is_empty() && let Some(ref p) = session.last_user_prompt {
+        prompts.push(p.clone());
+    }
+    prompts
+}
+
+fn recent_tool_lines(session: &SessionState, max_tools: usize) -> Vec<Line<'static>> {
     let tool_events: Vec<_> = session
         .recent_events
         .iter()
         .rev()
         .filter(|e| e.event_type == EventType::ToolStart)
-        .take(3)
+        .take(max_tools)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -1690,12 +1758,17 @@ mod tests {
             pane_id: None,
         };
 
-        let lines = recent_tool_lines(&session);
+        let lines = recent_tool_lines(&session, 3);
         assert_eq!(lines.len(), 3);
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert_eq!(text[0], "  Write — out.txt");
         assert_eq!(text[1], "  Bash");
         assert_eq!(text[2], "  Grep — pattern");
+
+        // Compact mode: only 1 tool (most recent)
+        let lines_compact = recent_tool_lines(&session, 1);
+        assert_eq!(lines_compact.len(), 1);
+        assert_eq!(lines_compact[0].to_string(), "  Grep — pattern");
     }
 
     #[test]
@@ -2294,5 +2367,121 @@ mod tests {
         let (need_bell, new_map) = compute_bell_needed(&sessions, &last, &BellConfig::default());
         assert!(need_bell);
         assert_eq!(new_map.get("new"), Some(&SessionStatus::WaitingForInput));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Card density tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_choose_density() {
+        // 1 session, 1 col, plenty of height -> Spacious
+        assert_eq!(choose_density(1, 1, 20), CardDensity::Spacious);
+
+        // 2 sessions, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
+        assert_eq!(choose_density(2, 2, 10), CardDensity::Spacious);
+
+        // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
+        assert_eq!(choose_density(2, 2, 9), CardDensity::Normal);
+
+        // 4 sessions, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
+        assert_eq!(choose_density(4, 2, 16), CardDensity::Normal);
+
+        // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*6=12 fits)
+        assert_eq!(choose_density(4, 2, 15), CardDensity::Compact);
+
+        // Many sessions, small screen -> Compact
+        assert_eq!(choose_density(10, 1, 20), CardDensity::Compact);
+
+        // Edge: 0 sessions -> Spacious (0 rows needed)
+        assert_eq!(choose_density(0, 1, 10), CardDensity::Spacious);
+    }
+
+    #[test]
+    fn test_collect_recent_prompts_from_events() {
+        use std::collections::VecDeque;
+
+        let mut events = VecDeque::new();
+        for prompt in ["first prompt", "second prompt", "third prompt"] {
+            events.push_back(AgentEvent {
+                session_id: "s1".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::Thinking,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: Some(prompt.to_string()),
+                metadata: HashMap::new(),
+                pane_id: None,
+            });
+        }
+
+        let session = SessionState {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            cwd: None,
+            status: SessionStatus::Idle,
+            active_tool: None,
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+            recent_events: events,
+            tool_count: 0,
+            last_user_prompt: Some("third prompt".to_string()),
+            pane_id: None,
+        };
+
+        // Spacious: get all 3
+        let prompts = collect_recent_prompts(&session, 3);
+        assert_eq!(prompts, vec!["first prompt", "second prompt", "third prompt"]);
+
+        // Normal/Compact: get only the most recent
+        let prompts = collect_recent_prompts(&session, 1);
+        assert_eq!(prompts, vec!["third prompt"]);
+    }
+
+    #[test]
+    fn test_collect_recent_prompts_fallback_to_last() {
+        use std::collections::VecDeque;
+
+        // No prompt events in recent_events, but last_user_prompt is set
+        let session = SessionState {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            cwd: None,
+            status: SessionStatus::Idle,
+            active_tool: None,
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+            recent_events: VecDeque::new(),
+            tool_count: 0,
+            last_user_prompt: Some("old prompt".to_string()),
+            pane_id: None,
+        };
+
+        let prompts = collect_recent_prompts(&session, 3);
+        assert_eq!(prompts, vec!["old prompt"]);
+    }
+
+    #[test]
+    fn test_collect_recent_prompts_empty() {
+        use std::collections::VecDeque;
+
+        let session = SessionState {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            cwd: None,
+            status: SessionStatus::Idle,
+            active_tool: None,
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+            recent_events: VecDeque::new(),
+            tool_count: 0,
+            last_user_prompt: None,
+            pane_id: None,
+        };
+
+        let prompts = collect_recent_prompts(&session, 3);
+        assert!(prompts.is_empty());
     }
 }
