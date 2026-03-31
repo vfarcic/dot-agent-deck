@@ -15,7 +15,7 @@ use ratatui::{
 use crate::config::{BellConfig, DashboardConfig};
 use crate::event::EventType;
 use crate::pane::{PaneController, PaneError};
-use crate::state::{AppState, SessionState, SessionStatus, SharedState};
+use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 
 impl fmt::Display for crate::event::AgentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -948,9 +948,8 @@ fn render_frame(
 
     let cols = grid_columns(area.width);
 
-    // Determine if we need a bottom bar (status/filter/rename)
-    let has_bottom_bar = true; // always show status bar
-    let bottom_height: u16 = if has_bottom_bar { 1 } else { 0 };
+    // Bottom area: 1 row for stats bar + 1 row for hints/filter bar
+    let bottom_height: u16 = 2;
 
     // Choose card density based on available vertical space
     // wide = true when each column has inner width >= 60 (card border takes 2 chars)
@@ -999,7 +998,10 @@ fn render_frame(
         .split(vertical[1]);
         frame.render_widget(msg, inner[1]);
 
-        render_bottom_bar(frame, ui, vertical[2], has_pane_control);
+        let bottom_split =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(vertical[2]);
+        render_stats_bar(frame, &state.aggregate_stats(), bottom_split[0]);
+        render_bottom_bar(frame, ui, bottom_split[1], has_pane_control);
         return;
     }
 
@@ -1060,9 +1062,12 @@ fn render_frame(
         }
     }
 
-    // Bottom bar
+    // Split bottom area into stats bar (row 0) + hints bar (row 1)
     let bottom_area = row_chunks[row_chunks.len() - 1];
-    render_bottom_bar(frame, ui, bottom_area, has_pane_control);
+    let bottom_split =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(bottom_area);
+    render_stats_bar(frame, &state.aggregate_stats(), bottom_split[0]);
+    render_bottom_bar(frame, ui, bottom_split[1], has_pane_control);
 
     // Overlays (drawn last, on top)
     if ui.mode == UiMode::Help {
@@ -1078,6 +1083,52 @@ fn render_frame(
     {
         render_new_pane_form(frame, form);
     }
+}
+
+fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
+    let mut spans: Vec<Span> = Vec::new();
+
+    // Always show active count
+    spans.push(Span::styled(
+        format!(" {} active", stats.active),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    let segments: &[(usize, &str, Color)] = &[
+        (stats.working, "working", Color::Green),
+        (stats.thinking, "thinking", Color::Blue),
+        (stats.compacting, "compacting", Color::Magenta),
+        (stats.waiting, "waiting", Color::Yellow),
+        (stats.errors, "error", Color::Red),
+        (stats.idle, "idle", Color::DarkGray),
+    ];
+
+    for &(count, label, color) in segments {
+        if count > 0 {
+            spans.push(Span::styled(
+                "  \u{2502}  ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::styled(
+                format!("{count} {label}"),
+                Style::default().fg(color),
+            ));
+        }
+    }
+
+    // Always show total tools
+    spans.push(Span::styled(
+        "  \u{2502}  ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::styled(
+        format!("{} tools", stats.total_tools),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_control: bool) {

@@ -1,6 +1,6 @@
 # PRD #17: Aggregate Stats Bar
 
-**Status**: Draft
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-03-31
 **GitHub Issue**: [#17](https://github.com/vfarcic/dot-agent-deck/issues/17)
