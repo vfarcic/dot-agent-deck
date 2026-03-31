@@ -52,11 +52,11 @@ impl AppState {
     pub fn apply_event(&mut self, event: AgentEvent) {
         if event.event_type == EventType::SessionEnd {
             // Preserve started_at for the pane so a restarted session keeps its position.
-            if let Some(session) = self.sessions.get(&event.session_id) {
-                if let Some(ref pane_id) = session.pane_id {
-                    self.pane_started_at
-                        .insert(pane_id.clone(), session.started_at);
-                }
+            if let Some(session) = self.sessions.get(&event.session_id)
+                && let Some(ref pane_id) = session.pane_id
+            {
+                self.pane_started_at
+                    .insert(pane_id.clone(), session.started_at);
             }
             self.sessions.remove(&event.session_id);
             return;
