@@ -47,11 +47,14 @@ enum CardDensity {
 }
 
 impl CardDensity {
-    fn card_height(self) -> u16 {
+    /// Card height in rows. When `wide` is false an extra stats line is rendered,
+    /// so each non-compact mode needs one more row.
+    fn card_height(self, wide: bool) -> u16 {
+        let extra = if wide { 0 } else { 1 };
         match self {
-            CardDensity::Compact => 6,
-            CardDensity::Normal => 8,
-            CardDensity::Spacious => 10,
+            CardDensity::Compact => 6 + extra,
+            CardDensity::Normal => 8 + extra,
+            CardDensity::Spacious => 10 + extra,
         }
     }
 
@@ -70,14 +73,19 @@ impl CardDensity {
     }
 }
 
-fn choose_density(total_cards: usize, cols: usize, available_height: u16) -> CardDensity {
+fn choose_density(
+    total_cards: usize,
+    cols: usize,
+    available_height: u16,
+    wide: bool,
+) -> CardDensity {
     let total_card_rows = total_cards.div_ceil(cols);
     for density in [
         CardDensity::Spacious,
         CardDensity::Normal,
         CardDensity::Compact,
     ] {
-        let needed = total_card_rows as u16 * density.card_height();
+        let needed = total_card_rows as u16 * density.card_height(wide);
         if needed <= available_height {
             return density;
         }
@@ -945,9 +953,12 @@ fn render_frame(
     let bottom_height: u16 = if has_bottom_bar { 1 } else { 0 };
 
     // Choose card density based on available vertical space
+    // wide = true when each column has inner width >= 60 (card border takes 2 chars)
+    let col_width = area.width / cols.max(1) as u16;
+    let wide = col_width.saturating_sub(2) >= 60;
     let available_for_density = area.height.saturating_sub(1 + bottom_height);
-    let density = choose_density(sessions.len(), cols, available_for_density);
-    let card_height = density.card_height();
+    let density = choose_density(sessions.len(), cols, available_for_density, wide);
+    let card_height = density.card_height(wide);
 
     // Title bar
     let total_sessions = state.sessions.len();
@@ -2380,27 +2391,46 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn test_choose_density() {
+    fn test_choose_density_wide() {
+        // Wide layout (no extra stats line)
         // 1 session, 1 col, plenty of height -> Spacious
-        assert_eq!(choose_density(1, 1, 20), CardDensity::Spacious);
+        assert_eq!(choose_density(1, 1, 20, true), CardDensity::Spacious);
 
         // 2 sessions, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(2, 2, 10), CardDensity::Spacious);
+        assert_eq!(choose_density(2, 2, 10, true), CardDensity::Spacious);
 
         // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
-        assert_eq!(choose_density(2, 2, 9), CardDensity::Normal);
+        assert_eq!(choose_density(2, 2, 9, true), CardDensity::Normal);
 
         // 4 sessions, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
-        assert_eq!(choose_density(4, 2, 16), CardDensity::Normal);
+        assert_eq!(choose_density(4, 2, 16, true), CardDensity::Normal);
 
         // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*6=12 fits)
-        assert_eq!(choose_density(4, 2, 15), CardDensity::Compact);
+        assert_eq!(choose_density(4, 2, 15, true), CardDensity::Compact);
 
         // Many sessions, small screen -> Compact
-        assert_eq!(choose_density(10, 1, 20), CardDensity::Compact);
+        assert_eq!(choose_density(10, 1, 20, true), CardDensity::Compact);
 
         // Edge: 0 sessions -> Spacious (0 rows needed)
-        assert_eq!(choose_density(0, 1, 10), CardDensity::Spacious);
+        assert_eq!(choose_density(0, 1, 10, true), CardDensity::Spacious);
+    }
+
+    #[test]
+    fn test_choose_density_narrow() {
+        // Narrow layout: each mode needs 1 extra row for stats line
+        // Spacious=11, Normal=9, Compact=7
+
+        // 1 session, height 11 -> Spacious (1*11=11)
+        assert_eq!(choose_density(1, 1, 11, false), CardDensity::Spacious);
+
+        // 1 session, height 10 -> Normal (1*9=9 fits)
+        assert_eq!(choose_density(1, 1, 10, false), CardDensity::Normal);
+
+        // 2 sessions, 1 col, height 18 -> Normal (2*9=18)
+        assert_eq!(choose_density(2, 1, 18, false), CardDensity::Normal);
+
+        // 2 sessions, 1 col, height 17 -> Compact (2*7=14 fits)
+        assert_eq!(choose_density(2, 1, 17, false), CardDensity::Compact);
     }
 
     #[test]
