@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.5.0] - 2026-03-31
+
+### Added
+
+- ## Aggregate Stats Bar
+- 
+- A persistent status bar at the bottom of the dashboard shows real-time aggregate metrics across all sessions. Instead of visually scanning every card to tally how many agents are active, waiting, or erroring, the stats bar provides an instant overview.
+- 
+- The bar displays total active sessions, per-status counts (working, thinking, compacting, waiting, error, idle), and a cumulative tool call count. Each status category is color-coded — green for working, yellow for waiting, red for errors — and zero-count categories are hidden to save space. Counts update automatically as agent events arrive with no user interaction required.
+
+### Fixed
+
+- ## WaitingForInput Status During AskUserQuestion
+- 
+- The dashboard now correctly shows "Waiting for Input" when Claude Code uses the AskUserQuestion tool. A previous fix to prevent spurious waiting status during non-interactive tools (like Bash) inadvertently blocked the status transition for interactive tools that genuinely wait for user input.
+
+
+
 ## [0.4.2] - 2026-03-31
 
 ### Fixed
