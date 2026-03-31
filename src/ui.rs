@@ -1491,11 +1491,12 @@ fn render_session_card(
     }
 
     let prompts = collect_recent_prompts(session, density.max_prompts());
-    for prompt in &prompts {
+    for (i, prompt) in prompts.iter().enumerate() {
+        let prefix = if i == 0 { "Prmt: " } else { "      " };
         let max_prompt = w.saturating_sub(6);
         let display = truncate_with_ellipsis(prompt, max_prompt);
         lines.push(Line::from(vec![
-            Span::styled("Prmt: ", Style::default().fg(Color::Gray)),
+            Span::styled(prefix, Style::default().fg(Color::Gray)),
             Span::raw(display),
         ]));
     }
