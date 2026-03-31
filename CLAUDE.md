@@ -2,4 +2,4 @@
 
 ## PERMANENT INSTRUCTIONS
 
-1. **Never Create Branches Directly — Always Use Worktrees**: When starting feature work (including `/prd-start`), always use `/worktree-prd` to create an isolated worktree. Never run `git checkout -b` or `git switch -c`, even if a skill instructs you to.
+1. **Ask Before Creating Branches or Worktrees**: When starting feature work (including `/prd-start`), ask the user whether they want a worktree (`/worktree-prd`) or a regular branch. Never assume one or the other.
