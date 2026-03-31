@@ -998,8 +998,8 @@ fn render_frame(
         .split(vertical[1]);
         frame.render_widget(msg, inner[1]);
 
-        let bottom_split = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
-            .split(vertical[2]);
+        let bottom_split =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(vertical[2]);
         render_stats_bar(frame, &state.aggregate_stats(), bottom_split[0]);
         render_bottom_bar(frame, ui, bottom_split[1], has_pane_control);
         return;
@@ -1064,8 +1064,8 @@ fn render_frame(
 
     // Split bottom area into stats bar (row 0) + hints bar (row 1)
     let bottom_area = row_chunks[row_chunks.len() - 1];
-    let bottom_split = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
-        .split(bottom_area);
+    let bottom_split =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(bottom_area);
     render_stats_bar(frame, &state.aggregate_stats(), bottom_split[0]);
     render_bottom_bar(frame, ui, bottom_split[1], has_pane_control);
 
@@ -1091,7 +1091,9 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
     // Always show active count
     spans.push(Span::styled(
         format!(" {} active", stats.active),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     ));
 
     let segments: &[(usize, &str, Color)] = &[
@@ -1105,7 +1107,10 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
 
     for &(count, label, color) in segments {
         if count > 0 {
-            spans.push(Span::styled("  \u{2502}  ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                "  \u{2502}  ",
+                Style::default().fg(Color::DarkGray),
+            ));
             spans.push(Span::styled(
                 format!("{count} {label}"),
                 Style::default().fg(color),
@@ -1114,7 +1119,10 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
     }
 
     // Always show total tools
-    spans.push(Span::styled("  \u{2502}  ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        "  \u{2502}  ",
+        Style::default().fg(Color::DarkGray),
+    ));
     spans.push(Span::styled(
         format!("{} tools", stats.total_tools),
         Style::default().fg(Color::DarkGray),
