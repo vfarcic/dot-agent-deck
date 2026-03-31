@@ -18,6 +18,18 @@ pub enum SessionStatus {
     Error,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DashboardStats {
+    pub active: usize,
+    pub working: usize,
+    pub thinking: usize,
+    pub waiting: usize,
+    pub errors: usize,
+    pub idle: usize,
+    pub compacting: usize,
+    pub total_tools: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ActiveTool {
     pub name: String,
@@ -49,6 +61,25 @@ pub struct AppState {
 pub type SharedState = Arc<RwLock<AppState>>;
 
 impl AppState {
+    pub fn aggregate_stats(&self) -> DashboardStats {
+        let mut stats = DashboardStats {
+            active: self.sessions.len(),
+            ..DashboardStats::default()
+        };
+        for session in self.sessions.values() {
+            match session.status {
+                SessionStatus::Working => stats.working += 1,
+                SessionStatus::Thinking => stats.thinking += 1,
+                SessionStatus::WaitingForInput => stats.waiting += 1,
+                SessionStatus::Error => stats.errors += 1,
+                SessionStatus::Idle => stats.idle += 1,
+                SessionStatus::Compacting => stats.compacting += 1,
+            }
+            stats.total_tools += session.tool_count as u64;
+        }
+        stats
+    }
+
     pub fn apply_event(&mut self, event: AgentEvent) {
         if event.event_type == EventType::SessionEnd {
             // Preserve started_at for the pane so a restarted session keeps its position.
@@ -123,11 +154,17 @@ impl AppState {
                 session.tool_count += 1;
             }
             EventType::WaitingForInput => {
-                // Only transition if no tool is actively running.
-                // Permission prompts always arrive before PreToolUse, so a
-                // Notification that arrives while a tool is executing is
-                // informational and must not override the Working status.
-                if session.active_tool.is_none() {
+                // Only transition if no tool is actively running, OR if the
+                // active tool is one that genuinely waits for user input
+                // (e.g. AskUserQuestion). Permission prompts always arrive
+                // before PreToolUse, so a Notification that arrives while a
+                // non-interactive tool is executing is informational and must
+                // not override the Working status.
+                let interactive_tool = session
+                    .active_tool
+                    .as_ref()
+                    .is_some_and(|t| t.name == "AskUserQuestion");
+                if session.active_tool.is_none() || interactive_tool {
                     session.status = SessionStatus::WaitingForInput;
                 }
             }
@@ -270,6 +307,22 @@ mod tests {
     }
 
     #[test]
+    fn ask_user_question_shows_waiting_for_input() {
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+
+        let mut tool_start = make_event("s1", EventType::ToolStart);
+        tool_start.tool_name = Some("AskUserQuestion".to_string());
+        state.apply_event(tool_start);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+
+        // AskUserQuestion is interactive — Notification SHOULD transition
+        // to WaitingForInput even though a tool is active.
+        state.apply_event(make_event("s1", EventType::WaitingForInput));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
+    }
+
+    #[test]
     fn tool_count_increments_on_tool_end() {
         let mut state = AppState::default();
         state.apply_event(make_event("s1", EventType::SessionStart));
@@ -327,6 +380,69 @@ mod tests {
             state.sessions["s1"].last_user_prompt.as_deref(),
             Some("add tests")
         );
+    }
+
+    #[test]
+    fn aggregate_stats_empty() {
+        let state = AppState::default();
+        let stats = state.aggregate_stats();
+        assert_eq!(stats, DashboardStats::default());
+    }
+
+    #[test]
+    fn aggregate_stats_mixed_sessions() {
+        let mut state = AppState::default();
+
+        state.apply_event(make_event("s1", EventType::SessionStart));
+        let mut tool = make_event("s1", EventType::ToolStart);
+        tool.tool_name = Some("Read".to_string());
+        state.apply_event(tool);
+        // s1: Working
+
+        state.apply_event(make_event("s2", EventType::SessionStart));
+        state.apply_event(make_event("s2", EventType::WaitingForInput));
+        // s2: WaitingForInput
+
+        state.apply_event(make_event("s3", EventType::SessionStart));
+        state.apply_event(make_event("s3", EventType::Error));
+        // s3: Error
+
+        state.apply_event(make_event("s4", EventType::SessionStart));
+        state.apply_event(make_event("s4", EventType::Thinking));
+        // s4: Thinking
+
+        state.apply_event(make_event("s5", EventType::SessionStart));
+        // s5: Idle
+
+        let stats = state.aggregate_stats();
+        assert_eq!(stats.active, 5);
+        assert_eq!(stats.working, 1);
+        assert_eq!(stats.waiting, 1);
+        assert_eq!(stats.errors, 1);
+        assert_eq!(stats.thinking, 1);
+        assert_eq!(stats.idle, 1);
+    }
+
+    #[test]
+    fn aggregate_stats_tool_count_summation() {
+        let mut state = AppState::default();
+
+        state.apply_event(make_event("s1", EventType::SessionStart));
+        let mut t1 = make_event("s1", EventType::ToolStart);
+        t1.tool_name = Some("Read".to_string());
+        state.apply_event(t1);
+        state.apply_event(make_event("s1", EventType::ToolEnd));
+
+        state.apply_event(make_event("s2", EventType::SessionStart));
+        for _ in 0..3 {
+            let mut t = make_event("s2", EventType::ToolStart);
+            t.tool_name = Some("Bash".to_string());
+            state.apply_event(t);
+            state.apply_event(make_event("s2", EventType::ToolEnd));
+        }
+
+        let stats = state.aggregate_stats();
+        assert_eq!(stats.total_tools, 4);
     }
 
     #[test]
