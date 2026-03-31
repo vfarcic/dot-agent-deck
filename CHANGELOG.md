@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1] - 2026-03-31
+
+### Fixed
+
+- Fixed "Needs Input" status getting stuck in sidebar when a Notification event arrived while a tool was actively running.
+
+
+
 ## [0.4.0] - 2026-03-31
 
 ### Added
