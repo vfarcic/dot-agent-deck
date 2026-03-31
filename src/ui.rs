@@ -72,7 +72,11 @@ impl CardDensity {
 
 fn choose_density(total_cards: usize, cols: usize, available_height: u16) -> CardDensity {
     let total_card_rows = total_cards.div_ceil(cols);
-    for density in [CardDensity::Spacious, CardDensity::Normal, CardDensity::Compact] {
+    for density in [
+        CardDensity::Spacious,
+        CardDensity::Normal,
+        CardDensity::Compact,
+    ] {
         let needed = total_card_rows as u16 * density.card_height();
         if needed <= available_height {
             return density;
@@ -1537,7 +1541,9 @@ fn collect_recent_prompts(session: &SessionState, max: usize) -> Vec<String> {
         .collect();
     prompts.reverse();
 
-    if prompts.is_empty() && let Some(ref p) = session.last_user_prompt {
+    if prompts.is_empty()
+        && let Some(ref p) = session.last_user_prompt
+    {
         prompts.push(p.clone());
     }
     prompts
@@ -2433,7 +2439,10 @@ mod tests {
 
         // Spacious: get all 3
         let prompts = collect_recent_prompts(&session, 3);
-        assert_eq!(prompts, vec!["first prompt", "second prompt", "third prompt"]);
+        assert_eq!(
+            prompts,
+            vec!["first prompt", "second prompt", "third prompt"]
+        );
 
         // Normal/Compact: get only the most recent
         let prompts = collect_recent_prompts(&session, 1);
