@@ -42,6 +42,8 @@ pub struct SessionState {
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
+    /// Remembers started_at per pane so a `/clear` restart keeps its position.
+    pane_started_at: HashMap<String, DateTime<Utc>>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -49,9 +51,22 @@ pub type SharedState = Arc<RwLock<AppState>>;
 impl AppState {
     pub fn apply_event(&mut self, event: AgentEvent) {
         if event.event_type == EventType::SessionEnd {
+            // Preserve started_at for the pane so a restarted session keeps its position.
+            if let Some(session) = self.sessions.get(&event.session_id) {
+                if let Some(ref pane_id) = session.pane_id {
+                    self.pane_started_at
+                        .insert(pane_id.clone(), session.started_at);
+                }
+            }
             self.sessions.remove(&event.session_id);
             return;
         }
+
+        let pane_started = event
+            .pane_id
+            .as_ref()
+            .and_then(|pid| self.pane_started_at.get(pid))
+            .copied();
 
         let session = self
             .sessions
@@ -62,7 +77,7 @@ impl AppState {
                 cwd: event.cwd.clone(),
                 status: SessionStatus::Idle,
                 active_tool: None,
-                started_at: event.timestamp,
+                started_at: pane_started.unwrap_or(event.timestamp),
                 last_activity: event.timestamp,
                 recent_events: VecDeque::new(),
                 tool_count: 0,
@@ -290,5 +305,28 @@ mod tests {
             state.sessions["s1"].last_user_prompt.as_deref(),
             Some("add tests")
         );
+    }
+
+    #[test]
+    fn restarted_session_preserves_started_at_via_pane() {
+        let mut state = AppState::default();
+
+        // Register session with a pane
+        let mut ev = make_event("s1", EventType::SessionStart);
+        ev.pane_id = Some("pane-42".to_string());
+        state.apply_event(ev);
+        let original_started = state.sessions["s1"].started_at;
+
+        // End the session (simulates /clear)
+        let mut end_ev = make_event("s1", EventType::SessionEnd);
+        end_ev.pane_id = Some("pane-42".to_string());
+        state.apply_event(end_ev);
+        assert!(!state.sessions.contains_key("s1"));
+
+        // New session on the same pane should keep the original started_at
+        let mut ev2 = make_event("s2", EventType::SessionStart);
+        ev2.pane_id = Some("pane-42".to_string());
+        state.apply_event(ev2);
+        assert_eq!(state.sessions["s2"].started_at, original_started);
     }
 }

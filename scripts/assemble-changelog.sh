@@ -6,25 +6,41 @@ CHANGELOG_DIR="changelog.d"
 CHANGELOG_FILE="CHANGELOG.md"
 DATE=$(date +%Y-%m-%d)
 
-# Collect entries by type
+# Collect entries by type.
+# Supports both Keep-a-Changelog names (added, changed, fixed, removed)
+# and semantic fragment names (feature, breaking, bugfix, doc, misc).
 declare -A TYPE_HEADERS=(
   [added]="Added"
+  [feature]="Added"
   [changed]="Changed"
+  [breaking]="Changed"
   [fixed]="Fixed"
+  [bugfix]="Fixed"
   [removed]="Removed"
+  [doc]="Documentation"
+  [misc]="Miscellaneous"
 )
+
+# Ordered list of types to scan — earlier entries appear first in the changelog.
+TYPES=(breaking added feature changed fixed bugfix removed doc misc)
 
 section=""
 processed_files=()
+seen_headers=()
 
-for type in added changed fixed removed; do
+for type in "${TYPES[@]}"; do
   fragments=()
   while IFS= read -r -d '' f; do
     fragments+=("$f")
   done < <(find "$CHANGELOG_DIR" -name "*.$type.md" -print0 2>/dev/null | sort -z)
 
   if [ ${#fragments[@]} -gt 0 ]; then
-    section+="### ${TYPE_HEADERS[$type]}"$'\n\n'
+    header="${TYPE_HEADERS[$type]}"
+    # Deduplicate headers (e.g. added & feature both map to "Added")
+    if [[ ! " ${seen_headers[*]:-} " =~ " ${header} " ]]; then
+      section+="### ${header}"$'\n\n'
+      seen_headers+=("$header")
+    fi
     for f in "${fragments[@]}"; do
       processed_files+=("$f")
       while IFS= read -r line; do
