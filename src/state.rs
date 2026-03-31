@@ -123,8 +123,13 @@ impl AppState {
                 session.tool_count += 1;
             }
             EventType::WaitingForInput => {
-                session.status = SessionStatus::WaitingForInput;
-                session.active_tool = None;
+                // Only transition if no tool is actively running.
+                // Permission prompts always arrive before PreToolUse, so a
+                // Notification that arrives while a tool is executing is
+                // informational and must not override the Working status.
+                if session.active_tool.is_none() {
+                    session.status = SessionStatus::WaitingForInput;
+                }
             }
             EventType::Idle => {
                 session.status = SessionStatus::Idle;
@@ -245,6 +250,23 @@ mod tests {
         state.apply_event(make_event("s1", EventType::WaitingForInput));
         assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
         assert!(state.sessions["s1"].active_tool.is_none());
+    }
+
+    #[test]
+    fn notification_during_active_tool_stays_working() {
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+
+        let mut tool_start = make_event("s1", EventType::ToolStart);
+        tool_start.tool_name = Some("Bash".to_string());
+        state.apply_event(tool_start);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+
+        // A Notification arriving while the tool is running must NOT
+        // override Working → WaitingForInput (the screenshot bug).
+        state.apply_event(make_event("s1", EventType::WaitingForInput));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+        assert!(state.sessions["s1"].active_tool.is_some());
     }
 
     #[test]
