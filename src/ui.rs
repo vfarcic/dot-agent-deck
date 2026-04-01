@@ -200,6 +200,8 @@ struct UiState {
     config: DashboardConfig,
     /// Tracks last-seen status per session for bell transition detection.
     last_bell_status: HashMap<String, SessionStatus>,
+    /// Populated by the background version-check task when a newer release is available.
+    update_available: Option<String>,
 }
 
 impl UiState {
@@ -219,6 +221,7 @@ impl UiState {
             pane_display_names: HashMap::new(),
             config,
             last_bell_status: HashMap::new(),
+            update_available: None,
         }
     }
 }
@@ -704,6 +707,11 @@ pub fn run_tui(
 
         let snapshot = state.blocking_read().clone();
 
+        // Pick up version-check result once
+        if ui.update_available.is_none() {
+            ui.update_available = snapshot.update_available.clone();
+        }
+
         // Apply pending pane names to sessions that have appeared
         if !ui.pane_names.is_empty() {
             for (sid, session) in &snapshot.sessions {
@@ -1165,6 +1173,18 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
         _ => {
             if let Some((ref msg, _)) = ui.status_message {
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
+                frame.render_widget(Paragraph::new(line), area);
+            } else if let Some(ref latest) = ui.update_available {
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!(" Update available: v{latest} (current: v{}) ", env!("CARGO_PKG_VERSION")),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  ?: help", Style::default().fg(Color::Gray)),
+                ]);
                 frame.render_widget(Paragraph::new(line), area);
             } else {
                 let hints = if has_pane_control {

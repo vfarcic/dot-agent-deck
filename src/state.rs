@@ -56,6 +56,8 @@ pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
     /// Remembers started_at per pane so a `/clear` restart keeps its position.
     pane_started_at: HashMap<String, DateTime<Utc>>,
+    /// Set by the background version-check task when a newer release exists.
+    pub update_available: Option<String>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
