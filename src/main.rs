@@ -90,11 +90,21 @@ fn main() -> ExitCode {
         Some(Commands::Hooks { action }) => {
             match action {
                 HooksAction::Install { agent } => match agent.as_str() {
-                    "opencode" => dot_agent_deck::opencode_manage::install(),
+                    "opencode" => {
+                        if let Err(e) = dot_agent_deck::opencode_manage::install() {
+                            eprintln!("Failed to install OpenCode plugin: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
                     _ => hooks_manage::install(),
                 },
                 HooksAction::Uninstall { agent } => match agent.as_str() {
-                    "opencode" => dot_agent_deck::opencode_manage::uninstall(),
+                    "opencode" => {
+                        if let Err(e) = dot_agent_deck::opencode_manage::uninstall() {
+                            eprintln!("Failed to uninstall OpenCode plugin: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
                     _ => hooks_manage::uninstall(),
                 },
             }
