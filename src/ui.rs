@@ -920,9 +920,11 @@ fn render_frame(
 ) {
     let area = frame.area();
 
-    // Force black background so dark-optimised colors are always readable
+    // Force true-black background so dark-optimised colors are always readable,
+    // regardless of terminal theme (ANSI "Black" can be remapped by themes).
+    let true_black = Color::Rgb(0, 0, 0);
     frame.render_widget(
-        ratatui::widgets::Block::default().style(Style::default().bg(Color::Black)),
+        ratatui::widgets::Block::default().style(Style::default().bg(true_black)),
         area,
     );
 
@@ -1279,7 +1281,8 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Help ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
     let paragraph = Paragraph::new(help_text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
@@ -1357,7 +1360,8 @@ fn render_dir_picker(frame: &mut Frame, picker: &DirPickerState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Select Directory ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 }
@@ -1438,7 +1442,8 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" New Pane ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 
