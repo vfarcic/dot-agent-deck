@@ -374,7 +374,9 @@ load_plugins {
 }
 keybinds clear-defaults=true {
     normal {
-        bind "Alt h" "Alt Left" "Alt d" { MoveFocus "Left"; }
+        bind "Alt h" "Alt Left" { MoveFocus "Left"; }
+        // Jump all the way to the dashboard (leftmost pane) regardless of column count
+        bind "Alt d" { MoveFocus "Left"; MoveFocus "Left"; MoveFocus "Left"; }
         bind "Alt j" "Alt Down"  { MoveFocus "Down"; }
         bind "Alt k" "Alt Up"    { MoveFocus "Up"; }
         bind "Alt w" { CloseFocus; }

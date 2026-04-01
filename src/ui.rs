@@ -1278,7 +1278,12 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
                 .add_modifier(Modifier::BOLD),
         ));
         help_text.push(Line::from(""));
-        help_text.push(Line::from(format!("  {MOD_KEY}+h         Go to dashboard")));
+        help_text.push(Line::from(format!(
+            "  {MOD_KEY}+h         Move left one pane"
+        )));
+        help_text.push(Line::from(format!(
+            "  {MOD_KEY}+d         Jump to dashboard"
+        )));
         help_text.push(Line::from(format!(
             "  {MOD_KEY}+j/k       Navigate stacked panes"
         )));

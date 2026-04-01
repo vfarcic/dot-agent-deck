@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.11.4] - 2026-04-02
+
+### Fixed
+
+- **Dashboard Shortcut Fix**
+  `Opt+d` from agent panes in the second column now jumps directly back to the dashboard even when every pane is visible. Previously the shortcut only moved focus left one column, so multi-column layouts forced two keypresses to reach the dashboard while stacked mode kept working as expected.
+
+
+
 ## [0.11.3] - 2026-04-02
 
 ### Fixed
