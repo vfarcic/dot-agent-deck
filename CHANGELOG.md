@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.1] - 2026-04-01
+
+### Fixed
+
+- Force black background on dashboard pane so colors remain readable on light terminal themes.
+
+
+
 ## [0.7.0] - 2026-04-01
 
 ### Added
