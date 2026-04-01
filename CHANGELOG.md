@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.11.3] - 2026-04-02
+
+### Fixed
+
+- **Balanced Pane Layout Toggle**
+  Pressing `t` now fans agent panes out on an even grid, so each column and row gets equal space instead of inheriting inconsistent sizes from the `children` placeholder.
+
+### Changed
+
+- **Devbox Agent Script Defaults to OpenCode**
+  Running `devbox run agent` now launches the `opencode` CLI so OpenCode sessions can be spun up without passing extra flags. The previous default pointed at `claude`, which no longer reflects the recommended workflow for the dashboard’s bundled OpenCode plugin.
+
+
 ## [0.11.2] - 2026-04-01
 
 ### Fixed
@@ -7,7 +20,6 @@
 - **OpenCode Sessions Render Correctly**
   OpenCode panes now appear in the dashboard alongside Claude Code again. The bundled OpenCode plugin was rewritten to use OpenCode's new `DotAgentDeckPlugin` export so session, tool, and permission events are forwarded in the format the daemon expects. Previously, OpenCode quietly stopped emitting compatible events after their plugin API change, leaving the third card empty in dot-agent-deck.
   Reinstall the plugin with `dot-agent-deck hooks install --agent opencode` to pick up the fix—future OpenCode upgrades will continue to stream into the dashboard without manual tweaks.
-
 
 
 ## [0.11.1] - 2026-04-01

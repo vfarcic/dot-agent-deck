@@ -291,37 +291,56 @@ fn maybe_exec_zellij() -> Option<ExitCode> {
             pane borderless=true size="33%"
             pane size="67%"
         }}
-        // 3-4 panes (2-3 agents): single column
+        // 3-4 panes (2-3 agents): single column, equal heights
         tab split_direction="vertical" max_panes=4 {{
             pane borderless=true size="33%"
-            pane size="67%" {{
-                children
+            pane split_direction="horizontal" size="67%" {{
+                pane
+                pane
+                pane
             }}
         }}
-        // 5-7 panes (4-6 agents): 2 columns
+        // 5-7 panes (4-6 agents): 2 columns (3 rows)
         tab split_direction="vertical" max_panes=7 {{
             pane borderless=true size="33%"
-            pane split_direction="vertical" size="67%" {{
-                pane {{
-                    children
+            pane split_direction="horizontal" size="67%" {{
+                pane split_direction="vertical" {{
+                    pane
+                    pane
                 }}
-                pane {{
-                    children
+                pane split_direction="vertical" {{
+                    pane
+                    pane
+                }}
+                pane split_direction="vertical" {{
+                    pane
+                    pane
                 }}
             }}
         }}
-        // 8+ panes (7+ agents): 3 columns
+        // 8+ panes (7+ agents): 3 columns (4 rows)
         tab split_direction="vertical" {{
             pane borderless=true size="33%"
-            pane split_direction="vertical" size="67%" {{
-                pane {{
-                    children
+            pane split_direction="horizontal" size="67%" {{
+                pane split_direction="vertical" {{
+                    pane
+                    pane
+                    pane
                 }}
-                pane {{
-                    children
+                pane split_direction="vertical" {{
+                    pane
+                    pane
+                    pane
                 }}
-                pane {{
-                    children
+                pane split_direction="vertical" {{
+                    pane
+                    pane
+                    pane
+                }}
+                pane split_direction="vertical" {{
+                    pane
+                    pane
+                    pane
                 }}
             }}
         }}
