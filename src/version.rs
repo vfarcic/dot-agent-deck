@@ -46,7 +46,10 @@ fn is_cache_fresh(cache: &VersionCache) -> bool {
 }
 
 fn should_notify(current: &semver::Version, latest_tag: &str) -> Option<String> {
-    let stripped = latest_tag.strip_prefix('v').or(latest_tag.strip_prefix('V')).unwrap_or(latest_tag);
+    let stripped = latest_tag
+        .strip_prefix('v')
+        .or(latest_tag.strip_prefix('V'))
+        .unwrap_or(latest_tag);
     let latest = semver::Version::parse(stripped).ok()?;
     if latest > *current {
         Some(latest.to_string())
@@ -63,7 +66,10 @@ async fn fetch_latest_version() -> Option<String> {
 
     let resp = client
         .get(GITHUB_RELEASES_URL)
-        .header("User-Agent", concat!("dot-agent-deck/", env!("CARGO_PKG_VERSION")))
+        .header(
+            "User-Agent",
+            concat!("dot-agent-deck/", env!("CARGO_PKG_VERSION")),
+        )
         .send()
         .await
         .ok()?;

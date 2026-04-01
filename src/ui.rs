@@ -1177,7 +1177,10 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
             } else if let Some(ref latest) = ui.update_available {
                 let line = Line::from(vec![
                     Span::styled(
-                        format!(" Update available: v{latest} (current: v{}) ", env!("CARGO_PKG_VERSION")),
+                        format!(
+                            " Update available: v{latest} (current: v{}) ",
+                            env!("CARGO_PKG_VERSION")
+                        ),
                         Style::default()
                             .fg(Color::Black)
                             .bg(Color::Yellow)
