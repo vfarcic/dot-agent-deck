@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.9.1] - 2026-04-01
+
+### Fixed
+
+- Use true black (RGB 0,0,0) background instead of ANSI black, fixing purple background on terminals with custom themes. Modals now also have an explicit black background.
+- Update notification no longer replaces keyboard shortcuts in the bottom bar; it now appears alongside them.
+- Derive binary version from git tags instead of hardcoded Cargo.toml value, fixing incorrect "current v0.1.0" in update notifications.
+
+
+
 ## [0.8.0] - 2026-04-01
 
 ### Added
