@@ -7,3 +7,4 @@ pub mod hooks_manage;
 pub mod pane;
 pub mod state;
 pub mod ui;
+pub mod version;

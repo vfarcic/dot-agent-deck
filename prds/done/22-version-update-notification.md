@@ -1,6 +1,6 @@
 # PRD #22: Version Update Notification
 
-**Status**: Draft
+**Status**: Complete (2026-04-01)
 **Priority**: Medium
 **Created**: 2026-04-01
 **GitHub Issue**: [#22](https://github.com/vfarcic/dot-agent-deck/issues/22)
@@ -90,11 +90,11 @@ The check is fully asynchronous — the TUI renders immediately and is never blo
 
 ## Milestones
 
-- [ ] Version module (`src/version.rs`) with GitHub API check, semver comparison, and file-based cache
-- [ ] Integration into dashboard startup as a non-blocking background task
-- [ ] TUI notification rendering when an update is available
-- [ ] Tests for version comparison logic and cache behavior
-- [ ] End-to-end validation: build with an older version, confirm notification appears against a newer release
+- [x] Version module (`src/version.rs`) with GitHub API check, semver comparison, and file-based cache
+- [x] Integration into dashboard startup as a non-blocking background task
+- [x] TUI notification rendering when an update is available
+- [x] Tests for version comparison logic and cache behavior
+- [x] End-to-end validation: build with an older version, confirm notification appears against a newer release
 
 ## Risks & Mitigations
 

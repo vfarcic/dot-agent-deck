@@ -136,6 +136,13 @@ async fn run_dashboard() {
         }
     });
 
+    let version_state = state.clone();
+    tokio::spawn(async move {
+        if let Some(latest) = dot_agent_deck::version::check_for_update().await {
+            version_state.write().await.update_available = Some(latest);
+        }
+    });
+
     let config = dot_agent_deck::config::DashboardConfig::load();
     let pane_controller = dot_agent_deck::pane::detect_multiplexer();
     let tui_state = state.clone();

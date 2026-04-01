@@ -113,7 +113,7 @@ fn config_path() -> PathBuf {
     dirs_home().join(".config/dot-agent-deck/config.toml")
 }
 
-fn dirs_home() -> PathBuf {
+pub(crate) fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/"))
