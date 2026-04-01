@@ -1102,7 +1102,7 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
         (stats.compacting, "compacting", Color::Magenta),
         (stats.waiting, "waiting", Color::Yellow),
         (stats.errors, "error", Color::Red),
-        (stats.idle, "idle", Color::DarkGray),
+        (stats.idle, "idle", Color::Gray),
     ];
 
     for &(count, label, color) in segments {
@@ -1125,7 +1125,7 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
     ));
     spans.push(Span::styled(
         format!("{} tools", stats.total_tools),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Gray),
     ));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
