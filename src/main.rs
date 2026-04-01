@@ -15,7 +15,7 @@ use dot_agent_deck::state::AppState;
 use dot_agent_deck::ui::run_tui;
 
 #[derive(Parser)]
-#[command(name = "dot-agent-deck", about = "AI agent session dashboard", version)]
+#[command(name = "dot-agent-deck", about = "AI agent session dashboard", version = env!("DAD_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,

@@ -19,7 +19,7 @@ struct GitHubRelease {
 }
 
 fn current_version() -> semver::Version {
-    semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is valid semver")
+    semver::Version::parse(env!("DAD_VERSION")).expect("DAD_VERSION is valid semver")
 }
 
 fn cache_path() -> PathBuf {
@@ -68,7 +68,7 @@ async fn fetch_latest_version() -> Option<String> {
         .get(GITHUB_RELEASES_URL)
         .header(
             "User-Agent",
-            concat!("dot-agent-deck/", env!("CARGO_PKG_VERSION")),
+            concat!("dot-agent-deck/", env!("DAD_VERSION")),
         )
         .send()
         .await

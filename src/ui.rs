@@ -1180,21 +1180,6 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
             if let Some((ref msg, _)) = ui.status_message {
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
-            } else if let Some(ref latest) = ui.update_available {
-                let line = Line::from(vec![
-                    Span::styled(
-                        format!(
-                            " Update available: v{latest} (current: v{}) ",
-                            env!("CARGO_PKG_VERSION")
-                        ),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("  ?: help", Style::default().fg(Color::Gray)),
-                ]);
-                frame.render_widget(Paragraph::new(line), area);
             } else {
                 let hints = if has_pane_control {
                     format!(
@@ -1203,7 +1188,21 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
                 } else {
                     format!("?: help  {MOD_KEY}+1-9: jump  q: quit")
                 };
-                let line = Line::styled(hints, Style::default().fg(Color::Gray));
+                let mut spans = vec![Span::styled(hints, Style::default().fg(Color::Gray))];
+                if let Some(ref latest) = ui.update_available {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(
+                        format!(
+                            " Update available: v{latest} (current: v{}) ",
+                            env!("DAD_VERSION")
+                        ),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                let line = Line::from(spans);
                 frame.render_widget(Paragraph::new(line), area);
             }
         }
