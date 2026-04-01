@@ -154,19 +154,12 @@ impl AppState {
                 session.tool_count += 1;
             }
             EventType::WaitingForInput => {
-                // Only transition if no tool is actively running, OR if the
-                // active tool is one that genuinely waits for user input
-                // (e.g. AskUserQuestion). Permission prompts always arrive
-                // before PreToolUse, so a Notification that arrives while a
-                // non-interactive tool is executing is informational and must
-                // not override the Working status.
-                let interactive_tool = session
-                    .active_tool
-                    .as_ref()
-                    .is_some_and(|t| t.name == "AskUserQuestion");
-                if session.active_tool.is_none() || interactive_tool {
-                    session.status = SessionStatus::WaitingForInput;
-                }
+                // Always trust Notification events from Claude Code — they
+                // fire specifically when the session needs user attention
+                // (permission prompts, AskUserQuestion, etc.).  PreToolUse
+                // fires before Notification for permission prompts, so the
+                // active_tool guard was incorrectly suppressing them.
+                session.status = SessionStatus::WaitingForInput;
             }
             EventType::Idle => {
                 session.status = SessionStatus::Idle;
@@ -290,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn notification_during_active_tool_stays_working() {
+    fn notification_during_active_tool_shows_waiting() {
         let mut state = AppState::default();
         state.apply_event(make_event("s1", EventType::SessionStart));
 
@@ -299,10 +292,10 @@ mod tests {
         state.apply_event(tool_start);
         assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
 
-        // A Notification arriving while the tool is running must NOT
-        // override Working → WaitingForInput (the screenshot bug).
+        // A Notification during an active tool means a permission prompt —
+        // PreToolUse fires before the Notification, so active_tool is set.
         state.apply_event(make_event("s1", EventType::WaitingForInput));
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
         assert!(state.sessions["s1"].active_tool.is_some());
     }
 
@@ -316,8 +309,7 @@ mod tests {
         state.apply_event(tool_start);
         assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
 
-        // AskUserQuestion is interactive — Notification SHOULD transition
-        // to WaitingForInput even though a tool is active.
+        // AskUserQuestion is interactive — Notification transitions to WaitingForInput.
         state.apply_event(make_event("s1", EventType::WaitingForInput));
         assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
     }
