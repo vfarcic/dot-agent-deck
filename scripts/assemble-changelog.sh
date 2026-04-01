@@ -44,7 +44,14 @@ for type in "${TYPES[@]}"; do
     for f in "${fragments[@]}"; do
       processed_files+=("$f")
       while IFS= read -r line; do
-        section+="- $line"$'\n'
+        # Skip blank lines
+        [[ -z "$line" ]] && continue
+        # Convert markdown headings to bold list items
+        if [[ "$line" =~ ^##\ (.+) ]]; then
+          section+="- **${BASH_REMATCH[1]}**"$'\n'
+        else
+          section+="  $line"$'\n'
+        fi
       done < "$f"
     done
     section+=$'\n'
