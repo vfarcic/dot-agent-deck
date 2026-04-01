@@ -1,6 +1,6 @@
 # PRD #16: Toggle Stacked/Tiled Pane Layout
 
-**Status**: Draft
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-03-31
 **GitHub Issue**: [#16](https://github.com/vfarcic/dot-agent-deck/issues/16)
@@ -36,7 +36,11 @@ Zellij natively supports multiple `swap_tiled_layout` blocks and cycles through 
 
 ### Layout Definition (`src/main.rs`)
 - Rename current `swap_tiled_layout name="dashboard"` to `name="stacked"`
-- Add second `swap_tiled_layout name="tiled"` — identical structure but without `stacked=true` on the children pane, so agent panes split equally
+- Add second `swap_tiled_layout name="tiled"` with responsive column breakpoints:
+  - 1-3 agents: single column (dashboard 33% + agents 67%)
+  - 4-6 agents: 2 columns within the 67% right area
+  - 7+ agents: 3 columns within the 67% right area
+  - Dashboard stays fixed at 33% width; agent columns are nested inside the remaining 67%
 
 ### Zellij Config (`src/main.rs`)
 - Add `bind "Alt t" { NextSwapLayout; }` to the `keybinds` block
@@ -63,11 +67,11 @@ Zellij natively supports multiple `swap_tiled_layout` blocks and cycles through 
 
 ## Milestones
 
-- [ ] Second `swap_tiled_layout` added and Zellij `Alt+t` keybind configured (`src/main.rs`)
-- [ ] `toggle_layout()` method added to `PaneController` trait with implementations (`src/pane.rs`)
-- [ ] `t` keybinding wired up in dashboard TUI with `ToggleLayout` KeyResult (`src/ui.rs`)
-- [ ] Help overlay updated with both `t` and `Alt+t` shortcuts (`src/ui.rs`)
-- [ ] All tests passing including new noop controller assertion
+- [x] Second `swap_tiled_layout` added and Zellij `Alt+t` keybind configured (`src/main.rs`)
+- [x] `toggle_layout()` method added to `PaneController` trait with implementations (`src/pane.rs`)
+- [x] `t` keybinding wired up in dashboard TUI with `ToggleLayout` KeyResult (`src/ui.rs`)
+- [x] Help overlay updated with both `t` and `Alt+t` shortcuts (`src/ui.rs`)
+- [x] All tests passing including new noop controller assertion
 
 ## Key Files
 

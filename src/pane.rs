@@ -54,6 +54,7 @@ pub trait PaneController: Send + Sync {
         amount: u16,
     ) -> Result<(), PaneError>;
     fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError>;
+    fn toggle_layout(&self) -> Result<(), PaneError>;
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
 }
@@ -192,6 +193,11 @@ impl PaneController for ZellijController {
         Ok(())
     }
 
+    fn toggle_layout(&self) -> Result<(), PaneError> {
+        self.run_zellij(&["action", "next-swap-layout"])?;
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "zellij"
     }
@@ -224,6 +230,9 @@ impl PaneController for NoopController {
         Err(PaneError::NotAvailable)
     }
     fn rename_pane(&self, _: &str, _: &str) -> Result<(), PaneError> {
+        Err(PaneError::NotAvailable)
+    }
+    fn toggle_layout(&self) -> Result<(), PaneError> {
         Err(PaneError::NotAvailable)
     }
     fn name(&self) -> &str {
@@ -388,6 +397,7 @@ mod tests {
         assert!(ctrl.close_pane("1").is_err());
         assert!(ctrl.list_panes().is_err());
         assert!(ctrl.resize_pane("1", PaneDirection::Up, 1).is_err());
+        assert!(ctrl.toggle_layout().is_err());
     }
 
     #[test]

@@ -212,8 +212,9 @@ fn maybe_exec_zellij() -> Option<ExitCode> {
         let _ = std::fs::set_permissions(&shell_path, std::fs::Permissions::from_mode(0o755));
     }
 
-    // Layout: two-column split — dashboard (1/3) + stacked agent panes (2/3).
-    // Swap layouts define how additional panes are arranged (stacked on the right).
+    // Layout: two-column split — dashboard (1/3) + agent panes (2/3).
+    // Two swap layouts: "stacked" (default, only active pane expanded) and
+    // "tiled" (all panes share space equally). Cycle with Alt+t.
     let layout = format!(
         r#"layout {{
     default_tab_template {{
@@ -223,7 +224,7 @@ fn maybe_exec_zellij() -> Option<ExitCode> {
         pane borderless=true command="{shell_path_str}"
     }}
 
-    swap_tiled_layout name="dashboard" {{
+    swap_tiled_layout name="stacked" {{
         tab max_panes=1 {{
             pane borderless=true
         }}
@@ -235,6 +236,52 @@ fn maybe_exec_zellij() -> Option<ExitCode> {
             pane borderless=true size="33%"
             pane stacked=true size="67%" {{
                 children
+            }}
+        }}
+    }}
+
+    swap_tiled_layout name="tiled" {{
+        // 1 pane: dashboard only
+        tab max_panes=1 {{
+            pane borderless=true
+        }}
+        // 2 panes: dashboard + 1 agent (single column)
+        tab split_direction="vertical" max_panes=2 {{
+            pane borderless=true size="33%"
+            pane size="67%"
+        }}
+        // 3-4 panes (2-3 agents): single column
+        tab split_direction="vertical" max_panes=4 {{
+            pane borderless=true size="33%"
+            pane size="67%" {{
+                children
+            }}
+        }}
+        // 5-7 panes (4-6 agents): 2 columns
+        tab split_direction="vertical" max_panes=7 {{
+            pane borderless=true size="33%"
+            pane split_direction="vertical" size="67%" {{
+                pane {{
+                    children
+                }}
+                pane {{
+                    children
+                }}
+            }}
+        }}
+        // 8+ panes (7+ agents): 3 columns
+        tab split_direction="vertical" {{
+            pane borderless=true size="33%"
+            pane split_direction="vertical" size="67%" {{
+                pane {{
+                    children
+                }}
+                pane {{
+                    children
+                }}
+                pane {{
+                    children
+                }}
             }}
         }}
     }}
@@ -272,6 +319,7 @@ keybinds clear-defaults=true {
         bind "Alt k" "Alt Up"    { MoveFocus "Up"; }
         bind "Alt w" { CloseFocus; }
         bind "Alt q" { Quit; }
+        bind "Alt t" { NextSwapLayout; }
     }
 }
 "#
