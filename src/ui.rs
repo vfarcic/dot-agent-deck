@@ -920,6 +920,12 @@ fn render_frame(
 ) {
     let area = frame.area();
 
+    // Force black background so dark-optimised colors are always readable
+    frame.render_widget(
+        ratatui::widgets::Block::default().style(Style::default().bg(Color::Black)),
+        area,
+    );
+
     if state.sessions.is_empty() {
         let bar_height = if has_pane_control { 2 } else { 1 };
         let vertical = Layout::vertical([
