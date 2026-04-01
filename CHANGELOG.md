@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.0] - 2026-04-01
+
+### Added
+
+- Add `--version` / `-V` flag to display the current version.
+
+
+
 ## [0.7.1] - 2026-04-01
 
 ### Fixed
