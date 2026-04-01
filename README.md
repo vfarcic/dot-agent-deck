@@ -85,7 +85,7 @@ dot-agent-deck hooks uninstall
 Running `dot-agent-deck` auto-launches Zellij with a two-column layout:
 
 - **Left (1/3)** — the dashboard, displaying a card grid of agent sessions
-- **Right (2/3)** — stacked agent panes where Claude Code instances run
+- **Right (2/3)** — agent panes where Claude Code instances run (stacked by default, toggle to tiled with `t`)
 
 The Zellij session is named `dot-agent-deck`. If the session already exists, it reattaches.
 
@@ -138,6 +138,7 @@ Cards also display: session ID, agent type, working directory, tool count, and l
 | `Enter` | Focus selected agent pane |
 | `n` | New pane (directory picker, then name + command form) |
 | `d` | Close selected agent pane |
+| `t` | Toggle stacked / tiled layout |
 
 ### Directory Picker
 
@@ -165,6 +166,7 @@ Cards also display: session ID, agent type, working directory, tool count, and l
 | `Alt+d` / `Alt+h` / `Alt+Left` | Go to dashboard pane |
 | `Alt+j` / `Alt+Down` | Navigate down in stacked panes |
 | `Alt+k` / `Alt+Up` | Navigate up in stacked panes |
+| `Alt+t` | Toggle stacked / tiled layout |
 | `Alt+w` | Close current pane |
 | `Alt+q` | Quit all (exit Zellij) |
 
