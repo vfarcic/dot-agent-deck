@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0] - 2026-04-01
+
+### Added
+
+- Add version update notification that checks GitHub Releases on startup and displays a non-intrusive TUI notification when a newer version is available. Results are cached for 24 hours to minimize API calls.
+
+
+
 ## [0.6.1] - 2026-04-01
 
 ### Fixed
