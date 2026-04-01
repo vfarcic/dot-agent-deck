@@ -153,11 +153,15 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
         "session.deleted" => Some(EventType::SessionEnd),
         "session.idle" => Some(EventType::Idle),
         "session.error" => Some(EventType::Error),
-        "session.status.updated" => match status {
-            Some("idle") => Some(EventType::Idle),
-            Some("error") => Some(EventType::Error),
-            _ => Some(EventType::Thinking),
-        },
+        "session.status" | "session.status.updated" => {
+            let norm = status.map(|s| s.to_ascii_lowercase());
+            match norm.as_deref() {
+                Some("idle") => Some(EventType::Idle),
+                Some("error") => Some(EventType::Error),
+                Some("waiting") => Some(EventType::WaitingForInput),
+                _ => Some(EventType::Thinking),
+            }
+        }
         "tool.execute.before" => Some(EventType::ToolStart),
         "tool.execute.after" => Some(EventType::ToolEnd),
         "permission.asked" => Some(EventType::WaitingForInput),
@@ -469,29 +473,33 @@ mod tests {
     }
 
     #[test]
-    fn map_opencode_status_updated_default() {
+    fn map_opencode_session_status_default() {
         assert_eq!(
-            map_opencode_event_type("session.status.updated", None),
+            map_opencode_event_type("session.status", None),
             Some(EventType::Thinking)
         );
         assert_eq!(
-            map_opencode_event_type("session.status.updated", Some("thinking")),
+            map_opencode_event_type("session.status", Some("busy")),
+            Some(EventType::Thinking)
+        );
+        assert_eq!(
+            map_opencode_event_type("session.status.updated", Some("retry")),
             Some(EventType::Thinking)
         );
     }
 
     #[test]
-    fn map_opencode_status_updated_idle() {
+    fn map_opencode_session_status_idle() {
         assert_eq!(
-            map_opencode_event_type("session.status.updated", Some("idle")),
+            map_opencode_event_type("session.status", Some("idle")),
             Some(EventType::Idle)
         );
     }
 
     #[test]
-    fn map_opencode_status_updated_error() {
+    fn map_opencode_session_status_error() {
         assert_eq!(
-            map_opencode_event_type("session.status.updated", Some("error")),
+            map_opencode_event_type("session.status", Some("error")),
             Some(EventType::Error)
         );
     }

@@ -12,31 +12,75 @@ fn plugin_template(binary_path: &str) -> String {
     let binary_path_json =
         serde_json::to_string(binary_path).unwrap_or_else(|_| "\"dot-agent-deck\"".to_string());
     format!(
-        r#"const {{ execFileSync }} = require("child_process");
+        r#"import {{ execFileSync }} from "child_process";
+
 const BINARY_PATH = {binary_path_json};
 
-module.exports = {{
-  name: "dot-agent-deck",
-  subscribe: [
-    "session.created",
-    "session.deleted",
-    "session.idle",
-    "session.error",
-    "session.status.updated",
-    "tool.execute.before",
-    "tool.execute.after",
-    "permission.asked",
-  ],
-  onEvent(event) {{
-    try {{
-      execFileSync(BINARY_PATH, ["hook", "--agent", "opencode"], {{
-        input: JSON.stringify(event),
-        timeout: 5000,
-        stdio: ["pipe", "ignore", "ignore"],
-      }});
-    }} catch (_) {{}}
-  }},
+const sendEvent = (payload) => {{
+  try {{
+    execFileSync(BINARY_PATH, ["hook", "--agent", "opencode"], {{
+      input: JSON.stringify(payload),
+      timeout: 5000,
+      stdio: ["pipe", "ignore", "ignore"],
+    }});
+  }} catch (_) {{}}
 }};
+
+const defaultSessionId = (value) => (value ? value : "unknown");
+
+const sessionPayload = (event, directory) => {{
+  const props = event?.properties ?? {{}};
+  const info = props.info ?? {{}};
+  const status = props.status ?? {{}};
+  return {{
+    session_id: defaultSessionId(props.sessionID ?? info.id),
+    event: event?.type ?? "session.unknown",
+    status: status.type,
+    cwd: info.directory ?? props.directory ?? directory ?? process.cwd(),
+  }};
+}};
+
+export const DotAgentDeckPlugin = async (ctx) => {{
+  const directory = ctx?.directory ?? process.cwd();
+
+  return {{
+    event: async (input) => {{
+      const event = input?.event;
+      if (!event?.type?.startsWith("session.")) {{
+        return;
+      }}
+      sendEvent(sessionPayload(event, directory));
+    }},
+    "tool.execute.before": async (input, output) => {{
+      sendEvent({{
+        session_id: defaultSessionId(input?.sessionID),
+        event: "tool.execute.before",
+        tool_name: input?.tool,
+        tool_input: output?.args,
+        cwd: directory,
+      }});
+    }},
+    "tool.execute.after": async (input) => {{
+      sendEvent({{
+        session_id: defaultSessionId(input?.sessionID),
+        event: "tool.execute.after",
+        tool_name: input?.tool,
+        tool_input: input?.args,
+        cwd: directory,
+      }});
+    }},
+    "permission.ask": async (input) => {{
+      sendEvent({{
+        session_id: defaultSessionId(input?.sessionID),
+        event: "permission.asked",
+        prompt: input?.title,
+        cwd: directory,
+      }});
+    }},
+  }};
+}};
+
+export default DotAgentDeckPlugin;
 "#
     )
 }
@@ -93,12 +137,13 @@ mod tests {
     #[test]
     fn plugin_template_uses_exec_file_sync() {
         let content = plugin_template("/usr/local/bin/dot-agent-deck");
-        assert!(content.contains("execFileSync"));
+        assert!(content.contains("import { execFileSync } from \"child_process\";"));
         assert!(!content.contains("execSync("));
         assert!(content.contains(r#"BINARY_PATH = "/usr/local/bin/dot-agent-deck""#));
         assert!(content.contains(r#"["hook", "--agent", "opencode"]"#));
-        assert!(content.contains("session.created"));
-        assert!(content.contains("onEvent"));
+        assert!(content.contains("event?.type?.startsWith(\"session.\")"));
+        assert!(content.contains("\"tool.execute.before\""));
+        assert!(content.contains("\"permission.ask\""));
     }
 
     #[test]
