@@ -22,6 +22,7 @@ pub enum EventType {
 #[serde(rename_all = "snake_case")]
 pub enum AgentType {
     ClaudeCode,
+    OpenCode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,5 +117,18 @@ mod tests {
             "timestamp": "2026-03-22T10:00:00Z"
         }"#;
         assert!(serde_json::from_str::<AgentEvent>(json).is_err());
+    }
+
+    #[test]
+    fn parse_open_code_event() {
+        let json = r#"{
+            "session_id": "oc-456",
+            "agent_type": "open_code",
+            "event_type": "session_start",
+            "timestamp": "2026-03-22T10:00:00Z"
+        }"#;
+        let event: AgentEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.agent_type, AgentType::OpenCode);
+        assert_eq!(event.event_type, EventType::SessionStart);
     }
 }

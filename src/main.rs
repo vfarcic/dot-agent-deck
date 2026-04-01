@@ -21,12 +21,23 @@ struct Cli {
     command: Option<Commands>,
 }
 
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum CliAgent {
+    #[default]
+    ClaudeCode,
+    Opencode,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Run the dashboard (default when no subcommand)
     Dashboard,
-    /// Handle a Claude Code hook event (reads stdin, sends to socket)
-    Hook,
+    /// Handle an agent hook event (reads stdin, sends to socket)
+    Hook {
+        /// Agent type
+        #[arg(long, value_enum, default_value_t = CliAgent::ClaudeCode)]
+        agent: CliAgent,
+    },
     /// Manage hook installation
     Hooks {
         #[command(subcommand)]
@@ -41,10 +52,18 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum HooksAction {
-    /// Install hooks into ~/.claude/settings.json
-    Install,
-    /// Remove hooks from ~/.claude/settings.json
-    Uninstall,
+    /// Install hooks for an agent
+    Install {
+        /// Agent type
+        #[arg(long, value_enum, default_value_t = CliAgent::ClaudeCode)]
+        agent: CliAgent,
+    },
+    /// Remove hooks for an agent
+    Uninstall {
+        /// Agent type
+        #[arg(long, value_enum, default_value_t = CliAgent::ClaudeCode)]
+        agent: CliAgent,
+    },
 }
 
 #[derive(Subcommand)]
@@ -74,11 +93,33 @@ fn main() -> ExitCode {
             run_dashboard();
             ExitCode::SUCCESS
         }
-        Some(Commands::Hook) => handle_hook(),
+        Some(Commands::Hook { agent }) => {
+            let agent_str = match agent {
+                CliAgent::ClaudeCode => "claude-code",
+                CliAgent::Opencode => "opencode",
+            };
+            handle_hook(agent_str)
+        }
         Some(Commands::Hooks { action }) => {
             match action {
-                HooksAction::Install => hooks_manage::install(),
-                HooksAction::Uninstall => hooks_manage::uninstall(),
+                HooksAction::Install { agent } => match agent {
+                    CliAgent::Opencode => {
+                        if let Err(e) = dot_agent_deck::opencode_manage::install() {
+                            eprintln!("Failed to install OpenCode plugin: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                    CliAgent::ClaudeCode => hooks_manage::install(),
+                },
+                HooksAction::Uninstall { agent } => match agent {
+                    CliAgent::Opencode => {
+                        if let Err(e) = dot_agent_deck::opencode_manage::uninstall() {
+                            eprintln!("Failed to uninstall OpenCode plugin: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                    CliAgent::ClaudeCode => hooks_manage::uninstall(),
+                },
             }
             ExitCode::SUCCESS
         }

@@ -15,7 +15,7 @@ A terminal dashboard for monitoring and controlling multiple AI coding agent ses
 - **Keyboard-driven interface** — vim-style navigation with single-key actions
 - **Auto-installed hooks** — one command registers all required hooks
 
-Currently supports **Claude Code**. Want support for your favorite TUI agent? [Open an issue](https://github.com/vfarcic/dot-agent-deck/issues/new) and let us know!
+Currently supports **Claude Code** and **OpenCode**. Want support for your favorite TUI agent? [Open an issue](https://github.com/vfarcic/dot-agent-deck/issues/new) and let us know!
 
 ## Quick Start
 
@@ -26,8 +26,9 @@ brew install zellij
 # 2. Install dot-agent-deck
 brew tap vfarcic/tap && brew install dot-agent-deck
 
-# 3. Register Claude Code hooks
-dot-agent-deck hooks install
+# 3. Register agent hooks
+dot-agent-deck hooks install                    # Claude Code
+dot-agent-deck hooks install --agent opencode   # OpenCode
 
 # 4. Launch the dashboard
 dot-agent-deck
@@ -66,7 +67,9 @@ dot-agent-deck --help
 
 ### Hook Setup
 
-Register hooks so Claude Code sends events to the dashboard:
+Register hooks so your agents send events to the dashboard:
+
+**Claude Code:**
 
 ```bash
 dot-agent-deck hooks install
@@ -74,10 +77,19 @@ dot-agent-deck hooks install
 
 This writes entries into `~/.claude/settings.json` for these hook types: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, PreCompact, SubagentStart, SubagentStop. The command is idempotent — safe to run again.
 
-To remove hooks:
+**OpenCode:**
 
 ```bash
-dot-agent-deck hooks uninstall
+dot-agent-deck hooks install --agent opencode
+```
+
+This creates a JS plugin at `~/.opencode/plugin/dot-agent-deck/index.js` that forwards session, tool, and permission events to the dashboard.
+
+**To remove hooks:**
+
+```bash
+dot-agent-deck hooks uninstall                    # Claude Code
+dot-agent-deck hooks uninstall --agent opencode   # OpenCode
 ```
 
 ### Launching
@@ -85,7 +97,7 @@ dot-agent-deck hooks uninstall
 Running `dot-agent-deck` auto-launches Zellij with a two-column layout:
 
 - **Left (1/3)** — the dashboard, displaying a card grid of agent sessions
-- **Right (2/3)** — agent panes where Claude Code instances run (stacked by default, toggle to tiled with `t`)
+- **Right (2/3)** — agent panes where Claude Code or OpenCode instances run (stacked by default, toggle to tiled with `t`)
 
 The Zellij session is named `dot-agent-deck`. If the session already exists, it reattaches.
 

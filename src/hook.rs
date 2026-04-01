@@ -23,18 +23,43 @@ struct ClaudeCodeHookInput {
     _extra: HashMap<String, Value>,
 }
 
-pub fn handle_hook() -> ExitCode {
+#[derive(Debug, Deserialize)]
+struct OpenCodeHookInput {
+    session_id: String,
+    event: String,
+    tool_name: Option<String>,
+    tool_input: Option<Value>,
+    status: Option<String>,
+    cwd: Option<String>,
+    prompt: Option<String>,
+    #[serde(flatten)]
+    _extra: HashMap<String, Value>,
+}
+
+pub fn handle_hook(agent: &str) -> ExitCode {
     let input = match read_stdin() {
         Some(s) if !s.is_empty() => s,
         _ => return ExitCode::SUCCESS,
     };
 
-    let hook_input: ClaudeCodeHookInput = match serde_json::from_str(&input) {
-        Ok(v) => v,
-        Err(_) => return ExitCode::SUCCESS,
+    let event = match agent {
+        "opencode" => {
+            let hook_input: OpenCodeHookInput = match serde_json::from_str(&input) {
+                Ok(v) => v,
+                Err(_) => return ExitCode::SUCCESS,
+            };
+            build_opencode_event(hook_input)
+        }
+        _ => {
+            let hook_input: ClaudeCodeHookInput = match serde_json::from_str(&input) {
+                Ok(v) => v,
+                Err(_) => return ExitCode::SUCCESS,
+            };
+            build_event(hook_input)
+        }
     };
 
-    let event = match build_event(hook_input) {
+    let event = match event {
         Some(e) => e,
         None => return ExitCode::SUCCESS,
     };
@@ -111,6 +136,44 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
     Some(AgentEvent {
         session_id: input.session_id,
         agent_type: AgentType::ClaudeCode,
+        event_type,
+        tool_name: input.tool_name,
+        tool_detail,
+        cwd: input.cwd,
+        timestamp: Utc::now(),
+        user_prompt,
+        metadata: HashMap::new(),
+        pane_id,
+    })
+}
+
+fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventType> {
+    match event {
+        "session.created" => Some(EventType::SessionStart),
+        "session.deleted" => Some(EventType::SessionEnd),
+        "session.idle" => Some(EventType::Idle),
+        "session.error" => Some(EventType::Error),
+        "session.status.updated" => match status {
+            Some("idle") => Some(EventType::Idle),
+            Some("error") => Some(EventType::Error),
+            _ => Some(EventType::Thinking),
+        },
+        "tool.execute.before" => Some(EventType::ToolStart),
+        "tool.execute.after" => Some(EventType::ToolEnd),
+        "permission.asked" => Some(EventType::WaitingForInput),
+        _ => None,
+    }
+}
+
+fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
+    let event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
+    let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
+    let user_prompt = input.prompt.map(|p| truncate(&p, 200));
+    let pane_id = std::env::var("ZELLIJ_PANE_ID").ok();
+
+    Some(AgentEvent {
+        session_id: input.session_id,
+        agent_type: AgentType::OpenCode,
         event_type,
         tool_name: input.tool_name,
         tool_detail,
@@ -369,5 +432,178 @@ mod tests {
         assert!(input.cwd.is_none());
         assert!(input.tool_name.is_none());
         assert!(input.tool_input.is_none());
+    }
+
+    // --- OpenCode tests ---
+
+    #[test]
+    fn map_opencode_session_created() {
+        assert_eq!(
+            map_opencode_event_type("session.created", None),
+            Some(EventType::SessionStart)
+        );
+    }
+
+    #[test]
+    fn map_opencode_session_deleted() {
+        assert_eq!(
+            map_opencode_event_type("session.deleted", None),
+            Some(EventType::SessionEnd)
+        );
+    }
+
+    #[test]
+    fn map_opencode_session_idle() {
+        assert_eq!(
+            map_opencode_event_type("session.idle", None),
+            Some(EventType::Idle)
+        );
+    }
+
+    #[test]
+    fn map_opencode_session_error() {
+        assert_eq!(
+            map_opencode_event_type("session.error", None),
+            Some(EventType::Error)
+        );
+    }
+
+    #[test]
+    fn map_opencode_status_updated_default() {
+        assert_eq!(
+            map_opencode_event_type("session.status.updated", None),
+            Some(EventType::Thinking)
+        );
+        assert_eq!(
+            map_opencode_event_type("session.status.updated", Some("thinking")),
+            Some(EventType::Thinking)
+        );
+    }
+
+    #[test]
+    fn map_opencode_status_updated_idle() {
+        assert_eq!(
+            map_opencode_event_type("session.status.updated", Some("idle")),
+            Some(EventType::Idle)
+        );
+    }
+
+    #[test]
+    fn map_opencode_status_updated_error() {
+        assert_eq!(
+            map_opencode_event_type("session.status.updated", Some("error")),
+            Some(EventType::Error)
+        );
+    }
+
+    #[test]
+    fn map_opencode_tool_before() {
+        assert_eq!(
+            map_opencode_event_type("tool.execute.before", None),
+            Some(EventType::ToolStart)
+        );
+    }
+
+    #[test]
+    fn map_opencode_tool_after() {
+        assert_eq!(
+            map_opencode_event_type("tool.execute.after", None),
+            Some(EventType::ToolEnd)
+        );
+    }
+
+    #[test]
+    fn map_opencode_permission_asked() {
+        assert_eq!(
+            map_opencode_event_type("permission.asked", None),
+            Some(EventType::WaitingForInput)
+        );
+    }
+
+    #[test]
+    fn map_opencode_unknown_returns_none() {
+        assert_eq!(map_opencode_event_type("unknown.event", None), None);
+    }
+
+    #[test]
+    fn build_opencode_event_session_created() {
+        let input = OpenCodeHookInput {
+            session_id: "oc-123".into(),
+            event: "session.created".into(),
+            tool_name: None,
+            tool_input: None,
+            status: None,
+            cwd: Some("/tmp".into()),
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_opencode_event(input).unwrap();
+        assert_eq!(event.session_id, "oc-123");
+        assert_eq!(event.agent_type, AgentType::OpenCode);
+        assert_eq!(event.event_type, EventType::SessionStart);
+        assert_eq!(event.cwd.as_deref(), Some("/tmp"));
+    }
+
+    #[test]
+    fn build_opencode_event_tool_with_detail() {
+        let input = OpenCodeHookInput {
+            session_id: "oc-123".into(),
+            event: "tool.execute.before".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": "cargo build"})),
+            status: None,
+            cwd: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_opencode_event(input).unwrap();
+        assert_eq!(event.event_type, EventType::ToolStart);
+        assert_eq!(event.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(event.tool_detail.as_deref(), Some("cargo build"));
+    }
+
+    #[test]
+    fn build_opencode_event_unknown_returns_none() {
+        let input = OpenCodeHookInput {
+            session_id: "oc-123".into(),
+            event: "unknown.event".into(),
+            tool_name: None,
+            tool_input: None,
+            status: None,
+            cwd: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        assert!(build_opencode_event(input).is_none());
+    }
+
+    #[test]
+    fn deserialize_opencode_hook_input() {
+        let json = r#"{
+            "session_id": "oc-456",
+            "event": "tool.execute.before",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/src/main.rs"},
+            "cwd": "/home/user",
+            "extra_field": "ignored"
+        }"#;
+        let input: OpenCodeHookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id, "oc-456");
+        assert_eq!(input.event, "tool.execute.before");
+        assert_eq!(input.tool_name.as_deref(), Some("Read"));
+        assert!(input.status.is_none());
+    }
+
+    #[test]
+    fn deserialize_minimal_opencode_input() {
+        let json = r#"{
+            "session_id": "oc-456",
+            "event": "session.created"
+        }"#;
+        let input: OpenCodeHookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id, "oc-456");
+        assert!(input.tool_name.is_none());
+        assert!(input.status.is_none());
+        assert!(input.cwd.is_none());
     }
 }

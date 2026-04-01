@@ -32,11 +32,11 @@ fn main() {
         ),
     );
 
-    // Session 2: start (concurrent session)
+    // Session 2: start (OpenCode session)
     send(
         &mut stream,
         &format!(
-            r#"{{"session_id":"demo-2","agent_type":"claude_code","event_type":"session_start","timestamp":"{}","cwd":"/home/user/other-project"}}"#,
+            r#"{{"session_id":"demo-2","agent_type":"open_code","event_type":"session_start","timestamp":"{}","cwd":"/home/user/other-project"}}"#,
             ts(1)
         ),
     );
@@ -50,11 +50,11 @@ fn main() {
         ),
     );
 
-    // Session 2: waiting for input
+    // Session 2 (OpenCode): waiting for input
     send(
         &mut stream,
         &format!(
-            r#"{{"session_id":"demo-2","agent_type":"claude_code","event_type":"waiting_for_input","timestamp":"{}"}}"#,
+            r#"{{"session_id":"demo-2","agent_type":"open_code","event_type":"waiting_for_input","timestamp":"{}"}}"#,
             ts(3)
         ),
     );
@@ -77,11 +77,11 @@ fn main() {
         ),
     );
 
-    // Session 2: end
+    // Session 2 (OpenCode): end
     send(
         &mut stream,
         &format!(
-            r#"{{"session_id":"demo-2","agent_type":"claude_code","event_type":"session_end","timestamp":"{}"}}"#,
+            r#"{{"session_id":"demo-2","agent_type":"open_code","event_type":"session_end","timestamp":"{}"}}"#,
             ts(6)
         ),
     );
