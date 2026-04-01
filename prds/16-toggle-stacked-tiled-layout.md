@@ -1,6 +1,6 @@
 # PRD #16: Toggle Stacked/Tiled Pane Layout
 
-**Status**: Draft
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-03-31
 **GitHub Issue**: [#16](https://github.com/vfarcic/dot-agent-deck/issues/16)
@@ -68,10 +68,10 @@ Zellij natively supports multiple `swap_tiled_layout` blocks and cycles through 
 ## Milestones
 
 - [x] Second `swap_tiled_layout` added and Zellij `Alt+t` keybind configured (`src/main.rs`)
-- [ ] `toggle_layout()` method added to `PaneController` trait with implementations (`src/pane.rs`)
-- [ ] `t` keybinding wired up in dashboard TUI with `ToggleLayout` KeyResult (`src/ui.rs`)
-- [ ] Help overlay updated with both `t` and `Alt+t` shortcuts (`src/ui.rs`)
-- [ ] All tests passing including new noop controller assertion
+- [x] `toggle_layout()` method added to `PaneController` trait with implementations (`src/pane.rs`)
+- [x] `t` keybinding wired up in dashboard TUI with `ToggleLayout` KeyResult (`src/ui.rs`)
+- [x] Help overlay updated with both `t` and `Alt+t` shortcuts (`src/ui.rs`)
+- [x] All tests passing including new noop controller assertion
 
 ## Key Files
 

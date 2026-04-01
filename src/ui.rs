@@ -363,6 +363,7 @@ enum KeyResult {
     Focus,
     NewPane(NewPaneRequest),
     ClosePane,
+    ToggleLayout,
 }
 
 /// Detect Alt+1 … Alt+9 and return the digit (1–9).
@@ -477,6 +478,7 @@ fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult
             KeyResult::Continue
         }
         KeyCode::Char('d') if total > 0 => KeyResult::ClosePane,
+        KeyCode::Char('t') => KeyResult::ToggleLayout,
         KeyCode::Enter if total > 0 => KeyResult::Focus,
         KeyCode::Esc => {
             if !ui.filter_text.is_empty() {
@@ -885,6 +887,18 @@ pub fn run_tui(
                         }
                     }
                 }
+                KeyResult::ToggleLayout => match pane.toggle_layout() {
+                    Ok(()) => {
+                        ui.status_message =
+                            Some(("Toggled layout".to_string(), std::time::Instant::now()));
+                    }
+                    Err(e) => {
+                        ui.status_message = Some((
+                            format!("Toggle layout failed: {e}"),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                },
                 KeyResult::Continue => {}
             }
 
@@ -1214,7 +1228,7 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
 fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     let area = frame.area();
     let popup_width = 52.min(area.width.saturating_sub(4));
-    let base_height: u16 = if has_pane_control { 30 } else { 17 };
+    let base_height: u16 = if has_pane_control { 32 } else { 17 };
     let popup_height = base_height.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -1254,6 +1268,7 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
         help_text.push(Line::from("  Enter         Focus agent pane"));
         help_text.push(Line::from("  n             New pane (dir + name + cmd)"));
         help_text.push(Line::from("  d             Close agent pane"));
+        help_text.push(Line::from("  t             Toggle stacked/tiled layout"));
         help_text.push(Line::from(""));
         help_text.push(Line::styled(
             "  Zellij (works from any pane)",
@@ -1268,6 +1283,9 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
         )));
         help_text.push(Line::from(format!(
             "  {MOD_KEY}+w         Close current pane"
+        )));
+        help_text.push(Line::from(format!(
+            "  {MOD_KEY}+t         Toggle layout (any pane)"
         )));
         help_text.push(Line::from(format!("  {MOD_KEY}+q         Quit all")));
     }
