@@ -15,6 +15,13 @@ fn event_json(session_id: &str, event_type: &str) -> String {
     )
 }
 
+fn opencode_event_json(session_id: &str, event_type: &str) -> String {
+    format!(
+        r#"{{"session_id":"{}","agent_type":"open_code","event_type":"{}","timestamp":"2026-03-22T10:00:00Z"}}"#,
+        session_id, event_type
+    )
+}
+
 fn prompt_event_json(session_id: &str, prompt: &str) -> String {
     format!(
         r#"{{"session_id":"{}","agent_type":"claude_code","event_type":"thinking","user_prompt":"{}","timestamp":"2026-03-22T10:00:00Z"}}"#,
@@ -264,6 +271,106 @@ async fn user_prompt_flows_through_daemon() {
         assert_eq!(
             s.sessions["s1"].last_user_prompt.as_deref(),
             Some("fix the login bug")
+        );
+    }
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn opencode_session_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("test.sock");
+    let state = Arc::new(RwLock::new(AppState::default()));
+
+    let daemon_state = state.clone();
+    let daemon_sock = sock_path.clone();
+    let handle = tokio::spawn(async move {
+        run_daemon(&daemon_sock, daemon_state).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = UnixStream::connect(&sock_path).await.unwrap();
+
+    // Send OpenCode session start
+    let msg = format!("{}\n", opencode_event_json("oc1", "session_start"));
+    stream.write_all(msg.as_bytes()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    {
+        let s = state.read().await;
+        assert!(s.sessions.contains_key("oc1"));
+        assert_eq!(s.sessions["oc1"].status, SessionStatus::Idle);
+        assert_eq!(
+            s.sessions["oc1"].agent_type,
+            dot_agent_deck::event::AgentType::OpenCode
+        );
+    }
+
+    // Send tool start
+    let msg = format!(
+        r#"{{"session_id":"oc1","agent_type":"open_code","event_type":"tool_start","tool_name":"Bash","timestamp":"2026-03-22T10:00:01Z"}}"#
+    );
+    stream
+        .write_all(format!("{msg}\n").as_bytes())
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    {
+        let s = state.read().await;
+        assert_eq!(s.sessions["oc1"].status, SessionStatus::Working);
+    }
+
+    // Send session end
+    let msg = format!("{}\n", opencode_event_json("oc1", "session_end"));
+    stream.write_all(msg.as_bytes()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    {
+        let s = state.read().await;
+        assert!(!s.sessions.contains_key("oc1"));
+    }
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn mixed_agent_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("test.sock");
+    let state = Arc::new(RwLock::new(AppState::default()));
+
+    let daemon_state = state.clone();
+    let daemon_sock = sock_path.clone();
+    let handle = tokio::spawn(async move {
+        run_daemon(&daemon_sock, daemon_state).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = UnixStream::connect(&sock_path).await.unwrap();
+
+    // Start both Claude Code and OpenCode sessions
+    let msg = format!(
+        "{}\n{}\n",
+        event_json("cc1", "session_start"),
+        opencode_event_json("oc1", "session_start")
+    );
+    stream.write_all(msg.as_bytes()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    {
+        let s = state.read().await;
+        assert_eq!(s.sessions.len(), 2);
+        assert_eq!(
+            s.sessions["cc1"].agent_type,
+            dot_agent_deck::event::AgentType::ClaudeCode
+        );
+        assert_eq!(
+            s.sessions["oc1"].agent_type,
+            dot_agent_deck::event::AgentType::OpenCode
         );
     }
 

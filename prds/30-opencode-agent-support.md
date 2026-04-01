@@ -1,6 +1,6 @@
 # PRD #30: OpenCode Agent Support
 
-**Status**: Draft
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-04-01
 **GitHub Issue**: [#30](https://github.com/vfarcic/dot-agent-deck/issues/30)
@@ -185,18 +185,18 @@ This is already used in the card title rendering — no other UI change required
 
 ## Milestones
 
-- [ ] `AgentType::OpenCode` variant added to enum with serialization tests (`src/event.rs`)
-- [ ] `--agent` CLI flag on `hook` and `hooks install/uninstall` subcommands (`src/main.rs`)
-- [ ] OpenCode event parsing and mapping implemented with tests (`src/hook.rs`)
-- [ ] OpenCode JS plugin installer and uninstaller (`src/hooks_manage.rs`)
-- [ ] Display formatting for OpenCode agent type (`src/ui.rs`)
-- [ ] End-to-end verification: OpenCode sessions visible in dashboard
-- [ ] All existing tests passing, new tests for OpenCode parsing and installation
+- [x] `AgentType::OpenCode` variant added to enum with serialization tests (`src/event.rs`)
+- [x] `--agent` CLI flag on `hook` and `hooks install/uninstall` subcommands (`src/main.rs`)
+- [x] OpenCode event parsing and mapping implemented with tests (`src/hook.rs`)
+- [x] OpenCode JS plugin installer and uninstaller (`src/opencode_manage.rs`)
+- [x] Display formatting for OpenCode agent type (`src/ui.rs`)
+- [x] End-to-end verification: OpenCode sessions visible in dashboard (integration tests)
+- [x] All existing tests passing, new tests for OpenCode parsing and installation
 
 ## Key Files
 
 - `src/event.rs` — AgentType enum extension
 - `src/hook.rs` — OpenCode input parsing and event mapping
-- `src/hooks_manage.rs` — Plugin installer/uninstaller
+- `src/opencode_manage.rs` — Plugin installer/uninstaller
 - `src/main.rs` — CLI flag additions
 - `src/ui.rs` — Display impl update

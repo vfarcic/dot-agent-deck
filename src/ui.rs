@@ -21,6 +21,7 @@ impl fmt::Display for crate::event::AgentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             crate::event::AgentType::ClaudeCode => write!(f, "ClaudeCode"),
+            crate::event::AgentType::OpenCode => write!(f, "OpenCode"),
         }
     }
 }
