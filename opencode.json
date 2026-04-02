@@ -1,5 +1,15 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "coderabbitai": {
+      "type": "local",
+      "command": ["npx", "coderabbitai-mcp@latest"],
+      "environment": {
+        "GITHUB_PAT": "{env:GITHUB_TOKEN}"
+      },
+      "enabled": true
+    }
+  },
   "permission": {
     "webfetch": "allow",
     "websearch": "allow"
