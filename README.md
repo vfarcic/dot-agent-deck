@@ -32,10 +32,9 @@ dot-agent-deck hooks install --agent opencode   # OpenCode
 
 # 4. Launch the dashboard
 dot-agent-deck
-
-# 5. See all the shortcuts
-?
 ```
+
+Once the dashboard is running, press `?` inside the app to see all shortcuts.
 
 ## Installation
 

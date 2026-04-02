@@ -253,6 +253,10 @@ impl DirPickerState {
         let idx = *self.filtered_indices.get(self.selected)?;
         self.entries.get(idx)
     }
+
+    fn has_subdirs(&self) -> bool {
+        self.entries.iter().any(|entry| entry != Path::new(".."))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -677,10 +681,16 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             KeyCode::Up => {
                 picker.select_previous();
             }
-            KeyCode::Char(c) => {
-                picker.filter_text.push(c);
-                picker.refilter();
-            }
+            KeyCode::Char(c) => match c {
+                'q' | 'Q' => {
+                    ui.dir_picker = None;
+                    ui.mode = UiMode::Normal;
+                }
+                _ => {
+                    picker.filter_text.push(c);
+                    picker.refilter();
+                }
+            },
             _ => {}
         }
         return KeyResult::Continue;
@@ -707,7 +717,7 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         }
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
             // If no subdirs, select current directory
-            if picker.entries.is_empty() {
+            if !picker.has_subdirs() {
                 transition_to_form(ui);
                 return KeyResult::Continue;
             }
@@ -1454,7 +1464,8 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
     if show_filter_row {
         reserved_lines += 1;
     }
-    let max_visible = (popup_height as usize).saturating_sub(reserved_lines);
+    let inner_height = popup_area.height.saturating_sub(2) as usize;
+    let max_visible = inner_height.saturating_sub(reserved_lines);
     let visible_rows = max_visible.max(1);
     picker.ensure_visible(visible_rows);
 
@@ -1518,10 +1529,14 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
     }
 
     lines.push(Line::from(""));
-    let nav_footer = "  j/k or ↑↓: navigate  l/Enter: open  Space: select  h/Backspace: up";
+    let nav_footer = if picker.filtering {
+        "  ↑↓: move between matches  Backspace: delete  q: cancel"
+    } else {
+        "  j/k or ↑↓: navigate  l/Enter: open  Space: select  h/Backspace: up"
+    };
     lines.push(Line::styled(nav_footer, Style::default().fg(Color::Gray)));
     let mode_footer = if picker.filtering {
-        "  Typing filter…  Enter: accept  Esc: clear  q: cancel"
+        "  Typing: add characters  Enter: accept filter  Esc: clear"
     } else if !picker.filter_text.is_empty() {
         "  /: edit filter  Esc: clear filter  q: cancel"
     } else {
@@ -2408,6 +2423,40 @@ mod tests {
         assert_eq!(picker.current_dir, root);
         assert!(picker.filter_text.is_empty());
         assert!(!picker.filtering);
+    }
+
+    #[test]
+    fn dir_picker_enter_confirms_when_no_subdirs() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        ui.dir_picker = Some(make_dir_picker(&[".."]));
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &mut ui,
+        );
+
+        assert_eq!(ui.mode, UiMode::NewPaneForm);
+        assert!(ui.new_pane_form.is_some());
+    }
+
+    #[test]
+    fn dir_picker_filter_mode_q_cancels_picker() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        ui.dir_picker = Some(make_dir_picker(&["..", "/tmp/a"]));
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut ui,
+        );
+
+        assert!(ui.dir_picker.is_none());
+        assert_eq!(ui.mode, UiMode::Normal);
     }
 
     // ---------------------------------------------------------------------------
