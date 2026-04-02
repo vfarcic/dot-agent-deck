@@ -82,7 +82,19 @@ impl AppState {
         stats
     }
 
-    pub fn apply_event(&mut self, event: AgentEvent) {
+    pub fn apply_event(&mut self, mut event: AgentEvent) {
+        if let Some(ref pane_id) = event.pane_id {
+            if let Some(existing_id) = self.sessions.iter().find_map(|(id, session)| {
+                (session.pane_id.as_ref().is_some_and(|p| p == pane_id) && id != &event.session_id)
+                    .then(|| id.clone())
+            }) {
+                let old_id = std::mem::replace(&mut event.session_id, existing_id);
+                if old_id != event.session_id {
+                    self.sessions.remove(&old_id);
+                }
+            }
+        }
+
         if event.event_type == EventType::SessionEnd {
             // Preserve started_at for the pane so a restarted session keeps its position.
             if let Some(session) = self.sessions.get(&event.session_id)
@@ -248,6 +260,23 @@ mod tests {
 
         assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
         assert_eq!(state.sessions["s2"].status, SessionStatus::Idle);
+    }
+
+    #[test]
+    fn reuse_session_for_same_pane() {
+        let mut state = AppState::default();
+
+        let mut first = make_event("s1", EventType::SessionStart);
+        first.pane_id = Some("pane-1".to_string());
+        state.apply_event(first);
+
+        let mut restart = make_event("s2", EventType::SessionStart);
+        restart.pane_id = Some("pane-1".to_string());
+        state.apply_event(restart);
+
+        assert!(state.sessions.contains_key("s1"));
+        assert!(!state.sessions.contains_key("s2"));
+        assert_eq!(state.sessions["s1"].pane_id.as_deref(), Some("pane-1"));
     }
 
     #[test]

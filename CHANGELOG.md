@@ -1,5 +1,13 @@
 # Changelog
 
+## [v0.11.6] - 2026-04-02
+
+### Fixed
+
+- **OpenCode Decks Survive Session Clears**
+  Clearing an OpenCode chat inside OpenCode now reuses the existing deck in dot-agent-deck instead of leaving the stale card behind and spawning a second one. The dashboard now remaps all incoming events that reference the same `pane_id` to the original session so pane layouts remain stable across `/clear` and new-chat resets.
+
+
 ## [v0.11.5] - 2026-04-02
 
 ### Fixed
