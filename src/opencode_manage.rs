@@ -233,7 +233,10 @@ export const DotAgentDeckPlugin = async (ctx) => {{
     event: async (input) => {{
       const event = input?.event;
       const eventType = event?.type ?? "";
-      if (eventType === "message.updated") {{
+      if (
+        eventType === "message.created" ||
+        eventType === "message.updated"
+      ) {{
         recordUserMessage(event, directory);
         return;
       }}
@@ -363,6 +366,8 @@ mod tests {
         assert!(content.contains(r#"["hook", "--agent", "opencode"]"#));
         assert!(content.contains("event?.type?.startsWith(\"session.\")"));
         assert!(content.contains("\"tool.execute.before\""));
+        assert!(content.contains("eventType === \"message.created\""));
+        assert!(content.contains("eventType === \"message.updated\""));
         assert!(content.contains("const permissionPayload"));
         assert!(content.contains("\"permission.asked\""));
     }
