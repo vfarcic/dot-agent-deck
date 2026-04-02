@@ -1,6 +1,6 @@
 # PRD #25: Type-to-Filter in Directory Picker
 
-**Status**: Draft
+**Status**: Complete (2026-04-02)
 **Priority**: Medium
 **Created**: 2026-04-01
 **GitHub Issue**: [#25](https://github.com/vfarcic/dot-agent-deck/issues/25)
@@ -35,6 +35,7 @@ Add a `/`-triggered filter mode to the directory picker, consistent with the exi
 - Case-insensitive substring matching on directory name (not full path)
 - `..` entry always passes filter
 - Filter resets on `enter_selected()` and `go_up()` (via `refresh()`)
+- Directory picker navigation wraps around when moving past the first or last entry
 - Visual filter input row in the popup
 - Updated footer help text showing `/: filter` hint
 - Empty state message: `(no matching directories)` when filter yields no results
@@ -78,7 +79,7 @@ The `handle_dir_picker_key()` function branches on `picker.filtering`:
 - `/` → enter filter mode
 - `Esc` → if filter active: clear filter + `refilter()`; if no filter: close picker
 - All other existing bindings preserved (`j/k/h/l/q/Space/Enter/arrows`)
-- Navigation uses `filtered_indices.len()` for bounds
+- Navigation uses `filtered_indices.len()` for bounds and wraps when moving past start or end
 
 ### Rendering Changes (`src/ui.rs`)
 
@@ -101,6 +102,7 @@ The existing `refresh()` method (called by `enter_selected()` and `go_up()`) wil
 - Typed characters progressively narrow the directory list
 - Matching is case-insensitive and matches anywhere in the directory name
 - `..` entry is always visible regardless of filter
+- Up from the first entry jumps to the last (and Down from the last jumps to the first), honoring active filters
 - `Esc` clears filter; second `Esc` closes picker
 - Navigating into a directory or going up resets the filter
 - Selecting a filtered entry works correctly (Space, Enter)
@@ -110,12 +112,13 @@ The existing `refresh()` method (called by `enter_selected()` and `go_up()`) wil
 
 ## Milestones
 
-- [ ] `DirPickerState` extended with `filter_text`, `filtering`, `filtered_indices` fields and `refilter()` method
-- [ ] `handle_dir_picker_key()` updated with filter mode branching and `/` keybinding
-- [ ] `enter_selected()` indexes through `filtered_indices`; `refresh()` resets filter state
-- [ ] `render_dir_picker()` updated with filter input row, filtered entry iteration, and dynamic footer
-- [ ] Unit tests for filter narrowing, `..` always visible, Esc behavior, and filter reset on navigation
-- [ ] All existing tests passing
+- [x] `DirPickerState` extended with `filter_text`, `filtering`, `filtered_indices` fields and `refilter()` method
+- [x] `handle_dir_picker_key()` updated with filter mode branching and `/` keybinding
+- [x] `enter_selected()` indexes through `filtered_indices`; `refresh()` resets filter state
+- [x] Directory picker navigation wraps when moving past start/end entries
+- [x] `render_dir_picker()` updated with filter input row, filtered entry iteration, and dynamic footer
+- [x] Unit tests for filter narrowing, `..` always visible, Esc behavior, and filter reset on navigation
+- [x] All existing tests passing
 
 ## Key Files
 

@@ -309,9 +309,8 @@ async fn opencode_session_lifecycle() {
     }
 
     // Send tool start
-    let msg = format!(
-        r#"{{"session_id":"oc1","agent_type":"open_code","event_type":"tool_start","tool_name":"Bash","timestamp":"2026-03-22T10:00:01Z"}}"#
-    );
+    let msg = r#"{"session_id":"oc1","agent_type":"open_code","event_type":"tool_start","tool_name":"Bash","timestamp":"2026-03-22T10:00:01Z"}"#
+        .to_string();
     stream
         .write_all(format!("{msg}\n").as_bytes())
         .await

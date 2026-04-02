@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -113,6 +113,9 @@ struct DirPickerState {
     entries: Vec<PathBuf>,
     selected: usize,
     scroll_offset: usize,
+    filter_text: String,
+    filtering: bool,
+    filtered_indices: Vec<usize>,
 }
 
 impl DirPickerState {
@@ -122,6 +125,9 @@ impl DirPickerState {
             entries: Vec::new(),
             selected: 0,
             scroll_offset: 0,
+            filter_text: String::new(),
+            filtering: false,
+            filtered_indices: Vec::new(),
         };
         state.refresh();
         state
@@ -148,19 +154,21 @@ impl DirPickerState {
             dirs.sort();
             self.entries.extend(dirs);
         }
-        self.selected = 0;
-        self.scroll_offset = 0;
+        self.filter_text.clear();
+        self.filtering = false;
+        self.refilter();
     }
 
     fn enter_selected(&mut self) {
-        if let Some(path) = self.entries.get(self.selected) {
-            if path == &PathBuf::from("..") {
-                self.go_up();
-                return;
-            }
-            self.current_dir = path.clone();
-            self.refresh();
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        if entry == Path::new("..") {
+            self.go_up();
+            return;
         }
+        self.current_dir = entry;
+        self.refresh();
     }
 
     fn go_up(&mut self) {
@@ -168,6 +176,86 @@ impl DirPickerState {
             self.current_dir = parent.to_path_buf();
             self.refresh();
         }
+    }
+
+    fn refilter(&mut self) {
+        let query = self.filter_text.to_lowercase();
+        self.filtered_indices.clear();
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if entry == Path::new("..") {
+                self.filtered_indices.push(idx);
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let name_lower = name.to_lowercase();
+            if query.is_empty() || name_lower.contains(&query) {
+                self.filtered_indices.push(idx);
+            }
+        }
+        self.selected = 0;
+        self.scroll_offset = 0;
+    }
+
+    fn clear_filter(&mut self) {
+        if self.filter_text.is_empty() && !self.filtering {
+            return;
+        }
+        self.filter_text.clear();
+        self.filtering = false;
+        self.refilter();
+    }
+
+    fn select_next(&mut self) {
+        let total = self.filtered_indices.len();
+        if total == 0 {
+            return;
+        }
+        self.selected = (self.selected + 1) % total;
+    }
+
+    fn select_previous(&mut self) {
+        let total = self.filtered_indices.len();
+        if total == 0 {
+            return;
+        }
+        if self.selected == 0 {
+            self.selected = total - 1;
+        } else {
+            self.selected -= 1;
+        }
+    }
+
+    fn ensure_visible(&mut self, max_visible: usize) {
+        if self.filtered_indices.is_empty() {
+            self.scroll_offset = 0;
+            self.selected = 0;
+            return;
+        }
+        if self.selected >= self.filtered_indices.len() {
+            self.selected = self.filtered_indices.len() - 1;
+        }
+        let window = max_visible.max(1);
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + window {
+            self.scroll_offset = self.selected + 1 - window;
+        }
+        let max_scroll = self.filtered_indices.len().saturating_sub(window);
+        if self.scroll_offset > max_scroll {
+            self.scroll_offset = max_scroll;
+        }
+    }
+
+    fn selected_entry(&self) -> Option<&PathBuf> {
+        let idx = *self.filtered_indices.get(self.selected)?;
+        self.entries.get(idx)
+    }
+
+    fn has_subdirs(&self) -> bool {
+        self.entries.iter().any(|entry| entry != Path::new(".."))
     }
 }
 
@@ -571,29 +659,78 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             return KeyResult::Continue;
         }
     };
+
+    if picker.filtering {
+        match key.code {
+            KeyCode::Esc => {
+                picker.clear_filter();
+            }
+            KeyCode::Enter => {
+                picker.filtering = false;
+            }
+            KeyCode::Backspace => {
+                picker.filter_text.pop();
+                if picker.filter_text.is_empty() {
+                    picker.filtering = false;
+                }
+                picker.refilter();
+            }
+            KeyCode::Down => {
+                picker.select_next();
+            }
+            KeyCode::Up => {
+                picker.select_previous();
+            }
+            KeyCode::Char(c) => match c {
+                'q' | 'Q' => {
+                    ui.dir_picker = None;
+                    ui.mode = UiMode::Normal;
+                }
+                _ => {
+                    picker.filter_text.push(c);
+                    picker.refilter();
+                }
+            },
+            _ => {}
+        }
+        return KeyResult::Continue;
+    }
+
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc => {
+            if !picker.filter_text.is_empty() {
+                picker.clear_filter();
+            } else {
+                ui.dir_picker = None;
+                ui.mode = UiMode::Normal;
+            }
+        }
+        KeyCode::Char('q') => {
             ui.dir_picker = None;
             ui.mode = UiMode::Normal;
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            if !picker.entries.is_empty() {
-                picker.selected = (picker.selected + 1).min(picker.entries.len() - 1);
-            }
+            picker.select_next();
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            picker.selected = picker.selected.saturating_sub(1);
+            picker.select_previous();
         }
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
             // If no subdirs, select current directory
-            if picker.entries.is_empty() {
+            if !picker.has_subdirs() {
                 transition_to_form(ui);
+                return KeyResult::Continue;
+            }
+            if picker.filtered_indices.is_empty() {
                 return KeyResult::Continue;
             }
             picker.enter_selected();
         }
         KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
             picker.go_up();
+        }
+        KeyCode::Char('/') => {
+            picker.filtering = true;
         }
         KeyCode::Char(' ') => {
             transition_to_form(ui);
@@ -962,7 +1099,7 @@ fn render_frame(
             render_help_overlay(frame, has_pane_control);
         }
         if ui.mode == UiMode::DirPicker
-            && let Some(ref picker) = ui.dir_picker
+            && let Some(picker) = ui.dir_picker.as_mut()
         {
             render_dir_picker(frame, picker);
         }
@@ -1105,7 +1242,7 @@ fn render_frame(
         render_help_overlay(frame, has_pane_control);
     }
     if ui.mode == UiMode::DirPicker
-        && let Some(ref picker) = ui.dir_picker
+        && let Some(picker) = ui.dir_picker.as_mut()
     {
         render_dir_picker(frame, picker);
     }
@@ -1311,7 +1448,7 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_dir_picker(frame: &mut Frame, picker: &DirPickerState) {
+fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
     let area = frame.area();
     let popup_width = 60.min(area.width.saturating_sub(4));
     let popup_height = 20u16.min(area.height.saturating_sub(4));
@@ -1321,40 +1458,56 @@ fn render_dir_picker(frame: &mut Frame, picker: &DirPickerState) {
 
     frame.render_widget(Clear, popup_area);
 
-    // Reserve lines: title(1) + current_dir(1) + blank(1) + footer(2) = 5
-    let max_visible = (popup_height as usize).saturating_sub(5);
+    // Reserve lines so controls remain visible regardless of list length.
+    let show_filter_row = picker.filtering || !picker.filter_text.is_empty();
+    let mut reserved_lines = 5; // current dir + blank + blank + two footer lines
+    if show_filter_row {
+        reserved_lines += 1;
+    }
+    let inner_height = popup_area.height.saturating_sub(2) as usize;
+    let max_visible = inner_height.saturating_sub(reserved_lines);
+    let visible_rows = max_visible.max(1);
+    picker.ensure_visible(visible_rows);
 
-    let mut lines = vec![
-        Line::styled(
-            format!("  {}", picker.current_dir.display()),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::from(""),
-    ];
+    let mut lines = vec![Line::styled(
+        format!("  {}", picker.current_dir.display()),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )];
 
-    if picker.entries.is_empty() {
-        lines.push(Line::styled(
-            "  (no subdirectories)",
-            Style::default().fg(Color::DarkGray),
+    if show_filter_row {
+        let mut spans = vec![Span::styled("  / ", Style::default().fg(Color::Gray))];
+        spans.push(Span::styled(
+            picker.filter_text.clone(),
+            Style::default().fg(Color::White),
         ));
-    } else {
-        // Adjust scroll offset to keep selected visible
-        let scroll = if picker.selected >= max_visible {
-            picker.selected - max_visible + 1
-        } else {
-            0
-        };
+        if picker.filtering {
+            spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
+        }
+        lines.push(Line::from(spans));
+    }
 
-        for (i, entry) in picker
-            .entries
+    lines.push(Line::from(""));
+
+    if picker.filtered_indices.is_empty() {
+        let message = if picker.entries.is_empty() {
+            "  (no subdirectories)"
+        } else {
+            "  (no matching directories)"
+        };
+        lines.push(Line::styled(message, Style::default().fg(Color::DarkGray)));
+    } else {
+        for (i, entry_idx) in picker
+            .filtered_indices
             .iter()
             .enumerate()
-            .skip(scroll)
-            .take(max_visible)
+            .skip(picker.scroll_offset)
+            .take(visible_rows)
         {
-            let name = if entry == &PathBuf::from("..") {
+            let entry = &picker.entries[*entry_idx];
+            let is_parent = entry == Path::new("..");
+            let name = if is_parent {
                 "..".to_string()
             } else {
                 entry
@@ -1370,16 +1523,26 @@ fn render_dir_picker(frame: &mut Frame, picker: &DirPickerState) {
             } else {
                 Style::default()
             };
-            let suffix = if name == ".." { "" } else { "/" };
+            let suffix = if is_parent { "" } else { "/" };
             lines.push(Line::styled(format!("{prefix}{name}{suffix}"), style));
         }
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::styled(
-        "  Space: select dir  Enter/l: open  h/BS: up  Esc: cancel",
-        Style::default().fg(Color::Gray),
-    ));
+    let nav_footer = if picker.filtering {
+        "  ↑↓: move between matches  Backspace: delete  q: cancel"
+    } else {
+        "  j/k or ↑↓: navigate  l/Enter: open  Space: select  h/Backspace: up"
+    };
+    lines.push(Line::styled(nav_footer, Style::default().fg(Color::Gray)));
+    let mode_footer = if picker.filtering {
+        "  Typing: add characters  Enter: accept filter  Esc: clear"
+    } else if !picker.filter_text.is_empty() {
+        "  /: edit filter  Esc: clear filter  q: cancel"
+    } else {
+        "  /: filter directories  Esc or q: cancel"
+    };
+    lines.push(Line::styled(mode_footer, Style::default().fg(Color::Gray)));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1744,6 +1907,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::HashMap;
+    use tempfile::tempdir;
 
     fn default_ui() -> UiState {
         UiState::default()
@@ -2050,6 +2214,249 @@ mod tests {
         assert_eq!(navigate_grid(0, Direction::Up, 2, 1), 0);
         assert_eq!(navigate_grid(0, Direction::Left, 2, 1), 0);
         assert_eq!(navigate_grid(0, Direction::Right, 2, 1), 0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Dir picker tests
+    // ---------------------------------------------------------------------------
+
+    fn make_dir_picker(entries: &[&str]) -> DirPickerState {
+        let mut picker = DirPickerState {
+            current_dir: PathBuf::from("/tmp"),
+            entries: entries.iter().copied().map(PathBuf::from).collect(),
+            selected: 0,
+            scroll_offset: 0,
+            filter_text: String::new(),
+            filtering: false,
+            filtered_indices: Vec::new(),
+        };
+        picker.refilter();
+        picker
+    }
+
+    #[test]
+    fn dir_picker_refilter_matches_case_insensitive() {
+        let mut picker = make_dir_picker(&["..", "/tmp/Alpha", "/tmp/beta"]);
+        picker.filter_text = "ALP".to_string();
+        picker.refilter();
+        assert_eq!(picker.filtered_indices.len(), 2);
+        assert_eq!(picker.filtered_indices[0], 0); // parent entry
+        assert_eq!(picker.filtered_indices[1], 1); // Alpha matches regardless of case
+    }
+
+    #[test]
+    fn dir_picker_parent_entry_always_present() {
+        let mut picker = make_dir_picker(&["..", "/tmp/app", "/tmp/docs"]);
+        picker.filter_text = "zzz".to_string();
+        picker.refilter();
+        assert_eq!(picker.filtered_indices.len(), 1);
+        let idx = picker.filtered_indices[0];
+        assert_eq!(picker.entries[idx], PathBuf::from(".."));
+    }
+
+    #[test]
+    fn dir_picker_selection_wraps() {
+        let mut picker = make_dir_picker(&["..", "/tmp/a", "/tmp/b"]);
+        let total = picker.filtered_indices.len();
+        assert_eq!(total, 3);
+        picker.select_previous();
+        assert_eq!(picker.selected, total - 1);
+        picker.select_next();
+        assert_eq!(picker.selected, 0);
+        picker.select_next();
+        assert_eq!(picker.selected, 1);
+        picker.selected = 0;
+        picker.select_previous();
+        assert_eq!(picker.selected, total - 1);
+    }
+
+    #[test]
+    fn dir_picker_filter_typing_narrows_entries() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        ui.dir_picker = Some(make_dir_picker(&[
+            "..",
+            "/tmp/alpha",
+            "/tmp/beta",
+            "/tmp/Bravo",
+        ]));
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            &mut ui,
+        );
+
+        let picker = ui.dir_picker.as_ref().unwrap();
+        assert!(picker.filtering);
+        assert_eq!(picker.filter_text, "b");
+        let filtered: Vec<String> = picker
+            .filtered_indices
+            .iter()
+            .map(|&idx| {
+                let entry = &picker.entries[idx];
+                entry
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| entry.to_string_lossy().to_string())
+            })
+            .collect();
+        assert_eq!(filtered, vec!["..", "beta", "Bravo"]);
+    }
+
+    #[test]
+    fn dir_picker_backspace_clears_filter_when_empty() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        ui.dir_picker = Some(make_dir_picker(&["..", "/tmp/alpha", "/tmp/beta"]));
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut ui,
+        );
+
+        let picker = ui.dir_picker.as_ref().unwrap();
+        assert!(!picker.filtering);
+        assert!(picker.filter_text.is_empty());
+        assert_eq!(picker.filtered_indices.len(), picker.entries.len());
+    }
+
+    #[test]
+    fn dir_picker_filter_esc_clears_text() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        ui.dir_picker = Some(make_dir_picker(&["..", "/tmp/app", "/tmp/docs"]));
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
+
+        let picker = ui.dir_picker.as_ref().unwrap();
+        assert!(picker.filter_text.is_empty());
+        assert!(!picker.filtering);
+        assert_eq!(picker.filtered_indices.len(), picker.entries.len());
+    }
+
+    #[test]
+    fn dir_picker_esc_clears_then_closes_picker() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        ui.dir_picker = Some(make_dir_picker(&["..", "/tmp/foo", "/tmp/bar"]));
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+
+        handle_dir_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
+        {
+            let picker = ui.dir_picker.as_ref().unwrap();
+            assert!(picker.filter_text.is_empty());
+            assert!(!picker.filtering);
+            assert_eq!(ui.mode, UiMode::DirPicker);
+        }
+
+        handle_dir_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
+        assert!(ui.dir_picker.is_none());
+        assert_eq!(ui.mode, UiMode::Normal);
+    }
+
+    #[test]
+    fn dir_picker_refresh_resets_filter_on_navigation() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let child = root.join("alpha");
+        let grandchild = child.join("beta");
+        std::fs::create_dir_all(&grandchild).unwrap();
+
+        let mut picker = DirPickerState::new(root.clone());
+        assert!(picker.entries.iter().any(|entry| entry == &child));
+
+        picker.filter_text = "alpha".to_string();
+        picker.refilter();
+        let child_pos = picker
+            .filtered_indices
+            .iter()
+            .position(|&idx| picker.entries[idx] == child)
+            .expect("alpha entry present");
+        picker.selected = child_pos;
+        picker.enter_selected();
+
+        assert_eq!(picker.current_dir, child);
+        assert!(picker.filter_text.is_empty());
+        assert!(!picker.filtering);
+
+        picker.filter_text = "beta".to_string();
+        picker.filtering = true;
+        picker.refilter();
+        assert!(
+            picker
+                .filtered_indices
+                .iter()
+                .any(|&idx| picker.entries[idx] == grandchild)
+        );
+
+        picker.go_up();
+
+        assert_eq!(picker.current_dir, root);
+        assert!(picker.filter_text.is_empty());
+        assert!(!picker.filtering);
+    }
+
+    #[test]
+    fn dir_picker_enter_confirms_when_no_subdirs() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        ui.dir_picker = Some(make_dir_picker(&[".."]));
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &mut ui,
+        );
+
+        assert_eq!(ui.mode, UiMode::NewPaneForm);
+        assert!(ui.new_pane_form.is_some());
+    }
+
+    #[test]
+    fn dir_picker_filter_mode_q_cancels_picker() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        ui.dir_picker = Some(make_dir_picker(&["..", "/tmp/a"]));
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut ui,
+        );
+
+        assert!(ui.dir_picker.is_none());
+        assert_eq!(ui.mode, UiMode::Normal);
     }
 
     // ---------------------------------------------------------------------------
