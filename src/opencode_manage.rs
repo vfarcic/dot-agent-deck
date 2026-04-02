@@ -15,6 +15,11 @@ fn plugin_template(binary_path: &str) -> String {
         r#"import {{ execFileSync }} from "child_process";
 
 const BINARY_PATH = {binary_path_json};
+const knownSessions = new Map();
+const messageRoles = new Map();
+const directorySessions = new Map();
+const sessionAliases = new Map();
+let shuttingDown = false;
 
 const sendEvent = (payload) => {{
   try {{
@@ -28,16 +33,197 @@ const sendEvent = (payload) => {{
 
 const defaultSessionId = (value) => (value ? value : "unknown");
 
+const normalizeSessionId = (sessionId, directory) => {{
+  const dirKey = directory ?? process.cwd();
+  if (sessionId && sessionAliases.has(sessionId)) {{
+    return sessionAliases.get(sessionId);
+  }}
+  if (sessionId && sessionId !== "unknown") {{
+    const existing = directorySessions.get(dirKey);
+    if (existing && existing !== sessionId) {{
+      sessionAliases.set(sessionId, existing);
+      return existing;
+    }}
+    directorySessions.set(dirKey, sessionId);
+    return sessionId;
+  }}
+  const fallback = directorySessions.get(dirKey);
+  if (fallback) {{
+    return fallback;
+  }}
+  return sessionId ?? "unknown";
+}};
+
+const updateSessionInfo = (sessionId, directory, status) => {{
+  if (!sessionId || sessionId === "unknown") {{
+    return null;
+  }}
+  const existing = knownSessions.get(sessionId) ?? {{}};
+  const cwd = directory ?? existing.cwd ?? process.cwd();
+  const info = {{
+    cwd,
+    status: status ?? existing.status,
+  }};
+  knownSessions.set(sessionId, info);
+  return info;
+}};
+
+const cleanupSessionMessages = (sessionId) => {{
+  for (const [messageId, info] of messageRoles.entries()) {{
+    if (info?.sessionId === sessionId) {{
+      messageRoles.delete(messageId);
+    }}
+  }}
+}};
+
 const sessionPayload = (event, directory) => {{
   const props = event?.properties ?? {{}};
   const info = props.info ?? {{}};
   const status = props.status ?? {{}};
+  const cwd = info.directory ?? props.directory ?? directory ?? process.cwd();
   return {{
-    session_id: defaultSessionId(props.sessionID ?? info.id),
+    session_id: normalizeSessionId(
+      defaultSessionId(props.sessionID ?? info.id),
+      cwd
+    ),
     event: event?.type ?? "session.unknown",
     status: status.type,
-    cwd: info.directory ?? props.directory ?? directory ?? process.cwd(),
+    cwd,
   }};
+}};
+
+const permissionPayload = (event, directory) => {{
+  const props = event?.properties ?? {{}};
+  const prompt =
+    props.prompt ??
+    props.title ??
+    props.message ??
+    props.text ??
+    props.question ??
+    "";
+  const cwd = directory ?? process.cwd();
+  return {{
+    session_id: normalizeSessionId(
+      defaultSessionId(props.sessionID ?? props.sessionId),
+      cwd
+    ),
+    event: event?.type ?? "permission.unknown",
+    prompt,
+    cwd,
+  }};
+}};
+
+const ensureSessionRegistered = (sessionId, directory, status, shouldEmitEvent = true) => {{
+  if (!sessionId || sessionId === "unknown") {{
+    return;
+  }}
+  const alreadyKnown = knownSessions.has(sessionId);
+  const info = updateSessionInfo(sessionId, directory, status);
+  if (!alreadyKnown && shouldEmitEvent) {{
+    sendEvent({{
+      session_id: sessionId,
+      event: "session.created",
+      status,
+      cwd: info?.cwd ?? process.cwd(),
+    }});
+  }}
+}};
+
+const closeSession = (sessionId, directory, emitEvent = true, removeAlias = true) => {{
+  if (!sessionId || sessionId === "unknown") {{
+    return;
+  }}
+  const info = knownSessions.get(sessionId);
+  knownSessions.delete(sessionId);
+  cleanupSessionMessages(sessionId);
+  if (removeAlias) {{
+    for (const [alias, target] of sessionAliases.entries()) {{
+      if (alias === sessionId || target === sessionId) {{
+        sessionAliases.delete(alias);
+      }}
+    }}
+    for (const [dirKey, id] of directorySessions.entries()) {{
+      if (id === sessionId) {{
+        directorySessions.delete(dirKey);
+      }}
+    }}
+  }}
+  if (emitEvent) {{
+    sendEvent({{
+      session_id: sessionId,
+      event: "session.deleted",
+      cwd: directory ?? info?.cwd ?? process.cwd(),
+    }});
+  }}
+}};
+
+const flushSessions = () => {{
+  for (const [sessionId, info] of knownSessions.entries()) {{
+    closeSession(sessionId, info?.cwd, true, true);
+  }}
+}};
+
+const handleShutdown = () => {{
+  if (shuttingDown) {{
+    return;
+  }}
+  shuttingDown = true;
+  flushSessions();
+}};
+
+process.once("exit", handleShutdown);
+for (const signal of ["SIGINT", "SIGTERM"]) {{
+  process.once(signal, handleShutdown);
+}}
+
+const recordUserMessage = (event, directory) => {{
+  const info = event?.properties?.info;
+  const messageId = info?.id;
+  if (!messageId) {{
+    return;
+  }}
+  const role = (info?.role ?? "").toLowerCase();
+  if (role !== "user") {{
+    messageRoles.delete(messageId);
+    return;
+  }}
+  const dir = info?.directory ?? directory ?? process.cwd();
+  messageRoles.set(messageId, {{
+    role,
+    sessionId: normalizeSessionId(info.sessionID ?? null, dir),
+  }});
+}};
+
+const emitUserPrompt = (sessionId, prompt, directory) => {{
+  const text = (prompt ?? "").trim();
+  if (!text) {{
+    return;
+  }}
+  ensureSessionRegistered(sessionId, directory);
+  const sessionInfo = knownSessions.get(sessionId);
+  sendEvent({{
+    session_id: sessionId,
+    event: "session.prompt",
+    prompt: text,
+    cwd: directory ?? sessionInfo?.cwd ?? process.cwd(),
+  }});
+}};
+
+const handleMessagePartUpdated = (event, directory) => {{
+  const part = event?.properties?.part;
+  if (!part?.messageID || part.type !== "text" || !part.text) {{
+    return;
+  }}
+  const info = messageRoles.get(part.messageID);
+  if (!info || info.role !== "user") {{
+    return;
+  }}
+  const sessionId = normalizeSessionId(
+    info.sessionId ?? defaultSessionId(event?.properties?.sessionID),
+    directory
+  );
+  emitUserPrompt(sessionId, part.text, directory);
+  messageRoles.delete(part.messageID);
 }};
 
 export const DotAgentDeckPlugin = async (ctx) => {{
@@ -46,14 +232,49 @@ export const DotAgentDeckPlugin = async (ctx) => {{
   return {{
     event: async (input) => {{
       const event = input?.event;
+      const eventType = event?.type ?? "";
+      if (eventType === "message.updated") {{
+        recordUserMessage(event, directory);
+        return;
+      }}
+      if (eventType === "message.part.updated") {{
+        handleMessagePartUpdated(event, directory);
+        return;
+      }}
+      if (eventType === "permission.asked" || eventType === "permission.replied") {{
+        const payload = permissionPayload(event, directory);
+        ensureSessionRegistered(payload.session_id, payload.cwd);
+        sendEvent(payload);
+        return;
+      }}
+      if (eventType === "server.instance.disposed") {{
+        flushSessions();
+        return;
+      }}
       if (!event?.type?.startsWith("session.")) {{
         return;
       }}
-      sendEvent(sessionPayload(event, directory));
+      const payload = sessionPayload(event, directory);
+      if (event?.type === "session.deleted") {{
+        closeSession(payload.session_id, payload.cwd, false, false);
+        return;
+      }}
+      ensureSessionRegistered(
+        payload.session_id,
+        payload.cwd,
+        payload.status,
+        event?.type !== "session.created"
+      );
+      sendEvent(payload);
     }},
     "tool.execute.before": async (input, output) => {{
+      const sessionId = normalizeSessionId(
+        defaultSessionId(input?.sessionID),
+        directory
+      );
+      ensureSessionRegistered(sessionId, directory);
       sendEvent({{
-        session_id: defaultSessionId(input?.sessionID),
+        session_id: sessionId,
         event: "tool.execute.before",
         tool_name: input?.tool,
         tool_input: output?.args,
@@ -61,19 +282,16 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       }});
     }},
     "tool.execute.after": async (input) => {{
+      const sessionId = normalizeSessionId(
+        defaultSessionId(input?.sessionID),
+        directory
+      );
+      ensureSessionRegistered(sessionId, directory);
       sendEvent({{
-        session_id: defaultSessionId(input?.sessionID),
+        session_id: sessionId,
         event: "tool.execute.after",
         tool_name: input?.tool,
         tool_input: input?.args,
-        cwd: directory,
-      }});
-    }},
-    "permission.ask": async (input) => {{
-      sendEvent({{
-        session_id: defaultSessionId(input?.sessionID),
-        event: "permission.asked",
-        prompt: input?.title,
         cwd: directory,
       }});
     }},
@@ -140,10 +358,13 @@ mod tests {
         assert!(content.contains("import { execFileSync } from \"child_process\";"));
         assert!(!content.contains("execSync("));
         assert!(content.contains(r#"BINARY_PATH = "/usr/local/bin/dot-agent-deck""#));
+        assert!(content.contains("const knownSessions = new Map();"));
+        assert!(content.contains("process.once(\"exit\", handleShutdown);"));
         assert!(content.contains(r#"["hook", "--agent", "opencode"]"#));
         assert!(content.contains("event?.type?.startsWith(\"session.\")"));
         assert!(content.contains("\"tool.execute.before\""));
-        assert!(content.contains("\"permission.ask\""));
+        assert!(content.contains("const permissionPayload"));
+        assert!(content.contains("\"permission.asked\""));
     }
 
     #[test]

@@ -1,5 +1,15 @@
 # Changelog
 
+## [v0.11.5] - 2026-04-02
+
+### Fixed
+
+- **Reliable OpenCode Decks**
+  OpenCode sessions now show up immediately and stay inside a single deck even when you clear prompts or start a fresh chat inside the same TUI window. Previously every restart created a brand-new card (and sometimes no card at all) because the OpenCode plugin lost track of its session IDs, so the dashboard could not correlate the lifecycle events.
+  The plugin now emits `session.prompt` events as soon as a user message arrives, synthesizes `session.created` and `session.deleted` transitions when OpenCode misses them, keeps a canonical session ID per working directory, and flushes the deck as soon as you exit with `Ctrl+C`. Reinstall the hook with `dot-agent-deck hooks install --agent opencode` (or rerun the installer via `cargo run`) to pick up the fix.
+
+
+
 ## [0.11.4] - 2026-04-02
 
 ### Fixed

@@ -153,6 +153,7 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
         "session.deleted" => Some(EventType::SessionEnd),
         "session.idle" => Some(EventType::Idle),
         "session.error" => Some(EventType::Error),
+        "session.prompt" => Some(EventType::Thinking),
         "session.status" | "session.status.updated" => {
             let norm = status.map(|s| s.to_ascii_lowercase());
             match norm.as_deref() {
