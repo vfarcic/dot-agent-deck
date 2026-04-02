@@ -1088,10 +1088,10 @@ fn render_frame(
         if ui.mode == UiMode::Help {
             render_help_overlay(frame, has_pane_control);
         }
-        if ui.mode == UiMode::DirPicker {
-            if let Some(picker) = ui.dir_picker.as_mut() {
-                render_dir_picker(frame, picker);
-            }
+        if ui.mode == UiMode::DirPicker
+            && let Some(picker) = ui.dir_picker.as_mut()
+        {
+            render_dir_picker(frame, picker);
         }
         if ui.mode == UiMode::NewPaneForm
             && let Some(ref form) = ui.new_pane_form
@@ -1231,10 +1231,10 @@ fn render_frame(
     if ui.mode == UiMode::Help {
         render_help_overlay(frame, has_pane_control);
     }
-    if ui.mode == UiMode::DirPicker {
-        if let Some(picker) = ui.dir_picker.as_mut() {
-            render_dir_picker(frame, picker);
-        }
+    if ui.mode == UiMode::DirPicker
+        && let Some(picker) = ui.dir_picker.as_mut()
+    {
+        render_dir_picker(frame, picker);
     }
     if ui.mode == UiMode::NewPaneForm
         && let Some(ref form) = ui.new_pane_form
@@ -2208,7 +2208,7 @@ mod tests {
     fn make_dir_picker(entries: &[&str]) -> DirPickerState {
         let mut picker = DirPickerState {
             current_dir: PathBuf::from("/tmp"),
-            entries: entries.iter().map(|e| PathBuf::from(e)).collect(),
+            entries: entries.iter().copied().map(PathBuf::from).collect(),
             selected: 0,
             scroll_offset: 0,
             filter_text: String::new(),

@@ -83,15 +83,15 @@ impl AppState {
     }
 
     pub fn apply_event(&mut self, mut event: AgentEvent) {
-        if let Some(ref pane_id) = event.pane_id {
-            if let Some(existing_id) = self.sessions.iter().find_map(|(id, session)| {
+        if let Some(ref pane_id) = event.pane_id
+            && let Some(existing_id) = self.sessions.iter().find_map(|(id, session)| {
                 (session.pane_id.as_ref().is_some_and(|p| p == pane_id) && id != &event.session_id)
                     .then(|| id.clone())
-            }) {
-                let old_id = std::mem::replace(&mut event.session_id, existing_id);
-                if old_id != event.session_id {
-                    self.sessions.remove(&old_id);
-                }
+            })
+        {
+            let old_id = std::mem::replace(&mut event.session_id, existing_id);
+            if old_id != event.session_id {
+                self.sessions.remove(&old_id);
             }
         }
 
