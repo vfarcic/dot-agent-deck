@@ -32,6 +32,9 @@ dot-agent-deck hooks install --agent opencode   # OpenCode
 
 # 4. Launch the dashboard
 dot-agent-deck
+
+# 5. See all the shortcuts
+?
 ```
 
 ## Installation
@@ -161,7 +164,11 @@ Cards also display: session ID, agent type, working directory, tool count, and l
 | `l` / `Right` / `Enter` | Enter directory (or confirm if no subdirs) |
 | `h` / `Left` / `Backspace` | Go up one level |
 | `Space` | Confirm current directory |
-| `Esc` / `q` | Cancel |
+| `/` | Enter filter mode; type to narrow directories (case-insensitive) |
+| `Esc` | Clear filter (press twice to close) |
+| `q` | Cancel |
+
+Directory lists loop end-to-end, so pressing `Up` on the first entry jumps to the last (and vice versa). The `..` parent entry always remains visible even when a filter is active.
 
 ### New Pane Form
 
