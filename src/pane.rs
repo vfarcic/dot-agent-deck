@@ -211,7 +211,9 @@ impl PaneController for ZellijController {
         self.run_zellij(&["action", "write", "13"])?;
         if let Some(ref dp) = dashboard_pane {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let _ = self.focus_pane(dp);
+            if let Err(e) = self.focus_pane(dp) {
+                tracing::debug!("Failed to restore focus to dashboard pane: {e}");
+            }
         }
         Ok(())
     }

@@ -56,6 +56,7 @@ pub async fn run_daemon(
                                         let mut map = responders.lock().unwrap();
                                         map.insert(tui_id.clone(), tx);
                                     }
+                                    let resp_cleanup = responders.clone();
                                     tokio::spawn(async move {
                                         let decision = match tokio::time::timeout(
                                             std::time::Duration::from_secs(600),
@@ -70,6 +71,9 @@ pub async fn run_daemon(
                                             }
                                             Err(_) => {
                                                 warn!("Permission timeout for {tui_id}");
+                                                if let Ok(mut map) = resp_cleanup.lock() {
+                                                    map.remove(&tui_id);
+                                                }
                                                 return;
                                             }
                                         };
