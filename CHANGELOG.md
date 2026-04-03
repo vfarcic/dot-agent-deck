@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.13.0] - 2026-04-03
+
+### Added
+
+- **Permission Prompt Control from Dashboard**
+  Respond to agent permission prompts directly from the dashboard without switching panes. Previously, when Claude Code or OpenCode needed permission to run a tool (e.g., execute a bash command), users had to switch to that specific agent's pane to approve or deny — breaking the dashboard workflow and making multi-agent oversight tedious.
+  Session cards now display a permission banner showing the tool name and details when an agent requests approval. Cards with pending permissions are highlighted with a distinct border color. Press `y` to allow or `n` to deny directly from the dashboard — the decision is sent back to the agent, which continues or receives denial feedback immediately. Multiple agents can have pending permissions simultaneously, and each is handled independently.
+  The feature works through the `PermissionRequest` hook mechanism: the hook process stays connected to the daemon via a Unix socket while a oneshot channel mediates the response from the TUI. A 10-minute timeout prevents stale permissions from blocking agents indefinitely.
+
+
+
 ## [0.12.1] - 2026-04-02
 
 ### Fixed
