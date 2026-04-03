@@ -1,6 +1,6 @@
 # PRD #18: Permission Prompt Control from Dashboard
 
-**Status**: Draft
+**Status**: Complete
 **Priority**: High
 **Created**: 2026-03-31
 **GitHub Issue**: [#18](https://github.com/vfarcic/dot-agent-deck/issues/18)
@@ -53,9 +53,10 @@ Intercept permission prompts using the `PermissionRequest` hook (currently unuse
 ### Hook Response Mechanism (`src/daemon.rs`, `src/hook.rs`)
 - The `PermissionRequest` hook is synchronous — Claude Code waits for the hook's exit code and stdout
 - The hook process must stay alive until the user responds in the dashboard
-- Architecture: hook script sends the request to the daemon via the Unix socket, then blocks waiting for a response on a per-request named pipe or secondary socket
-- When the user presses `y`/`n`, the daemon writes the decision to the waiting hook process
-- Hook process exits with code 0 and outputs `{"hookSpecificOutput": {"permissionDecision": "allow"|"deny"}}`
+- Architecture: hook sends the event to the daemon via Unix socket and keeps the connection open. The daemon splits the stream (`into_split()`), creates a `tokio::sync::oneshot` channel, stores the sender in a shared `PermissionResponders` map (`Arc<std::sync::Mutex<HashMap<String, oneshot::Sender>>>`), and spawns a task that awaits the receiver then writes the decision back on the socket. The TUI sends decisions via the oneshot sender (synchronous — works from `spawn_blocking`).
+- When the user presses `y`/`n`, the TUI looks up the sender by `tool_use_id` and sends the decision
+- Hook process reads the response line, exits with code 0, and outputs `{"hookSpecificOutput": {"permissionDecision": "allow"|"deny"}}`
+- 10-minute timeout on both sides (hook read timeout + daemon `tokio::time::timeout`)
 
 ### Session State (`src/state.rs`)
 - Add `pending_permission: Option<PendingPermission>` to `SessionState`
@@ -93,14 +94,15 @@ Claude Code → PermissionRequest hook fires
 
 ## Milestones
 
-- [ ] `PermissionRequest` hook registered in hook installation (`src/hooks_manage.rs`)
-- [ ] Event type and parsing for permission requests implemented (`src/event.rs`, `src/hook.rs`)
-- [ ] `PendingPermission` state tracking added to `SessionState` (`src/state.rs`)
-- [ ] Hook response mechanism: blocking hook script with daemon-mediated response channel (`src/daemon.rs`)
-- [ ] Permission banner rendering on cards with `y`/`n` keybindings (`src/ui.rs`)
-- [ ] Help overlay updated with permission approval shortcuts (`src/ui.rs`)
-- [ ] Integration test: permission request → dashboard approve → agent continues
-- [ ] All existing tests passing
+- [x] `PermissionRequest` hook registered in hook installation (`src/hooks_manage.rs`)
+- [x] Event type and parsing for permission requests implemented (`src/event.rs`, `src/hook.rs`)
+- [x] `PendingPermission` state tracking added to `SessionState` (`src/state.rs`)
+- [x] Hook response mechanism: blocking hook script with daemon-mediated response channel (`src/daemon.rs`)
+- [x] Permission banner rendering on cards with `y`/`n` keybindings (`src/ui.rs`)
+- [x] Help overlay updated with permission approval shortcuts (`src/ui.rs`)
+- [x] Integration test: permission request → dashboard approve → agent continues
+- [x] All existing tests passing
+- [x] Verify permission flow works end-to-end with OpenCode (`permission.asked` event); fix response format if needed
 
 ## Key Files
 

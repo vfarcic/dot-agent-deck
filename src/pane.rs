@@ -55,6 +55,7 @@ pub trait PaneController: Send + Sync {
     ) -> Result<(), PaneError>;
     fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError>;
     fn toggle_layout(&self) -> Result<(), PaneError>;
+    fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError>;
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
 }
@@ -198,6 +199,25 @@ impl PaneController for ZellijController {
         Ok(())
     }
 
+    fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
+        let dashboard_pane = std::env::var("ZELLIJ_PANE_ID").ok();
+        self.focus_pane(pane_id)?;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Send each character as raw bytes — reliable for TUI apps in raw mode
+        for byte in text.bytes() {
+            self.run_zellij(&["action", "write", &byte.to_string()])?;
+        }
+        // Send CR (byte 13) — what terminals send for Enter
+        self.run_zellij(&["action", "write", "13"])?;
+        if let Some(ref dp) = dashboard_pane {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Err(e) = self.focus_pane(dp) {
+                tracing::debug!("Failed to restore focus to dashboard pane: {e}");
+            }
+        }
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "zellij"
     }
@@ -233,6 +253,9 @@ impl PaneController for NoopController {
         Err(PaneError::NotAvailable)
     }
     fn toggle_layout(&self) -> Result<(), PaneError> {
+        Err(PaneError::NotAvailable)
+    }
+    fn write_to_pane(&self, _: &str, _: &str) -> Result<(), PaneError> {
         Err(PaneError::NotAvailable)
     }
     fn name(&self) -> &str {

@@ -13,9 +13,11 @@ use ratatui::{
 };
 
 use crate::config::{BellConfig, DashboardConfig};
-use crate::event::EventType;
+use crate::event::{AgentType, EventType};
 use crate::pane::{PaneController, PaneError};
-use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
+use crate::state::{
+    AppState, DashboardStats, PermissionResponders, SessionState, SessionStatus, SharedState,
+};
 
 impl fmt::Display for crate::event::AgentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -53,9 +55,9 @@ impl CardDensity {
     fn card_height(self, wide: bool) -> u16 {
         let extra = if wide { 0 } else { 1 };
         match self {
-            CardDensity::Compact => 6 + extra,
-            CardDensity::Normal => 8 + extra,
-            CardDensity::Spacious => 10 + extra,
+            CardDensity::Compact => 7 + extra,
+            CardDensity::Normal => 9 + extra,
+            CardDensity::Spacious => 11 + extra,
         }
     }
 
@@ -453,6 +455,7 @@ enum KeyResult {
     NewPane(NewPaneRequest),
     ClosePane,
     ToggleLayout,
+    PermissionResponse(String),
 }
 
 /// Detect Alt+1 … Alt+9 and return the digit (1–9).
@@ -521,12 +524,23 @@ fn focus_deck(
     true
 }
 
-fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
+fn handle_normal_key(
+    key: KeyEvent,
+    ui: &mut UiState,
+    total: usize,
+    has_pending_permission: bool,
+) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return KeyResult::Quit;
     }
     match key.code {
         KeyCode::Char('q') => KeyResult::Quit,
+        KeyCode::Char('y') if has_pending_permission => {
+            KeyResult::PermissionResponse("allow".to_string())
+        }
+        KeyCode::Char('n') if has_pending_permission => {
+            KeyResult::PermissionResponse("deny".to_string())
+        }
         KeyCode::Char('j') | KeyCode::Down => {
             ui.selected_index =
                 navigate_grid(ui.selected_index, Direction::Down, ui.columns, total);
@@ -826,6 +840,7 @@ pub fn run_tui(
     state: SharedState,
     pane: Box<dyn PaneController>,
     config: DashboardConfig,
+    responders: PermissionResponders,
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -926,8 +941,14 @@ pub fn run_tui(
             let selected_id: Option<String> =
                 filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
 
+            let has_pending_permission = selected_id
+                .as_ref()
+                .and_then(|sid| snapshot.sessions.get(sid))
+                .and_then(|s| s.next_pending_permission())
+                .is_some();
+
             let result = match ui.mode {
-                UiMode::Normal => handle_normal_key(key, &mut ui, total),
+                UiMode::Normal => handle_normal_key(key, &mut ui, total, has_pending_permission),
                 UiMode::Filter => handle_filter_key(key, &mut ui),
                 UiMode::Help => handle_help_key(key, &mut ui),
                 UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
@@ -1037,6 +1058,80 @@ pub fn run_tui(
                         ));
                     }
                 },
+                KeyResult::PermissionResponse(decision) => {
+                    if let Some(ref sid) = selected_id
+                        && let Some(session) = snapshot.sessions.get(sid)
+                        && let Some(pending) = session.next_pending_permission()
+                    {
+                        let tool_use_id = pending.tool_use_id.clone();
+                        let tool_name = pending.tool_name.clone().unwrap_or_else(|| "tool".into());
+                        let agent_type = session.agent_type.clone();
+
+                        match agent_type {
+                            AgentType::OpenCode => {
+                                let keystroke = if decision == "allow" { "y" } else { "n" };
+                                if let Some(ref pane_id) = session.pane_id {
+                                    match pane.write_to_pane(pane_id, keystroke) {
+                                        Ok(()) => {
+                                            state
+                                                .blocking_write()
+                                                .resolve_permission(sid, &tool_use_id);
+                                            let verb = if decision == "allow" {
+                                                "Approved"
+                                            } else {
+                                                "Denied"
+                                            };
+                                            ui.status_message = Some((
+                                                format!("{verb} {tool_name}"),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            ui.status_message = Some((
+                                                format!("Failed to send response: {e}"),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    ui.status_message = Some((
+                                        format!("No pane for {tool_name} — cannot send response"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                            }
+                            AgentType::ClaudeCode => {
+                                let sent = {
+                                    let mut map = responders.lock().unwrap();
+                                    if let Some(sender) = map.remove(&tool_use_id) {
+                                        sender.send(decision.clone()).is_ok()
+                                    } else {
+                                        false
+                                    }
+                                };
+
+                                state.blocking_write().resolve_permission(sid, &tool_use_id);
+
+                                if sent {
+                                    let verb = if decision == "allow" {
+                                        "Approved"
+                                    } else {
+                                        "Denied"
+                                    };
+                                    ui.status_message = Some((
+                                        format!("{verb} {tool_name}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                } else {
+                                    ui.status_message = Some((
+                                        format!("Permission expired for {tool_name}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
                 KeyResult::Continue => {}
             }
 
@@ -1366,7 +1461,7 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
 fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     let area = frame.area();
     let popup_width = 52.min(area.width.saturating_sub(4));
-    let base_height: u16 = if has_pane_control { 32 } else { 17 };
+    let base_height: u16 = if has_pane_control { 38 } else { 23 };
     let popup_height = base_height.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -1432,6 +1527,18 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
         )));
         help_text.push(Line::from(format!("  {MOD_KEY}+q         Quit all")));
     }
+
+    help_text.push(Line::from(""));
+    help_text.push(Line::styled(
+        "  Permission Approval",
+        Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+    ));
+    help_text.push(Line::from(""));
+    help_text.push(Line::from("  y             Allow permission"));
+    help_text.push(Line::from("  n             Deny permission"));
+    help_text.push(Line::from("  (only when card has pending prompt)"));
 
     help_text.push(Line::from(""));
     help_text.push(Line::styled(
@@ -1681,10 +1788,14 @@ fn render_session_card(
         Some(n) => format!("{n} "),
         None => String::new(),
     };
+    let sel_prefix = if is_selected { "▸ " } else { "" };
     let mut title_left = if let Some(name) = display_name {
-        format!(" {num_prefix}{} ", name)
+        format!(" {sel_prefix}{num_prefix}{} ", name)
     } else {
-        format!(" {num_prefix}{} · {} ", session.agent_type, id_display)
+        format!(
+            " {sel_prefix}{num_prefix}{} · {} ",
+            session.agent_type, id_display
+        )
     };
 
     let dot = flash_dot(&session.status, tick);
@@ -1693,7 +1804,15 @@ fn render_session_card(
     let max_title = (area.width as usize).saturating_sub(status_text.chars().count() + 2);
     title_left = truncate_with_ellipsis(&title_left, max_title);
 
-    let border_style = if is_selected {
+    let has_permission = session.next_pending_permission().is_some();
+
+    let border_style = if has_permission && is_selected {
+        Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD)
+    } else if has_permission {
+        Style::default().fg(Color::LightMagenta)
+    } else if is_selected {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
@@ -1701,9 +1820,16 @@ fn render_session_card(
         Style::default().fg(status_color)
     };
 
+    let card_bg = if is_selected {
+        Color::Rgb(20, 25, 45)
+    } else {
+        Color::Rgb(0, 0, 0)
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
+        .style(Style::default().bg(card_bg))
         .title(Span::styled(
             title_left,
             Style::default()
@@ -1784,7 +1910,24 @@ fn render_session_card(
     if density != CardDensity::Compact {
         lines.push(Line::from(""));
     }
-    lines.extend(recent_tool_lines(session, density.max_tools()));
+    let mut tool_lines = recent_tool_lines(session, density.max_tools());
+    if has_permission && let Some(last) = tool_lines.last_mut() {
+        *last = last.clone().style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    lines.extend(tool_lines);
+
+    if has_permission {
+        lines.push(Line::from(Span::styled(
+            "  [y] approve  [n] deny",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
@@ -2046,6 +2189,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             pane_id: None,
+            pending_permissions: VecDeque::new(),
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -2619,6 +2763,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
             &mut ui,
             3,
+            false,
         );
         assert_eq!(ui.mode, UiMode::Filter);
 
@@ -2631,6 +2776,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
             &mut ui,
             3,
+            false,
         );
         assert_eq!(ui.mode, UiMode::Help);
 
@@ -2643,6 +2789,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             3,
+            false,
         );
         assert_eq!(ui.mode, UiMode::Rename);
 
@@ -2735,7 +2882,12 @@ mod tests {
         let mut ui = default_ui();
         ui.filter_text = "active-filter".to_string();
 
-        handle_normal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui, 5);
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+            5,
+            false,
+        );
         assert!(ui.filter_text.is_empty());
     }
 
@@ -2747,6 +2899,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             0,
+            false,
         );
         assert_eq!(ui.mode, UiMode::Normal);
     }
@@ -2794,6 +2947,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             pane_id: None,
+            pending_permissions: std::collections::VecDeque::new(),
         }
     }
 
@@ -2909,20 +3063,22 @@ mod tests {
     #[test]
     fn test_choose_density_wide() {
         // Wide layout (no extra stats line)
+        // Spacious=11, Normal=9, Compact=7
+
         // 1 session, 1 col, plenty of height -> Spacious
         assert_eq!(choose_density(1, 1, 20, true), CardDensity::Spacious);
 
-        // 2 sessions, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(2, 2, 10, true), CardDensity::Spacious);
+        // 2 sessions, 2 cols = 1 row, height 11 -> Spacious (1*11=11)
+        assert_eq!(choose_density(2, 2, 11, true), CardDensity::Spacious);
 
-        // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
-        assert_eq!(choose_density(2, 2, 9, true), CardDensity::Normal);
+        // 2 sessions, 2 cols = 1 row, height 10 -> Normal (1*9=9 fits)
+        assert_eq!(choose_density(2, 2, 10, true), CardDensity::Normal);
 
-        // 4 sessions, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
-        assert_eq!(choose_density(4, 2, 16, true), CardDensity::Normal);
+        // 4 sessions, 2 cols = 2 rows, height 18 -> Normal (2*9=18)
+        assert_eq!(choose_density(4, 2, 18, true), CardDensity::Normal);
 
-        // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*6=12 fits)
-        assert_eq!(choose_density(4, 2, 15, true), CardDensity::Compact);
+        // 4 sessions, 2 cols = 2 rows, height 17 -> Compact (2*7=14 fits)
+        assert_eq!(choose_density(4, 2, 17, true), CardDensity::Compact);
 
         // Many sessions, small screen -> Compact
         assert_eq!(choose_density(10, 1, 20, true), CardDensity::Compact);
@@ -2934,19 +3090,19 @@ mod tests {
     #[test]
     fn test_choose_density_narrow() {
         // Narrow layout: each mode needs 1 extra row for stats line
-        // Spacious=11, Normal=9, Compact=7
+        // Spacious=12, Normal=10, Compact=8
 
-        // 1 session, height 11 -> Spacious (1*11=11)
-        assert_eq!(choose_density(1, 1, 11, false), CardDensity::Spacious);
+        // 1 session, height 12 -> Spacious (1*12=12)
+        assert_eq!(choose_density(1, 1, 12, false), CardDensity::Spacious);
 
-        // 1 session, height 10 -> Normal (1*9=9 fits)
-        assert_eq!(choose_density(1, 1, 10, false), CardDensity::Normal);
+        // 1 session, height 11 -> Normal (1*10=10 fits)
+        assert_eq!(choose_density(1, 1, 11, false), CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 18 -> Normal (2*9=18)
-        assert_eq!(choose_density(2, 1, 18, false), CardDensity::Normal);
+        // 2 sessions, 1 col, height 20 -> Normal (2*10=20)
+        assert_eq!(choose_density(2, 1, 20, false), CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 17 -> Compact (2*7=14 fits)
-        assert_eq!(choose_density(2, 1, 17, false), CardDensity::Compact);
+        // 2 sessions, 1 col, height 19 -> Compact (2*8=16 fits)
+        assert_eq!(choose_density(2, 1, 19, false), CardDensity::Compact);
     }
 
     #[test]
@@ -2981,6 +3137,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: Some("third prompt".to_string()),
             pane_id: None,
+            pending_permissions: VecDeque::new(),
         };
 
         // Spacious: get all 3
@@ -3012,6 +3169,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: Some("old prompt".to_string()),
             pane_id: None,
+            pending_permissions: VecDeque::new(),
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -3034,6 +3192,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             pane_id: None,
+            pending_permissions: VecDeque::new(),
         };
 
         let prompts = collect_recent_prompts(&session, 3);
