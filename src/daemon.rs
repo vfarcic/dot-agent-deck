@@ -47,42 +47,38 @@ pub async fn run_daemon(
 
                                 state.write().await.apply_event(event);
 
-                                if is_permission {
-                                    if let Some(tui_id) = tool_use_id
-                                        && let Some(writer) = write_half.take()
+                                if is_permission
+                                    && let Some(tui_id) = tool_use_id
+                                    && let Some(writer) = write_half.take()
+                                {
+                                    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
                                     {
-                                        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-                                        {
-                                            let mut map = responders.lock().unwrap();
-                                            map.insert(tui_id.clone(), tx);
-                                        }
-                                        tokio::spawn(async move {
-                                            let decision = match tokio::time::timeout(
-                                                std::time::Duration::from_secs(600),
-                                                rx,
-                                            )
-                                            .await
-                                            {
-                                                Ok(Ok(d)) => d,
-                                                Ok(Err(_)) => {
-                                                    warn!(
-                                                        "Permission responder dropped for {tui_id}"
-                                                    );
-                                                    return;
-                                                }
-                                                Err(_) => {
-                                                    warn!("Permission timeout for {tui_id}");
-                                                    return;
-                                                }
-                                            };
-                                            let response =
-                                                format!("{{\"decision\":\"{decision}\"}}\n");
-                                            let mut writer = writer;
-                                            let _ = writer.write_all(response.as_bytes()).await;
-                                            let _ = writer.flush().await;
-                                        });
-                                        break;
+                                        let mut map = responders.lock().unwrap();
+                                        map.insert(tui_id.clone(), tx);
                                     }
+                                    tokio::spawn(async move {
+                                        let decision = match tokio::time::timeout(
+                                            std::time::Duration::from_secs(600),
+                                            rx,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(d)) => d,
+                                            Ok(Err(_)) => {
+                                                warn!("Permission responder dropped for {tui_id}");
+                                                return;
+                                            }
+                                            Err(_) => {
+                                                warn!("Permission timeout for {tui_id}");
+                                                return;
+                                            }
+                                        };
+                                        let response = format!("{{\"decision\":\"{decision}\"}}\n");
+                                        let mut writer = writer;
+                                        let _ = writer.write_all(response.as_bytes()).await;
+                                        let _ = writer.flush().await;
+                                    });
+                                    break;
                                 }
                             }
                             Err(e) => {

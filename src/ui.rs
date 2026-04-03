@@ -1913,14 +1913,12 @@ fn render_session_card(
         lines.push(Line::from(""));
     }
     let mut tool_lines = recent_tool_lines(session, density.max_tools());
-    if has_permission {
-        if let Some(last) = tool_lines.last_mut() {
-            *last = last.clone().style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            );
-        }
+    if has_permission && let Some(last) = tool_lines.last_mut() {
+        *last = last.clone().style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
     }
     lines.extend(tool_lines);
 
