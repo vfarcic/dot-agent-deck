@@ -1907,8 +1907,6 @@ fn render_session_card(
         ]));
     }
 
-    let has_permission = session.next_pending_permission().is_some();
-
     if density != CardDensity::Compact {
         lines.push(Line::from(""));
     }

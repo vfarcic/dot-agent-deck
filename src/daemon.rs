@@ -45,8 +45,6 @@ pub async fn run_daemon(
                                     event.event_type == EventType::PermissionRequest;
                                 let tool_use_id = event.metadata.get("tool_use_id").cloned();
 
-                                state.write().await.apply_event(event);
-
                                 if is_permission
                                     && let Some(tui_id) = tool_use_id
                                     && let Some(writer) = write_half.take()
@@ -56,6 +54,7 @@ pub async fn run_daemon(
                                         let mut map = responders.lock().unwrap();
                                         map.insert(tui_id.clone(), tx);
                                     }
+                                    state.write().await.apply_event(event);
                                     let resp_cleanup = responders.clone();
                                     tokio::spawn(async move {
                                         let decision = match tokio::time::timeout(
@@ -83,6 +82,8 @@ pub async fn run_daemon(
                                         let _ = writer.flush().await;
                                     });
                                     break;
+                                } else {
+                                    state.write().await.apply_event(event);
                                 }
                             }
                             Err(e) => {
