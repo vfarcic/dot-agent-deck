@@ -13,7 +13,7 @@ use ratatui::{
 };
 
 use crate::config::{BellConfig, DashboardConfig};
-use crate::event::EventType;
+use crate::event::{AgentType, EventType};
 use crate::pane::{PaneController, PaneError};
 use crate::state::{
     AppState, DashboardStats, PermissionResponders, SessionState, SessionStatus, SharedState,
@@ -1065,31 +1065,70 @@ pub fn run_tui(
                     {
                         let tool_use_id = pending.tool_use_id.clone();
                         let tool_name = pending.tool_name.clone().unwrap_or_else(|| "tool".into());
+                        let agent_type = session.agent_type.clone();
 
-                        let sent = {
-                            let mut map = responders.lock().unwrap();
-                            if let Some(sender) = map.remove(&tool_use_id) {
-                                sender.send(decision.clone()).is_ok()
-                            } else {
-                                false
+                        match agent_type {
+                            AgentType::OpenCode => {
+                                let keystroke = if decision == "allow" { "y" } else { "n" };
+                                if let Some(ref pane_id) = session.pane_id {
+                                    match pane.write_to_pane(pane_id, keystroke) {
+                                        Ok(()) => {
+                                            state
+                                                .blocking_write()
+                                                .resolve_permission(sid, &tool_use_id);
+                                            let verb = if decision == "allow" {
+                                                "Approved"
+                                            } else {
+                                                "Denied"
+                                            };
+                                            ui.status_message = Some((
+                                                format!("{verb} {tool_name}"),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            ui.status_message = Some((
+                                                format!("Failed to send response: {e}"),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    ui.status_message = Some((
+                                        format!("No pane for {tool_name} — cannot send response"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
                             }
-                        };
+                            AgentType::ClaudeCode => {
+                                let sent = {
+                                    let mut map = responders.lock().unwrap();
+                                    if let Some(sender) = map.remove(&tool_use_id) {
+                                        sender.send(decision.clone()).is_ok()
+                                    } else {
+                                        false
+                                    }
+                                };
 
-                        state.blocking_write().resolve_permission(sid, &tool_use_id);
+                                state.blocking_write().resolve_permission(sid, &tool_use_id);
 
-                        if sent {
-                            let verb = if decision == "allow" {
-                                "Approved"
-                            } else {
-                                "Denied"
-                            };
-                            ui.status_message =
-                                Some((format!("{verb} {tool_name}"), std::time::Instant::now()));
-                        } else {
-                            ui.status_message = Some((
-                                format!("Permission expired for {tool_name}"),
-                                std::time::Instant::now(),
-                            ));
+                                if sent {
+                                    let verb = if decision == "allow" {
+                                        "Approved"
+                                    } else {
+                                        "Denied"
+                                    };
+                                    ui.status_message = Some((
+                                        format!("{verb} {tool_name}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                } else {
+                                    ui.status_message = Some((
+                                        format!("Permission expired for {tool_name}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -1749,10 +1788,14 @@ fn render_session_card(
         Some(n) => format!("{n} "),
         None => String::new(),
     };
+    let sel_prefix = if is_selected { "▸ " } else { "" };
     let mut title_left = if let Some(name) = display_name {
-        format!(" {num_prefix}{} ", name)
+        format!(" {sel_prefix}{num_prefix}{} ", name)
     } else {
-        format!(" {num_prefix}{} · {} ", session.agent_type, id_display)
+        format!(
+            " {sel_prefix}{num_prefix}{} · {} ",
+            session.agent_type, id_display
+        )
     };
 
     let dot = flash_dot(&session.status, tick);
@@ -1777,9 +1820,16 @@ fn render_session_card(
         Style::default().fg(status_color)
     };
 
+    let card_bg = if is_selected {
+        Color::Rgb(20, 25, 45)
+    } else {
+        Color::Rgb(0, 0, 0)
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
+        .style(Style::default().bg(card_bg))
         .title(Span::styled(
             title_left,
             Style::default()

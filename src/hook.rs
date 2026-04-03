@@ -65,14 +65,15 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         None => return ExitCode::SUCCESS,
     };
 
-    let is_permission = event.event_type == EventType::PermissionRequest;
+    let is_claude_permission = event.event_type == EventType::PermissionRequest
+        && matches!(event.agent_type, AgentType::ClaudeCode);
 
     let json = match serde_json::to_string(&event) {
         Ok(j) => j,
         Err(_) => return ExitCode::SUCCESS,
     };
 
-    if is_permission {
+    if is_claude_permission {
         match send_and_wait_for_response(&json) {
             Some(decision) => {
                 let output = serde_json::json!({
@@ -211,6 +212,7 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
         "tool.execute.before" => Some(EventType::ToolStart),
         "tool.execute.after" => Some(EventType::ToolEnd),
         "permission.asked" => Some(EventType::PermissionRequest),
+        "permission.replied" => Some(EventType::Thinking),
         _ => None,
     }
 }
