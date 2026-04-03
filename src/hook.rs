@@ -18,6 +18,7 @@ struct ClaudeCodeHookInput {
     cwd: Option<String>,
     tool_name: Option<String>,
     tool_input: Option<Value>,
+    tool_use_id: Option<String>,
     prompt: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
@@ -64,14 +65,30 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         None => return ExitCode::SUCCESS,
     };
 
+    let is_permission = event.event_type == EventType::PermissionRequest;
+
     let json = match serde_json::to_string(&event) {
         Ok(j) => j,
         Err(_) => return ExitCode::SUCCESS,
     };
 
-    let _ = send_to_socket(&json);
-
-    ExitCode::SUCCESS
+    if is_permission {
+        match send_and_wait_for_response(&json) {
+            Some(decision) => {
+                let output = serde_json::json!({
+                    "hookSpecificOutput": {
+                        "permissionDecision": decision
+                    }
+                });
+                println!("{output}");
+                ExitCode::SUCCESS
+            }
+            None => ExitCode::FAILURE,
+        }
+    } else {
+        let _ = send_to_socket(&json);
+        ExitCode::SUCCESS
+    }
 }
 
 fn read_stdin() -> Option<String> {
@@ -88,6 +105,7 @@ fn map_event_type(hook_event_name: &str) -> Option<EventType> {
         "PreToolUse" => Some(EventType::ToolStart),
         "PostToolUse" => Some(EventType::ToolEnd),
         "Notification" => Some(EventType::WaitingForInput),
+        "PermissionRequest" => Some(EventType::PermissionRequest),
         "Stop" => Some(EventType::Idle),
         "StopFailure" => Some(EventType::Error),
         "PreCompact" => Some(EventType::Compacting),
@@ -127,22 +145,41 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
-    let event_type = map_event_type(&input.hook_event_name)?;
-    let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
+    let ClaudeCodeHookInput {
+        session_id,
+        hook_event_name,
+        cwd,
+        tool_name,
+        tool_input,
+        tool_use_id,
+        prompt,
+        _extra: _,
+    } = input;
 
-    let user_prompt = input.prompt.map(|p| truncate(&p, 200));
+    let event_type = map_event_type(&hook_event_name)?;
+    let tool_detail = extract_tool_detail(tool_name.as_deref(), tool_input.as_ref());
+
+    let user_prompt = prompt.map(|p| truncate(&p, 200));
     let pane_id = std::env::var("ZELLIJ_PANE_ID").ok();
 
+    let mut metadata = HashMap::new();
+    if let Some(tool_use_id) = tool_use_id {
+        metadata.insert("tool_use_id".to_string(), tool_use_id);
+    }
+    if matches!(event_type, EventType::PermissionRequest) {
+        metadata.insert("permission_state".to_string(), "pending".to_string());
+    }
+
     Some(AgentEvent {
-        session_id: input.session_id,
+        session_id,
         agent_type: AgentType::ClaudeCode,
         event_type,
-        tool_name: input.tool_name,
+        tool_name,
         tool_detail,
-        cwd: input.cwd,
+        cwd,
         timestamp: Utc::now(),
         user_prompt,
-        metadata: HashMap::new(),
+        metadata,
         pane_id,
     })
 }
@@ -165,7 +202,7 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
         }
         "tool.execute.before" => Some(EventType::ToolStart),
         "tool.execute.after" => Some(EventType::ToolEnd),
-        "permission.asked" => Some(EventType::WaitingForInput),
+        "permission.asked" => Some(EventType::PermissionRequest),
         _ => None,
     }
 }
@@ -188,6 +225,33 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
         metadata: HashMap::new(),
         pane_id,
     })
+}
+
+fn send_and_wait_for_response(json: &str) -> Option<String> {
+    use std::io::BufRead;
+
+    let path = socket_path();
+    let mut stream = UnixStream::connect(path).ok()?;
+
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(600)))
+        .ok()?;
+
+    let msg = format!("{json}\n");
+    stream.write_all(msg.as_bytes()).ok()?;
+    stream.flush().ok()?;
+
+    let mut reader = std::io::BufReader::new(stream);
+    let mut response_line = String::new();
+    match reader.read_line(&mut response_line) {
+        Ok(0) => None,
+        Ok(_) => {
+            let parsed: serde_json::Value = serde_json::from_str(response_line.trim()).ok()?;
+            let decision = parsed.get("decision")?.as_str()?.to_string();
+            Some(decision)
+        }
+        Err(_) => None,
+    }
 }
 
 fn send_to_socket(json: &str) -> Option<()> {
@@ -226,6 +290,14 @@ mod tests {
         assert_eq!(
             map_event_type("Notification"),
             Some(EventType::WaitingForInput)
+        );
+    }
+
+    #[test]
+    fn map_permission_request() {
+        assert_eq!(
+            map_event_type("PermissionRequest"),
+            Some(EventType::PermissionRequest)
         );
     }
 
@@ -323,6 +395,7 @@ mod tests {
             cwd: Some("/tmp".into()),
             tool_name: None,
             tool_input: None,
+            tool_use_id: None,
             prompt: None,
             _extra: HashMap::new(),
         };
@@ -342,6 +415,7 @@ mod tests {
             cwd: None,
             tool_name: Some("Read".into()),
             tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
+            tool_use_id: None,
             prompt: None,
             _extra: HashMap::new(),
         };
@@ -359,6 +433,7 @@ mod tests {
             cwd: None,
             tool_name: None,
             tool_input: None,
+            tool_use_id: None,
             prompt: None,
             _extra: HashMap::new(),
         };
@@ -373,6 +448,7 @@ mod tests {
             cwd: None,
             tool_name: None,
             tool_input: None,
+            tool_use_id: None,
             prompt: Some("fix the login bug".into()),
             _extra: HashMap::new(),
         };
@@ -390,6 +466,7 @@ mod tests {
             cwd: None,
             tool_name: None,
             tool_input: None,
+            tool_use_id: None,
             prompt: Some(long_prompt),
             _extra: HashMap::new(),
         };
@@ -397,6 +474,30 @@ mod tests {
         let prompt = event.user_prompt.unwrap();
         assert!(prompt.len() <= 204); // 200 + "…" (3 bytes)
         assert!(prompt.ends_with('…'));
+    }
+
+    #[test]
+    fn build_event_permission_request_sets_metadata() {
+        let input = ClaudeCodeHookInput {
+            session_id: "test-123".into(),
+            hook_event_name: "PermissionRequest".into(),
+            cwd: None,
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": "rm -rf /"})),
+            tool_use_id: Some("use-1".into()),
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        assert_eq!(event.event_type, EventType::PermissionRequest);
+        assert_eq!(
+            event.metadata.get("tool_use_id").map(String::as_str),
+            Some("use-1")
+        );
+        assert_eq!(
+            event.metadata.get("permission_state").map(String::as_str),
+            Some("pending")
+        );
     }
 
     #[test]
@@ -498,6 +599,14 @@ mod tests {
     }
 
     #[test]
+    fn map_opencode_permission_asked() {
+        assert_eq!(
+            map_opencode_event_type("permission.asked", None),
+            Some(EventType::PermissionRequest)
+        );
+    }
+
+    #[test]
     fn map_opencode_session_status_error() {
         assert_eq!(
             map_opencode_event_type("session.status", Some("error")),
@@ -518,14 +627,6 @@ mod tests {
         assert_eq!(
             map_opencode_event_type("tool.execute.after", None),
             Some(EventType::ToolEnd)
-        );
-    }
-
-    #[test]
-    fn map_opencode_permission_asked() {
-        assert_eq!(
-            map_opencode_event_type("permission.asked", None),
-            Some(EventType::WaitingForInput)
         );
     }
 

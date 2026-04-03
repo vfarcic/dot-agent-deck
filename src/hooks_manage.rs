@@ -13,6 +13,7 @@ const HOOK_TYPES: &[&str] = &[
     "PreCompact",
     "SubagentStart",
     "SubagentStop",
+    "PermissionRequest",
 ];
 
 fn settings_path() -> PathBuf {

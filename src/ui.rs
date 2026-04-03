@@ -15,7 +15,9 @@ use ratatui::{
 use crate::config::{BellConfig, DashboardConfig};
 use crate::event::EventType;
 use crate::pane::{PaneController, PaneError};
-use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
+use crate::state::{
+    AppState, DashboardStats, PermissionResponders, SessionState, SessionStatus, SharedState,
+};
 
 impl fmt::Display for crate::event::AgentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -453,6 +455,7 @@ enum KeyResult {
     NewPane(NewPaneRequest),
     ClosePane,
     ToggleLayout,
+    PermissionResponse(String),
 }
 
 /// Detect Alt+1 … Alt+9 and return the digit (1–9).
@@ -521,12 +524,23 @@ fn focus_deck(
     true
 }
 
-fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
+fn handle_normal_key(
+    key: KeyEvent,
+    ui: &mut UiState,
+    total: usize,
+    has_pending_permission: bool,
+) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return KeyResult::Quit;
     }
     match key.code {
         KeyCode::Char('q') => KeyResult::Quit,
+        KeyCode::Char('y') if has_pending_permission => {
+            KeyResult::PermissionResponse("allow".to_string())
+        }
+        KeyCode::Char('n') if has_pending_permission => {
+            KeyResult::PermissionResponse("deny".to_string())
+        }
         KeyCode::Char('j') | KeyCode::Down => {
             ui.selected_index =
                 navigate_grid(ui.selected_index, Direction::Down, ui.columns, total);
@@ -826,6 +840,7 @@ pub fn run_tui(
     state: SharedState,
     pane: Box<dyn PaneController>,
     config: DashboardConfig,
+    responders: PermissionResponders,
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -926,8 +941,14 @@ pub fn run_tui(
             let selected_id: Option<String> =
                 filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
 
+            let has_pending_permission = selected_id
+                .as_ref()
+                .and_then(|sid| snapshot.sessions.get(sid))
+                .and_then(|s| s.next_pending_permission())
+                .is_some();
+
             let result = match ui.mode {
-                UiMode::Normal => handle_normal_key(key, &mut ui, total),
+                UiMode::Normal => handle_normal_key(key, &mut ui, total, has_pending_permission),
                 UiMode::Filter => handle_filter_key(key, &mut ui),
                 UiMode::Help => handle_help_key(key, &mut ui),
                 UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
@@ -1037,6 +1058,41 @@ pub fn run_tui(
                         ));
                     }
                 },
+                KeyResult::PermissionResponse(decision) => {
+                    if let Some(ref sid) = selected_id
+                        && let Some(session) = snapshot.sessions.get(sid)
+                        && let Some(pending) = session.next_pending_permission()
+                    {
+                        let tool_use_id = pending.tool_use_id.clone();
+                        let tool_name = pending.tool_name.clone().unwrap_or_else(|| "tool".into());
+
+                        let sent = {
+                            let mut map = responders.lock().unwrap();
+                            if let Some(sender) = map.remove(&tool_use_id) {
+                                sender.send(decision.clone()).is_ok()
+                            } else {
+                                false
+                            }
+                        };
+
+                        state.blocking_write().resolve_permission(sid, &tool_use_id);
+
+                        if sent {
+                            let verb = if decision == "allow" {
+                                "Approved"
+                            } else {
+                                "Denied"
+                            };
+                            ui.status_message =
+                                Some((format!("{verb} {tool_name}"), std::time::Instant::now()));
+                        } else {
+                            ui.status_message = Some((
+                                format!("Permission expired for {tool_name}"),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                }
                 KeyResult::Continue => {}
             }
 
@@ -1366,7 +1422,7 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
 fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     let area = frame.area();
     let popup_width = 52.min(area.width.saturating_sub(4));
-    let base_height: u16 = if has_pane_control { 32 } else { 17 };
+    let base_height: u16 = if has_pane_control { 38 } else { 23 };
     let popup_height = base_height.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -1432,6 +1488,18 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
         )));
         help_text.push(Line::from(format!("  {MOD_KEY}+q         Quit all")));
     }
+
+    help_text.push(Line::from(""));
+    help_text.push(Line::styled(
+        "  Permission Approval",
+        Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+    ));
+    help_text.push(Line::from(""));
+    help_text.push(Line::from("  y             Allow permission"));
+    help_text.push(Line::from("  n             Deny permission"));
+    help_text.push(Line::from("  (only when card has pending prompt)"));
 
     help_text.push(Line::from(""));
     help_text.push(Line::styled(
@@ -1693,7 +1761,15 @@ fn render_session_card(
     let max_title = (area.width as usize).saturating_sub(status_text.chars().count() + 2);
     title_left = truncate_with_ellipsis(&title_left, max_title);
 
-    let border_style = if is_selected {
+    let has_permission = session.next_pending_permission().is_some();
+
+    let border_style = if has_permission && is_selected {
+        Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD)
+    } else if has_permission {
+        Style::default().fg(Color::LightMagenta)
+    } else if is_selected {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
@@ -1781,10 +1857,24 @@ fn render_session_card(
         ]));
     }
 
-    if density != CardDensity::Compact {
-        lines.push(Line::from(""));
+    if let Some(perm) = session.next_pending_permission() {
+        let tool = perm.tool_name.as_deref().unwrap_or("tool");
+        let detail = perm.tool_detail.as_deref().unwrap_or("");
+        let banner_text = format!("[y] allow  [n] deny: {tool} {detail}");
+        let max_banner = w.saturating_sub(0);
+        let display = truncate_with_ellipsis(&banner_text, max_banner);
+        lines.push(Line::from(Span::styled(
+            display,
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        if density != CardDensity::Compact {
+            lines.push(Line::from(""));
+        }
+        lines.extend(recent_tool_lines(session, density.max_tools()));
     }
-    lines.extend(recent_tool_lines(session, density.max_tools()));
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
@@ -2046,6 +2136,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             pane_id: None,
+            pending_permissions: VecDeque::new(),
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -2619,6 +2710,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
             &mut ui,
             3,
+            false,
         );
         assert_eq!(ui.mode, UiMode::Filter);
 
@@ -2631,6 +2723,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
             &mut ui,
             3,
+            false,
         );
         assert_eq!(ui.mode, UiMode::Help);
 
@@ -2643,6 +2736,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             3,
+            false,
         );
         assert_eq!(ui.mode, UiMode::Rename);
 
@@ -2735,7 +2829,12 @@ mod tests {
         let mut ui = default_ui();
         ui.filter_text = "active-filter".to_string();
 
-        handle_normal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui, 5);
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+            5,
+            false,
+        );
         assert!(ui.filter_text.is_empty());
     }
 
@@ -2747,6 +2846,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             0,
+            false,
         );
         assert_eq!(ui.mode, UiMode::Normal);
     }
@@ -2794,6 +2894,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             pane_id: None,
+            pending_permissions: std::collections::VecDeque::new(),
         }
     }
 
@@ -2981,6 +3082,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: Some("third prompt".to_string()),
             pane_id: None,
+            pending_permissions: VecDeque::new(),
         };
 
         // Spacious: get all 3
@@ -3012,6 +3114,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: Some("old prompt".to_string()),
             pane_id: None,
+            pending_permissions: VecDeque::new(),
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -3034,6 +3137,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             pane_id: None,
+            pending_permissions: VecDeque::new(),
         };
 
         let prompts = collect_recent_prompts(&session, 3);

@@ -12,6 +12,7 @@ pub enum EventType {
     SubagentStart,
     SubagentStop,
     WaitingForInput,
+    PermissionRequest,
     Idle,
     Error,
     SessionStart,

@@ -6,7 +6,7 @@ use tokio::net::UnixStream;
 use tokio::sync::RwLock;
 
 use dot_agent_deck::daemon::run_daemon;
-use dot_agent_deck::state::{AppState, SessionStatus};
+use dot_agent_deck::state::{AppState, SessionStatus, new_permission_responders};
 
 fn event_json(session_id: &str, event_type: &str) -> String {
     format!(
@@ -45,7 +45,9 @@ async fn single_session_lifecycle() {
     let daemon_state = state.clone();
     let daemon_sock = sock_path.clone();
     let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
+        run_daemon(&daemon_sock, daemon_state, new_permission_responders())
+            .await
+            .unwrap();
     });
 
     // Wait for socket to be ready
@@ -106,7 +108,9 @@ async fn multiple_sessions() {
     let daemon_state = state.clone();
     let daemon_sock = sock_path.clone();
     let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
+        run_daemon(&daemon_sock, daemon_state, new_permission_responders())
+            .await
+            .unwrap();
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -140,7 +144,9 @@ async fn hook_handler_end_to_end() {
     let daemon_state = state.clone();
     let daemon_sock = sock_path.clone();
     let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
+        run_daemon(&daemon_sock, daemon_state, new_permission_responders())
+            .await
+            .unwrap();
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -207,7 +213,9 @@ async fn malformed_json_resilience() {
     let daemon_state = state.clone();
     let daemon_sock = sock_path.clone();
     let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
+        run_daemon(&daemon_sock, daemon_state, new_permission_responders())
+            .await
+            .unwrap();
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -236,7 +244,9 @@ async fn user_prompt_flows_through_daemon() {
     let daemon_state = state.clone();
     let daemon_sock = sock_path.clone();
     let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
+        run_daemon(&daemon_sock, daemon_state, new_permission_responders())
+            .await
+            .unwrap();
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -286,7 +296,9 @@ async fn opencode_session_lifecycle() {
     let daemon_state = state.clone();
     let daemon_sock = sock_path.clone();
     let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
+        run_daemon(&daemon_sock, daemon_state, new_permission_responders())
+            .await
+            .unwrap();
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -344,7 +356,9 @@ async fn mixed_agent_sessions() {
     let daemon_state = state.clone();
     let daemon_sock = sock_path.clone();
     let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
+        run_daemon(&daemon_sock, daemon_state, new_permission_responders())
+            .await
+            .unwrap();
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

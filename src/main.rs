@@ -11,7 +11,7 @@ use dot_agent_deck::config::{DashboardConfig, socket_path};
 use dot_agent_deck::daemon::run_daemon;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::hooks_manage;
-use dot_agent_deck::state::AppState;
+use dot_agent_deck::state::{AppState, new_permission_responders};
 use dot_agent_deck::ui::run_tui;
 
 #[derive(Parser)]
@@ -167,12 +167,14 @@ async fn run_dashboard() {
     }
 
     let state = Arc::new(RwLock::new(AppState::default()));
+    let responders = new_permission_responders();
     let path = socket_path();
 
     let daemon_state = state.clone();
+    let daemon_responders = responders.clone();
     let daemon_path = path.clone();
     let daemon_handle = tokio::spawn(async move {
-        if let Err(e) = run_daemon(&daemon_path, daemon_state).await {
+        if let Err(e) = run_daemon(&daemon_path, daemon_state, daemon_responders).await {
             eprintln!("Daemon error: {e}");
         }
     });
@@ -187,8 +189,11 @@ async fn run_dashboard() {
     let config = dot_agent_deck::config::DashboardConfig::load();
     let pane_controller = dot_agent_deck::pane::detect_multiplexer();
     let tui_state = state.clone();
-    let tui_result =
-        tokio::task::spawn_blocking(move || run_tui(tui_state, pane_controller, config)).await;
+    let tui_responders = responders.clone();
+    let tui_result = tokio::task::spawn_blocking(move || {
+        run_tui(tui_state, pane_controller, config, tui_responders)
+    })
+    .await;
 
     // TUI exited — clean up
     daemon_handle.abort();
