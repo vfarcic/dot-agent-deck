@@ -1,6 +1,6 @@
 # PRD #18: Permission Prompt Control from Dashboard
 
-**Status**: Complete
+**Status**: In Progress
 **Priority**: High
 **Created**: 2026-03-31
 **GitHub Issue**: [#18](https://github.com/vfarcic/dot-agent-deck/issues/18)
@@ -102,6 +102,7 @@ Claude Code → PermissionRequest hook fires
 - [x] Help overlay updated with permission approval shortcuts (`src/ui.rs`)
 - [x] Integration test: permission request → dashboard approve → agent continues
 - [x] All existing tests passing
+- [ ] Verify permission flow works end-to-end with OpenCode (`permission.asked` event); fix response format if needed
 
 ## Key Files
 

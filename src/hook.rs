@@ -77,7 +77,10 @@ pub fn handle_hook(agent: &str) -> ExitCode {
             Some(decision) => {
                 let output = serde_json::json!({
                     "hookSpecificOutput": {
-                        "permissionDecision": decision
+                        "hookEventName": "PermissionRequest",
+                        "decision": {
+                            "behavior": decision
+                        }
                     }
                 });
                 println!("{output}");
@@ -168,6 +171,11 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
     }
     if matches!(event_type, EventType::PermissionRequest) {
         metadata.insert("permission_state".to_string(), "pending".to_string());
+        // Claude Code doesn't include tool_use_id in PermissionRequest events,
+        // so generate a synthetic one for the response channel correlation.
+        metadata
+            .entry("tool_use_id".to_string())
+            .or_insert_with(|| format!("perm-{}-{}", session_id, Utc::now().timestamp_millis()));
     }
 
     Some(AgentEvent {
@@ -213,6 +221,19 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     let user_prompt = input.prompt.map(|p| truncate(&p, 200));
     let pane_id = std::env::var("ZELLIJ_PANE_ID").ok();
 
+    let mut metadata = HashMap::new();
+    if matches!(event_type, EventType::PermissionRequest) {
+        metadata.insert("permission_state".to_string(), "pending".to_string());
+        metadata.insert(
+            "tool_use_id".to_string(),
+            format!(
+                "perm-{}-{}",
+                input.session_id,
+                Utc::now().timestamp_millis()
+            ),
+        );
+    }
+
     Some(AgentEvent {
         session_id: input.session_id,
         agent_type: AgentType::OpenCode,
@@ -222,7 +243,7 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
         cwd: input.cwd,
         timestamp: Utc::now(),
         user_prompt,
-        metadata: HashMap::new(),
+        metadata,
         pane_id,
     })
 }
