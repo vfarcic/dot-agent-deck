@@ -1,6 +1,6 @@
 # PRD #18: Permission Prompt Control from Dashboard
 
-**Status**: In Progress
+**Status**: Complete
 **Priority**: High
 **Created**: 2026-03-31
 **GitHub Issue**: [#18](https://github.com/vfarcic/dot-agent-deck/issues/18)
@@ -100,7 +100,7 @@ Claude Code → PermissionRequest hook fires
 - [x] Hook response mechanism: blocking hook script with daemon-mediated response channel (`src/daemon.rs`)
 - [x] Permission banner rendering on cards with `y`/`n` keybindings (`src/ui.rs`)
 - [x] Help overlay updated with permission approval shortcuts (`src/ui.rs`)
-- [ ] Integration test: permission request → dashboard approve → agent continues
+- [x] Integration test: permission request → dashboard approve → agent continues
 - [x] All existing tests passing
 
 ## Key Files
