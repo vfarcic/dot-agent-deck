@@ -12,7 +12,7 @@
       "[ -f .env ] && source .env || true"
     ],
     "scripts": {
-      "agent": ["opencode"]
+      "agent": ["claude"]
     }
   }
 }
