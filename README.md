@@ -35,6 +35,15 @@ Once the dashboard is running, press `?` inside the app to see all shortcuts.
 
 ## Installation
 
+### Platform Support
+
+| Platform | Status |
+|---|---|
+| macOS (Intel & Apple Silicon) | Supported |
+| Linux (amd64 & arm64) | Supported |
+| Windows (via WSL) | Supported (runs as Linux) |
+| Windows (native) | Coming soon ([#42](https://github.com/vfarcic/dot-agent-deck/issues/42)) — comment on the issue if you need this! |
+
 ### Homebrew (macOS / Linux)
 
 ```bash
