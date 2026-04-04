@@ -139,8 +139,8 @@ Replace Zellij entirely with **Ratatui-native embedded terminal panes**. Each ag
 - [x] `EmbeddedPaneController` core — implement `create_pane`, `close_pane`, `list_panes`, `focus_pane`, `write_to_pane` against `PaneController` trait using PTY + VT parser
 - [x] Terminal widget rendering — Ratatui widget that renders VT grid cells with colors, cursor, and scrollback. Handles resize notifications (SIGWINCH). MasterPty stored for resize, Event::Resize updates PTY dimensions.
 - [x] Layout engine — stacked and tiled modes replacing Zellij swap layouts. Dashboard 33% left, panes 67% right. Toggle with `Ctrl+t`. Stats bar in dashboard area, hints bar full-width. Auto-focus and card sync on new pane creation.
-- [ ] Input routing — keyboard forwarding to focused pane's PTY. Global Ctrl+key shortcuts (Ctrl+n, Ctrl+w, Ctrl+t, Ctrl+d) implemented and intercepted before forwarding. Ctrl+C quits from dashboard only. Plain 1-9 jump in dashboard mode. PTY stdin forwarding pending.
-- [ ] Remove Zellij — `DOT_AGENT_DECK_PANE_ID` env var and managed pane filtering implemented. Still need to delete `ZellijController`, `NoopController`, `maybe_exec_zellij()`, layout/config generation.
+- [x] Input routing — `UiMode::PaneInput` forwards keystrokes to PTY stdin via `write_raw_bytes()`. `keyevent_to_bytes()` converts crossterm events to terminal byte sequences (control codes, ANSI escapes, F-keys, Alt prefix). Auto-enters PaneInput on pane focus. Ctrl+d returns to dashboard. Ctrl+C forwarded as 0x03. Quit confirmation dialog (Ctrl+C twice to exit). Poll reduced to 16ms for responsive typing. `KeyEventKind::Press` filter added.
+- [x] Remove Zellij — deleted `ZellijController`, `NoopController`, `maybe_exec_zellij()`, layout/config KDL generation, shell wrapper, `ZELLIJ_PANE_ID` fallback. ~600 lines removed. App no longer depends on or launches Zellij.
 - [ ] Tab support for modes — re-enable PRD 34 mode tab activation using native tabs (internal state, rendered as tab bar widget)
 - [ ] Tests and validation — unit tests for PTY lifecycle, VT rendering, layout calculations. Manual validation with Claude Code, OpenCode, and permission prompts.
 

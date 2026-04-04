@@ -75,6 +75,21 @@ impl EmbeddedPaneController {
             .map(|(id, _)| id.clone())
     }
 
+    /// Write raw bytes directly to a pane's PTY stdin without appending CR.
+    /// Used for interactive keyboard input forwarding.
+    pub fn write_raw_bytes(&self, pane_id: &str, bytes: &[u8]) -> Result<(), PaneError> {
+        let mut panes = self.panes.lock().unwrap();
+        if let Some(pane) = panes.get_mut(pane_id) {
+            pane.writer.write_all(bytes).map_err(PaneError::Io)?;
+            pane.writer.flush().map_err(PaneError::Io)?;
+            Ok(())
+        } else {
+            Err(PaneError::CommandFailed(format!(
+                "Pane {pane_id} not found"
+            )))
+        }
+    }
+
     /// Resize a pane's PTY and VT100 parser to the given dimensions.
     pub fn resize_pane_pty(&self, pane_id: &str, rows: u16, cols: u16) -> Result<(), PaneError> {
         let panes = self.panes.lock().unwrap();

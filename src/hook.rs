@@ -164,9 +164,7 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
     let tool_detail = extract_tool_detail(tool_name.as_deref(), tool_input.as_ref());
 
     let user_prompt = prompt.map(|p| truncate(&p, 200));
-    let pane_id = std::env::var("DOT_AGENT_DECK_PANE_ID")
-        .or_else(|_| std::env::var("ZELLIJ_PANE_ID"))
-        .ok();
+    let pane_id = std::env::var("DOT_AGENT_DECK_PANE_ID").ok();
 
     let mut metadata = HashMap::new();
     if let Some(tool_use_id) = tool_use_id {
@@ -223,9 +221,7 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     let event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
     let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
     let user_prompt = input.prompt.map(|p| truncate(&p, 200));
-    let pane_id = std::env::var("DOT_AGENT_DECK_PANE_ID")
-        .or_else(|_| std::env::var("ZELLIJ_PANE_ID"))
-        .ok();
+    let pane_id = std::env::var("DOT_AGENT_DECK_PANE_ID").ok();
 
     let mut metadata = HashMap::new();
     if matches!(event_type, EventType::PermissionRequest) {

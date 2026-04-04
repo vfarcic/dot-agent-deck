@@ -106,6 +106,8 @@ enum UiMode {
     Rename,
     DirPicker,
     NewPaneForm,
+    PaneInput,
+    QuitConfirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,18 +451,106 @@ fn compute_bell_needed(
 // Key handling
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct NewPaneRequest {
     dir: PathBuf,
     name: String,
     command: String,
 }
 
+#[derive(Debug)]
 enum KeyResult {
     Continue,
     Quit,
     Focus,
     NewPane(NewPaneRequest),
     PermissionResponse(String),
+    ForwardToPane(Vec<u8>),
+}
+
+/// Convert a crossterm `KeyEvent` into the byte sequence expected by a terminal PTY.
+fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+    // Ctrl+letter → control codes 0x01–0x1a
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && let KeyCode::Char(c) = key.code
+    {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_lowercase() {
+            return Some(vec![c as u8 - b'a' + 1]);
+        }
+    }
+
+    // Alt+key → ESC prefix + key bytes
+    if key.modifiers.contains(KeyModifiers::ALT)
+        && let KeyCode::Char(c) = key.code
+    {
+        let mut bytes = vec![0x1b];
+        let mut buf = [0u8; 4];
+        bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        return Some(bytes);
+    }
+
+    match key.code {
+        KeyCode::Char(c) => {
+            let mut buf = [0u8; 4];
+            Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
+        }
+        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Esc => Some(vec![0x1b]),
+        KeyCode::Up => Some(b"\x1b[A".to_vec()),
+        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Right => Some(b"\x1b[C".to_vec()),
+        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        KeyCode::F(n) => {
+            let seq = match n {
+                1 => "\x1bOP",
+                2 => "\x1bOQ",
+                3 => "\x1bOR",
+                4 => "\x1bOS",
+                5 => "\x1b[15~",
+                6 => "\x1b[17~",
+                7 => "\x1b[18~",
+                8 => "\x1b[19~",
+                9 => "\x1b[20~",
+                10 => "\x1b[21~",
+                11 => "\x1b[23~",
+                12 => "\x1b[24~",
+                _ => return None,
+            };
+            Some(seq.as_bytes().to_vec())
+        }
+        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
+        _ => None,
+    }
+}
+
+fn handle_pane_input_key(key: KeyEvent) -> KeyResult {
+    if let Some(bytes) = keyevent_to_bytes(&key) {
+        KeyResult::ForwardToPane(bytes)
+    } else {
+        KeyResult::Continue
+    }
+}
+
+fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    match key.code {
+        // Ctrl+C again: actually quit
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyResult::Quit,
+        // Esc: cancel, return to dashboard
+        KeyCode::Esc => {
+            ui.mode = UiMode::Normal;
+            KeyResult::Continue
+        }
+        _ => KeyResult::Continue,
+    }
 }
 
 fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
@@ -490,13 +580,18 @@ fn focus_deck(
         return false;
     }
     ui.selected_index = idx;
-    ui.mode = UiMode::Normal;
     if let Some((sid, _)) = filtered.get(idx)
         && let Some(session) = snapshot.sessions.get(*sid)
     {
         if let Some(ref pane_id) = session.pane_id {
             match pane.focus_pane(pane_id) {
-                Ok(()) => {}
+                Ok(()) => {
+                    ui.mode = UiMode::PaneInput;
+                    ui.status_message = Some((
+                        "PaneInput mode — type to interact, Ctrl+d for dashboard".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
                 Err(PaneError::CommandFailed(ref msg)) => {
                     state.blocking_write().sessions.remove(*sid);
                     ui.status_message = Some((
@@ -525,9 +620,10 @@ fn handle_normal_key(
     total: usize,
     has_pending_permission: bool,
 ) -> KeyResult {
-    // Ctrl+C from dashboard: quit
+    // Ctrl+C from dashboard: show quit confirmation
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return KeyResult::Quit;
+        ui.mode = UiMode::QuitConfirm;
+        return KeyResult::Continue;
     }
     match key.code {
         // Permission responses (dashboard-only)
@@ -584,7 +680,8 @@ fn handle_normal_key(
 
 fn handle_filter_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return KeyResult::Quit;
+        ui.mode = UiMode::QuitConfirm;
+        return KeyResult::Continue;
     }
     match key.code {
         KeyCode::Esc => {
@@ -621,7 +718,8 @@ fn handle_rename_key(
     selected_session_id: Option<&str>,
 ) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return KeyResult::Quit;
+        ui.mode = UiMode::QuitConfirm;
+        return KeyResult::Continue;
     }
     match key.code {
         KeyCode::Esc => {
@@ -653,7 +751,8 @@ fn handle_rename_key(
 
 fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return KeyResult::Quit;
+        ui.mode = UiMode::QuitConfirm;
+        return KeyResult::Continue;
     }
     let picker = match ui.dir_picker.as_mut() {
         Some(p) => p,
@@ -767,7 +866,8 @@ fn transition_to_form(ui: &mut UiState) {
 
 fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return KeyResult::Quit;
+        ui.mode = UiMode::QuitConfirm;
+        return KeyResult::Continue;
     }
     let form = match ui.new_pane_form.as_mut() {
         Some(f) => f,
@@ -940,7 +1040,9 @@ pub fn run_tui(
             let _ = std::io::stdout().flush();
         }
 
-        if crossterm::event::poll(std::time::Duration::from_millis(250))? {
+        // Use a short poll interval for responsive terminal input (~60fps).
+        // The render at the top of the loop is cheap when nothing changes (ratatui diffs).
+        if crossterm::event::poll(std::time::Duration::from_millis(16))? {
             let ev = event::read()?;
 
             // Handle terminal resize: update PTY dimensions for all embedded panes.
@@ -979,6 +1081,11 @@ pub fn run_tui(
             let Event::Key(key) = ev else {
                 continue;
             };
+
+            // Only handle key-press events (ignore release/repeat on platforms that send them).
+            if key.kind != crossterm::event::KeyEventKind::Press {
+                continue;
+            }
 
             // 1..9 in Normal mode: jump to card N and focus its pane
             if ui.mode == UiMode::Normal
@@ -1095,6 +1202,8 @@ pub fn run_tui(
                 UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
                 UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
                 UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
+                UiMode::PaneInput => handle_pane_input_key(key),
+                UiMode::QuitConfirm => handle_quit_confirm_key(key, &mut ui),
             };
 
             match result {
@@ -1105,7 +1214,14 @@ pub fn run_tui(
                     {
                         if let Some(ref pane_id) = session.pane_id {
                             match pane.focus_pane(pane_id) {
-                                Ok(()) => {}
+                                Ok(()) => {
+                                    ui.mode = UiMode::PaneInput;
+                                    ui.status_message = Some((
+                                        "PaneInput mode — type to interact, Ctrl+d for dashboard"
+                                            .to_string(),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
                                 Err(PaneError::CommandFailed(ref msg)) => {
                                     state.blocking_write().sessions.remove(sid);
                                     ui.status_message = Some((
@@ -1148,6 +1264,7 @@ pub fn run_tui(
                                 }
                                 // Auto-focus the newly created pane and select last card.
                                 let _ = pane.focus_pane(&new_id);
+                                ui.mode = UiMode::PaneInput;
                                 ui.selected_index = filtered.len(); // will point to new card once it appears
                                 // Resize new pane PTY to match current layout dimensions.
                                 if let Some(embedded) =
@@ -1258,6 +1375,15 @@ pub fn run_tui(
                         }
                     }
                 }
+                KeyResult::ForwardToPane(bytes) => {
+                    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                        && let Some(pane_id) = embedded.focused_pane_id()
+                        && let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes)
+                    {
+                        ui.status_message =
+                            Some((format!("PTY write failed: {e}"), std::time::Instant::now()));
+                    }
+                }
                 KeyResult::Continue => {}
             }
 
@@ -1353,6 +1479,9 @@ fn render_frame(
             && let Some(ref form) = ui.new_pane_form
         {
             render_new_pane_form(frame, form);
+        }
+        if ui.mode == UiMode::QuitConfirm {
+            render_quit_confirm(frame);
         }
         return;
     }
@@ -1497,6 +1626,9 @@ fn render_frame(
         && let Some(ref form) = ui.new_pane_form
     {
         render_new_pane_form(frame, form);
+    }
+    if ui.mode == UiMode::QuitConfirm {
+        render_quit_confirm(frame);
     }
 }
 
@@ -1702,6 +1834,44 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
             }
         }
     }
+}
+
+fn render_quit_confirm(frame: &mut Frame) {
+    let area = frame.area();
+    let popup_width = 44.min(area.width.saturating_sub(4));
+    let popup_height = 7u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let text = vec![
+        Line::from(""),
+        Line::styled(
+            "  Are you sure you want to quit?",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+        Line::from("  Ctrl+c  Confirm quit"),
+        Line::from("  Esc     Cancel"),
+    ];
+
+    let block = Block::default()
+        .title(" Quit ")
+        .title_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, popup_area);
 }
 
 fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
@@ -2319,7 +2489,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::pane::NoopController;
+                let noop = crate::embedded_pane::EmbeddedPaneController::new();
                 render_frame(
                     frame,
                     &state,
@@ -2378,7 +2548,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::pane::NoopController;
+                let noop = crate::embedded_pane::EmbeddedPaneController::new();
                 render_frame(
                     frame,
                     &state,
@@ -2484,7 +2654,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::pane::NoopController;
+                let noop = crate::embedded_pane::EmbeddedPaneController::new();
                 render_frame(
                     frame,
                     &state,
@@ -2554,7 +2724,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::pane::NoopController;
+                let noop = crate::embedded_pane::EmbeddedPaneController::new();
                 render_frame(
                     frame,
                     &state,
@@ -3441,5 +3611,125 @@ mod tests {
 
         let prompts = collect_recent_prompts(&session, 3);
         assert!(prompts.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // keyevent_to_bytes tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn keyevent_printable_ascii() {
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(keyevent_to_bytes(&key), Some(vec![b'a']));
+
+        let key = KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT);
+        assert_eq!(keyevent_to_bytes(&key), Some(vec![b'Z']));
+    }
+
+    #[test]
+    fn keyevent_enter_tab_backspace_esc() {
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(vec![b'\r'])
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(vec![b'\t'])
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            Some(vec![0x7f])
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(vec![0x1b])
+        );
+    }
+
+    #[test]
+    fn keyevent_ctrl_c_and_ctrl_a() {
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(keyevent_to_bytes(&key), Some(vec![0x03]));
+
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(keyevent_to_bytes(&key), Some(vec![0x01]));
+
+        let key = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(keyevent_to_bytes(&key), Some(vec![0x1a]));
+    }
+
+    #[test]
+    fn keyevent_alt_prefix() {
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+        assert_eq!(keyevent_to_bytes(&key), Some(vec![0x1b, b'x']));
+    }
+
+    #[test]
+    fn keyevent_arrow_keys() {
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Some(b"\x1b[B".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            Some(b"\x1b[C".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Some(b"\x1b[D".to_vec())
+        );
+    }
+
+    #[test]
+    fn keyevent_f_keys() {
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
+            Some(b"\x1bOP".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE)),
+            Some(b"\x1b[24~".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::F(13), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn keyevent_special_nav_keys() {
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            Some(b"\x1b[H".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            Some(b"\x1b[F".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+            Some(b"\x1b[3~".to_vec())
+        );
+    }
+
+    #[test]
+    fn keyevent_backtab() {
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(b"\x1b[Z".to_vec())
+        );
+    }
+
+    #[test]
+    fn handle_pane_input_forwards_printable() {
+        let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        match handle_pane_input_key(key) {
+            KeyResult::ForwardToPane(bytes) => assert_eq!(bytes, vec![b'l']),
+            other => panic!("Expected ForwardToPane, got {:?}", other),
+        }
     }
 }
