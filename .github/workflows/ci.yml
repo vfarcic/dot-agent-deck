@@ -17,7 +17,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4 # v4
+      - uses: actions/checkout@v5 # v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -30,7 +30,7 @@ jobs:
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4 # v4
+      - uses: actions/checkout@v5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2 # v2
       - run: cargo install cargo-audit --locked
