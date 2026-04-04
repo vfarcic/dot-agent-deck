@@ -61,16 +61,18 @@ impl TerminalWidget {
 
 impl Widget for TerminalWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let true_black = Color::Rgb(0, 0, 0);
         let border_style = if self.focused {
             Style::default().fg(Color::Cyan)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(Color::Gray)
         };
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
-            .title(self.title);
+            .title(self.title)
+            .style(Style::default().bg(true_black));
 
         let inner = block.inner(area);
         block.render(area, buf);

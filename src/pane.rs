@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::process::Command;
 
 use serde::Deserialize;
@@ -58,6 +59,7 @@ pub trait PaneController: Send + Sync {
     fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError>;
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
+    fn as_any(&self) -> &dyn Any;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +227,9 @@ impl PaneController for ZellijController {
     fn is_available(&self) -> bool {
         true
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +268,9 @@ impl PaneController for NoopController {
     }
     fn is_available(&self) -> bool {
         false
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

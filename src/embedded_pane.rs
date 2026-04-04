@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
+use std::any::Any;
+
 use crate::pane::{PaneController, PaneDirection, PaneError, PaneInfo};
 
 /// State for a single embedded terminal pane.
@@ -14,6 +16,8 @@ struct Pane {
     screen: Arc<Mutex<vt100::Parser>>,
     /// The child process handle.
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// Master PTY handle (kept alive for resize).
+    master: Box<dyn portable_pty::MasterPty + Send>,
     /// Display name for this pane.
     name: String,
     /// Whether this pane is currently focused.
@@ -71,6 +75,26 @@ impl EmbeddedPaneController {
             .map(|(id, _)| id.clone())
     }
 
+    /// Resize a pane's PTY and VT100 parser to the given dimensions.
+    pub fn resize_pane_pty(&self, pane_id: &str, rows: u16, cols: u16) -> Result<(), PaneError> {
+        let panes = self.panes.lock().unwrap();
+        let pane = panes
+            .get(pane_id)
+            .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
+        pane.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| PaneError::CommandFailed(format!("PTY resize failed: {e}")))?;
+        if let Ok(mut parser) = pane.screen.lock() {
+            parser.set_size(rows, cols);
+        }
+        Ok(())
+    }
+
     fn allocate_id(&self) -> String {
         let mut id = self.next_id.lock().unwrap();
         let current = *id;
@@ -122,6 +146,10 @@ impl PaneController for EmbeddedPaneController {
             cmd.cwd(dir);
         }
 
+        let pane_id = self.allocate_id();
+        // Tag the spawned process so hooks can identify which pane it belongs to.
+        cmd.env("DOT_AGENT_DECK_PANE_ID", &pane_id);
+
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -159,12 +187,11 @@ impl PaneController for EmbeddedPaneController {
             }
         });
 
-        let pane_id = self.allocate_id();
-
         let pane = Pane {
             writer,
             screen: parser,
             child,
+            master: pair.master,
             name: command.unwrap_or("shell").to_string(),
             is_focused: false,
             command: command.map(|c| c.to_string()),
@@ -259,6 +286,10 @@ impl PaneController for EmbeddedPaneController {
 
     fn is_available(&self) -> bool {
         true
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

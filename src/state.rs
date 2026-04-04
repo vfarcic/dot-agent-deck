@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -73,6 +73,8 @@ pub struct AppState {
     pane_started_at: HashMap<String, DateTime<Utc>>,
     /// Set by the background version-check task when a newer release exists.
     pub update_available: Option<String>,
+    /// Pane IDs created by our app — events from unknown panes are rejected.
+    managed_pane_ids: HashSet<String>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -123,7 +125,27 @@ impl AppState {
         stats
     }
 
+    /// Register a pane ID as managed by our app.
+    pub fn register_pane(&mut self, pane_id: String) {
+        self.managed_pane_ids.insert(pane_id);
+    }
+
+    /// Unregister a pane ID (e.g., when closing a pane).
+    pub fn unregister_pane(&mut self, pane_id: &str) {
+        self.managed_pane_ids.remove(pane_id);
+    }
+
     pub fn apply_event(&mut self, mut event: AgentEvent) {
+        // Only accept events from panes managed by our app.
+        // Events without a pane_id (external agents) are rejected when we have
+        // managed panes. Events with an unknown pane_id are always rejected.
+        if let Some(ref pane_id) = event.pane_id {
+            if !self.managed_pane_ids.contains(pane_id) {
+                return;
+            }
+        } else if !self.managed_pane_ids.is_empty() {
+            return;
+        }
         if let Some(ref pane_id) = event.pane_id
             && let Some(existing_id) = self.sessions.iter().find_map(|(id, session)| {
                 (session.pane_id.as_ref().is_some_and(|p| p == pane_id) && id != &event.session_id)
@@ -336,6 +358,7 @@ mod tests {
     #[test]
     fn reuse_session_for_same_pane() {
         let mut state = AppState::default();
+        state.register_pane("pane-1".to_string());
 
         let mut first = make_event("s1", EventType::SessionStart);
         first.pane_id = Some("pane-1".to_string());
@@ -542,6 +565,7 @@ mod tests {
     #[test]
     fn restarted_session_preserves_started_at_via_pane() {
         let mut state = AppState::default();
+        state.register_pane("pane-42".to_string());
 
         // Register session with a pane
         let mut ev = make_event("s1", EventType::SessionStart);

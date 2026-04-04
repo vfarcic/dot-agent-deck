@@ -13,11 +13,13 @@ use ratatui::{
 };
 
 use crate::config::{BellConfig, DashboardConfig};
+use crate::embedded_pane::EmbeddedPaneController;
 use crate::event::{AgentType, EventType};
 use crate::pane::{PaneController, PaneError};
 use crate::state::{
     AppState, DashboardStats, PermissionResponders, SessionState, SessionStatus, SharedState,
 };
+use crate::terminal_widget::TerminalWidget;
 
 impl fmt::Display for crate::event::AgentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -108,6 +110,12 @@ enum UiMode {
     Rename,
     DirPicker,
     NewPaneForm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneLayout {
+    Stacked,
+    Tiled,
 }
 
 struct DirPickerState {
@@ -293,6 +301,8 @@ struct UiState {
     last_bell_status: HashMap<String, SessionStatus>,
     /// Populated by the background version-check task when a newer release is available.
     update_available: Option<String>,
+    /// Layout mode for embedded terminal panes (stacked or tiled).
+    pane_layout: PaneLayout,
 }
 
 impl UiState {
@@ -313,6 +323,7 @@ impl UiState {
             config,
             last_bell_status: HashMap::new(),
             update_available: None,
+            pane_layout: PaneLayout::Stacked,
         }
     }
 }
@@ -453,8 +464,6 @@ enum KeyResult {
     Quit,
     Focus,
     NewPane(NewPaneRequest),
-    ClosePane,
-    ToggleLayout,
     PermissionResponse(String),
 }
 
@@ -534,13 +543,14 @@ fn handle_normal_key(
         return KeyResult::Quit;
     }
     match key.code {
-        KeyCode::Char('q') => KeyResult::Quit,
+        // Permission responses (dashboard-only)
         KeyCode::Char('y') if has_pending_permission => {
             KeyResult::PermissionResponse("allow".to_string())
         }
         KeyCode::Char('n') if has_pending_permission => {
             KeyResult::PermissionResponse("deny".to_string())
         }
+        // Dashboard navigation
         KeyCode::Char('j') | KeyCode::Down => {
             ui.selected_index =
                 navigate_grid(ui.selected_index, Direction::Down, ui.columns, total);
@@ -574,14 +584,6 @@ fn handle_normal_key(
             ui.rename_text.clear();
             KeyResult::Continue
         }
-        KeyCode::Char('n') => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-            ui.dir_picker = Some(DirPickerState::new(cwd));
-            ui.mode = UiMode::DirPicker;
-            KeyResult::Continue
-        }
-        KeyCode::Char('d') if total > 0 => KeyResult::ClosePane,
-        KeyCode::Char('t') => KeyResult::ToggleLayout,
         KeyCode::Enter if total > 0 => KeyResult::Focus,
         KeyCode::Esc => {
             if !ui.filter_text.is_empty() {
@@ -900,11 +902,32 @@ pub fn run_tui(
             ui.selected_index = 0;
         }
 
-        ui.columns = grid_columns(terminal.get_frame().area().width);
+        let term_width = terminal.get_frame().area().width;
+        let has_embedded_panes = pane
+            .as_any()
+            .downcast_ref::<EmbeddedPaneController>()
+            .map(|e| !e.pane_ids().is_empty())
+            .unwrap_or(false);
+        let dashboard_width = if has_embedded_panes {
+            term_width * 33 / 100
+        } else {
+            term_width
+        };
+        ui.columns = grid_columns(dashboard_width);
 
         let has_pane_control = pane.is_available();
+        let pane_layout = ui.pane_layout;
         terminal.draw(|frame| {
-            render_frame(frame, &snapshot, &mut ui, &filtered, tick, has_pane_control);
+            render_frame(
+                frame,
+                &snapshot,
+                &mut ui,
+                &filtered,
+                tick,
+                has_pane_control,
+                &*pane,
+                pane_layout,
+            );
         })?;
         tick = tick.wrapping_add(1);
 
@@ -918,9 +941,45 @@ pub fn run_tui(
             let _ = std::io::stdout().flush();
         }
 
-        if crossterm::event::poll(std::time::Duration::from_millis(250))?
-            && let Event::Key(key) = event::read()?
-        {
+        if crossterm::event::poll(std::time::Duration::from_millis(250))? {
+            let ev = event::read()?;
+
+            // Handle terminal resize: update PTY dimensions for all embedded panes.
+            if let Event::Resize(w, h) = ev {
+                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                    let pane_ids = embedded.pane_ids();
+                    if !pane_ids.is_empty() {
+                        // Right panel is 67% of width, minus 2 for borders.
+                        let right_width = (w * 67 / 100).saturating_sub(2);
+                        let pane_count = pane_ids.len() as u16;
+                        for pane_id in &pane_ids {
+                            let is_focused =
+                                embedded.focused_pane_id().as_deref() == Some(pane_id.as_str());
+                            let rows = match ui.pane_layout {
+                                PaneLayout::Tiled => (h / pane_count).saturating_sub(2),
+                                PaneLayout::Stacked => {
+                                    if is_focused
+                                        || (embedded.focused_pane_id().is_none()
+                                            && pane_id == &pane_ids[0])
+                                    {
+                                        h.saturating_sub(2 + pane_count.saturating_sub(1))
+                                    } else {
+                                        0 // collapsed panes don't need resize
+                                    }
+                                }
+                            };
+                            if rows > 0 {
+                                let _ = embedded.resize_pane_pty(pane_id, rows, right_width);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let Event::Key(key) = ev else {
+                continue;
+            };
             // Alt+1..9: jump to card N and focus its pane (works from any mode)
             if let Some(card_num) = alt_digit(key) {
                 let idx = (card_num as usize).saturating_sub(1);
@@ -936,6 +995,61 @@ pub fn run_tui(
                 let idx = (c as usize) - ('1' as usize);
                 focus_deck(idx, &mut ui, &filtered, &snapshot, &state, &*pane);
                 continue;
+            }
+
+            // ---------------------------------------------------------------
+            // Global Alt+key shortcuts (work from any mode / future pane focus)
+            // ---------------------------------------------------------------
+            if key.modifiers == KeyModifiers::ALT {
+                match key.code {
+                    // Alt+q: quit
+                    KeyCode::Char('q') => break,
+                    // Alt+d: jump to dashboard (ensure Normal mode)
+                    KeyCode::Char('d') => {
+                        ui.mode = UiMode::Normal;
+                        continue;
+                    }
+                    // Alt+t: toggle layout
+                    KeyCode::Char('t') => {
+                        ui.pane_layout = match ui.pane_layout {
+                            PaneLayout::Stacked => PaneLayout::Tiled,
+                            PaneLayout::Tiled => PaneLayout::Stacked,
+                        };
+                        let mode_name = match ui.pane_layout {
+                            PaneLayout::Stacked => "stacked",
+                            PaneLayout::Tiled => "tiled",
+                        };
+                        ui.status_message =
+                            Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
+                        continue;
+                    }
+                    // Alt+n: new pane (open directory picker)
+                    KeyCode::Char('n') => {
+                        ui.mode = UiMode::DirPicker;
+                        ui.dir_picker = Some(DirPickerState::new(
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+                        ));
+                        continue;
+                    }
+                    // Alt+w: close selected pane
+                    KeyCode::Char('w') => {
+                        if let Some(sid) =
+                            filtered.get(ui.selected_index).map(|(id, _)| (*id).clone())
+                            && let Some(session) = snapshot.sessions.get(&sid)
+                            && let Some(ref pane_id) = session.pane_id
+                        {
+                            let _ = pane.close_pane(pane_id);
+                            let mut st = state.blocking_write();
+                            st.sessions.remove(&sid);
+                            st.unregister_pane(pane_id);
+                            drop(st);
+                            ui.status_message =
+                                Some((format!("Closed pane {pane_id}"), std::time::Instant::now()));
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
             }
 
             let selected_id: Option<String> =
@@ -997,11 +1111,36 @@ pub fn run_tui(
                         };
                         match pane.create_pane(cmd, Some(&dir_str)) {
                             Ok(new_id) => {
+                                // Register so only events from our panes are accepted.
+                                state.blocking_write().register_pane(new_id.clone());
                                 if !req.name.is_empty() {
                                     let _ = pane.rename_pane(&new_id, &req.name);
                                     ui.pane_display_names
                                         .insert(new_id.clone(), req.name.clone());
                                     ui.pane_names.insert(new_id.clone(), req.name);
+                                }
+                                // Auto-focus the newly created pane.
+                                let _ = pane.focus_pane(&new_id);
+                                // Resize new pane PTY to match current layout dimensions.
+                                if let Some(embedded) =
+                                    pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                                {
+                                    let frame_area = terminal.get_frame().area();
+                                    let right_width =
+                                        (frame_area.width * 67 / 100).saturating_sub(2);
+                                    let pane_count = embedded.pane_ids().len() as u16;
+                                    let rows = match ui.pane_layout {
+                                        PaneLayout::Tiled => (frame_area.height
+                                            / pane_count.max(1))
+                                        .saturating_sub(2),
+                                        PaneLayout::Stacked => frame_area
+                                            .height
+                                            .saturating_sub(2 + pane_count.saturating_sub(1)),
+                                    };
+                                    if rows > 0 && right_width > 0 {
+                                        let _ =
+                                            embedded.resize_pane_pty(&new_id, rows, right_width);
+                                    }
                                 }
                                 ui.status_message = Some((
                                     format!("Created pane {new_id} in {dir_str}"),
@@ -1017,47 +1156,6 @@ pub fn run_tui(
                         }
                     }
                 }
-                KeyResult::ClosePane => {
-                    if let Some(ref sid) = selected_id
-                        && let Some(session) = snapshot.sessions.get(sid)
-                    {
-                        if let Some(ref pane_id) = session.pane_id {
-                            match pane.close_pane(pane_id) {
-                                Ok(()) => {
-                                    state.blocking_write().sessions.remove(sid);
-                                    ui.status_message = Some((
-                                        format!("Closed pane {pane_id}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                                Err(e) => {
-                                    state.blocking_write().sessions.remove(sid);
-                                    ui.status_message = Some((
-                                        format!("Removed stale session: {e}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            ui.status_message = Some((
-                                format!("No pane linked to session {sid}"),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                    }
-                }
-                KeyResult::ToggleLayout => match pane.toggle_layout() {
-                    Ok(()) => {
-                        ui.status_message =
-                            Some(("Toggled layout".to_string(), std::time::Instant::now()));
-                    }
-                    Err(e) => {
-                        ui.status_message = Some((
-                            format!("Toggle layout failed: {e}"),
-                            std::time::Instant::now(),
-                        ));
-                    }
-                },
                 KeyResult::PermissionResponse(decision) => {
                     if let Some(ref sid) = selected_id
                         && let Some(session) = snapshot.sessions.get(sid)
@@ -1157,6 +1255,7 @@ pub fn run_tui(
 // Rendering
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn render_frame(
     frame: &mut Frame,
     state: &AppState,
@@ -1164,6 +1263,8 @@ fn render_frame(
     filtered: &[(&String, &SessionState)],
     tick: u64,
     has_pane_control: bool,
+    pane_controller: &dyn PaneController,
+    pane_layout: PaneLayout,
 ) {
     let area = frame.area();
 
@@ -1175,20 +1276,44 @@ fn render_frame(
         area,
     );
 
+    // Bottom bar spans the full terminal width.
+    let bottom_height: u16 = if has_pane_control { 2 } else { 1 };
+    let top_bottom =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(bottom_height)]).split(area);
+    let main_area = top_bottom[0];
+    let bottom_bar_area = top_bottom[1];
+
+    // Determine if we have embedded terminal panes to show on the right.
+    let embedded = pane_controller
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>();
+    let pane_ids = embedded.map(|e| e.pane_ids()).unwrap_or_default();
+    let has_terminal_panes = !pane_ids.is_empty();
+
+    let (dashboard_area, panes_area) = if has_terminal_panes {
+        let chunks = Layout::horizontal([Constraint::Percentage(33), Constraint::Percentage(67)])
+            .split(main_area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (main_area, None)
+    };
+
     if state.sessions.is_empty() {
-        let bar_height = if has_pane_control { 2 } else { 1 };
         let vertical = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Length(1),
             Constraint::Fill(1),
-            Constraint::Length(bar_height),
         ])
-        .split(area);
+        .split(dashboard_area);
         let msg = Paragraph::new("No active sessions. Press n to create a pane.")
             .style(Style::default().fg(Color::Gray))
             .centered();
         frame.render_widget(msg, vertical[1]);
-        render_bottom_bar(frame, ui, vertical[3], has_pane_control);
+        render_full_bottom_bar(frame, ui, bottom_bar_area, has_pane_control, state);
+
+        if let Some(right) = panes_area {
+            render_terminal_panes(frame, embedded, right, pane_layout, &ui.pane_display_names);
+        }
 
         if ui.mode == UiMode::Help {
             render_help_overlay(frame, has_pane_control);
@@ -1209,16 +1334,13 @@ fn render_frame(
     let sessions: Vec<&SessionState> = filtered.iter().map(|(_, s)| *s).collect();
     let session_ids: Vec<&String> = filtered.iter().map(|(id, _)| *id).collect();
 
-    let cols = grid_columns(area.width);
-
-    // Bottom area: 1 row for stats bar + 1 row for hints/filter bar
-    let bottom_height: u16 = 2;
+    let cols = grid_columns(dashboard_area.width);
 
     // Choose card density based on available vertical space
     // wide = true when each column has inner width >= 60 (card border takes 2 chars)
-    let col_width = area.width / cols.max(1) as u16;
+    let col_width = dashboard_area.width / cols.max(1) as u16;
     let wide = col_width.saturating_sub(2) >= 60;
-    let available_for_density = area.height.saturating_sub(1 + bottom_height);
+    let available_for_density = dashboard_area.height.saturating_sub(1);
     let density = choose_density(sessions.len(), cols, available_for_density, wide);
     let card_height = density.card_height(wide);
 
@@ -1242,12 +1364,8 @@ fn render_frame(
 
     if sessions.is_empty() {
         // All filtered out
-        let vertical = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(bottom_height),
-        ])
-        .split(area);
+        let vertical =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).split(dashboard_area);
         frame.render_widget(title, vertical[0]);
 
         let msg = Paragraph::new("No sessions match filter.")
@@ -1261,10 +1379,7 @@ fn render_frame(
         .split(vertical[1]);
         frame.render_widget(msg, inner[1]);
 
-        let bottom_split =
-            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(vertical[2]);
-        render_stats_bar(frame, &state.aggregate_stats(), bottom_split[0]);
-        render_bottom_bar(frame, ui, bottom_split[1], has_pane_control);
+        render_full_bottom_bar(frame, ui, bottom_bar_area, has_pane_control, state);
         return;
     }
 
@@ -1292,9 +1407,8 @@ fn render_frame(
         constraints.push(Constraint::Length(card_height));
     }
     constraints.push(Constraint::Min(0)); // filler
-    constraints.push(Constraint::Length(bottom_height)); // bottom bar
 
-    let row_chunks = Layout::vertical(constraints).split(area);
+    let row_chunks = Layout::vertical(constraints).split(dashboard_area);
 
     frame.render_widget(title, row_chunks[0]);
 
@@ -1325,12 +1439,13 @@ fn render_frame(
         }
     }
 
-    // Split bottom area into stats bar (row 0) + hints bar (row 1)
-    let bottom_area = row_chunks[row_chunks.len() - 1];
-    let bottom_split =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(bottom_area);
-    render_stats_bar(frame, &state.aggregate_stats(), bottom_split[0]);
-    render_bottom_bar(frame, ui, bottom_split[1], has_pane_control);
+    // Full-width bottom bar (stats + hints)
+    render_full_bottom_bar(frame, ui, bottom_bar_area, has_pane_control, state);
+
+    // Render terminal panes on the right side
+    if let Some(right) = panes_area {
+        render_terminal_panes(frame, embedded, right, pane_layout, &ui.pane_display_names);
+    }
 
     // Overlays (drawn last, on top)
     if ui.mode == UiMode::Help {
@@ -1345,6 +1460,100 @@ fn render_frame(
         && let Some(ref form) = ui.new_pane_form
     {
         render_new_pane_form(frame, form);
+    }
+}
+
+fn render_terminal_panes(
+    frame: &mut Frame,
+    embedded: Option<&EmbeddedPaneController>,
+    area: Rect,
+    layout: PaneLayout,
+    display_names: &HashMap<String, String>,
+) {
+    let ctrl = match embedded {
+        Some(c) => c,
+        None => return,
+    };
+    let pane_ids = ctrl.pane_ids();
+    if pane_ids.is_empty() {
+        return;
+    }
+    let focused_id = ctrl.focused_pane_id();
+
+    // Get pane info for display names
+    let pane_infos = ctrl.list_panes().unwrap_or_default();
+    let pane_name = |id: &str| -> String {
+        if let Some(name) = display_names.get(id) {
+            return name.clone();
+        }
+        if let Some(info) = pane_infos.iter().find(|p| p.pane_id == id)
+            && !info.title.is_empty()
+        {
+            return info.title.clone();
+        }
+        format!("pane {id}")
+    };
+
+    match layout {
+        PaneLayout::Tiled => {
+            let constraints: Vec<Constraint> = pane_ids
+                .iter()
+                .map(|_| Constraint::Ratio(1, pane_ids.len() as u32))
+                .collect();
+            let chunks = Layout::vertical(constraints).split(area);
+            for (i, pane_id) in pane_ids.iter().enumerate() {
+                if let Some(screen) = ctrl.get_screen(pane_id) {
+                    let focused = focused_id.as_deref() == Some(pane_id.as_str());
+                    let title = pane_name(pane_id);
+                    let widget = TerminalWidget::new(screen, title, focused);
+                    frame.render_widget(widget, chunks[i]);
+                }
+            }
+        }
+        PaneLayout::Stacked => {
+            // Focused pane gets remaining space; unfocused get a single collapsed title row.
+            let title_bar_height: u16 = 1;
+            let mut constraints: Vec<Constraint> = Vec::new();
+            let mut focused_idx: Option<usize> = None;
+
+            for (i, pane_id) in pane_ids.iter().enumerate() {
+                let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
+                if is_focused {
+                    constraints.push(Constraint::Fill(1));
+                    focused_idx = Some(i);
+                } else {
+                    constraints.push(Constraint::Length(title_bar_height));
+                }
+            }
+
+            // If no pane is focused, expand the first one.
+            if focused_idx.is_none() && !pane_ids.is_empty() {
+                constraints[0] = Constraint::Fill(1);
+                focused_idx = Some(0);
+            }
+
+            let chunks = Layout::vertical(constraints).split(area);
+            for (i, pane_id) in pane_ids.iter().enumerate() {
+                let is_expanded = focused_idx == Some(i);
+                let title = pane_name(pane_id);
+                if is_expanded {
+                    if let Some(screen) = ctrl.get_screen(pane_id) {
+                        let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
+                        let widget = TerminalWidget::new(screen, title, is_focused);
+                        frame.render_widget(widget, chunks[i]);
+                    }
+                } else {
+                    // Collapsed: show a titled border block.
+                    let true_black = Color::Rgb(0, 0, 0);
+                    let block = Block::default()
+                        .borders(Borders::TOP)
+                        .border_style(Style::default().fg(Color::Gray))
+                        .title(format!(" {title} "))
+                        .style(Style::default().bg(true_black));
+                    frame.render_widget(block, chunks[i]);
+                }
+            }
+        }
     }
 }
 
@@ -1394,6 +1603,23 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Renders the full-width bottom bar: stats (row 0) + hints (row 1).
+fn render_full_bottom_bar(
+    frame: &mut Frame,
+    ui: &UiState,
+    area: Rect,
+    has_pane_control: bool,
+    state: &AppState,
+) {
+    if area.height >= 2 {
+        let split = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+        render_stats_bar(frame, &state.aggregate_stats(), split[0]);
+        render_bottom_bar(frame, ui, split[1], has_pane_control);
+    } else {
+        render_bottom_bar(frame, ui, area, has_pane_control);
+    }
+}
+
 fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_control: bool) {
     match ui.mode {
         UiMode::Filter => {
@@ -1432,7 +1658,7 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
             } else {
                 let hints = if has_pane_control {
                     format!(
-                        "?: help  {MOD_KEY}+1-9: jump  {MOD_KEY}+q: quit all  {MOD_KEY}+d: dashboard"
+                        "?: help  {MOD_KEY}+1-9: jump  {MOD_KEY}+n: new  {MOD_KEY}+w: close  {MOD_KEY}+t: layout  {MOD_KEY}+d: dashboard  {MOD_KEY}+q: quit"
                     )
                 } else {
                     format!("?: help  {MOD_KEY}+1-9: jump  q: quit")
@@ -1471,61 +1697,37 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
 
     let mut help_text = vec![
         Line::styled(
-            "  Keybindings",
+            "  Global (works from any pane)",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Line::from(""),
-        Line::from("  j / Down      Move down"),
-        Line::from("  k / Up        Move up"),
-        Line::from("  h / Left      Move left"),
-        Line::from("  l / Right     Move right"),
-        Line::from(format!("  {MOD_KEY}+1-9       Jump to card N")),
-        Line::from("  /             Filter sessions"),
-        Line::from("  r             Rename session"),
-        Line::from("  ?             Toggle this help"),
-        Line::from("  Esc           Clear filter"),
-        Line::from("  q             Quit"),
+        Line::from(format!("  {MOD_KEY}+1-9       Jump to pane N")),
+        Line::from(format!("  {MOD_KEY}+d         Focus dashboard")),
+        Line::from(format!("  {MOD_KEY}+n         Create new pane")),
+        Line::from(format!("  {MOD_KEY}+w         Close selected pane")),
+        Line::from(format!(
+            "  {MOD_KEY}+t         Toggle layout (stacked/tiled)"
+        )),
+        Line::from(format!("  {MOD_KEY}+q         Quit")),
     ];
 
     if has_pane_control {
         help_text.push(Line::from(""));
         help_text.push(Line::styled(
-            "  Pane Control",
+            "  Dashboard (after focusing dashboard)",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ));
         help_text.push(Line::from(""));
-        help_text.push(Line::from("  Enter         Focus agent pane"));
-        help_text.push(Line::from("  n             New pane (dir + name + cmd)"));
-        help_text.push(Line::from("  d             Close agent pane"));
-        help_text.push(Line::from("  t             Toggle stacked/tiled layout"));
-        help_text.push(Line::from(""));
-        help_text.push(Line::styled(
-            "  Zellij (works from any pane)",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        help_text.push(Line::from(""));
-        help_text.push(Line::from(format!(
-            "  {MOD_KEY}+h         Move left one pane"
-        )));
-        help_text.push(Line::from(format!(
-            "  {MOD_KEY}+d         Jump to dashboard"
-        )));
-        help_text.push(Line::from(format!(
-            "  {MOD_KEY}+j/k       Navigate stacked panes"
-        )));
-        help_text.push(Line::from(format!(
-            "  {MOD_KEY}+w         Close current pane"
-        )));
-        help_text.push(Line::from(format!(
-            "  {MOD_KEY}+t         Toggle layout (any pane)"
-        )));
-        help_text.push(Line::from(format!("  {MOD_KEY}+q         Quit all")));
+        help_text.push(Line::from("  j/k / arrows  Navigate cards"));
+        help_text.push(Line::from("  Enter         Focus selected pane"));
+        help_text.push(Line::from("  /             Filter sessions"));
+        help_text.push(Line::from("  r             Rename session"));
+        help_text.push(Line::from("  ?             Toggle this help"));
+        help_text.push(Line::from("  Esc           Clear filter"));
     }
 
     help_text.push(Line::from(""));
@@ -2096,7 +2298,19 @@ mod tests {
         let mut ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, &mut ui, &filtered, 0, false))
+            .draw(|frame| {
+                let noop = crate::pane::NoopController;
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                )
+            })
             .unwrap();
     }
 
@@ -2143,7 +2357,19 @@ mod tests {
         let mut ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, &mut ui, &filtered, 0, false))
+            .draw(|frame| {
+                let noop = crate::pane::NoopController;
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                )
+            })
             .unwrap();
     }
 
@@ -2237,7 +2463,19 @@ mod tests {
         let mut ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, &mut ui, &filtered, 0, false))
+            .draw(|frame| {
+                let noop = crate::pane::NoopController;
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                )
+            })
             .unwrap();
     }
 
@@ -2295,7 +2533,19 @@ mod tests {
         let mut ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
         terminal
-            .draw(|frame| render_frame(frame, &state, &mut ui, &filtered, 0, false))
+            .draw(|frame| {
+                let noop = crate::pane::NoopController;
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                )
+            })
             .unwrap();
     }
 
