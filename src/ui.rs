@@ -563,8 +563,17 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
+/// Compute the row offset between widget-relative coordinates and vt100 screen
+/// coordinates. The widget shows the bottom `inner_h` rows of the screen.
+fn screen_row_offset(screen: &vt100::Screen, pane_rect: Rect) -> u16 {
+    let inner_h = pane_rect.height.saturating_sub(2);
+    let screen_rows = screen.size().0;
+    screen_rows.saturating_sub(inner_h)
+}
+
 /// Extract text from a vt100 screen for the given selection region.
-fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection) -> String {
+/// Selection coordinates are widget-relative; `row_offset` maps them to screen rows.
+fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection, row_offset: u16) -> String {
     let (sr, sc, er, ec) = if (sel.start_row, sel.start_col) <= (sel.end_row, sel.end_col) {
         (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
     } else {
@@ -572,18 +581,19 @@ fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection) -> String
     };
     let mut result = String::new();
     let (screen_rows, screen_cols) = screen.size();
-    for row in sr..=er {
-        if row >= screen_rows {
+    for widget_row in sr..=er {
+        let screen_row = widget_row + row_offset;
+        if screen_row >= screen_rows {
             break;
         }
-        let col_start = if row == sr { sc } else { 0 };
-        let col_end = if row == er {
+        let col_start = if widget_row == sr { sc } else { 0 };
+        let col_end = if widget_row == er {
             ec
         } else {
             screen_cols.saturating_sub(1)
         };
         for col in col_start..=col_end.min(screen_cols.saturating_sub(1)) {
-            if let Some(cell) = screen.cell(row, col) {
+            if let Some(cell) = screen.cell(screen_row, col) {
                 let ch = cell.contents();
                 if ch.is_empty() {
                     result.push(' ');
@@ -593,7 +603,7 @@ fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection) -> String
             }
         }
         // Trim trailing spaces per line and add newline between lines.
-        if row < er {
+        if widget_row < er {
             let trimmed = result.trim_end_matches(' ');
             let trimmed_len = trimmed.len();
             result.truncate(trimmed_len);
@@ -645,20 +655,21 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 /// Find the word boundaries around (row, col) in a vt100 screen.
+/// `row` is widget-relative; `row_offset` maps it to screen coordinates.
 /// Returns (start_col, end_col) for the word at the given position.
-fn word_bounds_at(screen: &vt100::Screen, row: u16, col: u16) -> (u16, u16) {
+fn word_bounds_at(screen: &vt100::Screen, row: u16, col: u16, row_offset: u16) -> (u16, u16) {
     let (_rows, cols) = screen.size();
+    let screen_row = row + row_offset;
     let is_word_char = |c: u16| -> bool {
         screen
-            .cell(row, c)
+            .cell(screen_row, c)
             .map(|cell| {
                 let ch = cell.contents();
-                // Treat only alphanumeric chars and underscores as word characters.
                 !ch.is_empty()
                     && ch
                         .chars()
                         .next()
-                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-')
             })
             .unwrap_or(false)
     };
@@ -1294,8 +1305,14 @@ pub fn run_tui(
                                             if let Some(screen_arc) = embedded.get_screen(&pane_id)
                                                 && let Ok(parser) = screen_arc.lock()
                                             {
-                                                let (wstart, wend) =
-                                                    word_bounds_at(parser.screen(), row, col);
+                                                let offset =
+                                                    screen_row_offset(parser.screen(), rect);
+                                                let (wstart, wend) = word_bounds_at(
+                                                    parser.screen(),
+                                                    row,
+                                                    col,
+                                                    offset,
+                                                );
                                                 ui.selection = Some(TextSelection {
                                                     start_col: wstart,
                                                     start_row: row,
@@ -1306,14 +1323,50 @@ pub fn run_tui(
                                             }
                                         }
                                         3 => {
-                                            // Triple-click: select entire line.
-                                            ui.selection = Some(TextSelection {
-                                                start_col: 0,
-                                                start_row: row,
-                                                end_col: inner_w.saturating_sub(1),
-                                                end_row: row,
-                                                pane_rect: rect,
-                                            });
+                                            // Triple-click: select paragraph (contiguous
+                                            // non-blank lines around the clicked row).
+                                            if let Some(screen_arc) = embedded.get_screen(&pane_id)
+                                                && let Ok(parser) = screen_arc.lock()
+                                            {
+                                                let offset =
+                                                    screen_row_offset(parser.screen(), rect);
+                                                let screen = parser.screen();
+                                                let screen_rows = screen.size().0;
+                                                let is_blank_row = |wr: u16| -> bool {
+                                                    let sr = wr + offset;
+                                                    if sr >= screen_rows {
+                                                        return true;
+                                                    }
+                                                    let cols = screen.size().1;
+                                                    (0..cols).all(|c| {
+                                                        screen
+                                                            .cell(sr, c)
+                                                            .map(|cell| {
+                                                                let ch = cell.contents();
+                                                                ch.is_empty()
+                                                                    || ch.trim().is_empty()
+                                                            })
+                                                            .unwrap_or(true)
+                                                    })
+                                                };
+                                                let mut start_r = row;
+                                                while start_r > 0 && !is_blank_row(start_r - 1) {
+                                                    start_r -= 1;
+                                                }
+                                                let mut end_r = row;
+                                                while end_r + 1 < inner_h
+                                                    && !is_blank_row(end_r + 1)
+                                                {
+                                                    end_r += 1;
+                                                }
+                                                ui.selection = Some(TextSelection {
+                                                    start_col: 0,
+                                                    start_row: start_r,
+                                                    end_col: inner_w.saturating_sub(1),
+                                                    end_row: end_r,
+                                                    pane_rect: rect,
+                                                });
+                                            }
                                         }
                                         _ => {
                                             // Single click: start drag selection.
@@ -1356,7 +1409,8 @@ pub fn run_tui(
                                 && let Some(screen_arc) = embedded.get_screen(&pane_id)
                                 && let Ok(parser) = screen_arc.lock()
                             {
-                                let text = extract_selection_text(parser.screen(), sel);
+                                let offset = screen_row_offset(parser.screen(), sel.pane_rect);
+                                let text = extract_selection_text(parser.screen(), sel, offset);
                                 if !text.is_empty() {
                                     copy_to_clipboard_osc52(&text);
                                     ui.status_message = Some((

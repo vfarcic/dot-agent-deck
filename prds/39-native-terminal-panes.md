@@ -1,6 +1,6 @@
 # PRD #39: Native Terminal Panes (Replace Zellij)
 
-**Status**: Draft
+**Status**: In Progress
 **Priority**: High
 **Created**: 2026-04-04
 
@@ -141,12 +141,17 @@ Replace Zellij entirely with **Ratatui-native embedded terminal panes**. Each ag
 - [x] Layout engine — stacked and tiled modes replacing Zellij swap layouts. Dashboard 33% left, panes 67% right. Toggle with `Ctrl+t`. Stats bar in dashboard area, hints bar full-width. Auto-focus and card sync on new pane creation.
 - [x] Input routing — `UiMode::PaneInput` forwards keystrokes to PTY stdin via `write_raw_bytes()`. `keyevent_to_bytes()` converts crossterm events to terminal byte sequences (control codes, ANSI escapes, F-keys, Alt prefix). Auto-enters PaneInput on pane focus. Ctrl+d returns to dashboard. Ctrl+C forwarded as 0x03. Quit confirmation dialog (Ctrl+C twice to exit). Poll reduced to 16ms for responsive typing. `KeyEventKind::Press` filter added.
 - [x] Remove Zellij — deleted `ZellijController`, `NoopController`, `maybe_exec_zellij()`, layout/config KDL generation, shell wrapper, `ZELLIJ_PANE_ID` fallback. ~600 lines removed. App no longer depends on or launches Zellij.
-- [ ] Tab support for modes — re-enable PRD 34 mode tab activation using native tabs (internal state, rendered as tab bar widget)
-- [ ] Tests and validation — unit tests for PTY lifecycle, VT rendering, layout calculations. Manual validation with Claude Code, OpenCode, and permission prompts.
+- [x] Tests and validation — 187 unit tests + 10 integration tests covering PTY lifecycle, VT rendering, layout calculations, keyevent_to_bytes, color mapping, cursor, and selection. Manual validation with Claude Code. vt100 upgraded to 0.16, ratatui to 0.30.
+- [x] Documentation — README updated to remove all Zellij references, keybindings updated to Ctrl-based global shortcuts, Zellij installation section removed, Launching section rewritten for native panes.
+- [x] Terminal polish — typing latency fix (event drain loop), mouse scrollback (vt100 built-in), mouse text selection with double-click word / triple-click paragraph, clipboard copy via OSC 52, bracketed paste, Alt+Backspace/arrows, real blinking cursor.
+
+**Note**: Tab support for modes is tracked in PRD 34 (Extensible Modes System), not this PRD.
 
 ## Out of Scope (v1)
 
-- Mouse support in embedded terminals
 - Sixel / image protocol rendering
 - Split panes within a single embedded terminal
 - SSH / remote PTY connections
+- OSC 52 clipboard read (write is implemented)
+- Focus event forwarding (`\x1b[?1004h`)
+- Terminal title display from OSC 0/2 sequences
