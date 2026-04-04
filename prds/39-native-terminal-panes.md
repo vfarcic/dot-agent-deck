@@ -138,8 +138,8 @@ Replace Zellij entirely with **Ratatui-native embedded terminal panes**. Each ag
 - [x] Crate evaluation and proof of concept — spawn a PTY with `portable-pty`, parse output with `vt100`, render a single terminal in Ratatui. Validate that Claude Code / shell output renders correctly.
 - [x] `EmbeddedPaneController` core — implement `create_pane`, `close_pane`, `list_panes`, `focus_pane`, `write_to_pane` against `PaneController` trait using PTY + VT parser
 - [x] Terminal widget rendering — Ratatui widget that renders VT grid cells with colors, cursor, and scrollback. Handles resize notifications (SIGWINCH). MasterPty stored for resize, Event::Resize updates PTY dimensions.
-- [x] Layout engine — stacked and tiled modes replacing Zellij swap layouts. Dashboard 33% left, panes 67% right. Toggle with `Alt+t`. Full-width bottom bar. Auto-focus on new pane creation.
-- [ ] Input routing — keyboard forwarding to focused pane's PTY. Global Alt+key shortcuts (Alt+n, Alt+w, Alt+t, Alt+d, Alt+q, Alt+1-9) implemented and intercepted before forwarding. PTY stdin forwarding pending.
+- [x] Layout engine — stacked and tiled modes replacing Zellij swap layouts. Dashboard 33% left, panes 67% right. Toggle with `Ctrl+t`. Stats bar in dashboard area, hints bar full-width. Auto-focus and card sync on new pane creation.
+- [ ] Input routing — keyboard forwarding to focused pane's PTY. Global Ctrl+key shortcuts (Ctrl+n, Ctrl+w, Ctrl+t, Ctrl+d) implemented and intercepted before forwarding. Ctrl+C quits from dashboard only. Plain 1-9 jump in dashboard mode. PTY stdin forwarding pending.
 - [ ] Remove Zellij — `DOT_AGENT_DECK_PANE_ID` env var and managed pane filtering implemented. Still need to delete `ZellijController`, `NoopController`, `maybe_exec_zellij()`, layout/config generation.
 - [ ] Tab support for modes — re-enable PRD 34 mode tab activation using native tabs (internal state, rendered as tab bar widget)
 - [ ] Tests and validation — unit tests for PTY lifecycle, VT rendering, layout calculations. Manual validation with Claude Code, OpenCode, and permission prompts.
