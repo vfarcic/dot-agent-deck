@@ -20,17 +20,14 @@ Currently supports **Claude Code** and **OpenCode**. Want support for your favor
 ## Quick Start
 
 ```bash
-# 1. Install Zellij (terminal multiplexer for pane control)
-brew install zellij
-
-# 2. Install dot-agent-deck
+# 1. Install dot-agent-deck
 brew tap vfarcic/tap && brew install dot-agent-deck
 
-# 3. Register agent hooks
+# 2. Register agent hooks
 dot-agent-deck hooks install                    # Claude Code
 dot-agent-deck hooks install --agent opencode   # OpenCode
 
-# 4. Launch the dashboard
+# 3. Launch the dashboard
 dot-agent-deck
 ```
 
@@ -38,15 +35,14 @@ Once the dashboard is running, press `?` inside the app to see all shortcuts.
 
 ## Installation
 
-### Zellij
+### Platform Support
 
-dot-agent-deck uses [Zellij](https://zellij.dev/) for pane control. Install it first:
-
-```bash
-brew install zellij
-```
-
-See [Zellij installation docs](https://zellij.dev/documentation/installation) for other methods.
+| Platform | Status |
+|---|---|
+| macOS (Intel & Apple Silicon) | Supported |
+| Linux (amd64 & arm64) | Supported |
+| Windows (via WSL) | Supported (runs as Linux) |
+| Windows (native) | Coming soon ([#42](https://github.com/vfarcic/dot-agent-deck/issues/42)) — comment on the issue if you need this! |
 
 ### Homebrew (macOS / Linux)
 
@@ -96,12 +92,12 @@ dot-agent-deck hooks uninstall --agent opencode   # OpenCode
 
 ### Launching
 
-Running `dot-agent-deck` auto-launches Zellij with a two-column layout:
+Running `dot-agent-deck` opens a two-column layout with native embedded terminal panes:
 
 - **Left (1/3)** — the dashboard, displaying a card grid of agent sessions
-- **Right (2/3)** — agent panes where Claude Code or OpenCode instances run (stacked by default, toggle to tiled with `t`)
+- **Right (2/3)** — agent panes where Claude Code or OpenCode instances run (stacked by default, toggle to tiled with `Ctrl+t`)
 
-The Zellij session is named `dot-agent-deck`. If the session already exists, it reattaches.
+No external terminal multiplexer is required — dot-agent-deck is a single binary.
 
 ### Session Statuses
 
@@ -121,12 +117,12 @@ Cards also display: session ID, agent type, working directory, tool count, and l
 ### Basic Workflow
 
 1. Launch the dashboard with `dot-agent-deck`
-2. Press `n` to open a new pane (pick a directory, name, and command)
+2. Press `Ctrl+n` to open a new pane (pick a directory, name, and command)
 3. Run Claude Code in the new pane
 4. Watch session statuses update in real-time on the dashboard
 5. Press `Enter` on a card to jump to that agent's pane
 
-> **Tip:** Press `Alt+d` (`Opt+d` on macOS) from any pane to jump back to the dashboard.
+> **Tip:** Press `Ctrl+d` from any pane to jump back to the dashboard.
 
 ## Keyboard Shortcuts
 
@@ -138,21 +134,13 @@ Cards also display: session ID, agent type, working directory, tool count, and l
 | `k` / `Up` | Move up |
 | `h` / `Left` | Move left |
 | `l` / `Right` | Move right |
-| `Alt+1`–`9` | Jump to card N |
+| `1`–`9` | Jump to card N and focus its pane |
 | `/` | Filter sessions |
 | `r` | Rename session |
 | `?` | Toggle help overlay |
 | `Esc` | Clear filter |
-| `q` / `Ctrl+c` | Quit |
-
-### Pane Control
-
-| Key | Action |
-|---|---|
 | `Enter` | Focus selected agent pane |
-| `n` | New pane (directory picker, then name + command form) |
-| `d` | Close selected agent pane |
-| `t` | Toggle stacked / tiled layout |
+| `y` / `n` | Approve / deny pending permission request |
 
 ### Directory Picker
 
@@ -177,18 +165,16 @@ Directory lists loop end-to-end, so pressing `Up` on the first entry jumps to th
 | `Enter` | Confirm field / submit form |
 | `Esc` | Cancel |
 
-### Zellij Shortcuts (work from any pane)
+### Global Shortcuts (work from any mode)
 
 | Key | Action |
 |---|---|
-| `Alt+d` / `Alt+h` / `Alt+Left` | Go to dashboard pane |
-| `Alt+j` / `Alt+Down` | Navigate down in stacked panes |
-| `Alt+k` / `Alt+Up` | Navigate up in stacked panes |
-| `Alt+t` | Toggle stacked / tiled layout |
-| `Alt+w` | Close current pane |
-| `Alt+q` | Quit all (exit Zellij) |
+| `Ctrl+d` | Return to dashboard (intercepted globally; prevents sending EOF to focused pane) |
+| `Ctrl+n` | New pane (directory picker, then name + command form) |
+| `Ctrl+w` | Close selected agent pane |
+| `Ctrl+t` | Toggle stacked / tiled layout |
 
-> On macOS, `Alt` is the `Opt` key.
+In PaneInput mode, `Ctrl+c` is delivered to the terminal as SIGINT (0x03). From the dashboard, pressing `Ctrl+c` twice triggers the quit confirmation dialog.
 
 ## Configuration
 
