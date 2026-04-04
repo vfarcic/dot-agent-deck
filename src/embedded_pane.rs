@@ -90,6 +90,33 @@ impl EmbeddedPaneController {
         }
     }
 
+    /// Scroll a pane's view by `delta` lines (positive = scroll up into history).
+    /// vt100 0.16 clamps the offset to the actual scrollback buffer size.
+    pub fn scroll_pane(&self, pane_id: &str, delta: isize) {
+        let panes = self.panes.lock().unwrap();
+        if let Some(pane) = panes.get(pane_id)
+            && let Ok(mut parser) = pane.screen.lock()
+        {
+            let current = parser.screen().scrollback();
+            let new_offset = if delta > 0 {
+                current.saturating_add(delta as usize)
+            } else {
+                current.saturating_sub((-delta) as usize)
+            };
+            parser.screen_mut().set_scrollback(new_offset);
+        }
+    }
+
+    /// Reset a pane's scrollback offset to 0 (show latest output).
+    pub fn reset_scrollback(&self, pane_id: &str) {
+        let panes = self.panes.lock().unwrap();
+        if let Some(pane) = panes.get(pane_id)
+            && let Ok(mut parser) = pane.screen.lock()
+        {
+            parser.screen_mut().set_scrollback(0);
+        }
+    }
+
     /// Resize a pane's PTY and VT100 parser to the given dimensions.
     pub fn resize_pane_pty(&self, pane_id: &str, rows: u16, cols: u16) -> Result<(), PaneError> {
         let panes = self.panes.lock().unwrap();
@@ -105,7 +132,7 @@ impl EmbeddedPaneController {
             })
             .map_err(|e| PaneError::CommandFailed(format!("PTY resize failed: {e}")))?;
         if let Ok(mut parser) = pane.screen.lock() {
-            parser.set_size(rows, cols);
+            parser.screen_mut().set_size(rows, cols);
         }
         Ok(())
     }
@@ -405,6 +432,104 @@ mod tests {
         let contents = parser.screen().contents();
         // The screen should have some content (at minimum the echoed text or shell prompt)
         assert!(!contents.trim().is_empty());
+
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    #[test]
+    fn pane_ids_are_sequential() {
+        let ctrl = EmbeddedPaneController::new();
+        let id1 = ctrl.create_pane(None, None).unwrap();
+        let id2 = ctrl.create_pane(None, None).unwrap();
+        let id3 = ctrl.create_pane(None, None).unwrap();
+
+        let n1: u64 = id1.parse().unwrap();
+        let n2: u64 = id2.parse().unwrap();
+        let n3: u64 = id3.parse().unwrap();
+        assert_eq!(n2, n1 + 1);
+        assert_eq!(n3, n2 + 1);
+
+        ctrl.close_pane(&id1).unwrap();
+        ctrl.close_pane(&id2).unwrap();
+        ctrl.close_pane(&id3).unwrap();
+    }
+
+    #[test]
+    fn pane_ids_sorted_in_list() {
+        let ctrl = EmbeddedPaneController::new();
+        let id1 = ctrl.create_pane(None, None).unwrap();
+        let id2 = ctrl.create_pane(None, None).unwrap();
+        let id3 = ctrl.create_pane(None, None).unwrap();
+
+        let ids = ctrl.pane_ids();
+        assert_eq!(ids, vec![id1.clone(), id2.clone(), id3.clone()]);
+
+        ctrl.close_pane(&id1).unwrap();
+        ctrl.close_pane(&id2).unwrap();
+        ctrl.close_pane(&id3).unwrap();
+    }
+
+    #[test]
+    fn focused_pane_id_tracks_focus() {
+        let ctrl = EmbeddedPaneController::new();
+        assert!(ctrl.focused_pane_id().is_none());
+
+        let id1 = ctrl.create_pane(None, None).unwrap();
+        let id2 = ctrl.create_pane(None, None).unwrap();
+
+        ctrl.focus_pane(&id1).unwrap();
+        assert_eq!(ctrl.focused_pane_id().as_deref(), Some(id1.as_str()));
+
+        ctrl.focus_pane(&id2).unwrap();
+        assert_eq!(ctrl.focused_pane_id().as_deref(), Some(id2.as_str()));
+
+        ctrl.close_pane(&id1).unwrap();
+        ctrl.close_pane(&id2).unwrap();
+    }
+
+    #[test]
+    fn write_raw_bytes_no_cr_appended() {
+        let ctrl = EmbeddedPaneController::new();
+        let id = ctrl.create_pane(None, None).unwrap();
+
+        // write_raw_bytes should succeed without error
+        ctrl.write_raw_bytes(&id, b"hello").unwrap();
+
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    #[test]
+    fn write_raw_bytes_nonexistent_pane_errors() {
+        let ctrl = EmbeddedPaneController::new();
+        assert!(ctrl.write_raw_bytes("999", b"hello").is_err());
+    }
+
+    #[test]
+    fn rename_nonexistent_pane_errors() {
+        let ctrl = EmbeddedPaneController::new();
+        assert!(ctrl.rename_pane("999", "name").is_err());
+    }
+
+    #[test]
+    fn create_pane_with_command() {
+        let ctrl = EmbeddedPaneController::new();
+        let id = ctrl.create_pane(Some("echo test"), None).unwrap();
+
+        let panes = ctrl.list_panes().unwrap();
+        assert_eq!(panes[0].title, "echo test");
+        assert_eq!(panes[0].command.as_deref(), Some("echo test"));
+
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    #[test]
+    fn create_pane_default_name_is_shell() {
+        let ctrl = EmbeddedPaneController::new();
+        let id = ctrl.create_pane(None, None).unwrap();
+
+        let panes = ctrl.list_panes().unwrap();
+        assert_eq!(panes[0].title, "shell");
+        assert!(panes[0].command.is_none());
 
         ctrl.close_pane(&id).unwrap();
     }

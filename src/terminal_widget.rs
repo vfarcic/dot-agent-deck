@@ -105,7 +105,7 @@ impl Widget for TerminalWidget {
                     Some(cell) => {
                         let ch = cell.contents();
                         let style = cell_style(cell);
-                        let display = if ch.is_empty() { " " } else { &ch };
+                        let display = if ch.is_empty() { " " } else { ch };
                         spans.push(Span::styled(display.to_string(), style));
                         col += 1;
                     }
@@ -126,13 +126,12 @@ impl Widget for TerminalWidget {
             Paragraph::new(line).render(line_area, buf);
         }
 
-        // Render cursor if focused.
-        if self.focused {
+        // Render a visible block cursor when focused and not scrolled back.
+        if self.focused && screen.scrollback() == 0 && !screen.hide_cursor() {
             let cursor_pos = screen.cursor_position();
             let cursor_row = cursor_pos.0 as usize;
             let cursor_col = cursor_pos.1 as usize;
 
-            // Only render cursor if it's in the visible area.
             if cursor_row >= start_row && cursor_row - start_row < rows && cursor_col < cols {
                 let cx = inner.x + cursor_col as u16;
                 let cy = inner.y + (cursor_row - start_row) as u16;
@@ -141,7 +140,7 @@ impl Widget for TerminalWidget {
                     existing.set_style(
                         Style::default()
                             .fg(Color::Black)
-                            .bg(Color::White)
+                            .bg(Color::LightGreen)
                             .add_modifier(Modifier::BOLD),
                     );
                 }
@@ -212,5 +211,76 @@ mod tests {
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
         // Should not panic — just verifying unfocused rendering works.
+    }
+
+    #[test]
+    fn terminal_widget_renders_ansi_colors() {
+        // Red foreground text: ESC[31m
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(8, 38, 0)));
+        parser.lock().unwrap().process(b"\x1b[31mRed text\x1b[0m");
+
+        let widget = TerminalWidget::new(parser, "colors".to_string(), false);
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+
+        // Verify the 'R' in "Red text" has a red-ish foreground (indexed color 1)
+        let cell = buf.cell((1, 1)).unwrap(); // inner area starts at x=1,y=1
+        assert_eq!(cell.symbol(), "R");
+        assert_eq!(cell.fg, Color::Indexed(1)); // ANSI color 1 = red
+    }
+
+    #[test]
+    fn terminal_widget_shows_cursor_when_focused() {
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(8, 38, 0)));
+        // Cursor starts at (0,0), which maps to inner area (1,1)
+        let widget = TerminalWidget::new(parser, "cursor".to_string(), true);
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+
+        let cell = buf.cell((1, 1)).unwrap();
+        // Cursor cell should have bright green block cursor
+        assert_eq!(cell.bg, Color::LightGreen);
+        assert_eq!(cell.fg, Color::Black);
+    }
+
+    #[test]
+    fn terminal_widget_empty_parser_no_panic() {
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let widget = TerminalWidget::new(parser, "empty".to_string(), true);
+        let area = Rect::new(0, 0, 82, 26);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+    }
+
+    #[test]
+    fn terminal_widget_small_area_no_panic() {
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        parser.lock().unwrap().process(b"Hello world\nSecond line");
+
+        let widget = TerminalWidget::new(parser, "small".to_string(), false);
+        // Very small area — just 3 rows (borders + 1 inner row)
+        let area = Rect::new(0, 0, 10, 3);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+    }
+
+    #[test]
+    fn cell_style_bold_italic_underline() {
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(4, 40, 0)));
+        // ESC[1m = bold, ESC[3m = italic, ESC[4m = underline
+        parser.lock().unwrap().process(b"\x1b[1;3;4mStyled\x1b[0m");
+
+        let screen = parser.lock().unwrap();
+        let cell = screen.screen().cell(0, 0).unwrap();
+        assert!(cell.bold());
+        assert!(cell.italic());
+        assert!(cell.underline());
+
+        let style = cell_style(cell);
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert!(style.add_modifier.contains(Modifier::ITALIC));
+        assert!(style.add_modifier.contains(Modifier::UNDERLINED));
     }
 }

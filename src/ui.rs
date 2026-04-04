@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -301,6 +302,27 @@ struct UiState {
     update_available: Option<String>,
     /// Layout mode for embedded terminal panes (stacked or tiled).
     pane_layout: PaneLayout,
+    /// Mouse text selection state for copy support.
+    selection: Option<TextSelection>,
+    /// Screen rect of the focused pane (set during render, used for mouse mapping).
+    focused_pane_rect: Option<Rect>,
+    /// Tracks last click time and position for double/triple-click detection.
+    last_click: Option<(std::time::Instant, u16, u16, u8)>, // (time, col, row, click_count)
+}
+
+/// Tracks an in-progress or completed mouse text selection within a pane.
+#[derive(Debug, Clone)]
+struct TextSelection {
+    /// Pane-relative start column (0-based, within inner area).
+    start_col: u16,
+    /// Pane-relative start row.
+    start_row: u16,
+    /// Pane-relative end column.
+    end_col: u16,
+    /// Pane-relative end row.
+    end_row: u16,
+    /// The focused pane's Rect at selection start (screen coordinates).
+    pane_rect: Rect,
 }
 
 impl UiState {
@@ -322,6 +344,9 @@ impl UiState {
             last_bell_status: HashMap::new(),
             update_available: None,
             pane_layout: PaneLayout::Stacked,
+            selection: None,
+            focused_pane_rect: None,
+            last_click: None,
         }
     }
 }
@@ -470,27 +495,26 @@ enum KeyResult {
 
 /// Convert a crossterm `KeyEvent` into the byte sequence expected by a terminal PTY.
 fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
-    // Ctrl+letter → control codes 0x01–0x1a
+    // Alt modifier: wrap the base key bytes with an ESC prefix.
+    let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // Ctrl+letter → control codes 0x01–0x1a (Alt adds ESC prefix)
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && let KeyCode::Char(c) = key.code
     {
         let c = c.to_ascii_lowercase();
         if c.is_ascii_lowercase() {
-            return Some(vec![c as u8 - b'a' + 1]);
+            let ctrl = vec![c as u8 - b'a' + 1];
+            return Some(if has_alt {
+                [vec![0x1b], ctrl].concat()
+            } else {
+                ctrl
+            });
         }
     }
 
-    // Alt+key → ESC prefix + key bytes
-    if key.modifiers.contains(KeyModifiers::ALT)
-        && let KeyCode::Char(c) = key.code
-    {
-        let mut bytes = vec![0x1b];
-        let mut buf = [0u8; 4];
-        bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-        return Some(bytes);
-    }
-
-    match key.code {
+    // Base key bytes (without Alt). Alt prefix is added at the end.
+    let base: Option<Vec<u8>> = match key.code {
         KeyCode::Char(c) => {
             let mut buf = [0u8; 4];
             Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
@@ -529,7 +553,124 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
         }
         KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
         _ => None,
+    };
+
+    // Prepend ESC for Alt-modified keys (e.g., Alt+Backspace → \x1b\x7f).
+    match (has_alt, base) {
+        (true, Some(b)) => Some([vec![0x1b], b].concat()),
+        (false, b) => b,
+        (true, None) => None,
     }
+}
+
+/// Extract text from a vt100 screen for the given selection region.
+fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection) -> String {
+    let (sr, sc, er, ec) = if (sel.start_row, sel.start_col) <= (sel.end_row, sel.end_col) {
+        (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
+    } else {
+        (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
+    };
+    let mut result = String::new();
+    let (screen_rows, screen_cols) = screen.size();
+    for row in sr..=er {
+        if row >= screen_rows {
+            break;
+        }
+        let col_start = if row == sr { sc } else { 0 };
+        let col_end = if row == er {
+            ec
+        } else {
+            screen_cols.saturating_sub(1)
+        };
+        for col in col_start..=col_end.min(screen_cols.saturating_sub(1)) {
+            if let Some(cell) = screen.cell(row, col) {
+                let ch = cell.contents();
+                if ch.is_empty() {
+                    result.push(' ');
+                } else {
+                    result.push_str(ch);
+                }
+            }
+        }
+        // Trim trailing spaces per line and add newline between lines.
+        if row < er {
+            let trimmed = result.trim_end_matches(' ');
+            let trimmed_len = trimmed.len();
+            result.truncate(trimmed_len);
+            result.push('\n');
+        }
+    }
+    let trimmed = result.trim_end_matches(' ');
+    trimmed.to_string()
+}
+
+/// Copy text to the system clipboard using the OSC 52 escape sequence.
+/// Writes directly to `/dev/tty` to bypass ratatui's buffered terminal output.
+fn copy_to_clipboard_osc52(text: &str) {
+    use std::io::Write;
+    let encoded = base64_encode(text.as_bytes());
+    // Use ST (\x1b\\) terminator — more widely supported than BEL (\x07) in raw mode.
+    let seq = format!("\x1b]52;c;{encoded}\x1b\\");
+    // Write to /dev/tty directly so the escape sequence reaches the outer terminal
+    // even when ratatui has captured stdout.
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = tty.write_all(seq.as_bytes());
+        let _ = tty.flush();
+    }
+}
+
+/// Minimal base64 encoder (no external dependency needed).
+fn base64_encode(input: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
+/// Find the word boundaries around (row, col) in a vt100 screen.
+/// Returns (start_col, end_col) for the word at the given position.
+fn word_bounds_at(screen: &vt100::Screen, row: u16, col: u16) -> (u16, u16) {
+    let (_rows, cols) = screen.size();
+    let is_word_char = |c: u16| -> bool {
+        screen
+            .cell(row, c)
+            .map(|cell| {
+                let ch = cell.contents();
+                // Treat only alphanumeric chars and underscores as word characters.
+                !ch.is_empty()
+                    && ch
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+            .unwrap_or(false)
+    };
+    let mut start = col;
+    while start > 0 && is_word_char(start - 1) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < cols && is_word_char(end + 1) {
+        end += 1;
+    }
+    (start, end)
 }
 
 fn handle_pane_input_key(key: KeyEvent) -> KeyResult {
@@ -933,15 +1074,27 @@ pub fn run_tui(
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
+        );
         ratatui::restore();
         original_hook(info);
     }));
+
+    // Enable mouse capture and bracketed paste so events reach our event loop.
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste,
+    )?;
 
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config);
 
-    loop {
+    'outer: loop {
         // Expire stale status messages
         if let Some((_, created)) = &ui.status_message
             && created.elapsed() > std::time::Duration::from_secs(3)
@@ -1040,9 +1193,15 @@ pub fn run_tui(
             let _ = std::io::stdout().flush();
         }
 
-        // Use a short poll interval for responsive terminal input (~60fps).
-        // The render at the top of the loop is cheap when nothing changes (ratatui diffs).
-        if crossterm::event::poll(std::time::Duration::from_millis(16))? {
+        // Drain all pending events before re-rendering. This avoids a full
+        // render cycle between each keystroke, which eliminates perceived typing
+        // latency in PaneInput mode.
+        if !crossterm::event::poll(std::time::Duration::from_millis(16))? {
+            continue;
+        }
+
+        // Process events in a tight loop until the queue is empty.
+        loop {
             let ev = event::read()?;
 
             // Handle terminal resize: update PTY dimensions for all embedded panes.
@@ -1075,37 +1234,217 @@ pub fn run_tui(
                         }
                     }
                 }
+                break; // re-render after resize
+            }
+
+            // Handle mouse events: scroll, text selection, and copy.
+            if let Event::Mouse(mouse) = ev {
+                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                    && let Some(pane_id) = embedded.focused_pane_id()
+                {
+                    match mouse.kind {
+                        crossterm::event::MouseEventKind::ScrollUp
+                            if ui.mode == UiMode::PaneInput =>
+                        {
+                            embedded.scroll_pane(&pane_id, 3);
+                        }
+                        crossterm::event::MouseEventKind::ScrollDown
+                            if ui.mode == UiMode::PaneInput =>
+                        {
+                            embedded.scroll_pane(&pane_id, -3);
+                        }
+                        crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        ) => {
+                            if let Some(rect) = ui.focused_pane_rect {
+                                let inner_x = rect.x + 1;
+                                let inner_y = rect.y + 1;
+                                let inner_w = rect.width.saturating_sub(2);
+                                let inner_h = rect.height.saturating_sub(2);
+                                if mouse.column >= inner_x
+                                    && mouse.column < inner_x + inner_w
+                                    && mouse.row >= inner_y
+                                    && mouse.row < inner_y + inner_h
+                                {
+                                    let col = mouse.column - inner_x;
+                                    let row = mouse.row - inner_y;
+
+                                    // Detect multi-click (double/triple).
+                                    // Require same row and nearby column (within 3 cells)
+                                    // to handle slight mouse movement between clicks.
+                                    let now = std::time::Instant::now();
+                                    let click_count = if let Some((t, lc, lr, cnt)) = ui.last_click
+                                    {
+                                        if now.duration_since(t).as_millis() < 400
+                                            && lr == row
+                                            && col.abs_diff(lc) <= 3
+                                        {
+                                            (cnt + 1).min(3)
+                                        } else {
+                                            1
+                                        }
+                                    } else {
+                                        1
+                                    };
+                                    ui.last_click = Some((now, col, row, click_count));
+
+                                    match click_count {
+                                        2 => {
+                                            // Double-click: select word.
+                                            if let Some(screen_arc) = embedded.get_screen(&pane_id)
+                                                && let Ok(parser) = screen_arc.lock()
+                                            {
+                                                let (wstart, wend) =
+                                                    word_bounds_at(parser.screen(), row, col);
+                                                ui.selection = Some(TextSelection {
+                                                    start_col: wstart,
+                                                    start_row: row,
+                                                    end_col: wend,
+                                                    end_row: row,
+                                                    pane_rect: rect,
+                                                });
+                                            }
+                                        }
+                                        3 => {
+                                            // Triple-click: select entire line.
+                                            ui.selection = Some(TextSelection {
+                                                start_col: 0,
+                                                start_row: row,
+                                                end_col: inner_w.saturating_sub(1),
+                                                end_row: row,
+                                                pane_rect: rect,
+                                            });
+                                        }
+                                        _ => {
+                                            // Single click: start drag selection.
+                                            ui.selection = Some(TextSelection {
+                                                start_col: col,
+                                                start_row: row,
+                                                end_col: col,
+                                                end_row: row,
+                                                pane_rect: rect,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        crossterm::event::MouseEventKind::Drag(
+                            crossterm::event::MouseButton::Left,
+                        ) => {
+                            // Extend selection.
+                            if let Some(ref mut sel) = ui.selection {
+                                let inner_x = sel.pane_rect.x + 1;
+                                let inner_y = sel.pane_rect.y + 1;
+                                let inner_w = sel.pane_rect.width.saturating_sub(2);
+                                let inner_h = sel.pane_rect.height.saturating_sub(2);
+                                sel.end_col = mouse
+                                    .column
+                                    .saturating_sub(inner_x)
+                                    .min(inner_w.saturating_sub(1));
+                                sel.end_row = mouse
+                                    .row
+                                    .saturating_sub(inner_y)
+                                    .min(inner_h.saturating_sub(1));
+                            }
+                        }
+                        crossterm::event::MouseEventKind::Up(
+                            crossterm::event::MouseButton::Left,
+                        ) => {
+                            // Copy selected text to clipboard via OSC 52.
+                            if let Some(ref sel) = ui.selection
+                                && let Some(screen_arc) = embedded.get_screen(&pane_id)
+                                && let Ok(parser) = screen_arc.lock()
+                            {
+                                let text = extract_selection_text(parser.screen(), sel);
+                                if !text.is_empty() {
+                                    copy_to_clipboard_osc52(&text);
+                                    ui.status_message = Some((
+                                        "Copied to clipboard".to_string(),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                            }
+                            // Keep selection visible after multi-click; clear on single-click drag.
+                            let was_multiclick = ui
+                                .last_click
+                                .map(|(_, _, _, cnt)| cnt >= 2)
+                                .unwrap_or(false);
+                            if !was_multiclick {
+                                ui.selection = None;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                    break;
+                }
+                continue;
+            }
+
+            // Handle paste: wrap in bracketed paste sequences if the child app enabled it.
+            if let Event::Paste(text) = ev {
+                if ui.mode == UiMode::PaneInput
+                    && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                    && let Some(pane_id) = embedded.focused_pane_id()
+                {
+                    embedded.reset_scrollback(&pane_id);
+                    let use_bracketed = embedded
+                        .get_screen(&pane_id)
+                        .and_then(|s| s.lock().ok().map(|p| p.screen().bracketed_paste()))
+                        .unwrap_or(false);
+                    let mut payload = Vec::new();
+                    if use_bracketed {
+                        payload.extend_from_slice(b"\x1b[200~");
+                    }
+                    payload.extend_from_slice(text.as_bytes());
+                    if use_bracketed {
+                        payload.extend_from_slice(b"\x1b[201~");
+                    }
+                    let _ = embedded.write_raw_bytes(&pane_id, &payload);
+                }
+                if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                    break;
+                }
                 continue;
             }
 
             let Event::Key(key) = ev else {
+                if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                    break;
+                }
                 continue;
             };
 
             // Only handle key-press events (ignore release/repeat on platforms that send them).
             if key.kind != crossterm::event::KeyEventKind::Press {
+                if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                    break;
+                }
                 continue;
             }
 
             // 1..9 in Normal mode: jump to card N and focus its pane
+            let mut shortcut_handled = false;
             if ui.mode == UiMode::Normal
                 && let KeyCode::Char(c @ '1'..='9') = key.code
                 && key.modifiers == KeyModifiers::NONE
             {
                 let idx = (c as usize) - ('1' as usize);
                 focus_deck(idx, &mut ui, &filtered, &snapshot, &state, &*pane);
-                continue;
+                shortcut_handled = true;
             }
 
             // ---------------------------------------------------------------
             // Global Ctrl+key shortcuts (work from any mode / future pane focus)
             // ---------------------------------------------------------------
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if !shortcut_handled && key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
                     // Ctrl+d: jump to dashboard (ensure Normal mode)
                     KeyCode::Char('d') => {
                         ui.mode = UiMode::Normal;
-                        continue;
+                        shortcut_handled = true;
                     }
                     // Ctrl+t: toggle layout
                     KeyCode::Char('t') => {
@@ -1155,7 +1494,7 @@ pub fn run_tui(
                         }
                         ui.status_message =
                             Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
-                        continue;
+                        shortcut_handled = true;
                     }
                     // Ctrl+n: new pane (open directory picker)
                     KeyCode::Char('n') => {
@@ -1163,7 +1502,7 @@ pub fn run_tui(
                         ui.dir_picker = Some(DirPickerState::new(
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
                         ));
-                        continue;
+                        shortcut_handled = true;
                     }
                     // Ctrl+w: close selected pane
                     KeyCode::Char('w') => {
@@ -1180,7 +1519,7 @@ pub fn run_tui(
                             ui.status_message =
                                 Some((format!("Closed pane {pane_id}"), std::time::Instant::now()));
                         }
-                        continue;
+                        shortcut_handled = true;
                     }
                     _ => {}
                 }
@@ -1189,25 +1528,29 @@ pub fn run_tui(
             let selected_id: Option<String> =
                 filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
 
-            let has_pending_permission = selected_id
-                .as_ref()
-                .and_then(|sid| snapshot.sessions.get(sid))
-                .and_then(|s| s.next_pending_permission())
-                .is_some();
+            // Mode-specific key handling (skip if a global shortcut was handled).
+            let result = if shortcut_handled {
+                KeyResult::Continue
+            } else {
+                // TODO(prd-38): permission UI disabled — see PRD for redesign
+                let has_pending_permission = false;
 
-            let result = match ui.mode {
-                UiMode::Normal => handle_normal_key(key, &mut ui, total, has_pending_permission),
-                UiMode::Filter => handle_filter_key(key, &mut ui),
-                UiMode::Help => handle_help_key(key, &mut ui),
-                UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
-                UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
-                UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
-                UiMode::PaneInput => handle_pane_input_key(key),
-                UiMode::QuitConfirm => handle_quit_confirm_key(key, &mut ui),
+                match ui.mode {
+                    UiMode::Normal => {
+                        handle_normal_key(key, &mut ui, total, has_pending_permission)
+                    }
+                    UiMode::Filter => handle_filter_key(key, &mut ui),
+                    UiMode::Help => handle_help_key(key, &mut ui),
+                    UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
+                    UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
+                    UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
+                    UiMode::PaneInput => handle_pane_input_key(key),
+                    UiMode::QuitConfirm => handle_quit_confirm_key(key, &mut ui),
+                }
             };
 
             match result {
-                KeyResult::Quit => break,
+                KeyResult::Quit => break 'outer,
                 KeyResult::Focus => {
                     if let Some(ref sid) = selected_id
                         && let Some(session) = snapshot.sessions.get(sid)
@@ -1378,10 +1721,13 @@ pub fn run_tui(
                 KeyResult::ForwardToPane(bytes) => {
                     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
                         && let Some(pane_id) = embedded.focused_pane_id()
-                        && let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes)
                     {
-                        ui.status_message =
-                            Some((format!("PTY write failed: {e}"), std::time::Instant::now()));
+                        // Reset scrollback to live output on any keystroke.
+                        embedded.reset_scrollback(&pane_id);
+                        if let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes) {
+                            ui.status_message =
+                                Some((format!("PTY write failed: {e}"), std::time::Instant::now()));
+                        }
                     }
                 }
                 KeyResult::Continue => {}
@@ -1398,9 +1744,24 @@ pub fn run_tui(
                     }
                 }
             }
-        }
+
+            // In PaneInput mode, drain remaining events to reduce typing latency.
+            // In all other modes, break immediately to re-render so UI state
+            // transitions (mode changes, focus, dialogs) take effect before the
+            // next event is processed.
+            if ui.mode != UiMode::PaneInput
+                || !crossterm::event::poll(std::time::Duration::from_millis(0))?
+            {
+                break;
+            }
+        } // end inner event-drain loop
     }
 
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste,
+    );
     ratatui::restore();
     Ok(())
 }
@@ -1457,14 +1818,23 @@ fn render_frame(
             Constraint::Fill(1),
         ])
         .split(dashboard_area);
-        let msg = Paragraph::new("No active sessions. Press n to create a pane.")
-            .style(Style::default().fg(Color::Gray))
-            .centered();
+        let msg = Paragraph::new(format!(
+            "No active sessions. Press {MOD_KEY}+n to create a pane."
+        ))
+        .style(Style::default().fg(Color::Gray))
+        .centered();
         frame.render_widget(msg, vertical[1]);
         render_bottom_bar(frame, ui, hints_area, has_pane_control);
 
         if let Some(right) = panes_area {
-            render_terminal_panes(frame, embedded, right, pane_layout, &ui.pane_display_names);
+            ui.focused_pane_rect = render_terminal_panes(
+                frame,
+                embedded,
+                right,
+                pane_layout,
+                &ui.pane_display_names,
+                &ui.selection,
+            );
         }
 
         if ui.mode == UiMode::Help {
@@ -1610,7 +1980,14 @@ fn render_frame(
 
     // Render terminal panes on the right side
     if let Some(right) = panes_area {
-        render_terminal_panes(frame, embedded, right, pane_layout, &ui.pane_display_names);
+        ui.focused_pane_rect = render_terminal_panes(
+            frame,
+            embedded,
+            right,
+            pane_layout,
+            &ui.pane_display_names,
+            &ui.selection,
+        );
     }
 
     // Overlays (drawn last, on top)
@@ -1638,14 +2015,12 @@ fn render_terminal_panes(
     area: Rect,
     layout: PaneLayout,
     display_names: &HashMap<String, String>,
-) {
-    let ctrl = match embedded {
-        Some(c) => c,
-        None => return,
-    };
+    selection: &Option<TextSelection>,
+) -> Option<Rect> {
+    let ctrl = embedded?;
     let pane_ids = ctrl.pane_ids();
     if pane_ids.is_empty() {
-        return;
+        return None;
     }
     let focused_id = ctrl.focused_pane_id();
 
@@ -1663,6 +2038,10 @@ fn render_terminal_panes(
         format!("pane {id}")
     };
 
+    // Track the focused pane's rect and screen for hardware cursor positioning.
+    let mut focused_pane_rect: Option<Rect> = None;
+    let mut focused_screen: Option<std::sync::Arc<std::sync::Mutex<vt100::Parser>>> = None;
+
     match layout {
         PaneLayout::Tiled => {
             let constraints: Vec<Constraint> = pane_ids
@@ -1674,7 +2053,11 @@ fn render_terminal_panes(
                 if let Some(screen) = ctrl.get_screen(pane_id) {
                     let focused = focused_id.as_deref() == Some(pane_id.as_str());
                     let title = pane_name(pane_id);
-                    let widget = TerminalWidget::new(screen, title, focused);
+                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused);
+                    if focused {
+                        focused_pane_rect = Some(chunks[i]);
+                        focused_screen = Some(screen);
+                    }
                     frame.render_widget(widget, chunks[i]);
                 }
             }
@@ -1708,7 +2091,11 @@ fn render_terminal_panes(
                 if is_expanded {
                     if let Some(screen) = ctrl.get_screen(pane_id) {
                         let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
-                        let widget = TerminalWidget::new(screen, title, is_focused);
+                        let widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused);
+                        if is_focused {
+                            focused_pane_rect = Some(chunks[i]);
+                            focused_screen = Some(screen);
+                        }
                         frame.render_widget(widget, chunks[i]);
                     }
                 } else {
@@ -1724,6 +2111,65 @@ fn render_terminal_panes(
             }
         }
     }
+
+    // Set hardware cursor in the focused pane for real blinking.
+    if let Some(rect) = focused_pane_rect
+        && let Some(screen_arc) = focused_screen
+        && let Ok(parser) = screen_arc.lock()
+    {
+        let screen = parser.screen();
+        if !screen.hide_cursor() && screen.scrollback() == 0 {
+            let (crow, ccol) = screen.cursor_position();
+            // Inner area: 1-cell border on each side.
+            let inner_x = rect.x + 1;
+            let inner_y = rect.y + 1;
+            let inner_w = rect.width.saturating_sub(2);
+            let inner_h = rect.height.saturating_sub(2);
+            if ccol < inner_w && crow < inner_h {
+                frame.set_cursor_position(Position::new(inner_x + ccol, inner_y + crow));
+            }
+        }
+    }
+
+    // Render selection highlight over the focused pane.
+    if let Some(sel) = selection
+        && let Some(rect) = focused_pane_rect
+    {
+        let inner_x = rect.x + 1;
+        let inner_y = rect.y + 1;
+        let inner_w = rect.width.saturating_sub(2);
+        let inner_h = rect.height.saturating_sub(2);
+        // Normalize so start <= end.
+        let (sr, sc, er, ec) = if (sel.start_row, sel.start_col) <= (sel.end_row, sel.end_col) {
+            (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
+        } else {
+            (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
+        };
+        let buf = frame.buffer_mut();
+        for row in sr..=er.min(inner_h.saturating_sub(1)) {
+            let col_start = if row == sr { sc } else { 0 };
+            let col_end = if row == er {
+                ec
+            } else {
+                inner_w.saturating_sub(1)
+            };
+            for col in col_start..=col_end.min(inner_w.saturating_sub(1)) {
+                let x = inner_x + col;
+                let y = inner_y + row;
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    // Invert colors for selection highlight.
+                    cell.set_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::LightCyan)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+            }
+        }
+    }
+
+    focused_pane_rect
 }
 
 fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
@@ -1928,9 +2374,10 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
             .add_modifier(Modifier::BOLD),
     ));
     help_text.push(Line::from(""));
-    help_text.push(Line::from("  y             Allow permission"));
-    help_text.push(Line::from("  n             Deny permission"));
-    help_text.push(Line::from("  (only when card has pending prompt)"));
+    // TODO(prd-38): permission UI disabled — see PRD for redesign
+    // help_text.push(Line::from("  y             Allow permission"));
+    // help_text.push(Line::from("  n             Deny permission"));
+    // help_text.push(Line::from("  (only when card has pending prompt)"));
 
     help_text.push(Line::from(""));
     help_text.push(Line::styled(
@@ -2196,15 +2643,10 @@ fn render_session_card(
     let max_title = (area.width as usize).saturating_sub(status_text.chars().count() + 2);
     title_left = truncate_with_ellipsis(&title_left, max_title);
 
-    let has_permission = session.next_pending_permission().is_some();
+    // TODO(prd-38): permission UI disabled — see PRD for redesign
+    let has_permission = false;
 
-    let border_style = if has_permission && is_selected {
-        Style::default()
-            .fg(Color::LightMagenta)
-            .add_modifier(Modifier::BOLD)
-    } else if has_permission {
-        Style::default().fg(Color::LightMagenta)
-    } else if is_selected {
+    let border_style = if is_selected {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
