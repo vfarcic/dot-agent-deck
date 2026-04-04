@@ -1,5 +1,6 @@
 pub mod config;
 pub mod daemon;
+pub mod embedded_pane;
 pub mod error;
 pub mod event;
 pub mod hook;
@@ -7,5 +8,6 @@ pub mod hooks_manage;
 pub mod opencode_manage;
 pub mod pane;
 pub mod state;
+pub mod terminal_widget;
 pub mod ui;
 pub mod version;

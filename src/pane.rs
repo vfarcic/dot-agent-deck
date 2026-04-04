@@ -271,11 +271,7 @@ impl PaneController for NoopController {
 // ---------------------------------------------------------------------------
 
 pub fn detect_multiplexer() -> Box<dyn PaneController> {
-    if std::env::var("ZELLIJ").is_ok() {
-        Box::new(ZellijController::new())
-    } else {
-        Box::new(NoopController)
-    }
+    Box::new(crate::embedded_pane::EmbeddedPaneController::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -424,16 +420,9 @@ mod tests {
     }
 
     #[test]
-    fn detect_multiplexer_without_zellij() {
-        // Temporarily remove ZELLIJ so the detector falls back to NoopController
-        let prev = std::env::var("ZELLIJ").ok();
-        // SAFETY: test is single-threaded for this env var; restored immediately after.
-        unsafe { std::env::remove_var("ZELLIJ") };
+    fn detect_multiplexer_returns_embedded() {
         let ctrl = detect_multiplexer();
-        if let Some(val) = prev {
-            unsafe { std::env::set_var("ZELLIJ", val) };
-        }
-        assert_eq!(ctrl.name(), "none");
-        assert!(!ctrl.is_available());
+        assert_eq!(ctrl.name(), "embedded");
+        assert!(ctrl.is_available());
     }
 }

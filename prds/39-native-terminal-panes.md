@@ -136,7 +136,7 @@ Replace Zellij entirely with **Ratatui-native embedded terminal panes**. Each ag
 ## Milestones
 
 - [ ] Crate evaluation and proof of concept — spawn a PTY with `portable-pty`, parse output with `vt100`, render a single terminal in Ratatui. Validate that Claude Code / shell output renders correctly.
-- [ ] `EmbeddedPaneController` core — implement `create_pane`, `close_pane`, `list_panes`, `focus_pane`, `write_to_pane` against `PaneController` trait using PTY + VT parser
+- [x] `EmbeddedPaneController` core — implement `create_pane`, `close_pane`, `list_panes`, `focus_pane`, `write_to_pane` against `PaneController` trait using PTY + VT parser
 - [ ] Terminal widget rendering — Ratatui widget that renders VT grid cells with colors, cursor, and scrollback. Handles resize notifications (SIGWINCH).
 - [ ] Layout engine — stacked and tiled modes replacing Zellij swap layouts. Dashboard 33% left, panes 67% right. Toggle with existing `Alt+t` keybinding.
 - [ ] Input routing — keyboard forwarding to focused pane's PTY. Dashboard keybindings (Alt+d, Alt+w, n, etc.) intercepted before forwarding. Pane focus switching.
