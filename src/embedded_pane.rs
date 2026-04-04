@@ -245,17 +245,21 @@ impl PaneController for EmbeddedPaneController {
     }
 
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
-        let mut panes = self.panes.lock().unwrap();
-        if let Some(mut pane) = panes.remove(pane_id) {
-            // Kill the child process and wait for it to exit before dropping
-            // the MasterPty handle (which closes the PTY fd).
-            let _ = pane.child.kill();
-            let _ = pane.child.wait();
-        } else {
-            return Err(PaneError::CommandFailed(format!(
-                "Pane {pane_id} not found"
-            )));
-        }
+        let mut pane = {
+            let mut panes = self.panes.lock().unwrap();
+            match panes.remove(pane_id) {
+                Some(p) => p,
+                None => {
+                    return Err(PaneError::CommandFailed(format!(
+                        "Pane {pane_id} not found"
+                    )));
+                }
+            }
+        };
+        // Kill the child process and wait for it to exit after releasing the
+        // lock so we don't hold the mutex during blocking I/O.
+        let _ = pane.child.kill();
+        let _ = pane.child.wait();
         Ok(())
     }
 

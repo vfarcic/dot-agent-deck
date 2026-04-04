@@ -138,10 +138,17 @@ impl AppState {
     pub fn apply_event(&mut self, mut event: AgentEvent) {
         // Only accept events from panes managed by our app.
         // Events without a pane_id (external agents) are rejected when we have
-        // managed panes. Events with an unknown pane_id are always rejected.
+        // managed panes. Events with an unknown pane_id are rejected unless it
+        // is a SessionStart (which may arrive before register_pane during startup).
         if let Some(ref pane_id) = event.pane_id {
             if !self.managed_pane_ids.contains(pane_id) {
-                return;
+                if event.event_type == EventType::SessionStart {
+                    // Auto-register the pane to handle the startup race where
+                    // the hook fires before register_pane is called.
+                    self.managed_pane_ids.insert(pane_id.clone());
+                } else {
+                    return;
+                }
             }
         } else if !self.managed_pane_ids.is_empty() {
             return;

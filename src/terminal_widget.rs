@@ -98,22 +98,32 @@ impl Widget for TerminalWidget {
 
             let mut spans = Vec::new();
             let mut col = 0;
+            let mut run_text = String::new();
+            let mut run_style = Style::default();
 
             while col < cols {
                 let cell = screen.cell(row_idx as u16, col as u16);
-                match cell {
+                let (ch, style) = match cell {
                     Some(cell) => {
-                        let ch = cell.contents();
-                        let style = cell_style(cell);
-                        let display = if ch.is_empty() { " " } else { ch };
-                        spans.push(Span::styled(display.to_string(), style));
-                        col += 1;
+                        let c = cell.contents();
+                        let s = cell_style(cell);
+                        (if c.is_empty() { " " } else { c }, s)
                     }
-                    None => {
-                        spans.push(Span::raw(" "));
-                        col += 1;
+                    None => (" ", Style::default()),
+                };
+                if style == run_style && !run_text.is_empty() {
+                    run_text.push_str(ch);
+                } else {
+                    if !run_text.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut run_text), run_style));
                     }
+                    run_text.push_str(ch);
+                    run_style = style;
                 }
+                col += 1;
+            }
+            if !run_text.is_empty() {
+                spans.push(Span::styled(run_text, run_style));
             }
 
             let line = Line::from(spans);

@@ -739,4 +739,62 @@ mod tests {
         assert!(input.status.is_none());
         assert!(input.cwd.is_none());
     }
+
+    #[test]
+    fn pane_id_propagated_from_env_claude_code() {
+        // Temporarily set the env var and restore afterwards.
+        let key = "DOT_AGENT_DECK_PANE_ID";
+        let prev = std::env::var(key).ok();
+        // SAFETY: test is single-threaded for this env var; no other thread reads it.
+        unsafe { std::env::set_var(key, "pane-42") };
+
+        let input = ClaudeCodeHookInput {
+            session_id: "s1".into(),
+            hook_event_name: "SessionStart".into(),
+            cwd: None,
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        assert_eq!(event.pane_id.as_deref(), Some("pane-42"));
+
+        // Restore
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn pane_id_propagated_from_env_opencode() {
+        let key = "DOT_AGENT_DECK_PANE_ID";
+        let prev = std::env::var(key).ok();
+        // SAFETY: test is single-threaded for this env var; no other thread reads it.
+        unsafe { std::env::set_var(key, "pane-99") };
+
+        let input = OpenCodeHookInput {
+            session_id: "oc-1".into(),
+            event: "session.created".into(),
+            cwd: None,
+            tool_name: None,
+            tool_input: None,
+            prompt: None,
+            status: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_opencode_event(input).unwrap();
+        assert_eq!(event.pane_id.as_deref(), Some("pane-99"));
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
 }

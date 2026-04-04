@@ -160,11 +160,12 @@ Directory lists loop end-to-end, so pressing `Up` on the first entry jumps to th
 
 | Key | Action |
 |---|---|
-| `Ctrl+d` | Return to dashboard |
+| `Ctrl+d` | Return to dashboard (intercepted globally; prevents sending EOF to focused pane) |
 | `Ctrl+n` | New pane (directory picker, then name + command form) |
 | `Ctrl+w` | Close selected agent pane |
 | `Ctrl+t` | Toggle stacked / tiled layout |
-| `Ctrl+c` | Quit (press twice to confirm) |
+
+In PaneInput mode, `Ctrl+c` is delivered to the terminal as SIGINT (0x03). From the dashboard, pressing `Ctrl+c` twice triggers the quit confirmation dialog.
 
 ## Configuration
 

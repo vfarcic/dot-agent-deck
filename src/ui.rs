@@ -743,6 +743,30 @@ fn focus_deck(
                         "PaneInput mode — type to interact, Ctrl+d for dashboard".to_string(),
                         std::time::Instant::now(),
                     ));
+                    // Recompute PTY dimensions after focus change so stacked
+                    // panes get the correct expanded/collapsed sizes.
+                    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                        let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+                        let right_width = (term_w * 67 / 100).saturating_sub(2);
+                        let pane_ids = embedded.pane_ids();
+                        let pane_count = pane_ids.len() as u16;
+                        for pid in &pane_ids {
+                            let is_focused = pid == pane_id;
+                            let rows = match ui.pane_layout {
+                                PaneLayout::Tiled => (term_h / pane_count).saturating_sub(2),
+                                PaneLayout::Stacked => {
+                                    if is_focused {
+                                        term_h.saturating_sub(2 + pane_count.saturating_sub(1))
+                                    } else {
+                                        0
+                                    }
+                                }
+                            };
+                            if rows > 0 {
+                                let _ = embedded.resize_pane_pty(pid, rows, right_width);
+                            }
+                        }
+                    }
                 }
                 Err(PaneError::CommandFailed(ref msg)) => {
                     state.blocking_write().sessions.remove(*sid);
@@ -1404,8 +1428,16 @@ pub fn run_tui(
                         crossterm::event::MouseEventKind::Up(
                             crossterm::event::MouseButton::Left,
                         ) => {
-                            // Copy selected text to clipboard via OSC 52.
+                            let was_multiclick = ui
+                                .last_click
+                                .map(|(_, _, _, cnt)| cnt >= 2)
+                                .unwrap_or(false);
+                            // Only copy when the selection is a real drag or multi-click,
+                            // not a plain single click.
                             if let Some(ref sel) = ui.selection
+                                && (was_multiclick
+                                    || sel.start_col != sel.end_col
+                                    || sel.start_row != sel.end_row)
                                 && let Some(screen_arc) = embedded.get_screen(&pane_id)
                                 && let Ok(parser) = screen_arc.lock()
                             {
@@ -1419,11 +1451,7 @@ pub fn run_tui(
                                     ));
                                 }
                             }
-                            // Keep selection visible after multi-click; clear on single-click drag.
-                            let was_multiclick = ui
-                                .last_click
-                                .map(|(_, _, _, cnt)| cnt >= 2)
-                                .unwrap_or(false);
+                            // Keep selection visible after multi-click; clear on single-click.
                             if !was_multiclick {
                                 ui.selection = None;
                             }
@@ -1565,13 +1593,20 @@ pub fn run_tui(
                             && let Some(session) = snapshot.sessions.get(&sid)
                             && let Some(ref pane_id) = session.pane_id
                         {
+                            let closed_pane_id = pane_id.clone();
                             let _ = pane.close_pane(pane_id);
                             let mut st = state.blocking_write();
                             st.sessions.remove(&sid);
-                            st.unregister_pane(pane_id);
+                            st.unregister_pane(&closed_pane_id);
                             drop(st);
-                            ui.status_message =
-                                Some((format!("Closed pane {pane_id}"), std::time::Instant::now()));
+                            // Reset mode if the closed pane was focused.
+                            if ui.mode == UiMode::PaneInput {
+                                ui.mode = UiMode::Normal;
+                            }
+                            ui.status_message = Some((
+                                format!("Closed pane {closed_pane_id}"),
+                                std::time::Instant::now(),
+                            ));
                         }
                         shortcut_handled = true;
                     }
@@ -1965,6 +2000,17 @@ fn render_frame(
 
         render_stats_bar(frame, &state.aggregate_stats(), vertical[2]);
         render_bottom_bar(frame, ui, hints_area, has_pane_control);
+        // Still render live terminal panes even when filter matches zero sessions.
+        if let Some(right) = panes_area {
+            ui.focused_pane_rect = render_terminal_panes(
+                frame,
+                embedded,
+                right,
+                pane_layout,
+                &ui.pane_display_names,
+                &ui.selection,
+            );
+        }
         return;
     }
 
