@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.14.0] - 2026-04-04
+
+### Changed
+
+- **Native Terminal Panes (Zellij Removed)**
+  Zellij is no longer required. dot-agent-deck now embeds terminal panes directly using Ratatui-native widgets with `portable-pty` for PTY management and `vt100` for terminal emulation. The application is now a single binary with no external dependencies.
+  All keybindings have switched from Alt-based to Ctrl-based: `Ctrl+1`-`Ctrl+9` to select cards, `Ctrl+t` to toggle layout, `Ctrl+d` to return to dashboard from a pane. Terminal panes support mouse text selection (double-click word, triple-click paragraph), clipboard copy via OSC 52, mouse scrollback, bracketed paste, and `Alt+Backspace`/`Alt+arrows` for word-level editing. Layout modes (stacked/tiled) are now managed internally with the dashboard at 33% left and panes at 67% right.
+  Users who previously installed Zellij solely for dot-agent-deck can uninstall it. No configuration migration is needed — press `Ctrl+n` to open the directory picker and create a new embedded pane.
+
+
+
 ## [0.13.0] - 2026-04-03
 
 ### Added
