@@ -68,7 +68,7 @@ These ANSI accent colors are remapped by the terminal per-theme and need no swit
 | Card titles | White (BOLD) | Black (BOLD) |
 | Labels (Dir, Last, Tools) | Gray | DarkGray |
 | Secondary text | DarkGray | Gray |
-| Tool lines | DarkGray | DarkGray |
+| Tool lines | Gray | Gray |
 
 *Note: The palette includes `terminal_bg` (queried from the terminal) and `selected_bg` (derived shift for card highlights). Hardcoded `bg()` calls were removed; background colors now come from the detected terminal background.*
 
@@ -125,7 +125,7 @@ These ANSI accent colors are remapped by the terminal per-theme and need no swit
 | Date | Decision | Rationale |
 |------|----------|-----------|
 | 2026-04-05 | Remove forced black backgrounds | Dashboard's forced `bg(Rgb(0,0,0))` creates visual mismatch with other panes in light terminals; terminal should control its own background |
-| 2026-04-05 | No backgrounds in palettes | Neither dark nor light palette should set background colors — backgrounds are the terminal's responsibility |
+| 2026-04-05 | No hardcoded backgrounds | Removed forced `bg()` calls; palette includes `terminal_bg` (detected from terminal) and `selected_bg` (derived highlight) rather than hardcoded values |
 | 2026-04-05 | Auto-detect via terminal-colorsaurus | Proven crate used by bat, delta, helix; OSC 11 query works on most modern terminals |
 | 2026-04-05 | Keep accent ANSI colors as-is | Semantic colors (Cyan, Green, Yellow, Red, Blue, Magenta) are remapped by terminal themes and remain readable on both backgrounds |
 | 2026-04-05 | Small neutral color palette | Text/label colors (White, Gray, DarkGray) flip between themes; `terminal_bg` and `selected_bg` derived from detected background; accent colors adapt naturally |
