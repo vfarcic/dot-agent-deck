@@ -225,14 +225,20 @@ impl AppState {
                 session.active_tool = None;
             }
             EventType::ToolStart => {
-                session.status = SessionStatus::Working;
+                if session.status != SessionStatus::WaitingForInput
+                    || session.pending_permissions.is_empty()
+                {
+                    session.status = SessionStatus::Working;
+                }
                 session.active_tool = Some(ActiveTool {
                     name: event.tool_name.clone().unwrap_or_default(),
                     detail: event.tool_detail.clone(),
                 });
             }
             EventType::ToolEnd => {
-                if session.status == SessionStatus::WaitingForInput {
+                if session.status == SessionStatus::WaitingForInput
+                    && session.pending_permissions.is_empty()
+                {
                     session.status = SessionStatus::Working;
                 }
                 session.active_tool = None;
