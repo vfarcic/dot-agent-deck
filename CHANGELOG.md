@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.14.3] - 2026-04-05
+
+### Fixed
+
+  **Stale "Needs Input" status clears promptly after permission approval**
+  The dashboard no longer shows "Needs Input" after the user approves a permission prompt. Previously, approved permissions were not dequeued from the pending list, causing the status to stay stuck until an Idle event arrived. ToolStart events now resolve the matching permission by tool_use_id so the status transitions to "Working" immediately.
+
+
+
 ## [0.14.2] - 2026-04-05
 
 ### Fixed
