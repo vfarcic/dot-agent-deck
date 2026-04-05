@@ -1872,14 +1872,6 @@ fn render_frame(
 ) {
     let area = frame.area();
 
-    // Force true-black background so dark-optimised colors are always readable,
-    // regardless of terminal theme (ANSI "Black" can be remapped by themes).
-    let true_black = Color::Rgb(0, 0, 0);
-    frame.render_widget(
-        ratatui::widgets::Block::default().style(Style::default().bg(true_black)),
-        area,
-    );
-
     // Hints bar spans the full terminal width (1 row at the bottom).
     let top_bottom = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
     let main_area = top_bottom[0];
@@ -2200,12 +2192,10 @@ fn render_terminal_panes(
                     }
                 } else {
                     // Collapsed: show a titled border block.
-                    let true_black = Color::Rgb(0, 0, 0);
                     let block = Block::default()
                         .borders(Borders::TOP)
                         .border_style(Style::default().fg(Color::Gray))
-                        .title(format!(" {title} "))
-                        .style(Style::default().bg(true_black));
+                        .title(format!(" {title} "));
                     frame.render_widget(block, chunks[i]);
                 }
             }
@@ -2413,9 +2403,7 @@ fn render_quit_confirm(frame: &mut Frame) {
                 .add_modifier(Modifier::BOLD),
         )
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
-
+        .border_style(Style::default().fg(Color::Yellow));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
@@ -2488,8 +2476,7 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Help ")
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+        .border_style(Style::default().fg(Color::Cyan));
     let paragraph = Paragraph::new(help_text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
@@ -2593,8 +2580,7 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Select Directory ")
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+        .border_style(Style::default().fg(Color::Cyan));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 }
@@ -2675,8 +2661,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" New Pane ")
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+        .border_style(Style::default().fg(Color::Cyan));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 
@@ -2754,16 +2739,9 @@ fn render_session_card(
         Style::default().fg(status_color)
     };
 
-    let card_bg = if is_selected {
-        Color::Rgb(20, 25, 45)
-    } else {
-        Color::Rgb(0, 0, 0)
-    };
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .style(Style::default().bg(card_bg))
         .title(Span::styled(
             title_left,
             Style::default()
@@ -2931,7 +2909,7 @@ fn recent_tool_lines(session: &SessionState, max_tools: usize) -> Vec<Line<'stat
             } else {
                 format!("  {} — {}", name, detail)
             };
-            Line::styled(text, Style::default().fg(Color::Rgb(140, 140, 140)))
+            Line::styled(text, Style::default().fg(Color::DarkGray))
         })
         .collect()
 }
