@@ -17,6 +17,10 @@ use dot_agent_deck::ui::run_tui;
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Color theme: auto-detect, force light, or force dark
+    #[arg(long, value_enum)]
+    theme: Option<Theme>,
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -28,12 +32,6 @@ enum CliAgent {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the dashboard (default when no subcommand)
-    Dashboard {
-        /// Color theme: auto-detect, force light, or force dark
-        #[arg(long, value_enum)]
-        theme: Option<Theme>,
-    },
     /// Handle an agent hook event (reads stdin, sends to socket)
     Hook {
         /// Agent type
@@ -88,12 +86,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        None | Some(Commands::Dashboard { theme: None }) => {
-            run_dashboard(None);
-            ExitCode::SUCCESS
-        }
-        Some(Commands::Dashboard { theme: Some(t) }) => {
-            run_dashboard(Some(t));
+        None => {
+            run_dashboard(cli.theme);
             ExitCode::SUCCESS
         }
         Some(Commands::Hook { agent }) => {

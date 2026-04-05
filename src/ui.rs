@@ -1877,6 +1877,13 @@ fn render_frame(
     let area = frame.area();
     let palette = ui.palette;
 
+    // Fill entire frame with terminal background so nothing falls through
+    // to the alternate screen default (which may be black on light themes).
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.terminal_bg)),
+        area,
+    );
+
     // Hints bar spans the full terminal width (1 row at the bottom).
     let top_bottom = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
     let main_area = top_bottom[0];
@@ -1938,7 +1945,7 @@ fn render_frame(
             render_new_pane_form(frame, form, palette);
         }
         if ui.mode == UiMode::QuitConfirm {
-            render_quit_confirm(frame);
+            render_quit_confirm(frame, palette);
         }
         return;
     }
@@ -2106,7 +2113,7 @@ fn render_frame(
         render_new_pane_form(frame, form, palette);
     }
     if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame);
+        render_quit_confirm(frame, palette);
     }
 }
 
@@ -2155,7 +2162,7 @@ fn render_terminal_panes(
                 if let Some(screen) = ctrl.get_screen(pane_id) {
                     let focused = focused_id.as_deref() == Some(pane_id.as_str());
                     let title = pane_name(pane_id);
-                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused);
+                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused, palette);
                     if focused {
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
@@ -2193,7 +2200,8 @@ fn render_terminal_panes(
                 if is_expanded {
                     if let Some(screen) = ctrl.get_screen(pane_id) {
                         let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
-                        let widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused);
+                        let widget =
+                            TerminalWidget::new(Arc::clone(&screen), title, is_focused, palette);
                         if is_focused {
                             focused_pane_rect = Some(chunks[i]);
                             focused_screen = Some(screen);
@@ -2385,7 +2393,7 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
     }
 }
 
-fn render_quit_confirm(frame: &mut Frame) {
+fn render_quit_confirm(frame: &mut Frame, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 44.min(area.width.saturating_sub(4));
     let popup_height = 7u16.min(area.height.saturating_sub(4));
@@ -2416,7 +2424,8 @@ fn render_quit_confirm(frame: &mut Frame) {
                 .add_modifier(Modifier::BOLD),
         )
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
@@ -2489,7 +2498,8 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool, palette: Color
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Help ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(help_text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
@@ -2605,7 +2615,8 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Select Directory ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 }
@@ -2686,7 +2697,8 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" New Pane ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 
@@ -2765,7 +2777,7 @@ fn render_session_card(
         Style::default().fg(status_color)
     };
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(Span::styled(
@@ -2779,6 +2791,10 @@ fn render_session_card(
             Line::from(Span::styled(status_text, status_style))
                 .alignment(ratatui::layout::Alignment::Right),
         );
+
+    if is_selected {
+        block = block.style(Style::default().bg(palette.selected_bg));
+    }
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
