@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.15.0] - 2026-04-05
+
+### Added
+
+- **Light Theme Option for Dashboard**
+  The dashboard now adapts to your terminal's color scheme instead of forcing a black background. Previously, the hardcoded black background created a visual mismatch for users running light terminal themes — the dashboard pane appeared as a dark rectangle next to light-themed agent panes.
+  On startup, the dashboard auto-detects whether your terminal uses a light or dark background (via OSC 11 query) and selects the appropriate foreground color palette. Accent colors (Cyan, Green, Yellow, Red, Blue, Magenta) remain unchanged since terminals already remap these per-theme. Only neutral text colors (titles, labels, secondary text) switch between themes to maintain readability and visual hierarchy on both light and dark backgrounds.
+  Use `--theme auto|light|dark` (default: `auto`) to override auto-detection when needed — useful for tmux or SSH sessions where detection may not work reliably. The theme can also be set in the config file, for example `theme = "auto"`, `theme = "light"`, or `theme = "dark"`. The `dashboard` subcommand has been removed since `dot-agent-deck` defaults to dashboard mode and top-level args now work directly.
+- **Session Restore**
+  Pick up where you left off with automatic session persistence. Previously, launching `dot-agent-deck` always started from a blank slate, requiring users to re-open every agent pane, reselect directories, re-enter names, and retype commands each time.
+  The dashboard now automatically tracks every pane's launch metadata (directory, name, and command) while running and persists the full pane set on exit — no explicit save step required. On the next launch, pass `--continue` to restore all saved panes in their original directories with their original commands and names. Panes that reference directories that no longer exist are skipped with a warning, so partial restores work gracefully without aborting.
+  Session state is stored in `~/.config/dot-agent-deck/session.toml` (configurable via the `DOT_AGENT_DECK_SESSION` environment variable). The file uses a simple TOML format that can be edited manually or synced with dotfiles. Start with `dot-agent-deck --continue` or `dot-agent-deck dashboard --continue` to restore your last session.
+
+### Fixed
+
+- **Fix stuck "Needs Input" status**
+  Removed the permission approval queue and blocking `PermissionRequest` hook that caused sessions to display "Needs Input" indefinitely. The deck previously registered both a `Notification` and a `PermissionRequest` hook for the same permission event — the blocking hook delayed every permission prompt and left stale entries in the queue when users approved in the terminal instead of the deck. The deck's permission UI (y/n approval) was already disabled, making the blocking hook purely harmful.
+  The "Needs Input" status indicator still works correctly via the fire-and-forget `Notification` hook and clears automatically when the agent resumes work.
+
+
+
 ## [0.14.4] - 2026-04-05
 
 ### Fixed
