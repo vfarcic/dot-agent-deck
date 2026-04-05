@@ -19,6 +19,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 semver = "1"
 portable-pty = "0.8"
 vt100 = "0.16"
+open = "5"
 
 [dev-dependencies]
 tempfile = "3"

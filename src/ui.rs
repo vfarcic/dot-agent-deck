@@ -109,6 +109,7 @@ enum UiMode {
     DirPicker,
     NewPaneForm,
     PaneInput,
+    StarPrompt,
     QuitConfirm,
 }
 
@@ -313,6 +314,8 @@ struct UiState {
     focused_pane_rect: Option<Rect>,
     /// Tracks last click time and position for double/triple-click detection.
     last_click: Option<(std::time::Instant, u16, u16, u8)>, // (time, col, row, click_count)
+    /// Star-prompt state for the "star the repo" reminder dialog.
+    star_prompt_state: config::StarPromptState,
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -354,6 +357,7 @@ impl UiState {
             selection: None,
             focused_pane_rect: None,
             last_click: None,
+            star_prompt_state: config::StarPromptState::default(),
         }
     }
 }
@@ -718,6 +722,32 @@ fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyResult::Quit,
         // Esc: cancel, return to dashboard
         KeyCode::Esc => {
+            ui.mode = UiMode::Normal;
+            KeyResult::Continue
+        }
+        _ => KeyResult::Continue,
+    }
+}
+
+fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    match key.code {
+        KeyCode::Char('s') => {
+            let _ = open::that("https://github.com/vfarcic/dot-agent-deck");
+            ui.star_prompt_state.dismiss_permanently();
+            ui.mode = UiMode::Normal;
+            ui.status_message = Some((
+                "Thanks for starring! ⭐".to_string(),
+                std::time::Instant::now(),
+            ));
+            KeyResult::Continue
+        }
+        KeyCode::Char('l') | KeyCode::Esc => {
+            ui.star_prompt_state.snooze();
+            ui.mode = UiMode::Normal;
+            KeyResult::Continue
+        }
+        KeyCode::Char('d') => {
+            ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
             KeyResult::Continue
         }
@@ -1149,6 +1179,13 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config);
+
+    let mut star_state = config::StarPromptState::load();
+    let should_show_star = star_state.increment_and_check();
+    ui.star_prompt_state = star_state;
+    if should_show_star {
+        ui.mode = UiMode::StarPrompt;
+    }
 
     if continue_session {
         let saved = config::SavedSession::load();
@@ -1699,6 +1736,7 @@ pub fn run_tui(
                     UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
                     UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
                     UiMode::PaneInput => handle_pane_input_key(key),
+                    UiMode::StarPrompt => handle_star_prompt_key(key, &mut ui),
                     UiMode::QuitConfirm => handle_quit_confirm_key(key, &mut ui),
                 }
             };
@@ -2048,6 +2086,9 @@ fn render_frame(
             && let Some(ref form) = ui.new_pane_form
         {
             render_new_pane_form(frame, form);
+        }
+        if ui.mode == UiMode::StarPrompt {
+            render_star_prompt(frame);
         }
         if ui.mode == UiMode::QuitConfirm {
             render_quit_confirm(frame);
@@ -2517,6 +2558,55 @@ fn render_quit_confirm(frame: &mut Frame) {
 
     let block = Block::default()
         .title(" Quit ")
+        .title_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_star_prompt(frame: &mut Frame) {
+    let area = frame.area();
+    let popup_width = 50u16.min(area.width.saturating_sub(4));
+    let popup_height = 10u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let text = vec![
+        Line::from(""),
+        Line::styled(
+            "  If you find dot-agent-deck useful,",
+            Style::default().fg(Color::White),
+        ),
+        Line::styled(
+            "  please consider starring the repo!",
+            Style::default().fg(Color::White),
+        ),
+        Line::from(""),
+        Line::styled(
+            "  github.com/vfarcic/dot-agent-deck",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Line::from(""),
+        Line::styled(
+            "  s Star  l Later  d Don't ask again",
+            Style::default().fg(Color::Gray),
+        ),
+    ];
+
+    let block = Block::default()
+        .title(" ⭐ Enjoying dot-agent-deck? ")
         .title_style(
             Style::default()
                 .fg(Color::Yellow)
