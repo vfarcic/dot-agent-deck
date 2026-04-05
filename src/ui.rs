@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use crate::config;
 use crate::config::{BellConfig, DashboardConfig};
 use crate::embedded_pane::EmbeddedPaneController;
 use crate::event::{AgentType, EventType};
@@ -295,6 +296,8 @@ struct UiState {
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
+    /// Maps pane_id → launch metadata for auto-save/restore.
+    pane_metadata: HashMap<String, config::SavedPane>,
     config: DashboardConfig,
     /// Tracks last-seen status per session for bell transition detection.
     last_bell_status: HashMap<String, SessionStatus>,
@@ -340,6 +343,7 @@ impl UiState {
             new_pane_form: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
+            pane_metadata: HashMap::new(),
             config,
             last_bell_status: HashMap::new(),
             update_available: None,
@@ -1106,6 +1110,7 @@ pub fn run_tui(
     pane: Box<dyn PaneController>,
     config: DashboardConfig,
     responders: PermissionResponders,
+    continue_session: bool,
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1128,6 +1133,41 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config);
+
+    if continue_session {
+        let saved = config::SavedSession::load();
+        for saved_pane in &saved.panes {
+            let dir = std::path::Path::new(&saved_pane.dir);
+            if !dir.is_dir() {
+                eprintln!(
+                    "Warning: skipping pane '{}' — directory {} not found",
+                    saved_pane.name, saved_pane.dir
+                );
+                continue;
+            }
+            let cmd = if saved_pane.command.is_empty() {
+                None
+            } else {
+                Some(saved_pane.command.as_str())
+            };
+            match pane.create_pane(cmd, Some(&saved_pane.dir)) {
+                Ok(new_id) => {
+                    state.blocking_write().register_pane(new_id.clone());
+                    if !saved_pane.name.is_empty() {
+                        let _ = pane.rename_pane(&new_id, &saved_pane.name);
+                        ui.pane_display_names
+                            .insert(new_id.clone(), saved_pane.name.clone());
+                        ui.pane_names
+                            .insert(new_id.clone(), saved_pane.name.clone());
+                    }
+                    ui.pane_metadata.insert(new_id, saved_pane.clone());
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to restore pane '{}': {e}", saved_pane.name);
+                }
+            }
+        }
+    }
 
     'outer: loop {
         // Expire stale status messages
@@ -1599,6 +1639,7 @@ pub fn run_tui(
                             st.sessions.remove(&sid);
                             st.unregister_pane(&closed_pane_id);
                             drop(st);
+                            ui.pane_metadata.remove(&closed_pane_id);
                             // Reset mode if the closed pane was focused.
                             if ui.mode == UiMode::PaneInput {
                                 ui.mode = UiMode::Normal;
@@ -1692,8 +1733,16 @@ pub fn run_tui(
                                     let _ = pane.rename_pane(&new_id, &req.name);
                                     ui.pane_display_names
                                         .insert(new_id.clone(), req.name.clone());
-                                    ui.pane_names.insert(new_id.clone(), req.name);
+                                    ui.pane_names.insert(new_id.clone(), req.name.clone());
                                 }
+                                ui.pane_metadata.insert(
+                                    new_id.clone(),
+                                    config::SavedPane {
+                                        dir: dir_str.clone(),
+                                        name: req.name,
+                                        command: req.command,
+                                    },
+                                );
                                 // Auto-focus the newly created pane and select last card.
                                 let _ = pane.focus_pane(&new_id);
                                 ui.mode = UiMode::PaneInput;
@@ -1844,6 +1893,18 @@ pub fn run_tui(
                 break;
             }
         } // end inner event-drain loop
+    }
+
+    // Auto-save current pane session for --continue restore.
+    {
+        let session = config::SavedSession {
+            panes: ui.pane_metadata.values().cloned().collect(),
+        };
+        if session.panes.is_empty() {
+            config::SavedSession::clear();
+        } else if let Err(e) = session.save() {
+            eprintln!("Warning: failed to save session: {e}");
+        }
     }
 
     let _ = crossterm::execute!(

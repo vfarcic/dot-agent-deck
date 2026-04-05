@@ -28,7 +28,11 @@ enum CliAgent {
 #[derive(Subcommand)]
 enum Commands {
     /// Run the dashboard (default when no subcommand)
-    Dashboard,
+    Dashboard {
+        /// Restore pane session from last exit
+        #[arg(long = "continue")]
+        continue_session: bool,
+    },
     /// Handle an agent hook event (reads stdin, sends to socket)
     Hook {
         /// Agent type
@@ -83,8 +87,12 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        None | Some(Commands::Dashboard) => {
-            run_dashboard();
+        None => {
+            run_dashboard(false);
+            ExitCode::SUCCESS
+        }
+        Some(Commands::Dashboard { continue_session }) => {
+            run_dashboard(continue_session);
             ExitCode::SUCCESS
         }
         Some(Commands::Hook { agent }) => {
@@ -148,7 +156,7 @@ fn main() -> ExitCode {
 }
 
 #[tokio::main]
-async fn run_dashboard() {
+async fn run_dashboard(continue_session: bool) {
     // Optional file-based logging when DOT_AGENT_DECK_LOG is set
     if std::env::var("DOT_AGENT_DECK_LOG").is_ok() {
         tracing_subscriber::fmt()
@@ -185,7 +193,13 @@ async fn run_dashboard() {
     let tui_state = state.clone();
     let tui_responders = responders.clone();
     let tui_result = tokio::task::spawn_blocking(move || {
-        run_tui(tui_state, pane_controller, config, tui_responders)
+        run_tui(
+            tui_state,
+            pane_controller,
+            config,
+            tui_responders,
+            continue_session,
+        )
     })
     .await;
 
