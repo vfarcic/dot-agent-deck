@@ -225,10 +225,16 @@ impl AppState {
                 session.active_tool = None;
             }
             EventType::ToolStart => {
-                // A ToolStart for a previously-pending permission means the
-                // user approved it — resolve that permission from the queue.
-                if let Some(tool_use_id) = event.metadata.get("tool_use_id") {
-                    session.resolve_pending_permission(tool_use_id);
+                // A ToolStart for a tool that was pending permission means the
+                // user approved it — remove it from the queue.  We match by
+                // tool name against the front of the queue because
+                // PermissionRequest uses synthetic IDs that differ from the
+                // real tool_use_id on ToolStart.
+                if session.status == SessionStatus::WaitingForInput
+                    && let Some(front) = session.pending_permissions.front()
+                    && front.tool_name.as_deref() == event.tool_name.as_deref()
+                {
+                    session.pending_permissions.pop_front();
                 }
                 if session.status != SessionStatus::WaitingForInput
                     || session.pending_permissions.is_empty()
@@ -656,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_start_resolves_pending_permission_and_transitions_to_working() {
+    fn tool_start_resolves_pending_permission_by_name_and_transitions_to_working() {
         let mut state = AppState::default();
         state.apply_event(make_event("s1", EventType::SessionStart));
 
@@ -668,12 +674,9 @@ mod tests {
         assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
         assert_eq!(state.sessions["s1"].pending_permissions.len(), 1);
 
-        // User approves → ToolStart fires with the same tool_use_id
+        // User approves → ToolStart fires for the same tool (different ID is fine)
         let mut tool_start = make_event("s1", EventType::ToolStart);
         tool_start.tool_name = Some("Bash".into());
-        tool_start
-            .metadata
-            .insert("tool_use_id".into(), "perm-1".into());
         state.apply_event(tool_start);
 
         // Permission should be resolved and status should transition to Working
@@ -686,25 +689,46 @@ mod tests {
         let mut state = AppState::default();
         state.apply_event(make_event("s1", EventType::SessionStart));
 
-        // Enqueue two permission requests
+        // Enqueue two permission requests for different tools
         let mut perm1 = make_event("s1", EventType::PermissionRequest);
+        perm1.tool_name = Some("Bash".into());
         perm1.metadata.insert("tool_use_id".into(), "perm-1".into());
         state.apply_event(perm1);
 
         let mut perm2 = make_event("s1", EventType::PermissionRequest);
+        perm2.tool_name = Some("Edit".into());
         perm2.metadata.insert("tool_use_id".into(), "perm-2".into());
         state.apply_event(perm2);
 
         assert_eq!(state.sessions["s1"].pending_permissions.len(), 2);
 
-        // First permission approved → ToolStart fires
+        // First permission approved → ToolStart fires for Bash
         let mut tool_start = make_event("s1", EventType::ToolStart);
-        tool_start
-            .metadata
-            .insert("tool_use_id".into(), "perm-1".into());
+        tool_start.tool_name = Some("Bash".into());
         state.apply_event(tool_start);
 
-        // One permission resolved, but status stays WaitingForInput for the second
+        // One permission resolved, but status stays WaitingForInput for Edit
+        assert_eq!(state.sessions["s1"].pending_permissions.len(), 1);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn tool_start_does_not_resolve_unrelated_permission() {
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+
+        // Enqueue a permission for Bash
+        let mut perm = make_event("s1", EventType::PermissionRequest);
+        perm.tool_name = Some("Bash".into());
+        perm.metadata.insert("tool_use_id".into(), "perm-1".into());
+        state.apply_event(perm);
+
+        // A subagent fires ToolStart for Read (different tool)
+        let mut tool_start = make_event("s1", EventType::ToolStart);
+        tool_start.tool_name = Some("Read".into());
+        state.apply_event(tool_start);
+
+        // Permission should NOT be resolved — still waiting for Bash approval
         assert_eq!(state.sessions["s1"].pending_permissions.len(), 1);
         assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
     }
