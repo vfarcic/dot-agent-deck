@@ -2883,7 +2883,9 @@ fn padded_line<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> L
 }
 
 fn flash_dot(status: &SessionStatus, tick: u64) -> &'static str {
-    if *status == SessionStatus::WaitingForInput && tick % 2 == 1 {
+    let needs_attention =
+        *status == SessionStatus::WaitingForInput || *status == SessionStatus::Idle;
+    if needs_attention && (tick / 30) % 2 == 1 {
         " "
     } else {
         "●"
@@ -3213,21 +3215,33 @@ mod tests {
 
     #[test]
     fn test_flash_dot() {
+        // WaitingForInput: visible in first half (ticks 0–29), hidden in second half (30–59)
         assert_eq!(
             flash_dot(&crate::state::SessionStatus::WaitingForInput, 0),
             "●"
         );
         assert_eq!(
-            flash_dot(&crate::state::SessionStatus::WaitingForInput, 1),
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 29),
+            "●"
+        );
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 30),
             " "
         );
         assert_eq!(
-            flash_dot(&crate::state::SessionStatus::WaitingForInput, 2),
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 59),
+            " "
+        );
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 60),
             "●"
         );
+        // Idle also blinks
+        assert_eq!(flash_dot(&crate::state::SessionStatus::Idle, 0), "●");
+        assert_eq!(flash_dot(&crate::state::SessionStatus::Idle, 30), " ");
+        // Working never blinks
         assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 0), "●");
-        assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 1), "●");
-        assert_eq!(flash_dot(&crate::state::SessionStatus::Idle, 1), "●");
+        assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 30), "●");
     }
 
     #[test]
