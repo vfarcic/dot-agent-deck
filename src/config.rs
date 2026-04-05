@@ -113,6 +113,67 @@ fn config_path() -> PathBuf {
     dirs_home().join(".config/dot-agent-deck/config.toml")
 }
 
+fn session_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("DOT_AGENT_DECK_SESSION") {
+        return PathBuf::from(dir);
+    }
+    dirs_home().join(".config/dot-agent-deck/session.toml")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedPane {
+    pub dir: String,
+    pub name: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SavedSession {
+    #[serde(default)]
+    pub panes: Vec<SavedPane>,
+}
+
+impl SavedSession {
+    pub fn load() -> Self {
+        let path = session_path();
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => match toml::from_str(&contents) {
+                Ok(session) => session,
+                Err(err) => {
+                    eprintln!("Invalid session at {}: {err}", path.display());
+                    Self::default()
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => {
+                eprintln!("Failed to read session at {}: {err}", path.display());
+                Self::default()
+            }
+        }
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let path = session_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create session directory: {e}"))?;
+        }
+        let contents = toml::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize session: {e}"))?;
+        std::fs::write(&path, contents)
+            .map_err(|e| format!("Failed to write session at {}: {e}", path.display()))
+    }
+
+    pub fn clear() -> Result<(), std::io::Error> {
+        let path = session_path();
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 pub(crate) fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -178,6 +239,83 @@ on_idle = true
         };
         assert!(!bc.should_bell(&SessionStatus::WaitingForInput));
         assert!(!bc.should_bell(&SessionStatus::Error));
+    }
+
+    #[test]
+    fn saved_session_round_trip() {
+        let session = SavedSession {
+            panes: vec![
+                SavedPane {
+                    dir: "/repo/api".to_string(),
+                    name: "api".to_string(),
+                    command: "claude".to_string(),
+                },
+                SavedPane {
+                    dir: "/repo/ui".to_string(),
+                    name: "ui".to_string(),
+                    command: "".to_string(),
+                },
+            ],
+        };
+        let toml_str = toml::to_string_pretty(&session).unwrap();
+        let loaded: SavedSession = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.panes.len(), 2);
+        assert_eq!(loaded.panes[0].dir, "/repo/api");
+        assert_eq!(loaded.panes[0].name, "api");
+        assert_eq!(loaded.panes[0].command, "claude");
+        assert_eq!(loaded.panes[1].command, "");
+    }
+
+    #[test]
+    fn saved_session_empty_default() {
+        let session = SavedSession::default();
+        assert!(session.panes.is_empty());
+    }
+
+    #[test]
+    fn saved_session_deserialize_empty() {
+        let session: SavedSession = toml::from_str("").unwrap();
+        assert!(session.panes.is_empty());
+    }
+
+    #[test]
+    fn saved_session_load_save_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.toml");
+        let prev = std::env::var("DOT_AGENT_DECK_SESSION").ok();
+        // SAFETY: test is single-threaded; no other code reads this var concurrently.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_SESSION", path.to_str().unwrap());
+        }
+
+        // Load returns default when file missing
+        let session = SavedSession::load();
+        assert!(session.panes.is_empty());
+
+        // Save then load round-trips
+        let session = SavedSession {
+            panes: vec![SavedPane {
+                dir: "/tmp/test".to_string(),
+                name: "test".to_string(),
+                command: "echo hi".to_string(),
+            }],
+        };
+        session.save().unwrap();
+        let loaded = SavedSession::load();
+        assert_eq!(loaded.panes.len(), 1);
+        assert_eq!(loaded.panes[0].dir, "/tmp/test");
+
+        // Clear removes the file
+        SavedSession::clear().unwrap();
+        assert!(!path.exists());
+
+        // SAFETY: test cleanup — restore original env var.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_SESSION", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_SESSION"),
+            }
+        }
     }
 
     #[test]

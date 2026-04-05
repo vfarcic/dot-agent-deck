@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use crate::config;
 use crate::config::{BellConfig, DashboardConfig};
 use crate::embedded_pane::EmbeddedPaneController;
 use crate::event::{AgentType, EventType};
@@ -295,6 +296,8 @@ struct UiState {
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
+    /// Maps pane_id → launch metadata for auto-save/restore.
+    pane_metadata: HashMap<String, config::SavedPane>,
     config: DashboardConfig,
     /// Tracks last-seen status per session for bell transition detection.
     last_bell_status: HashMap<String, SessionStatus>,
@@ -302,6 +305,8 @@ struct UiState {
     update_available: Option<String>,
     /// Layout mode for embedded terminal panes (stacked or tiled).
     pane_layout: PaneLayout,
+    /// Warnings collected during session save/restore, flushed after terminal restore.
+    session_warnings: Vec<String>,
     /// Mouse text selection state for copy support.
     selection: Option<TextSelection>,
     /// Screen rect of the focused pane (set during render, used for mouse mapping).
@@ -340,10 +345,12 @@ impl UiState {
             new_pane_form: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
+            pane_metadata: HashMap::new(),
             config,
             last_bell_status: HashMap::new(),
             update_available: None,
             pane_layout: PaneLayout::Stacked,
+            session_warnings: Vec::new(),
             selection: None,
             focused_pane_rect: None,
             last_click: None,
@@ -419,7 +426,20 @@ fn navigate_grid(current: usize, dir: Direction, columns: usize, total: usize) -
 
 fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
     let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
-    sessions.sort_by_key(|(_, s)| s.started_at);
+    sessions.sort_by(|(_, a), (_, b)| {
+        // Sort by pane ID (numeric creation order) when available,
+        // falling back to started_at for sessions without a pane.
+        match (&a.pane_id, &b.pane_id) {
+            (Some(pa), Some(pb)) => {
+                let na = pa.parse::<u64>().unwrap_or(u64::MAX);
+                let nb = pb.parse::<u64>().unwrap_or(u64::MAX);
+                na.cmp(&nb)
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.started_at.cmp(&b.started_at),
+        }
+    });
 
     if ui.filter_text.is_empty() {
         return sessions;
@@ -1106,6 +1126,7 @@ pub fn run_tui(
     pane: Box<dyn PaneController>,
     config: DashboardConfig,
     responders: PermissionResponders,
+    continue_session: bool,
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1128,6 +1149,49 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config);
+
+    if continue_session {
+        let saved = config::SavedSession::load();
+        for saved_pane in &saved.panes {
+            let dir = std::path::Path::new(&saved_pane.dir);
+            if !dir.is_dir() {
+                ui.session_warnings.push(format!(
+                    "Warning: skipping pane '{}' — directory {} not found",
+                    saved_pane.name, saved_pane.dir
+                ));
+                continue;
+            }
+            let cmd = if saved_pane.command.is_empty() {
+                None
+            } else {
+                Some(saved_pane.command.as_str())
+            };
+            match pane.create_pane(cmd, Some(&saved_pane.dir)) {
+                Ok(new_id) => {
+                    state.blocking_write().register_pane(new_id.clone());
+                    if !saved_pane.name.is_empty() {
+                        if let Err(e) = pane.rename_pane(&new_id, &saved_pane.name) {
+                            ui.session_warnings.push(format!(
+                                "Warning: failed to rename pane '{}': {e}",
+                                saved_pane.name
+                            ));
+                        }
+                        ui.pane_display_names
+                            .insert(new_id.clone(), saved_pane.name.clone());
+                        ui.pane_names
+                            .insert(new_id.clone(), saved_pane.name.clone());
+                    }
+                    ui.pane_metadata.insert(new_id, saved_pane.clone());
+                }
+                Err(e) => {
+                    ui.session_warnings.push(format!(
+                        "Warning: failed to restore pane '{}': {e}",
+                        saved_pane.name
+                    ));
+                }
+            }
+        }
+    }
 
     'outer: loop {
         // Expire stale status messages
@@ -1599,6 +1663,7 @@ pub fn run_tui(
                             st.sessions.remove(&sid);
                             st.unregister_pane(&closed_pane_id);
                             drop(st);
+                            ui.pane_metadata.remove(&closed_pane_id);
                             // Reset mode if the closed pane was focused.
                             if ui.mode == UiMode::PaneInput {
                                 ui.mode = UiMode::Normal;
@@ -1692,8 +1757,16 @@ pub fn run_tui(
                                     let _ = pane.rename_pane(&new_id, &req.name);
                                     ui.pane_display_names
                                         .insert(new_id.clone(), req.name.clone());
-                                    ui.pane_names.insert(new_id.clone(), req.name);
+                                    ui.pane_names.insert(new_id.clone(), req.name.clone());
                                 }
+                                ui.pane_metadata.insert(
+                                    new_id.clone(),
+                                    config::SavedPane {
+                                        dir: dir_str.clone(),
+                                        name: req.name,
+                                        command: req.command,
+                                    },
+                                );
                                 // Auto-focus the newly created pane and select last card.
                                 let _ = pane.focus_pane(&new_id);
                                 ui.mode = UiMode::PaneInput;
@@ -1846,12 +1919,49 @@ pub fn run_tui(
         } // end inner event-drain loop
     }
 
+    // Auto-save current pane session for --continue restore.
+    // Reconcile pane_metadata with the authoritative live pane registry so that
+    // externally-closed panes are pruned and renames are captured.
+    {
+        let live_panes = state.blocking_read().managed_pane_ids.clone();
+        ui.pane_metadata.retain(|id, _| live_panes.contains(id));
+        for (id, meta) in ui.pane_metadata.iter_mut() {
+            if let Some(name) = ui.pane_display_names.get(id) {
+                meta.name = name.clone();
+            }
+        }
+        let session = config::SavedSession {
+            panes: {
+                let mut ids: Vec<&String> = ui.pane_metadata.keys().collect();
+                ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
+                ids.into_iter()
+                    .filter_map(|id| ui.pane_metadata.get(id).cloned())
+                    .collect()
+            },
+        };
+        if session.panes.is_empty() {
+            if let Err(e) = config::SavedSession::clear() {
+                ui.session_warnings
+                    .push(format!("Warning: failed to clear session: {e}"));
+            }
+        } else if let Err(e) = session.save() {
+            ui.session_warnings
+                .push(format!("Warning: failed to save session: {e}"));
+        }
+    }
+
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
     );
     ratatui::restore();
+
+    // Flush accumulated session warnings now that the terminal is restored.
+    for warning in &ui.session_warnings {
+        eprintln!("{warning}");
+    }
+
     Ok(())
 }
 
@@ -2423,7 +2533,7 @@ fn render_quit_confirm(frame: &mut Frame) {
 fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     let area = frame.area();
     let popup_width = 52.min(area.width.saturating_sub(4));
-    let base_height: u16 = if has_pane_control { 38 } else { 23 };
+    let base_height: u16 = if has_pane_control { 43 } else { 28 };
     let popup_height = base_height.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -2478,6 +2588,17 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     // help_text.push(Line::from("  y             Allow permission"));
     // help_text.push(Line::from("  n             Deny permission"));
     // help_text.push(Line::from("  (only when card has pending prompt)"));
+
+    help_text.push(Line::from(""));
+    help_text.push(Line::styled(
+        "  Session",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    help_text.push(Line::from(""));
+    help_text.push(Line::from("  Panes auto-saved on exit."));
+    help_text.push(Line::from("  Restore: dot-agent-deck --continue"));
 
     help_text.push(Line::from(""));
     help_text.push(Line::styled(
