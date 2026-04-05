@@ -22,6 +22,7 @@ use crate::state::{
     AppState, DashboardStats, PermissionResponders, SessionState, SessionStatus, SharedState,
 };
 use crate::terminal_widget::TerminalWidget;
+use crate::theme::ColorPalette;
 
 impl fmt::Display for crate::event::AgentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -299,6 +300,7 @@ struct UiState {
     /// Maps pane_id → launch metadata for auto-save/restore.
     pane_metadata: HashMap<String, config::SavedPane>,
     config: DashboardConfig,
+    palette: ColorPalette,
     /// Tracks last-seen status per session for bell transition detection.
     last_bell_status: HashMap<String, SessionStatus>,
     /// Populated by the background version-check task when a newer release is available.
@@ -331,7 +333,7 @@ struct TextSelection {
 }
 
 impl UiState {
-    fn new(config: DashboardConfig) -> Self {
+    fn new(config: DashboardConfig, palette: ColorPalette) -> Self {
         Self {
             mode: UiMode::Normal,
             selected_index: 0,
@@ -347,6 +349,7 @@ impl UiState {
             pane_display_names: HashMap::new(),
             pane_metadata: HashMap::new(),
             config,
+            palette,
             last_bell_status: HashMap::new(),
             update_available: None,
             pane_layout: PaneLayout::Stacked,
@@ -360,7 +363,7 @@ impl UiState {
 
 impl Default for UiState {
     fn default() -> Self {
-        Self::new(DashboardConfig::default())
+        Self::new(DashboardConfig::default(), ColorPalette::dark())
     }
 }
 
@@ -1126,6 +1129,7 @@ pub fn run_tui(
     pane: Box<dyn PaneController>,
     config: DashboardConfig,
     responders: PermissionResponders,
+    palette: ColorPalette,
     continue_session: bool,
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
@@ -1148,7 +1152,7 @@ pub fn run_tui(
 
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
-    let mut ui = UiState::new(config);
+    let mut ui = UiState::new(config, palette);
 
     if continue_session {
         let saved = config::SavedSession::load();
@@ -1981,12 +1985,12 @@ fn render_frame(
     pane_layout: PaneLayout,
 ) {
     let area = frame.area();
+    let palette = ui.palette;
 
-    // Force true-black background so dark-optimised colors are always readable,
-    // regardless of terminal theme (ANSI "Black" can be remapped by themes).
-    let true_black = Color::Rgb(0, 0, 0);
+    // Fill entire frame with terminal background so nothing falls through
+    // to the alternate screen default (which may be black on light themes).
     frame.render_widget(
-        ratatui::widgets::Block::default().style(Style::default().bg(true_black)),
+        Block::default().style(Style::default().bg(palette.terminal_bg)),
         area,
     );
 
@@ -2020,7 +2024,7 @@ fn render_frame(
         let msg = Paragraph::new(format!(
             "No active sessions. Press {MOD_KEY}+n to create a pane."
         ))
-        .style(Style::default().fg(Color::Gray))
+        .style(Style::default().fg(palette.text_secondary))
         .centered();
         frame.render_widget(msg, vertical[1]);
         render_bottom_bar(frame, ui, hints_area, has_pane_control);
@@ -2033,24 +2037,25 @@ fn render_frame(
                 pane_layout,
                 &ui.pane_display_names,
                 &ui.selection,
+                palette,
             );
         }
 
         if ui.mode == UiMode::Help {
-            render_help_overlay(frame, has_pane_control);
+            render_help_overlay(frame, has_pane_control, palette);
         }
         if ui.mode == UiMode::DirPicker
             && let Some(picker) = ui.dir_picker.as_mut()
         {
-            render_dir_picker(frame, picker);
+            render_dir_picker(frame, picker, palette);
         }
         if ui.mode == UiMode::NewPaneForm
             && let Some(ref form) = ui.new_pane_form
         {
-            render_new_pane_form(frame, form);
+            render_new_pane_form(frame, form, palette);
         }
         if ui.mode == UiMode::QuitConfirm {
-            render_quit_confirm(frame);
+            render_quit_confirm(frame, palette);
         }
         return;
     }
@@ -2084,7 +2089,7 @@ fn render_frame(
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(title_text, Style::default().fg(Color::Gray)),
+        Span::styled(title_text, Style::default().fg(palette.text_secondary)),
     ]));
 
     if sessions.is_empty() {
@@ -2098,7 +2103,7 @@ fn render_frame(
         frame.render_widget(title, vertical[0]);
 
         let msg = Paragraph::new("No sessions match filter.")
-            .style(Style::default().fg(Color::Gray))
+            .style(Style::default().fg(palette.text_secondary))
             .centered();
         let inner = Layout::vertical([
             Constraint::Fill(1),
@@ -2108,7 +2113,7 @@ fn render_frame(
         .split(vertical[1]);
         frame.render_widget(msg, inner[1]);
 
-        render_stats_bar(frame, &state.aggregate_stats(), vertical[2]);
+        render_stats_bar(frame, &state.aggregate_stats(), vertical[2], palette);
         render_bottom_bar(frame, ui, hints_area, has_pane_control);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
@@ -2119,6 +2124,7 @@ fn render_frame(
                 pane_layout,
                 &ui.pane_display_names,
                 &ui.selection,
+                palette,
             );
         }
         return;
@@ -2177,13 +2183,14 @@ fn render_frame(
                 display_name,
                 card_number,
                 density,
+                palette,
             );
         }
     }
 
     // Stats bar at bottom of dashboard area
     let stats_area = row_chunks[row_chunks.len() - 1];
-    render_stats_bar(frame, &state.aggregate_stats(), stats_area);
+    render_stats_bar(frame, &state.aggregate_stats(), stats_area, palette);
 
     // Full-width hints bar
     render_bottom_bar(frame, ui, hints_area, has_pane_control);
@@ -2197,25 +2204,26 @@ fn render_frame(
             pane_layout,
             &ui.pane_display_names,
             &ui.selection,
+            palette,
         );
     }
 
     // Overlays (drawn last, on top)
     if ui.mode == UiMode::Help {
-        render_help_overlay(frame, has_pane_control);
+        render_help_overlay(frame, has_pane_control, palette);
     }
     if ui.mode == UiMode::DirPicker
         && let Some(picker) = ui.dir_picker.as_mut()
     {
-        render_dir_picker(frame, picker);
+        render_dir_picker(frame, picker, palette);
     }
     if ui.mode == UiMode::NewPaneForm
         && let Some(ref form) = ui.new_pane_form
     {
-        render_new_pane_form(frame, form);
+        render_new_pane_form(frame, form, palette);
     }
     if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame);
+        render_quit_confirm(frame, palette);
     }
 }
 
@@ -2226,6 +2234,7 @@ fn render_terminal_panes(
     layout: PaneLayout,
     display_names: &HashMap<String, String>,
     selection: &Option<TextSelection>,
+    palette: ColorPalette,
 ) -> Option<Rect> {
     let ctrl = embedded?;
     let pane_ids = ctrl.pane_ids();
@@ -2263,7 +2272,7 @@ fn render_terminal_panes(
                 if let Some(screen) = ctrl.get_screen(pane_id) {
                     let focused = focused_id.as_deref() == Some(pane_id.as_str());
                     let title = pane_name(pane_id);
-                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused);
+                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused, palette);
                     if focused {
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
@@ -2301,7 +2310,8 @@ fn render_terminal_panes(
                 if is_expanded {
                     if let Some(screen) = ctrl.get_screen(pane_id) {
                         let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
-                        let widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused);
+                        let widget =
+                            TerminalWidget::new(Arc::clone(&screen), title, is_focused, palette);
                         if is_focused {
                             focused_pane_rect = Some(chunks[i]);
                             focused_screen = Some(screen);
@@ -2310,12 +2320,10 @@ fn render_terminal_panes(
                     }
                 } else {
                     // Collapsed: show a titled border block.
-                    let true_black = Color::Rgb(0, 0, 0);
                     let block = Block::default()
                         .borders(Borders::TOP)
-                        .border_style(Style::default().fg(Color::Gray))
-                        .title(format!(" {title} "))
-                        .style(Style::default().bg(true_black));
+                        .border_style(Style::default().fg(palette.text_secondary))
+                        .title(format!(" {title} "));
                     frame.render_widget(block, chunks[i]);
                 }
             }
@@ -2382,7 +2390,7 @@ fn render_terminal_panes(
     focused_pane_rect
 }
 
-fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
+fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect, palette: ColorPalette) {
     let mut spans: Vec<Span> = Vec::new();
 
     // Always show active count
@@ -2399,14 +2407,14 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
         (stats.compacting, "compacting", Color::Magenta),
         (stats.waiting, "waiting", Color::Yellow),
         (stats.errors, "error", Color::Red),
-        (stats.idle, "idle", Color::Gray),
+        (stats.idle, "idle", palette.text_secondary),
     ];
 
     for &(count, label, color) in segments {
         if count > 0 {
             spans.push(Span::styled(
                 "  \u{2502}  ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette.text_muted),
             ));
             spans.push(Span::styled(
                 format!("{count} {label}"),
@@ -2418,11 +2426,11 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
     // Always show total tools
     spans.push(Span::styled(
         "  \u{2502}  ",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette.text_muted),
     ));
     spans.push(Span::styled(
         format!("{} tools", stats.total_tools),
-        Style::default().fg(Color::Gray),
+        Style::default().fg(palette.text_secondary),
     ));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -2471,7 +2479,10 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
                 } else {
                     format!("?: help  1-9: jump  {MOD_KEY}+c: quit")
                 };
-                let mut spans = vec![Span::styled(hints, Style::default().fg(Color::Gray))];
+                let mut spans = vec![Span::styled(
+                    hints,
+                    Style::default().fg(ui.palette.text_secondary),
+                )];
                 if let Some(ref latest) = ui.update_available {
                     spans.push(Span::raw("  "));
                     spans.push(Span::styled(
@@ -2492,7 +2503,7 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
     }
 }
 
-fn render_quit_confirm(frame: &mut Frame) {
+fn render_quit_confirm(frame: &mut Frame, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 44.min(area.width.saturating_sub(4));
     let popup_height = 7u16.min(area.height.saturating_sub(4));
@@ -2524,13 +2535,12 @@ fn render_quit_confirm(frame: &mut Frame) {
         )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
-
+        .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
+fn render_help_overlay(frame: &mut Frame, has_pane_control: bool, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 52.min(area.width.saturating_sub(4));
     let base_height: u16 = if has_pane_control { 43 } else { 28 };
@@ -2603,19 +2613,19 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     help_text.push(Line::from(""));
     help_text.push(Line::styled(
         "  Press ? or Esc to close",
-        Style::default().fg(Color::Gray),
+        Style::default().fg(palette.text_secondary),
     ));
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Help ")
         .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+        .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(help_text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
+fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 60.min(area.width.saturating_sub(4));
     let popup_height = 20u16.min(area.height.saturating_sub(4));
@@ -2644,10 +2654,13 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
     )];
 
     if show_filter_row {
-        let mut spans = vec![Span::styled("  / ", Style::default().fg(Color::Gray))];
+        let mut spans = vec![Span::styled(
+            "  / ",
+            Style::default().fg(palette.text_secondary),
+        )];
         spans.push(Span::styled(
             picker.filter_text.clone(),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette.text_primary),
         ));
         if picker.filtering {
             spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
@@ -2663,7 +2676,10 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
         } else {
             "  (no matching directories)"
         };
-        lines.push(Line::styled(message, Style::default().fg(Color::DarkGray)));
+        lines.push(Line::styled(
+            message,
+            Style::default().fg(palette.text_muted),
+        ));
     } else {
         for (i, entry_idx) in picker
             .filtered_indices
@@ -2701,7 +2717,10 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
     } else {
         "  j/k or ↑↓: navigate  l/Enter: open  Space: select  h/Backspace: up"
     };
-    lines.push(Line::styled(nav_footer, Style::default().fg(Color::Gray)));
+    lines.push(Line::styled(
+        nav_footer,
+        Style::default().fg(palette.text_secondary),
+    ));
     let mode_footer = if picker.filtering {
         "  Typing: add characters  Enter: accept filter  Esc: clear"
     } else if !picker.filter_text.is_empty() {
@@ -2709,18 +2728,21 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
     } else {
         "  /: filter directories  Esc or q: cancel"
     };
-    lines.push(Line::styled(mode_footer, Style::default().fg(Color::Gray)));
+    lines.push(Line::styled(
+        mode_footer,
+        Style::default().fg(palette.text_secondary),
+    ));
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Select Directory ")
         .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+        .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
+fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 56.min(area.width.saturating_sub(4));
     let popup_height = 12u16.min(area.height.saturating_sub(4));
@@ -2737,14 +2759,14 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(palette.text_secondary)
     };
     let cmd_style = if form.focused == FormField::Command {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(palette.text_secondary)
     };
 
     let dir_display = form.dir.display().to_string();
@@ -2763,9 +2785,9 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
                     width = inner_width.saturating_sub(11)
                 ),
                 if form.focused == FormField::Name {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(palette.text_primary)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(palette.text_secondary)
                 },
             ),
         ]),
@@ -2779,9 +2801,9 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
                     width = inner_width.saturating_sub(11)
                 ),
                 if form.focused == FormField::Command {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(palette.text_primary)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(palette.text_secondary)
                 },
             ),
         ]),
@@ -2789,7 +2811,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
         Line::from(""),
         Line::styled(
             "  Tab: switch field  Enter: next/confirm  Esc: cancel",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(palette.text_secondary),
         ),
     ];
 
@@ -2797,7 +2819,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
         .borders(Borders::ALL)
         .title(" New Pane ")
         .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+        .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 
@@ -2834,9 +2856,10 @@ fn render_session_card(
     display_name: Option<&String>,
     card_number: Option<u8>,
     density: CardDensity,
+    palette: ColorPalette,
 ) {
     let (status_label, status_style) = status_style(&session.status);
-    let status_color = status_style.fg.unwrap_or(Color::Gray);
+    let status_color = status_style.fg.unwrap_or(palette.text_secondary);
 
     let id_display = if session.session_id.len() > 11 {
         &session.session_id[..11]
@@ -2875,20 +2898,13 @@ fn render_session_card(
         Style::default().fg(status_color)
     };
 
-    let card_bg = if is_selected {
-        Color::Rgb(20, 25, 45)
-    } else {
-        Color::Rgb(0, 0, 0)
-    };
-
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .style(Style::default().bg(card_bg))
         .title(Span::styled(
             title_left,
             Style::default()
-                .fg(Color::White)
+                .fg(palette.text_primary)
                 .add_modifier(Modifier::BOLD),
         ))
         .title_alignment(ratatui::layout::Alignment::Left)
@@ -2896,6 +2912,10 @@ fn render_session_card(
             Line::from(Span::styled(status_text, status_style))
                 .alignment(ratatui::layout::Alignment::Right),
         );
+
+    if is_selected {
+        block = block.style(Style::default().bg(palette.selected_bg));
+    }
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2916,9 +2936,9 @@ fn render_session_card(
 
     if wide {
         let right_spans = vec![
-            Span::styled("Last: ", Style::default().fg(Color::Gray)),
+            Span::styled("Last: ", Style::default().fg(palette.text_secondary)),
             Span::raw(format!("{}  ", elapsed)),
-            Span::styled("Tools: ", Style::default().fg(Color::Gray)),
+            Span::styled("Tools: ", Style::default().fg(palette.text_secondary)),
             Span::raw(session.tool_count.to_string()),
         ];
         let right_len: usize = right_spans.iter().map(|s| s.width()).sum();
@@ -2929,7 +2949,7 @@ fn render_session_card(
 
         lines.push(padded_line(
             vec![
-                Span::styled("Dir:  ", Style::default().fg(Color::Gray)),
+                Span::styled("Dir:  ", Style::default().fg(palette.text_secondary)),
                 Span::raw(dir_display),
             ],
             right_spans,
@@ -2937,7 +2957,7 @@ fn render_session_card(
         ));
     } else {
         lines.push(Line::from(vec![
-            Span::styled("Dir:  ", Style::default().fg(Color::Gray)),
+            Span::styled("Dir:  ", Style::default().fg(palette.text_secondary)),
             Span::raw(cwd_display),
         ]));
     }
@@ -2948,16 +2968,16 @@ fn render_session_card(
         let max_prompt = w.saturating_sub(6);
         let display = truncate_with_ellipsis(prompt, max_prompt);
         lines.push(Line::from(vec![
-            Span::styled(prefix, Style::default().fg(Color::Gray)),
+            Span::styled(prefix, Style::default().fg(palette.text_secondary)),
             Span::raw(display),
         ]));
     }
 
     if !wide {
         lines.push(Line::from(vec![
-            Span::styled("Last: ", Style::default().fg(Color::Gray)),
+            Span::styled("Last: ", Style::default().fg(palette.text_secondary)),
             Span::raw(format!("{}  ", elapsed)),
-            Span::styled("Tools: ", Style::default().fg(Color::Gray)),
+            Span::styled("Tools: ", Style::default().fg(palette.text_secondary)),
             Span::raw(session.tool_count.to_string()),
         ]));
     }
@@ -2965,7 +2985,7 @@ fn render_session_card(
     if density != CardDensity::Compact {
         lines.push(Line::from(""));
     }
-    let mut tool_lines = recent_tool_lines(session, density.max_tools());
+    let mut tool_lines = recent_tool_lines(session, density.max_tools(), palette);
     if has_permission && let Some(last) = tool_lines.last_mut() {
         *last = last.clone().style(
             Style::default()
@@ -3032,7 +3052,11 @@ fn collect_recent_prompts(session: &SessionState, max: usize) -> Vec<String> {
     prompts
 }
 
-fn recent_tool_lines(session: &SessionState, max_tools: usize) -> Vec<Line<'static>> {
+fn recent_tool_lines(
+    session: &SessionState,
+    max_tools: usize,
+    palette: ColorPalette,
+) -> Vec<Line<'static>> {
     let tool_events: Vec<_> = session
         .recent_events
         .iter()
@@ -3054,7 +3078,7 @@ fn recent_tool_lines(session: &SessionState, max_tools: usize) -> Vec<Line<'stat
             } else {
                 format!("  {} — {}", name, detail)
             };
-            Line::styled(text, Style::default().fg(Color::Rgb(140, 140, 140)))
+            Line::styled(text, Style::default().fg(palette.text_muted))
         })
         .collect()
 }
@@ -3273,7 +3297,8 @@ mod tests {
             pending_permissions: VecDeque::new(),
         };
 
-        let lines = recent_tool_lines(&session, 3);
+        let palette = ColorPalette::dark();
+        let lines = recent_tool_lines(&session, 3, palette);
         assert_eq!(lines.len(), 3);
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert_eq!(text[0], "  Write — out.txt");
@@ -3281,7 +3306,7 @@ mod tests {
         assert_eq!(text[2], "  Grep — pattern");
 
         // Compact mode: only 1 tool (most recent)
-        let lines_compact = recent_tool_lines(&session, 1);
+        let lines_compact = recent_tool_lines(&session, 1, palette);
         assert_eq!(lines_compact.len(), 1);
         assert_eq!(lines_compact[0].to_string(), "  Grep — pattern");
     }

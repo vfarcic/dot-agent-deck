@@ -6,6 +6,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
+use crate::theme::ColorPalette;
+
 /// Converts a vt100 color to a ratatui Color.
 fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
     match color {
@@ -47,32 +49,38 @@ pub struct TerminalWidget {
     parser: Arc<Mutex<vt100::Parser>>,
     title: String,
     focused: bool,
+    palette: ColorPalette,
 }
 
 impl TerminalWidget {
-    pub fn new(parser: Arc<Mutex<vt100::Parser>>, title: String, focused: bool) -> Self {
+    pub fn new(
+        parser: Arc<Mutex<vt100::Parser>>,
+        title: String,
+        focused: bool,
+        palette: ColorPalette,
+    ) -> Self {
         Self {
             parser,
             title,
             focused,
+            palette,
         }
     }
 }
 
 impl Widget for TerminalWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let true_black = Color::Rgb(0, 0, 0);
         let border_style = if self.focused {
             Style::default().fg(Color::Cyan)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(self.palette.text_secondary)
         };
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
             .title(self.title)
-            .style(Style::default().bg(true_black));
+            .style(Style::default().bg(self.palette.terminal_bg));
 
         let inner = block.inner(area);
         block.render(area, buf);
@@ -193,7 +201,7 @@ mod tests {
         // Feed some content into the parser.
         parser.lock().unwrap().process(b"Hello, terminal!");
 
-        let widget = TerminalWidget::new(parser, "test".to_string(), true);
+        let widget = TerminalWidget::new(parser, "test".to_string(), true, ColorPalette::dark());
 
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
@@ -215,7 +223,7 @@ mod tests {
     #[test]
     fn terminal_widget_unfocused_no_cursor() {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
-        let widget = TerminalWidget::new(parser, "test".to_string(), false);
+        let widget = TerminalWidget::new(parser, "test".to_string(), false, ColorPalette::dark());
 
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
@@ -229,7 +237,7 @@ mod tests {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(8, 38, 0)));
         parser.lock().unwrap().process(b"\x1b[31mRed text\x1b[0m");
 
-        let widget = TerminalWidget::new(parser, "colors".to_string(), false);
+        let widget = TerminalWidget::new(parser, "colors".to_string(), false, ColorPalette::dark());
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
@@ -244,7 +252,7 @@ mod tests {
     fn terminal_widget_shows_cursor_when_focused() {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(8, 38, 0)));
         // Cursor starts at (0,0), which maps to inner area (1,1)
-        let widget = TerminalWidget::new(parser, "cursor".to_string(), true);
+        let widget = TerminalWidget::new(parser, "cursor".to_string(), true, ColorPalette::dark());
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
@@ -258,7 +266,7 @@ mod tests {
     #[test]
     fn terminal_widget_empty_parser_no_panic() {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
-        let widget = TerminalWidget::new(parser, "empty".to_string(), true);
+        let widget = TerminalWidget::new(parser, "empty".to_string(), true, ColorPalette::dark());
         let area = Rect::new(0, 0, 82, 26);
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
@@ -269,7 +277,7 @@ mod tests {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
         parser.lock().unwrap().process(b"Hello world\nSecond line");
 
-        let widget = TerminalWidget::new(parser, "small".to_string(), false);
+        let widget = TerminalWidget::new(parser, "small".to_string(), false, ColorPalette::dark());
         // Very small area — just 3 rows (borders + 1 inner row)
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
