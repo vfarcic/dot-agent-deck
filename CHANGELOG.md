@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.14.3] - 2026-04-05
+
+### Fixed
+
+  **Stale "Needs Input" status clears promptly after permission approval**
+  The dashboard no longer shows "Needs Input" after the user approves a permission prompt. Previously, approved permissions were not dequeued from the pending list, causing the status to stay stuck until an Idle event arrived. ToolStart events now resolve the matching permission by tool_use_id so the status transitions to "Working" immediately.
+
+
+
+## [0.14.2] - 2026-04-05
+
+### Fixed
+
+- **Status indicator blinks at a comfortable rate and Idle status now blinks**
+  The status dot for "Needs Input" now pulses at ~1 blink per second instead of flickering rapidly at ~30Hz. The "Idle" status also blinks now, since it represents a state where the user needs to provide the next prompt.
+
+
+
+## [0.14.1] - 2026-04-05
+
+### Fixed
+
+- **Permission prompt status no longer overridden by concurrent tool events**
+  The dashboard now correctly maintains "Needs Input" status when a permission prompt is active and subagent tools complete concurrently. Previously, `ToolStart` and `ToolEnd` events from subagent tools (e.g., an Explore agent running Bash commands) would override the `WaitingForInput` status back to `Working`, making the permission prompt invisible in the dashboard card. The status now stays as "Needs Input" until all pending permissions are resolved.
+
+
+
 ## [0.14.0] - 2026-04-04
 
 ### Changed
