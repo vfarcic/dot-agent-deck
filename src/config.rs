@@ -164,9 +164,13 @@ impl SavedSession {
             .map_err(|e| format!("Failed to write session at {}: {e}", path.display()))
     }
 
-    pub fn clear() {
+    pub fn clear() -> Result<(), std::io::Error> {
         let path = session_path();
-        let _ = std::fs::remove_file(path);
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -278,6 +282,7 @@ on_idle = true
     fn saved_session_load_save_clear() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.toml");
+        let prev = std::env::var("DOT_AGENT_DECK_SESSION").ok();
         // SAFETY: test is single-threaded; no other code reads this var concurrently.
         unsafe {
             std::env::set_var("DOT_AGENT_DECK_SESSION", path.to_str().unwrap());
@@ -301,12 +306,15 @@ on_idle = true
         assert_eq!(loaded.panes[0].dir, "/tmp/test");
 
         // Clear removes the file
-        SavedSession::clear();
+        SavedSession::clear().unwrap();
         assert!(!path.exists());
 
-        // SAFETY: test cleanup.
+        // SAFETY: test cleanup — restore original env var.
         unsafe {
-            std::env::remove_var("DOT_AGENT_DECK_SESSION");
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_SESSION", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_SESSION"),
+            }
         }
     }
 

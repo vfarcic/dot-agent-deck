@@ -305,6 +305,8 @@ struct UiState {
     update_available: Option<String>,
     /// Layout mode for embedded terminal panes (stacked or tiled).
     pane_layout: PaneLayout,
+    /// Warnings collected during session save/restore, flushed after terminal restore.
+    session_warnings: Vec<String>,
     /// Mouse text selection state for copy support.
     selection: Option<TextSelection>,
     /// Screen rect of the focused pane (set during render, used for mouse mapping).
@@ -348,6 +350,7 @@ impl UiState {
             last_bell_status: HashMap::new(),
             update_available: None,
             pane_layout: PaneLayout::Stacked,
+            session_warnings: Vec::new(),
             selection: None,
             focused_pane_rect: None,
             last_click: None,
@@ -1152,10 +1155,10 @@ pub fn run_tui(
         for saved_pane in &saved.panes {
             let dir = std::path::Path::new(&saved_pane.dir);
             if !dir.is_dir() {
-                eprintln!(
+                ui.session_warnings.push(format!(
                     "Warning: skipping pane '{}' — directory {} not found",
                     saved_pane.name, saved_pane.dir
-                );
+                ));
                 continue;
             }
             let cmd = if saved_pane.command.is_empty() {
@@ -1176,7 +1179,10 @@ pub fn run_tui(
                     ui.pane_metadata.insert(new_id, saved_pane.clone());
                 }
                 Err(e) => {
-                    eprintln!("Warning: failed to restore pane '{}': {e}", saved_pane.name);
+                    ui.session_warnings.push(format!(
+                        "Warning: failed to restore pane '{}': {e}",
+                        saved_pane.name
+                    ));
                 }
             }
         }
@@ -1909,7 +1915,16 @@ pub fn run_tui(
     }
 
     // Auto-save current pane session for --continue restore.
+    // Reconcile pane_metadata with the authoritative live pane registry so that
+    // externally-closed panes are pruned and renames are captured.
     {
+        let live_panes = state.blocking_read().managed_pane_ids.clone();
+        ui.pane_metadata.retain(|id, _| live_panes.contains(id));
+        for (id, meta) in ui.pane_metadata.iter_mut() {
+            if let Some(name) = ui.pane_display_names.get(id) {
+                meta.name = name.clone();
+            }
+        }
         let session = config::SavedSession {
             panes: {
                 let mut ids: Vec<&String> = ui.pane_metadata.keys().collect();
@@ -1920,9 +1935,13 @@ pub fn run_tui(
             },
         };
         if session.panes.is_empty() {
-            config::SavedSession::clear();
+            if let Err(e) = config::SavedSession::clear() {
+                ui.session_warnings
+                    .push(format!("Warning: failed to clear session: {e}"));
+            }
         } else if let Err(e) = session.save() {
-            eprintln!("Warning: failed to save session: {e}");
+            ui.session_warnings
+                .push(format!("Warning: failed to save session: {e}"));
         }
     }
 
@@ -1932,6 +1951,12 @@ pub fn run_tui(
         crossterm::event::DisableBracketedPaste,
     );
     ratatui::restore();
+
+    // Flush accumulated session warnings now that the terminal is restored.
+    for warning in &ui.session_warnings {
+        eprintln!("{warning}");
+    }
+
     Ok(())
 }
 

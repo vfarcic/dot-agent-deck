@@ -96,7 +96,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(Commands::Dashboard { continue_session }) => {
-            run_dashboard(continue_session);
+            run_dashboard(cli.continue_session || continue_session);
             ExitCode::SUCCESS
         }
         Some(Commands::Hook { agent }) => {

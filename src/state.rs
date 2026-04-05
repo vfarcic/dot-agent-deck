@@ -74,7 +74,7 @@ pub struct AppState {
     /// Set by the background version-check task when a newer release exists.
     pub update_available: Option<String>,
     /// Pane IDs created by our app — events from unknown panes are rejected.
-    managed_pane_ids: HashSet<String>,
+    pub managed_pane_ids: HashSet<String>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
