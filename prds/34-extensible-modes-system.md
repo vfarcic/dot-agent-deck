@@ -105,11 +105,22 @@ watch = false
 
 5. **All modes are user-defined.** No builtin modes or auto-update mechanism. Users own their config entirely.
 
+6. **Pane `name` is optional.** Persistent panes require `command` but `name` is optional. When omitted, the pane name defaults to the command string itself.
+
+7. **Reactive rules use `watch` and `interval`.** Each rule has a `pattern` (required regex), `watch` (bool, default false), and `interval` (u64 seconds, optional, only meaningful when `watch = true`). Commands like `kubectl get` benefit from periodic re-execution (`watch = true`) to show live state, while point-in-time commands like `kubectl describe` should run once (`watch = false`). Rules do not specify a target pane — matched commands go to the next available reactive pane in the circular pool.
+
+8. **Real test config as canonical example.** `../dot-ai-infra/.dot-agent-deck.toml` contains a `kubernetes-operations` mode exercising persistent panes, watch rules, and one-shot rules. Use this for integration testing.
+
 ## Technical Design
 
 ### Config (`src/project_config.rs` — new)
 
-New structs: `ModeRule`, `ModePersistentPane`, `ModeConfig`, `ProjectConfig`. Separate from existing `DashboardConfig` (global settings). `ProjectConfig` loads from `.dot-agent-deck.toml` in the selected directory.
+New structs, separate from existing `DashboardConfig` (global settings). `ProjectConfig` loads from `.dot-agent-deck.toml` in the selected directory.
+
+- `ProjectConfig` — top-level: `modes: Vec<ModeConfig>`
+- `ModeConfig` — `name: String`, `shell_init: Option<String>`, `panes: Vec<ModePersistentPane>`, `rules: Vec<ModeRule>`
+- `ModePersistentPane` — `command: String`, `name: Option<String>` (defaults to command)
+- `ModeRule` — `pattern: String` (regex), `watch: bool` (default false), `interval: Option<u64>` (seconds, only when watch=true)
 
 ### Hook Changes (`src/hook.rs`)
 
@@ -139,7 +150,7 @@ New `ModeSelector` UI mode inserted between DirPicker and NewPaneForm (only when
 
 ## Milestones
 
-- [ ] Project config loading — `ProjectConfig` struct, `.dot-agent-deck.toml` parsing, `resolve_modes()` returns user-defined modes
+- [x] Project config loading — `ProjectConfig` struct, `.dot-agent-deck.toml` parsing, `resolve_modes()` returns user-defined modes
 - [ ] Full command capture — store complete bash command in hook event metadata for re-execution
 - [ ] EmbeddedPaneController extensions — mode-driven pane creation, command writing, Ctrl+C via native PTY
 - [ ] Mode manager core — regex compilation, circular pane pool, command routing, pane lifecycle, `shell_init` support

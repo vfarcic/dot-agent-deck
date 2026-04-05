@@ -7,6 +7,7 @@ pub mod hook;
 pub mod hooks_manage;
 pub mod opencode_manage;
 pub mod pane;
+pub mod project_config;
 pub mod state;
 pub mod terminal_widget;
 pub mod ui;
