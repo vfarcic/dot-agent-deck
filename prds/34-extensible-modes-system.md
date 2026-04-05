@@ -159,7 +159,7 @@ New `ModeSelector` UI mode inserted between DirPicker and NewPaneForm (only when
 - [x] Status indicator and help — mode status in stats bar, help overlay updates
 - [x] Unit tests — config parsing, rule matching, slot allocation, mode selector navigation
 - [x] Manual integration testing — end-to-end flow with a sample mode config
-- [ ] Config generation via agent — in mode selector, offer "Generate config for this project" when no `.dot-agent-deck.toml` exists
+- [x] Config generation via agent — in mode selector, offer "Generate config for this project" when no `.dot-agent-deck.toml` exists
 - [ ] `dot-agent-deck init` CLI command — scaffolding for project configs
 
 ## Out of Scope (v1)

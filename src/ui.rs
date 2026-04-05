@@ -278,20 +278,22 @@ impl DirPickerState {
 struct ModeSelectorState {
     dir: PathBuf,
     modes: Vec<ModeConfig>,
-    selected: usize, // 0 = "New agent pane", 1..N = modes[0..N-1]
+    selected: usize, // 0 = "New agent pane", 1..N = modes[0..N-1], last = generate (when show_generate)
+    show_generate: bool, // true when no .dot-agent-deck.toml exists
 }
 
 impl ModeSelectorState {
-    fn new(dir: PathBuf, modes: Vec<ModeConfig>) -> Self {
+    fn new(dir: PathBuf, modes: Vec<ModeConfig>, show_generate: bool) -> Self {
         Self {
             dir,
             modes,
             selected: 0,
+            show_generate,
         }
     }
 
     fn item_count(&self) -> usize {
-        1 + self.modes.len()
+        1 + self.modes.len() + if self.show_generate { 1 } else { 0 }
     }
 
     fn select_next(&mut self) {
@@ -306,11 +308,16 @@ impl ModeSelectorState {
 
     /// Returns `None` for "New agent pane" (index 0), `Some(&ModeConfig)` for a mode.
     fn selected_mode(&self) -> Option<&ModeConfig> {
-        if self.selected == 0 {
+        if self.selected == 0 || self.is_generate_selected() {
             None
         } else {
             self.modes.get(self.selected - 1)
         }
+    }
+
+    /// Returns `true` when the "Generate mode config" option is selected (last item).
+    fn is_generate_selected(&self) -> bool {
+        self.show_generate && self.selected == self.item_count() - 1
     }
 }
 
@@ -541,6 +548,7 @@ enum KeyResult {
     Focus,
     NewPane(NewPaneRequest),
     ActivateMode { dir: PathBuf, config: ModeConfig },
+    GenerateModeConfig { dir: PathBuf },
     PermissionResponse(String),
     ForwardToPane(Vec<u8>),
 }
@@ -1071,29 +1079,22 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     KeyResult::Continue
 }
 
-fn transition_to_form(ui: &mut UiState) {
-    let dir = ui
-        .dir_picker
-        .as_ref()
-        .map(|p| p.current_dir.clone())
-        .unwrap_or_default();
-    let name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let command = ui.config.default_command.clone();
-    ui.dir_picker = None;
-    ui.new_pane_form = Some(NewPaneFormState {
-        dir,
-        name,
-        command,
-        focused: FormField::Name,
-    });
-    ui.mode = UiMode::NewPaneForm;
+fn generate_mode_config_prompt(dir: &str) -> String {
+    format!(
+        "Analyze the project in {dir} and generate a .dot-agent-deck.toml configuration file. \
+         The file defines modes for the dot-agent-deck TUI. Each mode has: name (string), \
+         optional shell_init (setup command run in every pane), panes (array of persistent \
+         panes with command and optional name), and rules (array of reactive rules with \
+         pattern as regex, optional watch bool, optional interval in seconds). \
+         Example: [[modes]] name = \"dev\" / [[modes.panes]] command = \"cargo watch -x test\" \
+         name = \"Tests\" / [[modes.rules]] pattern = \"cargo\\\\s+build\" watch = false. \
+         Look at the project languages, build tools, and workflows to create useful modes. \
+         Write the file to {dir}/.dot-agent-deck.toml"
+    )
 }
 
 /// Check for `.dot-agent-deck.toml` in the selected directory.
-/// If modes are defined, show the mode selector; otherwise go straight to the form.
+/// If modes are defined, show the mode selector; otherwise show it with a generate option.
 fn transition_after_dir_pick(ui: &mut UiState) {
     let dir = ui
         .dir_picker
@@ -1104,11 +1105,14 @@ fn transition_after_dir_pick(ui: &mut UiState) {
     match load_project_config(&dir) {
         Ok(Some(config)) if !config.modes.is_empty() => {
             ui.dir_picker = None;
-            ui.mode_selector = Some(ModeSelectorState::new(dir, config.modes));
+            ui.mode_selector = Some(ModeSelectorState::new(dir, config.modes, false));
             ui.mode = UiMode::ModeSelector;
         }
         _ => {
-            transition_to_form(ui);
+            // No config or empty — show selector with generate option.
+            ui.dir_picker = None;
+            ui.mode_selector = Some(ModeSelectorState::new(dir, vec![], true));
+            ui.mode = UiMode::ModeSelector;
         }
     }
 }
@@ -1136,8 +1140,14 @@ fn handle_mode_selector_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         }
         KeyCode::Enter => {
             let dir = selector.dir.clone();
+            let is_generate = selector.is_generate_selected();
             let selected_mode = selector.selected_mode().cloned();
             ui.mode_selector = None;
+
+            if is_generate {
+                ui.mode = UiMode::Normal;
+                return KeyResult::GenerateModeConfig { dir };
+            }
 
             if let Some(config) = selected_mode {
                 ui.mode = UiMode::Normal;
@@ -1958,6 +1968,62 @@ pub fn run_tui(
                                 format!("Mode activation failed: {e}"),
                                 std::time::Instant::now(),
                             ));
+                        }
+                    }
+                }
+                KeyResult::GenerateModeConfig { dir } => {
+                    if pane.is_available() {
+                        let dir_str = dir.display().to_string();
+                        let cmd = if ui.config.default_command.is_empty() {
+                            None
+                        } else {
+                            Some(ui.config.default_command.as_str())
+                        };
+                        match pane.create_pane(cmd, Some(&dir_str)) {
+                            Ok(new_id) => {
+                                state.blocking_write().register_pane(new_id.clone());
+                                let _ = pane.rename_pane(&new_id, "Config Generator");
+                                ui.pane_display_names
+                                    .insert(new_id.clone(), "Config Generator".to_string());
+                                ui.pane_names
+                                    .insert(new_id.clone(), "Config Generator".to_string());
+                                let _ = pane.focus_pane(&new_id);
+                                ui.mode = UiMode::PaneInput;
+                                // Resize new pane PTY to match current layout.
+                                if let Some(embedded) =
+                                    pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                                {
+                                    let frame_area = terminal.get_frame().area();
+                                    let right_width =
+                                        (frame_area.width * 67 / 100).saturating_sub(2);
+                                    let pane_count = embedded.pane_ids().len() as u16;
+                                    let rows = match ui.pane_layout {
+                                        PaneLayout::Tiled => (frame_area.height
+                                            / pane_count.max(1))
+                                        .saturating_sub(2),
+                                        PaneLayout::Stacked => frame_area
+                                            .height
+                                            .saturating_sub(2 + pane_count.saturating_sub(1)),
+                                    };
+                                    if rows > 0 && right_width > 0 {
+                                        let _ =
+                                            embedded.resize_pane_pty(&new_id, rows, right_width);
+                                    }
+                                }
+                                // Send generation prompt to the agent pane.
+                                let prompt = generate_mode_config_prompt(&dir_str);
+                                let _ = pane.write_to_pane(&new_id, &prompt);
+                                ui.status_message = Some((
+                                    "Generating mode config...".to_string(),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                            Err(e) => {
+                                ui.status_message = Some((
+                                    format!("Config generation failed: {e}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -2933,6 +2999,24 @@ fn render_mode_selector(frame: &mut Frame, selector: &ModeSelectorState) {
             Style::default()
         };
         lines.push(Line::styled(format!("{prefix}{}", mode.name), style));
+    }
+
+    // "Generate mode config" option (last item, only when show_generate is true)
+    if selector.show_generate {
+        let gen_idx = selector.item_count() - 1;
+        let prefix = if selector.selected == gen_idx {
+            "> "
+        } else {
+            "  "
+        };
+        let style = if selector.selected == gen_idx {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        lines.push(Line::styled(format!("{prefix}Generate mode config"), style));
     }
 
     lines.push(Line::from(""));
@@ -3917,8 +4001,12 @@ mod tests {
             &mut ui,
         );
 
-        assert_eq!(ui.mode, UiMode::NewPaneForm);
-        assert!(ui.new_pane_form.is_some());
+        // Now goes to ModeSelector (with generate option) instead of NewPaneForm
+        assert_eq!(ui.mode, UiMode::ModeSelector);
+        assert!(ui.mode_selector.is_some());
+        let selector = ui.mode_selector.as_ref().unwrap();
+        assert!(selector.show_generate);
+        assert!(selector.modes.is_empty());
     }
 
     #[test]
@@ -4645,12 +4733,13 @@ mod tests {
 
     #[test]
     fn mode_selector_item_count() {
-        let s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![make_mode("a")]);
+        let s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![make_mode("a")], false);
         assert_eq!(s.item_count(), 2); // "New agent pane" + 1 mode
 
         let s = ModeSelectorState::new(
             PathBuf::from("/tmp"),
             vec![make_mode("a"), make_mode("b"), make_mode("c")],
+            false,
         );
         assert_eq!(s.item_count(), 4);
     }
@@ -4660,6 +4749,7 @@ mod tests {
         let mut s = ModeSelectorState::new(
             PathBuf::from("/tmp"),
             vec![make_mode("alpha"), make_mode("beta")],
+            false,
         );
         assert_eq!(s.selected, 0);
 
@@ -4680,7 +4770,7 @@ mod tests {
     #[test]
     fn mode_selector_selected_mode() {
         let modes = vec![make_mode("k8s"), make_mode("rust-tdd")];
-        let mut s = ModeSelectorState::new(PathBuf::from("/tmp"), modes);
+        let mut s = ModeSelectorState::new(PathBuf::from("/tmp"), modes, false);
 
         // Index 0 = "New agent pane" → None
         assert!(s.selected_mode().is_none());
@@ -4699,6 +4789,7 @@ mod tests {
         ui.mode_selector = Some(ModeSelectorState::new(
             PathBuf::from("/tmp"),
             vec![make_mode("a"), make_mode("b")],
+            false,
         ));
 
         // j moves down
@@ -4719,6 +4810,7 @@ mod tests {
         ui.mode_selector = Some(ModeSelectorState::new(
             PathBuf::from("/tmp/myproject"),
             vec![make_mode("a")],
+            false,
         ));
 
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
@@ -4738,6 +4830,7 @@ mod tests {
         ui.mode_selector = Some(ModeSelectorState::new(
             PathBuf::from("/tmp/proj"),
             vec![make_mode("k8s-ops")],
+            false,
         ));
 
         // Navigate to mode entry
@@ -4762,6 +4855,7 @@ mod tests {
         ui.mode_selector = Some(ModeSelectorState::new(
             PathBuf::from("/tmp"),
             vec![make_mode("a")],
+            false,
         ));
 
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -4769,6 +4863,77 @@ mod tests {
 
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.mode_selector.is_none());
+    }
+
+    #[test]
+    fn mode_selector_item_count_with_generate() {
+        // No modes + generate option = 2 items ("New agent pane" + "Generate")
+        let s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![], true);
+        assert_eq!(s.item_count(), 2);
+
+        // Modes + generate = modes + 2
+        let s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![make_mode("a")], true);
+        assert_eq!(s.item_count(), 3);
+    }
+
+    #[test]
+    fn mode_selector_generate_is_last_item() {
+        let mut s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![], true);
+        assert!(!s.is_generate_selected()); // index 0 = "New agent pane"
+
+        s.selected = 1; // last item = generate
+        assert!(s.is_generate_selected());
+        assert!(s.selected_mode().is_none()); // generate returns None for mode
+    }
+
+    #[test]
+    fn mode_selector_no_generate_when_config_exists() {
+        let s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![make_mode("a")], false);
+        assert!(!s.is_generate_selected());
+        assert_eq!(s.item_count(), 2); // no extra item
+    }
+
+    #[test]
+    fn mode_selector_enter_on_generate_returns_generate() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ModeSelector;
+        ui.mode_selector = Some(ModeSelectorState::new(
+            PathBuf::from("/tmp/proj"),
+            vec![],
+            true,
+        ));
+
+        // Navigate to generate option (index 1)
+        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        handle_mode_selector_key(key, &mut ui);
+
+        // Select it
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_mode_selector_key(key, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.mode_selector.is_none());
+        assert!(
+            matches!(result, KeyResult::GenerateModeConfig { ref dir } if dir == Path::new("/tmp/proj"))
+        );
+    }
+
+    #[test]
+    fn mode_selector_generate_navigation() {
+        let mut s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![], true);
+        assert_eq!(s.selected, 0); // starts at "New agent pane"
+        assert_eq!(s.item_count(), 2);
+
+        s.select_next();
+        assert_eq!(s.selected, 1); // "Generate mode config"
+        assert!(s.is_generate_selected());
+
+        s.select_next();
+        assert_eq!(s.selected, 1); // can't go past last
+
+        s.select_previous();
+        assert_eq!(s.selected, 0); // back to "New agent pane"
+        assert!(!s.is_generate_selected());
     }
 
     // --- extract_new_bash_commands tests ---
