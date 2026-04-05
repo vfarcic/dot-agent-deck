@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.14.2] - 2026-04-05
+
+### Fixed
+
+- **Status indicator blinks at a comfortable rate and Idle status now blinks**
+  The status dot for "Needs Input" now pulses at ~1 blink per second instead of flickering rapidly at ~30Hz. The "Idle" status also blinks now, since it represents a state where the user needs to provide the next prompt.
+
+
+
 ## [0.14.1] - 2026-04-05
 
 ### Fixed
