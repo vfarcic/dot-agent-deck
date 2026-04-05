@@ -225,6 +225,11 @@ impl AppState {
                 session.active_tool = None;
             }
             EventType::ToolStart => {
+                // A ToolStart for a previously-pending permission means the
+                // user approved it — resolve that permission from the queue.
+                if let Some(tool_use_id) = event.metadata.get("tool_use_id") {
+                    session.resolve_pending_permission(tool_use_id);
+                }
                 if session.status != SessionStatus::WaitingForInput
                     || session.pending_permissions.is_empty()
                 {
@@ -648,5 +653,59 @@ mod tests {
                 .tool_use_id,
             "perm-2"
         );
+    }
+
+    #[test]
+    fn tool_start_resolves_pending_permission_and_transitions_to_working() {
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+
+        // Enqueue a permission request → status becomes WaitingForInput
+        let mut perm = make_event("s1", EventType::PermissionRequest);
+        perm.tool_name = Some("Bash".into());
+        perm.metadata.insert("tool_use_id".into(), "perm-1".into());
+        state.apply_event(perm);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
+        assert_eq!(state.sessions["s1"].pending_permissions.len(), 1);
+
+        // User approves → ToolStart fires with the same tool_use_id
+        let mut tool_start = make_event("s1", EventType::ToolStart);
+        tool_start.tool_name = Some("Bash".into());
+        tool_start
+            .metadata
+            .insert("tool_use_id".into(), "perm-1".into());
+        state.apply_event(tool_start);
+
+        // Permission should be resolved and status should transition to Working
+        assert_eq!(state.sessions["s1"].pending_permissions.len(), 0);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn tool_start_preserves_waiting_when_other_permissions_remain() {
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+
+        // Enqueue two permission requests
+        let mut perm1 = make_event("s1", EventType::PermissionRequest);
+        perm1.metadata.insert("tool_use_id".into(), "perm-1".into());
+        state.apply_event(perm1);
+
+        let mut perm2 = make_event("s1", EventType::PermissionRequest);
+        perm2.metadata.insert("tool_use_id".into(), "perm-2".into());
+        state.apply_event(perm2);
+
+        assert_eq!(state.sessions["s1"].pending_permissions.len(), 2);
+
+        // First permission approved → ToolStart fires
+        let mut tool_start = make_event("s1", EventType::ToolStart);
+        tool_start
+            .metadata
+            .insert("tool_use_id".into(), "perm-1".into());
+        state.apply_event(tool_start);
+
+        // One permission resolved, but status stays WaitingForInput for the second
+        assert_eq!(state.sessions["s1"].pending_permissions.len(), 1);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
     }
 }
