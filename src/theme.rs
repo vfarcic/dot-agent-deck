@@ -81,44 +81,20 @@ impl ColorPalette {
 /// For [`Theme::Auto`], queries the terminal background via OSC 11 and falls
 /// back to the dark palette on detection failure.
 pub fn resolve_palette(theme: Theme) -> ColorPalette {
-    let mut palette = match theme {
+    match theme {
         Theme::Dark => ColorPalette::dark(),
         Theme::Light => ColorPalette::light(),
-        Theme::Auto => return detect_palette(),
-    };
-
-    // For explicit themes, still try to detect the actual terminal background
-    // so we can fill the frame correctly (alternate screen may not inherit theme bg).
-    if let Ok(bg_color) =
-        terminal_colorsaurus::background_color(terminal_colorsaurus::QueryOptions::default())
-    {
-        let (r, g, b) = bg_color.scale_to_8bit();
-        palette.terminal_bg = Color::Rgb(r, g, b);
-        let is_light = matches!(theme, Theme::Light);
-        palette.selected_bg = if is_light {
-            Color::Rgb(
-                r.saturating_sub(20),
-                g.saturating_sub(18),
-                b.saturating_sub(10),
-            )
-        } else {
-            Color::Rgb(
-                r.saturating_add(20),
-                g.saturating_add(22),
-                b.saturating_add(35),
-            )
-        };
+        Theme::Auto => detect_palette(),
     }
-
-    palette
 }
 
 fn detect_palette() -> ColorPalette {
-    let opts = terminal_colorsaurus::QueryOptions::default();
-    let mode = terminal_colorsaurus::theme_mode(opts);
-    let bg = terminal_colorsaurus::background_color(terminal_colorsaurus::QueryOptions::default());
+    let colors = terminal_colorsaurus::color_palette(terminal_colorsaurus::QueryOptions::default());
 
-    let is_light = matches!(mode, Ok(terminal_colorsaurus::ThemeMode::Light));
+    let is_light = matches!(
+        colors.as_ref().map(|c| c.theme_mode()),
+        Ok(terminal_colorsaurus::ThemeMode::Light)
+    );
     let mut palette = if is_light {
         ColorPalette::light()
     } else {
@@ -126,8 +102,8 @@ fn detect_palette() -> ColorPalette {
     };
 
     // Derive selected_bg and terminal_bg from the actual terminal background.
-    if let Ok(bg_color) = bg {
-        let (r, g, b) = bg_color.scale_to_8bit();
+    if let Ok(colors) = colors {
+        let (r, g, b) = colors.background.scale_to_8bit();
         palette.terminal_bg = Color::Rgb(r, g, b);
         palette.selected_bg = if is_light {
             // Darken slightly for light backgrounds

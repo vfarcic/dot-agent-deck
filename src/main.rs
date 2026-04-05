@@ -15,7 +15,7 @@ use dot_agent_deck::ui::run_tui;
 #[derive(Parser)]
 #[command(name = "dot-agent-deck", about = "AI agent session dashboard", version = env!("DAD_VERSION"))]
 struct Cli {
-    /// Restore pane session from last exit (shortcut for `dashboard --continue`)
+    /// Restore pane session from last exit
     #[arg(long = "continue")]
     continue_session: bool,
 

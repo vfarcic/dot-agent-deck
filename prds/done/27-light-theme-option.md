@@ -36,7 +36,7 @@ Remove forced backgrounds and auto-detect the terminal's theme to select the app
 - Auto-detection of terminal background color via `terminal-colorsaurus` crate
 - CLI flag `--theme auto|light|dark` (default: `auto`)
 - Config file option `theme: auto|light|dark`
-- Small foreground-only color palette for neutral text colors (no background colors in palette)
+- Small color palette for neutral text colors plus `terminal_bg` and `selected_bg` background tokens
 - Accent/status ANSI colors kept as-is (terminal remaps them per-theme)
 - Fallback to dark palette when auto-detection fails
 
@@ -70,7 +70,7 @@ These ANSI accent colors are remapped by the terminal per-theme and need no swit
 | Secondary text | DarkGray | Gray |
 | Tool lines | DarkGray | DarkGray |
 
-*Note: No background colors in either palette — the terminal's native background is used.*
+*Note: The palette includes `terminal_bg` (queried from the terminal) and `selected_bg` (derived shift for card highlights). Hardcoded `bg()` calls were removed; background colors now come from the detected terminal background.*
 
 *Note: Light palette colors are initial estimates — will need testing and iteration.*
 
