@@ -1340,6 +1340,7 @@ pub fn run_tui(
                 has_pane_control,
                 &*pane,
                 pane_layout,
+                mode_manager.active_mode_name(),
             );
         })?;
         tick = tick.wrapping_add(1);
@@ -2052,6 +2053,7 @@ fn render_frame(
     has_pane_control: bool,
     pane_controller: &dyn PaneController,
     pane_layout: PaneLayout,
+    active_mode_name: Option<&str>,
 ) {
     let area = frame.area();
 
@@ -2110,7 +2112,7 @@ fn render_frame(
         }
 
         if ui.mode == UiMode::Help {
-            render_help_overlay(frame, has_pane_control);
+            render_help_overlay(frame, has_pane_control, active_mode_name);
         }
         if ui.mode == UiMode::DirPicker
             && let Some(picker) = ui.dir_picker.as_mut()
@@ -2186,7 +2188,12 @@ fn render_frame(
         .split(vertical[1]);
         frame.render_widget(msg, inner[1]);
 
-        render_stats_bar(frame, &state.aggregate_stats(), vertical[2]);
+        render_stats_bar(
+            frame,
+            &state.aggregate_stats(),
+            vertical[2],
+            active_mode_name,
+        );
         render_bottom_bar(frame, ui, hints_area, has_pane_control);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
@@ -2261,7 +2268,12 @@ fn render_frame(
 
     // Stats bar at bottom of dashboard area
     let stats_area = row_chunks[row_chunks.len() - 1];
-    render_stats_bar(frame, &state.aggregate_stats(), stats_area);
+    render_stats_bar(
+        frame,
+        &state.aggregate_stats(),
+        stats_area,
+        active_mode_name,
+    );
 
     // Full-width hints bar
     render_bottom_bar(frame, ui, hints_area, has_pane_control);
@@ -2280,7 +2292,7 @@ fn render_frame(
 
     // Overlays (drawn last, on top)
     if ui.mode == UiMode::Help {
-        render_help_overlay(frame, has_pane_control);
+        render_help_overlay(frame, has_pane_control, active_mode_name);
     }
     if ui.mode == UiMode::DirPicker
         && let Some(picker) = ui.dir_picker.as_mut()
@@ -2465,7 +2477,12 @@ fn render_terminal_panes(
     focused_pane_rect
 }
 
-fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
+fn render_stats_bar(
+    frame: &mut Frame,
+    stats: &DashboardStats,
+    area: Rect,
+    active_mode_name: Option<&str>,
+) {
     let mut spans: Vec<Span> = Vec::new();
 
     // Always show active count
@@ -2507,6 +2524,19 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
         format!("{} tools", stats.total_tools),
         Style::default().fg(Color::Gray),
     ));
+
+    if let Some(name) = active_mode_name {
+        spans.push(Span::styled(
+            "  \u{2502}  ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            format!("mode: {name}"),
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -2613,10 +2643,11 @@ fn render_quit_confirm(frame: &mut Frame) {
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
+fn render_help_overlay(frame: &mut Frame, has_pane_control: bool, active_mode_name: Option<&str>) {
     let area = frame.area();
     let popup_width = 52.min(area.width.saturating_sub(4));
-    let base_height: u16 = if has_pane_control { 38 } else { 23 };
+    let mode_lines: u16 = if active_mode_name.is_some() { 8 } else { 6 };
+    let base_height: u16 = if has_pane_control { 38 } else { 23 } + mode_lines;
     let popup_height = base_height.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -2657,6 +2688,27 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
         help_text.push(Line::from("  ?             Toggle this help"));
         help_text.push(Line::from("  Esc           Clear filter"));
         help_text.push(Line::from(format!("  {MOD_KEY}+c         Quit")));
+    }
+
+    help_text.push(Line::from(""));
+    help_text.push(Line::styled(
+        "  Mode Selector",
+        Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+    ));
+    help_text.push(Line::from(""));
+    help_text.push(Line::from("  j/k           Navigate modes"));
+    help_text.push(Line::from("  Enter         Select mode"));
+    help_text.push(Line::from("  Esc           Cancel (default pane)"));
+    if let Some(name) = active_mode_name {
+        help_text.push(Line::from(""));
+        help_text.push(Line::styled(
+            format!("  Active: {name}"),
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
 
     help_text.push(Line::from(""));
@@ -3296,6 +3348,7 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
+                    None,
                 )
             })
             .unwrap();
@@ -3355,6 +3408,7 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
+                    None,
                 )
             })
             .unwrap();
@@ -3461,6 +3515,7 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
+                    None,
                 )
             })
             .unwrap();
@@ -3531,6 +3586,7 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
+                    None,
                 )
             })
             .unwrap();
