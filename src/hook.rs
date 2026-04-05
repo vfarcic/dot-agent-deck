@@ -65,34 +65,13 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         None => return ExitCode::SUCCESS,
     };
 
-    let is_claude_permission = event.event_type == EventType::PermissionRequest
-        && matches!(event.agent_type, AgentType::ClaudeCode);
-
     let json = match serde_json::to_string(&event) {
         Ok(j) => j,
         Err(_) => return ExitCode::SUCCESS,
     };
 
-    if is_claude_permission {
-        match send_and_wait_for_response(&json) {
-            Some(decision) => {
-                let output = serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PermissionRequest",
-                        "decision": {
-                            "behavior": decision
-                        }
-                    }
-                });
-                println!("{output}");
-                ExitCode::SUCCESS
-            }
-            None => ExitCode::FAILURE,
-        }
-    } else {
-        let _ = send_to_socket(&json);
-        ExitCode::SUCCESS
-    }
+    let _ = send_to_socket(&json);
+    ExitCode::SUCCESS
 }
 
 fn read_stdin() -> Option<String> {
@@ -170,14 +149,6 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
     if let Some(tool_use_id) = tool_use_id {
         metadata.insert("tool_use_id".to_string(), tool_use_id);
     }
-    if matches!(event_type, EventType::PermissionRequest) {
-        metadata.insert("permission_state".to_string(), "pending".to_string());
-        // Claude Code doesn't include tool_use_id in PermissionRequest events,
-        // so generate a synthetic one for the response channel correlation.
-        metadata
-            .entry("tool_use_id".to_string())
-            .or_insert_with(|| format!("perm-{}-{}", session_id, Utc::now().timestamp_millis()));
-    }
 
     Some(AgentEvent {
         session_id,
@@ -223,19 +194,6 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     let user_prompt = input.prompt.map(|p| truncate(&p, 200));
     let pane_id = std::env::var("DOT_AGENT_DECK_PANE_ID").ok();
 
-    let mut metadata = HashMap::new();
-    if matches!(event_type, EventType::PermissionRequest) {
-        metadata.insert("permission_state".to_string(), "pending".to_string());
-        metadata.insert(
-            "tool_use_id".to_string(),
-            format!(
-                "perm-{}-{}",
-                input.session_id,
-                Utc::now().timestamp_millis()
-            ),
-        );
-    }
-
     Some(AgentEvent {
         session_id: input.session_id,
         agent_type: AgentType::OpenCode,
@@ -245,36 +203,9 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
         cwd: input.cwd,
         timestamp: Utc::now(),
         user_prompt,
-        metadata,
+        metadata: HashMap::new(),
         pane_id,
     })
-}
-
-fn send_and_wait_for_response(json: &str) -> Option<String> {
-    use std::io::BufRead;
-
-    let path = socket_path();
-    let mut stream = UnixStream::connect(path).ok()?;
-
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(600)))
-        .ok()?;
-
-    let msg = format!("{json}\n");
-    stream.write_all(msg.as_bytes()).ok()?;
-    stream.flush().ok()?;
-
-    let mut reader = std::io::BufReader::new(stream);
-    let mut response_line = String::new();
-    match reader.read_line(&mut response_line) {
-        Ok(0) => None,
-        Ok(_) => {
-            let parsed: serde_json::Value = serde_json::from_str(response_line.trim()).ok()?;
-            let decision = parsed.get("decision")?.as_str()?.to_string();
-            Some(decision)
-        }
-        Err(_) => None,
-    }
 }
 
 fn send_to_socket(json: &str) -> Option<()> {
@@ -497,30 +428,6 @@ mod tests {
         let prompt = event.user_prompt.unwrap();
         assert!(prompt.len() <= 204); // 200 + "…" (3 bytes)
         assert!(prompt.ends_with('…'));
-    }
-
-    #[test]
-    fn build_event_permission_request_sets_metadata() {
-        let input = ClaudeCodeHookInput {
-            session_id: "test-123".into(),
-            hook_event_name: "PermissionRequest".into(),
-            cwd: None,
-            tool_name: Some("Bash".into()),
-            tool_input: Some(serde_json::json!({"command": "rm -rf /"})),
-            tool_use_id: Some("use-1".into()),
-            prompt: None,
-            _extra: HashMap::new(),
-        };
-        let event = build_event(input).unwrap();
-        assert_eq!(event.event_type, EventType::PermissionRequest);
-        assert_eq!(
-            event.metadata.get("tool_use_id").map(String::as_str),
-            Some("use-1")
-        );
-        assert_eq!(
-            event.metadata.get("permission_state").map(String::as_str),
-            Some("pending")
-        );
     }
 
     #[test]

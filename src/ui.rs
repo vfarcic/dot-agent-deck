@@ -16,11 +16,9 @@ use ratatui::{
 use crate::config;
 use crate::config::{BellConfig, DashboardConfig};
 use crate::embedded_pane::EmbeddedPaneController;
-use crate::event::{AgentType, EventType};
+use crate::event::EventType;
 use crate::pane::{PaneController, PaneError};
-use crate::state::{
-    AppState, DashboardStats, PermissionResponders, SessionState, SessionStatus, SharedState,
-};
+use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::terminal_widget::TerminalWidget;
 use crate::theme::ColorPalette;
 
@@ -512,7 +510,6 @@ enum KeyResult {
     Quit,
     Focus,
     NewPane(NewPaneRequest),
-    PermissionResponse(String),
     ForwardToPane(Vec<u8>),
 }
 
@@ -813,25 +810,13 @@ fn focus_deck(
     true
 }
 
-fn handle_normal_key(
-    key: KeyEvent,
-    ui: &mut UiState,
-    total: usize,
-    has_pending_permission: bool,
-) -> KeyResult {
+fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
     // Ctrl+C from dashboard: show quit confirmation
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.mode = UiMode::QuitConfirm;
         return KeyResult::Continue;
     }
     match key.code {
-        // Permission responses (dashboard-only)
-        KeyCode::Char('y') if has_pending_permission => {
-            KeyResult::PermissionResponse("allow".to_string())
-        }
-        KeyCode::Char('n') if has_pending_permission => {
-            KeyResult::PermissionResponse("deny".to_string())
-        }
         // Dashboard navigation
         KeyCode::Char('j') | KeyCode::Down => {
             ui.selected_index =
@@ -1128,7 +1113,6 @@ pub fn run_tui(
     state: SharedState,
     pane: Box<dyn PaneController>,
     config: DashboardConfig,
-    responders: PermissionResponders,
     palette: ColorPalette,
     continue_session: bool,
 ) -> std::io::Result<()> {
@@ -1690,13 +1674,8 @@ pub fn run_tui(
             let result = if shortcut_handled {
                 KeyResult::Continue
             } else {
-                // TODO(prd-38): permission UI disabled — see PRD for redesign
-                let has_pending_permission = false;
-
                 match ui.mode {
-                    UiMode::Normal => {
-                        handle_normal_key(key, &mut ui, total, has_pending_permission)
-                    }
+                    UiMode::Normal => handle_normal_key(key, &mut ui, total),
                     UiMode::Filter => handle_filter_key(key, &mut ui),
                     UiMode::Help => handle_help_key(key, &mut ui),
                     UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
@@ -1806,80 +1785,6 @@ pub fn run_tui(
                                     format!("New pane failed: {e}"),
                                     std::time::Instant::now(),
                                 ));
-                            }
-                        }
-                    }
-                }
-                KeyResult::PermissionResponse(decision) => {
-                    if let Some(ref sid) = selected_id
-                        && let Some(session) = snapshot.sessions.get(sid)
-                        && let Some(pending) = session.next_pending_permission()
-                    {
-                        let tool_use_id = pending.tool_use_id.clone();
-                        let tool_name = pending.tool_name.clone().unwrap_or_else(|| "tool".into());
-                        let agent_type = session.agent_type.clone();
-
-                        match agent_type {
-                            AgentType::OpenCode => {
-                                let keystroke = if decision == "allow" { "y" } else { "n" };
-                                if let Some(ref pane_id) = session.pane_id {
-                                    match pane.write_to_pane(pane_id, keystroke) {
-                                        Ok(()) => {
-                                            state
-                                                .blocking_write()
-                                                .resolve_permission(sid, &tool_use_id);
-                                            let verb = if decision == "allow" {
-                                                "Approved"
-                                            } else {
-                                                "Denied"
-                                            };
-                                            ui.status_message = Some((
-                                                format!("{verb} {tool_name}"),
-                                                std::time::Instant::now(),
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            ui.status_message = Some((
-                                                format!("Failed to send response: {e}"),
-                                                std::time::Instant::now(),
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    ui.status_message = Some((
-                                        format!("No pane for {tool_name} — cannot send response"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                            AgentType::ClaudeCode => {
-                                let sent = {
-                                    let mut map = responders.lock().unwrap();
-                                    if let Some(sender) = map.remove(&tool_use_id) {
-                                        sender.send(decision.clone()).is_ok()
-                                    } else {
-                                        false
-                                    }
-                                };
-
-                                state.blocking_write().resolve_permission(sid, &tool_use_id);
-
-                                if sent {
-                                    let verb = if decision == "allow" {
-                                        "Approved"
-                                    } else {
-                                        "Denied"
-                                    };
-                                    ui.status_message = Some((
-                                        format!("{verb} {tool_name}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                } else {
-                                    ui.status_message = Some((
-                                        format!("Permission expired for {tool_name}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
                             }
                         }
                     }
@@ -2587,18 +2492,6 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool, palette: Color
     }
 
     help_text.push(Line::from(""));
-    help_text.push(Line::styled(
-        "  Permission Approval",
-        Style::default()
-            .fg(Color::LightMagenta)
-            .add_modifier(Modifier::BOLD),
-    ));
-    help_text.push(Line::from(""));
-    // TODO(prd-38): permission UI disabled — see PRD for redesign
-    // help_text.push(Line::from("  y             Allow permission"));
-    // help_text.push(Line::from("  n             Deny permission"));
-    // help_text.push(Line::from("  (only when card has pending prompt)"));
-
     help_text.push(Line::from(""));
     help_text.push(Line::styled(
         "  Session",
@@ -2887,9 +2780,6 @@ fn render_session_card(
     let max_title = (area.width as usize).saturating_sub(status_text.chars().count() + 2);
     title_left = truncate_with_ellipsis(&title_left, max_title);
 
-    // TODO(prd-38): permission UI disabled — see PRD for redesign
-    let has_permission = false;
-
     let border_style = if is_selected {
         Style::default()
             .fg(Color::Cyan)
@@ -2985,24 +2875,8 @@ fn render_session_card(
     if density != CardDensity::Compact {
         lines.push(Line::from(""));
     }
-    let mut tool_lines = recent_tool_lines(session, density.max_tools(), palette);
-    if has_permission && let Some(last) = tool_lines.last_mut() {
-        *last = last.clone().style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
-    }
+    let tool_lines = recent_tool_lines(session, density.max_tools(), palette);
     lines.extend(tool_lines);
-
-    if has_permission {
-        lines.push(Line::from(Span::styled(
-            "  [y] approve  [n] deny",
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
-        )));
-    }
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
@@ -3294,7 +3168,6 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             pane_id: None,
-            pending_permissions: VecDeque::new(),
         };
 
         let palette = ColorPalette::dark();
@@ -3905,7 +3778,6 @@ mod tests {
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
             &mut ui,
             3,
-            false,
         );
         assert_eq!(ui.mode, UiMode::Filter);
 
@@ -3918,7 +3790,6 @@ mod tests {
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
             &mut ui,
             3,
-            false,
         );
         assert_eq!(ui.mode, UiMode::Help);
 
@@ -3931,7 +3802,6 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             3,
-            false,
         );
         assert_eq!(ui.mode, UiMode::Rename);
 
@@ -4024,12 +3894,7 @@ mod tests {
         let mut ui = default_ui();
         ui.filter_text = "active-filter".to_string();
 
-        handle_normal_key(
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &mut ui,
-            5,
-            false,
-        );
+        handle_normal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui, 5);
         assert!(ui.filter_text.is_empty());
     }
 
@@ -4041,7 +3906,6 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             0,
-            false,
         );
         assert_eq!(ui.mode, UiMode::Normal);
     }
@@ -4063,7 +3927,6 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             pane_id: None,
-            pending_permissions: std::collections::VecDeque::new(),
         }
     }
 
@@ -4253,7 +4116,6 @@ mod tests {
             tool_count: 0,
             last_user_prompt: Some("third prompt".to_string()),
             pane_id: None,
-            pending_permissions: VecDeque::new(),
         };
 
         // Spacious: get all 3
@@ -4285,7 +4147,6 @@ mod tests {
             tool_count: 0,
             last_user_prompt: Some("old prompt".to_string()),
             pane_id: None,
-            pending_permissions: VecDeque::new(),
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -4308,7 +4169,6 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             pane_id: None,
-            pending_permissions: VecDeque::new(),
         };
 
         let prompts = collect_recent_prompts(&session, 3);
