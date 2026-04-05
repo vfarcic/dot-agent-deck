@@ -355,6 +355,8 @@ struct UiState {
     focused_pane_rect: Option<Rect>,
     /// Tracks last click time and position for double/triple-click detection.
     last_click: Option<(std::time::Instant, u16, u16, u8)>, // (time, col, row, click_count)
+    /// Tracks last-seen event timestamp per session for reactive pane routing.
+    last_routed_timestamp: HashMap<String, DateTime<Utc>>,
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -395,6 +397,7 @@ impl UiState {
             selection: None,
             focused_pane_rect: None,
             last_click: None,
+            last_routed_timestamp: HashMap::new(),
         }
     }
 }
@@ -1223,6 +1226,36 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
 }
 
 // ---------------------------------------------------------------------------
+// Reactive pane routing — extract new Bash commands from session events
+// ---------------------------------------------------------------------------
+
+fn extract_new_bash_commands(
+    sessions: &HashMap<String, SessionState>,
+    last_routed: &mut HashMap<String, DateTime<Utc>>,
+) -> Vec<String> {
+    let mut commands = Vec::new();
+    for (sid, session) in sessions {
+        let cutoff = last_routed.get(sid).copied();
+        for event in session.recent_events.iter() {
+            if cutoff.is_some_and(|ts| event.timestamp <= ts) {
+                continue;
+            }
+            if event.event_type == EventType::ToolStart
+                && event.tool_name.as_deref() == Some("Bash")
+                && let Some(cmd) = event.metadata.get("bash_command")
+            {
+                commands.push(cmd.clone());
+            }
+        }
+        if let Some(last) = session.recent_events.back() {
+            last_routed.insert(sid.clone(), last.timestamp);
+        }
+    }
+    last_routed.retain(|sid, _| sessions.contains_key(sid));
+    commands
+}
+
+// ---------------------------------------------------------------------------
 // TUI entry point
 // ---------------------------------------------------------------------------
 
@@ -1264,6 +1297,17 @@ pub fn run_tui(
         }
 
         let snapshot = state.blocking_read().clone();
+
+        // Route new Bash commands through the mode manager for reactive panes.
+        if mode_manager.active_mode_name().is_some() {
+            let new_commands =
+                extract_new_bash_commands(&snapshot.sessions, &mut ui.last_routed_timestamp);
+            for cmd in new_commands {
+                if let Err(e) = mode_manager.handle_command(&cmd) {
+                    tracing::warn!("Reactive pane routing error: {e}");
+                }
+            }
+        }
 
         // Pick up version-check result once
         if ui.update_available.is_none() {
@@ -4725,5 +4769,115 @@ mod tests {
 
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.mode_selector.is_none());
+    }
+
+    // --- extract_new_bash_commands tests ---
+
+    fn make_event(
+        event_type: EventType,
+        tool_name: Option<&str>,
+        bash_command: Option<&str>,
+        ts: DateTime<Utc>,
+    ) -> AgentEvent {
+        let mut metadata = HashMap::new();
+        if let Some(cmd) = bash_command {
+            metadata.insert("bash_command".to_string(), cmd.to_string());
+        }
+        AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: tool_name.map(String::from),
+            tool_detail: None,
+            cwd: None,
+            timestamp: ts,
+            user_prompt: None,
+            metadata,
+            pane_id: None,
+        }
+    }
+
+    fn make_session_with_events(events: Vec<AgentEvent>) -> SessionState {
+        use std::collections::VecDeque;
+        SessionState {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            status: SessionStatus::Idle,
+            cwd: None,
+            active_tool: None,
+            pane_id: None,
+            tool_count: 0,
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+            recent_events: VecDeque::from(events),
+            last_user_prompt: None,
+            pending_permissions: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn extract_new_bash_commands_finds_new_commands() {
+        let now = Utc::now();
+        let e = make_event(
+            EventType::ToolStart,
+            Some("Bash"),
+            Some("kubectl get pods"),
+            now,
+        );
+        let mut sessions = HashMap::new();
+        sessions.insert("s1".to_string(), make_session_with_events(vec![e]));
+
+        let mut last_routed = HashMap::new();
+        let cmds = extract_new_bash_commands(&sessions, &mut last_routed);
+        assert_eq!(cmds, vec!["kubectl get pods"]);
+    }
+
+    #[test]
+    fn extract_new_bash_commands_skips_already_seen() {
+        let now = Utc::now();
+        let e = make_event(
+            EventType::ToolStart,
+            Some("Bash"),
+            Some("kubectl get pods"),
+            now,
+        );
+        let mut sessions = HashMap::new();
+        sessions.insert("s1".to_string(), make_session_with_events(vec![e]));
+
+        let mut last_routed = HashMap::new();
+        // First call picks it up
+        let _ = extract_new_bash_commands(&sessions, &mut last_routed);
+        // Second call with same events returns nothing
+        let cmds = extract_new_bash_commands(&sessions, &mut last_routed);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn extract_new_bash_commands_ignores_non_bash() {
+        let now = Utc::now();
+        let e = make_event(EventType::ToolStart, Some("Read"), None, now);
+        let mut sessions = HashMap::new();
+        sessions.insert("s1".to_string(), make_session_with_events(vec![e]));
+
+        let mut last_routed = HashMap::new();
+        let cmds = extract_new_bash_commands(&sessions, &mut last_routed);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn extract_new_bash_commands_cleans_up_removed_sessions() {
+        let now = Utc::now();
+        let e = make_event(EventType::ToolStart, Some("Bash"), Some("ls"), now);
+        let mut sessions = HashMap::new();
+        sessions.insert("s1".to_string(), make_session_with_events(vec![e]));
+
+        let mut last_routed = HashMap::new();
+        let _ = extract_new_bash_commands(&sessions, &mut last_routed);
+        assert!(last_routed.contains_key("s1"));
+
+        // Remove the session and call again
+        sessions.clear();
+        let _ = extract_new_bash_commands(&sessions, &mut last_routed);
+        assert!(last_routed.is_empty());
     }
 }

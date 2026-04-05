@@ -151,7 +151,7 @@ New `ModeSelector` UI mode inserted between DirPicker and NewPaneForm (only when
 ## Milestones
 
 - [x] Project config loading — `ProjectConfig` struct, `.dot-agent-deck.toml` parsing, `resolve_modes()` returns user-defined modes
-- [ ] Full command capture — store complete bash command in hook event metadata for re-execution
+- [x] Full command capture — store complete bash command in hook event metadata for re-execution
 - [x] EmbeddedPaneController extensions — mode-driven pane creation, command writing, Ctrl+C via native PTY
 - [x] Mode manager core — regex compilation, circular pane pool, command routing, pane lifecycle, `shell_init` support
 - [x] Mode selector UI — modal in `n` dialog flow, loads config from selected directory, mode list with j/k navigation, "New agent pane" default option

@@ -179,6 +179,15 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
             .or_insert_with(|| format!("perm-{}-{}", session_id, Utc::now().timestamp_millis()));
     }
 
+    // Store full bash command for reactive pane routing (tool_detail truncates).
+    if matches!(event_type, EventType::ToolStart)
+        && tool_name.as_deref() == Some("Bash")
+        && let Some(ref input) = tool_input
+        && let Some(cmd) = input.get("command").and_then(|v| v.as_str())
+    {
+        metadata.insert("bash_command".to_string(), cmd.to_string());
+    }
+
     Some(AgentEvent {
         session_id,
         agent_type: AgentType::ClaudeCode,
@@ -234,6 +243,15 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
                 Utc::now().timestamp_millis()
             ),
         );
+    }
+
+    // Store full bash command for reactive pane routing (tool_detail truncates).
+    if matches!(event_type, EventType::ToolStart)
+        && input.tool_name.as_deref() == Some("Bash")
+        && let Some(ref tool_input) = input.tool_input
+        && let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str())
+    {
+        metadata.insert("bash_command".to_string(), cmd.to_string());
     }
 
     Some(AgentEvent {
@@ -796,5 +814,82 @@ mod tests {
                 None => std::env::remove_var(key),
             }
         }
+    }
+
+    #[test]
+    fn build_event_bash_tool_start_stores_full_command() {
+        let full_cmd = "kubectl get pods -n production\nkubectl get svc -n production";
+        let input = ClaudeCodeHookInput {
+            session_id: "s1".into(),
+            hook_event_name: "PreToolUse".into(),
+            cwd: None,
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": full_cmd})),
+            tool_use_id: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        assert_eq!(
+            event.metadata.get("bash_command").map(String::as_str),
+            Some(full_cmd),
+        );
+        // tool_detail should only have the first line (truncated)
+        assert_eq!(
+            event.tool_detail.as_deref(),
+            Some("kubectl get pods -n production"),
+        );
+    }
+
+    #[test]
+    fn build_event_non_bash_tool_start_no_bash_command() {
+        let input = ClaudeCodeHookInput {
+            session_id: "s1".into(),
+            hook_event_name: "PreToolUse".into(),
+            cwd: None,
+            tool_name: Some("Read".into()),
+            tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
+            tool_use_id: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        assert!(event.metadata.get("bash_command").is_none());
+    }
+
+    #[test]
+    fn build_event_bash_tool_end_no_bash_command() {
+        let input = ClaudeCodeHookInput {
+            session_id: "s1".into(),
+            hook_event_name: "PostToolUse".into(),
+            cwd: None,
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": "ls -la"})),
+            tool_use_id: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        assert!(event.metadata.get("bash_command").is_none());
+    }
+
+    #[test]
+    fn build_opencode_event_bash_tool_start_stores_full_command() {
+        let full_cmd = "helm status my-release --namespace prod";
+        let input = OpenCodeHookInput {
+            session_id: "oc-1".into(),
+            event: "tool.execute.before".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": full_cmd})),
+            status: None,
+            cwd: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_opencode_event(input).unwrap();
+        assert_eq!(
+            event.metadata.get("bash_command").map(String::as_str),
+            Some(full_cmd),
+        );
     }
 }
