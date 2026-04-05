@@ -1170,7 +1170,12 @@ pub fn run_tui(
                 Ok(new_id) => {
                     state.blocking_write().register_pane(new_id.clone());
                     if !saved_pane.name.is_empty() {
-                        let _ = pane.rename_pane(&new_id, &saved_pane.name);
+                        if let Err(e) = pane.rename_pane(&new_id, &saved_pane.name) {
+                            ui.session_warnings.push(format!(
+                                "Warning: failed to rename pane '{}': {e}",
+                                saved_pane.name
+                            ));
+                        }
                         ui.pane_display_names
                             .insert(new_id.clone(), saved_pane.name.clone());
                         ui.pane_names
