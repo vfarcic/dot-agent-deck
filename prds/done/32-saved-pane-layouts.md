@@ -1,8 +1,9 @@
 # PRD #32: Saved Pane Layouts
 
-**Status**: Draft
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-04-02
+**Completed**: 2026-04-05
 **GitHub Issue**: [#32](https://github.com/vfarcic/dot-agent-deck/issues/32)
 
 ## Problem Statement
