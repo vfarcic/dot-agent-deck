@@ -90,7 +90,7 @@ These ANSI accent colors are remapped by the terminal per-theme and need no swit
 - [x] Replace `Rgb(140,140,140)` with ANSI `DarkGray` color
 - [x] Add `terminal-colorsaurus` dependency to `Cargo.toml`
 - [x] Implement theme auto-detection on startup
-- [x] Define small foreground-only palette struct with dark/light variants (`src/theme.rs`)
+- [x] Define small color palette struct with dark/light variants (`src/theme.rs`)
 - [x] Add `--theme auto|light|dark` CLI flag and config file option
 - [x] Thread palette through render functions for neutral text colors
 - [x] Test on Ghostty with light and dark themes (other emulators not available)
@@ -128,7 +128,7 @@ These ANSI accent colors are remapped by the terminal per-theme and need no swit
 | 2026-04-05 | No backgrounds in palettes | Neither dark nor light palette should set background colors — backgrounds are the terminal's responsibility |
 | 2026-04-05 | Auto-detect via terminal-colorsaurus | Proven crate used by bat, delta, helix; OSC 11 query works on most modern terminals |
 | 2026-04-05 | Keep accent ANSI colors as-is | Semantic colors (Cyan, Green, Yellow, Red, Blue, Magenta) are remapped by terminal themes and remain readable on both backgrounds |
-| 2026-04-05 | Small foreground-only palette | Only text/label neutral colors (White, Gray, DarkGray) need to flip; accent colors adapt naturally |
+| 2026-04-05 | Small neutral color palette | Text/label colors (White, Gray, DarkGray) flip between themes; `terminal_bg` and `selected_bg` derived from detected background; accent colors adapt naturally |
 | 2026-04-05 | --theme auto\|light\|dark (default: auto) | Auto-detection covers most users; override available for tmux/SSH edge cases |
 | 2026-04-05 | Replace Rgb(140,140,140) with DarkGray | Eliminate last hardcoded RGB foreground color; use ANSI color that adapts to terminal theme |
 | 2026-04-05 | Default to dark on detection failure | Safe fallback since most terminal users use dark themes; config override available |
