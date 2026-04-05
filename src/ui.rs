@@ -17,6 +17,7 @@ use crate::config::{BellConfig, DashboardConfig};
 use crate::embedded_pane::EmbeddedPaneController;
 use crate::event::{AgentType, EventType};
 use crate::pane::{PaneController, PaneError};
+use crate::project_config::{ModeConfig, load_project_config};
 use crate::state::{
     AppState, DashboardStats, PermissionResponders, SessionState, SessionStatus, SharedState,
 };
@@ -106,6 +107,7 @@ enum UiMode {
     Help,
     Rename,
     DirPicker,
+    ModeSelector,
     NewPaneForm,
     PaneInput,
     QuitConfirm,
@@ -268,6 +270,49 @@ impl DirPickerState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Mode selector state (shown when dir has .dot-agent-deck.toml with modes)
+// ---------------------------------------------------------------------------
+
+struct ModeSelectorState {
+    dir: PathBuf,
+    modes: Vec<ModeConfig>,
+    selected: usize, // 0 = "New agent pane", 1..N = modes[0..N-1]
+}
+
+impl ModeSelectorState {
+    fn new(dir: PathBuf, modes: Vec<ModeConfig>) -> Self {
+        Self {
+            dir,
+            modes,
+            selected: 0,
+        }
+    }
+
+    fn item_count(&self) -> usize {
+        1 + self.modes.len()
+    }
+
+    fn select_next(&mut self) {
+        if self.selected + 1 < self.item_count() {
+            self.selected += 1;
+        }
+    }
+
+    fn select_previous(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Returns `None` for "New agent pane" (index 0), `Some(&ModeConfig)` for a mode.
+    fn selected_mode(&self) -> Option<&ModeConfig> {
+        if self.selected == 0 {
+            None
+        } else {
+            self.modes.get(self.selected - 1)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormField {
     Name,
@@ -292,6 +337,7 @@ struct UiState {
     status_message: Option<(String, std::time::Instant)>,
     dir_picker: Option<DirPickerState>,
     new_pane_form: Option<NewPaneFormState>,
+    mode_selector: Option<ModeSelectorState>,
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
@@ -338,6 +384,7 @@ impl UiState {
             status_message: None,
             dir_picker: None,
             new_pane_form: None,
+            mode_selector: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
             config,
@@ -996,7 +1043,7 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
             // If no subdirs, select current directory
             if !picker.has_subdirs() {
-                transition_to_form(ui);
+                transition_after_dir_pick(ui);
                 return KeyResult::Continue;
             }
             if picker.filtered_indices.is_empty() {
@@ -1011,7 +1058,7 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             picker.filtering = true;
         }
         KeyCode::Char(' ') => {
-            transition_to_form(ui);
+            transition_after_dir_pick(ui);
             return KeyResult::Continue;
         }
         _ => {}
@@ -1038,6 +1085,78 @@ fn transition_to_form(ui: &mut UiState) {
         focused: FormField::Name,
     });
     ui.mode = UiMode::NewPaneForm;
+}
+
+/// Check for `.dot-agent-deck.toml` in the selected directory.
+/// If modes are defined, show the mode selector; otherwise go straight to the form.
+fn transition_after_dir_pick(ui: &mut UiState) {
+    let dir = ui
+        .dir_picker
+        .as_ref()
+        .map(|p| p.current_dir.clone())
+        .unwrap_or_default();
+
+    match load_project_config(&dir) {
+        Ok(Some(config)) if !config.modes.is_empty() => {
+            ui.dir_picker = None;
+            ui.mode_selector = Some(ModeSelectorState::new(dir, config.modes));
+            ui.mode = UiMode::ModeSelector;
+        }
+        _ => {
+            transition_to_form(ui);
+        }
+    }
+}
+
+fn handle_mode_selector_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.mode = UiMode::QuitConfirm;
+        return KeyResult::Continue;
+    }
+
+    let selector = match ui.mode_selector.as_mut() {
+        Some(s) => s,
+        None => {
+            ui.mode = UiMode::Normal;
+            return KeyResult::Continue;
+        }
+    };
+
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            selector.select_next();
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            selector.select_previous();
+        }
+        KeyCode::Enter => {
+            let dir = selector.dir.clone();
+            let _selected_mode = selector.selected_mode().cloned();
+            ui.mode_selector = None;
+
+            // TODO(prd-34): When _selected_mode is Some, activate mode via ModeManager
+            // instead of falling through to the new pane form.
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let command = ui.config.default_command.clone();
+            ui.new_pane_form = Some(NewPaneFormState {
+                dir,
+                name,
+                command,
+                focused: FormField::Name,
+            });
+            ui.mode = UiMode::NewPaneForm;
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            ui.mode_selector = None;
+            ui.mode = UiMode::Normal;
+        }
+        _ => {}
+    }
+
+    KeyResult::Continue
 }
 
 fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
@@ -1632,6 +1751,7 @@ pub fn run_tui(
                     UiMode::Help => handle_help_key(key, &mut ui),
                     UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
                     UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
+                    UiMode::ModeSelector => handle_mode_selector_key(key, &mut ui),
                     UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
                     UiMode::PaneInput => handle_pane_input_key(key),
                     UiMode::QuitConfirm => handle_quit_confirm_key(key, &mut ui),
@@ -1934,6 +2054,11 @@ fn render_frame(
         {
             render_dir_picker(frame, picker);
         }
+        if ui.mode == UiMode::ModeSelector
+            && let Some(ref selector) = ui.mode_selector
+        {
+            render_mode_selector(frame, selector);
+        }
         if ui.mode == UiMode::NewPaneForm
             && let Some(ref form) = ui.new_pane_form
         {
@@ -2098,6 +2223,11 @@ fn render_frame(
         && let Some(picker) = ui.dir_picker.as_mut()
     {
         render_dir_picker(frame, picker);
+    }
+    if ui.mode == UiMode::ModeSelector
+        && let Some(ref selector) = ui.mode_selector
+    {
+        render_mode_selector(frame, selector);
     }
     if ui.mode == UiMode::NewPaneForm
         && let Some(ref form) = ui.new_pane_form
@@ -2593,6 +2723,68 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Select Directory ")
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_mode_selector(frame: &mut Frame, selector: &ModeSelectorState) {
+    let area = frame.area();
+    let item_count = selector.item_count();
+    // 2 (border) + 1 (dir) + 1 (blank) + items + 1 (blank) + 1 (footer)
+    let content_height = (6 + item_count) as u16;
+    let popup_width = 50u16.min(area.width.saturating_sub(4));
+    let popup_height = content_height.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let mut lines = Vec::new();
+    lines.push(Line::styled(
+        format!("  {}", selector.dir.display()),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::from(""));
+
+    // "New agent pane" as first item (index 0)
+    let prefix = if selector.selected == 0 { "> " } else { "  " };
+    let style = if selector.selected == 0 {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    lines.push(Line::styled(format!("{prefix}New agent pane"), style));
+
+    // Mode entries
+    for (i, mode) in selector.modes.iter().enumerate() {
+        let idx = i + 1;
+        let prefix = if selector.selected == idx { "> " } else { "  " };
+        let style = if selector.selected == idx {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(format!("{prefix}{}", mode.name), style));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "  j/k: navigate  Enter: select  Esc: cancel",
+        Style::default().fg(Color::Gray),
+    ));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Select Mode ")
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(Color::Rgb(0, 0, 0)));
     let paragraph = Paragraph::new(lines).block(block);
@@ -4273,5 +4465,144 @@ mod tests {
             KeyResult::ForwardToPane(bytes) => assert_eq!(bytes, vec![b'l']),
             other => panic!("Expected ForwardToPane, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ModeSelectorState tests
+    // -----------------------------------------------------------------------
+
+    fn make_mode(name: &str) -> ModeConfig {
+        ModeConfig {
+            name: name.to_string(),
+            shell_init: None,
+            panes: vec![],
+            rules: vec![],
+        }
+    }
+
+    #[test]
+    fn mode_selector_item_count() {
+        let s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![make_mode("a")]);
+        assert_eq!(s.item_count(), 2); // "New agent pane" + 1 mode
+
+        let s = ModeSelectorState::new(
+            PathBuf::from("/tmp"),
+            vec![make_mode("a"), make_mode("b"), make_mode("c")],
+        );
+        assert_eq!(s.item_count(), 4);
+    }
+
+    #[test]
+    fn mode_selector_navigation_bounds() {
+        let mut s = ModeSelectorState::new(
+            PathBuf::from("/tmp"),
+            vec![make_mode("alpha"), make_mode("beta")],
+        );
+        assert_eq!(s.selected, 0);
+
+        // Can't go above 0
+        s.select_previous();
+        assert_eq!(s.selected, 0);
+
+        s.select_next();
+        assert_eq!(s.selected, 1);
+        s.select_next();
+        assert_eq!(s.selected, 2);
+
+        // Can't go past last item
+        s.select_next();
+        assert_eq!(s.selected, 2);
+    }
+
+    #[test]
+    fn mode_selector_selected_mode() {
+        let modes = vec![make_mode("k8s"), make_mode("rust-tdd")];
+        let mut s = ModeSelectorState::new(PathBuf::from("/tmp"), modes);
+
+        // Index 0 = "New agent pane" → None
+        assert!(s.selected_mode().is_none());
+
+        s.selected = 1;
+        assert_eq!(s.selected_mode().unwrap().name, "k8s");
+
+        s.selected = 2;
+        assert_eq!(s.selected_mode().unwrap().name, "rust-tdd");
+    }
+
+    #[test]
+    fn mode_selector_key_navigation() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ModeSelector;
+        ui.mode_selector = Some(ModeSelectorState::new(
+            PathBuf::from("/tmp"),
+            vec![make_mode("a"), make_mode("b")],
+        ));
+
+        // j moves down
+        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        handle_mode_selector_key(key, &mut ui);
+        assert_eq!(ui.mode_selector.as_ref().unwrap().selected, 1);
+
+        // k moves up
+        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+        handle_mode_selector_key(key, &mut ui);
+        assert_eq!(ui.mode_selector.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn mode_selector_enter_new_agent_pane() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ModeSelector;
+        ui.mode_selector = Some(ModeSelectorState::new(
+            PathBuf::from("/tmp/myproject"),
+            vec![make_mode("a")],
+        ));
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_mode_selector_key(key, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::NewPaneForm);
+        assert!(ui.mode_selector.is_none());
+        let form = ui.new_pane_form.as_ref().unwrap();
+        assert_eq!(form.dir, PathBuf::from("/tmp/myproject"));
+        assert_eq!(form.name, "myproject");
+    }
+
+    #[test]
+    fn mode_selector_enter_on_mode_stub() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ModeSelector;
+        ui.mode_selector = Some(ModeSelectorState::new(
+            PathBuf::from("/tmp/proj"),
+            vec![make_mode("k8s-ops")],
+        ));
+
+        // Navigate to mode entry
+        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        handle_mode_selector_key(key, &mut ui);
+
+        // Select it
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_mode_selector_key(key, &mut ui);
+
+        // Stub: still goes to NewPaneForm for now
+        assert_eq!(ui.mode, UiMode::NewPaneForm);
+        assert!(ui.mode_selector.is_none());
+    }
+
+    #[test]
+    fn mode_selector_esc_cancels() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ModeSelector;
+        ui.mode_selector = Some(ModeSelectorState::new(
+            PathBuf::from("/tmp"),
+            vec![make_mode("a")],
+        ));
+
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_mode_selector_key(key, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.mode_selector.is_none());
     }
 }
