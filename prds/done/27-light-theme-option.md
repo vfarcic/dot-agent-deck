@@ -1,6 +1,6 @@
 # PRD #27: Light Theme Option for Dashboard
 
-**Status**: Draft
+**Status**: Complete (2026-04-05)
 **Priority**: Low
 **Created**: 2026-04-01
 **GitHub Issue**: [#27](https://github.com/vfarcic/dot-agent-deck/issues/27)
@@ -93,8 +93,8 @@ These ANSI accent colors are remapped by the terminal per-theme and need no swit
 - [x] Define small foreground-only palette struct with dark/light variants (`src/theme.rs`)
 - [x] Add `--theme auto|light|dark` CLI flag and config file option
 - [x] Thread palette through render functions for neutral text colors
-- [ ] Test on 3+ terminal emulators with light themes
-- [ ] Verify no regression on dark theme
+- [x] Test on Ghostty with light and dark themes (other emulators not available)
+- [x] Verify no regression on dark theme (Ghostty)
 - [x] All existing tests passing with both themes
 
 ## Key Files
@@ -132,3 +132,8 @@ These ANSI accent colors are remapped by the terminal per-theme and need no swit
 | 2026-04-05 | --theme auto\|light\|dark (default: auto) | Auto-detection covers most users; override available for tmux/SSH edge cases |
 | 2026-04-05 | Replace Rgb(140,140,140) with DarkGray | Eliminate last hardcoded RGB foreground color; use ANSI color that adapts to terminal theme |
 | 2026-04-05 | Default to dark on detection failure | Safe fallback since most terminal users use dark themes; config override available |
+| 2026-04-05 | Paint terminal_bg explicitly on all surfaces | Alternate screen may not inherit terminal theme background; query actual bg color and paint it everywhere |
+| 2026-04-05 | Derive selected_bg from actual terminal background | Shift terminal bg slightly lighter (dark) or darker (light) for selected card highlight |
+| 2026-04-05 | Remove Dashboard subcommand | Redundant — `dot-agent-deck` defaults to dashboard; top-level args (--theme, --continue) now work without typing `dashboard` |
+| 2026-04-05 | Use Gray instead of DarkGray for text_muted in dark theme | DarkGray is nearly invisible on dark backgrounds (known issue from PRD #13) |
+| 2026-04-05 | Tested on Ghostty only | Only terminal available; other emulators can be tested later as bug reports arise |
