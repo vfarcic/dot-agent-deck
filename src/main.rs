@@ -15,6 +15,10 @@ use dot_agent_deck::ui::run_tui;
 #[derive(Parser)]
 #[command(name = "dot-agent-deck", about = "AI agent session dashboard", version = env!("DAD_VERSION"))]
 struct Cli {
+    /// Restore pane session from last exit (shortcut for `dashboard --continue`)
+    #[arg(long = "continue")]
+    continue_session: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -87,7 +91,7 @@ fn main() -> ExitCode {
 
     match cli.command {
         None => {
-            run_dashboard(cli.theme);
+            run_dashboard(cli.theme, cli.continue_session);
             ExitCode::SUCCESS
         }
         Some(Commands::Hook { agent }) => {
@@ -151,7 +155,7 @@ fn main() -> ExitCode {
 }
 
 #[tokio::main]
-async fn run_dashboard(cli_theme: Option<Theme>) {
+async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     // Optional file-based logging when DOT_AGENT_DECK_LOG is set
     if std::env::var("DOT_AGENT_DECK_LOG").is_ok() {
         tracing_subscriber::fmt()
@@ -191,7 +195,14 @@ async fn run_dashboard(cli_theme: Option<Theme>) {
     let tui_state = state.clone();
     let tui_responders = responders.clone();
     let tui_result = tokio::task::spawn_blocking(move || {
-        run_tui(tui_state, pane_controller, config, tui_responders, palette)
+        run_tui(
+            tui_state,
+            pane_controller,
+            config,
+            tui_responders,
+            palette,
+            continue_session,
+        )
     })
     .await;
 
