@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::state::SessionStatus;
+use crate::theme::Theme;
 
 pub fn socket_path() -> PathBuf {
     if let Ok(path) = std::env::var("DOT_AGENT_DECK_SOCKET") {
@@ -55,6 +56,7 @@ impl BellConfig {
 pub struct DashboardConfig {
     pub default_command: String,
     pub bell: BellConfig,
+    pub theme: Theme,
 }
 
 impl DashboardConfig {
@@ -91,6 +93,7 @@ impl DashboardConfig {
     pub fn get_field(&self, key: &str) -> Result<String, String> {
         match key {
             "default_command" => Ok(self.default_command.clone()),
+            "theme" => Ok(self.theme.to_string()),
             _ => Err(format!("Unknown config key: {key}")),
         }
     }
@@ -99,6 +102,10 @@ impl DashboardConfig {
         match key {
             "default_command" => {
                 self.default_command = value.to_string();
+                Ok(())
+            }
+            "theme" => {
+                self.theme = value.parse().map_err(|e: String| e)?;
                 Ok(())
             }
             _ => Err(format!("Unknown config key: {key}")),
@@ -178,6 +185,27 @@ on_idle = true
         };
         assert!(!bc.should_bell(&SessionStatus::WaitingForInput));
         assert!(!bc.should_bell(&SessionStatus::Error));
+    }
+
+    #[test]
+    fn theme_defaults_to_auto() {
+        let dc: DashboardConfig = toml::from_str("").unwrap();
+        assert_eq!(dc.theme, Theme::Auto);
+    }
+
+    #[test]
+    fn theme_deserialize_light() {
+        let dc: DashboardConfig = toml::from_str(r#"theme = "light""#).unwrap();
+        assert_eq!(dc.theme, Theme::Light);
+    }
+
+    #[test]
+    fn theme_get_set_field() {
+        let mut dc = DashboardConfig::default();
+        assert_eq!(dc.get_field("theme").unwrap(), "auto");
+        dc.set_field("theme", "dark").unwrap();
+        assert_eq!(dc.theme, Theme::Dark);
+        assert!(dc.set_field("theme", "invalid").is_err());
     }
 
     #[test]

@@ -9,5 +9,6 @@ pub mod opencode_manage;
 pub mod pane;
 pub mod state;
 pub mod terminal_widget;
+pub mod theme;
 pub mod ui;
 pub mod version;

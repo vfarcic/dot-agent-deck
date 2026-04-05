@@ -88,14 +88,14 @@ These ANSI accent colors are remapped by the terminal per-theme and need no swit
 
 - [x] Remove all forced `bg()` background colors from `src/ui.rs`
 - [x] Replace `Rgb(140,140,140)` with ANSI `DarkGray` color
-- [ ] Add `terminal-colorsaurus` dependency to `Cargo.toml`
-- [ ] Implement theme auto-detection on startup
-- [ ] Define small foreground-only palette struct with dark/light variants (`src/ui.rs`)
-- [ ] Add `--theme auto|light|dark` CLI flag and config file option
-- [ ] Thread palette through render functions for neutral text colors
+- [x] Add `terminal-colorsaurus` dependency to `Cargo.toml`
+- [x] Implement theme auto-detection on startup
+- [x] Define small foreground-only palette struct with dark/light variants (`src/theme.rs`)
+- [x] Add `--theme auto|light|dark` CLI flag and config file option
+- [x] Thread palette through render functions for neutral text colors
 - [ ] Test on 3+ terminal emulators with light themes
 - [ ] Verify no regression on dark theme
-- [ ] All existing tests passing with both themes
+- [x] All existing tests passing with both themes
 
 ## Key Files
 

@@ -9,6 +9,7 @@ use dot_agent_deck::daemon::run_daemon;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::hooks_manage;
 use dot_agent_deck::state::{AppState, new_permission_responders};
+use dot_agent_deck::theme::Theme;
 use dot_agent_deck::ui::run_tui;
 
 #[derive(Parser)]
@@ -28,7 +29,11 @@ enum CliAgent {
 #[derive(Subcommand)]
 enum Commands {
     /// Run the dashboard (default when no subcommand)
-    Dashboard,
+    Dashboard {
+        /// Color theme: auto-detect, force light, or force dark
+        #[arg(long, value_enum)]
+        theme: Option<Theme>,
+    },
     /// Handle an agent hook event (reads stdin, sends to socket)
     Hook {
         /// Agent type
@@ -83,8 +88,12 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        None | Some(Commands::Dashboard) => {
-            run_dashboard();
+        None | Some(Commands::Dashboard { theme: None }) => {
+            run_dashboard(None);
+            ExitCode::SUCCESS
+        }
+        Some(Commands::Dashboard { theme: Some(t) }) => {
+            run_dashboard(Some(t));
             ExitCode::SUCCESS
         }
         Some(Commands::Hook { agent }) => {
@@ -148,7 +157,7 @@ fn main() -> ExitCode {
 }
 
 #[tokio::main]
-async fn run_dashboard() {
+async fn run_dashboard(cli_theme: Option<Theme>) {
     // Optional file-based logging when DOT_AGENT_DECK_LOG is set
     if std::env::var("DOT_AGENT_DECK_LOG").is_ok() {
         tracing_subscriber::fmt()
@@ -181,11 +190,14 @@ async fn run_dashboard() {
     });
 
     let config = dot_agent_deck::config::DashboardConfig::load();
+    let effective_theme = cli_theme.unwrap_or(config.theme);
+    // Detect terminal theme *before* raw mode / alternate screen takes over.
+    let palette = dot_agent_deck::theme::resolve_palette(effective_theme);
     let pane_controller = dot_agent_deck::pane::detect_multiplexer();
     let tui_state = state.clone();
     let tui_responders = responders.clone();
     let tui_result = tokio::task::spawn_blocking(move || {
-        run_tui(tui_state, pane_controller, config, tui_responders)
+        run_tui(tui_state, pane_controller, config, tui_responders, palette)
     })
     .await;
 
