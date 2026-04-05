@@ -54,7 +54,7 @@ Introduce **auto-save and restore** for the current session:
 - [x] Auto-save session state to config on dashboard exit.
 - [x] Add `--continue` flag to CLI and drive pane recreation through existing pane controller on startup.
 - [x] Handle restore failures gracefully (warnings, partial successes) and surface them via dashboard status messages/logs.
-- [ ] Update README/help overlay with session restore instructions and add automated tests covering config serialization + restore flows.
+- [x] Update README/help overlay with session restore instructions and add automated tests covering config serialization + restore flows.
 
 ## Key Files
 

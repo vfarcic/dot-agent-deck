@@ -14,6 +14,10 @@ use dot_agent_deck::ui::run_tui;
 #[derive(Parser)]
 #[command(name = "dot-agent-deck", about = "AI agent session dashboard", version = env!("DAD_VERSION"))]
 struct Cli {
+    /// Restore pane session from last exit (shortcut for `dashboard --continue`)
+    #[arg(long = "continue")]
+    continue_session: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -88,7 +92,7 @@ fn main() -> ExitCode {
 
     match cli.command {
         None => {
-            run_dashboard(false);
+            run_dashboard(cli.continue_session);
             ExitCode::SUCCESS
         }
         Some(Commands::Dashboard { continue_session }) => {

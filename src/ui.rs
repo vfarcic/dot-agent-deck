@@ -423,7 +423,20 @@ fn navigate_grid(current: usize, dir: Direction, columns: usize, total: usize) -
 
 fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
     let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
-    sessions.sort_by_key(|(_, s)| s.started_at);
+    sessions.sort_by(|(_, a), (_, b)| {
+        // Sort by pane ID (numeric creation order) when available,
+        // falling back to started_at for sessions without a pane.
+        match (&a.pane_id, &b.pane_id) {
+            (Some(pa), Some(pb)) => {
+                let na = pa.parse::<u64>().unwrap_or(u64::MAX);
+                let nb = pb.parse::<u64>().unwrap_or(u64::MAX);
+                na.cmp(&nb)
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.started_at.cmp(&b.started_at),
+        }
+    });
 
     if ui.filter_text.is_empty() {
         return sessions;
@@ -1898,7 +1911,13 @@ pub fn run_tui(
     // Auto-save current pane session for --continue restore.
     {
         let session = config::SavedSession {
-            panes: ui.pane_metadata.values().cloned().collect(),
+            panes: {
+                let mut ids: Vec<&String> = ui.pane_metadata.keys().collect();
+                ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
+                ids.into_iter()
+                    .filter_map(|id| ui.pane_metadata.get(id).cloned())
+                    .collect()
+            },
         };
         if session.panes.is_empty() {
             config::SavedSession::clear();
@@ -2484,7 +2503,7 @@ fn render_quit_confirm(frame: &mut Frame) {
 fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     let area = frame.area();
     let popup_width = 52.min(area.width.saturating_sub(4));
-    let base_height: u16 = if has_pane_control { 38 } else { 23 };
+    let base_height: u16 = if has_pane_control { 43 } else { 28 };
     let popup_height = base_height.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -2539,6 +2558,17 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool) {
     // help_text.push(Line::from("  y             Allow permission"));
     // help_text.push(Line::from("  n             Deny permission"));
     // help_text.push(Line::from("  (only when card has pending prompt)"));
+
+    help_text.push(Line::from(""));
+    help_text.push(Line::styled(
+        "  Session",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    help_text.push(Line::from(""));
+    help_text.push(Line::from("  Panes auto-saved on exit."));
+    help_text.push(Line::from("  Restore: dot-agent-deck --continue"));
 
     help_text.push(Line::from(""));
     help_text.push(Line::styled(
