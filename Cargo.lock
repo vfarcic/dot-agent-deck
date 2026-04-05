@@ -471,6 +471,7 @@ dependencies = [
  "crossterm 0.28.1",
  "portable-pty",
  "ratatui",
+ "regex",
  "reqwest",
  "semver",
  "serde",

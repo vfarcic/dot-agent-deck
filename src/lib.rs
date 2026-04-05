@@ -5,6 +5,7 @@ pub mod error;
 pub mod event;
 pub mod hook;
 pub mod hooks_manage;
+pub mod mode_manager;
 pub mod opencode_manage;
 pub mod pane;
 pub mod project_config;
