@@ -155,7 +155,7 @@ New `ModeSelector` UI mode inserted between DirPicker and NewPaneForm (only when
 - [ ] EmbeddedPaneController extensions — mode-driven pane creation, command writing, Ctrl+C via native PTY
 - [x] Mode manager core — regex compilation, circular pane pool, command routing, pane lifecycle, `shell_init` support
 - [x] Mode selector UI — modal in `n` dialog flow, loads config from selected directory, mode list with j/k navigation, "New agent pane" default option
-- [ ] Mode activation — create agent + side panes in 50/50 layout, start persistent commands, wire reactive event processing
+- [x] Mode activation — create agent + side panes in 50/50 layout, start persistent commands, wire reactive event processing
 - [ ] Status indicator and help — mode status in stats bar, help overlay updates
 - [x] Unit tests — config parsing, rule matching, slot allocation, mode selector navigation
 - [ ] Manual integration testing — end-to-end flow with a sample mode config

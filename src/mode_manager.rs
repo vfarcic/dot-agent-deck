@@ -96,7 +96,11 @@ impl ModeManager {
         }
     }
 
-    pub fn activate_mode(&mut self, config: &ModeConfig) -> Result<(), ModeManagerError> {
+    pub fn activate_mode(
+        &mut self,
+        config: &ModeConfig,
+        cwd: Option<&str>,
+    ) -> Result<(), ModeManagerError> {
         // Deactivate any existing mode first
         if self.active_mode.is_some() {
             self.deactivate_mode()?;
@@ -124,7 +128,7 @@ impl ModeManager {
         // Create persistent panes
         let mut persistent_pane_ids = Vec::with_capacity(config.panes.len());
         for pane_cfg in &config.panes {
-            let pane_id = self.pane_controller.create_pane(None, None)?;
+            let pane_id = self.pane_controller.create_pane(None, cwd)?;
 
             let display_name = pane_cfg.name.as_deref().unwrap_or(&pane_cfg.command);
             self.pane_controller.rename_pane(&pane_id, display_name)?;
@@ -142,7 +146,7 @@ impl ModeManager {
         // Create reactive pool panes
         let mut reactive_pool = ReactivePool::new();
         for i in 0..self.reactive_pool_size {
-            let pane_id = self.pane_controller.create_pane(None, None)?;
+            let pane_id = self.pane_controller.create_pane(None, cwd)?;
             self.pane_controller
                 .rename_pane(&pane_id, &format!("reactive-{i}"))?;
 
@@ -403,7 +407,7 @@ mod tests {
     fn activate_creates_persistent_and_reactive_panes() {
         let mock = Arc::new(MockPaneController::new());
         let mut mgr = ModeManager::new(mock.clone(), 3);
-        mgr.activate_mode(&test_config()).unwrap();
+        mgr.activate_mode(&test_config(), None).unwrap();
 
         // 1 persistent + 3 reactive = 4 panes
         let ids = mgr.managed_pane_ids();
@@ -418,7 +422,7 @@ mod tests {
 
         let mut config = test_config();
         config.shell_init = Some("source .env".to_string());
-        mgr.activate_mode(&config).unwrap();
+        mgr.activate_mode(&config, None).unwrap();
 
         let written = mock.written.lock().unwrap();
         // Persistent pane: shell_init then command
@@ -441,7 +445,7 @@ mod tests {
     fn handle_command_matches_first_rule() {
         let mock = Arc::new(MockPaneController::new());
         let mut mgr = ModeManager::new(mock.clone(), 2);
-        mgr.activate_mode(&test_config()).unwrap();
+        mgr.activate_mode(&test_config(), None).unwrap();
 
         let pane_id = mgr
             .handle_command("kubectl describe pod nginx")
@@ -471,7 +475,7 @@ mod tests {
                 interval: None,
             }],
         };
-        mgr.activate_mode(&config).unwrap();
+        mgr.activate_mode(&config, None).unwrap();
 
         let p1 = mgr.handle_command("cmd1").unwrap().unwrap();
         let p2 = mgr.handle_command("cmd2").unwrap().unwrap();
@@ -487,7 +491,7 @@ mod tests {
     fn deactivate_closes_all_panes() {
         let mock = Arc::new(MockPaneController::new());
         let mut mgr = ModeManager::new(mock.clone(), 2);
-        mgr.activate_mode(&test_config()).unwrap();
+        mgr.activate_mode(&test_config(), None).unwrap();
 
         mgr.deactivate_mode().unwrap();
 
@@ -514,7 +518,7 @@ mod tests {
             }],
         };
 
-        let err = mgr.activate_mode(&config).unwrap_err();
+        let err = mgr.activate_mode(&config, None).unwrap_err();
         assert!(matches!(err, ModeManagerError::InvalidPattern { .. }));
     }
 
@@ -531,7 +535,7 @@ mod tests {
     fn no_match_returns_none() {
         let mock = Arc::new(MockPaneController::new());
         let mut mgr = ModeManager::new(mock, 2);
-        mgr.activate_mode(&test_config()).unwrap();
+        mgr.activate_mode(&test_config(), None).unwrap();
 
         let result = mgr.handle_command("echo hello").unwrap();
         assert!(result.is_none());

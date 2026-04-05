@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -53,8 +54,8 @@ pub trait PaneController: Send + Sync {
 // Detection
 // ---------------------------------------------------------------------------
 
-pub fn detect_multiplexer() -> Box<dyn PaneController> {
-    Box::new(crate::embedded_pane::EmbeddedPaneController::new())
+pub fn detect_multiplexer() -> Arc<dyn PaneController> {
+    Arc::new(crate::embedded_pane::EmbeddedPaneController::new())
 }
 
 #[cfg(test)]

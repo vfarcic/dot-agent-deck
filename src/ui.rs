@@ -16,6 +16,7 @@ use ratatui::{
 use crate::config::{BellConfig, DashboardConfig};
 use crate::embedded_pane::EmbeddedPaneController;
 use crate::event::{AgentType, EventType};
+use crate::mode_manager::ModeManager;
 use crate::pane::{PaneController, PaneError};
 use crate::project_config::{ModeConfig, load_project_config};
 use crate::state::{
@@ -536,6 +537,7 @@ enum KeyResult {
     Quit,
     Focus,
     NewPane(NewPaneRequest),
+    ActivateMode { dir: PathBuf, config: ModeConfig },
     PermissionResponse(String),
     ForwardToPane(Vec<u8>),
 }
@@ -1131,11 +1133,15 @@ fn handle_mode_selector_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         }
         KeyCode::Enter => {
             let dir = selector.dir.clone();
-            let _selected_mode = selector.selected_mode().cloned();
+            let selected_mode = selector.selected_mode().cloned();
             ui.mode_selector = None;
 
-            // TODO(prd-34): When _selected_mode is Some, activate mode via ModeManager
-            // instead of falling through to the new pane form.
+            if let Some(config) = selected_mode {
+                ui.mode = UiMode::Normal;
+                return KeyResult::ActivateMode { dir, config };
+            }
+
+            // "New agent pane" selected — show the regular form.
             let name = dir
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -1222,7 +1228,7 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
 
 pub fn run_tui(
     state: SharedState,
-    pane: Box<dyn PaneController>,
+    pane: Arc<dyn PaneController>,
     config: DashboardConfig,
     responders: PermissionResponders,
 ) -> std::io::Result<()> {
@@ -1247,6 +1253,7 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config);
+    let mut mode_manager = ModeManager::new(Arc::clone(&pane), 3);
 
     'outer: loop {
         // Expire stale status messages
@@ -1850,6 +1857,62 @@ pub fn run_tui(
                                     std::time::Instant::now(),
                                 ));
                             }
+                        }
+                    }
+                }
+                KeyResult::ActivateMode { dir, config } => {
+                    let dir_str = dir.display().to_string();
+                    let mode_name = config.name.clone();
+
+                    // Unregister panes from a previously active mode.
+                    for old_id in mode_manager.managed_pane_ids() {
+                        state.blocking_write().unregister_pane(&old_id);
+                        ui.pane_display_names.remove(&old_id);
+                        ui.pane_names.remove(&old_id);
+                    }
+
+                    match mode_manager.activate_mode(&config, Some(&dir_str)) {
+                        Ok(()) => {
+                            let new_ids = mode_manager.managed_pane_ids();
+                            for id in &new_ids {
+                                state.blocking_write().register_pane(id.clone());
+                            }
+                            // Focus the first persistent pane if any exist.
+                            if let Some(first) = new_ids.first() {
+                                let _ = pane.focus_pane(first);
+                                ui.mode = UiMode::PaneInput;
+                            }
+                            // Resize all new PTYs to match the current layout.
+                            if let Some(embedded) =
+                                pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                            {
+                                let frame_area = terminal.get_frame().area();
+                                let right_width = (frame_area.width * 67 / 100).saturating_sub(2);
+                                let pane_count = embedded.pane_ids().len() as u16;
+                                let rows = match ui.pane_layout {
+                                    PaneLayout::Tiled => {
+                                        (frame_area.height / pane_count.max(1)).saturating_sub(2)
+                                    }
+                                    PaneLayout::Stacked => frame_area
+                                        .height
+                                        .saturating_sub(2 + pane_count.saturating_sub(1)),
+                                };
+                                if rows > 0 && right_width > 0 {
+                                    for id in &new_ids {
+                                        let _ = embedded.resize_pane_pty(id, rows, right_width);
+                                    }
+                                }
+                            }
+                            ui.status_message = Some((
+                                format!("Activated mode: {mode_name}"),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                        Err(e) => {
+                            ui.status_message = Some((
+                                format!("Mode activation failed: {e}"),
+                                std::time::Instant::now(),
+                            ));
                         }
                     }
                 }
@@ -4569,7 +4632,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_selector_enter_on_mode_stub() {
+    fn mode_selector_enter_on_mode_returns_activate() {
         let mut ui = default_ui();
         ui.mode = UiMode::ModeSelector;
         ui.mode_selector = Some(ModeSelectorState::new(
@@ -4583,11 +4646,13 @@ mod tests {
 
         // Select it
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        handle_mode_selector_key(key, &mut ui);
+        let result = handle_mode_selector_key(key, &mut ui);
 
-        // Stub: still goes to NewPaneForm for now
-        assert_eq!(ui.mode, UiMode::NewPaneForm);
+        assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.mode_selector.is_none());
+        assert!(
+            matches!(result, KeyResult::ActivateMode { ref dir, ref config } if dir == Path::new("/tmp/proj") && config.name == "k8s-ops")
+        );
     }
 
     #[test]
