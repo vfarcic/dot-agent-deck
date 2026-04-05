@@ -1,6 +1,6 @@
 # PRD #34: Extensible Modes System
 
-**Status**: Draft
+**Status**: Complete
 **Priority**: High
 **Created**: 2026-04-03
 
@@ -160,7 +160,7 @@ New `ModeSelector` UI mode inserted between DirPicker and NewPaneForm (only when
 - [x] Unit tests — config parsing, rule matching, slot allocation, mode selector navigation
 - [x] Manual integration testing — end-to-end flow with a sample mode config
 - [x] Config generation via agent — in mode selector, offer "Generate config for this project" when no `.dot-agent-deck.toml` exists
-- [ ] `dot-agent-deck init` CLI command — scaffolding for project configs
+- [x] `dot-agent-deck init` CLI command — scaffolding for project configs
 
 ## Out of Scope (v1)
 

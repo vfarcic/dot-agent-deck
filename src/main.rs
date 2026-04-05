@@ -45,6 +45,12 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Generate a .dot-agent-deck.toml template in the current or specified directory
+    Init {
+        /// Target directory (defaults to current directory)
+        #[arg(short, long, default_value = ".")]
+        path: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -144,6 +150,7 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         },
+        Some(Commands::Init { path }) => dot_agent_deck::init::run_init(&path),
     }
 }
 
