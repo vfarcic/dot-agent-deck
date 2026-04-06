@@ -1,6 +1,6 @@
 # PRD #37: Star Repo Reminder Dialog
 
-**Status**: In Progress
+**Status**: Done
 **Priority**: Low
 **Created**: 2026-04-03
 **GitHub Issue**: [#37](https://github.com/vfarcic/dot-agent-deck/issues/37)
@@ -123,4 +123,4 @@ let _ = open::that("https://github.com/vfarcic/dot-agent-deck");
 - [x] Keyboard handling for star/snooze/dismiss actions with URL opening
 - [x] Startup integration to check state and show dialog when appropriate
 - [x] Tests for state transitions (snooze resets counter, dismiss is permanent, interval logic)
-- [ ] Manual end-to-end validation across multiple launches
+- [x] Manual end-to-end validation across multiple launches
