@@ -219,6 +219,9 @@ New tab abstraction layered on top of the existing UI:
 - [ ] Update README — document tab-based workflow
 - [x] Tests — tab creation, switching, close, card-to-tab navigation
 
+### Phase 3: Smart config generation (brainstorm)
+- [ ] Brainstorm and design improved `.dot-agent-deck.toml` generation — explore: project-type detection (Cargo.toml, package.json, Helm, Terraform, etc.), curated ecosystem templates, learning from agent command history to suggest reactive rules, interactive TUI wizard, smarter agent-assisted generation that analyzes repo structure, config validation (regex syntax, conflicting rules)
+
 ## Out of Scope (v1)
 
 - Mode-specific keybindings or custom layouts beyond side panes
