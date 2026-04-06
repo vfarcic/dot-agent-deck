@@ -213,7 +213,12 @@ impl TabManager {
     }
 
     /// Route reactive commands to all active mode tabs.
-    pub fn route_reactive_commands(&mut self, sessions: &HashMap<String, SessionState>) {
+    /// Returns pairs of (closed_pane_id, new_pane_id) for panes that were recreated.
+    pub fn route_reactive_commands(
+        &mut self,
+        sessions: &HashMap<String, SessionState>,
+    ) -> Vec<(String, String)> {
+        let mut pane_changes = Vec::new();
         for tab in &mut self.tabs {
             if let Tab::Mode {
                 mode_manager,
@@ -223,13 +228,23 @@ impl TabManager {
             } = tab
             {
                 let new_commands = extract_new_bash_commands(sessions, last_routed_timestamp);
-                for cmd in new_commands {
-                    if let Err(e) = mode_manager.handle_command(&cmd) {
-                        tracing::warn!("Reactive pane routing error in tab '{name}': {e}");
+                for cmd in &new_commands {
+                    tracing::info!("Routing command to tab '{name}': {cmd}");
+                    match mode_manager.handle_command(cmd) {
+                        Ok(Some(change)) => {
+                            if let (Some(old_id), Some(new_id)) = (change.closed, change.created) {
+                                pane_changes.push((old_id, new_id));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!("Reactive pane routing error in tab '{name}': {e}");
+                        }
                     }
                 }
             }
         }
+        pane_changes
     }
 }
 

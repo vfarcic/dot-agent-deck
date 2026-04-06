@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Tabs},
 };
 
 use crate::config;
@@ -130,6 +130,13 @@ enum ActiveTabView {
         agent_pane_id: String,
         side_pane_ids: Vec<String>,
     },
+}
+
+/// Lightweight snapshot of tab state for rendering, decoupled from TabManager.
+struct TabBarInfo {
+    show: bool,
+    labels: Vec<String>,
+    active_index: usize,
 }
 
 struct DirPickerState {
@@ -377,6 +384,8 @@ struct UiState {
     selection: Option<TextSelection>,
     /// Screen rect of the focused pane (set during render, used for mouse mapping).
     focused_pane_rect: Option<Rect>,
+    /// Screen rects of side panes in mode tabs (set during render, used for scroll hit-testing).
+    side_pane_rects: Vec<(String, Rect)>,
     /// Tracks last click time and position for double/triple-click detection.
     last_click: Option<(std::time::Instant, u16, u16, u8)>, // (time, col, row, click_count)
 }
@@ -421,6 +430,7 @@ impl UiState {
             session_warnings: Vec::new(),
             selection: None,
             focused_pane_rect: None,
+            side_pane_rects: Vec::new(),
             last_click: None,
         }
     }
@@ -1344,7 +1354,27 @@ pub fn run_tui(
         let snapshot = state.blocking_read().clone();
 
         // Route new Bash commands through mode tabs for reactive panes.
-        tab_manager.route_reactive_commands(&snapshot.sessions);
+        let pane_changes = tab_manager.route_reactive_commands(&snapshot.sessions);
+        for (old_id, new_id) in &pane_changes {
+            let mut st = state.blocking_write();
+            st.unregister_pane(old_id);
+            st.register_pane(new_id.clone());
+            drop(st);
+            // Resize the new pane PTY to match the current side pane dimensions.
+            if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                let frame_area = terminal.get_frame().area();
+                let half_width = (frame_area.width / 2).saturating_sub(2);
+                let side_pane_count = embedded.pane_ids().len().saturating_sub(1) as u16; // exclude agent
+                let pane_rows = if side_pane_count > 0 {
+                    (frame_area.height / side_pane_count).saturating_sub(2)
+                } else {
+                    frame_area.height.saturating_sub(3)
+                };
+                if pane_rows > 0 && half_width > 0 {
+                    let _ = embedded.resize_pane_pty(new_id, pane_rows, half_width);
+                }
+            }
+        }
 
         // Pick up version-check result once
         if ui.update_available.is_none() {
@@ -1426,6 +1456,11 @@ pub fn run_tui(
                 side_pane_ids: mode_manager.managed_pane_ids(),
             },
         };
+        let tab_bar_info = TabBarInfo {
+            show: tab_manager.show_tab_bar(),
+            labels: tab_manager.tab_labels(),
+            active_index: tab_manager.active_index(),
+        };
         terminal.draw(|frame| {
             render_frame(
                 frame,
@@ -1437,6 +1472,7 @@ pub fn run_tui(
                 &*pane,
                 pane_layout,
                 &tab_view,
+                &tab_bar_info,
             );
         })?;
         tick = tick.wrapping_add(1);
@@ -1497,7 +1533,32 @@ pub fn run_tui(
 
             // Handle mouse events: scroll, text selection, and copy.
             if let Event::Mouse(mouse) = ev {
-                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                // Side pane scroll: works in any UI mode by hit-testing rects
+                let mut side_scrolled = false;
+                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                    let side_rects = ui.side_pane_rects.clone();
+                    let scroll_delta = match mouse.kind {
+                        crossterm::event::MouseEventKind::ScrollUp => Some(3_isize),
+                        crossterm::event::MouseEventKind::ScrollDown => Some(-3_isize),
+                        _ => None,
+                    };
+                    if let Some(delta) = scroll_delta {
+                        for (side_id, rect) in &side_rects {
+                            if mouse.column >= rect.x
+                                && mouse.column < rect.x + rect.width
+                                && mouse.row >= rect.y
+                                && mouse.row < rect.y + rect.height
+                            {
+                                embedded.scroll_pane(side_id, delta);
+                                side_scrolled = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if !side_scrolled
+                    && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
                     && let Some(pane_id) = embedded.focused_pane_id()
                 {
                     match mouse.kind {
@@ -1834,6 +1895,24 @@ pub fn run_tui(
                         }
                         shortcut_handled = true;
                     }
+                    // Ctrl+PageDown: next tab
+                    KeyCode::PageDown => {
+                        if tab_manager.show_tab_bar() {
+                            let next = tab_manager.active_index() + 1;
+                            tab_manager.switch_to(next);
+                        }
+                        shortcut_handled = true;
+                    }
+                    // Ctrl+PageUp: previous tab
+                    KeyCode::PageUp => {
+                        if tab_manager.show_tab_bar() {
+                            let current = tab_manager.active_index();
+                            if current > 0 {
+                                tab_manager.switch_to(current - 1);
+                            }
+                        }
+                        shortcut_handled = true;
+                    }
                     _ => {}
                 }
             }
@@ -1969,6 +2048,10 @@ pub fn run_tui(
                     match pane.create_pane(None, Some(&dir_str)) {
                         Ok(agent_pane_id) => {
                             state.blocking_write().register_pane(agent_pane_id.clone());
+                            // Run shell_init in the agent pane before anything else.
+                            if let Some(ref init_cmd) = config.shell_init {
+                                let _ = pane.write_to_pane(&agent_pane_id, init_cmd);
+                            }
                             match tab_manager.open_mode_tab(
                                 &config,
                                 &dir_str,
@@ -2195,9 +2278,11 @@ fn render_frame(
     pane_controller: &dyn PaneController,
     pane_layout: PaneLayout,
     tab_view: &ActiveTabView,
+    tab_bar: &TabBarInfo,
 ) {
     let area = frame.area();
     let palette = ui.palette;
+    ui.side_pane_rects.clear();
 
     let active_mode_name = match tab_view {
         ActiveTabView::Dashboard { .. } => None,
@@ -2211,10 +2296,38 @@ fn render_frame(
         area,
     );
 
-    // Hints bar spans the full terminal width (1 row at the bottom).
-    let top_bottom = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
-    let main_area = top_bottom[0];
-    let hints_area = top_bottom[1];
+    // Layout: optional tab bar at top, main content, hints bar at bottom.
+    let (main_area, hints_area) = if tab_bar.show {
+        let chunks = Layout::vertical([
+            Constraint::Length(1), // tab bar
+            Constraint::Fill(1),   // main content
+            Constraint::Length(1), // hints bar
+        ])
+        .split(area);
+
+        // Render the tab bar.
+        let titles: Vec<Line> = tab_bar
+            .labels
+            .iter()
+            .map(|l| Line::from(format!(" {l} ")))
+            .collect();
+        let tabs_widget = Tabs::new(titles)
+            .select(tab_bar.active_index)
+            .style(Style::default().fg(palette.text_secondary))
+            .highlight_style(
+                Style::default()
+                    .fg(palette.text_primary)
+                    .bg(palette.selected_bg)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .divider(" | ");
+        frame.render_widget(tabs_widget, chunks[0]);
+
+        (chunks[1], chunks[2])
+    } else {
+        let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
+        (chunks[0], chunks[1])
+    };
 
     // Determine if we have embedded terminal panes to show on the right.
     let embedded = pane_controller
@@ -2238,6 +2351,7 @@ fn render_frame(
             hints_area,
             has_pane_control,
             active_mode_name,
+            tab_bar.show,
         );
         return;
     }
@@ -2275,7 +2389,7 @@ fn render_frame(
         .style(Style::default().fg(palette.text_secondary))
         .centered();
         frame.render_widget(msg, vertical[1]);
-        render_bottom_bar(frame, ui, hints_area, has_pane_control);
+        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show);
 
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -2374,7 +2488,7 @@ fn render_frame(
             active_mode_name,
             palette,
         );
-        render_bottom_bar(frame, ui, hints_area, has_pane_control);
+        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -2460,7 +2574,7 @@ fn render_frame(
     );
 
     // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control);
+    render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show);
 
     // Render terminal panes on the right side
     if let Some(right) = panes_area {
@@ -2676,6 +2790,7 @@ fn render_mode_tab(
     hints_area: Rect,
     has_pane_control: bool,
     active_mode_name: Option<&str>,
+    show_tab_bar: bool,
 ) {
     let palette = ui.palette;
 
@@ -2718,10 +2833,21 @@ fn render_mode_tab(
         if ui.focused_pane_rect.is_none() {
             ui.focused_pane_rect = rect;
         }
+
+        // Track side pane rects for scroll hit-testing
+        let count = side_pane_ids.len() as u32;
+        let constraints: Vec<Constraint> = side_pane_ids
+            .iter()
+            .map(|_| Constraint::Ratio(1, count))
+            .collect();
+        let chunks = Layout::vertical(constraints).split(side_area);
+        for (i, pane_id) in side_pane_ids.iter().enumerate() {
+            ui.side_pane_rects.push((pane_id.clone(), chunks[i]));
+        }
     }
 
     // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control);
+    render_bottom_bar(frame, ui, hints_area, has_pane_control, show_tab_bar);
 
     // Overlays (drawn last, on top)
     if ui.mode == UiMode::Help {
@@ -2812,7 +2938,13 @@ fn render_stats_bar(
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_control: bool) {
+fn render_bottom_bar(
+    frame: &mut Frame,
+    ui: &UiState,
+    area: Rect,
+    has_pane_control: bool,
+    show_tab_bar: bool,
+) {
     match ui.mode {
         UiMode::Filter => {
             let line = Line::from(vec![
@@ -2848,12 +2980,17 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
             } else {
+                let tab_hint = if show_tab_bar {
+                    format!("  {MOD_KEY}+PgUp/PgDn: tabs")
+                } else {
+                    String::new()
+                };
                 let hints = if has_pane_control {
                     format!(
-                        "{MOD_KEY}+n: new  {MOD_KEY}+w: close  {MOD_KEY}+t: layout  {MOD_KEY}+d: dashboard (1-9 ? /)  {MOD_KEY}+c: quit"
+                        "{MOD_KEY}+n: new  {MOD_KEY}+w: close  {MOD_KEY}+t: layout  {MOD_KEY}+d: dashboard (1-9 ? /)  {MOD_KEY}+c: quit{tab_hint}"
                     )
                 } else {
-                    format!("?: help  1-9: jump  {MOD_KEY}+c: quit")
+                    format!("?: help  1-9: jump  {MOD_KEY}+c: quit{tab_hint}")
                 };
                 let mut spans = vec![Span::styled(
                     hints,
@@ -3643,6 +3780,11 @@ mod tests {
                     &ActiveTabView::Dashboard {
                         exclude_pane_ids: vec![],
                     },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
                 )
             })
             .unwrap();
@@ -3704,6 +3846,11 @@ mod tests {
                     PaneLayout::Stacked,
                     &ActiveTabView::Dashboard {
                         exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
                     },
                 )
             })
@@ -3814,6 +3961,11 @@ mod tests {
                     &ActiveTabView::Dashboard {
                         exclude_pane_ids: vec![],
                     },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
                 )
             })
             .unwrap();
@@ -3898,6 +4050,11 @@ mod tests {
                     PaneLayout::Stacked,
                     &ActiveTabView::Dashboard {
                         exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
                     },
                 )
             })

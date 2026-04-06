@@ -678,12 +678,14 @@ mod tests {
         assert!(input.cwd.is_none());
     }
 
+    /// Serialize env-var-mutating tests to avoid races.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn pane_id_propagated_from_env_claude_code() {
-        // Temporarily set the env var and restore afterwards.
+        let _lock = ENV_MUTEX.lock().unwrap();
         let key = "DOT_AGENT_DECK_PANE_ID";
         let prev = std::env::var(key).ok();
-        // SAFETY: test is single-threaded for this env var; no other thread reads it.
         unsafe { std::env::set_var(key, "pane-42") };
 
         let input = ClaudeCodeHookInput {
@@ -699,7 +701,6 @@ mod tests {
         let event = build_event(input).unwrap();
         assert_eq!(event.pane_id.as_deref(), Some("pane-42"));
 
-        // Restore
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(key, v),
@@ -710,9 +711,9 @@ mod tests {
 
     #[test]
     fn pane_id_propagated_from_env_opencode() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let key = "DOT_AGENT_DECK_PANE_ID";
         let prev = std::env::var(key).ok();
-        // SAFETY: test is single-threaded for this env var; no other thread reads it.
         unsafe { std::env::set_var(key, "pane-99") };
 
         let input = OpenCodeHookInput {

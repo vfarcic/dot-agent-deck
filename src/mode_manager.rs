@@ -62,6 +62,12 @@ impl ReactivePool {
     fn all_ids(&self) -> &[String] {
         &self.pane_ids
     }
+
+    fn replace(&mut self, old_id: &str, new_id: String) {
+        if let Some(pos) = self.pane_ids.iter().position(|id| id == old_id) {
+            self.pane_ids[pos] = new_id;
+        }
+    }
 }
 
 struct WatchHandle {
@@ -77,6 +83,15 @@ struct ActiveMode {
     watch_handles: Vec<WatchHandle>,
 }
 
+/// Result of routing a command to a reactive pane.
+#[derive(Debug, PartialEq)]
+pub struct PaneChange {
+    /// Pane that was closed (if recreated).
+    pub closed: Option<String>,
+    /// Pane that was created (if recreated).
+    pub created: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // ModeManager
 // ---------------------------------------------------------------------------
@@ -85,6 +100,7 @@ pub struct ModeManager {
     pane_controller: Arc<dyn PaneController>,
     active_mode: Option<ActiveMode>,
     reactive_pool_size: usize,
+    cwd: Option<String>,
 }
 
 impl ModeManager {
@@ -93,6 +109,7 @@ impl ModeManager {
             pane_controller,
             active_mode: None,
             reactive_pool_size,
+            cwd: None,
         }
     }
 
@@ -105,6 +122,8 @@ impl ModeManager {
         if self.active_mode.is_some() {
             self.deactivate_mode()?;
         }
+
+        self.cwd = cwd.map(|s| s.to_string());
 
         // Compile regex rules — fail fast on invalid patterns
         let compiled_rules = config
@@ -125,34 +144,25 @@ impl ModeManager {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Create persistent panes
+        // Create persistent panes with direct command execution (no interactive shell)
         let mut persistent_pane_ids = Vec::with_capacity(config.panes.len());
         for pane_cfg in &config.panes {
-            let pane_id = self.pane_controller.create_pane(None, cwd)?;
+            let pane_id = self
+                .pane_controller
+                .create_pane(Some(&pane_cfg.command), cwd)?;
 
             let display_name = pane_cfg.name.as_deref().unwrap_or(&pane_cfg.command);
             self.pane_controller.rename_pane(&pane_id, display_name)?;
 
-            if let Some(ref init_cmd) = config.shell_init {
-                self.pane_controller.write_to_pane(&pane_id, init_cmd)?;
-            }
-
-            self.pane_controller
-                .write_to_pane(&pane_id, &pane_cfg.command)?;
-
             persistent_pane_ids.push(pane_id);
         }
 
-        // Create reactive pool panes
+        // Create reactive pool panes (blank — no interactive shell)
         let mut reactive_pool = ReactivePool::new();
         for i in 0..self.reactive_pool_size {
-            let pane_id = self.pane_controller.create_pane(None, cwd)?;
+            let pane_id = self.pane_controller.create_pane(Some("true"), cwd)?;
             self.pane_controller
                 .rename_pane(&pane_id, &format!("reactive-{i}"))?;
-
-            if let Some(ref init_cmd) = config.shell_init {
-                self.pane_controller.write_to_pane(&pane_id, init_cmd)?;
-            }
 
             reactive_pool.add(pane_id);
         }
@@ -192,7 +202,14 @@ impl ModeManager {
         Ok(())
     }
 
-    pub fn handle_command(&mut self, command: &str) -> Result<Option<String>, ModeManagerError> {
+    /// Routes a command to a matching reactive pane. Returns pane change info:
+    /// - `None` if no rule matched
+    /// - `Some((closed_pane_id, new_pane_id))` if a pane was recreated
+    /// - `Some((None, Some(pane_id)))` if the command was written to an existing pane (watch rules)
+    pub fn handle_command(
+        &mut self,
+        command: &str,
+    ) -> Result<Option<PaneChange>, ModeManagerError> {
         let mode = self
             .active_mode
             .as_mut()
@@ -210,7 +227,7 @@ impl ModeManager {
         };
 
         // Allocate a reactive pane
-        let pane_id = match mode.reactive_pool.allocate() {
+        let old_pane_id = match mode.reactive_pool.allocate() {
             Some(id) => id.to_string(),
             None => {
                 return Err(ModeManagerError::Pane(PaneError::CommandFailed(
@@ -221,7 +238,7 @@ impl ModeManager {
 
         // Cancel any existing watch on this pane
         mode.watch_handles.retain(|wh| {
-            if wh.pane_id == pane_id {
+            if wh.pane_id == old_pane_id {
                 wh.abort_handle.abort();
                 false
             } else {
@@ -229,27 +246,43 @@ impl ModeManager {
             }
         });
 
-        // Send the command
-        self.pane_controller.write_to_pane(&pane_id, command)?;
-
-        // If this is a watch rule, start periodic re-execution
         let watch = mode.compiled_rules[rule_idx].watch;
         let interval = mode.compiled_rules[rule_idx].interval;
+
         if watch {
+            // Watch rules: use interactive shell with clear prefix
+            self.pane_controller
+                .write_to_pane(&old_pane_id, &format!("clear && {command}"))?;
+            let _ = self.pane_controller.rename_pane(&old_pane_id, command);
             let interval_secs = interval.unwrap_or(5);
             let abort_handle = Self::start_watch(
                 &self.pane_controller,
-                pane_id.clone(),
+                old_pane_id.clone(),
                 command.to_string(),
                 interval_secs,
             );
             mode.watch_handles.push(WatchHandle {
                 abort_handle,
-                pane_id: pane_id.clone(),
+                pane_id: old_pane_id,
             });
+            Ok(Some(PaneChange {
+                closed: None,
+                created: None,
+            }))
+        } else {
+            // Non-watch: close old pane and recreate with direct command execution
+            self.pane_controller.close_pane(&old_pane_id)?;
+            let new_pane_id = self
+                .pane_controller
+                .create_pane(Some(command), self.cwd.as_deref())?;
+            let _ = self.pane_controller.rename_pane(&new_pane_id, command);
+            mode.reactive_pool
+                .replace(&old_pane_id, new_pane_id.clone());
+            Ok(Some(PaneChange {
+                closed: Some(old_pane_id),
+                created: Some(new_pane_id),
+            }))
         }
-
-        Ok(Some(pane_id))
     }
 
     pub fn active_mode_name(&self) -> Option<&str> {
@@ -416,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_init_sent_before_command() {
+    fn shell_init_not_sent_to_side_panes() {
         let mock = Arc::new(MockPaneController::new());
         let mut mgr = ModeManager::new(mock.clone(), 1);
 
@@ -425,20 +458,9 @@ mod tests {
         mgr.activate_mode(&config, None).unwrap();
 
         let written = mock.written.lock().unwrap();
-        // Persistent pane: shell_init then command
-        assert_eq!(
-            written[0],
-            ("mock-1".to_string(), "source .env".to_string())
-        );
-        assert_eq!(
-            written[1],
-            ("mock-1".to_string(), "kubectl get pods -w".to_string())
-        );
-        // Reactive pane: shell_init
-        assert_eq!(
-            written[2],
-            ("mock-2".to_string(), "source .env".to_string())
-        );
+        // shell_init is handled by the UI layer (agent pane only).
+        // Persistent panes use create_pane(Some(command)) now, no write_to_pane.
+        assert_eq!(written.len(), 0);
     }
 
     #[test]
@@ -447,17 +469,18 @@ mod tests {
         let mut mgr = ModeManager::new(mock.clone(), 2);
         mgr.activate_mode(&test_config(), None).unwrap();
 
-        let pane_id = mgr
+        let change = mgr
             .handle_command("kubectl describe pod nginx")
             .unwrap()
             .unwrap();
 
-        // Should match first rule (describe), dispatch to first reactive pane
-        assert_eq!(pane_id, "mock-2"); // mock-1 is persistent, mock-2 is first reactive
+        // Non-watch rule: old pane closed, new pane created
+        assert_eq!(change.closed.as_deref(), Some("mock-2")); // first reactive pane
+        assert!(change.created.is_some()); // new pane created with the command
 
-        let written = mock.written.lock().unwrap();
-        let last = written.last().unwrap();
-        assert_eq!(last.1, "kubectl describe pod nginx");
+        // Old pane was closed
+        let closed = mock.closed.lock().unwrap();
+        assert!(closed.contains(&"mock-2".to_string()));
     }
 
     #[test]
@@ -481,10 +504,14 @@ mod tests {
         let p2 = mgr.handle_command("cmd2").unwrap().unwrap();
         let p3 = mgr.handle_command("cmd3").unwrap().unwrap();
 
-        // 2 reactive panes: mock-1, mock-2 (no persistent panes)
-        assert_eq!(p1, "mock-1");
-        assert_eq!(p2, "mock-2");
-        assert_eq!(p3, "mock-1"); // wraps around
+        // Each command closes old pane and creates new — IDs keep incrementing
+        assert!(p1.closed.is_some());
+        assert!(p1.created.is_some());
+        assert!(p2.closed.is_some());
+        assert!(p2.created.is_some());
+        // Third command wraps around the pool and closes a recreated pane
+        assert!(p3.closed.is_some());
+        assert!(p3.created.is_some());
     }
 
     #[test]

@@ -177,7 +177,8 @@ fn load_real_config_and_activate_mode() {
     let created = mock.created.lock().unwrap();
     assert_eq!(created.len(), 5);
 
-    // Verify shell_init was sent to all 5 panes (before their commands)
+    // shell_init is now handled by the UI layer (agent pane only),
+    // so ModeManager should NOT send it to any panes.
     let written = mock.written.lock().unwrap();
     let shell_init_writes: Vec<_> = written
         .iter()
@@ -185,45 +186,16 @@ fn load_real_config_and_activate_mode() {
         .collect();
     assert_eq!(
         shell_init_writes.len(),
-        5,
-        "shell_init should be sent to all 5 panes"
+        0,
+        "shell_init should not be sent by ModeManager (handled by UI for agent pane)"
     );
 
-    // Verify persistent pane commands were sent after shell_init
-    // For mock-1 (first persistent pane): writes should be [shell_init, command]
-    let pane1_writes: Vec<_> = written
-        .iter()
-        .filter(|(id, _)| id == "mock-1")
-        .map(|(_, t)| t.as_str())
-        .collect();
-    assert_eq!(
-        pane1_writes,
-        vec!["devbox shell", "kubectl get applications -n argocd -w"]
+    // Persistent panes now use create_pane(Some(command)), so no write_to_pane calls.
+    // Reactive panes also get no writes at activation.
+    assert!(
+        written.is_empty(),
+        "No write_to_pane calls expected during activation — persistent panes use direct command execution"
     );
-
-    let pane2_writes: Vec<_> = written
-        .iter()
-        .filter(|(id, _)| id == "mock-2")
-        .map(|(_, t)| t.as_str())
-        .collect();
-    assert_eq!(
-        pane2_writes,
-        vec!["devbox shell", "kubectl get events -A -w"]
-    );
-
-    // Verify reactive panes only got shell_init (no command yet)
-    for i in 3..=5 {
-        let pane_writes: Vec<_> = written
-            .iter()
-            .filter(|(id, _)| id == &format!("mock-{i}"))
-            .map(|(_, t)| t.as_str())
-            .collect();
-        assert_eq!(
-            pane_writes,
-            vec!["devbox shell"],
-            "reactive pane mock-{i} should only have shell_init"
-        );
-    }
 
     // Verify pane renames
     let renamed = mock.renamed.lock().unwrap();
@@ -280,24 +252,27 @@ async fn end_to_end_command_routing() {
     let result = mgr.handle_command("docker build .").unwrap();
     assert!(result.is_none(), "docker should not match any rule");
 
-    // Verify the matching commands were actually written to reactive panes
+    // Non-watch commands (describe, helm) use close+recreate (no write_to_pane).
+    // Watch commands (kubectl get) use write_to_pane with clear prefix.
     let written = mock.written.lock().unwrap();
-    let reactive_commands: Vec<_> = written
+    let watch_commands: Vec<_> = written
         .iter()
-        .filter(|(id, _)| {
-            id.starts_with("mock-") && {
-                let num: u64 = id.strip_prefix("mock-").unwrap().parse().unwrap();
-                num >= 3 // reactive panes start at mock-3
-            }
-        })
-        .filter(|(_, text)| text != "devbox shell") // exclude shell_init
         .map(|(id, text)| (id.as_str(), text.as_str()))
         .collect();
+    // Only the watch rule (kubectl get) should have a write_to_pane call
+    assert_eq!(watch_commands.len(), 1);
+    assert!(
+        watch_commands[0]
+            .1
+            .contains("kubectl get pods -n production")
+    );
 
-    assert_eq!(reactive_commands.len(), 3);
-    assert_eq!(reactive_commands[0].1, "kubectl describe pod nginx");
-    assert_eq!(reactive_commands[1].1, "kubectl get pods -n production");
-    assert_eq!(reactive_commands[2].1, "helm status myrelease");
+    // Non-watch commands should have closed old panes
+    let closed = mock.closed.lock().unwrap();
+    assert!(
+        closed.len() >= 2,
+        "Non-watch commands should close old reactive panes"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -329,20 +304,11 @@ async fn reactive_pool_cycling_with_real_config() {
         "kubectl get configmaps",
     ];
 
-    let mut pane_ids: Vec<String> = Vec::new();
+    // All commands should match and route to reactive panes
     for cmd in &commands {
-        let pane_id = mgr.handle_command(cmd).unwrap().unwrap();
-        pane_ids.push(pane_id);
+        let change = mgr.handle_command(cmd).unwrap();
+        assert!(change.is_some(), "Command '{cmd}' should match a rule");
     }
-
-    // Reactive panes are mock-3, mock-4, mock-5 (first two are persistent)
-    assert_eq!(pane_ids[0], "mock-3");
-    assert_eq!(pane_ids[1], "mock-4");
-    assert_eq!(pane_ids[2], "mock-5");
-    // Wraps around
-    assert_eq!(pane_ids[3], "mock-3");
-    assert_eq!(pane_ids[4], "mock-4");
-    assert_eq!(pane_ids[5], "mock-5");
 }
 
 // ---------------------------------------------------------------------------

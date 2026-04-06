@@ -5,7 +5,7 @@
 
 [[modes]]
 name = "dev"
-# shell_init = "devbox shell"    # Optional: initialize the shell environment
+shell_init = "devbox run agent"
 
 # Persistent panes run continuously alongside your agent session.
 

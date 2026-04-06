@@ -208,8 +208,8 @@ New tab abstraction layered on top of the existing UI:
 
 ### Phase 2: Tab-based workspaces (in progress)
 - [x] Tab data model — `Tab` enum (Dashboard / Mode), tab list, active tab index, tab-to-pane mapping
-- [ ] Tab bar rendering — rendered at top when >1 tab, shows names, highlights active, mouse-clickable
-- [ ] Tab switching — `Ctrl+Shift+1-9` keybindings, mouse click on tab bar
+- [x] Tab bar rendering — rendered at top when >1 tab, shows names, highlights active (mouse click deferred)
+- [x] Tab switching — `Ctrl+PageUp/PageDown` keybindings (`Ctrl+Shift+1-9` not feasible in terminals)
 - [x] Mode activation creates new tab — refactor mode activation to create a new tab with 50/50 layout instead of injecting panes into the dashboard
 - [x] Mode tab rendering — dedicated render path: agent pane left 50%, side panes stacked right 50%
 - [ ] Dashboard card → tab navigation — `Enter` on a session card whose agent lives in a mode tab switches to that tab
