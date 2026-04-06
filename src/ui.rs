@@ -20,7 +20,7 @@ use crate::event::EventType;
 use crate::pane::{PaneController, PaneError};
 use crate::project_config::{ModeConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
-use crate::tab::TabManager;
+use crate::tab::{Tab, TabManager};
 use crate::terminal_widget::TerminalWidget;
 use crate::theme::ColorPalette;
 
@@ -118,6 +118,18 @@ enum UiMode {
 enum PaneLayout {
     Stacked,
     Tiled,
+}
+
+/// Describes which panes to render and how to lay them out, based on the active tab.
+enum ActiveTabView {
+    /// Dashboard tab: show all panes except those managed by mode tabs.
+    Dashboard { exclude_pane_ids: Vec<String> },
+    /// Mode tab: agent pane on left (50%), side panes stacked on right (50%).
+    Mode {
+        mode_name: String,
+        agent_pane_id: String,
+        side_pane_ids: Vec<String>,
+    },
 }
 
 struct DirPickerState {
@@ -1399,6 +1411,21 @@ pub fn run_tui(
 
         let has_pane_control = pane.is_available();
         let pane_layout = ui.pane_layout;
+        let tab_view = match tab_manager.active_tab() {
+            Tab::Dashboard => ActiveTabView::Dashboard {
+                exclude_pane_ids: tab_manager.all_managed_pane_ids(),
+            },
+            Tab::Mode {
+                name,
+                agent_pane_id,
+                mode_manager,
+                ..
+            } => ActiveTabView::Mode {
+                mode_name: name.clone(),
+                agent_pane_id: agent_pane_id.clone(),
+                side_pane_ids: mode_manager.managed_pane_ids(),
+            },
+        };
         terminal.draw(|frame| {
             render_frame(
                 frame,
@@ -1409,7 +1436,7 @@ pub fn run_tui(
                 has_pane_control,
                 &*pane,
                 pane_layout,
-                tab_manager.active_mode_name(),
+                &tab_view,
             );
         })?;
         tick = tick.wrapping_add(1);
@@ -1938,41 +1965,62 @@ pub fn run_tui(
                     let dir_str = dir.display().to_string();
                     let mode_name = config.name.clone();
 
-                    match tab_manager.open_mode_tab(&config, &dir_str, String::new()) {
-                        Ok((_tab_idx, new_ids)) => {
-                            for id in &new_ids {
-                                state.blocking_write().register_pane(id.clone());
-                            }
-                            // Focus the first persistent pane if any exist.
-                            if let Some(first) = new_ids.first() {
-                                let _ = pane.focus_pane(first);
-                                ui.mode = UiMode::PaneInput;
-                            }
-                            // Resize all new PTYs to match the current layout.
-                            if let Some(embedded) =
-                                pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                            {
-                                let frame_area = terminal.get_frame().area();
-                                let right_width = (frame_area.width * 67 / 100).saturating_sub(2);
-                                let pane_count = embedded.pane_ids().len() as u16;
-                                let rows = match ui.pane_layout {
-                                    PaneLayout::Tiled => {
-                                        (frame_area.height / pane_count.max(1)).saturating_sub(2)
+                    // Create agent pane first, then open mode tab with it.
+                    match pane.create_pane(None, Some(&dir_str)) {
+                        Ok(agent_pane_id) => {
+                            state.blocking_write().register_pane(agent_pane_id.clone());
+                            match tab_manager.open_mode_tab(
+                                &config,
+                                &dir_str,
+                                agent_pane_id.clone(),
+                            ) {
+                                Ok((_tab_idx, side_ids)) => {
+                                    for id in &side_ids {
+                                        state.blocking_write().register_pane(id.clone());
                                     }
-                                    PaneLayout::Stacked => frame_area
-                                        .height
-                                        .saturating_sub(2 + pane_count.saturating_sub(1)),
-                                };
-                                if rows > 0 && right_width > 0 {
-                                    for id in &new_ids {
-                                        let _ = embedded.resize_pane_pty(id, rows, right_width);
+                                    // Focus the agent pane by default.
+                                    let _ = pane.focus_pane(&agent_pane_id);
+                                    ui.mode = UiMode::PaneInput;
+                                    // Resize all new PTYs for 50/50 mode layout.
+                                    if let Some(embedded) =
+                                        pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                                    {
+                                        let frame_area = terminal.get_frame().area();
+                                        let half_width = (frame_area.width / 2).saturating_sub(2);
+                                        // Agent pane: full height of left half.
+                                        let agent_rows = frame_area.height.saturating_sub(3);
+                                        if agent_rows > 0 && half_width > 0 {
+                                            let _ = embedded.resize_pane_pty(
+                                                &agent_pane_id,
+                                                agent_rows,
+                                                half_width,
+                                            );
+                                        }
+                                        // Side panes: stacked in right half.
+                                        let side_count = side_ids.len().max(1) as u16;
+                                        let side_rows =
+                                            (frame_area.height / side_count).saturating_sub(2);
+                                        if side_rows > 0 && half_width > 0 {
+                                            for id in &side_ids {
+                                                let _ = embedded
+                                                    .resize_pane_pty(id, side_rows, half_width);
+                                            }
+                                        }
                                     }
+                                    ui.status_message = Some((
+                                        format!("Activated mode: {mode_name}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    // Clean up agent pane on mode activation failure.
+                                    let _ = pane.close_pane(&agent_pane_id);
+                                    ui.status_message = Some((
+                                        format!("Mode activation failed: {e}"),
+                                        std::time::Instant::now(),
+                                    ));
                                 }
                             }
-                            ui.status_message = Some((
-                                format!("Activated mode: {mode_name}"),
-                                std::time::Instant::now(),
-                            ));
                         }
                         Err(e) => {
                             ui.status_message = Some((
@@ -2146,10 +2194,15 @@ fn render_frame(
     has_pane_control: bool,
     pane_controller: &dyn PaneController,
     pane_layout: PaneLayout,
-    active_mode_name: Option<&str>,
+    tab_view: &ActiveTabView,
 ) {
     let area = frame.area();
     let palette = ui.palette;
+
+    let active_mode_name = match tab_view {
+        ActiveTabView::Dashboard { .. } => None,
+        ActiveTabView::Mode { mode_name, .. } => Some(mode_name.as_str()),
+    };
 
     // Fill entire frame with terminal background so nothing falls through
     // to the alternate screen default (which may be black on light themes).
@@ -2167,7 +2220,38 @@ fn render_frame(
     let embedded = pane_controller
         .as_any()
         .downcast_ref::<EmbeddedPaneController>();
-    let pane_ids = embedded.map(|e| e.pane_ids()).unwrap_or_default();
+
+    // ── Mode tab rendering ─────────────────────────────────────────────
+    if let ActiveTabView::Mode {
+        agent_pane_id,
+        side_pane_ids,
+        ..
+    } = tab_view
+    {
+        render_mode_tab(
+            frame,
+            ui,
+            embedded,
+            agent_pane_id,
+            side_pane_ids,
+            main_area,
+            hints_area,
+            has_pane_control,
+            active_mode_name,
+        );
+        return;
+    }
+
+    // ── Dashboard tab rendering ────────────────────────────────────────
+    let all_pane_ids = embedded.map(|e| e.pane_ids()).unwrap_or_default();
+    let exclude = match tab_view {
+        ActiveTabView::Dashboard { exclude_pane_ids } => exclude_pane_ids,
+        _ => unreachable!(),
+    };
+    let pane_ids: Vec<String> = all_pane_ids
+        .into_iter()
+        .filter(|id| !exclude.contains(id))
+        .collect();
     let has_terminal_panes = !pane_ids.is_empty();
 
     let (dashboard_area, panes_area) = if has_terminal_panes {
@@ -2198,6 +2282,7 @@ fn render_frame(
                 frame,
                 embedded,
                 right,
+                &pane_ids,
                 pane_layout,
                 &ui.pane_display_names,
                 &ui.selection,
@@ -2296,6 +2381,7 @@ fn render_frame(
                 frame,
                 embedded,
                 right,
+                &pane_ids,
                 pane_layout,
                 &ui.pane_display_names,
                 &ui.selection,
@@ -2382,6 +2468,7 @@ fn render_frame(
             frame,
             embedded,
             right,
+            &pane_ids,
             pane_layout,
             &ui.pane_display_names,
             &ui.selection,
@@ -2413,17 +2500,18 @@ fn render_frame(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_terminal_panes(
     frame: &mut Frame,
     embedded: Option<&EmbeddedPaneController>,
     area: Rect,
+    pane_ids: &[String],
     layout: PaneLayout,
     display_names: &HashMap<String, String>,
     selection: &Option<TextSelection>,
     palette: ColorPalette,
 ) -> Option<Rect> {
     let ctrl = embedded?;
-    let pane_ids = ctrl.pane_ids();
     if pane_ids.is_empty() {
         return None;
     }
@@ -2574,6 +2662,89 @@ fn render_terminal_panes(
     }
 
     focused_pane_rect
+}
+
+/// Render a mode tab: agent pane on left 50%, side panes stacked on right 50%.
+#[allow(clippy::too_many_arguments)]
+fn render_mode_tab(
+    frame: &mut Frame,
+    ui: &mut UiState,
+    embedded: Option<&EmbeddedPaneController>,
+    agent_pane_id: &str,
+    side_pane_ids: &[String],
+    main_area: Rect,
+    hints_area: Rect,
+    has_pane_control: bool,
+    active_mode_name: Option<&str>,
+) {
+    let palette = ui.palette;
+
+    // 50/50 horizontal split
+    let chunks = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(main_area);
+    let agent_area = chunks[0];
+    let side_area = chunks[1];
+
+    // Left side: single agent pane
+    if !agent_pane_id.is_empty() {
+        let agent_ids = vec![agent_pane_id.to_string()];
+        let rect = render_terminal_panes(
+            frame,
+            embedded,
+            agent_area,
+            &agent_ids,
+            PaneLayout::Stacked,
+            &ui.pane_display_names,
+            &ui.selection,
+            palette,
+        );
+        if rect.is_some() {
+            ui.focused_pane_rect = rect;
+        }
+    }
+
+    // Right side: side panes stacked (all visible simultaneously)
+    if !side_pane_ids.is_empty() {
+        let rect = render_terminal_panes(
+            frame,
+            embedded,
+            side_area,
+            side_pane_ids,
+            PaneLayout::Tiled,
+            &ui.pane_display_names,
+            &ui.selection,
+            palette,
+        );
+        if ui.focused_pane_rect.is_none() {
+            ui.focused_pane_rect = rect;
+        }
+    }
+
+    // Full-width hints bar
+    render_bottom_bar(frame, ui, hints_area, has_pane_control);
+
+    // Overlays (drawn last, on top)
+    if ui.mode == UiMode::Help {
+        render_help_overlay(frame, has_pane_control, active_mode_name, palette);
+    }
+    if ui.mode == UiMode::DirPicker
+        && let Some(picker) = ui.dir_picker.as_mut()
+    {
+        render_dir_picker(frame, picker, palette);
+    }
+    if ui.mode == UiMode::ModeSelector
+        && let Some(ref selector) = ui.mode_selector
+    {
+        render_mode_selector(frame, selector);
+    }
+    if ui.mode == UiMode::NewPaneForm
+        && let Some(ref form) = ui.new_pane_form
+    {
+        render_new_pane_form(frame, form, palette);
+    }
+    if ui.mode == UiMode::QuitConfirm {
+        render_quit_confirm(frame, palette);
+    }
 }
 
 fn render_stats_bar(
@@ -3469,7 +3640,9 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
-                    None,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
                 )
             })
             .unwrap();
@@ -3529,7 +3702,9 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
-                    None,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
                 )
             })
             .unwrap();
@@ -3636,7 +3811,9 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
-                    None,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
                 )
             })
             .unwrap();
@@ -3719,7 +3896,9 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
-                    None,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
                 )
             })
             .unwrap();

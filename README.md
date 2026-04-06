@@ -11,6 +11,7 @@ A terminal dashboard for monitoring and controlling multiple AI coding agent ses
 ## Features
 
 - **Real-time session monitoring** — see status, active tool, working directory, and last prompt for every agent session
+- **Workspace modes** — per-project config files define persistent side panes and reactive command routing (see [Workspace Modes](#workspace-modes))
 - **Pane control** — create, focus, close, and rename agent panes without leaving the dashboard
 - **Keyboard-driven interface** — vim-style navigation with single-key actions
 - **Auto-installed hooks** — one command registers all required hooks
@@ -190,6 +191,69 @@ Directory lists loop end-to-end, so pressing `Up` on the first entry jumps to th
 | `Ctrl+t` | Toggle stacked / tiled layout |
 
 In PaneInput mode, `Ctrl+c` is delivered to the terminal as SIGINT (0x03). From the dashboard, pressing `Ctrl+c` twice triggers the quit confirmation dialog.
+
+## Workspace Modes
+
+Modes let you define workspace layouts per project so that relevant command output appears in dedicated side panes alongside your agent — instead of scrolling away in the chat.
+
+### Quick Setup
+
+```bash
+# Scaffold a starter config in your project
+cd my-project
+dot-agent-deck init
+```
+
+This creates `.dot-agent-deck.toml` with a commented example. Edit it to match your workflow.
+
+### How It Works
+
+1. Press `Ctrl+n` and pick a directory that contains `.dot-agent-deck.toml`
+2. A **mode selector** appears listing "New agent pane" (default) plus each mode defined in the config
+3. Select a mode — the dashboard creates an agent pane on the left and side panes on the right in a 50/50 split
+4. **Persistent panes** start their commands immediately (e.g., `cargo watch -x test`)
+5. **Reactive panes** populate automatically when the agent runs a command matching one of your regex rules (e.g., `kubectl describe`)
+
+If no `.dot-agent-deck.toml` exists in the chosen directory, the existing new-pane flow is used unchanged. The mode selector also offers a "Generate mode config" option that opens an agent pane with a prompt to create a config for you.
+
+### Config Format
+
+Create `.dot-agent-deck.toml` in your project root:
+
+```toml
+[[modes]]
+name = "kubernetes-operations"
+shell_init = "source .env"   # optional: runs in every side pane before its command
+
+# Persistent panes — always visible, start immediately
+[[modes.panes]]
+command = "kubectl get pods -w"
+name = "Pods"                # optional: defaults to the command
+
+# Reactive rules — route agent commands to side panes
+[[modes.rules]]
+pattern = "kubectl\\s+(describe|explain)"   # regex matched against agent commands
+watch = false                               # run once
+
+[[modes.rules]]
+pattern = "kubectl\\s+(get|top)"
+watch = true                                # re-run periodically
+interval = 2                                # refresh every 2 seconds
+```
+
+You can define multiple `[[modes]]` in a single file (e.g., one for Kubernetes ops, another for Rust TDD). Each mode has its own persistent panes and reactive rules.
+
+### Mode Selector Shortcuts
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Navigate modes |
+| `Enter` | Select mode |
+| `Esc` | Cancel (opens default new-pane form) |
+
+### Reactive Pane Pool
+
+Persistent panes claim the first slots. Reactive rules share a circular pool of remaining slots — when a new command matches, it goes to the next available reactive pane, cycling back to the first when all are used.
 
 ## Configuration
 
