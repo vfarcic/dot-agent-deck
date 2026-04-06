@@ -35,10 +35,9 @@ The UI uses a tab-based layout. Tab 1 is always the **Dashboard** — the multi-
 
 1. User presses `Ctrl+n` → dir picker (existing)
 2. User selects dir → app checks for `.dot-agent-deck.toml` in that dir
-3. **If no config found** → straight to NewPaneForm (existing behavior, zero friction). Pane is created in the dashboard tab.
-4. **If config found** → show mode selector: "New agent pane" (default) + one entry per mode
-5. If "New agent pane" selected → existing NewPaneForm flow (unchanged, pane in dashboard tab)
-6. If mode selected → **new tab** created with agent pane + side panes in 50/50 layout
+3. **Unified form** opens with Name/Command fields. If config found, a Mode field appears at the top with `◀▶` cycling through "No mode" + configured modes + "Generate config"
+4. If "No mode" selected → pane created in dashboard tab
+5. If mode selected → **new tab** created with agent pane + side panes in 50/50 layout
 7. Persistent panes start their commands immediately
 8. Reactive panes start empty, populate as agent executes matching commands
 9. Circular pane pool for reactive panes: commands cycle through available slots
@@ -133,7 +132,7 @@ watch = false
 
 4. **Dashboard card links to mode tab.** When an agent running in a mode tab appears as a session card in the dashboard, pressing `Enter` on that card switches to the mode's tab. This ties the multi-agent overview to the focused workspaces.
 
-5. **Unified form flow for all pane creation.** All mode selections (including modes) go through the Name/Command form. The user always names the agent and chooses a command. `shell_init` was removed — the command field in the form replaces it. "New agent pane" renamed to "No mode" in the mode selector.
+5. **Unified form flow for all pane creation.** Mode selection and name/command are combined into a single form. When modes are available, a Mode field appears at the top with `◀▶` arrow cycling. The user always names the agent and chooses a command. `shell_init` was removed — the command field in the form replaces it. Default option is "No mode".
 
 6. **Shell panes with sent commands.** Side panes are created as shells, not process panes. Commands are sent after creation. This prevents pane death when commands exit with errors — the shell stays alive for re-use.
 
@@ -219,9 +218,9 @@ New tab abstraction layered on top of the existing UI:
 - [x] Dashboard card → tab navigation — `Enter` on a session card whose agent lives in a mode tab switches to that tab
 - [x] Tab close — close mode tab tears down entire workspace (agent + all side panes), switch to dashboard
 - [x] Reactive event routing per tab — route bash commands to the correct tab's ModeManager based on agent pane ownership
-- [ ] Update help overlay — reflect tab navigation keybindings
-- [ ] Update README — document tab-based workflow
-- [x] Unified mode form flow — all mode selections go through Name/Command form; "New agent pane" → "No mode"; `shell_init` removed from config
+- [x] Update help overlay — reflect tab navigation keybindings and unified new-agent form
+- [ ] Update docs — `docs/keyboard-shortcuts.md` (tab nav, corrected `Ctrl+d`, mode selector), `docs/configuration.md` (`.dot-agent-deck.toml` project config), `docs/getting-started.md` (modes workflow), new `docs/workspace-modes.md` (modes, tabs, config examples)
+- [x] Unified mode form flow — mode selector and name/command form merged into single modal with inline mode cycling; "No mode" default; `shell_init` removed from config
 - [x] Tab bar styling — distinct `tab_bar_bg` background, improved contrast, dynamic tab labels from user-chosen name
 - [x] Navigation redesign — `Up/Down` linear card cycling, `Ctrl+d` as universal command mode toggle
 - [x] Tests — tab creation, switching, close, card-to-tab navigation

@@ -62,8 +62,8 @@ impl ColorPalette {
             text_primary: Color::White,
             text_secondary: Color::Gray,
             text_muted: Color::Gray,
-            selected_bg: Color::Rgb(25, 30, 50),
-            tab_bar_bg: Color::Rgb(20, 20, 25),
+            selected_bg: Color::Rgb(30, 40, 70),
+            tab_bar_bg: Color::Rgb(30, 30, 40),
             terminal_bg: Color::Rgb(0, 0, 0),
         }
     }
@@ -73,8 +73,8 @@ impl ColorPalette {
             text_primary: Color::Black,
             text_secondary: Color::DarkGray,
             text_muted: Color::Gray,
-            selected_bg: Color::Rgb(225, 230, 240),
-            tab_bar_bg: Color::Rgb(235, 235, 240),
+            selected_bg: Color::Rgb(210, 218, 235),
+            tab_bar_bg: Color::Rgb(220, 220, 230),
             terminal_bg: Color::Rgb(255, 255, 255),
         }
     }
@@ -110,31 +110,29 @@ fn detect_palette() -> ColorPalette {
         let (r, g, b) = colors.background.scale_to_8bit();
         palette.terminal_bg = Color::Rgb(r, g, b);
         palette.selected_bg = if is_light {
-            // Darken slightly for light backgrounds
             Color::Rgb(
-                r.saturating_sub(20),
-                g.saturating_sub(18),
-                b.saturating_sub(10),
+                r.saturating_sub(35),
+                g.saturating_sub(30),
+                b.saturating_sub(15),
             )
         } else {
-            // Lighten slightly for dark backgrounds
             Color::Rgb(
-                r.saturating_add(20),
-                g.saturating_add(22),
-                b.saturating_add(35),
+                r.saturating_add(25),
+                g.saturating_add(30),
+                b.saturating_add(50),
             )
         };
         palette.tab_bar_bg = if is_light {
             Color::Rgb(
-                r.saturating_sub(12),
-                g.saturating_sub(12),
-                b.saturating_sub(8),
+                r.saturating_sub(25),
+                g.saturating_sub(25),
+                b.saturating_sub(15),
             )
         } else {
             Color::Rgb(
-                r.saturating_add(12),
-                g.saturating_add(12),
-                b.saturating_add(15),
+                r.saturating_add(22),
+                g.saturating_add(22),
+                b.saturating_add(30),
             )
         };
     }
@@ -152,8 +150,8 @@ mod tests {
         assert_eq!(p.text_primary, Color::White);
         assert_eq!(p.text_secondary, Color::Gray);
         assert_eq!(p.text_muted, Color::Gray);
-        assert_eq!(p.selected_bg, Color::Rgb(25, 30, 50));
-        assert_eq!(p.tab_bar_bg, Color::Rgb(20, 20, 25));
+        assert_eq!(p.selected_bg, Color::Rgb(30, 40, 70));
+        assert_eq!(p.tab_bar_bg, Color::Rgb(30, 30, 40));
         assert_eq!(p.terminal_bg, Color::Rgb(0, 0, 0));
     }
 
@@ -163,8 +161,8 @@ mod tests {
         assert_eq!(p.text_primary, Color::Black);
         assert_eq!(p.text_secondary, Color::DarkGray);
         assert_eq!(p.text_muted, Color::Gray);
-        assert_eq!(p.selected_bg, Color::Rgb(225, 230, 240));
-        assert_eq!(p.tab_bar_bg, Color::Rgb(235, 235, 240));
+        assert_eq!(p.selected_bg, Color::Rgb(210, 218, 235));
+        assert_eq!(p.tab_bar_bg, Color::Rgb(220, 220, 230));
         assert_eq!(p.terminal_bg, Color::Rgb(255, 255, 255));
     }
 

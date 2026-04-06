@@ -108,7 +108,6 @@ enum UiMode {
     Help,
     Rename,
     DirPicker,
-    ModeSelector,
     NewPaneForm,
     PaneInput,
     StarPrompt,
@@ -292,57 +291,12 @@ impl DirPickerState {
 }
 
 // ---------------------------------------------------------------------------
-// Mode selector state (shown when dir has .dot-agent-deck.toml with modes)
+// Unified new-pane form (mode selection + name/command in one modal)
 // ---------------------------------------------------------------------------
-
-struct ModeSelectorState {
-    dir: PathBuf,
-    modes: Vec<ModeConfig>,
-    selected: usize, // 0 = "No mode", 1..N = modes[0..N-1], last = generate (when show_generate)
-    show_generate: bool, // true when no .dot-agent-deck.toml exists
-}
-
-impl ModeSelectorState {
-    fn new(dir: PathBuf, modes: Vec<ModeConfig>, show_generate: bool) -> Self {
-        Self {
-            dir,
-            modes,
-            selected: 0,
-            show_generate,
-        }
-    }
-
-    fn item_count(&self) -> usize {
-        1 + self.modes.len() + if self.show_generate { 1 } else { 0 }
-    }
-
-    fn select_next(&mut self) {
-        if self.selected + 1 < self.item_count() {
-            self.selected += 1;
-        }
-    }
-
-    fn select_previous(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
-    }
-
-    /// Returns `None` for "No mode" (index 0), `Some(&ModeConfig)` for a mode.
-    fn selected_mode(&self) -> Option<&ModeConfig> {
-        if self.selected == 0 || self.is_generate_selected() {
-            None
-        } else {
-            self.modes.get(self.selected - 1)
-        }
-    }
-
-    /// Returns `true` when the "Generate mode config" option is selected (last item).
-    fn is_generate_selected(&self) -> bool {
-        self.show_generate && self.selected == self.item_count() - 1
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormField {
+    Mode,
     Name,
     Command,
 }
@@ -351,8 +305,102 @@ struct NewPaneFormState {
     dir: PathBuf,
     name: String,
     command: String,
-    mode_config: Option<ModeConfig>,
+    // Mode selection fields
+    modes: Vec<ModeConfig>,
+    mode_selected: usize, // 0 = "No mode", 1..N = modes, last = generate (when show_generate)
+    show_generate: bool,
+    has_mode_field: bool,
     focused: FormField,
+}
+
+impl NewPaneFormState {
+    fn new(
+        dir: PathBuf,
+        name: String,
+        command: String,
+        modes: Vec<ModeConfig>,
+        show_generate: bool,
+    ) -> Self {
+        let has_mode_field = !modes.is_empty() || show_generate;
+        Self {
+            dir,
+            name,
+            command,
+            modes,
+            mode_selected: 0,
+            show_generate,
+            has_mode_field,
+            focused: if has_mode_field {
+                FormField::Mode
+            } else {
+                FormField::Name
+            },
+        }
+    }
+
+    fn mode_option_count(&self) -> usize {
+        1 + self.modes.len() + if self.show_generate { 1 } else { 0 }
+    }
+
+    fn select_next_mode(&mut self) {
+        if self.mode_selected + 1 < self.mode_option_count() {
+            self.mode_selected += 1;
+        }
+    }
+
+    fn select_previous_mode(&mut self) {
+        self.mode_selected = self.mode_selected.saturating_sub(1);
+    }
+
+    fn selected_mode(&self) -> Option<&ModeConfig> {
+        if self.mode_selected == 0 || self.is_generate_selected() {
+            None
+        } else {
+            self.modes.get(self.mode_selected - 1)
+        }
+    }
+
+    fn is_generate_selected(&self) -> bool {
+        self.show_generate && self.mode_selected == self.mode_option_count() - 1
+    }
+
+    fn mode_display_name(&self) -> &str {
+        if self.mode_selected == 0 {
+            "No mode"
+        } else if self.is_generate_selected() {
+            "Generate config"
+        } else {
+            &self.modes[self.mode_selected - 1].name
+        }
+    }
+
+    fn next_field(&self) -> FormField {
+        match self.focused {
+            FormField::Mode => FormField::Name,
+            FormField::Name => FormField::Command,
+            FormField::Command => {
+                if self.has_mode_field {
+                    FormField::Mode
+                } else {
+                    FormField::Name
+                }
+            }
+        }
+    }
+
+    fn prev_field(&self) -> FormField {
+        match self.focused {
+            FormField::Mode => FormField::Command,
+            FormField::Name => {
+                if self.has_mode_field {
+                    FormField::Mode
+                } else {
+                    FormField::Command
+                }
+            }
+            FormField::Command => FormField::Name,
+        }
+    }
 }
 
 struct UiState {
@@ -366,7 +414,6 @@ struct UiState {
     status_message: Option<(String, std::time::Instant)>,
     dir_picker: Option<DirPickerState>,
     new_pane_form: Option<NewPaneFormState>,
-    mode_selector: Option<ModeSelectorState>,
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
@@ -422,7 +469,6 @@ impl UiState {
             status_message: None,
             dir_picker: None,
             new_pane_form: None,
-            mode_selector: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
             pane_metadata: HashMap::new(),
@@ -454,6 +500,49 @@ impl Default for UiState {
 // ---------------------------------------------------------------------------
 // Session filtering
 // ---------------------------------------------------------------------------
+
+/// Resize dashboard panes to match the dashboard layout after a tab switch.
+fn resize_dashboard_panes(
+    pane: &dyn PaneController,
+    ui: &UiState,
+    tab_manager: &TabManager,
+    area: Rect,
+) {
+    if !matches!(tab_manager.active_tab(), Tab::Dashboard) {
+        return;
+    }
+    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+        let exclude = tab_manager.all_managed_pane_ids();
+        let pane_ids: Vec<String> = embedded
+            .pane_ids()
+            .into_iter()
+            .filter(|id| !exclude.contains(id))
+            .collect();
+        if pane_ids.is_empty() {
+            return;
+        }
+        let right_width = (area.width * 67 / 100).saturating_sub(2);
+        let pane_count = pane_ids.len() as u16;
+        for pane_id in &pane_ids {
+            let is_focused = embedded.focused_pane_id().as_deref() == Some(pane_id.as_str());
+            let rows = match ui.pane_layout {
+                PaneLayout::Tiled => (area.height / pane_count).saturating_sub(2),
+                PaneLayout::Stacked => {
+                    if is_focused
+                        || (embedded.focused_pane_id().is_none() && pane_id == &pane_ids[0])
+                    {
+                        area.height.saturating_sub(2 + pane_count.saturating_sub(1))
+                    } else {
+                        0
+                    }
+                }
+            };
+            if rows > 0 {
+                let _ = embedded.resize_pane_pty(pane_id, rows, right_width);
+            }
+        }
+    }
+}
 
 fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
     let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
@@ -1095,7 +1184,7 @@ fn generate_mode_config_prompt(dir: &str) -> String {
 }
 
 /// Check for `.dot-agent-deck.toml` in the selected directory.
-/// If modes are defined, show the mode selector; otherwise show it with a generate option.
+/// Open the unified new-pane form, with mode field when modes are available.
 fn transition_after_dir_pick(ui: &mut UiState) {
     let dir = ui
         .dir_picker
@@ -1103,76 +1192,26 @@ fn transition_after_dir_pick(ui: &mut UiState) {
         .map(|p| p.current_dir.clone())
         .unwrap_or_default();
 
-    match load_project_config(&dir) {
-        Ok(Some(config)) if !config.modes.is_empty() => {
-            ui.dir_picker = None;
-            ui.mode_selector = Some(ModeSelectorState::new(dir, config.modes, false));
-            ui.mode = UiMode::ModeSelector;
-        }
-        _ => {
-            // No config or empty — show selector with generate option.
-            ui.dir_picker = None;
-            ui.mode_selector = Some(ModeSelectorState::new(dir, vec![], true));
-            ui.mode = UiMode::ModeSelector;
-        }
-    }
-}
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let command = ui.config.default_command.clone();
 
-fn handle_mode_selector_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        ui.mode = UiMode::QuitConfirm;
-        return KeyResult::Continue;
-    }
-
-    let selector = match ui.mode_selector.as_mut() {
-        Some(s) => s,
-        None => {
-            ui.mode = UiMode::Normal;
-            return KeyResult::Continue;
-        }
+    let (modes, show_generate) = match load_project_config(&dir) {
+        Ok(Some(config)) if !config.modes.is_empty() => (config.modes, false),
+        _ => (vec![], true),
     };
 
-    match key.code {
-        KeyCode::Char('j') | KeyCode::Down => {
-            selector.select_next();
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            selector.select_previous();
-        }
-        KeyCode::Enter => {
-            let dir = selector.dir.clone();
-            let is_generate = selector.is_generate_selected();
-            let selected_mode = selector.selected_mode().cloned();
-            ui.mode_selector = None;
-
-            if is_generate {
-                ui.mode = UiMode::Normal;
-                return KeyResult::GenerateModeConfig { dir };
-            }
-
-            // All selections (mode or no-mode) go through the Name/Command form.
-            let name = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let command = ui.config.default_command.clone();
-            ui.new_pane_form = Some(NewPaneFormState {
-                dir,
-                name,
-                command,
-                mode_config: selected_mode,
-                focused: FormField::Name,
-            });
-            ui.mode = UiMode::NewPaneForm;
-        }
-        KeyCode::Esc | KeyCode::Char('q') => {
-            ui.mode_selector = None;
-            ui.mode = UiMode::Normal;
-        }
-        _ => {}
-    }
-
-    KeyResult::Continue
+    ui.dir_picker = None;
+    ui.new_pane_form = Some(NewPaneFormState::new(
+        dir,
+        name,
+        command,
+        modes,
+        show_generate,
+    ));
+    ui.mode = UiMode::NewPaneForm;
 }
 
 fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
@@ -1192,39 +1231,57 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             ui.new_pane_form = None;
             ui.mode = UiMode::Normal;
         }
-        KeyCode::Tab | KeyCode::BackTab => {
-            form.focused = match form.focused {
-                FormField::Name => FormField::Command,
-                FormField::Command => FormField::Name,
-            };
+        KeyCode::Tab => {
+            form.focused = form.next_field();
+        }
+        KeyCode::BackTab => {
+            form.focused = form.prev_field();
+        }
+        // Left/Right cycle mode when Mode field is focused
+        KeyCode::Left | KeyCode::Char('h') if form.focused == FormField::Mode => {
+            form.select_previous_mode();
+        }
+        KeyCode::Right | KeyCode::Char('l') if form.focused == FormField::Mode => {
+            form.select_next_mode();
         }
         KeyCode::Enter => match form.focused {
+            FormField::Mode => {
+                form.focused = FormField::Name;
+            }
             FormField::Name => {
                 form.focused = FormField::Command;
             }
             FormField::Command => {
+                if form.is_generate_selected() {
+                    let dir = form.dir.clone();
+                    ui.new_pane_form = None;
+                    ui.mode = UiMode::Normal;
+                    return KeyResult::GenerateModeConfig { dir };
+                }
                 let req = NewPaneRequest {
                     dir: form.dir.clone(),
                     name: form.name.clone(),
                     command: form.command.clone(),
-                    mode_config: form.mode_config.clone(),
+                    mode_config: form.selected_mode().cloned(),
                 };
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
                 return KeyResult::NewPane(req);
             }
         },
-        KeyCode::Backspace => {
+        KeyCode::Backspace if form.focused != FormField::Mode => {
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
+                FormField::Mode => unreachable!(),
             };
             field.pop();
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if form.focused != FormField::Mode => {
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
+                FormField::Mode => unreachable!(),
             };
             field.push(c);
         }
@@ -1917,16 +1974,34 @@ pub fn run_tui(
                     KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                         let count = tab_manager.tab_count();
                         if count > 0 {
-                            let next = (tab_manager.active_index() + 1) % count;
+                            let prev_idx = tab_manager.active_index();
+                            let next = (prev_idx + 1) % count;
                             tab_manager.switch_to(next);
+                            if prev_idx != tab_manager.active_index() {
+                                resize_dashboard_panes(
+                                    &*pane,
+                                    &ui,
+                                    &tab_manager,
+                                    terminal.get_frame().area(),
+                                );
+                            }
                         }
                         shortcut_handled = true;
                     }
                     KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                         let count = tab_manager.tab_count();
                         if count > 0 {
-                            let prev = (tab_manager.active_index() + count - 1) % count;
+                            let prev_idx = tab_manager.active_index();
+                            let prev = (prev_idx + count - 1) % count;
                             tab_manager.switch_to(prev);
+                            if prev_idx != tab_manager.active_index() {
+                                resize_dashboard_panes(
+                                    &*pane,
+                                    &ui,
+                                    &tab_manager,
+                                    terminal.get_frame().area(),
+                                );
+                            }
                         }
                         shortcut_handled = true;
                     }
@@ -1936,6 +2011,23 @@ pub fn run_tui(
 
             let selected_id: Option<String> =
                 filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+
+            // On a mode tab in Normal mode, Enter re-focuses the agent pane.
+            if !shortcut_handled
+                && ui.mode == UiMode::Normal
+                && key.code == KeyCode::Enter
+                && let Tab::Mode { agent_pane_id, .. } = tab_manager.active_tab()
+            {
+                let pid = agent_pane_id.clone();
+                if pane.focus_pane(&pid).is_ok() {
+                    ui.mode = UiMode::PaneInput;
+                    ui.status_message = Some((
+                        "PaneInput mode — type to interact, Ctrl+d for dashboard".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
+                shortcut_handled = true;
+            }
 
             // Mode-specific key handling (skip if a global shortcut was handled).
             let result = if shortcut_handled {
@@ -1947,7 +2039,6 @@ pub fn run_tui(
                     UiMode::Help => handle_help_key(key, &mut ui),
                     UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
                     UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
-                    UiMode::ModeSelector => handle_mode_selector_key(key, &mut ui),
                     UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
                     UiMode::PaneInput => handle_pane_input_key(key),
                     UiMode::StarPrompt => handle_star_prompt_key(key, &mut ui),
@@ -2320,13 +2411,14 @@ fn render_frame(
             Block::default().style(Style::default().bg(palette.tab_bar_bg)),
             chunks[0],
         );
+        // Active tab: inverted colors for high contrast.
         let tabs_widget = Tabs::new(titles)
             .select(tab_bar.active_index)
-            .style(Style::default().fg(palette.text_secondary))
+            .style(Style::default().fg(palette.text_muted))
             .highlight_style(
                 Style::default()
-                    .fg(palette.text_primary)
-                    .bg(palette.selected_bg)
+                    .fg(palette.terminal_bg)
+                    .bg(palette.text_secondary)
                     .add_modifier(Modifier::BOLD),
             )
             .divider("│");
@@ -2420,11 +2512,6 @@ fn render_frame(
             && let Some(picker) = ui.dir_picker.as_mut()
         {
             render_dir_picker(frame, picker, palette);
-        }
-        if ui.mode == UiMode::ModeSelector
-            && let Some(ref selector) = ui.mode_selector
-        {
-            render_mode_selector(frame, selector);
         }
         if ui.mode == UiMode::NewPaneForm
             && let Some(ref form) = ui.new_pane_form
@@ -2610,11 +2697,6 @@ fn render_frame(
         && let Some(picker) = ui.dir_picker.as_mut()
     {
         render_dir_picker(frame, picker, palette);
-    }
-    if ui.mode == UiMode::ModeSelector
-        && let Some(ref selector) = ui.mode_selector
-    {
-        render_mode_selector(frame, selector);
     }
     if ui.mode == UiMode::NewPaneForm
         && let Some(ref form) = ui.new_pane_form
@@ -2873,11 +2955,6 @@ fn render_mode_tab(
     {
         render_dir_picker(frame, picker, palette);
     }
-    if ui.mode == UiMode::ModeSelector
-        && let Some(ref selector) = ui.mode_selector
-    {
-        render_mode_selector(frame, selector);
-    }
     if ui.mode == UiMode::NewPaneForm
         && let Some(ref form) = ui.new_pane_form
     {
@@ -3125,8 +3202,9 @@ fn render_help_overlay(
 ) {
     let area = frame.area();
     let popup_width = 52.min(area.width.saturating_sub(4));
+    let tab_nav_lines: u16 = if active_mode_name.is_some() { 6 } else { 0 };
     let mode_lines: u16 = if active_mode_name.is_some() { 8 } else { 6 };
-    let base_height: u16 = if has_pane_control { 43 } else { 28 } + mode_lines;
+    let base_height: u16 = if has_pane_control { 43 } else { 28 } + mode_lines + tab_nav_lines;
     let popup_height = base_height.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -3142,7 +3220,7 @@ fn render_help_overlay(
                 .add_modifier(Modifier::BOLD),
         ),
         Line::from(""),
-        Line::from(format!("  {MOD_KEY}+d         Focus dashboard")),
+        Line::from(format!("  {MOD_KEY}+d         Command mode (dashboard)")),
         Line::from(format!("  {MOD_KEY}+n         Create new pane")),
         Line::from(format!("  {MOD_KEY}+w         Close selected pane")),
         Line::from(format!(
@@ -3150,17 +3228,33 @@ fn render_help_overlay(
         )),
     ];
 
+    if active_mode_name.is_some() {
+        help_text.push(Line::from(""));
+        help_text.push(Line::styled(
+            "  Tab Navigation (command mode)",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        help_text.push(Line::from(""));
+        help_text.push(Line::from("  Tab / Right / l     Next tab"));
+        help_text.push(Line::from("  Shift+Tab / Left / h  Prev tab"));
+        help_text.push(Line::from(format!(
+            "  {MOD_KEY}+PgDn/PgUp  Next / prev tab"
+        )));
+    }
+
     if has_pane_control {
         help_text.push(Line::from(""));
         help_text.push(Line::styled(
-            "  Dashboard (Ctrl+d to focus)",
+            "  Dashboard (command mode)",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ));
         help_text.push(Line::from(""));
         help_text.push(Line::from("  1-9           Jump to pane N"));
-        help_text.push(Line::from("  j/k / arrows  Navigate cards"));
+        help_text.push(Line::from("  j/k / Up/Down Navigate cards"));
         help_text.push(Line::from("  Enter         Focus selected pane"));
         help_text.push(Line::from("  /             Filter sessions"));
         help_text.push(Line::from("  r             Rename session"));
@@ -3172,15 +3266,16 @@ fn render_help_overlay(
     help_text.push(Line::from(""));
     help_text.push(Line::from(""));
     help_text.push(Line::styled(
-        "  Mode Selector",
+        "  New Agent Form",
         Style::default()
             .fg(Color::LightMagenta)
             .add_modifier(Modifier::BOLD),
     ));
     help_text.push(Line::from(""));
-    help_text.push(Line::from("  j/k           Navigate modes"));
-    help_text.push(Line::from("  Enter         Select mode"));
-    help_text.push(Line::from("  Esc           Cancel (default pane)"));
+    help_text.push(Line::from("  Tab           Switch field"));
+    help_text.push(Line::from("  \u{25c0}/\u{25b6}           Cycle mode"));
+    help_text.push(Line::from("  Enter         Next field / confirm"));
+    help_text.push(Line::from("  Esc           Cancel"));
     if let Some(name) = active_mode_name {
         help_text.push(Line::from(""));
         help_text.push(Line::styled(
@@ -3334,90 +3429,11 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_mode_selector(frame: &mut Frame, selector: &ModeSelectorState) {
-    let area = frame.area();
-    let item_count = selector.item_count();
-    // 2 (border) + 1 (dir) + 1 (blank) + items + 1 (blank) + 1 (footer)
-    let content_height = (6 + item_count) as u16;
-    let popup_width = 50u16.min(area.width.saturating_sub(4));
-    let popup_height = content_height.min(area.height.saturating_sub(4));
-    let x = (area.width.saturating_sub(popup_width)) / 2;
-    let y = (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
-
-    frame.render_widget(Clear, popup_area);
-
-    let mut lines = Vec::new();
-    lines.push(Line::styled(
-        format!("  {}", selector.dir.display()),
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    ));
-    lines.push(Line::from(""));
-
-    // "No mode" as first item (index 0)
-    let prefix = if selector.selected == 0 { "> " } else { "  " };
-    let style = if selector.selected == 0 {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
-    lines.push(Line::styled(format!("{prefix}No mode"), style));
-
-    // Mode entries
-    for (i, mode) in selector.modes.iter().enumerate() {
-        let idx = i + 1;
-        let prefix = if selector.selected == idx { "> " } else { "  " };
-        let style = if selector.selected == idx {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        lines.push(Line::styled(format!("{prefix}{}", mode.name), style));
-    }
-
-    // "Generate mode config" option (last item, only when show_generate is true)
-    if selector.show_generate {
-        let gen_idx = selector.item_count() - 1;
-        let prefix = if selector.selected == gen_idx {
-            "> "
-        } else {
-            "  "
-        };
-        let style = if selector.selected == gen_idx {
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Green)
-        };
-        lines.push(Line::styled(format!("{prefix}Generate mode config"), style));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::styled(
-        "  j/k: navigate  Enter: select  Esc: cancel",
-        Style::default().fg(Color::Gray),
-    ));
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Select Mode ")
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
-    let paragraph = Paragraph::new(lines).block(block);
-    frame.render_widget(paragraph, popup_area);
-}
-
 fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 56.min(area.width.saturating_sub(4));
-    let popup_height = 12u16.min(area.height.saturating_sub(4));
+    let mode_extra: u16 = if form.has_mode_field { 2 } else { 0 };
+    let popup_height = (12 + mode_extra).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -3426,70 +3442,106 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
 
     let inner_width = popup_width.saturating_sub(4) as usize;
 
-    let name_style = if form.focused == FormField::Name {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+    let focused_label = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let unfocused_label = Style::default().fg(palette.text_secondary);
+
+    let mode_style = if form.focused == FormField::Mode {
+        focused_label
     } else {
-        Style::default().fg(palette.text_secondary)
+        unfocused_label
+    };
+    let name_style = if form.focused == FormField::Name {
+        focused_label
+    } else {
+        unfocused_label
     };
     let cmd_style = if form.focused == FormField::Command {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        focused_label
     } else {
-        Style::default().fg(palette.text_secondary)
+        unfocused_label
     };
 
     let dir_display = form.dir.display().to_string();
-    let lines = vec![
+    let mut lines = vec![
         Line::styled(
             format!("  Dir: {dir_display}"),
             Style::default().fg(Color::Yellow),
         ),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  Name:    ", name_style),
-            Span::styled(
-                format!(
-                    "{:<width$}",
-                    form.name,
-                    width = inner_width.saturating_sub(11)
-                ),
-                if form.focused == FormField::Name {
-                    Style::default().fg(palette.text_primary)
-                } else {
-                    Style::default().fg(palette.text_secondary)
-                },
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Command: ", cmd_style),
-            Span::styled(
-                format!(
-                    "{:<width$}",
-                    form.command,
-                    width = inner_width.saturating_sub(11)
-                ),
-                if form.focused == FormField::Command {
-                    Style::default().fg(palette.text_primary)
-                } else {
-                    Style::default().fg(palette.text_secondary)
-                },
-            ),
-        ]),
-        Line::from(""),
-        Line::from(""),
-        Line::styled(
-            "  Tab: switch field  Enter: next/confirm  Esc: cancel",
-            Style::default().fg(palette.text_secondary),
-        ),
     ];
 
-    let title = match form.mode_config {
-        Some(ref cfg) => format!(" New Pane — {} mode ", cfg.name),
-        None => " New Pane ".to_string(),
+    // Mode field (only when modes or generate option available)
+    if form.has_mode_field {
+        let mode_name = form.mode_display_name();
+        let mode_value = if form.focused == FormField::Mode {
+            format!("\u{25c0} {mode_name} \u{25b6}")
+        } else {
+            mode_name.to_string()
+        };
+        let mode_value_style = if form.is_generate_selected() {
+            Style::default().fg(Color::Green)
+        } else if form.focused == FormField::Mode {
+            Style::default().fg(palette.text_primary)
+        } else {
+            unfocused_label
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Mode:    ", mode_style),
+            Span::styled(mode_value, mode_value_style),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("  Name:    ", name_style),
+        Span::styled(
+            format!(
+                "{:<width$}",
+                form.name,
+                width = inner_width.saturating_sub(11)
+            ),
+            if form.focused == FormField::Name {
+                Style::default().fg(palette.text_primary)
+            } else {
+                unfocused_label
+            },
+        ),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  Command: ", cmd_style),
+        Span::styled(
+            format!(
+                "{:<width$}",
+                form.command,
+                width = inner_width.saturating_sub(11)
+            ),
+            if form.focused == FormField::Command {
+                Style::default().fg(palette.text_primary)
+            } else {
+                unfocused_label
+            },
+        ),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(""));
+
+    let footer = if form.has_mode_field {
+        "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: next  Esc: cancel"
+    } else {
+        "  Tab: switch field  Enter: next/confirm  Esc: cancel"
+    };
+    lines.push(Line::styled(
+        footer,
+        Style::default().fg(palette.text_secondary),
+    ));
+
+    let title = match form.selected_mode() {
+        Some(cfg) => format!(" New Agent \u{2014} {} mode ", cfg.name),
+        None if form.is_generate_selected() => " New Agent \u{2014} generate config ".to_string(),
+        None => " New Agent ".to_string(),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3499,17 +3551,21 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 
-    // Show cursor in the active field
-    let cursor_y = match form.focused {
-        FormField::Name => popup_area.y + 3,
-        FormField::Command => popup_area.y + 5,
-    };
-    let field_text = match form.focused {
-        FormField::Name => &form.name,
-        FormField::Command => &form.command,
-    };
-    let cursor_x = popup_area.x + 12 + field_text.len() as u16;
-    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    // Show cursor in the active text field (not for Mode which uses arrow cycling)
+    if form.focused != FormField::Mode {
+        let cursor_y = match form.focused {
+            FormField::Name => popup_area.y + 3 + mode_extra,
+            FormField::Command => popup_area.y + 5 + mode_extra,
+            FormField::Mode => unreachable!(),
+        };
+        let field_text = match form.focused {
+            FormField::Name => &form.name,
+            FormField::Command => &form.command,
+            FormField::Mode => unreachable!(),
+        };
+        let cursor_x = popup_area.x + 12 + field_text.len() as u16;
+        frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    }
 }
 
 fn grid_columns(width: u16) -> usize {
@@ -4353,12 +4409,14 @@ mod tests {
             &mut ui,
         );
 
-        // Now goes to ModeSelector (with generate option) instead of NewPaneForm
-        assert_eq!(ui.mode, UiMode::ModeSelector);
-        assert!(ui.mode_selector.is_some());
-        let selector = ui.mode_selector.as_ref().unwrap();
-        assert!(selector.show_generate);
-        assert!(selector.modes.is_empty());
+        // Goes directly to unified NewPaneForm (with generate option)
+        assert_eq!(ui.mode, UiMode::NewPaneForm);
+        assert!(ui.new_pane_form.is_some());
+        let form = ui.new_pane_form.as_ref().unwrap();
+        assert!(form.show_generate);
+        assert!(form.modes.is_empty());
+        assert!(form.has_mode_field);
+        assert_eq!(form.focused, FormField::Mode);
     }
 
     #[test]
@@ -5058,7 +5116,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ModeSelectorState tests
+    // Unified NewPaneFormState tests
     // -----------------------------------------------------------------------
 
     fn make_mode(name: &str) -> ModeConfig {
@@ -5070,213 +5128,390 @@ mod tests {
     }
 
     #[test]
-    fn mode_selector_item_count() {
-        let s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![make_mode("a")], false);
-        assert_eq!(s.item_count(), 2); // "No mode" + 1 mode
-
-        let s = ModeSelectorState::new(
+    fn unified_form_mode_option_count() {
+        let f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
-            vec![make_mode("a"), make_mode("b"), make_mode("c")],
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
             false,
         );
-        assert_eq!(s.item_count(), 4);
+        assert_eq!(f.mode_option_count(), 2); // "No mode" + 1 mode
+
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            true,
+        );
+        assert_eq!(f.mode_option_count(), 2); // "No mode" + "Generate"
+
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            true,
+        );
+        assert_eq!(f.mode_option_count(), 3); // "No mode" + 1 mode + "Generate"
     }
 
     #[test]
-    fn mode_selector_navigation_bounds() {
-        let mut s = ModeSelectorState::new(
+    fn unified_form_mode_cycling() {
+        let mut f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
             vec![make_mode("alpha"), make_mode("beta")],
             false,
         );
-        assert_eq!(s.selected, 0);
+        assert_eq!(f.mode_selected, 0);
 
-        // Can't go above 0
-        s.select_previous();
-        assert_eq!(s.selected, 0);
+        // Can't go below 0
+        f.select_previous_mode();
+        assert_eq!(f.mode_selected, 0);
 
-        s.select_next();
-        assert_eq!(s.selected, 1);
-        s.select_next();
-        assert_eq!(s.selected, 2);
+        f.select_next_mode();
+        assert_eq!(f.mode_selected, 1);
+        f.select_next_mode();
+        assert_eq!(f.mode_selected, 2);
 
-        // Can't go past last item
-        s.select_next();
-        assert_eq!(s.selected, 2);
+        // Can't go past last
+        f.select_next_mode();
+        assert_eq!(f.mode_selected, 2);
     }
 
     #[test]
-    fn mode_selector_selected_mode() {
-        let modes = vec![make_mode("k8s"), make_mode("rust-tdd")];
-        let mut s = ModeSelectorState::new(PathBuf::from("/tmp"), modes, false);
-
-        // Index 0 = "No mode" → None
-        assert!(s.selected_mode().is_none());
-
-        s.selected = 1;
-        assert_eq!(s.selected_mode().unwrap().name, "k8s");
-
-        s.selected = 2;
-        assert_eq!(s.selected_mode().unwrap().name, "rust-tdd");
-    }
-
-    #[test]
-    fn mode_selector_key_navigation() {
-        let mut ui = default_ui();
-        ui.mode = UiMode::ModeSelector;
-        ui.mode_selector = Some(ModeSelectorState::new(
+    fn unified_form_selected_mode() {
+        let mut f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("k8s"), make_mode("rust-tdd")],
+            false,
+        );
+
+        // Index 0 = "No mode"
+        assert!(f.selected_mode().is_none());
+        assert_eq!(f.mode_display_name(), "No mode");
+
+        f.mode_selected = 1;
+        assert_eq!(f.selected_mode().unwrap().name, "k8s");
+        assert_eq!(f.mode_display_name(), "k8s");
+
+        f.mode_selected = 2;
+        assert_eq!(f.selected_mode().unwrap().name, "rust-tdd");
+    }
+
+    #[test]
+    fn unified_form_tab_cycles_with_mode() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            false,
+        );
+        assert_eq!(f.focused, FormField::Mode);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Name);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Command);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Mode); // wraps
+
+        // Reverse
+        f.focused = f.prev_field();
+        assert_eq!(f.focused, FormField::Command);
+    }
+
+    #[test]
+    fn unified_form_tab_cycles_without_mode() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            false,
+        );
+        assert!(!f.has_mode_field);
+        assert_eq!(f.focused, FormField::Name);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Command);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Name); // wraps, skips Mode
+
+        f.focused = f.prev_field();
+        assert_eq!(f.focused, FormField::Command);
+    }
+
+    #[test]
+    fn unified_form_initial_focus_with_modes() {
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            false,
+        );
+        assert_eq!(f.focused, FormField::Mode);
+    }
+
+    #[test]
+    fn unified_form_initial_focus_without_modes() {
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            false,
+        );
+        assert_eq!(f.focused, FormField::Name);
+    }
+
+    #[test]
+    fn unified_form_arrow_cycles_mode() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
             vec![make_mode("a"), make_mode("b")],
             false,
         ));
 
-        // j moves down
-        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
-        handle_mode_selector_key(key, &mut ui);
-        assert_eq!(ui.mode_selector.as_ref().unwrap().selected, 1);
+        // Right arrow cycles forward
+        let key = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().mode_selected, 1);
 
-        // k moves up
-        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
-        handle_mode_selector_key(key, &mut ui);
-        assert_eq!(ui.mode_selector.as_ref().unwrap().selected, 0);
+        // Left arrow cycles back
+        let key = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().mode_selected, 0);
     }
 
     #[test]
-    fn mode_selector_enter_new_agent_pane() {
+    fn unified_form_enter_navigates_fields() {
         let mut ui = default_ui();
-        ui.mode = UiMode::ModeSelector;
-        ui.mode_selector = Some(ModeSelectorState::new(
-            PathBuf::from("/tmp/myproject"),
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            "agent".to_string(),
+            "claude".to_string(),
             vec![make_mode("a")],
             false,
         ));
 
+        // Enter on Mode → Name
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        handle_mode_selector_key(key, &mut ui);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Name);
 
-        assert_eq!(ui.mode, UiMode::NewPaneForm);
-        assert!(ui.mode_selector.is_none());
-        let form = ui.new_pane_form.as_ref().unwrap();
-        assert_eq!(form.dir, PathBuf::from("/tmp/myproject"));
-        assert_eq!(form.name, "myproject");
-        assert!(form.mode_config.is_none());
+        // Enter on Name → Command
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().focused,
+            FormField::Command
+        );
+
+        // Enter on Command → submit
+        let result = handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.new_pane_form.is_none());
+        assert!(matches!(result, KeyResult::NewPane(_)));
     }
 
     #[test]
-    fn mode_selector_enter_on_mode_returns_activate() {
+    fn unified_form_submit_with_mode() {
         let mut ui = default_ui();
-        ui.mode = UiMode::ModeSelector;
-        ui.mode_selector = Some(ModeSelectorState::new(
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
             PathBuf::from("/tmp/proj"),
+            "agent".to_string(),
+            "claude".to_string(),
             vec![make_mode("k8s-ops")],
             false,
         ));
 
-        // Navigate to mode entry
-        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
-        handle_mode_selector_key(key, &mut ui);
+        // Select mode "k8s-ops" (index 1)
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui);
 
-        // Select it
-        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        let result = handle_mode_selector_key(key, &mut ui);
+        // Navigate to Command field and submit
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        handle_new_pane_form_key(enter, &mut ui); // Name → Command
+        let result = handle_new_pane_form_key(enter, &mut ui); // submit
 
-        assert_eq!(ui.mode, UiMode::NewPaneForm);
-        assert!(ui.mode_selector.is_none());
-        assert!(matches!(result, KeyResult::Continue));
-        let form = ui.new_pane_form.as_ref().unwrap();
-        assert_eq!(form.dir, PathBuf::from("/tmp/proj"));
-        assert!(
-            form.mode_config
-                .as_ref()
-                .is_some_and(|c| c.name == "k8s-ops")
-        );
+        match result {
+            KeyResult::NewPane(req) => {
+                assert_eq!(req.dir, PathBuf::from("/tmp/proj"));
+                assert!(
+                    req.mode_config
+                        .as_ref()
+                        .is_some_and(|c| c.name == "k8s-ops")
+                );
+            }
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
     }
 
     #[test]
-    fn mode_selector_esc_cancels() {
+    fn unified_form_submit_no_mode() {
         let mut ui = default_ui();
-        ui.mode = UiMode::ModeSelector;
-        ui.mode_selector = Some(ModeSelectorState::new(
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
             PathBuf::from("/tmp"),
+            "agent".to_string(),
+            "claude".to_string(),
             vec![make_mode("a")],
             false,
         ));
 
-        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        handle_mode_selector_key(key, &mut ui);
+        // Stay on "No mode" (index 0), navigate through fields
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        handle_new_pane_form_key(enter, &mut ui); // Name → Command
+        let result = handle_new_pane_form_key(enter, &mut ui);
 
-        assert_eq!(ui.mode, UiMode::Normal);
-        assert!(ui.mode_selector.is_none());
+        match result {
+            KeyResult::NewPane(req) => {
+                assert!(req.mode_config.is_none());
+            }
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
     }
 
     #[test]
-    fn mode_selector_item_count_with_generate() {
-        // No modes + generate option = 2 items ("No mode" + "Generate")
-        let s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![], true);
-        assert_eq!(s.item_count(), 2);
-
-        // Modes + generate = modes + 2
-        let s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![make_mode("a")], true);
-        assert_eq!(s.item_count(), 3);
-    }
-
-    #[test]
-    fn mode_selector_generate_is_last_item() {
-        let mut s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![], true);
-        assert!(!s.is_generate_selected()); // index 0 = "No mode"
-
-        s.selected = 1; // last item = generate
-        assert!(s.is_generate_selected());
-        assert!(s.selected_mode().is_none()); // generate returns None for mode
-    }
-
-    #[test]
-    fn mode_selector_no_generate_when_config_exists() {
-        let s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![make_mode("a")], false);
-        assert!(!s.is_generate_selected());
-        assert_eq!(s.item_count(), 2); // no extra item
-    }
-
-    #[test]
-    fn mode_selector_enter_on_generate_returns_generate() {
+    fn unified_form_generate_submit() {
         let mut ui = default_ui();
-        ui.mode = UiMode::ModeSelector;
-        ui.mode_selector = Some(ModeSelectorState::new(
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
             PathBuf::from("/tmp/proj"),
+            String::new(),
+            String::new(),
             vec![],
             true,
         ));
 
-        // Navigate to generate option (index 1)
-        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
-        handle_mode_selector_key(key, &mut ui);
+        // Navigate to "Generate config" (index 1)
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui);
+        assert!(ui.new_pane_form.as_ref().unwrap().is_generate_selected());
 
-        // Select it
-        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        let result = handle_mode_selector_key(key, &mut ui);
+        // Navigate through fields to Command and submit
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        handle_new_pane_form_key(enter, &mut ui); // Name → Command
+        let result = handle_new_pane_form_key(enter, &mut ui);
 
         assert_eq!(ui.mode, UiMode::Normal);
-        assert!(ui.mode_selector.is_none());
         assert!(
             matches!(result, KeyResult::GenerateModeConfig { ref dir } if dir == Path::new("/tmp/proj"))
         );
     }
 
     #[test]
-    fn mode_selector_generate_navigation() {
-        let mut s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![], true);
-        assert_eq!(s.selected, 0); // starts at "No mode"
-        assert_eq!(s.item_count(), 2);
+    fn unified_form_esc_cancels() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            false,
+        ));
 
-        s.select_next();
-        assert_eq!(s.selected, 1); // "Generate mode config"
-        assert!(s.is_generate_selected());
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
 
-        s.select_next();
-        assert_eq!(s.selected, 1); // can't go past last
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.new_pane_form.is_none());
+    }
 
-        s.select_previous();
-        assert_eq!(s.selected, 0); // back to "No mode"
-        assert!(!s.is_generate_selected());
+    #[test]
+    fn unified_form_typing_in_text_fields() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            false,
+        ));
+
+        // Move to Name field
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui);
+
+        // Type into Name field
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().name, "x");
+
+        // Backspace
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().name, "");
+    }
+
+    #[test]
+    fn unified_form_h_l_types_chars_in_name() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            false,
+        ));
+
+        // Move to Name field
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui);
+
+        // h and l should type characters, not cycle modes
+        let key_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        handle_new_pane_form_key(key_h, &mut ui);
+        let key_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        handle_new_pane_form_key(key_l, &mut ui);
+
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().name, "hl");
+    }
+
+    #[test]
+    fn unified_form_generate_navigation() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            true,
+        );
+        assert_eq!(f.mode_selected, 0);
+        assert_eq!(f.mode_option_count(), 2);
+
+        f.select_next_mode();
+        assert_eq!(f.mode_selected, 1);
+        assert!(f.is_generate_selected());
+        assert_eq!(f.mode_display_name(), "Generate config");
+
+        f.select_next_mode();
+        assert_eq!(f.mode_selected, 1); // can't go past last
+
+        f.select_previous_mode();
+        assert_eq!(f.mode_selected, 0);
+        assert!(!f.is_generate_selected());
     }
 }

@@ -180,6 +180,8 @@ impl TabManager {
     }
 
     /// Collect all managed pane IDs across all mode tabs.
+    /// Returns side pane IDs managed by mode tabs (excludes agent panes,
+    /// which should still render on the dashboard).
     pub fn all_managed_pane_ids(&self) -> Vec<String> {
         let mut ids = Vec::new();
         for tab in &self.tabs {
