@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.16.0] - 2026-04-06
+
+### Added
+
+- **Project Documentation Site**
+  A dedicated documentation site built with Docusaurus v3 replaces the monolithic README as the primary resource for users. Previously, all guides, configuration details, and feature overviews lived in the README, making it increasingly difficult to navigate as the project grew.
+  The site covers the core user journey: installation, getting started, configuration, keyboard shortcuts, session management, and licensing. A custom homepage provides a polished entry point with feature highlights and quick-start links. The docs directory in the repository serves as the single source of truth — update a Markdown file and the site rebuilds automatically.
+  Deployment uses a multi-stage Docker build (Node.js builder + nginx) published to ghcr.io, with a Helm chart for Kubernetes hosting monitored by Argo CD. The CI/CD pipeline builds and publishes the docs image as part of the release workflow on version tags.
+  Visit the documentation at [agent-deck.devopstoolkit.ai](https://agent-deck.devopstoolkit.ai).
+- **Star Repo Reminder Dialog**
+  A non-intrusive dialog now appears every 10 launches encouraging you to star the GitHub repository. The dialog offers three options: press `s` to open the repo in your browser and dismiss permanently, `l` or `Esc` to snooze (reminder returns after 10 more launches), or `d` to permanently hide the dialog.
+  State is persisted in `~/.config/dot-agent-deck/star-prompt-state.json` so your preference survives across sessions.
+- **Arrow Key Navigation Focuses Panes**
+  Arrow keys and vim-style navigation (`j`/`k`/`h`/`l`) on the dashboard now focus the selected session's pane, matching the behavior of the 1-9 number key shortcuts. Previously, arrow keys only moved the card highlight without switching the pane view.
+
+### Fixed
+
+- **"Needs Input" Status Clears After Tool Completion**
+  Dashboard session cards no longer remain stuck on "Needs Input" after a permission-gated tool finishes executing. Previously, approving a tool (e.g., a long-running `gcloud` command) left the status as "Needs Input" indefinitely because the `PostToolUse` event did not update the session status. The status now transitions to "Thinking" once the tool completes, accurately reflecting that the agent is processing the result.
+
+
+
 ## [0.15.0] - 2026-04-05
 
 ### Added
