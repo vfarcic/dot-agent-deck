@@ -186,6 +186,11 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     });
 
     let config = dot_agent_deck::config::DashboardConfig::load();
+
+    // Auto-install hooks for detected agents (silent, best-effort)
+    hooks_manage::auto_install();
+    dot_agent_deck::opencode_manage::auto_install();
+
     let effective_theme = cli_theme.unwrap_or(config.theme);
     // Detect terminal theme *before* raw mode / alternate screen takes over.
     let palette = dot_agent_deck::theme::resolve_palette(effective_theme);
