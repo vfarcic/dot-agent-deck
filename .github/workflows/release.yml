@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: release
@@ -147,3 +148,65 @@ jobs:
         run: task scoop-publish VERSION=v${{ needs.prepare.outputs.version }}
         env:
           SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+
+  docs:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install dependencies
+        working-directory: site
+        run: npm ci
+
+      - name: Build site
+        working-directory: site
+        run: npm run build
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: site/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/vfarcic/dot-agent-deck-docs:v${{ needs.prepare.outputs.version }}
+            ghcr.io/vfarcic/dot-agent-deck-docs:latest
+
+      - name: Update Helm chart
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq -i ".version = \"${VERSION}\"" site/helm/Chart.yaml
+          yq -i ".appVersion = \"v${VERSION}\"" site/helm/Chart.yaml
+          yq -i ".image.tag = \"v${VERSION}\"" site/helm/values.yaml
+
+      - name: Commit chart changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git stash
+          git checkout main
+          git stash pop || true
+          git add site/helm/Chart.yaml site/helm/values.yaml
+          git diff --cached --quiet || git commit -m "chore: update docs chart to v${{ needs.prepare.outputs.version }} [skip ci]"
+          git push origin main

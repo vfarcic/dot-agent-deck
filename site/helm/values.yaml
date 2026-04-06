@@ -13,7 +13,7 @@ ingress:
   enabled: true
   className: ""
   annotations: {}
-  host: dot-agent-deck.example.com
+  host: agent-deck.devopstoolkit.ai
   tls: []
 
 resources:

@@ -6,7 +6,7 @@ const config = {
   tagline: 'A terminal dashboard for running multiple AI coding agents in parallel',
   favicon: 'img/favicon.ico',
 
-  url: 'https://dot-agent-deck.example.com',
+  url: 'https://agent-deck.devopstoolkit.ai',
   baseUrl: '/',
 
   organizationName: 'vfarcic',

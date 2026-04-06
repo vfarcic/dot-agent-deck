@@ -32,7 +32,8 @@ Create a documentation site generated from a `docs/` directory in this repo and 
 - **Site generator**: Docusaurus v3 (chosen for unified look across custom homepage and docs)
 - **Hosting**: Kubernetes cluster via Helm chart, monitored by Argo CD
 - **Container**: Multi-stage Docker build (Node.js builder + nginx), published to ghcr.io
-- **CI/CD**: GitHub Actions builds image, pushes to GHCR, auto-updates Helm chart version
+- **CI/CD**: Docs image built and chart updated as part of release workflow (on `v*` tags)
+- **URL**: https://agent-deck.devopstoolkit.ai
 
 ## Success Criteria
 
