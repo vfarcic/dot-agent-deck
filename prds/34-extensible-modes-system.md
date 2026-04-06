@@ -219,7 +219,7 @@ New tab abstraction layered on top of the existing UI:
 - [x] Tab close — close mode tab tears down entire workspace (agent + all side panes), switch to dashboard
 - [x] Reactive event routing per tab — route bash commands to the correct tab's ModeManager based on agent pane ownership
 - [x] Update help overlay — reflect tab navigation keybindings and unified new-agent form
-- [ ] Update docs — `docs/keyboard-shortcuts.md` (tab nav, corrected `Ctrl+d`, mode selector), `docs/configuration.md` (`.dot-agent-deck.toml` project config), `docs/getting-started.md` (modes workflow), new `docs/workspace-modes.md` (modes, tabs, config examples)
+- [x] Update docs — `docs/keyboard-shortcuts.md` (tab nav, corrected `Ctrl+d`, mode selector), `docs/configuration.md` (`.dot-agent-deck.toml` project config), `docs/getting-started.md` (modes workflow), new `docs/workspace-modes.md` (modes, tabs, config examples)
 - [x] Unified mode form flow — mode selector and name/command form merged into single modal with inline mode cycling; "No mode" default; `shell_init` removed from config
 - [x] Tab bar styling — distinct `tab_bar_bg` background, improved contrast, dynamic tab labels from user-chosen name
 - [x] Navigation redesign — `Up/Down` linear card cycling, `Ctrl+d` as universal command mode toggle
