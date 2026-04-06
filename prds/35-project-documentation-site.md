@@ -30,8 +30,9 @@ Create a documentation site generated from a `docs/` directory in this repo and 
 
 - **Content source**: `docs/` directory in this repository
 - **Site generator**: Docusaurus v3 (chosen for unified look across custom homepage and docs)
-- **Hosting**: Kubernetes cluster
-- **CI/CD**: Automated build and deploy on changes to `docs/`
+- **Hosting**: Kubernetes cluster via Helm chart, monitored by Argo CD
+- **Container**: Multi-stage Docker build (Node.js builder + nginx), published to ghcr.io
+- **CI/CD**: GitHub Actions builds image, pushes to GHCR, auto-updates Helm chart version
 
 ## Success Criteria
 
@@ -45,7 +46,7 @@ Create a documentation site generated from a `docs/` directory in this repo and 
 - [x] `docs/` directory created with initial content structure
 - [x] Static site generator chosen and configured (Docusaurus v3)
 - [x] Core documentation pages written (install, usage, configuration, keybindings)
-- [ ] Kubernetes deployment manifests created
+- [x] Kubernetes deployment manifests created (Helm chart + Dockerfile)
 - [x] CI/CD pipeline for automated build and deploy on docs changes
 - [ ] Site live and accessible
 
@@ -54,7 +55,9 @@ Create a documentation site generated from a `docs/` directory in this repo and 
 - `docs/` — Documentation content source (7 Markdown files)
 - `site/` — Docusaurus v3 project with custom homepage
 - `site/docusaurus.config.js` — Site configuration (ingests `../docs`)
-- `.github/workflows/docs.yml` — CI/CD pipeline for docs build
+- `site/Dockerfile` — Multi-stage Docker build (Node.js + nginx)
+- `site/helm/` — Helm chart for Kubernetes deployment
+- `.github/workflows/docs.yml` — CI/CD pipeline: build, push image, update chart
 
 ## Risks
 
