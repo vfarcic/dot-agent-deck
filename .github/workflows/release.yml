@@ -157,20 +157,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: site/package-lock.json
-
-      - name: Install dependencies
-        working-directory: site
-        run: npm ci
-
-      - name: Build site
-        working-directory: site
-        run: npm run build
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -194,7 +180,7 @@ jobs:
       - name: Update Helm chart
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.52.5/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
           yq -i ".version = \"${VERSION}\"" site/helm/Chart.yaml
           yq -i ".appVersion = \"v${VERSION}\"" site/helm/Chart.yaml
