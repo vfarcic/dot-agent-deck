@@ -13,12 +13,7 @@ const config = {
   projectName: 'dot-agent-deck',
 
   onBrokenLinks: 'throw',
-
-  markdown: {
-    hooks: {
-      onBrokenMarkdownLinks: 'warn',
-    },
-  },
+  onBrokenMarkdownLinks: 'warn',
 
   i18n: {
     defaultLocale: 'en',

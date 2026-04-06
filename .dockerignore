@@ -11,6 +11,5 @@ scripts/
 tests/
 examples/
 dist/
-*.lock
 Cargo.toml
 Cargo.lock
