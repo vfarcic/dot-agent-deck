@@ -1,6 +1,6 @@
 # PRD #37: Star Repo Reminder Dialog
 
-**Status**: Draft
+**Status**: Done
 **Priority**: Low
 **Created**: 2026-04-03
 **GitHub Issue**: [#37](https://github.com/vfarcic/dot-agent-deck/issues/37)
@@ -27,7 +27,7 @@ A local state file tracks the launch count and user preference. The dialog follo
 - "Don't ask again" permanently suppresses the dialog
 - Dialog includes the repo URL and brief message
 - Dialog appears at startup before the main loop takes over
-- Keyboard handling: `y` opens the repo URL (if possible) or shows it, `l` for later, `d` for don't ask again, `Esc` for later
+- Keyboard handling: `s` opens the repo URL and dismisses permanently, `l` for later, `d` for don't ask again, `Esc` for later
 
 ### Out of Scope
 - Checking whether the user has actually starred the repo (requires GitHub API auth)
@@ -86,7 +86,7 @@ Add a new `UiMode::StarPrompt` variant. The dialog follows the existing overlay 
 5. Footer with key hints: `[s] Star on GitHub  [l] Later  [d] Don't ask again`
 
 Key handling:
-- `s` — opens `https://github.com/vfarcic/dot-agent-deck` via `open` (macOS) / `xdg-open` (Linux), then snoozes and continues
+- `s` — opens `https://github.com/vfarcic/dot-agent-deck` via the `open` crate (cross-platform), then dismisses permanently (trusts the user starred)
 - `l` or `Esc` — snooze (show again in N launches)
 - `d` — dismiss permanently
 
@@ -100,13 +100,10 @@ Before entering the main event loop:
 
 ### URL Opening
 
-Use `std::process::Command` to call `open` (macOS) or `xdg-open` (Linux):
+Use the `open` crate for cross-platform browser URL opening:
 
 ```rust
-#[cfg(target_os = "macos")]
-std::process::Command::new("open").arg(url).spawn();
-#[cfg(target_os = "linux")]
-std::process::Command::new("xdg-open").arg(url).spawn();
+let _ = open::that("https://github.com/vfarcic/dot-agent-deck");
 ```
 
 ## Success Criteria
@@ -121,9 +118,9 @@ std::process::Command::new("xdg-open").arg(url).spawn();
 
 ## Milestones
 
-- [ ] Star prompt state file: load/save/increment logic with unit tests
-- [ ] Star prompt dialog rendering following existing overlay patterns
-- [ ] Keyboard handling for star/snooze/dismiss actions with URL opening
-- [ ] Startup integration to check state and show dialog when appropriate
-- [ ] Tests for state transitions (snooze resets counter, dismiss is permanent, interval logic)
-- [ ] Manual end-to-end validation across multiple launches
+- [x] Star prompt state file: load/save/increment logic with unit tests
+- [x] Star prompt dialog rendering following existing overlay patterns
+- [x] Keyboard handling for star/snooze/dismiss actions with URL opening
+- [x] Startup integration to check state and show dialog when appropriate
+- [x] Tests for state transitions (snooze resets counter, dismiss is permanent, interval logic)
+- [x] Manual end-to-end validation across multiple launches

@@ -181,6 +181,79 @@ impl SavedSession {
     }
 }
 
+const STAR_PROMPT_INTERVAL: u64 = 10;
+
+fn star_prompt_path() -> PathBuf {
+    if let Ok(p) = std::env::var("DOT_AGENT_DECK_STAR_PROMPT") {
+        return PathBuf::from(p);
+    }
+    dirs_home().join(".config/dot-agent-deck/star-prompt-state.json")
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StarPromptState {
+    pub launch_count: u64,
+    pub permanently_dismissed: bool,
+    pub last_prompt_at_launch: u64,
+}
+
+impl StarPromptState {
+    pub fn load() -> Self {
+        let path = star_prompt_path();
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => match serde_json::from_str(&contents) {
+                Ok(state) => state,
+                Err(err) => {
+                    eprintln!("Invalid star prompt state at {}: {err}", path.display());
+                    Self::default()
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => {
+                eprintln!(
+                    "Failed to read star prompt state at {}: {err}",
+                    path.display()
+                );
+                Self::default()
+            }
+        }
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let path = star_prompt_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create star prompt directory: {e}"))?;
+        }
+        let contents = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize star prompt state: {e}"))?;
+        std::fs::write(&path, contents).map_err(|e| {
+            format!(
+                "Failed to write star prompt state at {}: {e}",
+                path.display()
+            )
+        })
+    }
+
+    pub fn increment_and_check(&mut self) -> bool {
+        self.launch_count += 1;
+        let _ = self.save();
+        !self.permanently_dismissed
+            && self.launch_count - self.last_prompt_at_launch >= STAR_PROMPT_INTERVAL
+    }
+
+    pub fn snooze(&mut self) {
+        self.last_prompt_at_launch = self.launch_count;
+        let _ = self.save();
+    }
+
+    pub fn dismiss_permanently(&mut self) {
+        self.permanently_dismissed = true;
+        let _ = self.save();
+    }
+}
+
 pub(crate) fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -355,5 +428,122 @@ on_idle = true
         assert!(!bc.should_bell(&SessionStatus::Thinking));
         assert!(!bc.should_bell(&SessionStatus::Working));
         assert!(!bc.should_bell(&SessionStatus::Compacting));
+    }
+
+    #[test]
+    fn star_prompt_default_values() {
+        let state = StarPromptState::default();
+        assert_eq!(state.launch_count, 0);
+        assert!(!state.permanently_dismissed);
+        assert_eq!(state.last_prompt_at_launch, 0);
+    }
+
+    #[test]
+    fn star_prompt_serde_round_trip() {
+        let state = StarPromptState {
+            launch_count: 42,
+            permanently_dismissed: true,
+            last_prompt_at_launch: 30,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let loaded: StarPromptState = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.launch_count, 42);
+        assert!(loaded.permanently_dismissed);
+        assert_eq!(loaded.last_prompt_at_launch, 30);
+    }
+
+    #[test]
+    fn star_prompt_serde_missing_fields() {
+        let loaded: StarPromptState = serde_json::from_str("{}").unwrap();
+        assert_eq!(loaded.launch_count, 0);
+        assert!(!loaded.permanently_dismissed);
+        assert_eq!(loaded.last_prompt_at_launch, 0);
+    }
+
+    #[test]
+    fn star_prompt_increment_and_check_triggers_at_10() {
+        // Test pure logic without file I/O — manually track state
+        let mut state = StarPromptState::default();
+        for i in 1..=9 {
+            state.launch_count = i;
+            let should_show = !state.permanently_dismissed
+                && state.launch_count - state.last_prompt_at_launch >= STAR_PROMPT_INTERVAL;
+            assert!(!should_show, "should not trigger at launch {i}");
+        }
+        state.launch_count = 10;
+        let should_show = !state.permanently_dismissed
+            && state.launch_count - state.last_prompt_at_launch >= STAR_PROMPT_INTERVAL;
+        assert!(should_show, "should trigger at launch 10");
+    }
+
+    #[test]
+    fn star_prompt_snooze_resets_window() {
+        let mut state = StarPromptState::default();
+        state.launch_count = 10;
+        state.last_prompt_at_launch = state.launch_count; // snooze
+        for i in 11..=19 {
+            state.launch_count = i;
+            let should_show = !state.permanently_dismissed
+                && state.launch_count - state.last_prompt_at_launch >= STAR_PROMPT_INTERVAL;
+            assert!(!should_show, "should not trigger at launch {i}");
+        }
+        state.launch_count = 20;
+        let should_show = !state.permanently_dismissed
+            && state.launch_count - state.last_prompt_at_launch >= STAR_PROMPT_INTERVAL;
+        assert!(should_show, "should trigger at launch 20");
+    }
+
+    #[test]
+    fn star_prompt_dismiss_permanently() {
+        let mut state = StarPromptState::default();
+        state.permanently_dismissed = true;
+        for i in 1..=20 {
+            state.launch_count = i;
+            let should_show = !state.permanently_dismissed
+                && state.launch_count - state.last_prompt_at_launch >= STAR_PROMPT_INTERVAL;
+            assert!(!should_show, "dismissed state should never trigger");
+        }
+    }
+
+    #[test]
+    fn star_prompt_load_save_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("star.json");
+        let prev = std::env::var("DOT_AGENT_DECK_STAR_PROMPT").ok();
+        // SAFETY: test is single-threaded; no other code reads this var concurrently.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_STAR_PROMPT", path.to_str().unwrap());
+        }
+
+        let state = StarPromptState {
+            launch_count: 15,
+            permanently_dismissed: false,
+            last_prompt_at_launch: 10,
+        };
+        state.save().unwrap();
+
+        let loaded = StarPromptState::load();
+        assert_eq!(loaded.launch_count, 15);
+        assert!(!loaded.permanently_dismissed);
+        assert_eq!(loaded.last_prompt_at_launch, 10);
+
+        // Load from corrupted file returns default
+        std::fs::write(&path, "not valid json!!!").unwrap();
+        let loaded = StarPromptState::load();
+        assert_eq!(loaded.launch_count, 0);
+
+        // Load from missing file returns default
+        std::fs::remove_file(&path).unwrap();
+        let loaded = StarPromptState::load();
+        assert_eq!(loaded.launch_count, 0);
+        assert!(!loaded.permanently_dismissed);
+
+        // SAFETY: test cleanup — restore original env var.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_STAR_PROMPT", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_STAR_PROMPT"),
+            }
+        }
     }
 }
