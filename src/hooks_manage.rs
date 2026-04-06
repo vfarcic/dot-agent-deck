@@ -185,6 +185,50 @@ fn rule_contains_dot_agent_deck(rule: &Value) -> bool {
     new_format || old_format
 }
 
+/// Silently install hooks if Claude Code is detected.
+/// Intended for dashboard startup — never prints to stdout.
+pub fn auto_install() {
+    let path = settings_path();
+    if path.parent().is_none_or(|p| !p.exists()) {
+        return;
+    }
+
+    let binary_path = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "dot-agent-deck".into());
+
+    let mut settings = read_settings(&path);
+    let (installed, _skipped) = install_impl(&mut settings, &binary_path);
+
+    if installed.is_empty() {
+        return;
+    }
+
+    if let Err(e) = write_settings(&path, &settings) {
+        tracing::warn!("auto-install: failed to write Claude Code hooks: {e}");
+        return;
+    }
+
+    tracing::info!("auto-installed Claude Code hooks: {}", installed.join(", "));
+}
+
+/// Auto-install to a custom settings path (for testing).
+pub fn auto_install_to(path: &PathBuf) {
+    if path.parent().is_none_or(|p| !p.exists()) {
+        return;
+    }
+
+    let binary_path = "dot-agent-deck".to_string();
+    let mut settings = read_settings(path);
+    let (installed, _skipped) = install_impl(&mut settings, &binary_path);
+
+    if installed.is_empty() {
+        return;
+    }
+
+    write_settings(path, &settings).expect("failed to write settings");
+}
+
 pub fn install() {
     let binary_path = std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -463,5 +507,47 @@ mod tests {
     fn uninstall_noop_when_no_file() {
         let (_dir, path) = temp_settings();
         uninstall_from(&path); // Should not panic
+    }
+
+    #[test]
+    fn auto_install_skips_when_no_claude_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // Point to a settings.json inside a non-existent .claude dir
+        let path = dir.path().join("nonexistent").join("settings.json");
+        auto_install_to(&path);
+        assert!(
+            !path.exists(),
+            "Should not create settings when dir missing"
+        );
+    }
+
+    #[test]
+    fn auto_install_installs_when_claude_dir_exists() {
+        let (_dir, path) = temp_settings();
+        // Parent dir exists (created by temp_settings), so auto_install should work
+        auto_install_to(&path);
+        assert!(path.exists(), "Should create settings when dir exists");
+
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let hooks = settings["hooks"].as_object().unwrap();
+        for hook_type in HOOK_TYPES {
+            let rules = hooks[*hook_type].as_array().unwrap();
+            assert_eq!(rules.len(), 1, "Expected 1 rule for {hook_type}");
+        }
+    }
+
+    #[test]
+    fn auto_install_is_idempotent() {
+        let (_dir, path) = temp_settings();
+        auto_install_to(&path);
+        auto_install_to(&path);
+
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for hook_type in HOOK_TYPES {
+            let rules = settings["hooks"][*hook_type].as_array().unwrap();
+            assert_eq!(rules.len(), 1, "Duplicate rule for {hook_type}");
+        }
     }
 }

@@ -1,6 +1,6 @@
 # PRD #50: Auto-Install Hooks on CLI Startup
 
-**Status**: Draft
+**Status**: Complete
 **Priority**: High
 **Created**: 2026-04-06
 
@@ -45,11 +45,11 @@ dot-agent-deck                                  # hooks auto-installed
 
 ## Milestones
 
-- [ ] Auto-detect installed agents and install hooks on startup
-- [ ] Errors during auto-install are logged without blocking startup
-- [ ] Existing `hooks install`/`uninstall` commands still work as before
-- [ ] Documentation updated (getting-started.md quickstart and hook setup sections)
-- [ ] Changelog fragment created
+- [x] Auto-detect installed agents and install hooks on startup
+- [x] Errors during auto-install are logged without blocking startup
+- [x] Existing `hooks install`/`uninstall` commands still work as before
+- [x] Documentation updated (getting-started.md quickstart and hook setup sections)
+- [x] Changelog fragment created
 
 ## Success Criteria
 
