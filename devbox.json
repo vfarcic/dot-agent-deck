@@ -3,7 +3,8 @@
   "packages": [
     "gh@2.83.1",
     "vals@0.43.7",
-    "go-task@3.48.0"
+    "go-task@3.48.0",
+    "nodejs@20"
   ],
   "shell": {
     "init_hook": [

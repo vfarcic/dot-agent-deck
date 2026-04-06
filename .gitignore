@@ -1,1 +1,6 @@
 /target
+
+# Documentation site
+site/node_modules/
+site/build/
+site/.docusaurus/

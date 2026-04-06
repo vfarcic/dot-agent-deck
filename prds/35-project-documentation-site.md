@@ -1,6 +1,6 @@
 # PRD #35: Project Documentation Site
 
-**Status**: Draft
+**Status**: In Progress
 **Priority**: Low
 **Created**: 2026-04-03
 **GitHub Issue**: [#35](https://github.com/vfarcic/dot-agent-deck/issues/35)
@@ -29,7 +29,7 @@ Create a documentation site generated from a `docs/` directory in this repo and 
 ## Technical Approach
 
 - **Content source**: `docs/` directory in this repository
-- **Site generator**: TBD — evaluate options during implementation
+- **Site generator**: Docusaurus v3 (chosen for unified look across custom homepage and docs)
 - **Hosting**: Kubernetes cluster
 - **CI/CD**: Automated build and deploy on changes to `docs/`
 
@@ -42,17 +42,19 @@ Create a documentation site generated from a `docs/` directory in this repo and 
 
 ## Milestones
 
-- [ ] `docs/` directory created with initial content structure
-- [ ] Static site generator chosen and configured
-- [ ] Core documentation pages written (install, usage, configuration, keybindings)
+- [x] `docs/` directory created with initial content structure
+- [x] Static site generator chosen and configured (Docusaurus v3)
+- [x] Core documentation pages written (install, usage, configuration, keybindings)
 - [ ] Kubernetes deployment manifests created
-- [ ] CI/CD pipeline for automated build and deploy on docs changes
+- [x] CI/CD pipeline for automated build and deploy on docs changes
 - [ ] Site live and accessible
 
 ## Key Files
 
-- `docs/` — Documentation content source
-- TBD — Site generator config, Kubernetes manifests, CI pipeline
+- `docs/` — Documentation content source (7 Markdown files)
+- `site/` — Docusaurus v3 project with custom homepage
+- `site/docusaurus.config.js` — Site configuration (ingests `../docs`)
+- `.github/workflows/docs.yml` — CI/CD pipeline for docs build
 
 ## Risks
 

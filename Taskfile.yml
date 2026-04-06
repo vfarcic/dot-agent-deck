@@ -1,6 +1,30 @@
 version: "3"
 
 tasks:
+  docs-install:
+    desc: Install documentation site dependencies
+    dir: site
+    cmds:
+      - npm install
+
+  docs-dev:
+    desc: Start documentation site in dev mode with live reload
+    dir: site
+    cmds:
+      - npm start
+
+  docs-build:
+    desc: Build documentation site for production
+    dir: site
+    cmds:
+      - npm run build
+
+  docs-serve:
+    desc: Serve the built documentation site locally
+    dir: site
+    cmds:
+      - npm run serve
+
   checksums:
     desc: Generate SHA256 checksums for release binaries
     dir: dist
