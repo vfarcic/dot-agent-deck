@@ -1,0 +1,44 @@
+.heroBanner {
+  padding: 4rem 0;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.brandName {
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  opacity: 0.8;
+  margin-bottom: 0.25rem;
+}
+
+.buttons {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+
+.features {
+  display: flex;
+  align-items: center;
+  padding: 2rem 0;
+  width: 100%;
+}
+
+.quickStart {
+  padding: 2rem 0 4rem;
+}
+
+.codeBlock {
+  max-width: 700px;
+  margin: 1rem auto 0;
+}
+
+.codeBlock pre {
+  border-radius: 8px;
+  padding: 1.5rem;
+  text-align: left;
+}
