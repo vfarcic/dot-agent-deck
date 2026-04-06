@@ -1,6 +1,7 @@
 # PRD #35: Project Documentation Site
 
-**Status**: In Progress
+**Status**: Complete
+**Completed**: 2026-04-06
 **Priority**: Low
 **Created**: 2026-04-03
 **GitHub Issue**: [#35](https://github.com/vfarcic/dot-agent-deck/issues/35)
