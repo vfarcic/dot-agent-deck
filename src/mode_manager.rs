@@ -416,7 +416,7 @@ mod tests {
     fn test_config() -> ModeConfig {
         ModeConfig {
             name: "kubernetes".to_string(),
-            shell_init: None,
+
             panes: vec![ModePersistentPane {
                 command: "kubectl get pods -w".to_string(),
                 name: Some("Pods".to_string()),
@@ -449,21 +449,6 @@ mod tests {
     }
 
     #[test]
-    fn shell_init_not_sent_to_side_panes() {
-        let mock = Arc::new(MockPaneController::new());
-        let mut mgr = ModeManager::new(mock.clone(), 1);
-
-        let mut config = test_config();
-        config.shell_init = Some("source .env".to_string());
-        mgr.activate_mode(&config, None).unwrap();
-
-        let written = mock.written.lock().unwrap();
-        // shell_init is handled by the UI layer (agent pane only).
-        // Persistent panes use create_pane(Some(command)) now, no write_to_pane.
-        assert_eq!(written.len(), 0);
-    }
-
-    #[test]
     fn handle_command_matches_first_rule() {
         let mock = Arc::new(MockPaneController::new());
         let mut mgr = ModeManager::new(mock.clone(), 2);
@@ -490,7 +475,7 @@ mod tests {
 
         let config = ModeConfig {
             name: "test".to_string(),
-            shell_init: None,
+
             panes: vec![],
             rules: vec![ModeRule {
                 pattern: r".*".to_string(),
@@ -536,7 +521,7 @@ mod tests {
 
         let config = ModeConfig {
             name: "bad".to_string(),
-            shell_init: None,
+
             panes: vec![],
             rules: vec![ModeRule {
                 pattern: r"[invalid".to_string(),

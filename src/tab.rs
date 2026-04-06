@@ -369,7 +369,6 @@ mod tests {
     fn test_config(name: &str) -> ModeConfig {
         ModeConfig {
             name: name.to_string(),
-            shell_init: None,
             panes: vec![ModePersistentPane {
                 command: "kubectl get pods -w".to_string(),
                 name: Some("Pods".to_string()),

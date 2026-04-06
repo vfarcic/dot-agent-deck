@@ -26,7 +26,6 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModeConfig {
     pub name: String,
-    pub shell_init: Option<String>,
     #[serde(default)]
     pub panes: Vec<ModePersistentPane>,
     #[serde(default)]
@@ -103,7 +102,6 @@ watch = false
 
         let mode = &config.modes[0];
         assert_eq!(mode.name, "kubernetes-operations");
-        assert_eq!(mode.shell_init.as_deref(), Some("devbox shell"));
         assert_eq!(mode.panes.len(), 2);
         assert_eq!(
             mode.panes[0].command,
@@ -134,7 +132,6 @@ command = "echo hello"
         let config: ProjectConfig = toml::from_str(toml).unwrap();
         let mode = &config.modes[0];
         assert_eq!(mode.name, "minimal");
-        assert!(mode.shell_init.is_none());
         assert_eq!(mode.panes.len(), 1);
         assert!(mode.rules.is_empty());
     }

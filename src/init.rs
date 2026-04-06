@@ -12,7 +12,6 @@ const TEMPLATE: &str = r#"# dot-agent-deck project configuration
 
 [[modes]]
 name = "dev"
-# shell_init = "devbox shell"    # Optional: initialize the shell environment
 
 # Persistent panes run continuously alongside your agent session.
 

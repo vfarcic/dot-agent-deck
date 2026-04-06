@@ -129,7 +129,6 @@ fn load_real_config_and_verify_structure() {
 
     let mode = &config.modes[0];
     assert_eq!(mode.name, "kubernetes-operations");
-    assert_eq!(mode.shell_init.as_deref(), Some("devbox shell"));
     assert_eq!(mode.panes.len(), 2);
     assert_eq!(mode.rules.len(), 3);
 
@@ -177,21 +176,9 @@ fn load_real_config_and_activate_mode() {
     let created = mock.created.lock().unwrap();
     assert_eq!(created.len(), 5);
 
-    // shell_init is now handled by the UI layer (agent pane only),
-    // so ModeManager should NOT send it to any panes.
-    let written = mock.written.lock().unwrap();
-    let shell_init_writes: Vec<_> = written
-        .iter()
-        .filter(|(_, text)| text == "devbox shell")
-        .collect();
-    assert_eq!(
-        shell_init_writes.len(),
-        0,
-        "shell_init should not be sent by ModeManager (handled by UI for agent pane)"
-    );
-
     // Persistent panes now use create_pane(Some(command)), so no write_to_pane calls.
     // Reactive panes also get no writes at activation.
+    let written = mock.written.lock().unwrap();
     assert!(
         written.is_empty(),
         "No write_to_pane calls expected during activation — persistent panes use direct command execution"
@@ -384,7 +371,7 @@ fn invalid_toml_returns_parse_error() {
 fn invalid_regex_in_config_fails_activation() {
     let config = ModeConfig {
         name: "bad-regex".to_string(),
-        shell_init: None,
+
         panes: vec![],
         rules: vec![ModeRule {
             pattern: "[unclosed".to_string(),
@@ -407,7 +394,7 @@ fn invalid_regex_in_config_fails_activation() {
 fn mode_switching_cleans_up_previous() {
     let mode_a = ModeConfig {
         name: "mode-a".to_string(),
-        shell_init: None,
+
         panes: vec![ModePersistentPane {
             command: "echo a".to_string(),
             name: Some("A".to_string()),
@@ -417,7 +404,7 @@ fn mode_switching_cleans_up_previous() {
 
     let mode_b = ModeConfig {
         name: "mode-b".to_string(),
-        shell_init: None,
+
         panes: vec![ModePersistentPane {
             command: "echo b".to_string(),
             name: Some("B".to_string()),
@@ -453,7 +440,7 @@ fn mode_switching_cleans_up_previous() {
 fn all_reactive_mode_works() {
     let config = ModeConfig {
         name: "reactive-only".to_string(),
-        shell_init: None,
+
         panes: vec![],
         rules: vec![ModeRule {
             pattern: r".*".to_string(),
@@ -480,7 +467,7 @@ fn all_reactive_mode_works() {
 fn all_persistent_mode_works() {
     let config = ModeConfig {
         name: "persistent-only".to_string(),
-        shell_init: None,
+
         panes: vec![ModePersistentPane {
             command: "watch -n1 date".to_string(),
             name: Some("Clock".to_string()),

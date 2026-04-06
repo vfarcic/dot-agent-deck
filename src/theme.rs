@@ -50,6 +50,8 @@ pub struct ColorPalette {
     pub text_muted: Color,
     /// Background for the selected/active card — a subtle shift from the terminal background.
     pub selected_bg: Color,
+    /// Background for the tab bar row — slightly shifted from terminal_bg for visual distinction.
+    pub tab_bar_bg: Color,
     /// The terminal's actual background color (used to fill the frame explicitly).
     pub terminal_bg: Color,
 }
@@ -61,6 +63,7 @@ impl ColorPalette {
             text_secondary: Color::Gray,
             text_muted: Color::Gray,
             selected_bg: Color::Rgb(25, 30, 50),
+            tab_bar_bg: Color::Rgb(20, 20, 25),
             terminal_bg: Color::Rgb(0, 0, 0),
         }
     }
@@ -71,6 +74,7 @@ impl ColorPalette {
             text_secondary: Color::DarkGray,
             text_muted: Color::Gray,
             selected_bg: Color::Rgb(225, 230, 240),
+            tab_bar_bg: Color::Rgb(235, 235, 240),
             terminal_bg: Color::Rgb(255, 255, 255),
         }
     }
@@ -120,6 +124,19 @@ fn detect_palette() -> ColorPalette {
                 b.saturating_add(35),
             )
         };
+        palette.tab_bar_bg = if is_light {
+            Color::Rgb(
+                r.saturating_sub(12),
+                g.saturating_sub(12),
+                b.saturating_sub(8),
+            )
+        } else {
+            Color::Rgb(
+                r.saturating_add(12),
+                g.saturating_add(12),
+                b.saturating_add(15),
+            )
+        };
     }
 
     palette
@@ -136,6 +153,7 @@ mod tests {
         assert_eq!(p.text_secondary, Color::Gray);
         assert_eq!(p.text_muted, Color::Gray);
         assert_eq!(p.selected_bg, Color::Rgb(25, 30, 50));
+        assert_eq!(p.tab_bar_bg, Color::Rgb(20, 20, 25));
         assert_eq!(p.terminal_bg, Color::Rgb(0, 0, 0));
     }
 
@@ -146,6 +164,7 @@ mod tests {
         assert_eq!(p.text_secondary, Color::DarkGray);
         assert_eq!(p.text_muted, Color::Gray);
         assert_eq!(p.selected_bg, Color::Rgb(225, 230, 240));
+        assert_eq!(p.tab_bar_bg, Color::Rgb(235, 235, 240));
         assert_eq!(p.terminal_bg, Color::Rgb(255, 255, 255));
     }
 

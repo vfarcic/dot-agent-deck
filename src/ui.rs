@@ -297,7 +297,7 @@ impl DirPickerState {
 struct ModeSelectorState {
     dir: PathBuf,
     modes: Vec<ModeConfig>,
-    selected: usize, // 0 = "New agent pane", 1..N = modes[0..N-1], last = generate (when show_generate)
+    selected: usize, // 0 = "No mode", 1..N = modes[0..N-1], last = generate (when show_generate)
     show_generate: bool, // true when no .dot-agent-deck.toml exists
 }
 
@@ -325,7 +325,7 @@ impl ModeSelectorState {
         self.selected = self.selected.saturating_sub(1);
     }
 
-    /// Returns `None` for "New agent pane" (index 0), `Some(&ModeConfig)` for a mode.
+    /// Returns `None` for "No mode" (index 0), `Some(&ModeConfig)` for a mode.
     fn selected_mode(&self) -> Option<&ModeConfig> {
         if self.selected == 0 || self.is_generate_selected() {
             None
@@ -350,6 +350,7 @@ struct NewPaneFormState {
     dir: PathBuf,
     name: String,
     command: String,
+    mode_config: Option<ModeConfig>,
     focused: FormField,
 }
 
@@ -446,58 +447,6 @@ impl Default for UiState {
 // Grid navigation
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Direction {
-    Up,
-    Down,
-    Left,
-    Right,
-}
-
-fn navigate_grid(current: usize, dir: Direction, columns: usize, total: usize) -> usize {
-    if total == 0 {
-        return 0;
-    }
-    let row = current / columns;
-    let col = current % columns;
-    let total_rows = total.div_ceil(columns);
-
-    match dir {
-        Direction::Up => {
-            if row > 0 {
-                (row - 1) * columns + col
-            } else {
-                current
-            }
-        }
-        Direction::Down => {
-            let new_idx = (row + 1) * columns + col;
-            if row + 1 < total_rows && new_idx < total {
-                new_idx
-            } else if row + 1 < total_rows {
-                // Last row has fewer items; go to last item
-                total - 1
-            } else {
-                current
-            }
-        }
-        Direction::Left => {
-            if col > 0 {
-                current - 1
-            } else {
-                current
-            }
-        }
-        Direction::Right => {
-            if col + 1 < columns && current + 1 < total {
-                current + 1
-            } else {
-                current
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Session filtering
 // ---------------------------------------------------------------------------
@@ -579,6 +528,7 @@ struct NewPaneRequest {
     dir: PathBuf,
     name: String,
     command: String,
+    mode_config: Option<ModeConfig>,
 }
 
 #[derive(Debug)]
@@ -587,7 +537,6 @@ enum KeyResult {
     Quit,
     Focus,
     NewPane(NewPaneRequest),
-    ActivateMode { dir: PathBuf, config: ModeConfig },
     GenerateModeConfig { dir: PathBuf },
     ForwardToPane(Vec<u8>),
 }
@@ -896,26 +845,20 @@ fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult
         return KeyResult::Continue;
     }
     match key.code {
-        // Dashboard navigation
+        // Dashboard card navigation (linear cycling)
         KeyCode::Char('j') | KeyCode::Down => {
-            ui.selected_index =
-                navigate_grid(ui.selected_index, Direction::Down, ui.columns, total);
+            if total > 0 {
+                ui.selected_index = (ui.selected_index + 1) % total;
+            }
             KeyResult::Continue
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            ui.selected_index = navigate_grid(ui.selected_index, Direction::Up, ui.columns, total);
+            if total > 0 {
+                ui.selected_index = (ui.selected_index + total - 1) % total;
+            }
             KeyResult::Continue
         }
-        KeyCode::Char('h') | KeyCode::Left => {
-            ui.selected_index =
-                navigate_grid(ui.selected_index, Direction::Left, ui.columns, total);
-            KeyResult::Continue
-        }
-        KeyCode::Char('l') | KeyCode::Right => {
-            ui.selected_index =
-                navigate_grid(ui.selected_index, Direction::Right, ui.columns, total);
-            KeyResult::Continue
-        }
+        // Left/Right/h/l handled in main loop for tab switching
         KeyCode::Char('/') => {
             ui.mode = UiMode::Filter;
             ui.filter_text.clear();
@@ -1110,7 +1053,7 @@ fn generate_mode_config_prompt(dir: &str) -> String {
     format!(
         "Analyze the project in {dir} and generate a .dot-agent-deck.toml configuration file. \
          The file defines modes for the dot-agent-deck TUI. Each mode has: name (string), \
-         optional shell_init (setup command run in every pane), panes (array of persistent \
+         panes (array of persistent \
          panes with command and optional name), and rules (array of reactive rules with \
          pattern as regex, optional watch bool, optional interval in seconds). \
          Example: [[modes]] name = \"dev\" / [[modes.panes]] command = \"cargo watch -x test\" \
@@ -1176,12 +1119,7 @@ fn handle_mode_selector_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
                 return KeyResult::GenerateModeConfig { dir };
             }
 
-            if let Some(config) = selected_mode {
-                ui.mode = UiMode::Normal;
-                return KeyResult::ActivateMode { dir, config };
-            }
-
-            // "New agent pane" selected — show the regular form.
+            // All selections (mode or no-mode) go through the Name/Command form.
             let name = dir
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -1191,6 +1129,7 @@ fn handle_mode_selector_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
                 dir,
                 name,
                 command,
+                mode_config: selected_mode,
                 focused: FormField::Name,
             });
             ui.mode = UiMode::NewPaneForm;
@@ -1237,6 +1176,7 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
                     dir: form.dir.clone(),
                     name: form.name.clone(),
                     command: form.command.clone(),
+                    mode_config: form.mode_config.clone(),
                 };
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
@@ -1456,9 +1396,25 @@ pub fn run_tui(
                 side_pane_ids: mode_manager.managed_pane_ids(),
             },
         };
+        let tab_bar_labels: Vec<String> = tab_manager
+            .tabs()
+            .iter()
+            .map(|tab| match tab {
+                Tab::Dashboard => "Dashboard".to_string(),
+                Tab::Mode {
+                    name,
+                    agent_pane_id,
+                    ..
+                } => ui
+                    .pane_metadata
+                    .get(agent_pane_id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| name.clone()),
+            })
+            .collect();
         let tab_bar_info = TabBarInfo {
             show: tab_manager.show_tab_bar(),
-            labels: tab_manager.tab_labels(),
+            labels: tab_bar_labels,
             active_index: tab_manager.active_index(),
         };
         terminal.draw(|frame| {
@@ -1807,7 +1763,7 @@ pub fn run_tui(
             // ---------------------------------------------------------------
             if !shortcut_handled && key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
-                    // Ctrl+d: jump to dashboard (ensure Normal mode)
+                    // Ctrl+d: enter Normal (command) mode, stay on current tab
                     KeyCode::Char('d') => {
                         ui.mode = UiMode::Normal;
                         shortcut_handled = true;
@@ -1917,6 +1873,29 @@ pub fn run_tui(
                 }
             }
 
+            // Tab / Shift+Tab / Left / Right / h / l: cycle tabs in Normal mode
+            if !shortcut_handled && ui.mode == UiMode::Normal {
+                match key.code {
+                    KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                        let count = tab_manager.tab_count();
+                        if count > 0 {
+                            let next = (tab_manager.active_index() + 1) % count;
+                            tab_manager.switch_to(next);
+                        }
+                        shortcut_handled = true;
+                    }
+                    KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                        let count = tab_manager.tab_count();
+                        if count > 0 {
+                            let prev = (tab_manager.active_index() + count - 1) % count;
+                            tab_manager.switch_to(prev);
+                        }
+                        shortcut_handled = true;
+                    }
+                    _ => {}
+                }
+            }
+
             let selected_id: Option<String> =
                 filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
 
@@ -1944,6 +1923,9 @@ pub fn run_tui(
                         && let Some(session) = snapshot.sessions.get(sid)
                     {
                         if let Some(ref pane_id) = session.pane_id {
+                            if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
+                                tab_manager.switch_to(tab_idx);
+                            }
                             match pane.focus_pane(pane_id) {
                                 Ok(()) => {
                                     ui.mode = UiMode::PaneInput;
@@ -1985,7 +1967,6 @@ pub fn run_tui(
                         };
                         match pane.create_pane(cmd, Some(&dir_str)) {
                             Ok(new_id) => {
-                                // Register so only events from our panes are accepted.
                                 state.blocking_write().register_pane(new_id.clone());
                                 if !req.name.is_empty() {
                                     let _ = pane.rename_pane(&new_id, &req.name);
@@ -1997,39 +1978,96 @@ pub fn run_tui(
                                     new_id.clone(),
                                     config::SavedPane {
                                         dir: dir_str.clone(),
-                                        name: req.name,
+                                        name: req.name.clone(),
                                         command: req.command,
                                     },
                                 );
-                                // Auto-focus the newly created pane and select last card.
-                                let _ = pane.focus_pane(&new_id);
-                                ui.mode = UiMode::PaneInput;
-                                ui.selected_index = filtered.len(); // will point to new card once it appears
-                                // Resize new pane PTY to match current layout dimensions.
-                                if let Some(embedded) =
-                                    pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                                {
-                                    let frame_area = terminal.get_frame().area();
-                                    let right_width =
-                                        (frame_area.width * 67 / 100).saturating_sub(2);
-                                    let pane_count = embedded.pane_ids().len() as u16;
-                                    let rows = match ui.pane_layout {
-                                        PaneLayout::Tiled => (frame_area.height
-                                            / pane_count.max(1))
-                                        .saturating_sub(2),
-                                        PaneLayout::Stacked => frame_area
-                                            .height
-                                            .saturating_sub(2 + pane_count.saturating_sub(1)),
-                                    };
-                                    if rows > 0 && right_width > 0 {
-                                        let _ =
-                                            embedded.resize_pane_pty(&new_id, rows, right_width);
+
+                                if let Some(mode_config) = req.mode_config {
+                                    // Mode selected — open a mode tab.
+                                    let mode_name = mode_config.name.clone();
+                                    match tab_manager.open_mode_tab(
+                                        &mode_config,
+                                        &dir_str,
+                                        new_id.clone(),
+                                    ) {
+                                        Ok((_tab_idx, side_ids)) => {
+                                            for id in &side_ids {
+                                                state.blocking_write().register_pane(id.clone());
+                                            }
+                                            let _ = pane.focus_pane(&new_id);
+                                            ui.mode = UiMode::PaneInput;
+                                            if let Some(embedded) =
+                                                pane.as_any()
+                                                    .downcast_ref::<EmbeddedPaneController>()
+                                            {
+                                                let frame_area = terminal.get_frame().area();
+                                                let half_width =
+                                                    (frame_area.width / 2).saturating_sub(2);
+                                                let agent_rows =
+                                                    frame_area.height.saturating_sub(3);
+                                                if agent_rows > 0 && half_width > 0 {
+                                                    let _ = embedded.resize_pane_pty(
+                                                        &new_id, agent_rows, half_width,
+                                                    );
+                                                }
+                                                let side_count = side_ids.len().max(1) as u16;
+                                                let side_rows = (frame_area.height / side_count)
+                                                    .saturating_sub(2);
+                                                if side_rows > 0 && half_width > 0 {
+                                                    for id in &side_ids {
+                                                        let _ = embedded.resize_pane_pty(
+                                                            id, side_rows, half_width,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            ui.status_message = Some((
+                                                format!("Activated mode: {mode_name}"),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            let _ = pane.close_pane(&new_id);
+                                            ui.status_message = Some((
+                                                format!("Mode activation failed: {e}"),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
                                     }
+                                } else {
+                                    // No mode — regular dashboard pane.
+                                    let _ = pane.focus_pane(&new_id);
+                                    ui.mode = UiMode::PaneInput;
+                                    ui.selected_index = filtered.len();
+                                    if let Some(embedded) =
+                                        pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                                    {
+                                        let frame_area = terminal.get_frame().area();
+                                        let right_width =
+                                            (frame_area.width * 67 / 100).saturating_sub(2);
+                                        let pane_count = embedded.pane_ids().len() as u16;
+                                        let rows = match ui.pane_layout {
+                                            PaneLayout::Tiled => (frame_area.height
+                                                / pane_count.max(1))
+                                            .saturating_sub(2),
+                                            PaneLayout::Stacked => frame_area
+                                                .height
+                                                .saturating_sub(2 + pane_count.saturating_sub(1)),
+                                        };
+                                        if rows > 0 && right_width > 0 {
+                                            let _ = embedded.resize_pane_pty(
+                                                &new_id,
+                                                rows,
+                                                right_width,
+                                            );
+                                        }
+                                    }
+                                    ui.status_message = Some((
+                                        format!("Created pane {new_id} in {dir_str}"),
+                                        std::time::Instant::now(),
+                                    ));
                                 }
-                                ui.status_message = Some((
-                                    format!("Created pane {new_id} in {dir_str}"),
-                                    std::time::Instant::now(),
-                                ));
                             }
                             Err(e) => {
                                 ui.status_message = Some((
@@ -2037,79 +2075,6 @@ pub fn run_tui(
                                     std::time::Instant::now(),
                                 ));
                             }
-                        }
-                    }
-                }
-                KeyResult::ActivateMode { dir, config } => {
-                    let dir_str = dir.display().to_string();
-                    let mode_name = config.name.clone();
-
-                    // Create agent pane first, then open mode tab with it.
-                    match pane.create_pane(None, Some(&dir_str)) {
-                        Ok(agent_pane_id) => {
-                            state.blocking_write().register_pane(agent_pane_id.clone());
-                            // Run shell_init in the agent pane before anything else.
-                            if let Some(ref init_cmd) = config.shell_init {
-                                let _ = pane.write_to_pane(&agent_pane_id, init_cmd);
-                            }
-                            match tab_manager.open_mode_tab(
-                                &config,
-                                &dir_str,
-                                agent_pane_id.clone(),
-                            ) {
-                                Ok((_tab_idx, side_ids)) => {
-                                    for id in &side_ids {
-                                        state.blocking_write().register_pane(id.clone());
-                                    }
-                                    // Focus the agent pane by default.
-                                    let _ = pane.focus_pane(&agent_pane_id);
-                                    ui.mode = UiMode::PaneInput;
-                                    // Resize all new PTYs for 50/50 mode layout.
-                                    if let Some(embedded) =
-                                        pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                                    {
-                                        let frame_area = terminal.get_frame().area();
-                                        let half_width = (frame_area.width / 2).saturating_sub(2);
-                                        // Agent pane: full height of left half.
-                                        let agent_rows = frame_area.height.saturating_sub(3);
-                                        if agent_rows > 0 && half_width > 0 {
-                                            let _ = embedded.resize_pane_pty(
-                                                &agent_pane_id,
-                                                agent_rows,
-                                                half_width,
-                                            );
-                                        }
-                                        // Side panes: stacked in right half.
-                                        let side_count = side_ids.len().max(1) as u16;
-                                        let side_rows =
-                                            (frame_area.height / side_count).saturating_sub(2);
-                                        if side_rows > 0 && half_width > 0 {
-                                            for id in &side_ids {
-                                                let _ = embedded
-                                                    .resize_pane_pty(id, side_rows, half_width);
-                                            }
-                                        }
-                                    }
-                                    ui.status_message = Some((
-                                        format!("Activated mode: {mode_name}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                                Err(e) => {
-                                    // Clean up agent pane on mode activation failure.
-                                    let _ = pane.close_pane(&agent_pane_id);
-                                    ui.status_message = Some((
-                                        format!("Mode activation failed: {e}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            ui.status_message = Some((
-                                format!("Mode activation failed: {e}"),
-                                std::time::Instant::now(),
-                            ));
                         }
                     }
                 }
@@ -2311,6 +2276,11 @@ fn render_frame(
             .iter()
             .map(|l| Line::from(format!(" {l} ")))
             .collect();
+        // Fill tab bar row with distinct background.
+        frame.render_widget(
+            Block::default().style(Style::default().bg(palette.tab_bar_bg)),
+            chunks[0],
+        );
         let tabs_widget = Tabs::new(titles)
             .select(tab_bar.active_index)
             .style(Style::default().fg(palette.text_secondary))
@@ -2320,7 +2290,7 @@ fn render_frame(
                     .bg(palette.selected_bg)
                     .add_modifier(Modifier::BOLD),
             )
-            .divider(" | ");
+            .divider("│");
         frame.render_widget(tabs_widget, chunks[0]);
 
         (chunks[1], chunks[2])
@@ -3292,7 +3262,7 @@ fn render_mode_selector(frame: &mut Frame, selector: &ModeSelectorState) {
     ));
     lines.push(Line::from(""));
 
-    // "New agent pane" as first item (index 0)
+    // "No mode" as first item (index 0)
     let prefix = if selector.selected == 0 { "> " } else { "  " };
     let style = if selector.selected == 0 {
         Style::default()
@@ -3301,7 +3271,7 @@ fn render_mode_selector(frame: &mut Frame, selector: &ModeSelectorState) {
     } else {
         Style::default()
     };
-    lines.push(Line::styled(format!("{prefix}New agent pane"), style));
+    lines.push(Line::styled(format!("{prefix}No mode"), style));
 
     // Mode entries
     for (i, mode) in selector.modes.iter().enumerate() {
@@ -3423,9 +3393,13 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
         ),
     ];
 
+    let title = match form.mode_config {
+        Some(ref cfg) => format!(" New Pane — {} mode ", cfg.name),
+        None => " New Pane ".to_string(),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" New Pane ")
+        .title(title)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(lines).block(block);
@@ -4064,63 +4038,6 @@ mod tests {
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_navigate_grid_single_column() {
-        // 5 items, 1 column
-        assert_eq!(navigate_grid(0, Direction::Down, 1, 5), 1);
-        assert_eq!(navigate_grid(4, Direction::Down, 1, 5), 4); // at bottom
-        assert_eq!(navigate_grid(0, Direction::Up, 1, 5), 0); // at top
-        assert_eq!(navigate_grid(3, Direction::Up, 1, 5), 2);
-        // Left/Right are no-ops in single column
-        assert_eq!(navigate_grid(2, Direction::Left, 1, 5), 2);
-        assert_eq!(navigate_grid(2, Direction::Right, 1, 5), 2);
-    }
-
-    #[test]
-    fn test_navigate_grid_two_columns() {
-        // 5 items, 2 columns:
-        // [0] [1]
-        // [2] [3]
-        // [4]
-        assert_eq!(navigate_grid(0, Direction::Right, 2, 5), 1);
-        assert_eq!(navigate_grid(1, Direction::Left, 2, 5), 0);
-        assert_eq!(navigate_grid(0, Direction::Down, 2, 5), 2);
-        assert_eq!(navigate_grid(2, Direction::Up, 2, 5), 0);
-        // Down from col 1 row 1 to col 1 row 2 — but index 5 doesn't exist, clamp to 4
-        assert_eq!(navigate_grid(3, Direction::Down, 2, 5), 4);
-        // Right from last item
-        assert_eq!(navigate_grid(4, Direction::Right, 2, 5), 4);
-        // Left from first col
-        assert_eq!(navigate_grid(0, Direction::Left, 2, 5), 0);
-    }
-
-    #[test]
-    fn test_navigate_grid_three_columns() {
-        // 7 items, 3 columns:
-        // [0] [1] [2]
-        // [3] [4] [5]
-        // [6]
-        assert_eq!(navigate_grid(1, Direction::Down, 3, 7), 4);
-        assert_eq!(navigate_grid(4, Direction::Up, 3, 7), 1);
-        assert_eq!(navigate_grid(5, Direction::Down, 3, 7), 6); // col 2 row 2 -> last item
-        assert_eq!(navigate_grid(6, Direction::Up, 3, 7), 3);
-        assert_eq!(navigate_grid(2, Direction::Right, 3, 7), 2); // at right edge
-    }
-
-    #[test]
-    fn test_navigate_grid_empty() {
-        assert_eq!(navigate_grid(0, Direction::Down, 2, 0), 0);
-        assert_eq!(navigate_grid(0, Direction::Up, 2, 0), 0);
-    }
-
-    #[test]
-    fn test_navigate_grid_single_item() {
-        assert_eq!(navigate_grid(0, Direction::Down, 2, 1), 0);
-        assert_eq!(navigate_grid(0, Direction::Up, 2, 1), 0);
-        assert_eq!(navigate_grid(0, Direction::Left, 2, 1), 0);
-        assert_eq!(navigate_grid(0, Direction::Right, 2, 1), 0);
-    }
 
     // ---------------------------------------------------------------------------
     // Dir picker tests
@@ -5053,7 +4970,6 @@ mod tests {
     fn make_mode(name: &str) -> ModeConfig {
         ModeConfig {
             name: name.to_string(),
-            shell_init: None,
             panes: vec![],
             rules: vec![],
         }
@@ -5062,7 +4978,7 @@ mod tests {
     #[test]
     fn mode_selector_item_count() {
         let s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![make_mode("a")], false);
-        assert_eq!(s.item_count(), 2); // "New agent pane" + 1 mode
+        assert_eq!(s.item_count(), 2); // "No mode" + 1 mode
 
         let s = ModeSelectorState::new(
             PathBuf::from("/tmp"),
@@ -5100,7 +5016,7 @@ mod tests {
         let modes = vec![make_mode("k8s"), make_mode("rust-tdd")];
         let mut s = ModeSelectorState::new(PathBuf::from("/tmp"), modes, false);
 
-        // Index 0 = "New agent pane" → None
+        // Index 0 = "No mode" → None
         assert!(s.selected_mode().is_none());
 
         s.selected = 1;
@@ -5149,6 +5065,7 @@ mod tests {
         let form = ui.new_pane_form.as_ref().unwrap();
         assert_eq!(form.dir, PathBuf::from("/tmp/myproject"));
         assert_eq!(form.name, "myproject");
+        assert!(form.mode_config.is_none());
     }
 
     #[test]
@@ -5169,10 +5086,15 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_mode_selector_key(key, &mut ui);
 
-        assert_eq!(ui.mode, UiMode::Normal);
+        assert_eq!(ui.mode, UiMode::NewPaneForm);
         assert!(ui.mode_selector.is_none());
+        assert!(matches!(result, KeyResult::Continue));
+        let form = ui.new_pane_form.as_ref().unwrap();
+        assert_eq!(form.dir, PathBuf::from("/tmp/proj"));
         assert!(
-            matches!(result, KeyResult::ActivateMode { ref dir, ref config } if dir == Path::new("/tmp/proj") && config.name == "k8s-ops")
+            form.mode_config
+                .as_ref()
+                .is_some_and(|c| c.name == "k8s-ops")
         );
     }
 
@@ -5195,7 +5117,7 @@ mod tests {
 
     #[test]
     fn mode_selector_item_count_with_generate() {
-        // No modes + generate option = 2 items ("New agent pane" + "Generate")
+        // No modes + generate option = 2 items ("No mode" + "Generate")
         let s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![], true);
         assert_eq!(s.item_count(), 2);
 
@@ -5207,7 +5129,7 @@ mod tests {
     #[test]
     fn mode_selector_generate_is_last_item() {
         let mut s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![], true);
-        assert!(!s.is_generate_selected()); // index 0 = "New agent pane"
+        assert!(!s.is_generate_selected()); // index 0 = "No mode"
 
         s.selected = 1; // last item = generate
         assert!(s.is_generate_selected());
@@ -5249,7 +5171,7 @@ mod tests {
     #[test]
     fn mode_selector_generate_navigation() {
         let mut s = ModeSelectorState::new(PathBuf::from("/tmp"), vec![], true);
-        assert_eq!(s.selected, 0); // starts at "New agent pane"
+        assert_eq!(s.selected, 0); // starts at "No mode"
         assert_eq!(s.item_count(), 2);
 
         s.select_next();
@@ -5260,7 +5182,7 @@ mod tests {
         assert_eq!(s.selected, 1); // can't go past last
 
         s.select_previous();
-        assert_eq!(s.selected, 0); // back to "New agent pane"
+        assert_eq!(s.selected, 0); // back to "No mode"
         assert!(!s.is_generate_selected());
     }
 }

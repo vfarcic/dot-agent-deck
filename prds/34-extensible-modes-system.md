@@ -49,8 +49,12 @@ The UI uses a tab-based layout. Tab 1 is always the **Dashboard** — the multi-
 
 | Key | Action |
 |---|---|
-| `Ctrl+Shift+1`–`9` | Switch to tab N (1 = dashboard, 2+ = mode tabs) |
-| Click tab in tab bar | Switch to that tab |
+| `Tab` / `Right` / `l` | Next tab (cycles) |
+| `Shift+Tab` / `Left` / `h` | Previous tab (cycles) |
+| `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab (secondary) |
+| `Ctrl+d` | Enter command/navigation mode (stay on current tab) |
+| `Up` / `Down` / `j` / `k` | Cycle through dashboard cards |
+| `1`–`9` | Jump to card N and focus |
 | `Enter` on dashboard card | If agent is in a mode tab, switch to that tab |
 | Close mode tab | Tears down the entire workspace (agent + all side panes) |
 
@@ -123,13 +127,13 @@ watch = false
 
 1. **Tab-based workspaces.** Mode activation creates a new tab rather than injecting panes into the dashboard. This keeps the dashboard clean for multi-agent management and gives each mode a dedicated full-screen workspace. The tab bar is only shown when more than one tab exists (zero visual overhead for users who don't use modes).
 
-2. **`Ctrl+Shift+1-9` for tab switching.** Avoids conflicts with terminal bindings (`Ctrl+Tab` is taken by most terminals). Numbers map directly to tab positions. Needs validation across common terminals (iTerm2, Alacritty, WezTerm, Windows Terminal, GNOME Terminal) — fallback to `Alt+1-9` if support is poor.
+2. **`Tab`/`Shift+Tab` and `Left`/`Right` for tab switching.** `Ctrl+Shift+1-9` was infeasible (terminals don't pass it through). `Ctrl+Tab` is consumed by terminal emulators. `Tab`/`Shift+Tab` and arrow keys are universally available on all keyboards including laptops without PageUp/PageDown. `Ctrl+PageUp/PageDown` kept as secondary binding. `h`/`l` also cycle tabs for vim users.
 
 3. **No per-pane close in mode tabs.** All panes are defined by config; users cannot add or remove individual panes at runtime. Only the entire tab can be closed, which tears down the agent + all side panes together.
 
 4. **Dashboard card links to mode tab.** When an agent running in a mode tab appears as a session card in the dashboard, pressing `Enter` on that card switches to the mode's tab. This ties the multi-agent overview to the focused workspaces.
 
-5. **`shell_init` per mode.** An optional setup command (e.g., `source .env`, `devbox shell`) that runs in every side pane before the pane-specific command. Configured as `shell_init` on the mode.
+5. **Unified form flow for all pane creation.** All mode selections (including modes) go through the Name/Command form. The user always names the agent and chooses a command. `shell_init` was removed — the command field in the form replaces it. "New agent pane" renamed to "No mode" in the mode selector.
 
 6. **Shell panes with sent commands.** Side panes are created as shells, not process panes. Commands are sent after creation. This prevents pane death when commands exit with errors — the shell stays alive for re-use.
 
@@ -152,7 +156,7 @@ watch = false
 New structs, separate from existing `DashboardConfig` (global settings). `ProjectConfig` loads from `.dot-agent-deck.toml` in the selected directory.
 
 - `ProjectConfig` — top-level: `modes: Vec<ModeConfig>`
-- `ModeConfig` — `name: String`, `shell_init: Option<String>`, `panes: Vec<ModePersistentPane>`, `rules: Vec<ModeRule>`
+- `ModeConfig` — `name: String`, `panes: Vec<ModePersistentPane>`, `rules: Vec<ModeRule>`
 - `ModePersistentPane` — `command: String`, `name: Option<String>` (defaults to command)
 - `ModeRule` — `pattern: String` (regex), `watch: bool` (default false), `interval: Option<u64>` (seconds, only when watch=true)
 
@@ -209,14 +213,17 @@ New tab abstraction layered on top of the existing UI:
 ### Phase 2: Tab-based workspaces (in progress)
 - [x] Tab data model — `Tab` enum (Dashboard / Mode), tab list, active tab index, tab-to-pane mapping
 - [x] Tab bar rendering — rendered at top when >1 tab, shows names, highlights active (mouse click deferred)
-- [x] Tab switching — `Ctrl+PageUp/PageDown` keybindings (`Ctrl+Shift+1-9` not feasible in terminals)
+- [x] Tab switching — `Tab`/`Shift+Tab`, `Left`/`Right`/`h`/`l` cycling; `Ctrl+PageUp/PageDown` as secondary
 - [x] Mode activation creates new tab — refactor mode activation to create a new tab with 50/50 layout instead of injecting panes into the dashboard
 - [x] Mode tab rendering — dedicated render path: agent pane left 50%, side panes stacked right 50%
-- [ ] Dashboard card → tab navigation — `Enter` on a session card whose agent lives in a mode tab switches to that tab
+- [x] Dashboard card → tab navigation — `Enter` on a session card whose agent lives in a mode tab switches to that tab
 - [x] Tab close — close mode tab tears down entire workspace (agent + all side panes), switch to dashboard
 - [x] Reactive event routing per tab — route bash commands to the correct tab's ModeManager based on agent pane ownership
 - [ ] Update help overlay — reflect tab navigation keybindings
 - [ ] Update README — document tab-based workflow
+- [x] Unified mode form flow — all mode selections go through Name/Command form; "New agent pane" → "No mode"; `shell_init` removed from config
+- [x] Tab bar styling — distinct `tab_bar_bg` background, improved contrast, dynamic tab labels from user-chosen name
+- [x] Navigation redesign — `Up/Down` linear card cycling, `Ctrl+d` as universal command mode toggle
 - [x] Tests — tab creation, switching, close, card-to-tab navigation
 
 ### Phase 3: Smart config generation (brainstorm)
