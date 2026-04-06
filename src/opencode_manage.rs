@@ -329,6 +329,50 @@ fn uninstall_impl(dir: &PathBuf) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Silently install OpenCode plugin if OpenCode is detected.
+/// Intended for dashboard startup — never prints to stdout.
+pub fn auto_install() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let opencode_dir = PathBuf::from(&home).join(".opencode");
+    if !opencode_dir.exists() {
+        return;
+    }
+
+    let binary_path = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "dot-agent-deck".into());
+
+    let dir = plugin_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("auto-install: failed to create OpenCode plugin dir: {e}");
+        return;
+    }
+
+    let path = dir.join("index.js");
+    let content = plugin_template(&binary_path);
+    if let Err(e) = std::fs::write(&path, content) {
+        tracing::warn!("auto-install: failed to write OpenCode plugin: {e}");
+        return;
+    }
+
+    tracing::info!("auto-installed OpenCode plugin: {}", path.display());
+}
+
+/// Auto-install to a custom dir, checking a custom opencode_dir for detection (for testing).
+pub fn auto_install_to(opencode_dir: &std::path::Path, target_dir: &std::path::Path) {
+    if !opencode_dir.exists() {
+        return;
+    }
+
+    let binary_path = "dot-agent-deck".to_string();
+
+    std::fs::create_dir_all(target_dir).expect("failed to create plugin dir");
+
+    let path = target_dir.join("index.js");
+    let content = plugin_template(&binary_path);
+    std::fs::write(&path, content).expect("failed to write plugin");
+}
+
 pub fn install() -> std::io::Result<()> {
     let binary_path = std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -418,5 +462,50 @@ mod tests {
         let plugin_dir = dir.path().join("nonexistent");
 
         uninstall_from(&plugin_dir).unwrap(); // Should not panic
+    }
+
+    #[test]
+    fn auto_install_skips_when_no_opencode_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let opencode_dir = dir.path().join("nonexistent_opencode");
+        let target_dir = dir.path().join("plugin");
+
+        auto_install_to(&opencode_dir, &target_dir);
+        assert!(
+            !target_dir.exists(),
+            "Should not create plugin when opencode dir missing"
+        );
+    }
+
+    #[test]
+    fn auto_install_installs_when_opencode_dir_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let opencode_dir = dir.path().join(".opencode");
+        std::fs::create_dir(&opencode_dir).unwrap();
+        let target_dir = dir.path().join("plugin");
+
+        auto_install_to(&opencode_dir, &target_dir);
+
+        let index = target_dir.join("index.js");
+        assert!(
+            index.exists(),
+            "Should create index.js when opencode exists"
+        );
+        let content = std::fs::read_to_string(&index).unwrap();
+        assert!(content.contains("dot-agent-deck"));
+    }
+
+    #[test]
+    fn auto_install_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let opencode_dir = dir.path().join(".opencode");
+        std::fs::create_dir(&opencode_dir).unwrap();
+        let target_dir = dir.path().join("plugin");
+
+        auto_install_to(&opencode_dir, &target_dir);
+        auto_install_to(&opencode_dir, &target_dir);
+
+        let index = target_dir.join("index.js");
+        assert!(index.exists());
     }
 }
