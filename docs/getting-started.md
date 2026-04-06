@@ -11,14 +11,10 @@ title: Getting Started
 # 1. Install dot-agent-deck
 brew tap vfarcic/tap && brew install dot-agent-deck
 
-# 2. Register agent hooks
-dot-agent-deck hooks install                    # Claude Code
-dot-agent-deck hooks install --agent opencode   # OpenCode
-
-# 3. Launch the dashboard
+# 2. Launch the dashboard (hooks are auto-installed for detected agents)
 dot-agent-deck
 
-# 4. Or resume your previous session
+# Or resume your previous session
 dot-agent-deck --continue
 ```
 
@@ -26,30 +22,28 @@ Once the dashboard is running, press `?` inside the app to see all shortcuts.
 
 ## Hook Setup
 
-Register hooks so your agents send events to the dashboard:
+Hooks are **auto-installed on every startup**. The CLI detects which agents are present by checking for their configuration directories and installs hooks automatically:
 
-**Claude Code:**
+- **Claude Code** (`~/.claude/` detected) — writes entries into `~/.claude/settings.json` for hook types: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, PreCompact, SubagentStart, SubagentStop.
+- **OpenCode** (`~/.opencode/` detected) — creates a JS plugin at `~/.opencode/plugin/dot-agent-deck/index.js` that forwards session, tool, and permission events.
 
-```bash
-dot-agent-deck hooks install
-```
+Auto-install is idempotent and best-effort — if an agent directory is missing the step is silently skipped, and errors are logged without blocking startup.
 
-This writes entries into `~/.claude/settings.json` for these hook types: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, PreCompact, SubagentStart, SubagentStop. The command is idempotent — safe to run again.
+### Manual Management
 
-**OpenCode:**
-
-```bash
-dot-agent-deck hooks install --agent opencode
-```
-
-This creates a JS plugin at `~/.opencode/plugin/dot-agent-deck/index.js` that forwards session, tool, and permission events to the dashboard.
-
-**To remove hooks:**
+The `hooks install` and `hooks uninstall` commands are still available for debugging or explicit removal:
 
 ```bash
+# Install manually
+dot-agent-deck hooks install                    # Claude Code
+dot-agent-deck hooks install --agent opencode   # OpenCode
+
+# Remove hooks
 dot-agent-deck hooks uninstall                    # Claude Code
 dot-agent-deck hooks uninstall --agent opencode   # OpenCode
 ```
+
+> **Note:** If you uninstall hooks manually, the next dashboard launch will re-install them automatically.
 
 ## Launching
 
