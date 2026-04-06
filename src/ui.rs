@@ -13,16 +13,16 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use crate::config;
 use crate::config::{BellConfig, DashboardConfig};
 use crate::embedded_pane::EmbeddedPaneController;
-use crate::event::{AgentType, EventType};
+use crate::event::EventType;
 use crate::mode_manager::ModeManager;
 use crate::pane::{PaneController, PaneError};
 use crate::project_config::{ModeConfig, load_project_config};
-use crate::state::{
-    AppState, DashboardStats, PermissionResponders, SessionState, SessionStatus, SharedState,
-};
+use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::terminal_widget::TerminalWidget;
+use crate::theme::ColorPalette;
 
 impl fmt::Display for crate::event::AgentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -349,13 +349,18 @@ struct UiState {
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
+    /// Maps pane_id → launch metadata for auto-save/restore.
+    pane_metadata: HashMap<String, config::SavedPane>,
     config: DashboardConfig,
+    palette: ColorPalette,
     /// Tracks last-seen status per session for bell transition detection.
     last_bell_status: HashMap<String, SessionStatus>,
     /// Populated by the background version-check task when a newer release is available.
     update_available: Option<String>,
     /// Layout mode for embedded terminal panes (stacked or tiled).
     pane_layout: PaneLayout,
+    /// Warnings collected during session save/restore, flushed after terminal restore.
+    session_warnings: Vec<String>,
     /// Mouse text selection state for copy support.
     selection: Option<TextSelection>,
     /// Screen rect of the focused pane (set during render, used for mouse mapping).
@@ -382,7 +387,7 @@ struct TextSelection {
 }
 
 impl UiState {
-    fn new(config: DashboardConfig) -> Self {
+    fn new(config: DashboardConfig, palette: ColorPalette) -> Self {
         Self {
             mode: UiMode::Normal,
             selected_index: 0,
@@ -397,10 +402,13 @@ impl UiState {
             mode_selector: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
+            pane_metadata: HashMap::new(),
             config,
+            palette,
             last_bell_status: HashMap::new(),
             update_available: None,
             pane_layout: PaneLayout::Stacked,
+            session_warnings: Vec::new(),
             selection: None,
             focused_pane_rect: None,
             last_click: None,
@@ -411,7 +419,7 @@ impl UiState {
 
 impl Default for UiState {
     fn default() -> Self {
-        Self::new(DashboardConfig::default())
+        Self::new(DashboardConfig::default(), ColorPalette::dark())
     }
 }
 
@@ -477,7 +485,20 @@ fn navigate_grid(current: usize, dir: Direction, columns: usize, total: usize) -
 
 fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
     let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
-    sessions.sort_by_key(|(_, s)| s.started_at);
+    sessions.sort_by(|(_, a), (_, b)| {
+        // Sort by pane ID (numeric creation order) when available,
+        // falling back to started_at for sessions without a pane.
+        match (&a.pane_id, &b.pane_id) {
+            (Some(pa), Some(pb)) => {
+                let na = pa.parse::<u64>().unwrap_or(u64::MAX);
+                let nb = pb.parse::<u64>().unwrap_or(u64::MAX);
+                na.cmp(&nb)
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.started_at.cmp(&b.started_at),
+        }
+    });
 
     if ui.filter_text.is_empty() {
         return sessions;
@@ -549,7 +570,6 @@ enum KeyResult {
     NewPane(NewPaneRequest),
     ActivateMode { dir: PathBuf, config: ModeConfig },
     GenerateModeConfig { dir: PathBuf },
-    PermissionResponse(String),
     ForwardToPane(Vec<u8>),
 }
 
@@ -850,25 +870,13 @@ fn focus_deck(
     true
 }
 
-fn handle_normal_key(
-    key: KeyEvent,
-    ui: &mut UiState,
-    total: usize,
-    has_pending_permission: bool,
-) -> KeyResult {
+fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
     // Ctrl+C from dashboard: show quit confirmation
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.mode = UiMode::QuitConfirm;
         return KeyResult::Continue;
     }
     match key.code {
-        // Permission responses (dashboard-only)
-        KeyCode::Char('y') if has_pending_permission => {
-            KeyResult::PermissionResponse("allow".to_string())
-        }
-        KeyCode::Char('n') if has_pending_permission => {
-            KeyResult::PermissionResponse("deny".to_string())
-        }
         // Dashboard navigation
         KeyCode::Char('j') | KeyCode::Down => {
             ui.selected_index =
@@ -1273,7 +1281,8 @@ pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
     config: DashboardConfig,
-    responders: PermissionResponders,
+    palette: ColorPalette,
+    continue_session: bool,
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1295,8 +1304,51 @@ pub fn run_tui(
 
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
-    let mut ui = UiState::new(config);
+    let mut ui = UiState::new(config, palette);
     let mut mode_manager = ModeManager::new(Arc::clone(&pane), 3);
+
+    if continue_session {
+        let saved = config::SavedSession::load();
+        for saved_pane in &saved.panes {
+            let dir = std::path::Path::new(&saved_pane.dir);
+            if !dir.is_dir() {
+                ui.session_warnings.push(format!(
+                    "Warning: skipping pane '{}' — directory {} not found",
+                    saved_pane.name, saved_pane.dir
+                ));
+                continue;
+            }
+            let cmd = if saved_pane.command.is_empty() {
+                None
+            } else {
+                Some(saved_pane.command.as_str())
+            };
+            match pane.create_pane(cmd, Some(&saved_pane.dir)) {
+                Ok(new_id) => {
+                    state.blocking_write().register_pane(new_id.clone());
+                    if !saved_pane.name.is_empty() {
+                        if let Err(e) = pane.rename_pane(&new_id, &saved_pane.name) {
+                            ui.session_warnings.push(format!(
+                                "Warning: failed to rename pane '{}': {e}",
+                                saved_pane.name
+                            ));
+                        }
+                        ui.pane_display_names
+                            .insert(new_id.clone(), saved_pane.name.clone());
+                        ui.pane_names
+                            .insert(new_id.clone(), saved_pane.name.clone());
+                    }
+                    ui.pane_metadata.insert(new_id, saved_pane.clone());
+                }
+                Err(e) => {
+                    ui.session_warnings.push(format!(
+                        "Warning: failed to restore pane '{}': {e}",
+                        saved_pane.name
+                    ));
+                }
+            }
+        }
+    }
 
     'outer: loop {
         // Expire stale status messages
@@ -1780,6 +1832,7 @@ pub fn run_tui(
                             st.sessions.remove(&sid);
                             st.unregister_pane(&closed_pane_id);
                             drop(st);
+                            ui.pane_metadata.remove(&closed_pane_id);
                             // Reset mode if the closed pane was focused.
                             if ui.mode == UiMode::PaneInput {
                                 ui.mode = UiMode::Normal;
@@ -1802,13 +1855,8 @@ pub fn run_tui(
             let result = if shortcut_handled {
                 KeyResult::Continue
             } else {
-                // TODO(prd-38): permission UI disabled — see PRD for redesign
-                let has_pending_permission = false;
-
                 match ui.mode {
-                    UiMode::Normal => {
-                        handle_normal_key(key, &mut ui, total, has_pending_permission)
-                    }
+                    UiMode::Normal => handle_normal_key(key, &mut ui, total),
                     UiMode::Filter => handle_filter_key(key, &mut ui),
                     UiMode::Help => handle_help_key(key, &mut ui),
                     UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
@@ -1874,8 +1922,16 @@ pub fn run_tui(
                                     let _ = pane.rename_pane(&new_id, &req.name);
                                     ui.pane_display_names
                                         .insert(new_id.clone(), req.name.clone());
-                                    ui.pane_names.insert(new_id.clone(), req.name);
+                                    ui.pane_names.insert(new_id.clone(), req.name.clone());
                                 }
+                                ui.pane_metadata.insert(
+                                    new_id.clone(),
+                                    config::SavedPane {
+                                        dir: dir_str.clone(),
+                                        name: req.name,
+                                        command: req.command,
+                                    },
+                                );
                                 // Auto-focus the newly created pane and select last card.
                                 let _ = pane.focus_pane(&new_id);
                                 ui.mode = UiMode::PaneInput;
@@ -2027,80 +2083,6 @@ pub fn run_tui(
                         }
                     }
                 }
-                KeyResult::PermissionResponse(decision) => {
-                    if let Some(ref sid) = selected_id
-                        && let Some(session) = snapshot.sessions.get(sid)
-                        && let Some(pending) = session.next_pending_permission()
-                    {
-                        let tool_use_id = pending.tool_use_id.clone();
-                        let tool_name = pending.tool_name.clone().unwrap_or_else(|| "tool".into());
-                        let agent_type = session.agent_type.clone();
-
-                        match agent_type {
-                            AgentType::OpenCode => {
-                                let keystroke = if decision == "allow" { "y" } else { "n" };
-                                if let Some(ref pane_id) = session.pane_id {
-                                    match pane.write_to_pane(pane_id, keystroke) {
-                                        Ok(()) => {
-                                            state
-                                                .blocking_write()
-                                                .resolve_permission(sid, &tool_use_id);
-                                            let verb = if decision == "allow" {
-                                                "Approved"
-                                            } else {
-                                                "Denied"
-                                            };
-                                            ui.status_message = Some((
-                                                format!("{verb} {tool_name}"),
-                                                std::time::Instant::now(),
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            ui.status_message = Some((
-                                                format!("Failed to send response: {e}"),
-                                                std::time::Instant::now(),
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    ui.status_message = Some((
-                                        format!("No pane for {tool_name} — cannot send response"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                            AgentType::ClaudeCode => {
-                                let sent = {
-                                    let mut map = responders.lock().unwrap();
-                                    if let Some(sender) = map.remove(&tool_use_id) {
-                                        sender.send(decision.clone()).is_ok()
-                                    } else {
-                                        false
-                                    }
-                                };
-
-                                state.blocking_write().resolve_permission(sid, &tool_use_id);
-
-                                if sent {
-                                    let verb = if decision == "allow" {
-                                        "Approved"
-                                    } else {
-                                        "Denied"
-                                    };
-                                    ui.status_message = Some((
-                                        format!("{verb} {tool_name}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                } else {
-                                    ui.status_message = Some((
-                                        format!("Permission expired for {tool_name}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
                 KeyResult::ForwardToPane(bytes) => {
                     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
                         && let Some(pane_id) = embedded.focused_pane_id()
@@ -2140,12 +2122,49 @@ pub fn run_tui(
         } // end inner event-drain loop
     }
 
+    // Auto-save current pane session for --continue restore.
+    // Reconcile pane_metadata with the authoritative live pane registry so that
+    // externally-closed panes are pruned and renames are captured.
+    {
+        let live_panes = state.blocking_read().managed_pane_ids.clone();
+        ui.pane_metadata.retain(|id, _| live_panes.contains(id));
+        for (id, meta) in ui.pane_metadata.iter_mut() {
+            if let Some(name) = ui.pane_display_names.get(id) {
+                meta.name = name.clone();
+            }
+        }
+        let session = config::SavedSession {
+            panes: {
+                let mut ids: Vec<&String> = ui.pane_metadata.keys().collect();
+                ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
+                ids.into_iter()
+                    .filter_map(|id| ui.pane_metadata.get(id).cloned())
+                    .collect()
+            },
+        };
+        if session.panes.is_empty() {
+            if let Err(e) = config::SavedSession::clear() {
+                ui.session_warnings
+                    .push(format!("Warning: failed to clear session: {e}"));
+            }
+        } else if let Err(e) = session.save() {
+            ui.session_warnings
+                .push(format!("Warning: failed to save session: {e}"));
+        }
+    }
+
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
     );
     ratatui::restore();
+
+    // Flush accumulated session warnings now that the terminal is restored.
+    for warning in &ui.session_warnings {
+        eprintln!("{warning}");
+    }
+
     Ok(())
 }
 
@@ -2166,12 +2185,12 @@ fn render_frame(
     active_mode_name: Option<&str>,
 ) {
     let area = frame.area();
+    let palette = ui.palette;
 
-    // Force true-black background so dark-optimised colors are always readable,
-    // regardless of terminal theme (ANSI "Black" can be remapped by themes).
-    let true_black = Color::Rgb(0, 0, 0);
+    // Fill entire frame with terminal background so nothing falls through
+    // to the alternate screen default (which may be black on light themes).
     frame.render_widget(
-        ratatui::widgets::Block::default().style(Style::default().bg(true_black)),
+        Block::default().style(Style::default().bg(palette.terminal_bg)),
         area,
     );
 
@@ -2205,7 +2224,7 @@ fn render_frame(
         let msg = Paragraph::new(format!(
             "No active sessions. Press {MOD_KEY}+n to create a pane."
         ))
-        .style(Style::default().fg(Color::Gray))
+        .style(Style::default().fg(palette.text_secondary))
         .centered();
         frame.render_widget(msg, vertical[1]);
         render_bottom_bar(frame, ui, hints_area, has_pane_control);
@@ -2218,16 +2237,17 @@ fn render_frame(
                 pane_layout,
                 &ui.pane_display_names,
                 &ui.selection,
+                palette,
             );
         }
 
         if ui.mode == UiMode::Help {
-            render_help_overlay(frame, has_pane_control, active_mode_name);
+            render_help_overlay(frame, has_pane_control, active_mode_name, palette);
         }
         if ui.mode == UiMode::DirPicker
             && let Some(picker) = ui.dir_picker.as_mut()
         {
-            render_dir_picker(frame, picker);
+            render_dir_picker(frame, picker, palette);
         }
         if ui.mode == UiMode::ModeSelector
             && let Some(ref selector) = ui.mode_selector
@@ -2237,10 +2257,10 @@ fn render_frame(
         if ui.mode == UiMode::NewPaneForm
             && let Some(ref form) = ui.new_pane_form
         {
-            render_new_pane_form(frame, form);
+            render_new_pane_form(frame, form, palette);
         }
         if ui.mode == UiMode::QuitConfirm {
-            render_quit_confirm(frame);
+            render_quit_confirm(frame, palette);
         }
         return;
     }
@@ -2274,7 +2294,7 @@ fn render_frame(
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(title_text, Style::default().fg(Color::Gray)),
+        Span::styled(title_text, Style::default().fg(palette.text_secondary)),
     ]));
 
     if sessions.is_empty() {
@@ -2288,7 +2308,7 @@ fn render_frame(
         frame.render_widget(title, vertical[0]);
 
         let msg = Paragraph::new("No sessions match filter.")
-            .style(Style::default().fg(Color::Gray))
+            .style(Style::default().fg(palette.text_secondary))
             .centered();
         let inner = Layout::vertical([
             Constraint::Fill(1),
@@ -2303,6 +2323,7 @@ fn render_frame(
             &state.aggregate_stats(),
             vertical[2],
             active_mode_name,
+            palette,
         );
         render_bottom_bar(frame, ui, hints_area, has_pane_control);
         // Still render live terminal panes even when filter matches zero sessions.
@@ -2314,6 +2335,7 @@ fn render_frame(
                 pane_layout,
                 &ui.pane_display_names,
                 &ui.selection,
+                palette,
             );
         }
         return;
@@ -2372,6 +2394,7 @@ fn render_frame(
                 display_name,
                 card_number,
                 density,
+                palette,
             );
         }
     }
@@ -2383,6 +2406,7 @@ fn render_frame(
         &state.aggregate_stats(),
         stats_area,
         active_mode_name,
+        palette,
     );
 
     // Full-width hints bar
@@ -2397,17 +2421,18 @@ fn render_frame(
             pane_layout,
             &ui.pane_display_names,
             &ui.selection,
+            palette,
         );
     }
 
     // Overlays (drawn last, on top)
     if ui.mode == UiMode::Help {
-        render_help_overlay(frame, has_pane_control, active_mode_name);
+        render_help_overlay(frame, has_pane_control, active_mode_name, palette);
     }
     if ui.mode == UiMode::DirPicker
         && let Some(picker) = ui.dir_picker.as_mut()
     {
-        render_dir_picker(frame, picker);
+        render_dir_picker(frame, picker, palette);
     }
     if ui.mode == UiMode::ModeSelector
         && let Some(ref selector) = ui.mode_selector
@@ -2417,10 +2442,10 @@ fn render_frame(
     if ui.mode == UiMode::NewPaneForm
         && let Some(ref form) = ui.new_pane_form
     {
-        render_new_pane_form(frame, form);
+        render_new_pane_form(frame, form, palette);
     }
     if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame);
+        render_quit_confirm(frame, palette);
     }
 }
 
@@ -2431,6 +2456,7 @@ fn render_terminal_panes(
     layout: PaneLayout,
     display_names: &HashMap<String, String>,
     selection: &Option<TextSelection>,
+    palette: ColorPalette,
 ) -> Option<Rect> {
     let ctrl = embedded?;
     let pane_ids = ctrl.pane_ids();
@@ -2468,7 +2494,7 @@ fn render_terminal_panes(
                 if let Some(screen) = ctrl.get_screen(pane_id) {
                     let focused = focused_id.as_deref() == Some(pane_id.as_str());
                     let title = pane_name(pane_id);
-                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused);
+                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused, palette);
                     if focused {
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
@@ -2506,7 +2532,8 @@ fn render_terminal_panes(
                 if is_expanded {
                     if let Some(screen) = ctrl.get_screen(pane_id) {
                         let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
-                        let widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused);
+                        let widget =
+                            TerminalWidget::new(Arc::clone(&screen), title, is_focused, palette);
                         if is_focused {
                             focused_pane_rect = Some(chunks[i]);
                             focused_screen = Some(screen);
@@ -2515,12 +2542,10 @@ fn render_terminal_panes(
                     }
                 } else {
                     // Collapsed: show a titled border block.
-                    let true_black = Color::Rgb(0, 0, 0);
                     let block = Block::default()
                         .borders(Borders::TOP)
-                        .border_style(Style::default().fg(Color::Gray))
-                        .title(format!(" {title} "))
-                        .style(Style::default().bg(true_black));
+                        .border_style(Style::default().fg(palette.text_secondary))
+                        .title(format!(" {title} "));
                     frame.render_widget(block, chunks[i]);
                 }
             }
@@ -2592,6 +2617,7 @@ fn render_stats_bar(
     stats: &DashboardStats,
     area: Rect,
     active_mode_name: Option<&str>,
+    palette: ColorPalette,
 ) {
     let mut spans: Vec<Span> = Vec::new();
 
@@ -2609,14 +2635,14 @@ fn render_stats_bar(
         (stats.compacting, "compacting", Color::Magenta),
         (stats.waiting, "waiting", Color::Yellow),
         (stats.errors, "error", Color::Red),
-        (stats.idle, "idle", Color::Gray),
+        (stats.idle, "idle", palette.text_secondary),
     ];
 
     for &(count, label, color) in segments {
         if count > 0 {
             spans.push(Span::styled(
                 "  \u{2502}  ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette.text_muted),
             ));
             spans.push(Span::styled(
                 format!("{count} {label}"),
@@ -2628,11 +2654,11 @@ fn render_stats_bar(
     // Always show total tools
     spans.push(Span::styled(
         "  \u{2502}  ",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette.text_muted),
     ));
     spans.push(Span::styled(
         format!("{} tools", stats.total_tools),
-        Style::default().fg(Color::Gray),
+        Style::default().fg(palette.text_secondary),
     ));
 
     if let Some(name) = active_mode_name {
@@ -2694,7 +2720,10 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
                 } else {
                     format!("?: help  1-9: jump  {MOD_KEY}+c: quit")
                 };
-                let mut spans = vec![Span::styled(hints, Style::default().fg(Color::Gray))];
+                let mut spans = vec![Span::styled(
+                    hints,
+                    Style::default().fg(ui.palette.text_secondary),
+                )];
                 if let Some(ref latest) = ui.update_available {
                     spans.push(Span::raw("  "));
                     spans.push(Span::styled(
@@ -2715,7 +2744,7 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
     }
 }
 
-fn render_quit_confirm(frame: &mut Frame) {
+fn render_quit_confirm(frame: &mut Frame, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 44.min(area.width.saturating_sub(4));
     let popup_height = 7u16.min(area.height.saturating_sub(4));
@@ -2747,17 +2776,21 @@ fn render_quit_confirm(frame: &mut Frame) {
         )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
-
+        .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_help_overlay(frame: &mut Frame, has_pane_control: bool, active_mode_name: Option<&str>) {
+fn render_help_overlay(
+    frame: &mut Frame,
+    has_pane_control: bool,
+    active_mode_name: Option<&str>,
+    palette: ColorPalette,
+) {
     let area = frame.area();
     let popup_width = 52.min(area.width.saturating_sub(4));
     let mode_lines: u16 = if active_mode_name.is_some() { 8 } else { 6 };
-    let base_height: u16 = if has_pane_control { 38 } else { 23 } + mode_lines;
+    let base_height: u16 = if has_pane_control { 43 } else { 28 } + mode_lines;
     let popup_height = base_height.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -2801,6 +2834,7 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool, active_mode_na
     }
 
     help_text.push(Line::from(""));
+    help_text.push(Line::from(""));
     help_text.push(Line::styled(
         "  Mode Selector",
         Style::default()
@@ -2823,33 +2857,31 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool, active_mode_na
 
     help_text.push(Line::from(""));
     help_text.push(Line::styled(
-        "  Permission Approval",
+        "  Session",
         Style::default()
-            .fg(Color::LightMagenta)
+            .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     ));
     help_text.push(Line::from(""));
-    // TODO(prd-38): permission UI disabled — see PRD for redesign
-    // help_text.push(Line::from("  y             Allow permission"));
-    // help_text.push(Line::from("  n             Deny permission"));
-    // help_text.push(Line::from("  (only when card has pending prompt)"));
+    help_text.push(Line::from("  Panes auto-saved on exit."));
+    help_text.push(Line::from("  Restore: dot-agent-deck --continue"));
 
     help_text.push(Line::from(""));
     help_text.push(Line::styled(
         "  Press ? or Esc to close",
-        Style::default().fg(Color::Gray),
+        Style::default().fg(palette.text_secondary),
     ));
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Help ")
         .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+        .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(help_text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
+fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 60.min(area.width.saturating_sub(4));
     let popup_height = 20u16.min(area.height.saturating_sub(4));
@@ -2878,10 +2910,13 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
     )];
 
     if show_filter_row {
-        let mut spans = vec![Span::styled("  / ", Style::default().fg(Color::Gray))];
+        let mut spans = vec![Span::styled(
+            "  / ",
+            Style::default().fg(palette.text_secondary),
+        )];
         spans.push(Span::styled(
             picker.filter_text.clone(),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette.text_primary),
         ));
         if picker.filtering {
             spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
@@ -2897,7 +2932,10 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
         } else {
             "  (no matching directories)"
         };
-        lines.push(Line::styled(message, Style::default().fg(Color::DarkGray)));
+        lines.push(Line::styled(
+            message,
+            Style::default().fg(palette.text_muted),
+        ));
     } else {
         for (i, entry_idx) in picker
             .filtered_indices
@@ -2935,7 +2973,10 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
     } else {
         "  j/k or ↑↓: navigate  l/Enter: open  Space: select  h/Backspace: up"
     };
-    lines.push(Line::styled(nav_footer, Style::default().fg(Color::Gray)));
+    lines.push(Line::styled(
+        nav_footer,
+        Style::default().fg(palette.text_secondary),
+    ));
     let mode_footer = if picker.filtering {
         "  Typing: add characters  Enter: accept filter  Esc: clear"
     } else if !picker.filter_text.is_empty() {
@@ -2943,13 +2984,16 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
     } else {
         "  /: filter directories  Esc or q: cancel"
     };
-    lines.push(Line::styled(mode_footer, Style::default().fg(Color::Gray)));
+    lines.push(Line::styled(
+        mode_footer,
+        Style::default().fg(palette.text_secondary),
+    ));
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Select Directory ")
         .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+        .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 }
@@ -3034,7 +3078,7 @@ fn render_mode_selector(frame: &mut Frame, selector: &ModeSelectorState) {
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
+fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 56.min(area.width.saturating_sub(4));
     let popup_height = 12u16.min(area.height.saturating_sub(4));
@@ -3051,14 +3095,14 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(palette.text_secondary)
     };
     let cmd_style = if form.focused == FormField::Command {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(palette.text_secondary)
     };
 
     let dir_display = form.dir.display().to_string();
@@ -3077,9 +3121,9 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
                     width = inner_width.saturating_sub(11)
                 ),
                 if form.focused == FormField::Name {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(palette.text_primary)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(palette.text_secondary)
                 },
             ),
         ]),
@@ -3093,9 +3137,9 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
                     width = inner_width.saturating_sub(11)
                 ),
                 if form.focused == FormField::Command {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(palette.text_primary)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(palette.text_secondary)
                 },
             ),
         ]),
@@ -3103,7 +3147,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
         Line::from(""),
         Line::styled(
             "  Tab: switch field  Enter: next/confirm  Esc: cancel",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(palette.text_secondary),
         ),
     ];
 
@@ -3111,7 +3155,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
         .borders(Borders::ALL)
         .title(" New Pane ")
         .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+        .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 
@@ -3148,9 +3192,10 @@ fn render_session_card(
     display_name: Option<&String>,
     card_number: Option<u8>,
     density: CardDensity,
+    palette: ColorPalette,
 ) {
     let (status_label, status_style) = status_style(&session.status);
-    let status_color = status_style.fg.unwrap_or(Color::Gray);
+    let status_color = status_style.fg.unwrap_or(palette.text_secondary);
 
     let id_display = if session.session_id.len() > 11 {
         &session.session_id[..11]
@@ -3178,9 +3223,6 @@ fn render_session_card(
     let max_title = (area.width as usize).saturating_sub(status_text.chars().count() + 2);
     title_left = truncate_with_ellipsis(&title_left, max_title);
 
-    // TODO(prd-38): permission UI disabled — see PRD for redesign
-    let has_permission = false;
-
     let border_style = if is_selected {
         Style::default()
             .fg(Color::Cyan)
@@ -3189,20 +3231,13 @@ fn render_session_card(
         Style::default().fg(status_color)
     };
 
-    let card_bg = if is_selected {
-        Color::Rgb(20, 25, 45)
-    } else {
-        Color::Rgb(0, 0, 0)
-    };
-
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .style(Style::default().bg(card_bg))
         .title(Span::styled(
             title_left,
             Style::default()
-                .fg(Color::White)
+                .fg(palette.text_primary)
                 .add_modifier(Modifier::BOLD),
         ))
         .title_alignment(ratatui::layout::Alignment::Left)
@@ -3210,6 +3245,10 @@ fn render_session_card(
             Line::from(Span::styled(status_text, status_style))
                 .alignment(ratatui::layout::Alignment::Right),
         );
+
+    if is_selected {
+        block = block.style(Style::default().bg(palette.selected_bg));
+    }
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -3230,9 +3269,9 @@ fn render_session_card(
 
     if wide {
         let right_spans = vec![
-            Span::styled("Last: ", Style::default().fg(Color::Gray)),
+            Span::styled("Last: ", Style::default().fg(palette.text_secondary)),
             Span::raw(format!("{}  ", elapsed)),
-            Span::styled("Tools: ", Style::default().fg(Color::Gray)),
+            Span::styled("Tools: ", Style::default().fg(palette.text_secondary)),
             Span::raw(session.tool_count.to_string()),
         ];
         let right_len: usize = right_spans.iter().map(|s| s.width()).sum();
@@ -3243,7 +3282,7 @@ fn render_session_card(
 
         lines.push(padded_line(
             vec![
-                Span::styled("Dir:  ", Style::default().fg(Color::Gray)),
+                Span::styled("Dir:  ", Style::default().fg(palette.text_secondary)),
                 Span::raw(dir_display),
             ],
             right_spans,
@@ -3251,7 +3290,7 @@ fn render_session_card(
         ));
     } else {
         lines.push(Line::from(vec![
-            Span::styled("Dir:  ", Style::default().fg(Color::Gray)),
+            Span::styled("Dir:  ", Style::default().fg(palette.text_secondary)),
             Span::raw(cwd_display),
         ]));
     }
@@ -3262,16 +3301,16 @@ fn render_session_card(
         let max_prompt = w.saturating_sub(6);
         let display = truncate_with_ellipsis(prompt, max_prompt);
         lines.push(Line::from(vec![
-            Span::styled(prefix, Style::default().fg(Color::Gray)),
+            Span::styled(prefix, Style::default().fg(palette.text_secondary)),
             Span::raw(display),
         ]));
     }
 
     if !wide {
         lines.push(Line::from(vec![
-            Span::styled("Last: ", Style::default().fg(Color::Gray)),
+            Span::styled("Last: ", Style::default().fg(palette.text_secondary)),
             Span::raw(format!("{}  ", elapsed)),
-            Span::styled("Tools: ", Style::default().fg(Color::Gray)),
+            Span::styled("Tools: ", Style::default().fg(palette.text_secondary)),
             Span::raw(session.tool_count.to_string()),
         ]));
     }
@@ -3279,24 +3318,8 @@ fn render_session_card(
     if density != CardDensity::Compact {
         lines.push(Line::from(""));
     }
-    let mut tool_lines = recent_tool_lines(session, density.max_tools());
-    if has_permission && let Some(last) = tool_lines.last_mut() {
-        *last = last.clone().style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
-    }
+    let tool_lines = recent_tool_lines(session, density.max_tools(), palette);
     lines.extend(tool_lines);
-
-    if has_permission {
-        lines.push(Line::from(Span::styled(
-            "  [y] approve  [n] deny",
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
-        )));
-    }
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
@@ -3318,7 +3341,9 @@ fn padded_line<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> L
 }
 
 fn flash_dot(status: &SessionStatus, tick: u64) -> &'static str {
-    if *status == SessionStatus::WaitingForInput && tick % 2 == 1 {
+    let needs_attention =
+        *status == SessionStatus::WaitingForInput || *status == SessionStatus::Idle;
+    if needs_attention && (tick / 30) % 2 == 1 {
         " "
     } else {
         "●"
@@ -3344,7 +3369,11 @@ fn collect_recent_prompts(session: &SessionState, max: usize) -> Vec<String> {
     prompts
 }
 
-fn recent_tool_lines(session: &SessionState, max_tools: usize) -> Vec<Line<'static>> {
+fn recent_tool_lines(
+    session: &SessionState,
+    max_tools: usize,
+    palette: ColorPalette,
+) -> Vec<Line<'static>> {
     let tool_events: Vec<_> = session
         .recent_events
         .iter()
@@ -3366,7 +3395,7 @@ fn recent_tool_lines(session: &SessionState, max_tools: usize) -> Vec<Line<'stat
             } else {
                 format!("  {} — {}", name, detail)
             };
-            Line::styled(text, Style::default().fg(Color::Rgb(140, 140, 140)))
+            Line::styled(text, Style::default().fg(palette.text_muted))
         })
         .collect()
 }
@@ -3584,10 +3613,10 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             pane_id: None,
-            pending_permissions: VecDeque::new(),
         };
 
-        let lines = recent_tool_lines(&session, 3);
+        let palette = ColorPalette::dark();
+        let lines = recent_tool_lines(&session, 3, palette);
         assert_eq!(lines.len(), 3);
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert_eq!(text[0], "  Write — out.txt");
@@ -3595,7 +3624,7 @@ mod tests {
         assert_eq!(text[2], "  Grep — pattern");
 
         // Compact mode: only 1 tool (most recent)
-        let lines_compact = recent_tool_lines(&session, 1);
+        let lines_compact = recent_tool_lines(&session, 1, palette);
         assert_eq!(lines_compact.len(), 1);
         assert_eq!(lines_compact[0].to_string(), "  Grep — pattern");
     }
@@ -3651,21 +3680,33 @@ mod tests {
 
     #[test]
     fn test_flash_dot() {
+        // WaitingForInput: visible in first half (ticks 0–29), hidden in second half (30–59)
         assert_eq!(
             flash_dot(&crate::state::SessionStatus::WaitingForInput, 0),
             "●"
         );
         assert_eq!(
-            flash_dot(&crate::state::SessionStatus::WaitingForInput, 1),
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 29),
+            "●"
+        );
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 30),
             " "
         );
         assert_eq!(
-            flash_dot(&crate::state::SessionStatus::WaitingForInput, 2),
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 59),
+            " "
+        );
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 60),
             "●"
         );
+        // Idle also blinks
+        assert_eq!(flash_dot(&crate::state::SessionStatus::Idle, 0), "●");
+        assert_eq!(flash_dot(&crate::state::SessionStatus::Idle, 30), " ");
+        // Working never blinks
         assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 0), "●");
-        assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 1), "●");
-        assert_eq!(flash_dot(&crate::state::SessionStatus::Idle, 1), "●");
+        assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 30), "●");
     }
 
     #[test]
@@ -4188,7 +4229,6 @@ mod tests {
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
             &mut ui,
             3,
-            false,
         );
         assert_eq!(ui.mode, UiMode::Filter);
 
@@ -4201,7 +4241,6 @@ mod tests {
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
             &mut ui,
             3,
-            false,
         );
         assert_eq!(ui.mode, UiMode::Help);
 
@@ -4214,7 +4253,6 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             3,
-            false,
         );
         assert_eq!(ui.mode, UiMode::Rename);
 
@@ -4307,12 +4345,7 @@ mod tests {
         let mut ui = default_ui();
         ui.filter_text = "active-filter".to_string();
 
-        handle_normal_key(
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &mut ui,
-            5,
-            false,
-        );
+        handle_normal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui, 5);
         assert!(ui.filter_text.is_empty());
     }
 
@@ -4324,7 +4357,6 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             0,
-            false,
         );
         assert_eq!(ui.mode, UiMode::Normal);
     }
@@ -4346,7 +4378,6 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             pane_id: None,
-            pending_permissions: std::collections::VecDeque::new(),
         }
     }
 
@@ -4536,7 +4567,6 @@ mod tests {
             tool_count: 0,
             last_user_prompt: Some("third prompt".to_string()),
             pane_id: None,
-            pending_permissions: VecDeque::new(),
         };
 
         // Spacious: get all 3
@@ -4568,7 +4598,6 @@ mod tests {
             tool_count: 0,
             last_user_prompt: Some("old prompt".to_string()),
             pane_id: None,
-            pending_permissions: VecDeque::new(),
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -4591,7 +4620,6 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             pane_id: None,
-            pending_permissions: VecDeque::new(),
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -4976,7 +5004,6 @@ mod tests {
             last_activity: Utc::now(),
             recent_events: VecDeque::from(events),
             last_user_prompt: None,
-            pending_permissions: VecDeque::new(),
         }
     }
 

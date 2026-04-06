@@ -1,16 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 
 use crate::event::{AgentEvent, AgentType, EventType};
-
-pub type PermissionResponders = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>>;
-
-pub fn new_permission_responders() -> PermissionResponders {
-    Arc::new(Mutex::new(HashMap::new()))
-}
 
 const MAX_RECENT_EVENTS: usize = 50;
 
@@ -42,14 +36,6 @@ pub struct ActiveTool {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingPermission {
-    pub tool_name: Option<String>,
-    pub tool_detail: Option<String>,
-    pub tool_use_id: String,
-    pub requested_at: DateTime<Utc>,
-}
-
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub session_id: String,
@@ -63,7 +49,6 @@ pub struct SessionState {
     pub tool_count: u32,
     pub last_user_prompt: Option<String>,
     pub pane_id: Option<String>,
-    pub pending_permissions: VecDeque<PendingPermission>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -74,36 +59,10 @@ pub struct AppState {
     /// Set by the background version-check task when a newer release exists.
     pub update_available: Option<String>,
     /// Pane IDs created by our app — events from unknown panes are rejected.
-    managed_pane_ids: HashSet<String>,
+    pub managed_pane_ids: HashSet<String>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
-
-impl PendingPermission {
-    fn from_event(event: &AgentEvent) -> Option<Self> {
-        let tool_use_id = event.metadata.get("tool_use_id")?.clone();
-        Some(Self {
-            tool_name: event.tool_name.clone(),
-            tool_detail: event.tool_detail.clone(),
-            tool_use_id,
-            requested_at: event.timestamp,
-        })
-    }
-}
-
-impl SessionState {
-    pub fn resolve_pending_permission(&mut self, tool_use_id: &str) -> Option<PendingPermission> {
-        let position = self
-            .pending_permissions
-            .iter()
-            .position(|permission| permission.tool_use_id == tool_use_id)?;
-        self.pending_permissions.remove(position)
-    }
-
-    pub fn next_pending_permission(&self) -> Option<&PendingPermission> {
-        self.pending_permissions.front()
-    }
-}
 
 impl AppState {
     pub fn aggregate_stats(&self) -> DashboardStats {
@@ -198,7 +157,6 @@ impl AppState {
                 tool_count: 0,
                 last_user_prompt: None,
                 pane_id: event.pane_id.clone(),
-                pending_permissions: VecDeque::new(),
             });
 
         session.last_activity = event.timestamp;
@@ -232,25 +190,11 @@ impl AppState {
                 });
             }
             EventType::ToolEnd => {
-                if session.status == SessionStatus::WaitingForInput {
-                    session.status = SessionStatus::Working;
-                }
                 session.active_tool = None;
                 session.tool_count += 1;
             }
-            EventType::WaitingForInput => {
-                // Always trust Notification events from Claude Code — they
-                // fire specifically when the session needs user attention
-                // (permission prompts, AskUserQuestion, etc.).  PreToolUse
-                // fires before Notification for permission prompts, so the
-                // active_tool guard was incorrectly suppressing them.
+            EventType::WaitingForInput | EventType::PermissionRequest => {
                 session.status = SessionStatus::WaitingForInput;
-            }
-            EventType::PermissionRequest => {
-                session.status = SessionStatus::WaitingForInput;
-                if let Some(permission) = PendingPermission::from_event(&event) {
-                    session.pending_permissions.push_back(permission);
-                }
             }
             EventType::Idle => {
                 session.status = SessionStatus::Idle;
@@ -269,33 +213,10 @@ impl AppState {
             EventType::SessionEnd => unreachable!(),
         }
 
-        // Clear stale permissions when session moves past waiting state
-        if !matches!(
-            event.event_type,
-            EventType::PermissionRequest | EventType::WaitingForInput
-        ) && !session.pending_permissions.is_empty()
-            && matches!(
-                session.status,
-                SessionStatus::Working | SessionStatus::Thinking | SessionStatus::Idle
-            )
-        {
-            session.pending_permissions.clear();
-        }
-
         session.recent_events.push_back(event);
         if session.recent_events.len() > MAX_RECENT_EVENTS {
             session.recent_events.pop_front();
         }
-    }
-
-    pub fn resolve_permission(
-        &mut self,
-        session_id: &str,
-        tool_use_id: &str,
-    ) -> Option<PendingPermission> {
-        self.sessions
-            .get_mut(session_id)
-            .and_then(|session| session.resolve_pending_permission(tool_use_id))
     }
 }
 
@@ -594,53 +515,23 @@ mod tests {
     }
 
     #[test]
-    fn permission_request_event_enqueues_pending_permissions() {
+    fn permission_request_sets_waiting_for_input() {
         let mut state = AppState::default();
         state.apply_event(make_event("s1", EventType::SessionStart));
-
-        let mut permission = make_event("s1", EventType::PermissionRequest);
-        permission.tool_name = Some("Bash".into());
-        permission.tool_detail = Some("rm -rf /".into());
-        permission
-            .metadata
-            .insert("tool_use_id".into(), "perm-1".into());
-        state.apply_event(permission);
-
-        let session = &state.sessions["s1"];
-        assert_eq!(session.pending_permissions.len(), 1);
-        let pending = session.pending_permissions.front().unwrap();
-        assert_eq!(pending.tool_use_id, "perm-1");
-        assert_eq!(pending.tool_name.as_deref(), Some("Bash"));
-        assert_eq!(pending.tool_detail.as_deref(), Some("rm -rf /"));
+        state.apply_event(make_event("s1", EventType::PermissionRequest));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
     }
 
     #[test]
-    fn resolve_permission_removes_matching_entry() {
+    fn tool_start_clears_waiting_for_input() {
         let mut state = AppState::default();
         state.apply_event(make_event("s1", EventType::SessionStart));
+        state.apply_event(make_event("s1", EventType::WaitingForInput));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
 
-        let mut first = make_event("s1", EventType::PermissionRequest);
-        first.metadata.insert("tool_use_id".into(), "perm-1".into());
-        state.apply_event(first);
-
-        let mut second = make_event("s1", EventType::PermissionRequest);
-        second
-            .metadata
-            .insert("tool_use_id".into(), "perm-2".into());
-        state.apply_event(second);
-
-        assert_eq!(state.sessions["s1"].pending_permissions.len(), 2);
-
-        let removed = state.resolve_permission("s1", "perm-1").unwrap();
-        assert_eq!(removed.tool_use_id, "perm-1");
-        assert_eq!(state.sessions["s1"].pending_permissions.len(), 1);
-        assert_eq!(
-            state.sessions["s1"]
-                .pending_permissions
-                .front()
-                .unwrap()
-                .tool_use_id,
-            "perm-2"
-        );
+        let mut tool_start = make_event("s1", EventType::ToolStart);
+        tool_start.tool_name = Some("Bash".into());
+        state.apply_event(tool_start);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
     }
 }

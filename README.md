@@ -29,6 +29,9 @@ dot-agent-deck hooks install --agent opencode   # OpenCode
 
 # 3. Launch the dashboard
 dot-agent-deck
+
+# 4. Or resume your previous session
+dot-agent-deck --continue
 ```
 
 Once the dashboard is running, press `?` inside the app to see all shortcuts.
@@ -124,6 +127,18 @@ Cards also display: session ID, agent type, working directory, tool count, and l
 
 > **Tip:** Press `Ctrl+d` from any pane to jump back to the dashboard.
 
+### Session Management
+
+The dashboard automatically saves your open panes (directories, names, and commands) when you exit. To restore them next time:
+
+```bash
+dot-agent-deck --continue
+```
+
+Without `--continue`, the dashboard starts with a blank slate. If a saved directory no longer exists, that pane is skipped with a warning.
+
+Session data is stored in `~/.config/dot-agent-deck/session.toml`.
+
 ## Keyboard Shortcuts
 
 ### Dashboard Pane (active when the dashboard is focused)
@@ -192,6 +207,7 @@ dot-agent-deck config get default_command
 |---|---|---|
 | `DOT_AGENT_DECK_SOCKET` | `$XDG_RUNTIME_DIR/dot-agent-deck.sock` or `/tmp/dot-agent-deck.sock` | Unix socket path for daemon IPC |
 | `DOT_AGENT_DECK_CONFIG` | `~/.config/dot-agent-deck/config.toml` | Config file path |
+| `DOT_AGENT_DECK_SESSION` | `~/.config/dot-agent-deck/session.toml` | Session file path |
 | `DOT_AGENT_DECK_LOG` | *(unset)* | Set to any value to enable tracing logs on stderr |
 
 ## License

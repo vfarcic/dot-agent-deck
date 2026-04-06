@@ -8,14 +8,23 @@ use dot_agent_deck::config::{DashboardConfig, socket_path};
 use dot_agent_deck::daemon::run_daemon;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::hooks_manage;
-use dot_agent_deck::state::{AppState, new_permission_responders};
+use dot_agent_deck::state::AppState;
+use dot_agent_deck::theme::Theme;
 use dot_agent_deck::ui::run_tui;
 
 #[derive(Parser)]
 #[command(name = "dot-agent-deck", about = "AI agent session dashboard", version = env!("DAD_VERSION"))]
 struct Cli {
+    /// Restore pane session from last exit
+    #[arg(long = "continue")]
+    continue_session: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Color theme: auto-detect, force light, or force dark
+    #[arg(long, value_enum)]
+    theme: Option<Theme>,
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -27,8 +36,6 @@ enum CliAgent {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the dashboard (default when no subcommand)
-    Dashboard,
     /// Handle an agent hook event (reads stdin, sends to socket)
     Hook {
         /// Agent type
@@ -89,8 +96,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        None | Some(Commands::Dashboard) => {
-            run_dashboard();
+        None => {
+            run_dashboard(cli.theme, cli.continue_session);
             ExitCode::SUCCESS
         }
         Some(Commands::Hook { agent }) => {
@@ -155,7 +162,7 @@ fn main() -> ExitCode {
 }
 
 #[tokio::main]
-async fn run_dashboard() {
+async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     // Optional file-based logging when DOT_AGENT_DECK_LOG is set
     if std::env::var("DOT_AGENT_DECK_LOG").is_ok() {
         tracing_subscriber::fmt()
@@ -168,14 +175,12 @@ async fn run_dashboard() {
     }
 
     let state = Arc::new(RwLock::new(AppState::default()));
-    let responders = new_permission_responders();
     let path = socket_path();
 
     let daemon_state = state.clone();
-    let daemon_responders = responders.clone();
     let daemon_path = path.clone();
     let daemon_handle = tokio::spawn(async move {
-        if let Err(e) = run_daemon(&daemon_path, daemon_state, daemon_responders).await {
+        if let Err(e) = run_daemon(&daemon_path, daemon_state).await {
             eprintln!("Daemon error: {e}");
         }
     });
@@ -188,11 +193,19 @@ async fn run_dashboard() {
     });
 
     let config = dot_agent_deck::config::DashboardConfig::load();
+    let effective_theme = cli_theme.unwrap_or(config.theme);
+    // Detect terminal theme *before* raw mode / alternate screen takes over.
+    let palette = dot_agent_deck::theme::resolve_palette(effective_theme);
     let pane_controller = dot_agent_deck::pane::detect_multiplexer();
     let tui_state = state.clone();
-    let tui_responders = responders.clone();
     let tui_result = tokio::task::spawn_blocking(move || {
-        run_tui(tui_state, pane_controller, config, tui_responders)
+        run_tui(
+            tui_state,
+            pane_controller,
+            config,
+            palette,
+            continue_session,
+        )
     })
     .await;
 
