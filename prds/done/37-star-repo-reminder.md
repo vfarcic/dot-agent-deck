@@ -27,7 +27,7 @@ A local state file tracks the launch count and user preference. The dialog follo
 - "Don't ask again" permanently suppresses the dialog
 - Dialog includes the repo URL and brief message
 - Dialog appears at startup before the main loop takes over
-- Keyboard handling: `y` opens the repo URL (if possible) or shows it, `l` for later, `d` for don't ask again, `Esc` for later
+- Keyboard handling: `s` opens the repo URL and dismisses permanently, `l` for later, `d` for don't ask again, `Esc` for later
 
 ### Out of Scope
 - Checking whether the user has actually starred the repo (requires GitHub API auth)

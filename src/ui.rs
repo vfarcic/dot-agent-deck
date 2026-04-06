@@ -732,13 +732,14 @@ fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
 fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     match key.code {
         KeyCode::Char('s') => {
-            let _ = open::that("https://github.com/vfarcic/dot-agent-deck");
+            let msg = if open::that("https://github.com/vfarcic/dot-agent-deck").is_ok() {
+                "Thanks for starring! ⭐".to_string()
+            } else {
+                "Visit github.com/vfarcic/dot-agent-deck to star ⭐".to_string()
+            };
             ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
-            ui.status_message = Some((
-                "Thanks for starring! ⭐".to_string(),
-                std::time::Instant::now(),
-            ));
+            ui.status_message = Some((msg, std::time::Instant::now()));
             KeyResult::Continue
         }
         KeyCode::Char('l') | KeyCode::Esc => {
@@ -1998,7 +1999,7 @@ fn render_frame(
             render_new_pane_form(frame, form, palette);
         }
         if ui.mode == UiMode::StarPrompt {
-            render_star_prompt(frame);
+            render_star_prompt(frame, palette);
         }
         if ui.mode == UiMode::QuitConfirm {
             render_quit_confirm(frame, palette);
@@ -2167,6 +2168,9 @@ fn render_frame(
         && let Some(ref form) = ui.new_pane_form
     {
         render_new_pane_form(frame, form, palette);
+    }
+    if ui.mode == UiMode::StarPrompt {
+        render_star_prompt(frame, palette);
     }
     if ui.mode == UiMode::QuitConfirm {
         render_quit_confirm(frame, palette);
@@ -2486,7 +2490,7 @@ fn render_quit_confirm(frame: &mut Frame, palette: ColorPalette) {
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_star_prompt(frame: &mut Frame) {
+fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 50u16.min(area.width.saturating_sub(4));
     let popup_height = 10u16.min(area.height.saturating_sub(4));
@@ -2529,7 +2533,7 @@ fn render_star_prompt(frame: &mut Frame) {
         )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+        .style(Style::default().bg(palette.terminal_bg));
 
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
