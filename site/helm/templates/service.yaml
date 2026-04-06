@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dot-agent-deck-docs.fullname" . }}
+  labels:
+    {{- include "dot-agent-deck-docs.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "dot-agent-deck-docs.selectorLabels" . | nindent 4 }}

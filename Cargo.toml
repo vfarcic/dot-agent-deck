@@ -20,6 +20,7 @@ semver = "1"
 portable-pty = "0.8"
 vt100 = "0.16"
 regex = "1"
+open = "5"
 terminal-colorsaurus = "1"
 
 [dev-dependencies]

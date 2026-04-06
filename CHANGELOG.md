@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.16.0] - 2026-04-06
+
+### Added
+
+- **Project Documentation Site**
+  A dedicated documentation site built with Docusaurus v3 replaces the monolithic README as the primary resource for users. Previously, all guides, configuration details, and feature overviews lived in the README, making it increasingly difficult to navigate as the project grew.
+  The site covers the core user journey: installation, getting started, configuration, keyboard shortcuts, session management, and licensing. A custom homepage provides a polished entry point with feature highlights and quick-start links. The docs directory in the repository serves as the single source of truth — update a Markdown file and the site rebuilds automatically.
+  Deployment uses a multi-stage Docker build (Node.js builder + nginx) published to ghcr.io, with a Helm chart for Kubernetes hosting monitored by Argo CD. The CI/CD pipeline builds and publishes the docs image as part of the release workflow on version tags.
+  Visit the documentation at [agent-deck.devopstoolkit.ai](https://agent-deck.devopstoolkit.ai).
+- **Star Repo Reminder Dialog**
+  A non-intrusive dialog now appears every 10 launches encouraging you to star the GitHub repository. The dialog offers three options: press `s` to open the repo in your browser and dismiss permanently, `l` or `Esc` to snooze (reminder returns after 10 more launches), or `d` to permanently hide the dialog.
+  State is persisted in `~/.config/dot-agent-deck/star-prompt-state.json` so your preference survives across sessions.
+- **Arrow Key Navigation Focuses Panes**
+  Arrow keys and vim-style navigation (`j`/`k`/`h`/`l`) on the dashboard now focus the selected session's pane, matching the behavior of the 1-9 number key shortcuts. Previously, arrow keys only moved the card highlight without switching the pane view.
+
+### Fixed
+
+- **"Needs Input" Status Clears After Tool Completion**
+  Dashboard session cards no longer remain stuck on "Needs Input" after a permission-gated tool finishes executing. Previously, approving a tool (e.g., a long-running `gcloud` command) left the status as "Needs Input" indefinitely because the `PostToolUse` event did not update the session status. The status now transitions to "Thinking" once the tool completes, accurately reflecting that the agent is processing the result.
+
+
+
+## [0.15.0] - 2026-04-05
+
+### Added
+
+- **Light Theme Option for Dashboard**
+  The dashboard now adapts to your terminal's color scheme instead of forcing a black background. Previously, the hardcoded black background created a visual mismatch for users running light terminal themes — the dashboard pane appeared as a dark rectangle next to light-themed agent panes.
+  On startup, the dashboard auto-detects whether your terminal uses a light or dark background (via OSC 11 query) and selects the appropriate foreground color palette. Accent colors (Cyan, Green, Yellow, Red, Blue, Magenta) remain unchanged since terminals already remap these per-theme. Only neutral text colors (titles, labels, secondary text) switch between themes to maintain readability and visual hierarchy on both light and dark backgrounds.
+  Use `--theme auto|light|dark` (default: `auto`) to override auto-detection when needed — useful for tmux or SSH sessions where detection may not work reliably. The theme can also be set in the config file, for example `theme = "auto"`, `theme = "light"`, or `theme = "dark"`. The `dashboard` subcommand has been removed since `dot-agent-deck` defaults to dashboard mode and top-level args now work directly.
+- **Session Restore**
+  Pick up where you left off with automatic session persistence. Previously, launching `dot-agent-deck` always started from a blank slate, requiring users to re-open every agent pane, reselect directories, re-enter names, and retype commands each time.
+  The dashboard now automatically tracks every pane's launch metadata (directory, name, and command) while running and persists the full pane set on exit — no explicit save step required. On the next launch, pass `--continue` to restore all saved panes in their original directories with their original commands and names. Panes that reference directories that no longer exist are skipped with a warning, so partial restores work gracefully without aborting.
+  Session state is stored in `~/.config/dot-agent-deck/session.toml` (configurable via the `DOT_AGENT_DECK_SESSION` environment variable). The file uses a simple TOML format that can be edited manually or synced with dotfiles. Start with `dot-agent-deck --continue` or `dot-agent-deck dashboard --continue` to restore your last session.
+
+### Fixed
+
+- **Fix stuck "Needs Input" status**
+  Removed the permission approval queue and blocking `PermissionRequest` hook that caused sessions to display "Needs Input" indefinitely. The deck previously registered both a `Notification` and a `PermissionRequest` hook for the same permission event — the blocking hook delayed every permission prompt and left stale entries in the queue when users approved in the terminal instead of the deck. The deck's permission UI (y/n approval) was already disabled, making the blocking hook purely harmful.
+  The "Needs Input" status indicator still works correctly via the fire-and-forget `Notification` hook and clears automatically when the agent resumes work.
+
+
+
 ## [0.14.4] - 2026-04-05
 
 ### Fixed

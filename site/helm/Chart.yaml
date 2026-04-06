@@ -1,0 +1,6 @@
+apiVersion: v2
+name: dot-agent-deck-docs
+description: Documentation site for dot-agent-deck
+type: application
+version: 0.16.0
+appVersion: "v0.16.0"

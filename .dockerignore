@@ -1,0 +1,15 @@
+target/
+site/node_modules/
+site/build/
+site/.docusaurus/
+site/helm/
+.git/
+.github/
+.claude/
+prds/
+scripts/
+tests/
+examples/
+dist/
+Cargo.toml
+Cargo.lock

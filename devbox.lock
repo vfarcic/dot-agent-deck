@@ -101,6 +101,103 @@
         }
       }
     },
+    "kubernetes-helm@3.19.1": {
+      "last_modified": "2026-03-21T07:29:51Z",
+      "resolved": "github:NixOS/nixpkgs/09061f748ee21f68a089cd5d91ec1859cd93d0be#kubernetes-helm",
+      "source": "devbox-search",
+      "version": "3.19.1",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/lj80z1b76xig3lfn0s0cmj1lff99jrq3-kubernetes-helm-3.19.1",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/lj80z1b76xig3lfn0s0cmj1lff99jrq3-kubernetes-helm-3.19.1"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/zzzspvhp2sxrcii8g6gi65c78mmc5ifg-kubernetes-helm-3.19.1",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/zzzspvhp2sxrcii8g6gi65c78mmc5ifg-kubernetes-helm-3.19.1"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/5wig6vkavjfp1jd3qbx9mbyiiqbfsa75-kubernetes-helm-3.19.1",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/5wig6vkavjfp1jd3qbx9mbyiiqbfsa75-kubernetes-helm-3.19.1"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/6gdpshqw9zx0iz7g6xdkbkxkd5xc6kdd-kubernetes-helm-3.19.1",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/6gdpshqw9zx0iz7g6xdkbkxkd5xc6kdd-kubernetes-helm-3.19.1"
+        }
+      }
+    },
+    "nodejs@20": {
+      "last_modified": "2026-03-27T11:17:38Z",
+      "plugin_version": "0.0.2",
+      "resolved": "github:NixOS/nixpkgs/832efc09b4caf6b4569fbf9dc01bec3082a00611#nodejs_20",
+      "source": "devbox-search",
+      "version": "20.20.2",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/vamh3ysrfc0qz2mdhh6klyi5ngaffl0q-nodejs-20.20.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/vamh3ysrfc0qz2mdhh6klyi5ngaffl0q-nodejs-20.20.2"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/b1i1izsybrhzifbrr84nbmw62fl07ia2-nodejs-20.20.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/b1i1izsybrhzifbrr84nbmw62fl07ia2-nodejs-20.20.2"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/yg5qivw8g8gxpc536kwc0fg73nviiv9l-nodejs-20.20.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/yg5qivw8g8gxpc536kwc0fg73nviiv9l-nodejs-20.20.2"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/1gw2r0h59vr5dzcilhg1xvzjqgn84f8b-nodejs-20.20.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/1gw2r0h59vr5dzcilhg1xvzjqgn84f8b-nodejs-20.20.2"
+        }
+      }
+    },
     "vals@0.43.7": {
       "last_modified": "2026-03-12T22:11:02Z",
       "resolved": "github:NixOS/nixpkgs/24f4544180242cd80bb2492ce6907243bc716e08#vals",

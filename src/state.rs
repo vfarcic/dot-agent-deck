@@ -192,6 +192,9 @@ impl AppState {
             EventType::ToolEnd => {
                 session.active_tool = None;
                 session.tool_count += 1;
+                if session.status == SessionStatus::WaitingForInput {
+                    session.status = SessionStatus::Thinking;
+                }
             }
             EventType::WaitingForInput | EventType::PermissionRequest => {
                 session.status = SessionStatus::WaitingForInput;
@@ -386,6 +389,39 @@ mod tests {
         state.apply_event(tool_start2);
         state.apply_event(make_event("s1", EventType::ToolEnd));
         assert_eq!(state.sessions["s1"].tool_count, 2);
+    }
+
+    #[test]
+    fn tool_end_clears_waiting_for_input() {
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+
+        // Simulate: PreToolUse → PermissionRequest → tool runs → PostToolUse
+        let mut tool_start = make_event("s1", EventType::ToolStart);
+        tool_start.tool_name = Some("Bash".to_string());
+        state.apply_event(tool_start);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+
+        state.apply_event(make_event("s1", EventType::PermissionRequest));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
+
+        state.apply_event(make_event("s1", EventType::ToolEnd));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Thinking);
+    }
+
+    #[test]
+    fn tool_end_preserves_working_status() {
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+
+        let mut tool_start = make_event("s1", EventType::ToolStart);
+        tool_start.tool_name = Some("Bash".to_string());
+        state.apply_event(tool_start);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+
+        // ToolEnd without permission request should keep Working→Working (not change)
+        state.apply_event(make_event("s1", EventType::ToolEnd));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
     }
 
     #[test]
