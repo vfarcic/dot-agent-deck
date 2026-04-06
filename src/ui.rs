@@ -850,23 +850,40 @@ fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult
     match key.code {
         // Dashboard navigation
         KeyCode::Char('j') | KeyCode::Down => {
-            ui.selected_index =
-                navigate_grid(ui.selected_index, Direction::Down, ui.columns, total);
-            KeyResult::Continue
+            let new = navigate_grid(ui.selected_index, Direction::Down, ui.columns, total);
+            ui.selected_index = new;
+            if total > 0 {
+                KeyResult::Focus
+            } else {
+                KeyResult::Continue
+            }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            ui.selected_index = navigate_grid(ui.selected_index, Direction::Up, ui.columns, total);
-            KeyResult::Continue
+            let new = navigate_grid(ui.selected_index, Direction::Up, ui.columns, total);
+            ui.selected_index = new;
+            if total > 0 {
+                KeyResult::Focus
+            } else {
+                KeyResult::Continue
+            }
         }
         KeyCode::Char('h') | KeyCode::Left => {
-            ui.selected_index =
-                navigate_grid(ui.selected_index, Direction::Left, ui.columns, total);
-            KeyResult::Continue
+            let new = navigate_grid(ui.selected_index, Direction::Left, ui.columns, total);
+            ui.selected_index = new;
+            if total > 0 {
+                KeyResult::Focus
+            } else {
+                KeyResult::Continue
+            }
         }
         KeyCode::Char('l') | KeyCode::Right => {
-            ui.selected_index =
-                navigate_grid(ui.selected_index, Direction::Right, ui.columns, total);
-            KeyResult::Continue
+            let new = navigate_grid(ui.selected_index, Direction::Right, ui.columns, total);
+            ui.selected_index = new;
+            if total > 0 {
+                KeyResult::Focus
+            } else {
+                KeyResult::Continue
+            }
         }
         KeyCode::Char('/') => {
             ui.mode = UiMode::Filter;
