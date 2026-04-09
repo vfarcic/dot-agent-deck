@@ -66,11 +66,12 @@ pub type SharedState = Arc<RwLock<AppState>>;
 
 impl AppState {
     pub fn aggregate_stats(&self) -> DashboardStats {
-        let mut stats = DashboardStats {
-            active: self.sessions.len(),
-            ..DashboardStats::default()
-        };
+        let mut stats = DashboardStats::default();
         for session in self.sessions.values() {
+            if session.agent_type == AgentType::None {
+                continue;
+            }
+            stats.active += 1;
             match session.status {
                 SessionStatus::Working => stats.working += 1,
                 SessionStatus::Thinking => stats.thinking += 1,
@@ -87,6 +88,29 @@ impl AppState {
     /// Register a pane ID as managed by our app.
     pub fn register_pane(&mut self, pane_id: String) {
         self.managed_pane_ids.insert(pane_id);
+    }
+
+    /// Create a placeholder session for a newly created pane so it always has a dashboard card.
+    pub fn insert_placeholder_session(&mut self, pane_id: String, cwd: Option<String>) {
+        let session_id = format!("pane-{}", pane_id);
+        let now = Utc::now();
+        let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
+        self.sessions.insert(
+            session_id.clone(),
+            SessionState {
+                session_id,
+                agent_type: AgentType::None,
+                cwd,
+                status: SessionStatus::Idle,
+                active_tool: None,
+                started_at,
+                last_activity: now,
+                recent_events: VecDeque::new(),
+                tool_count: 0,
+                last_user_prompt: None,
+                pane_id: Some(pane_id),
+            },
+        );
     }
 
     /// Unregister a pane ID (e.g., when closing a pane).
@@ -126,13 +150,19 @@ impl AppState {
 
         if event.event_type == EventType::SessionEnd {
             // Preserve started_at for the pane so a restarted session keeps its position.
-            if let Some(session) = self.sessions.get(&event.session_id)
-                && let Some(ref pane_id) = session.pane_id
-            {
-                self.pane_started_at
-                    .insert(pane_id.clone(), session.started_at);
-            }
+            let pane_id_and_cwd = self.sessions.get(&event.session_id).and_then(|session| {
+                session.pane_id.as_ref().map(|pid| {
+                    self.pane_started_at.insert(pid.clone(), session.started_at);
+                    (pid.clone(), session.cwd.clone())
+                })
+            });
             self.sessions.remove(&event.session_id);
+            // Restore a placeholder card so the pane remains visible on the dashboard.
+            if let Some((pane_id, cwd)) = pane_id_and_cwd
+                && self.managed_pane_ids.contains(&pane_id)
+            {
+                self.insert_placeholder_session(pane_id, cwd);
+            }
             return;
         }
 
@@ -160,6 +190,10 @@ impl AppState {
             });
 
         session.last_activity = event.timestamp;
+
+        if session.agent_type == AgentType::None && event.agent_type != AgentType::None {
+            session.agent_type = event.agent_type.clone();
+        }
 
         if event.cwd.is_some() {
             session.cwd.clone_from(&event.cwd);
@@ -541,13 +575,15 @@ mod tests {
         let mut end_ev = make_event("s1", EventType::SessionEnd);
         end_ev.pane_id = Some("pane-42".to_string());
         state.apply_event(end_ev);
-        assert!(!state.sessions.contains_key("s1"));
+        // After SessionEnd, a placeholder is restored since the pane is still managed.
+        // Key is "pane-pane-42" because pane_id="pane-42" and placeholder keys use "pane-{pane_id}".
+        assert!(state.sessions.contains_key("pane-pane-42"));
 
-        // New session on the same pane should keep the original started_at
+        // New session on the same pane reuses the placeholder key and keeps started_at.
         let mut ev2 = make_event("s2", EventType::SessionStart);
         ev2.pane_id = Some("pane-42".to_string());
         state.apply_event(ev2);
-        assert_eq!(state.sessions["s2"].started_at, original_started);
+        assert_eq!(state.sessions["pane-pane-42"].started_at, original_started);
     }
 
     #[test]
@@ -569,5 +605,112 @@ mod tests {
         tool_start.tool_name = Some("Bash".into());
         state.apply_event(tool_start);
         assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn placeholder_session_created() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+
+        assert!(state.sessions.contains_key("pane-42"));
+        let session = &state.sessions["pane-42"];
+        assert_eq!(session.agent_type, AgentType::None);
+        assert_eq!(session.status, SessionStatus::Idle);
+        assert_eq!(session.pane_id.as_deref(), Some("42"));
+        assert_eq!(session.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(session.tool_count, 0);
+    }
+
+    #[test]
+    fn placeholder_transitions_to_real_session() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+
+        let mut start = make_event("real-uuid-123", EventType::SessionStart);
+        start.pane_id = Some("42".to_string());
+        start.cwd = Some("/home".to_string());
+        state.apply_event(start);
+
+        // Placeholder key is reused, real UUID key is removed
+        assert!(state.sessions.contains_key("pane-42"));
+        assert!(!state.sessions.contains_key("real-uuid-123"));
+        let session = &state.sessions["pane-42"];
+        assert_eq!(session.agent_type, AgentType::ClaudeCode);
+        assert_eq!(session.cwd.as_deref(), Some("/home"));
+        assert_eq!(session.pane_id.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn placeholder_restored_after_session_end() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+
+        // Transition to real session
+        let mut start = make_event("real-uuid", EventType::SessionStart);
+        start.pane_id = Some("42".to_string());
+        state.apply_event(start);
+        assert_eq!(state.sessions["pane-42"].agent_type, AgentType::ClaudeCode);
+
+        // End the real session — placeholder should be restored
+        let mut end = make_event("pane-42", EventType::SessionEnd);
+        end.pane_id = Some("42".to_string());
+        state.apply_event(end);
+
+        assert!(state.sessions.contains_key("pane-42"));
+        assert_eq!(state.sessions["pane-42"].agent_type, AgentType::None);
+        assert_eq!(state.sessions["pane-42"].pane_id.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn placeholder_not_restored_after_close() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+
+        // Transition to real session
+        let mut start = make_event("real-uuid", EventType::SessionStart);
+        start.pane_id = Some("42".to_string());
+        state.apply_event(start);
+
+        // Simulate Ctrl+w: remove session and unregister pane (same as ui handler)
+        state.sessions.remove("pane-42");
+        state.unregister_pane("42");
+
+        assert!(state.sessions.is_empty());
+        assert!(!state.managed_pane_ids.contains("42"));
+    }
+
+    #[test]
+    fn placeholder_excluded_from_stats() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+
+        // Add a real session on a different registered pane
+        state.register_pane("99".to_string());
+        let mut start = make_event("s1", EventType::SessionStart);
+        start.pane_id = Some("99".to_string());
+        state.apply_event(start);
+
+        let stats = state.aggregate_stats();
+        assert_eq!(stats.active, 1);
+        assert_eq!(stats.idle, 1);
+    }
+
+    #[test]
+    fn close_placeholder_session() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+
+        // Simulate Ctrl+w on the placeholder
+        state.sessions.remove("pane-42");
+        state.unregister_pane("42");
+
+        assert!(state.sessions.is_empty());
+        assert!(!state.managed_pane_ids.contains("42"));
     }
 }
