@@ -1,3 +1,4 @@
+pub mod ascii_art;
 pub mod config;
 pub mod daemon;
 pub mod embedded_pane;
@@ -5,6 +6,7 @@ pub mod error;
 pub mod event;
 pub mod hook;
 pub mod hooks_manage;
+pub mod llm;
 pub mod opencode_manage;
 pub mod pane;
 pub mod state;

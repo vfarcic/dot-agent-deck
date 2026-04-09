@@ -5,6 +5,45 @@ use serde::{Deserialize, Serialize};
 use crate::state::SessionStatus;
 use crate::theme::Theme;
 
+pub const CONFIG_KEYS: &[(&str, &str)] = &[
+    ("default_command", "Default shell command for new panes"),
+    ("theme", "Color theme: auto, light, dark (default: auto)"),
+    (
+        "bell.enabled",
+        "Enable/disable terminal bell (default: true)",
+    ),
+    (
+        "bell.on_waiting_for_input",
+        "Bell when agent waits for input (default: true)",
+    ),
+    (
+        "bell.on_idle",
+        "Bell when session goes idle (default: false)",
+    ),
+    ("bell.on_error", "Bell on agent error (default: true)"),
+    (
+        "idle_art.enabled",
+        "Enable ASCII art in dashboard idle cards (default: false)",
+    ),
+    (
+        "idle_art.provider",
+        "LLM provider: anthropic (ANTHROPIC_API_KEY), openai (OPENAI_API_KEY), ollama (no key needed) (default: anthropic)",
+    ),
+    ("idle_art.model", "LLM model (default: claude-haiku-4-5)"),
+    (
+        "idle_art.timeout_secs",
+        "Seconds idle before triggering art (default: 300)",
+    ),
+];
+
+pub fn config_keys_help() -> String {
+    let mut help = String::from("Available keys:\n");
+    for (key, desc) in CONFIG_KEYS {
+        help.push_str(&format!("  {key:<30} {desc}\n"));
+    }
+    help
+}
+
 pub fn socket_path() -> PathBuf {
     if let Ok(path) = std::env::var("DOT_AGENT_DECK_SOCKET") {
         return PathBuf::from(path);
@@ -51,12 +90,33 @@ impl BellConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IdleArtConfig {
+    pub enabled: bool,
+    pub provider: String,
+    pub model: String,
+    pub timeout_secs: u64,
+}
+
+impl Default for IdleArtConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "anthropic".to_string(),
+            model: "claude-haiku-4-5".to_string(),
+            timeout_secs: 300,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct DashboardConfig {
     pub default_command: String,
     pub bell: BellConfig,
     pub theme: Theme,
+    pub idle_art: IdleArtConfig,
 }
 
 impl DashboardConfig {
@@ -94,11 +154,22 @@ impl DashboardConfig {
         match key {
             "default_command" => Ok(self.default_command.clone()),
             "theme" => Ok(self.theme.to_string()),
-            _ => Err(format!("Unknown config key: {key}")),
+            "bell.enabled" => Ok(self.bell.enabled.to_string()),
+            "bell.on_waiting_for_input" => Ok(self.bell.on_waiting_for_input.to_string()),
+            "bell.on_idle" => Ok(self.bell.on_idle.to_string()),
+            "bell.on_error" => Ok(self.bell.on_error.to_string()),
+            "idle_art.enabled" => Ok(self.idle_art.enabled.to_string()),
+            "idle_art.provider" => Ok(self.idle_art.provider.clone()),
+            "idle_art.model" => Ok(self.idle_art.model.clone()),
+            "idle_art.timeout_secs" => Ok(self.idle_art.timeout_secs.to_string()),
+            _ => Err(format!("Unknown config key: {key}\n{}", config_keys_help())),
         }
     }
 
     pub fn set_field(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let parse_bool = |v: &str| -> Result<bool, String> {
+            v.parse().map_err(|_| format!("Invalid boolean: {v}"))
+        };
         match key {
             "default_command" => {
                 self.default_command = value.to_string();
@@ -108,7 +179,41 @@ impl DashboardConfig {
                 self.theme = value.parse().map_err(|e: String| e)?;
                 Ok(())
             }
-            _ => Err(format!("Unknown config key: {key}")),
+            "bell.enabled" => {
+                self.bell.enabled = parse_bool(value)?;
+                Ok(())
+            }
+            "bell.on_waiting_for_input" => {
+                self.bell.on_waiting_for_input = parse_bool(value)?;
+                Ok(())
+            }
+            "bell.on_idle" => {
+                self.bell.on_idle = parse_bool(value)?;
+                Ok(())
+            }
+            "bell.on_error" => {
+                self.bell.on_error = parse_bool(value)?;
+                Ok(())
+            }
+            "idle_art.enabled" => {
+                self.idle_art.enabled = parse_bool(value)?;
+                Ok(())
+            }
+            "idle_art.provider" => {
+                self.idle_art.provider = value.to_string();
+                Ok(())
+            }
+            "idle_art.model" => {
+                self.idle_art.model = value.to_string();
+                Ok(())
+            }
+            "idle_art.timeout_secs" => {
+                self.idle_art.timeout_secs = value
+                    .parse()
+                    .map_err(|_| format!("Invalid number: {value}"))?;
+                Ok(())
+            }
+            _ => Err(format!("Unknown config key: {key}\n{}", config_keys_help())),
         }
     }
 }
@@ -545,5 +650,62 @@ on_idle = true
                 None => std::env::remove_var("DOT_AGENT_DECK_STAR_PROMPT"),
             }
         }
+    }
+
+    #[test]
+    fn idle_art_config_defaults() {
+        let config = IdleArtConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.provider, "anthropic");
+        assert_eq!(config.model, "claude-haiku-4-5");
+        assert_eq!(config.timeout_secs, 300);
+    }
+
+    #[test]
+    fn dashboard_config_without_idle_art() {
+        let dc: DashboardConfig = toml::from_str("").unwrap();
+        assert!(!dc.idle_art.enabled);
+        assert_eq!(dc.idle_art.provider, "anthropic");
+        assert_eq!(dc.idle_art.model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn dashboard_config_with_idle_art() {
+        let toml_str = r#"
+[idle_art]
+enabled = true
+provider = "openai"
+model = "gpt-4o-mini"
+timeout_secs = 600
+"#;
+        let dc: DashboardConfig = toml::from_str(toml_str).unwrap();
+        assert!(dc.idle_art.enabled);
+        assert_eq!(dc.idle_art.provider, "openai");
+        assert_eq!(dc.idle_art.model, "gpt-4o-mini");
+        assert_eq!(dc.idle_art.timeout_secs, 600);
+    }
+
+    #[test]
+    fn idle_art_get_set_fields() {
+        let mut dc = DashboardConfig::default();
+        assert_eq!(dc.get_field("idle_art.enabled").unwrap(), "false");
+        assert_eq!(dc.get_field("idle_art.provider").unwrap(), "anthropic");
+        assert_eq!(dc.get_field("idle_art.model").unwrap(), "claude-haiku-4-5");
+        assert_eq!(dc.get_field("idle_art.timeout_secs").unwrap(), "300");
+
+        dc.set_field("idle_art.enabled", "true").unwrap();
+        assert!(dc.idle_art.enabled);
+
+        dc.set_field("idle_art.provider", "ollama").unwrap();
+        assert_eq!(dc.idle_art.provider, "ollama");
+
+        dc.set_field("idle_art.model", "llama3").unwrap();
+        assert_eq!(dc.idle_art.model, "llama3");
+
+        dc.set_field("idle_art.timeout_secs", "120").unwrap();
+        assert_eq!(dc.idle_art.timeout_secs, 120);
+
+        assert!(dc.set_field("idle_art.enabled", "notabool").is_err());
+        assert!(dc.set_field("idle_art.timeout_secs", "notanumber").is_err());
     }
 }

@@ -34,21 +34,22 @@ Before writing any integration code, validate that the LLM can consistently prod
 Expose the ASCII art generation as a standalone CLI subcommand:
 
 ```
-dot-agent-deck ascii --input "user prompts here" --output "agent final response here"
+dot-agent-deck ascii --input "user prompts here" --output "agent final response here" [--provider anthropic] [--model claude-haiku-4-5]
 ```
 
 - Reads the embedded prompt from `assets/idle-art-prompt.md` via `include_str!()`
 - Calls the configured LLM with the assembled prompt + provided context
 - Prints the ASCII art frames to stdout (delimited for multi-frame output)
-- Respects configuration for provider and model
+- Respects configuration for provider and model; CLI flags `--provider` and `--model` override config
 - Useful standalone: users can script it, pipe it, or have agents call it post-completion
+- The `idle_art.enabled` config flag is ignored by the CLI — it only gates automatic dashboard art in Phase 3
 
 **Configuration** (in `.dot-agent-deck.toml` or global config):
 
 ```toml
 [idle_art]
-enabled = true
-provider = "anthropic"       # or "openai", "ollama", etc.
+enabled = false              # only affects dashboard (Phase 3); CLI always works
+provider = "anthropic"       # or "openai", "ollama" — requires ANTHROPIC_API_KEY / OPENAI_API_KEY env var
 model = "claude-haiku-4-5"
 ```
 
@@ -73,8 +74,8 @@ Wire the proven CLI logic into the dashboard's idle card rendering:
 
 ```toml
 [idle_art]
-enabled = true
-provider = "anthropic"
+enabled = true               # must be explicitly enabled for dashboard art
+provider = "anthropic"       # requires ANTHROPIC_API_KEY env var
 model = "claude-haiku-4-5"
 timeout_secs = 300           # idle time before triggering
 ```
@@ -89,6 +90,9 @@ timeout_secs = 300           # idle time before triggering
 - **Configurable provider/model**: Users control cost and can use local models (Ollama) for zero-cost art generation.
 - **Density-aware rendering** (decided 2026-04-09): ASCII art is only attempted in Spacious card density mode (~8 usable content rows). In Normal and Compact modes, cards fall back to the existing flashing-dot idle indicator. Rationale: truncating ASCII art to fit smaller cards destroys the visual — a stick figure missing its legs is worse than no art at all.
 - **Generate-validate-retry** (decided 2026-04-09): LLMs cannot reliably count output lines. Phase 1 validation showed Haiku exceeds the 8-line constraint in ~60% of generations. Rather than relying on the prompt alone, the pipeline validates dimensions after each generation and retries up to 3 times. If all attempts fail, it falls back to the flashing dot. This ensures broken art never reaches the screen while keeping costs low (Haiku calls are cheap and fast).
+- **Opt-in by default** (decided 2026-04-09): `idle_art.enabled` defaults to `false`. Most Claude Code users have `ANTHROPIC_API_KEY` set, so defaulting to enabled would silently make LLM calls and incur costs on every idle session without the user opting in. Users enable it explicitly via `dot-agent-deck config set idle_art.enabled true`. The `ascii` CLI subcommand ignores this flag — explicit invocation always works.
+- **CLI flags override config** (decided 2026-04-09): The `ascii` subcommand accepts `--provider` and `--model` flags that override config file values. This lets users try the feature without creating a config file first — just `ANTHROPIC_API_KEY=... dot-agent-deck ascii --input "..." --output "..."` works out of the box.
+- **API keys via environment only** (decided 2026-04-09): Provider API keys are read from environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) and never stored in config files. This follows standard security practice and avoids secrets on disk. Ollama needs no key. The `config set --help` output documents which env var each provider requires.
 
 ## Out of Scope
 
@@ -99,8 +103,8 @@ timeout_secs = 300           # idle time before triggering
 ## Milestones
 
 - [x] `assets/idle-art-prompt.md` created and validated against Haiku with 10+ sample generations
-- [ ] `dot-agent-deck ascii` CLI subcommand working end-to-end
-- [ ] Configuration schema for `[idle_art]` implemented and documented
+- [x] `dot-agent-deck ascii` CLI subcommand working end-to-end
+- [x] Configuration schema for `[idle_art]` implemented and documented
 - [ ] First-prompt capture added to `SessionState` (first 2-3 prompts preserved separately)
 - [ ] Dashboard idle detection triggers art generation after configured timeout
 - [ ] ASCII art frames render correctly in dashboard cards with proper cycling

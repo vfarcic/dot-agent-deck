@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
 use dot_agent_deck::config::{DashboardConfig, socket_path};
@@ -52,6 +52,21 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Generate ASCII art from session context via LLM
+    Ascii {
+        /// User prompts / session input context
+        #[arg(long)]
+        input: String,
+        /// Agent response / session output context
+        #[arg(long)]
+        output: String,
+        /// LLM provider (overrides config; e.g., anthropic, openai, ollama)
+        #[arg(long)]
+        provider: Option<String>,
+        /// LLM model (overrides config; e.g., claude-haiku-4-5, gpt-4o-mini)
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -74,12 +89,12 @@ enum HooksAction {
 enum ConfigAction {
     /// Get a configuration value
     Get {
-        /// Configuration key (e.g., default_command)
+        /// Configuration key (e.g., default_command, idle_art.provider)
         key: String,
     },
     /// Set a configuration value
     Set {
-        /// Configuration key (e.g., default_command)
+        /// Configuration key (e.g., default_command, idle_art.provider)
         key: String,
         /// Value to set
         value: String,
@@ -87,7 +102,17 @@ enum ConfigAction {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let keys_help = dot_agent_deck::config::config_keys_help();
+    let cmd = Cli::command().mut_subcommand("config", |c| {
+        c.mut_subcommand("get", |g| {
+            g.long_about(format!("Get a configuration value\n\n{keys_help}"))
+        })
+        .mut_subcommand("set", |s| {
+            s.long_about(format!("Set a configuration value\n\n{keys_help}"))
+        })
+    });
+    let cli = Cli::from_arg_matches(&cmd.get_matches())
+        .expect("clap arg matches should be valid for Cli struct");
 
     match cli.command {
         None => {
@@ -123,6 +148,28 @@ fn main() -> ExitCode {
                 },
             }
             ExitCode::SUCCESS
+        }
+        Some(Commands::Ascii {
+            input,
+            output,
+            provider,
+            model,
+        }) => {
+            let config = DashboardConfig::load();
+            let mut idle_art = config.idle_art;
+            if let Some(p) = provider {
+                idle_art.provider = p;
+            }
+            if let Some(m) = model {
+                idle_art.model = m;
+            }
+            match run_ascii(&input, &output, &idle_art) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Some(Commands::Config { action }) => match action {
             ConfigAction::Get { key } => {
@@ -219,4 +266,21 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     } else if let Ok(Err(e)) = tui_result {
         eprintln!("TUI error: {e}");
     }
+}
+
+#[tokio::main]
+async fn run_ascii(
+    input: &str,
+    output: &str,
+    config: &dot_agent_deck::config::IdleArtConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = dot_agent_deck::ascii_art::generate_ascii_art(input, output, config).await?;
+    for (i, frame) in result.frames.iter().enumerate() {
+        if i > 0 {
+            println!("---FRAME---");
+        }
+        print!("{frame}");
+    }
+    println!();
+    Ok(())
 }
