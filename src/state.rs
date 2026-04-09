@@ -576,6 +576,7 @@ mod tests {
         end_ev.pane_id = Some("pane-42".to_string());
         state.apply_event(end_ev);
         // After SessionEnd, a placeholder is restored since the pane is still managed.
+        // Key is "pane-pane-42" because pane_id="pane-42" and placeholder keys use "pane-{pane_id}".
         assert!(state.sessions.contains_key("pane-pane-42"));
 
         // New session on the same pane reuses the placeholder key and keeps started_at.
