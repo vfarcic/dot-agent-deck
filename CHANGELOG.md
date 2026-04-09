@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.17.0] - 2026-04-06
+
+### Added
+
+- **Auto-Install Hooks on Startup**
+  Agent hooks are now automatically installed when the dashboard launches. The CLI detects which agents are present (`~/.claude/` for Claude Code, `~/.opencode/` for OpenCode) and installs hooks for each one. Manual `hooks install` commands are no longer required for normal use.
+
+
+
 ## [0.16.0] - 2026-04-06
 
 ### Added

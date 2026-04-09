@@ -29,6 +29,7 @@ impl fmt::Display for crate::event::AgentType {
         match self {
             crate::event::AgentType::ClaudeCode => write!(f, "ClaudeCode"),
             crate::event::AgentType::OpenCode => write!(f, "OpenCode"),
+            crate::event::AgentType::None => write!(f, "No agent"),
         }
     }
 }
@@ -2281,7 +2282,16 @@ pub fn run_tui(
                         };
                         match pane.create_pane(cmd, Some(&dir_str)) {
                             Ok(new_id) => {
-                                state.blocking_write().register_pane(new_id.clone());
+                                // Register so only events from our panes are accepted,
+                                // and create a placeholder session for an immediate dashboard card.
+                                {
+                                    let mut st = state.blocking_write();
+                                    st.register_pane(new_id.clone());
+                                    st.insert_placeholder_session(
+                                        new_id.clone(),
+                                        Some(dir_str.clone()),
+                                    );
+                                }
                                 if !req.name.is_empty() {
                                     let _ = pane.rename_pane(&new_id, &req.name);
                                     ui.pane_display_names
@@ -3888,7 +3898,12 @@ fn render_session_card(
     show_config_hint: bool,
     palette: ColorPalette,
 ) {
-    let (status_label, status_style) = status_style(&session.status);
+    let is_placeholder = session.agent_type == crate::event::AgentType::None;
+    let (status_label, status_style) = if is_placeholder {
+        ("No agent", Style::default().fg(Color::DarkGray))
+    } else {
+        status_style(&session.status)
+    };
     let status_color = status_style.fg.unwrap_or(palette.text_secondary);
 
     let id_display = if session.session_id.len() > 11 {
@@ -3989,15 +4004,22 @@ fn render_session_card(
         ]));
     }
 
-    let prompts = collect_recent_prompts(session, density.max_prompts());
-    for (i, prompt) in prompts.iter().enumerate() {
-        let prefix = if i == 0 { "Prmt: " } else { "      " };
-        let max_prompt = w.saturating_sub(6);
-        let display = truncate_with_ellipsis(prompt, max_prompt);
-        lines.push(Line::from(vec![
-            Span::styled(prefix, Style::default().fg(palette.text_secondary)),
-            Span::raw(display),
-        ]));
+    if is_placeholder {
+        lines.push(Line::from(Span::styled(
+            "Launch an agent to get started",
+            Style::default().fg(palette.text_muted),
+        )));
+    } else {
+        let prompts = collect_recent_prompts(session, density.max_prompts());
+        for (i, prompt) in prompts.iter().enumerate() {
+            let prefix = if i == 0 { "Prmt: " } else { "      " };
+            let max_prompt = w.saturating_sub(6);
+            let display = truncate_with_ellipsis(prompt, max_prompt);
+            lines.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(palette.text_secondary)),
+                Span::raw(display),
+            ]));
+        }
     }
 
     if !wide {
