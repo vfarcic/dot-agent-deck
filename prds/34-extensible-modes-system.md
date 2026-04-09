@@ -262,8 +262,9 @@ New tab abstraction layered on top of the existing UI:
 - [x] Config generation prompt improvements — project-aware tooling discovery, read-only rules only, compact output guidance, command validation enforcement
 - [x] Terminal widget improvements — content-aware row anchoring, tab-aware PTY resize (50% for mode tabs), column clamping to prevent stale buffer reads
 - [x] Reactive pane environment preservation — panes with `init_command` reuse shell on command routing (no re-initialization)
-- [ ] Side pane focus/selection — keyboard navigation and/or click-to-focus for side panes in mode tabs
-- [ ] PaneInput mode on side panes — once a side pane is focused, Enter enters PaneInput mode allowing Ctrl+C, typing commands, and full interaction
+- [x] Side pane focus/selection — keyboard navigation (j/k), click-to-focus, visual focus indicator, Esc to reset to agent pane
+- [x] PaneInput mode on side panes — Enter on focused side pane enters PaneInput mode; Ctrl+C, typing, full shell interaction work via existing PaneInput infrastructure
+- [ ] Update docs — review all Phase 1–4 work against `docs/keyboard-shortcuts.md`, `docs/workspace-modes.md`, and other relevant docs; add missing documentation and fix any incorrect/outdated content
 
 ## Out of Scope (v1)
 

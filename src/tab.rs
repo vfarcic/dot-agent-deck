@@ -43,6 +43,8 @@ pub enum Tab {
         mode_manager: Box<ModeManager>,
         last_routed_timestamp: HashMap<String, DateTime<Utc>>,
         cwd: String,
+        /// Which side pane has visual focus in Normal mode. `None` = agent pane.
+        focused_side_pane_index: Option<usize>,
     },
 }
 
@@ -135,6 +137,7 @@ impl TabManager {
             mode_manager: Box::new(mode_manager),
             last_routed_timestamp: HashMap::new(),
             cwd: cwd.to_string(),
+            focused_side_pane_index: None,
         });
 
         let index = self.tabs.len() - 1;

@@ -130,6 +130,8 @@ enum ActiveTabView {
         mode_name: String,
         agent_pane_id: String,
         side_pane_ids: Vec<String>,
+        /// Which side pane has visual focus (`None` = agent pane).
+        focused_side_pane_index: Option<usize>,
     },
 }
 
@@ -422,6 +424,8 @@ struct UiState {
     focused_pane_rect: Option<Rect>,
     /// Screen rects of side panes in mode tabs (set during render, used for scroll hit-testing).
     side_pane_rects: Vec<(String, Rect)>,
+    /// Screen rect of the agent pane in mode tabs (set during render, used for click-to-focus).
+    agent_pane_rect: Option<Rect>,
     /// Tracks last click time and position for double/triple-click detection.
     last_click: Option<(std::time::Instant, u16, u16, u8)>, // (time, col, row, click_count)
     /// Star-prompt state for the "star the repo" reminder dialog.
@@ -476,6 +480,7 @@ impl UiState {
             selection: None,
             focused_pane_rect: None,
             side_pane_rects: Vec::new(),
+            agent_pane_rect: None,
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
             config_gen_state: config::ConfigGenState::load(),
@@ -1456,6 +1461,23 @@ pub fn run_tui(
             }
         }
 
+        // Clamp focused side pane index after reactive pane pool changes.
+        if !pane_changes.is_empty()
+            && let Tab::Mode {
+                focused_side_pane_index,
+                mode_manager,
+                ..
+            } = tab_manager.active_tab_mut()
+            && let Some(idx) = *focused_side_pane_index
+        {
+            let count = mode_manager.managed_pane_ids().len();
+            if count == 0 {
+                *focused_side_pane_index = None;
+            } else if idx >= count {
+                *focused_side_pane_index = Some(count - 1);
+            }
+        }
+
         // Pick up version-check result once
         if ui.update_available.is_none() {
             ui.update_available = snapshot.update_available.clone();
@@ -1529,11 +1551,13 @@ pub fn run_tui(
                 name,
                 agent_pane_id,
                 mode_manager,
+                focused_side_pane_index,
                 ..
             } => ActiveTabView::Mode {
                 mode_name: name.clone(),
                 agent_pane_id: agent_pane_id.clone(),
                 side_pane_ids: mode_manager.managed_pane_ids(),
+                focused_side_pane_index: *focused_side_pane_index,
             },
         };
         let tab_bar_labels: Vec<String> = tab_manager
@@ -1657,6 +1681,48 @@ pub fn run_tui(
                                 break;
                             }
                         }
+                    }
+                }
+
+                // Click-to-focus for mode tab panes (Normal mode only).
+                if ui.mode == UiMode::Normal
+                    && matches!(
+                        mouse.kind,
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                    )
+                {
+                    let mut clicked_focus = false;
+                    // Check side panes.
+                    for (idx, (_side_id, rect)) in ui.side_pane_rects.iter().enumerate() {
+                        if mouse.column >= rect.x
+                            && mouse.column < rect.x + rect.width
+                            && mouse.row >= rect.y
+                            && mouse.row < rect.y + rect.height
+                        {
+                            if let Tab::Mode {
+                                focused_side_pane_index,
+                                ..
+                            } = tab_manager.active_tab_mut()
+                            {
+                                *focused_side_pane_index = Some(idx);
+                                clicked_focus = true;
+                            }
+                            break;
+                        }
+                    }
+                    // Check agent pane area.
+                    if !clicked_focus
+                        && let Some(rect) = ui.agent_pane_rect
+                        && mouse.column >= rect.x
+                        && mouse.column < rect.x + rect.width
+                        && mouse.row >= rect.y
+                        && mouse.row < rect.y + rect.height
+                        && let Tab::Mode {
+                            focused_side_pane_index,
+                            ..
+                        } = tab_manager.active_tab_mut()
+                    {
+                        *focused_side_pane_index = None;
                     }
                 }
 
@@ -2064,21 +2130,70 @@ pub fn run_tui(
             let selected_id: Option<String> =
                 filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
 
-            // On a mode tab in Normal mode, Enter re-focuses the agent pane.
+            // On a mode tab in Normal mode, j/k navigate side panes, Enter focuses, Esc resets.
             if !shortcut_handled
                 && ui.mode == UiMode::Normal
-                && key.code == KeyCode::Enter
-                && let Tab::Mode { agent_pane_id, .. } = tab_manager.active_tab()
+                && let Tab::Mode {
+                    focused_side_pane_index,
+                    mode_manager,
+                    agent_pane_id,
+                    ..
+                } = tab_manager.active_tab_mut()
             {
-                let pid = agent_pane_id.clone();
-                if pane.focus_pane(&pid).is_ok() {
-                    ui.mode = UiMode::PaneInput;
-                    ui.status_message = Some((
-                        "PaneInput mode — type to interact, Ctrl+d for dashboard".to_string(),
-                        std::time::Instant::now(),
-                    ));
+                let side_ids = mode_manager.managed_pane_ids();
+                let side_count = side_ids.len();
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        *focused_side_pane_index = match *focused_side_pane_index {
+                            None => {
+                                if side_count > 0 {
+                                    Some(0)
+                                } else {
+                                    None
+                                }
+                            }
+                            Some(i) => Some((i + 1).min(side_count.saturating_sub(1))),
+                        };
+                        shortcut_handled = true;
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        *focused_side_pane_index = match *focused_side_pane_index {
+                            None => {
+                                if side_count > 0 {
+                                    Some(side_count - 1)
+                                } else {
+                                    None
+                                }
+                            }
+                            Some(0) => None,
+                            Some(i) => Some(i - 1),
+                        };
+                        shortcut_handled = true;
+                    }
+                    KeyCode::Enter => {
+                        let target_pane_id = match *focused_side_pane_index {
+                            None => agent_pane_id.clone(),
+                            Some(i) => side_ids
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| agent_pane_id.clone()),
+                        };
+                        if pane.focus_pane(&target_pane_id).is_ok() {
+                            ui.mode = UiMode::PaneInput;
+                            ui.status_message = Some((
+                                "PaneInput mode — type to interact, Ctrl+d for dashboard"
+                                    .to_string(),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                        shortcut_handled = true;
+                    }
+                    KeyCode::Esc => {
+                        *focused_side_pane_index = None;
+                        shortcut_handled = true;
+                    }
+                    _ => {}
                 }
-                shortcut_handled = true;
             }
 
             // Mode-specific key handling (skip if a global shortcut was handled).
@@ -2416,6 +2531,7 @@ fn render_frame(
     let area = frame.area();
     let palette = ui.palette;
     ui.side_pane_rects.clear();
+    ui.agent_pane_rect = None;
 
     let active_mode_name = match tab_view {
         ActiveTabView::Dashboard { .. } => None,
@@ -2477,6 +2593,7 @@ fn render_frame(
     if let ActiveTabView::Mode {
         agent_pane_id,
         side_pane_ids,
+        focused_side_pane_index,
         ..
     } = tab_view
     {
@@ -2491,6 +2608,7 @@ fn render_frame(
             has_pane_control,
             active_mode_name,
             tab_bar.show,
+            *focused_side_pane_index,
         );
         return;
     }
@@ -2528,7 +2646,7 @@ fn render_frame(
         .style(Style::default().fg(palette.text_secondary))
         .centered();
         frame.render_widget(msg, vertical[1]);
-        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show);
+        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
 
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -2540,6 +2658,7 @@ fn render_frame(
                 &ui.pane_display_names,
                 &ui.selection,
                 palette,
+                None,
             );
         }
 
@@ -2628,7 +2747,7 @@ fn render_frame(
             active_mode_name,
             palette,
         );
-        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show);
+        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -2640,6 +2759,7 @@ fn render_frame(
                 &ui.pane_display_names,
                 &ui.selection,
                 palette,
+                None,
             );
         }
         return;
@@ -2726,7 +2846,7 @@ fn render_frame(
     );
 
     // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show);
+    render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
 
     // Render terminal panes on the right side
     if let Some(right) = panes_area {
@@ -2739,6 +2859,7 @@ fn render_frame(
             &ui.pane_display_names,
             &ui.selection,
             palette,
+            None,
         );
     }
 
@@ -2777,12 +2898,15 @@ fn render_terminal_panes(
     display_names: &HashMap<String, String>,
     selection: &Option<TextSelection>,
     palette: ColorPalette,
+    visual_focus_id: Option<&str>,
 ) -> Option<Rect> {
     let ctrl = embedded?;
     if pane_ids.is_empty() {
         return None;
     }
-    let focused_id = ctrl.focused_pane_id();
+    let focused_id = visual_focus_id
+        .map(|s| s.to_string())
+        .or_else(|| ctrl.focused_pane_id());
 
     // Get pane info for display names
     let pane_infos = ctrl.list_panes().unwrap_or_default();
@@ -2944,14 +3068,27 @@ fn render_mode_tab(
     has_pane_control: bool,
     active_mode_name: Option<&str>,
     show_tab_bar: bool,
+    focused_side_pane_index: Option<usize>,
 ) {
     let palette = ui.palette;
+
+    // Determine which pane ID should appear visually focused.
+    let agent_visual_focus: Option<&str> = if focused_side_pane_index.is_none() {
+        Some(agent_pane_id)
+    } else {
+        None
+    };
+    let side_visual_focus: Option<String> =
+        focused_side_pane_index.and_then(|i| side_pane_ids.get(i).cloned());
 
     // 50/50 horizontal split
     let chunks = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(main_area);
     let agent_area = chunks[0];
     let side_area = chunks[1];
+
+    // Track agent pane rect for click-to-focus.
+    ui.agent_pane_rect = Some(agent_area);
 
     // Left side: single agent pane
     if !agent_pane_id.is_empty() {
@@ -2965,6 +3102,7 @@ fn render_mode_tab(
             &ui.pane_display_names,
             &ui.selection,
             palette,
+            agent_visual_focus,
         );
         if rect.is_some() {
             ui.focused_pane_rect = rect;
@@ -2982,8 +3120,10 @@ fn render_mode_tab(
             &ui.pane_display_names,
             &ui.selection,
             palette,
+            side_visual_focus.as_deref(),
         );
-        if ui.focused_pane_rect.is_none() {
+        // Use side pane rect when a side pane is visually focused, or as fallback.
+        if side_visual_focus.is_some() || ui.focused_pane_rect.is_none() {
             ui.focused_pane_rect = rect;
         }
 
@@ -3000,7 +3140,7 @@ fn render_mode_tab(
     }
 
     // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control, show_tab_bar);
+    render_bottom_bar(frame, ui, hints_area, has_pane_control, show_tab_bar, true);
 
     // Overlays (drawn last, on top)
     if ui.mode == UiMode::Help {
@@ -3092,6 +3232,7 @@ fn render_bottom_bar(
     area: Rect,
     has_pane_control: bool,
     show_tab_bar: bool,
+    is_mode_tab: bool,
 ) {
     match ui.mode {
         UiMode::Filter => {
@@ -3133,7 +3274,11 @@ fn render_bottom_bar(
                 } else {
                     String::new()
                 };
-                let hints = if has_pane_control {
+                let hints = if is_mode_tab {
+                    format!(
+                        "j/k: navigate panes  Enter: interact  Esc: agent pane  {MOD_KEY}+w: close tab  ?: help  {MOD_KEY}+c: quit{tab_hint}"
+                    )
+                } else if has_pane_control {
                     format!(
                         "{MOD_KEY}+n: new  {MOD_KEY}+w: close  {MOD_KEY}+t: layout  {MOD_KEY}+d: dashboard (1-9 ? /)  {MOD_KEY}+c: quit{tab_hint}"
                     )
