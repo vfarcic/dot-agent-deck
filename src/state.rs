@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use crate::event::{AgentEvent, AgentType, EventType};
 
 const MAX_RECENT_EVENTS: usize = 50;
+const MAX_FIRST_PROMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -48,6 +49,7 @@ pub struct SessionState {
     pub recent_events: VecDeque<AgentEvent>,
     pub tool_count: u32,
     pub last_user_prompt: Option<String>,
+    pub first_prompts: Vec<String>,
     pub pane_id: Option<String>,
 }
 
@@ -156,6 +158,7 @@ impl AppState {
                 recent_events: VecDeque::new(),
                 tool_count: 0,
                 last_user_prompt: None,
+                first_prompts: Vec::new(),
                 pane_id: event.pane_id.clone(),
             });
 
@@ -165,8 +168,11 @@ impl AppState {
             session.cwd.clone_from(&event.cwd);
         }
 
-        if event.user_prompt.is_some() {
-            session.last_user_prompt.clone_from(&event.user_prompt);
+        if let Some(ref prompt) = event.user_prompt {
+            session.last_user_prompt = Some(prompt.clone());
+            if session.first_prompts.len() < MAX_FIRST_PROMPTS {
+                session.first_prompts.push(prompt.clone());
+            }
         }
 
         if event.pane_id.is_some() {
@@ -461,6 +467,56 @@ mod tests {
             state.sessions["s1"].last_user_prompt.as_deref(),
             Some("add tests")
         );
+    }
+
+    #[test]
+    fn first_prompts_captures_up_to_three() {
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+        assert!(state.sessions["s1"].first_prompts.is_empty());
+
+        let prompts = ["first", "second", "third"];
+        for (i, text) in prompts.iter().enumerate() {
+            let mut ev = make_event("s1", EventType::Thinking);
+            ev.user_prompt = Some(text.to_string());
+            state.apply_event(ev);
+            assert_eq!(state.sessions["s1"].first_prompts.len(), i + 1);
+            assert_eq!(state.sessions["s1"].first_prompts[i], *text);
+        }
+    }
+
+    #[test]
+    fn first_prompts_no_overwrite_after_cap() {
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+
+        for text in &["p1", "p2", "p3", "p4", "p5"] {
+            let mut ev = make_event("s1", EventType::Thinking);
+            ev.user_prompt = Some(text.to_string());
+            state.apply_event(ev);
+        }
+
+        assert_eq!(state.sessions["s1"].first_prompts.len(), 3);
+        assert_eq!(state.sessions["s1"].first_prompts[0], "p1");
+        assert_eq!(state.sessions["s1"].first_prompts[1], "p2");
+        assert_eq!(state.sessions["s1"].first_prompts[2], "p3");
+    }
+
+    #[test]
+    fn first_prompts_persist_across_events() {
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+
+        let mut ev = make_event("s1", EventType::Thinking);
+        ev.user_prompt = Some("only prompt".to_string());
+        state.apply_event(ev);
+
+        state.apply_event(make_event("s1", EventType::ToolEnd));
+        state.apply_event(make_event("s1", EventType::Idle));
+        state.apply_event(make_event("s1", EventType::Thinking));
+
+        assert_eq!(state.sessions["s1"].first_prompts.len(), 1);
+        assert_eq!(state.sessions["s1"].first_prompts[0], "only prompt");
     }
 
     #[test]

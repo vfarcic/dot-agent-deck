@@ -3278,6 +3278,7 @@ mod tests {
             recent_events: events,
             tool_count: 0,
             last_user_prompt: None,
+            first_prompts: Vec::new(),
             pane_id: None,
         };
 
@@ -4037,6 +4038,7 @@ mod tests {
             recent_events: std::collections::VecDeque::new(),
             tool_count: 0,
             last_user_prompt: None,
+            first_prompts: Vec::new(),
             pane_id: None,
         }
     }
@@ -4226,6 +4228,7 @@ mod tests {
             recent_events: events,
             tool_count: 0,
             last_user_prompt: Some("third prompt".to_string()),
+            first_prompts: Vec::new(),
             pane_id: None,
         };
 
@@ -4257,6 +4260,7 @@ mod tests {
             recent_events: VecDeque::new(),
             tool_count: 0,
             last_user_prompt: Some("old prompt".to_string()),
+            first_prompts: Vec::new(),
             pane_id: None,
         };
 
@@ -4279,6 +4283,7 @@ mod tests {
             recent_events: VecDeque::new(),
             tool_count: 0,
             last_user_prompt: None,
+            first_prompts: Vec::new(),
             pane_id: None,
         };
 

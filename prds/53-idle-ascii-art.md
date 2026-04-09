@@ -105,7 +105,7 @@ timeout_secs = 300           # idle time before triggering
 - [x] `assets/idle-art-prompt.md` created and validated against Haiku with 10+ sample generations
 - [x] `dot-agent-deck ascii` CLI subcommand working end-to-end
 - [x] Configuration schema for `[idle_art]` implemented and documented
-- [ ] First-prompt capture added to `SessionState` (first 2-3 prompts preserved separately)
+- [x] First-prompt capture added to `SessionState` (first 2-3 prompts preserved separately)
 - [ ] Dashboard idle detection triggers art generation after configured timeout
 - [ ] ASCII art frames render correctly in dashboard cards with proper cycling
 - [ ] Fallback animation works when LLM call fails
