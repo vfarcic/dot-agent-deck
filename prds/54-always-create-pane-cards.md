@@ -1,6 +1,6 @@
 # PRD #54: Always Create Dashboard Card for Every Pane
 
-**Status**: Draft
+**Status**: Complete
 **Priority**: High
 **Created**: 2026-04-09
 
@@ -55,12 +55,12 @@ When a `SessionStart` event arrives with a `pane_id` matching an existing placeh
 
 ## Milestones
 
-- [ ] Placeholder `SessionState` created at pane creation time with "No agent" status and `pane_id` set
-- [ ] Dashboard card rendered for placeholder sessions with distinct border color (works in light and dark modes) and "No agent" label
-- [ ] Seamless transition from placeholder to real session when agent starts (`SessionStart` event received)
-- [ ] Pane switching (arrow keys, number keys, Enter) works for placeholder cards
-- [ ] Pane closing (`Ctrl+w`) works for placeholder cards
-- [ ] Tests covering placeholder creation, card rendering, session transition, and close behavior
+- [x] Placeholder `SessionState` created at pane creation time with "No agent" status and `pane_id` set
+- [x] Dashboard card rendered for placeholder sessions with distinct border color (works in light and dark modes) and "No agent" label
+- [x] Seamless transition from placeholder to real session when agent starts (`SessionStart` event received)
+- [x] Pane switching (arrow keys, number keys, Enter) works for placeholder cards
+- [x] Pane closing (`Ctrl+w`) works for placeholder cards
+- [x] Tests covering placeholder creation, card rendering, session transition, and close behavior
 
 ## Technical Notes
 
