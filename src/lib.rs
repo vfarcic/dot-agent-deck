@@ -1,4 +1,6 @@
 pub mod config;
+pub mod config_gen;
+pub mod config_validation;
 pub mod daemon;
 pub mod embedded_pane;
 pub mod error;
@@ -16,3 +18,4 @@ pub mod terminal_widget;
 pub mod theme;
 pub mod ui;
 pub mod version;
+pub mod watch;

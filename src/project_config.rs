@@ -27,15 +27,29 @@ pub struct ProjectConfig {
 pub struct ModeConfig {
     pub name: String,
     #[serde(default)]
+    pub init_command: Option<String>,
+    #[serde(default)]
     pub panes: Vec<ModePersistentPane>,
     #[serde(default)]
     pub rules: Vec<ModeRule>,
+    #[serde(default = "default_reactive_panes")]
+    pub reactive_panes: usize,
+}
+
+fn default_reactive_panes() -> usize {
+    2
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModePersistentPane {
     pub command: String,
     pub name: Option<String>,
+    #[serde(default = "default_pane_watch")]
+    pub watch: bool,
+}
+
+fn default_pane_watch() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -152,6 +166,33 @@ pattern = "some pattern"
     }
 
     #[test]
+    fn pane_watch_defaults_to_true() {
+        let toml = r#"
+[[modes]]
+name = "test"
+
+[[modes.panes]]
+command = "kubectl get pods"
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert!(config.modes[0].panes[0].watch);
+    }
+
+    #[test]
+    fn pane_watch_can_be_set_to_false() {
+        let toml = r#"
+[[modes]]
+name = "test"
+
+[[modes.panes]]
+command = "kubectl get pods -w"
+watch = false
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert!(!config.modes[0].panes[0].watch);
+    }
+
+    #[test]
     fn pane_name_defaults_to_none() {
         let toml = r#"
 [[modes]]
@@ -194,6 +235,27 @@ name = "Greeter"
         let config = load_project_config(dir.path()).unwrap().unwrap();
         assert_eq!(config.modes[0].name, "test-mode");
         assert_eq!(config.modes[0].panes[0].name.as_deref(), Some("Greeter"));
+    }
+
+    #[test]
+    fn reactive_panes_defaults_to_two() {
+        let toml = r#"
+[[modes]]
+name = "test"
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.modes[0].reactive_panes, 2);
+    }
+
+    #[test]
+    fn reactive_panes_configurable() {
+        let toml = r#"
+[[modes]]
+name = "test"
+reactive_panes = 4
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.modes[0].reactive_panes, 4);
     }
 
     #[test]

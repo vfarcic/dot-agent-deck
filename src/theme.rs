@@ -54,6 +54,8 @@ pub struct ColorPalette {
     pub tab_bar_bg: Color,
     /// The terminal's actual background color (used to fill the frame explicitly).
     pub terminal_bg: Color,
+    /// Accent color for hints and actionable suggestions (readable on both dark and light).
+    pub hint_accent: Color,
 }
 
 impl ColorPalette {
@@ -65,6 +67,7 @@ impl ColorPalette {
             selected_bg: Color::Rgb(30, 40, 70),
             tab_bar_bg: Color::Rgb(30, 30, 40),
             terminal_bg: Color::Rgb(0, 0, 0),
+            hint_accent: Color::Yellow,
         }
     }
 
@@ -76,6 +79,7 @@ impl ColorPalette {
             selected_bg: Color::Rgb(210, 218, 235),
             tab_bar_bg: Color::Rgb(220, 220, 230),
             terminal_bg: Color::Rgb(255, 255, 255),
+            hint_accent: Color::Rgb(180, 120, 0),
         }
     }
 }

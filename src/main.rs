@@ -58,6 +58,20 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         path: std::path::PathBuf,
     },
+    /// Validate a .dot-agent-deck.toml configuration file
+    Validate {
+        /// Target directory (defaults to current directory)
+        #[arg(short, long, default_value = ".")]
+        path: std::path::PathBuf,
+    },
+    /// Execute a command repeatedly at a fixed interval (like Linux watch)
+    Watch {
+        /// Refresh interval in seconds
+        #[arg(long)]
+        interval: u64,
+        /// Command to execute
+        command: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -158,6 +172,40 @@ fn main() -> ExitCode {
             }
         },
         Some(Commands::Init { path }) => dot_agent_deck::init::run_init(&path),
+        Some(Commands::Watch { interval, command }) => {
+            dot_agent_deck::watch::run_watch(interval, &command)
+        }
+        Some(Commands::Validate { path }) => {
+            use dot_agent_deck::config_validation::{has_errors, validate_config};
+            use dot_agent_deck::project_config::load_project_config;
+
+            match load_project_config(&path) {
+                Ok(None) => {
+                    eprintln!("No .dot-agent-deck.toml found in {}", path.display());
+                    ExitCode::FAILURE
+                }
+                Ok(Some(config)) => {
+                    let issues = validate_config(&config);
+                    if issues.is_empty() {
+                        println!("Config is valid.");
+                        ExitCode::SUCCESS
+                    } else {
+                        for issue in &issues {
+                            eprintln!("{issue}");
+                        }
+                        if has_errors(&issues) {
+                            ExitCode::FAILURE
+                        } else {
+                            ExitCode::SUCCESS
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
 

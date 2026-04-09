@@ -35,7 +35,7 @@ The UI uses a tab-based layout. Tab 1 is always the **Dashboard** — the multi-
 
 1. User presses `Ctrl+n` → dir picker (existing)
 2. User selects dir → app checks for `.dot-agent-deck.toml` in that dir
-3. **Unified form** opens with Name/Command fields. If config found, a Mode field appears at the top with `◀▶` cycling through "No mode" + configured modes + "Generate config"
+3. **Unified form** opens with Name/Command fields. If config found, a Mode field appears at the top with `◀▶` cycling through "No mode" + configured modes
 4. If "No mode" selected → pane created in dashboard tab
 5. If mode selected → **new tab** created with agent pane + side panes in 50/50 layout
 7. Persistent panes start their commands immediately
@@ -146,7 +146,23 @@ watch = false
 
 11. **Reactive rules use `watch` and `interval`.** Each rule has a `pattern` (required regex), `watch` (bool, default false), and `interval` (u64 seconds, optional, only meaningful when `watch = true`). Commands like `kubectl get` benefit from periodic re-execution (`watch = true`) to show live state, while point-in-time commands like `kubectl describe` should run once (`watch = false`). Rules do not specify a target pane — matched commands go to the next available reactive pane in the circular pool.
 
-12. **Real test config as canonical example.** `../dot-ai-infra/.dot-agent-deck.toml` contains a `kubernetes-operations` mode exercising persistent panes, watch rules, and one-shot rules. Use this for integration testing.
+12. **Self-contained test fixtures.** Integration tests use embedded TOML config constants rather than external project files. This ensures tests work in CI without sibling directories.
+
+13. **Agent-driven config generation over static templates.** Rather than detecting project types and applying templates, the system sends a rich prompt to the running AI agent asking it to analyze the project and propose a config. The agent validates commands exist (`which`), presents proposals for user approval, and only writes the file after confirmation. This leverages the agent's intelligence rather than hardcoded heuristics.
+
+14. **Card hint + modal for config generation discovery.** Dashboard cards show a yellow `g: generate .dot-agent-deck.toml` hint when no config exists. Pressing `g` opens an arrow-navigable modal (Yes/No/Never). No auto-popup on session start — the hint is non-intrusive and the modal is user-initiated.
+
+15. **`init_command` for environment setup.** Modes support an optional `init_command` (e.g., `devbox shell`, `nvm use`) that runs once in every pane before its own command. When set, panes are created as interactive shells instead of direct command execution. Trade-off: shell prompts are visible in panes when `init_command` is used.
+
+16. **Config validation as both library and CLI.** `validate_config()` checks regex syntax, duplicate mode names, and interval/watch mismatches. Available programmatically and as `dot-agent-deck validate` subcommand.
+
+17. **Arrow-navigable modal dialogs.** All modal dialogs (config generation, quit confirmation) support Up/Down arrow navigation with Enter to confirm, replacing single-key shortcuts as the primary interaction. Legacy shortcuts (e.g., Ctrl+C for quit) are preserved.
+
+18. **Built-in `dot-agent-deck watch` for reactive watch rules.** Instead of managing Ctrl+C/re-execute cycles in shell panes (which leaves shell prompts visible), watch rules execute via `dot-agent-deck watch --interval N "command"`. This is a built-in CLI subcommand that runs the command, displays output, waits the configured interval, clears, and repeats — producing clean output without shell prompt artifacts. The interval value comes from the rule's `interval` field in `.dot-agent-deck.toml`.
+
+19. **No restart command for side panes.** Side panes are shells (decision #6), so after Ctrl+C stops a command, the shell stays alive and the user can type a new command directly. A dedicated "restart" feature is unnecessary.
+
+20. **Scrolling already works in side panes.** Mouse wheel scrolling on side panes is functional via hit-testing on pane rects. Phase 4 does not need to address scrolling.
 
 ## Technical Design
 
@@ -155,7 +171,7 @@ watch = false
 New structs, separate from existing `DashboardConfig` (global settings). `ProjectConfig` loads from `.dot-agent-deck.toml` in the selected directory.
 
 - `ProjectConfig` — top-level: `modes: Vec<ModeConfig>`
-- `ModeConfig` — `name: String`, `panes: Vec<ModePersistentPane>`, `rules: Vec<ModeRule>`
+- `ModeConfig` — `name: String`, `init_command: Option<String>`, `panes: Vec<ModePersistentPane>`, `rules: Vec<ModeRule>`
 - `ModePersistentPane` — `command: String`, `name: Option<String>` (defaults to command)
 - `ModeRule` — `pattern: String` (regex), `watch: bool` (default false), `interval: Option<u64>` (seconds, only when watch=true)
 
@@ -209,7 +225,7 @@ New tab abstraction layered on top of the existing UI:
 - [x] Config generation via agent — in mode selector, offer "Generate config for this project" when no `.dot-agent-deck.toml` exists
 - [x] `dot-agent-deck init` CLI command — scaffolding for project configs
 
-### Phase 2: Tab-based workspaces (in progress)
+### Phase 2: Tab-based workspaces (complete)
 - [x] Tab data model — `Tab` enum (Dashboard / Mode), tab list, active tab index, tab-to-pane mapping
 - [x] Tab bar rendering — rendered at top when >1 tab, shows names, highlights active (mouse click deferred)
 - [x] Tab switching — `Tab`/`Shift+Tab`, `Left`/`Right`/`h`/`l` cycling; `Ctrl+PageUp/PageDown` as secondary
@@ -225,8 +241,29 @@ New tab abstraction layered on top of the existing UI:
 - [x] Navigation redesign — `Up/Down` linear card cycling, `Ctrl+d` as universal command mode toggle
 - [x] Tests — tab creation, switching, close, card-to-tab navigation
 
-### Phase 3: Smart config generation (brainstorm)
-- [ ] Brainstorm and design improved `.dot-agent-deck.toml` generation — explore: project-type detection (Cargo.toml, package.json, Helm, Terraform, etc.), curated ecosystem templates, learning from agent command history to suggest reactive rules, interactive TUI wizard, smarter agent-assisted generation that analyzes repo structure, config validation (regex syntax, conflicting rules)
+### Phase 3: Smart config generation (complete)
+- [x] Agent-driven config generation — rich prompt template (`src/config_gen.rs`) that instructs the agent to analyze the project, validate commands exist, propose a config for user approval, and write the file
+- [x] Card hint for discovery — yellow `g: generate .dot-agent-deck.toml` hint on dashboard cards when no config exists and dir not suppressed
+- [x] Arrow-navigable modal — `g` opens Yes/No/Never dialog; Yes sends prompt and focuses agent pane; Never persists suppression per directory
+- [x] `ConfigGenState` persistence — tracks suppressed directories in `~/.config/dot-agent-deck/config-gen-state.json`
+- [x] `auto_config_prompt` global setting — disables hint/modal entirely via `dot-agent-deck config set auto_config_prompt false`
+- [x] Config validation module (`src/config_validation.rs`) — regex syntax, duplicate mode names, interval/watch mismatch checks
+- [x] `dot-agent-deck validate` CLI subcommand
+- [x] `init_command` support — optional mode-level setup command (e.g., `devbox shell`) runs once in every pane before its own command
+- [x] Arrow-navigable quit confirmation dialog — consistent modal interaction pattern
+- [x] Self-contained integration tests — embedded TOML fixtures, no external directory dependencies
+- [x] Updated docs — `docs/workspace-modes.md` (config generation flow, `init_command` reference, validation), `docs/keyboard-shortcuts.md` (`g` keybinding)
+
+### Phase 4: Side pane interactivity & watch subcommand
+- [x] `dot-agent-deck watch` CLI subcommand — runs a command periodically (`--interval N`), captures output, clears screen, re-executes; used by mode manager for watch rules and persistent panes
+- [x] Persistent pane auto-watch — `watch = true` (default) wraps pane commands in `dot-agent-deck watch --interval 10`; `watch = false` for self-streaming commands
+- [x] Configurable `reactive_panes` — per-mode setting in TOML (default: 2)
+- [x] Two-phase mode activation — panes created as empty shells, resized to correct display dimensions, then commands sent (prevents PTY size mismatch artifacts)
+- [x] Config generation prompt improvements — project-aware tooling discovery, read-only rules only, compact output guidance, command validation enforcement
+- [x] Terminal widget improvements — content-aware row anchoring, tab-aware PTY resize (50% for mode tabs), column clamping to prevent stale buffer reads
+- [x] Reactive pane environment preservation — panes with `init_command` reuse shell on command routing (no re-initialization)
+- [ ] Side pane focus/selection — keyboard navigation and/or click-to-focus for side panes in mode tabs
+- [ ] PaneInput mode on side panes — once a side pane is focused, Enter enters PaneInput mode allowing Ctrl+C, typing commands, and full interaction
 
 ## Out of Scope (v1)
 

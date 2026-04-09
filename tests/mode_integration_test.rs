@@ -1,5 +1,4 @@
 use std::any::Any;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use dot_agent_deck::mode_manager::ModeManager;
@@ -97,31 +96,50 @@ impl PaneController for MockPaneController {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: resolve path to the real test config
+// Helper: create a temp dir with an embedded test config
 // ---------------------------------------------------------------------------
 
-fn real_config_dir() -> PathBuf {
-    // ../dot-ai-infra relative to the project root
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest.join("../dot-ai-infra")
+const TEST_CONFIG: &str = r#"
+[[modes]]
+name = "kubernetes-operations"
+
+[[modes.panes]]
+command = "kubectl get applications -n argocd -w"
+name = "ArgoCD Apps"
+
+[[modes.panes]]
+command = "kubectl get events -A -w"
+name = "Events"
+
+[[modes.rules]]
+pattern = "kubectl\\s+.*(describe|explain)"
+watch = false
+
+[[modes.rules]]
+pattern = "kubectl\\s+.*(get|top|logs)"
+watch = true
+interval = 2
+
+[[modes.rules]]
+pattern = "helm\\s+.*(status|list)"
+watch = false
+"#;
+
+fn test_config_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(CONFIG_FILE_NAME), TEST_CONFIG).unwrap();
+    dir
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: Load the real config file and verify full structure
+// Test 1: Load config and verify full structure
 // ---------------------------------------------------------------------------
 
 #[test]
 fn load_real_config_and_verify_structure() {
-    let dir = real_config_dir();
-    if !dir.join(CONFIG_FILE_NAME).exists() {
-        eprintln!(
-            "Skipping: real config not found at {}",
-            dir.join(CONFIG_FILE_NAME).display()
-        );
-        return;
-    }
+    let dir = test_config_dir();
 
-    let config = load_project_config(&dir)
+    let config = load_project_config(dir.path())
         .expect("should not error")
         .expect("config file exists");
 
@@ -149,18 +167,14 @@ fn load_real_config_and_verify_structure() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: Load real config and activate mode — verify pane creation sequence
+// Test 2: Load config and activate mode — verify pane creation sequence
 // ---------------------------------------------------------------------------
 
 #[test]
 fn load_real_config_and_activate_mode() {
-    let dir = real_config_dir();
-    if !dir.join(CONFIG_FILE_NAME).exists() {
-        eprintln!("Skipping: real config not found");
-        return;
-    }
+    let dir = test_config_dir();
 
-    let config = load_project_config(&dir).unwrap().unwrap();
+    let config = load_project_config(dir.path()).unwrap().unwrap();
     let mode = &config.modes[0];
 
     let mock = Arc::new(MockPaneController::new());
@@ -197,18 +211,14 @@ fn load_real_config_and_activate_mode() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: End-to-end command routing with real config rules
+// Test 3: End-to-end command routing with config rules
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn end_to_end_command_routing() {
-    let dir = real_config_dir();
-    if !dir.join(CONFIG_FILE_NAME).exists() {
-        eprintln!("Skipping: real config not found");
-        return;
-    }
+    let dir = test_config_dir();
 
-    let config = load_project_config(&dir).unwrap().unwrap();
+    let config = load_project_config(dir.path()).unwrap().unwrap();
     let mode = &config.modes[0];
 
     let mock = Arc::new(MockPaneController::new());
@@ -239,42 +249,32 @@ async fn end_to_end_command_routing() {
     let result = mgr.handle_command("docker build .").unwrap();
     assert!(result.is_none(), "docker should not match any rule");
 
-    // Non-watch commands (describe, helm) use close+recreate (no write_to_pane).
-    // Watch commands (kubectl get) use write_to_pane with clear prefix.
+    // All matched commands (watch and non-watch) use close+recreate.
+    // No write_to_pane calls expected — watch rules now use `dot-agent-deck watch` subprocess.
     let written = mock.written.lock().unwrap();
-    let watch_commands: Vec<_> = written
-        .iter()
-        .map(|(id, text)| (id.as_str(), text.as_str()))
-        .collect();
-    // Only the watch rule (kubectl get) should have a write_to_pane call
-    assert_eq!(watch_commands.len(), 1);
     assert!(
-        watch_commands[0]
-            .1
-            .contains("kubectl get pods -n production")
+        written.is_empty(),
+        "No write_to_pane calls expected — all matched commands use close+recreate"
     );
 
-    // Non-watch commands should have closed old panes
+    // All 3 matched commands should have closed old panes
     let closed = mock.closed.lock().unwrap();
-    assert!(
-        closed.len() >= 2,
-        "Non-watch commands should close old reactive panes"
+    assert_eq!(
+        closed.len(),
+        3,
+        "All matched commands (describe, get, helm) should close old reactive panes"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: Reactive pool cycling with real config
+// Test 4: Reactive pool cycling with config
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn reactive_pool_cycling_with_real_config() {
-    let dir = real_config_dir();
-    if !dir.join(CONFIG_FILE_NAME).exists() {
-        eprintln!("Skipping: real config not found");
-        return;
-    }
+    let dir = test_config_dir();
 
-    let config = load_project_config(&dir).unwrap().unwrap();
+    let config = load_project_config(dir.path()).unwrap().unwrap();
     let mode = &config.modes[0];
 
     let mock = Arc::new(MockPaneController::new());
@@ -304,13 +304,9 @@ async fn reactive_pool_cycling_with_real_config() {
 
 #[tokio::test]
 async fn mode_deactivation_closes_all_panes() {
-    let dir = real_config_dir();
-    if !dir.join(CONFIG_FILE_NAME).exists() {
-        eprintln!("Skipping: real config not found");
-        return;
-    }
+    let dir = test_config_dir();
 
-    let config = load_project_config(&dir).unwrap().unwrap();
+    let config = load_project_config(dir.path()).unwrap().unwrap();
     let mode = &config.modes[0];
 
     let mock = Arc::new(MockPaneController::new());
@@ -323,12 +319,12 @@ async fn mode_deactivation_closes_all_panes() {
     // Deactivate
     mgr.deactivate_mode().unwrap();
 
-    // Verify all 5 panes closed
+    // 1 close from handle_command (watch rule closes+recreates) + 5 from deactivation
     let closed = mock.closed.lock().unwrap();
     assert_eq!(
         closed.len(),
-        5,
-        "all 5 panes (2 persistent + 3 reactive) should be closed"
+        6,
+        "1 (watch close+recreate) + 5 (2 persistent + 3 reactive deactivation) = 6"
     );
 
     // Verify mode is fully cleared
@@ -371,13 +367,14 @@ fn invalid_toml_returns_parse_error() {
 fn invalid_regex_in_config_fails_activation() {
     let config = ModeConfig {
         name: "bad-regex".to_string(),
-
+        init_command: None,
         panes: vec![],
         rules: vec![ModeRule {
             pattern: "[unclosed".to_string(),
             watch: false,
             interval: None,
         }],
+        reactive_panes: 1,
     };
 
     let mock = Arc::new(MockPaneController::new());
@@ -394,22 +391,26 @@ fn invalid_regex_in_config_fails_activation() {
 fn mode_switching_cleans_up_previous() {
     let mode_a = ModeConfig {
         name: "mode-a".to_string(),
-
+        init_command: None,
         panes: vec![ModePersistentPane {
             command: "echo a".to_string(),
             name: Some("A".to_string()),
+            watch: false,
         }],
         rules: vec![],
+        reactive_panes: 1,
     };
 
     let mode_b = ModeConfig {
         name: "mode-b".to_string(),
-
+        init_command: None,
         panes: vec![ModePersistentPane {
             command: "echo b".to_string(),
             name: Some("B".to_string()),
+            watch: false,
         }],
         rules: vec![],
+        reactive_panes: 1,
     };
 
     let mock = Arc::new(MockPaneController::new());
@@ -440,13 +441,14 @@ fn mode_switching_cleans_up_previous() {
 fn all_reactive_mode_works() {
     let config = ModeConfig {
         name: "reactive-only".to_string(),
-
+        init_command: None,
         panes: vec![],
         rules: vec![ModeRule {
             pattern: r".*".to_string(),
             watch: false,
             interval: None,
         }],
+        reactive_panes: 2,
     };
 
     let mock = Arc::new(MockPaneController::new());
@@ -467,12 +469,14 @@ fn all_reactive_mode_works() {
 fn all_persistent_mode_works() {
     let config = ModeConfig {
         name: "persistent-only".to_string(),
-
+        init_command: None,
         panes: vec![ModePersistentPane {
-            command: "watch -n1 date".to_string(),
+            command: "date".to_string(),
             name: Some("Clock".to_string()),
+            watch: false,
         }],
         rules: vec![],
+        reactive_panes: 2,
     };
 
     let mock = Arc::new(MockPaneController::new());

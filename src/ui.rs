@@ -111,6 +111,7 @@ enum UiMode {
     NewPaneForm,
     PaneInput,
     StarPrompt,
+    ConfigGenPrompt,
     QuitConfirm,
 }
 
@@ -307,28 +308,20 @@ struct NewPaneFormState {
     command: String,
     // Mode selection fields
     modes: Vec<ModeConfig>,
-    mode_selected: usize, // 0 = "No mode", 1..N = modes, last = generate (when show_generate)
-    show_generate: bool,
+    mode_selected: usize, // 0 = "No mode", 1..N = modes
     has_mode_field: bool,
     focused: FormField,
 }
 
 impl NewPaneFormState {
-    fn new(
-        dir: PathBuf,
-        name: String,
-        command: String,
-        modes: Vec<ModeConfig>,
-        show_generate: bool,
-    ) -> Self {
-        let has_mode_field = !modes.is_empty() || show_generate;
+    fn new(dir: PathBuf, name: String, command: String, modes: Vec<ModeConfig>) -> Self {
+        let has_mode_field = !modes.is_empty();
         Self {
             dir,
             name,
             command,
             modes,
             mode_selected: 0,
-            show_generate,
             has_mode_field,
             focused: if has_mode_field {
                 FormField::Mode
@@ -339,7 +332,7 @@ impl NewPaneFormState {
     }
 
     fn mode_option_count(&self) -> usize {
-        1 + self.modes.len() + if self.show_generate { 1 } else { 0 }
+        1 + self.modes.len()
     }
 
     fn select_next_mode(&mut self) {
@@ -353,22 +346,16 @@ impl NewPaneFormState {
     }
 
     fn selected_mode(&self) -> Option<&ModeConfig> {
-        if self.mode_selected == 0 || self.is_generate_selected() {
+        if self.mode_selected == 0 {
             None
         } else {
             self.modes.get(self.mode_selected - 1)
         }
     }
 
-    fn is_generate_selected(&self) -> bool {
-        self.show_generate && self.mode_selected == self.mode_option_count() - 1
-    }
-
     fn mode_display_name(&self) -> &str {
         if self.mode_selected == 0 {
             "No mode"
-        } else if self.is_generate_selected() {
-            "Generate config"
         } else {
             &self.modes[self.mode_selected - 1].name
         }
@@ -439,6 +426,14 @@ struct UiState {
     last_click: Option<(std::time::Instant, u16, u16, u8)>, // (time, col, row, click_count)
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
+    /// Config generation state — tracks directories where user chose "Never".
+    config_gen_state: config::ConfigGenState,
+    /// Pane ID + cwd for the pending config-gen modal prompt.
+    config_gen_target: Option<(String, String)>,
+    /// Selected option index in the config-gen modal (0=Yes, 1=No, 2=Never).
+    config_gen_selected: usize,
+    /// Selected option in quit confirm modal (0=Quit, 1=Cancel).
+    quit_confirm_selected: usize,
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -483,6 +478,10 @@ impl UiState {
             side_pane_rects: Vec::new(),
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
+            config_gen_state: config::ConfigGenState::load(),
+            config_gen_target: None,
+            config_gen_selected: 0,
+            quit_confirm_selected: 0,
         }
     }
 }
@@ -630,7 +629,8 @@ enum KeyResult {
     Quit,
     Focus,
     NewPane(NewPaneRequest),
-    GenerateModeConfig { dir: PathBuf },
+    SendConfigGenPrompt { pane_id: String, cwd: String },
+    RequestConfigGen,
     ForwardToPane(Vec<u8>),
 }
 
@@ -835,9 +835,24 @@ fn handle_pane_input_key(key: KeyEvent) -> KeyResult {
 
 fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     match key.code {
-        // Ctrl+C again: actually quit
+        // Ctrl+C again: actually quit (legacy shortcut)
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyResult::Quit,
-        // Esc: cancel, return to dashboard
+        KeyCode::Up | KeyCode::Char('k') => {
+            ui.quit_confirm_selected = 0;
+            KeyResult::Continue
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            ui.quit_confirm_selected = 1;
+            KeyResult::Continue
+        }
+        KeyCode::Enter => {
+            if ui.quit_confirm_selected == 0 {
+                KeyResult::Quit
+            } else {
+                ui.mode = UiMode::Normal;
+                KeyResult::Continue
+            }
+        }
         KeyCode::Esc => {
             ui.mode = UiMode::Normal;
             KeyResult::Continue
@@ -866,6 +881,56 @@ fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         }
         KeyCode::Char('d') => {
             ui.star_prompt_state.dismiss_permanently();
+            ui.mode = UiMode::Normal;
+            KeyResult::Continue
+        }
+        _ => KeyResult::Continue,
+    }
+}
+
+fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            ui.config_gen_selected = ui.config_gen_selected.saturating_sub(1);
+            KeyResult::Continue
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if ui.config_gen_selected < 2 {
+                ui.config_gen_selected += 1;
+            }
+            KeyResult::Continue
+        }
+        KeyCode::Enter => match ui.config_gen_selected {
+            0 => {
+                // Yes — send prompt and focus pane.
+                ui.mode = UiMode::Normal;
+                if let Some((pane_id, cwd)) = ui.config_gen_target.take() {
+                    return KeyResult::SendConfigGenPrompt { pane_id, cwd };
+                }
+                KeyResult::Continue
+            }
+            1 => {
+                // No — dismiss for now, hint stays on card.
+                ui.config_gen_target = None;
+                ui.mode = UiMode::Normal;
+                KeyResult::Continue
+            }
+            _ => {
+                // Never — suppress hint permanently for this directory.
+                if let Some((_, ref cwd)) = ui.config_gen_target {
+                    ui.config_gen_state.suppress_dir(cwd);
+                }
+                ui.config_gen_target = None;
+                ui.mode = UiMode::Normal;
+                ui.status_message = Some((
+                    "Config prompt suppressed for this directory.".to_string(),
+                    std::time::Instant::now(),
+                ));
+                KeyResult::Continue
+            }
+        },
+        KeyCode::Esc => {
+            ui.config_gen_target = None;
             ui.mode = UiMode::Normal;
             KeyResult::Continue
         }
@@ -961,6 +1026,7 @@ fn focus_deck(
 fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
     // Ctrl+C from dashboard: show quit confirmation
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
         return KeyResult::Continue;
     }
@@ -994,6 +1060,7 @@ fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult
             KeyResult::Continue
         }
         KeyCode::Enter if total > 0 => KeyResult::Focus,
+        KeyCode::Char('g') if total > 0 => KeyResult::RequestConfigGen,
         KeyCode::Esc => {
             if !ui.filter_text.is_empty() {
                 ui.filter_text.clear();
@@ -1006,6 +1073,7 @@ fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult
 
 fn handle_filter_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
         return KeyResult::Continue;
     }
@@ -1044,6 +1112,7 @@ fn handle_rename_key(
     selected_session_id: Option<&str>,
 ) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
         return KeyResult::Continue;
     }
@@ -1077,6 +1146,7 @@ fn handle_rename_key(
 
 fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
         return KeyResult::Continue;
     }
@@ -1169,20 +1239,6 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     KeyResult::Continue
 }
 
-fn generate_mode_config_prompt(dir: &str) -> String {
-    format!(
-        "Analyze the project in {dir} and generate a .dot-agent-deck.toml configuration file. \
-         The file defines modes for the dot-agent-deck TUI. Each mode has: name (string), \
-         panes (array of persistent \
-         panes with command and optional name), and rules (array of reactive rules with \
-         pattern as regex, optional watch bool, optional interval in seconds). \
-         Example: [[modes]] name = \"dev\" / [[modes.panes]] command = \"cargo watch -x test\" \
-         name = \"Tests\" / [[modes.rules]] pattern = \"cargo\\\\s+build\" watch = false. \
-         Look at the project languages, build tools, and workflows to create useful modes. \
-         Write the file to {dir}/.dot-agent-deck.toml"
-    )
-}
-
 /// Check for `.dot-agent-deck.toml` in the selected directory.
 /// Open the unified new-pane form, with mode field when modes are available.
 fn transition_after_dir_pick(ui: &mut UiState) {
@@ -1198,24 +1254,19 @@ fn transition_after_dir_pick(ui: &mut UiState) {
         .unwrap_or_default();
     let command = ui.config.default_command.clone();
 
-    let (modes, show_generate) = match load_project_config(&dir) {
-        Ok(Some(config)) if !config.modes.is_empty() => (config.modes, false),
-        _ => (vec![], true),
+    let modes = match load_project_config(&dir) {
+        Ok(Some(config)) if !config.modes.is_empty() => config.modes,
+        _ => vec![],
     };
 
     ui.dir_picker = None;
-    ui.new_pane_form = Some(NewPaneFormState::new(
-        dir,
-        name,
-        command,
-        modes,
-        show_generate,
-    ));
+    ui.new_pane_form = Some(NewPaneFormState::new(dir, name, command, modes));
     ui.mode = UiMode::NewPaneForm;
 }
 
 fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
         return KeyResult::Continue;
     }
@@ -1252,12 +1303,6 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
                 form.focused = FormField::Command;
             }
             FormField::Command => {
-                if form.is_generate_selected() {
-                    let dir = form.dir.clone();
-                    ui.new_pane_form = None;
-                    ui.mode = UiMode::Normal;
-                    return KeyResult::GenerateModeConfig { dir };
-                }
                 let req = NewPaneRequest {
                     dir: form.dir.clone(),
                     name: form.name.clone(),
@@ -1326,7 +1371,7 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, palette);
-    let mut tab_manager = TabManager::new(Arc::clone(&pane), 3);
+    let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
     let should_show_star = star_state.increment_and_check();
@@ -1554,8 +1599,15 @@ pub fn run_tui(
                 if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
                     let pane_ids = embedded.pane_ids();
                     if !pane_ids.is_empty() {
-                        // Right panel is 67% of width, minus 2 for borders.
-                        let right_width = (w * 67 / 100).saturating_sub(2);
+                        // Width depends on active tab layout:
+                        // - Dashboard: right panel is 67% of width
+                        // - Mode tab: both agent and side panes are 50% of width
+                        let is_mode_tab = tab_manager.active_mode_name().is_some();
+                        let pane_width = if is_mode_tab {
+                            (w * 50 / 100).saturating_sub(2)
+                        } else {
+                            (w * 67 / 100).saturating_sub(2)
+                        };
                         let pane_count = pane_ids.len() as u16;
                         for pane_id in &pane_ids {
                             let is_focused =
@@ -1574,7 +1626,7 @@ pub fn run_tui(
                                 }
                             };
                             if rows > 0 {
-                                let _ = embedded.resize_pane_pty(pane_id, rows, right_width);
+                                let _ = embedded.resize_pane_pty(pane_id, rows, pane_width);
                             }
                         }
                     }
@@ -2042,6 +2094,7 @@ pub fn run_tui(
                     UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
                     UiMode::PaneInput => handle_pane_input_key(key),
                     UiMode::StarPrompt => handle_star_prompt_key(key, &mut ui),
+                    UiMode::ConfigGenPrompt => handle_config_gen_prompt_key(key, &mut ui),
                     UiMode::QuitConfirm => handle_quit_confirm_key(key, &mut ui),
                 }
             };
@@ -2085,6 +2138,22 @@ pub fn run_tui(
                                 std::time::Instant::now(),
                             ));
                         }
+                    }
+                }
+                KeyResult::RequestConfigGen => {
+                    if let Some(ref sid) = selected_id
+                        && let Some(session) = snapshot.sessions.get(sid)
+                        && let Some(ref pane_id) = session.pane_id
+                        && let Some(ref cwd) = session.cwd
+                    {
+                        ui.config_gen_target = Some((pane_id.clone(), cwd.clone()));
+                        ui.config_gen_selected = 0;
+                        ui.mode = UiMode::ConfigGenPrompt;
+                    } else {
+                        ui.status_message = Some((
+                            "No active agent session to send prompt to.".to_string(),
+                            std::time::Instant::now(),
+                        ));
                     }
                 }
                 KeyResult::NewPane(req) => {
@@ -2152,6 +2221,8 @@ pub fn run_tui(
                                                     }
                                                 }
                                             }
+                                            // Start commands now that panes are correctly sized
+                                            let _ = tab_manager.start_mode_commands();
                                             ui.status_message = Some((
                                                 format!("Activated mode: {mode_name}"),
                                                 std::time::Instant::now(),
@@ -2208,59 +2279,26 @@ pub fn run_tui(
                         }
                     }
                 }
-                KeyResult::GenerateModeConfig { dir } => {
-                    if pane.is_available() {
-                        let dir_str = dir.display().to_string();
-                        let cmd = if ui.config.default_command.is_empty() {
-                            None
-                        } else {
-                            Some(ui.config.default_command.as_str())
-                        };
-                        match pane.create_pane(cmd, Some(&dir_str)) {
-                            Ok(new_id) => {
-                                state.blocking_write().register_pane(new_id.clone());
-                                let _ = pane.rename_pane(&new_id, "Config Generator");
-                                ui.pane_display_names
-                                    .insert(new_id.clone(), "Config Generator".to_string());
-                                ui.pane_names
-                                    .insert(new_id.clone(), "Config Generator".to_string());
-                                let _ = pane.focus_pane(&new_id);
-                                ui.mode = UiMode::PaneInput;
-                                // Resize new pane PTY to match current layout.
-                                if let Some(embedded) =
-                                    pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                                {
-                                    let frame_area = terminal.get_frame().area();
-                                    let right_width =
-                                        (frame_area.width * 67 / 100).saturating_sub(2);
-                                    let pane_count = embedded.pane_ids().len() as u16;
-                                    let rows = match ui.pane_layout {
-                                        PaneLayout::Tiled => (frame_area.height
-                                            / pane_count.max(1))
-                                        .saturating_sub(2),
-                                        PaneLayout::Stacked => frame_area
-                                            .height
-                                            .saturating_sub(2 + pane_count.saturating_sub(1)),
-                                    };
-                                    if rows > 0 && right_width > 0 {
-                                        let _ =
-                                            embedded.resize_pane_pty(&new_id, rows, right_width);
-                                    }
-                                }
-                                // Send generation prompt to the agent pane.
-                                let prompt = generate_mode_config_prompt(&dir_str);
-                                let _ = pane.write_to_pane(&new_id, &prompt);
-                                ui.status_message = Some((
-                                    "Generating mode config...".to_string(),
-                                    std::time::Instant::now(),
-                                ));
+                KeyResult::SendConfigGenPrompt { pane_id, cwd } => {
+                    let prompt = crate::config_gen::config_gen_prompt(&cwd);
+                    match pane.write_to_pane(&pane_id, &prompt) {
+                        Ok(()) => {
+                            // Focus the pane so user can press Enter to execute.
+                            if let Some(tab_idx) = tab_manager.tab_index_for_pane(&pane_id) {
+                                tab_manager.switch_to(tab_idx);
                             }
-                            Err(e) => {
-                                ui.status_message = Some((
-                                    format!("Config generation failed: {e}"),
-                                    std::time::Instant::now(),
-                                ));
-                            }
+                            let _ = pane.focus_pane(&pane_id);
+                            ui.mode = UiMode::PaneInput;
+                            ui.status_message = Some((
+                                "Config prompt sent — press Enter to execute.".to_string(),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                        Err(e) => {
+                            ui.status_message = Some((
+                                format!("Failed to send config prompt: {e}"),
+                                std::time::Instant::now(),
+                            ));
                         }
                     }
                 }
@@ -2521,8 +2559,11 @@ fn render_frame(
         if ui.mode == UiMode::StarPrompt {
             render_star_prompt(frame, palette);
         }
+        if ui.mode == UiMode::ConfigGenPrompt {
+            render_config_gen_prompt(frame, ui.config_gen_selected, palette);
+        }
         if ui.mode == UiMode::QuitConfirm {
-            render_quit_confirm(frame, palette);
+            render_quit_confirm(frame, ui.quit_confirm_selected, palette);
         }
         return;
     }
@@ -2648,6 +2689,17 @@ fn render_frame(
                 let n = flat_index + 1;
                 if n <= 9 { Some(n as u8) } else { None }
             };
+            let show_config_hint = ui.config.auto_config_prompt
+                && session
+                    .cwd
+                    .as_deref()
+                    .map(|cwd| {
+                        !ui.config_gen_state.is_suppressed(cwd)
+                            && !std::path::Path::new(cwd)
+                                .join(".dot-agent-deck.toml")
+                                .exists()
+                    })
+                    .unwrap_or(false);
             render_session_card(
                 frame,
                 col_chunks[col_idx],
@@ -2657,6 +2709,7 @@ fn render_frame(
                 display_name,
                 card_number,
                 density,
+                show_config_hint,
                 palette,
             );
         }
@@ -2706,8 +2759,11 @@ fn render_frame(
     if ui.mode == UiMode::StarPrompt {
         render_star_prompt(frame, palette);
     }
+    if ui.mode == UiMode::ConfigGenPrompt {
+        render_config_gen_prompt(frame, ui.config_gen_selected, palette);
+    }
     if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame, palette);
+        render_quit_confirm(frame, ui.quit_confirm_selected, palette);
     }
 }
 
@@ -2961,7 +3017,7 @@ fn render_mode_tab(
         render_new_pane_form(frame, form, palette);
     }
     if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame, palette);
+        render_quit_confirm(frame, ui.quit_confirm_selected, palette);
     }
 }
 
@@ -3108,17 +3164,22 @@ fn render_bottom_bar(
     }
 }
 
-fn render_quit_confirm(frame: &mut Frame, palette: ColorPalette) {
+fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 44.min(area.width.saturating_sub(4));
-    let popup_height = 7u16.min(area.height.saturating_sub(4));
+    let popup_height = 9u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
-    let text = vec![
+    let options = [
+        ("Quit", "exit the application"),
+        ("Cancel", "return to dashboard"),
+    ];
+
+    let mut text = vec![
         Line::from(""),
         Line::styled(
             "  Are you sure you want to quit?",
@@ -3127,9 +3188,28 @@ fn render_quit_confirm(frame: &mut Frame, palette: ColorPalette) {
                 .add_modifier(Modifier::BOLD),
         ),
         Line::from(""),
-        Line::from("  Ctrl+c  Confirm quit"),
-        Line::from("  Esc     Cancel"),
     ];
+
+    for (i, (label, desc)) in options.iter().enumerate() {
+        let cursor = if i == selected { ">" } else { " " };
+        let style = if i == selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        text.push(Line::styled(
+            format!("  {cursor} {label:<7} \u{2014} {desc}"),
+            style,
+        ));
+    }
+
+    text.push(Line::from(""));
+    text.push(Line::styled(
+        "  Up/Down: navigate  Enter: confirm  Esc: cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
 
     let block = Block::default()
         .title(" Quit ")
@@ -3194,6 +3274,80 @@ fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
     frame.render_widget(paragraph, popup_area);
 }
 
+fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPalette) {
+    let area = frame.area();
+    let popup_width = 60u16.min(area.width.saturating_sub(4));
+    let popup_height = 14u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let options = [
+        ("Yes", "generate config for this project"),
+        ("No", "skip for now"),
+        ("Never", "never ask for this directory"),
+    ];
+
+    let mut text = vec![
+        Line::from(""),
+        Line::styled(
+            "  No workspace modes config found for this",
+            Style::default().fg(Color::White),
+        ),
+        Line::styled(
+            "  project. Want to instruct your agent to",
+            Style::default().fg(Color::White),
+        ),
+        Line::styled(
+            "  analyze the project and create one?",
+            Style::default().fg(Color::White),
+        ),
+        Line::from(""),
+    ];
+
+    for (i, (label, desc)) in options.iter().enumerate() {
+        let cursor = if i == selected { ">" } else { " " };
+        let style = if i == selected {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        text.push(Line::styled(
+            format!("  {cursor} {label:<6} \u{2014} {desc}"),
+            style,
+        ));
+    }
+
+    text.push(Line::from(""));
+    text.push(Line::styled(
+        "  Disable: dot-agent-deck config set auto_config_prompt false",
+        Style::default().fg(Color::DarkGray),
+    ));
+    text.push(Line::from(""));
+    text.push(Line::styled(
+        "  Up/Down: navigate  Enter: confirm  Esc: cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let block = Block::default()
+        .title(" Generate .dot-agent-deck.toml ")
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(palette.terminal_bg));
+
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
 fn render_help_overlay(
     frame: &mut Frame,
     has_pane_control: bool,
@@ -3204,7 +3358,7 @@ fn render_help_overlay(
     let popup_width = 52.min(area.width.saturating_sub(4));
     let tab_nav_lines: u16 = if active_mode_name.is_some() { 6 } else { 0 };
     let mode_lines: u16 = if active_mode_name.is_some() { 8 } else { 6 };
-    let base_height: u16 = if has_pane_control { 43 } else { 28 } + mode_lines + tab_nav_lines;
+    let base_height: u16 = if has_pane_control { 44 } else { 28 } + mode_lines + tab_nav_lines;
     let popup_height = base_height.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -3258,6 +3412,7 @@ fn render_help_overlay(
         help_text.push(Line::from("  Enter         Focus selected pane"));
         help_text.push(Line::from("  /             Filter sessions"));
         help_text.push(Line::from("  r             Rename session"));
+        help_text.push(Line::from("  g             Generate .dot-agent-deck.toml"));
         help_text.push(Line::from("  ?             Toggle this help"));
         help_text.push(Line::from("  Esc           Clear filter"));
         help_text.push(Line::from(format!("  {MOD_KEY}+c         Quit")));
@@ -3480,9 +3635,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
         } else {
             mode_name.to_string()
         };
-        let mode_value_style = if form.is_generate_selected() {
-            Style::default().fg(Color::Green)
-        } else if form.focused == FormField::Mode {
+        let mode_value_style = if form.focused == FormField::Mode {
             Style::default().fg(palette.text_primary)
         } else {
             unfocused_label
@@ -3540,7 +3693,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
 
     let title = match form.selected_mode() {
         Some(cfg) => format!(" New Agent \u{2014} {} mode ", cfg.name),
-        None if form.is_generate_selected() => " New Agent \u{2014} generate config ".to_string(),
         None => " New Agent ".to_string(),
     };
     let block = Block::default()
@@ -3588,6 +3740,7 @@ fn render_session_card(
     display_name: Option<&String>,
     card_number: Option<u8>,
     density: CardDensity,
+    show_config_hint: bool,
     palette: ColorPalette,
 ) {
     let (status_label, status_style) = status_style(&session.status);
@@ -3716,6 +3869,13 @@ fn render_session_card(
     }
     let tool_lines = recent_tool_lines(session, density.max_tools(), palette);
     lines.extend(tool_lines);
+
+    if show_config_hint {
+        lines.push(Line::styled(
+            "g: generate .dot-agent-deck.toml",
+            Style::default().fg(palette.hint_accent),
+        ));
+    }
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
@@ -4409,14 +4569,13 @@ mod tests {
             &mut ui,
         );
 
-        // Goes directly to unified NewPaneForm (with generate option)
+        // Goes directly to unified NewPaneForm
         assert_eq!(ui.mode, UiMode::NewPaneForm);
         assert!(ui.new_pane_form.is_some());
         let form = ui.new_pane_form.as_ref().unwrap();
-        assert!(form.show_generate);
         assert!(form.modes.is_empty());
-        assert!(form.has_mode_field);
-        assert_eq!(form.focused, FormField::Mode);
+        assert!(!form.has_mode_field);
+        assert_eq!(form.focused, FormField::Name);
     }
 
     #[test]
@@ -5122,8 +5281,10 @@ mod tests {
     fn make_mode(name: &str) -> ModeConfig {
         ModeConfig {
             name: name.to_string(),
+            init_command: None,
             panes: vec![],
             rules: vec![],
+            reactive_panes: 2,
         }
     }
 
@@ -5134,27 +5295,11 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
-            false,
         );
         assert_eq!(f.mode_option_count(), 2); // "No mode" + 1 mode
 
-        let f = NewPaneFormState::new(
-            PathBuf::from("/tmp"),
-            String::new(),
-            String::new(),
-            vec![],
-            true,
-        );
-        assert_eq!(f.mode_option_count(), 2); // "No mode" + "Generate"
-
-        let f = NewPaneFormState::new(
-            PathBuf::from("/tmp"),
-            String::new(),
-            String::new(),
-            vec![make_mode("a")],
-            true,
-        );
-        assert_eq!(f.mode_option_count(), 3); // "No mode" + 1 mode + "Generate"
+        let f = NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
+        assert_eq!(f.mode_option_count(), 1); // "No mode" only
     }
 
     #[test]
@@ -5164,7 +5309,6 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("alpha"), make_mode("beta")],
-            false,
         );
         assert_eq!(f.mode_selected, 0);
 
@@ -5189,7 +5333,6 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("k8s"), make_mode("rust-tdd")],
-            false,
         );
 
         // Index 0 = "No mode"
@@ -5211,7 +5354,6 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
-            false,
         );
         assert_eq!(f.focused, FormField::Mode);
 
@@ -5231,13 +5373,8 @@ mod tests {
 
     #[test]
     fn unified_form_tab_cycles_without_mode() {
-        let mut f = NewPaneFormState::new(
-            PathBuf::from("/tmp"),
-            String::new(),
-            String::new(),
-            vec![],
-            false,
-        );
+        let mut f =
+            NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
         assert!(!f.has_mode_field);
         assert_eq!(f.focused, FormField::Name);
 
@@ -5258,20 +5395,13 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
-            false,
         );
         assert_eq!(f.focused, FormField::Mode);
     }
 
     #[test]
     fn unified_form_initial_focus_without_modes() {
-        let f = NewPaneFormState::new(
-            PathBuf::from("/tmp"),
-            String::new(),
-            String::new(),
-            vec![],
-            false,
-        );
+        let f = NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
         assert_eq!(f.focused, FormField::Name);
     }
 
@@ -5284,7 +5414,6 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a"), make_mode("b")],
-            false,
         ));
 
         // Right arrow cycles forward
@@ -5307,7 +5436,6 @@ mod tests {
             "agent".to_string(),
             "claude".to_string(),
             vec![make_mode("a")],
-            false,
         ));
 
         // Enter on Mode → Name
@@ -5338,7 +5466,6 @@ mod tests {
             "agent".to_string(),
             "claude".to_string(),
             vec![make_mode("k8s-ops")],
-            false,
         ));
 
         // Select mode "k8s-ops" (index 1)
@@ -5373,7 +5500,6 @@ mod tests {
             "agent".to_string(),
             "claude".to_string(),
             vec![make_mode("a")],
-            false,
         ));
 
         // Stay on "No mode" (index 0), navigate through fields
@@ -5391,35 +5517,6 @@ mod tests {
     }
 
     #[test]
-    fn unified_form_generate_submit() {
-        let mut ui = default_ui();
-        ui.mode = UiMode::NewPaneForm;
-        ui.new_pane_form = Some(NewPaneFormState::new(
-            PathBuf::from("/tmp/proj"),
-            String::new(),
-            String::new(),
-            vec![],
-            true,
-        ));
-
-        // Navigate to "Generate config" (index 1)
-        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
-        handle_new_pane_form_key(right, &mut ui);
-        assert!(ui.new_pane_form.as_ref().unwrap().is_generate_selected());
-
-        // Navigate through fields to Command and submit
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
-        handle_new_pane_form_key(enter, &mut ui); // Name → Command
-        let result = handle_new_pane_form_key(enter, &mut ui);
-
-        assert_eq!(ui.mode, UiMode::Normal);
-        assert!(
-            matches!(result, KeyResult::GenerateModeConfig { ref dir } if dir == Path::new("/tmp/proj"))
-        );
-    }
-
-    #[test]
     fn unified_form_esc_cancels() {
         let mut ui = default_ui();
         ui.mode = UiMode::NewPaneForm;
@@ -5428,7 +5525,6 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
-            false,
         ));
 
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -5447,7 +5543,6 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
-            false,
         ));
 
         // Move to Name field
@@ -5474,7 +5569,6 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
-            false,
         ));
 
         // Move to Name field
@@ -5491,27 +5585,87 @@ mod tests {
     }
 
     #[test]
-    fn unified_form_generate_navigation() {
-        let mut f = NewPaneFormState::new(
-            PathBuf::from("/tmp"),
-            String::new(),
-            String::new(),
-            vec![],
-            true,
+    fn config_gen_prompt_enter_on_yes_sends_prompt() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_selected = 0; // Yes
+        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_config_gen_prompt_key(enter, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.config_gen_target.is_none());
+        assert!(
+            matches!(result, KeyResult::SendConfigGenPrompt { ref pane_id, ref cwd }
+                if pane_id == "pane-1" && cwd == "/my/project")
         );
-        assert_eq!(f.mode_selected, 0);
-        assert_eq!(f.mode_option_count(), 2);
+    }
 
-        f.select_next_mode();
-        assert_eq!(f.mode_selected, 1);
-        assert!(f.is_generate_selected());
-        assert_eq!(f.mode_display_name(), "Generate config");
+    #[test]
+    fn config_gen_prompt_enter_on_no_dismisses() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_selected = 1; // No
+        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
 
-        f.select_next_mode();
-        assert_eq!(f.mode_selected, 1); // can't go past last
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_config_gen_prompt_key(enter, &mut ui);
 
-        f.select_previous_mode();
-        assert_eq!(f.mode_selected, 0);
-        assert!(!f.is_generate_selected());
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.config_gen_target.is_none());
+        assert!(matches!(result, KeyResult::Continue));
+    }
+
+    #[test]
+    fn config_gen_prompt_enter_on_never_suppresses_dir() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_selected = 2; // Never
+        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_config_gen_prompt_key(enter, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.config_gen_target.is_none());
+        assert!(ui.config_gen_state.is_suppressed("/my/project"));
+        assert!(matches!(result, KeyResult::Continue));
+        assert!(ui.status_message.is_some());
+    }
+
+    #[test]
+    fn config_gen_prompt_arrow_navigation() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_selected = 0;
+
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_config_gen_prompt_key(down, &mut ui);
+        assert_eq!(ui.config_gen_selected, 1);
+
+        handle_config_gen_prompt_key(down, &mut ui);
+        assert_eq!(ui.config_gen_selected, 2);
+
+        // Can't go past last
+        handle_config_gen_prompt_key(down, &mut ui);
+        assert_eq!(ui.config_gen_selected, 2);
+
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        handle_config_gen_prompt_key(up, &mut ui);
+        assert_eq!(ui.config_gen_selected, 1);
+    }
+
+    #[test]
+    fn config_gen_prompt_esc_dismisses() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let result = handle_config_gen_prompt_key(esc, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(matches!(result, KeyResult::Continue));
     }
 }

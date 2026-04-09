@@ -70,17 +70,19 @@ impl ReactivePool {
     }
 }
 
-struct WatchHandle {
-    abort_handle: tokio::task::AbortHandle,
+struct PendingCommand {
     pane_id: String,
+    init_command: Option<String>,
+    command: String,
 }
 
 struct ActiveMode {
     name: String,
+    has_init: bool,
     compiled_rules: Vec<CompiledRule>,
     persistent_pane_ids: Vec<String>,
     reactive_pool: ReactivePool,
-    watch_handles: Vec<WatchHandle>,
+    pending_commands: Vec<PendingCommand>,
 }
 
 /// Result of routing a command to a reactive pane.
@@ -144,36 +146,86 @@ impl ModeManager {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Create persistent panes with direct command execution (no interactive shell)
+        // Phase 1: Create all panes as empty shells. Commands are NOT sent yet —
+        // the caller must resize panes to correct dimensions, then call
+        // start_mode_commands() to send commands at the right PTY size.
         let mut persistent_pane_ids = Vec::with_capacity(config.panes.len());
-        for pane_cfg in &config.panes {
-            let pane_id = self
-                .pane_controller
-                .create_pane(Some(&pane_cfg.command), cwd)?;
+        let mut pending_commands = Vec::new();
 
+        for pane_cfg in &config.panes {
+            let effective_cmd = if pane_cfg.watch {
+                let exe = std::env::current_exe()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("dot-agent-deck"));
+                format!(
+                    "{} watch --interval 10 {:?}",
+                    exe.display(),
+                    pane_cfg.command
+                )
+            } else {
+                pane_cfg.command.clone()
+            };
+
+            let pane_id = self.pane_controller.create_pane(None, cwd)?;
             let display_name = pane_cfg.name.as_deref().unwrap_or(&pane_cfg.command);
             self.pane_controller.rename_pane(&pane_id, display_name)?;
+
+            pending_commands.push(PendingCommand {
+                pane_id: pane_id.clone(),
+                init_command: config.init_command.clone(),
+                command: effective_cmd,
+            });
 
             persistent_pane_ids.push(pane_id);
         }
 
-        // Create reactive pool panes (blank — no interactive shell)
         let mut reactive_pool = ReactivePool::new();
         for i in 0..self.reactive_pool_size {
-            let pane_id = self.pane_controller.create_pane(Some("true"), cwd)?;
+            let pane_id = self.pane_controller.create_pane(None, cwd)?;
             self.pane_controller
                 .rename_pane(&pane_id, &format!("reactive-{i}"))?;
+
+            // Reactive panes only need init_command (no command until a rule matches)
+            if config.init_command.is_some() {
+                pending_commands.push(PendingCommand {
+                    pane_id: pane_id.clone(),
+                    init_command: config.init_command.clone(),
+                    command: String::new(),
+                });
+            }
 
             reactive_pool.add(pane_id);
         }
 
         self.active_mode = Some(ActiveMode {
             name: config.name.clone(),
+            has_init: config.init_command.is_some(),
             compiled_rules,
             persistent_pane_ids,
             reactive_pool,
-            watch_handles: Vec::new(),
+            pending_commands,
         });
+
+        Ok(())
+    }
+
+    /// Phase 2: Send commands to panes. Must be called after panes are resized
+    /// to correct display dimensions to avoid stale content artifacts.
+    pub fn start_mode_commands(&mut self) -> Result<(), ModeManagerError> {
+        let mode = self
+            .active_mode
+            .as_mut()
+            .ok_or(ModeManagerError::NoActiveMode)?;
+
+        let pending = std::mem::take(&mut mode.pending_commands);
+        for cmd in &pending {
+            if let Some(ref init) = cmd.init_command {
+                self.pane_controller.write_to_pane(&cmd.pane_id, init)?;
+            }
+            if !cmd.command.is_empty() {
+                self.pane_controller
+                    .write_to_pane(&cmd.pane_id, &cmd.command)?;
+            }
+        }
 
         Ok(())
     }
@@ -183,11 +235,6 @@ impl ModeManager {
             .active_mode
             .take()
             .ok_or(ModeManagerError::NoActiveMode)?;
-
-        // Cancel all watch tasks
-        for wh in &mode.watch_handles {
-            wh.abort_handle.abort();
-        }
 
         // Close persistent panes
         for id in &mode.persistent_pane_ids {
@@ -236,45 +283,43 @@ impl ModeManager {
             }
         };
 
-        // Cancel any existing watch on this pane
-        mode.watch_handles.retain(|wh| {
-            if wh.pane_id == old_pane_id {
-                wh.abort_handle.abort();
-                false
-            } else {
-                true
-            }
-        });
-
         let watch = mode.compiled_rules[rule_idx].watch;
         let interval = mode.compiled_rules[rule_idx].interval;
 
-        if watch {
-            // Watch rules: use interactive shell with clear prefix
-            self.pane_controller
-                .write_to_pane(&old_pane_id, &format!("clear && {command}"))?;
-            let _ = self.pane_controller.rename_pane(&old_pane_id, command);
+        let pane_cmd = if watch {
+            let exe = std::env::current_exe()
+                .unwrap_or_else(|_| std::path::PathBuf::from("dot-agent-deck"));
             let interval_secs = interval.unwrap_or(5);
-            let abort_handle = Self::start_watch(
-                &self.pane_controller,
-                old_pane_id.clone(),
-                command.to_string(),
+            format!(
+                "{} watch --interval {} {:?}",
+                exe.display(),
                 interval_secs,
-            );
-            mode.watch_handles.push(WatchHandle {
-                abort_handle,
-                pane_id: old_pane_id,
-            });
+                command
+            )
+        } else {
+            command.to_string()
+        };
+
+        if mode.has_init {
+            // Reuse existing shell pane to preserve init_command environment.
+            // Send Ctrl+C to stop any running command, then clear scrollback + screen
+            // before running the new command so old output is not visible.
+            let _ = self.pane_controller.write_to_pane(&old_pane_id, "\x03");
+            self.pane_controller.write_to_pane(
+                &old_pane_id,
+                &format!("printf '\\x1b[3J\\x1b[2J\\x1b[H' && {pane_cmd}"),
+            )?;
+            let _ = self.pane_controller.rename_pane(&old_pane_id, command);
             Ok(Some(PaneChange {
                 closed: None,
                 created: None,
             }))
         } else {
-            // Non-watch: close old pane and recreate with direct command execution
+            // No init_command — close and recreate for clean output.
             self.pane_controller.close_pane(&old_pane_id)?;
             let new_pane_id = self
                 .pane_controller
-                .create_pane(Some(command), self.cwd.as_deref())?;
+                .create_pane(Some(&pane_cmd), self.cwd.as_deref())?;
             let _ = self.pane_controller.rename_pane(&new_pane_id, command);
             mode.reactive_pool
                 .replace(&old_pane_id, new_pane_id.clone());
@@ -298,25 +343,6 @@ impl ModeManager {
             }
             None => Vec::new(),
         }
-    }
-
-    fn start_watch(
-        pane_controller: &Arc<dyn PaneController>,
-        pane_id: String,
-        command: String,
-        interval_secs: u64,
-    ) -> tokio::task::AbortHandle {
-        let controller = Arc::clone(pane_controller);
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-                // Send Ctrl-C to kill any previous execution
-                let _ = controller.write_to_pane(&pane_id, "\x03");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let _ = controller.write_to_pane(&pane_id, &command);
-            }
-        });
-        handle.abort_handle()
     }
 }
 
@@ -416,10 +442,11 @@ mod tests {
     fn test_config() -> ModeConfig {
         ModeConfig {
             name: "kubernetes".to_string(),
-
+            init_command: None,
             panes: vec![ModePersistentPane {
                 command: "kubectl get pods -w".to_string(),
                 name: Some("Pods".to_string()),
+                watch: false,
             }],
             rules: vec![
                 ModeRule {
@@ -433,6 +460,7 @@ mod tests {
                     interval: Some(2),
                 },
             ],
+            reactive_panes: 2,
         }
     }
 
@@ -475,13 +503,14 @@ mod tests {
 
         let config = ModeConfig {
             name: "test".to_string(),
-
+            init_command: None,
             panes: vec![],
             rules: vec![ModeRule {
                 pattern: r".*".to_string(),
                 watch: false,
                 interval: None,
             }],
+            reactive_panes: 2,
         };
         mgr.activate_mode(&config, None).unwrap();
 
@@ -521,13 +550,14 @@ mod tests {
 
         let config = ModeConfig {
             name: "bad".to_string(),
-
+            init_command: None,
             panes: vec![],
             rules: vec![ModeRule {
                 pattern: r"[invalid".to_string(),
                 watch: false,
                 interval: None,
             }],
+            reactive_panes: 1,
         };
 
         let err = mgr.activate_mode(&config, None).unwrap_err();

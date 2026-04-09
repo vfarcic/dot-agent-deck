@@ -64,17 +64,15 @@ pub struct TabManager {
     active_index: usize,
     next_id: TabId,
     pane_controller: Arc<dyn PaneController>,
-    reactive_pool_size: usize,
 }
 
 impl TabManager {
-    pub fn new(pane_controller: Arc<dyn PaneController>, reactive_pool_size: usize) -> Self {
+    pub fn new(pane_controller: Arc<dyn PaneController>) -> Self {
         Self {
             tabs: vec![Tab::Dashboard],
             active_index: 0,
             next_id: 1,
             pane_controller,
-            reactive_pool_size,
         }
     }
 
@@ -123,7 +121,7 @@ impl TabManager {
         agent_pane_id: String,
     ) -> Result<(usize, Vec<String>), TabError> {
         let mut mode_manager =
-            ModeManager::new(Arc::clone(&self.pane_controller), self.reactive_pool_size);
+            ModeManager::new(Arc::clone(&self.pane_controller), config.reactive_panes);
         mode_manager.activate_mode(config, Some(cwd))?;
         let pane_ids = mode_manager.managed_pane_ids();
 
@@ -143,6 +141,17 @@ impl TabManager {
         self.active_index = index;
 
         Ok((index, pane_ids))
+    }
+
+    /// Send pending commands to the active mode tab's panes.
+    /// Must be called after panes are resized to correct display dimensions.
+    pub fn start_mode_commands(&mut self) -> Result<(), TabError> {
+        if let Some(Tab::Mode { mode_manager, .. }) = self.tabs.get_mut(self.active_index) {
+            mode_manager
+                .start_mode_commands()
+                .map_err(TabError::ModeManager)?;
+        }
+        Ok(())
     }
 
     /// Close a mode tab by index. Returns the pane IDs that were managed.
@@ -371,21 +380,24 @@ mod tests {
     fn test_config(name: &str) -> ModeConfig {
         ModeConfig {
             name: name.to_string(),
+            init_command: None,
             panes: vec![ModePersistentPane {
                 command: "kubectl get pods -w".to_string(),
                 name: Some("Pods".to_string()),
+                watch: false,
             }],
             rules: vec![ModeRule {
                 pattern: r"kubectl\s+describe".to_string(),
                 watch: false,
                 interval: None,
             }],
+            reactive_panes: 3,
         }
     }
 
     fn make_manager() -> TabManager {
         let mock = Arc::new(MockPaneController::new());
-        TabManager::new(mock, 3)
+        TabManager::new(mock)
     }
 
     // -- Tests --
@@ -436,7 +448,7 @@ mod tests {
     #[test]
     fn close_mode_tab() {
         let mock = Arc::new(MockPaneController::new());
-        let mut tm = TabManager::new(mock.clone(), 3);
+        let mut tm = TabManager::new(mock.clone());
         let (_, ids) = tm
             .open_mode_tab(&test_config("k8s"), "/tmp", String::new())
             .unwrap();

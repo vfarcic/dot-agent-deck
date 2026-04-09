@@ -13,14 +13,14 @@ Modes are config-driven workspaces that pair an AI agent with live command outpu
 
 Defined in `[[modes.panes]]`. These run immediately when the mode activates and stay alive for the lifetime of the tab.
 
-Use persistent panes for continuous monitoring — `cargo watch -x test`, `kubectl get pods -w`, or a log tail.
+By default (`watch = true`), persistent pane commands are re-executed every 10 seconds via the built-in `dot-agent-deck watch` subcommand. Write plain commands without watch/follow flags — the system handles refresh automatically. Set `watch = false` for commands that stream on their own (e.g., `kubectl get pods -w`, `tail -f`).
 
 ### Reactive Panes
 
 Driven by `[[modes.rules]]`. Reactive panes start empty and populate when the agent executes a command matching a rule's regex `pattern`.
 
 - `watch = false` (default) — command runs once and the output stays visible.
-- `watch = true` with optional `interval` — command re-runs on a timer (in seconds).
+- `watch = true` with optional `interval` — command re-runs on a timer (in seconds) via the built-in `dot-agent-deck watch` subcommand, producing clean output without shell prompt artifacts.
 
 ### Circular Pane Pool
 
@@ -33,8 +33,10 @@ Persistent panes claim the first slots and are never overwritten. Reactive comma
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `name` | string | yes | — | Display name shown in the tab bar |
+| `init_command` | string | no | — | Setup command run once in every pane before its own command (e.g., `devbox shell`) |
 | `panes` | array | no | `[]` | Persistent pane definitions |
 | `rules` | array | no | `[]` | Reactive command-routing rules |
+| `reactive_panes` | integer | no | `2` | Number of reactive pane slots for command routing |
 
 ### `[[modes.panes]]`
 
@@ -42,6 +44,7 @@ Persistent panes claim the first slots and are never overwritten. Reactive comma
 |---|---|---|---|---|
 | `command` | string | yes | — | Shell command to run |
 | `name` | string | no | command string | Display label for the pane |
+| `watch` | bool | no | `true` | Re-execute command every 10s via built-in watcher. Set to `false` for commands with built-in streaming (e.g., `-w`, `tail -f`) |
 
 ### `[[modes.rules]]`
 
@@ -142,4 +145,35 @@ The generated file contains a commented example you can edit. It will not overwr
 
 ### Agent-Assisted Config Generation
 
-When creating a new pane in a directory that has no `.dot-agent-deck.toml`, the mode selector offers a **Generate config** option. Selecting it invokes the agent to analyze the project and create a config tailored to the detected toolchain.
+When an agent session is running in a directory without a `.dot-agent-deck.toml`, its dashboard card shows a yellow hint: **`g: generate .dot-agent-deck.toml`**.
+
+Press `g` on the card to open a dialog with three options (navigate with arrow keys, confirm with Enter):
+
+- **Yes** — sends a prompt to the agent asking it to analyze the project, propose a config, and write it after your approval.
+- **No** — dismisses the dialog; the hint stays on the card.
+- **Never** — suppresses the hint permanently for this directory.
+
+After the agent creates the file, press `Ctrl+w` to close the current pane, then `Ctrl+n` to create a new one and select your mode.
+
+To disable the hint globally: `dot-agent-deck config set auto_config_prompt false`.
+
+### Config Validation
+
+Run `dot-agent-deck validate` to check your config for issues:
+
+```bash
+cd your-project
+dot-agent-deck validate
+```
+
+This checks regex syntax, duplicate mode names, and mismatched watch/interval settings.
+
+### `dot-agent-deck watch`
+
+A built-in command that re-executes a shell command at a fixed interval with clean terminal output, similar to the Linux `watch` utility. This is used internally by reactive watch rules but can also be run standalone:
+
+```bash
+dot-agent-deck watch --interval 2 "kubectl get pods"
+```
+
+The command clears the screen between executions and displays a header line showing the interval and command. Press `Ctrl+C` to stop.

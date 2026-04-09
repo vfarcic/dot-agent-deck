@@ -38,6 +38,7 @@ The tab bar appears when more than one tab is open.
 | `/` | Filter sessions |
 | `Esc` | Clear filter |
 | `r` | Rename session |
+| `g` | Generate `.dot-agent-deck.toml` (opens config generation dialog) |
 | `?` | Toggle help overlay |
 | `y` / `n` | Approve / deny pending permission request |
 
