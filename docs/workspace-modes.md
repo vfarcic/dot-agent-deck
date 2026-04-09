@@ -130,6 +130,20 @@ Press `Ctrl+w` on a mode tab to tear down the entire workspace — the agent and
 
 Press `Enter` on an agent's card in the dashboard to jump directly to that agent's mode tab (if it has one).
 
+## Side Pane Interaction
+
+Side panes in a mode tab support focus, selection, and direct interaction.
+
+### Focus & Navigation
+
+A visual indicator highlights the currently selected side pane. Use `j`/`k` (or `Down`/`Up`) to move the selection between panes. Press `Esc` to deselect and return focus to the agent pane. You can also click a side pane to select it, or click the agent pane to deselect.
+
+### PaneInput Mode
+
+Press `Enter` on a selected side pane to enter PaneInput mode — this lets you type directly into the pane's shell (run commands, send input, interact with running processes). `Ctrl+c` sends SIGINT to the pane's process. Press `Ctrl+d` to exit PaneInput mode and return to Normal mode.
+
+If no side pane is selected, `Enter` focuses the agent pane instead.
+
 ## Scaffolding
 
 ### `dot-agent-deck init`

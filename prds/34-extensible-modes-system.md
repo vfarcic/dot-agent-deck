@@ -264,7 +264,7 @@ New tab abstraction layered on top of the existing UI:
 - [x] Reactive pane environment preservation — panes with `init_command` reuse shell on command routing (no re-initialization)
 - [x] Side pane focus/selection — keyboard navigation (j/k), click-to-focus, visual focus indicator, Esc to reset to agent pane
 - [x] PaneInput mode on side panes — Enter on focused side pane enters PaneInput mode; Ctrl+C, typing, full shell interaction work via existing PaneInput infrastructure
-- [ ] Update docs — review all Phase 1–4 work against `docs/keyboard-shortcuts.md`, `docs/workspace-modes.md`, and other relevant docs; add missing documentation and fix any incorrect/outdated content
+- [x] Update docs — review all Phase 1–4 work against `docs/keyboard-shortcuts.md`, `docs/workspace-modes.md`, and other relevant docs; add missing documentation and fix any incorrect/outdated content
 
 ## Out of Scope (v1)
 

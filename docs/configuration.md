@@ -47,8 +47,8 @@ watch = false
 
 | Block | Key Fields |
 |---|---|
-| `[[modes]]` | `name` (required), `panes`, `rules` |
-| `[[modes.panes]]` | `command` (required), `name` (optional label) |
+| `[[modes]]` | `name` (required), `init_command` (optional), `panes`, `rules`, `reactive_panes` (default: 2) |
+| `[[modes.panes]]` | `command` (required), `name` (optional label), `watch` (default: true) |
 | `[[modes.rules]]` | `pattern` (regex, required), `watch` (bool), `interval` (seconds) |
 
 For the full reference and more examples, see [Workspace Modes](workspace-modes.md).
