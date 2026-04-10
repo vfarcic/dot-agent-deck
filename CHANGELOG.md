@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.18.0] - 2026-04-10
+
+### Added
+
+- **Extensible Modes System**
+  Workspace modes transform dot-agent-deck from a multi-agent dashboard into a focused development environment. When AI agents execute commands, relevant output now appears in dedicated side panes alongside the agent instead of being buried in the conversation.
+  Each mode is defined in a per-project `.dot-agent-deck.toml` config file. Modes create tab-based workspaces with an agent pane on the left and configurable side panes on the right in a 50/50 layout. Side panes come in two types: persistent panes run predefined commands immediately (e.g., `cargo watch -x test`, `kubectl get pods -w`), while reactive panes populate automatically when the agent executes commands matching user-defined regex rules (e.g., `kubectl describe`, `terraform plan`). Watch rules periodically re-execute commands via the built-in `dot-agent-deck watch` subcommand for live-updating output.
+  Mode activation is integrated into the new-agent flow: press `Ctrl+n`, select a directory, and if a `.dot-agent-deck.toml` exists, cycle through available modes with arrow keys in the unified form. Tab navigation uses `Tab`/`Shift+Tab`, arrow keys, or `h`/`l` for vim users. Side panes support keyboard focus (`j`/`k`), click-to-focus, and full shell interaction via `Enter` on a focused pane. The `dot-agent-deck init` command scaffolds new config files, and `dot-agent-deck validate` checks config correctness. An agent-driven config generation flow (`g` on dashboard cards) analyzes the project and proposes a config interactively.
+  See the [Workspace Modes Guide](https://devopstoolkit.ai/docs/ui/workspace-modes) for configuration examples and usage details.
+
+### Fixed
+
+- **Dashboard Card for Every Pane**
+  Panes created with `Ctrl+n` now immediately display a dashboard card, even before an agent starts. Previously, new panes had no card until an agent emitted its first event, leaving the pane orphaned with no way to switch back to it or close it.
+  A placeholder card appears instantly with a "No agent" label and a muted gray border, distinguishing it from active sessions. When an agent starts in the pane, the placeholder transitions seamlessly into a real session card. If a session ends (e.g., via `/clear`), the placeholder is restored so the pane remains visible and reusable. Placeholder sessions are excluded from active session statistics to keep dashboard counts accurate.
+
+
+
 ## [0.17.0] - 2026-04-06
 
 ### Added
