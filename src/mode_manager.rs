@@ -101,16 +101,14 @@ pub struct PaneChange {
 pub struct ModeManager {
     pane_controller: Arc<dyn PaneController>,
     active_mode: Option<ActiveMode>,
-    reactive_pool_size: usize,
     cwd: Option<String>,
 }
 
 impl ModeManager {
-    pub fn new(pane_controller: Arc<dyn PaneController>, reactive_pool_size: usize) -> Self {
+    pub fn new(pane_controller: Arc<dyn PaneController>) -> Self {
         Self {
             pane_controller,
             active_mode: None,
-            reactive_pool_size,
             cwd: None,
         }
     }
@@ -185,7 +183,7 @@ impl ModeManager {
                 }
 
                 let mut pool = ReactivePool::new();
-                for i in 0..self.reactive_pool_size {
+                for i in 0..config.reactive_panes {
                     let pane_id = self.pane_controller.create_pane(None, cwd)?;
                     created_pane_ids.push(pane_id.clone());
                     self.pane_controller
@@ -237,16 +235,24 @@ impl ModeManager {
             .as_mut()
             .ok_or(ModeManagerError::NoActiveMode)?;
 
+        let mut failed = Vec::new();
         let pending = std::mem::take(&mut mode.pending_commands);
-        for cmd in &pending {
-            if let Some(ref init) = cmd.init_command {
-                self.pane_controller.write_to_pane(&cmd.pane_id, init)?;
-            }
-            if !cmd.command.is_empty() {
-                self.pane_controller
-                    .write_to_pane(&cmd.pane_id, &cmd.command)?;
+        for cmd in pending {
+            let ok = (|| -> Result<(), ModeManagerError> {
+                if let Some(ref init) = cmd.init_command {
+                    self.pane_controller.write_to_pane(&cmd.pane_id, init)?;
+                }
+                if !cmd.command.is_empty() {
+                    self.pane_controller
+                        .write_to_pane(&cmd.pane_id, &cmd.command)?;
+                }
+                Ok(())
+            })();
+            if ok.is_err() {
+                failed.push(cmd);
             }
         }
+        mode.pending_commands = failed;
 
         Ok(())
     }
@@ -489,19 +495,19 @@ mod tests {
     #[test]
     fn activate_creates_persistent_and_reactive_panes() {
         let mock = Arc::new(MockPaneController::new());
-        let mut mgr = ModeManager::new(mock.clone(), 3);
+        let mut mgr = ModeManager::new(mock.clone());
         mgr.activate_mode(&test_config(), None).unwrap();
 
-        // 1 persistent + 3 reactive = 4 panes
+        // 1 persistent + 2 reactive (from config) = 3 panes
         let ids = mgr.managed_pane_ids();
-        assert_eq!(ids.len(), 4);
+        assert_eq!(ids.len(), 3);
         assert_eq!(mgr.active_mode_name(), Some("kubernetes"));
     }
 
     #[test]
     fn handle_command_matches_first_rule() {
         let mock = Arc::new(MockPaneController::new());
-        let mut mgr = ModeManager::new(mock.clone(), 2);
+        let mut mgr = ModeManager::new(mock.clone());
         mgr.activate_mode(&test_config(), None).unwrap();
 
         let change = mgr
@@ -521,7 +527,7 @@ mod tests {
     #[test]
     fn reactive_pool_cycles() {
         let mock = Arc::new(MockPaneController::new());
-        let mut mgr = ModeManager::new(mock.clone(), 2);
+        let mut mgr = ModeManager::new(mock.clone());
 
         let config = ModeConfig {
             name: "test".to_string(),
@@ -553,7 +559,7 @@ mod tests {
     #[test]
     fn deactivate_closes_all_panes() {
         let mock = Arc::new(MockPaneController::new());
-        let mut mgr = ModeManager::new(mock.clone(), 2);
+        let mut mgr = ModeManager::new(mock.clone());
         mgr.activate_mode(&test_config(), None).unwrap();
 
         mgr.deactivate_mode().unwrap();
@@ -568,7 +574,7 @@ mod tests {
     #[test]
     fn invalid_regex_returns_error() {
         let mock = Arc::new(MockPaneController::new());
-        let mut mgr = ModeManager::new(mock, 1);
+        let mut mgr = ModeManager::new(mock);
 
         let config = ModeConfig {
             name: "bad".to_string(),
@@ -589,7 +595,7 @@ mod tests {
     #[test]
     fn handle_command_no_active_mode_errors() {
         let mock = Arc::new(MockPaneController::new());
-        let mut mgr = ModeManager::new(mock, 1);
+        let mut mgr = ModeManager::new(mock);
 
         let err = mgr.handle_command("anything").unwrap_err();
         assert!(matches!(err, ModeManagerError::NoActiveMode));
@@ -598,7 +604,7 @@ mod tests {
     #[test]
     fn no_match_returns_none() {
         let mock = Arc::new(MockPaneController::new());
-        let mut mgr = ModeManager::new(mock, 2);
+        let mut mgr = ModeManager::new(mock);
         mgr.activate_mode(&test_config(), None).unwrap();
 
         let result = mgr.handle_command("echo hello").unwrap();

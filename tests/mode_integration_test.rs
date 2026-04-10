@@ -178,17 +178,17 @@ fn load_real_config_and_activate_mode() {
     let mode = &config.modes[0];
 
     let mock = Arc::new(MockPaneController::new());
-    let mut mgr = ModeManager::new(mock.clone(), 3);
+    let mut mgr = ModeManager::new(mock.clone());
     mgr.activate_mode(mode, Some("/tmp/test")).unwrap();
 
-    // 2 persistent + 3 reactive = 5 panes
+    // 2 persistent + 2 reactive (default) = 4 panes
     let ids = mgr.managed_pane_ids();
-    assert_eq!(ids.len(), 5);
+    assert_eq!(ids.len(), 4);
     assert_eq!(mgr.active_mode_name(), Some("kubernetes-operations"));
 
-    // Verify all 5 panes were created
+    // Verify all 4 panes were created
     let created = mock.created.lock().unwrap();
-    assert_eq!(created.len(), 5);
+    assert_eq!(created.len(), 4);
 
     // Persistent panes now use create_pane(Some(command)), so no write_to_pane calls.
     // Reactive panes also get no writes at activation.
@@ -207,7 +207,6 @@ fn load_real_config_and_activate_mode() {
     assert_eq!(renamed[1], ("mock-2".to_string(), "Events".to_string()));
     assert_eq!(renamed[2], ("mock-3".to_string(), "reactive-0".to_string()));
     assert_eq!(renamed[3], ("mock-4".to_string(), "reactive-1".to_string()));
-    assert_eq!(renamed[4], ("mock-5".to_string(), "reactive-2".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +221,7 @@ async fn end_to_end_command_routing() {
     let mode = &config.modes[0];
 
     let mock = Arc::new(MockPaneController::new());
-    let mut mgr = ModeManager::new(mock.clone(), 3);
+    let mut mgr = ModeManager::new(mock.clone());
     mgr.activate_mode(mode, None).unwrap();
 
     // kubectl describe → matches rule 1 (watch=false)
@@ -278,10 +277,10 @@ async fn reactive_pool_cycling_with_real_config() {
     let mode = &config.modes[0];
 
     let mock = Arc::new(MockPaneController::new());
-    let mut mgr = ModeManager::new(mock.clone(), 3);
+    let mut mgr = ModeManager::new(mock.clone());
     mgr.activate_mode(mode, None).unwrap();
 
-    // Send 6 matching commands to cycle through 3 reactive panes twice
+    // Send 6 matching commands to cycle through 2 reactive panes multiple times
     let commands = [
         "kubectl get pods",
         "kubectl get svc",
@@ -310,7 +309,7 @@ async fn mode_deactivation_closes_all_panes() {
     let mode = &config.modes[0];
 
     let mock = Arc::new(MockPaneController::new());
-    let mut mgr = ModeManager::new(mock.clone(), 3);
+    let mut mgr = ModeManager::new(mock.clone());
     mgr.activate_mode(mode, None).unwrap();
 
     // Route a command to create a watch task
@@ -319,12 +318,12 @@ async fn mode_deactivation_closes_all_panes() {
     // Deactivate
     mgr.deactivate_mode().unwrap();
 
-    // 1 close from handle_command (watch rule closes+recreates) + 5 from deactivation
+    // 1 close from handle_command (watch rule closes+recreates) + 4 from deactivation
     let closed = mock.closed.lock().unwrap();
     assert_eq!(
         closed.len(),
-        6,
-        "1 (watch close+recreate) + 5 (2 persistent + 3 reactive deactivation) = 6"
+        5,
+        "1 (watch close+recreate) + 4 (2 persistent + 2 reactive deactivation) = 5"
     );
 
     // Verify mode is fully cleared
@@ -378,7 +377,7 @@ fn invalid_regex_in_config_fails_activation() {
     };
 
     let mock = Arc::new(MockPaneController::new());
-    let mut mgr = ModeManager::new(mock, 1);
+    let mut mgr = ModeManager::new(mock);
     let result = mgr.activate_mode(&config, None);
     assert!(result.is_err(), "invalid regex should fail activation");
 }
@@ -414,7 +413,7 @@ fn mode_switching_cleans_up_previous() {
     };
 
     let mock = Arc::new(MockPaneController::new());
-    let mut mgr = ModeManager::new(mock.clone(), 1);
+    let mut mgr = ModeManager::new(mock.clone());
 
     // Activate mode A
     mgr.activate_mode(&mode_a, None).unwrap();
@@ -452,7 +451,7 @@ fn all_reactive_mode_works() {
     };
 
     let mock = Arc::new(MockPaneController::new());
-    let mut mgr = ModeManager::new(mock.clone(), 2);
+    let mut mgr = ModeManager::new(mock.clone());
     mgr.activate_mode(&config, None).unwrap();
 
     assert_eq!(mgr.managed_pane_ids().len(), 2); // 0 persistent + 2 reactive
@@ -480,7 +479,7 @@ fn all_persistent_mode_works() {
     };
 
     let mock = Arc::new(MockPaneController::new());
-    let mut mgr = ModeManager::new(mock.clone(), 2);
+    let mut mgr = ModeManager::new(mock.clone());
     mgr.activate_mode(&config, None).unwrap();
 
     // 1 persistent + 2 reactive (pool still created even with no rules)

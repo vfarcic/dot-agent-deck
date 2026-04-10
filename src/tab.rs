@@ -122,8 +122,7 @@ impl TabManager {
         cwd: &str,
         agent_pane_id: String,
     ) -> Result<(usize, Vec<String>), TabError> {
-        let mut mode_manager =
-            ModeManager::new(Arc::clone(&self.pane_controller), config.reactive_panes);
+        let mut mode_manager = ModeManager::new(Arc::clone(&self.pane_controller));
         mode_manager.activate_mode(config, Some(cwd))?;
         let pane_ids = mode_manager.managed_pane_ids();
 
