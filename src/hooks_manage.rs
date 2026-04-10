@@ -82,25 +82,6 @@ fn ensure_hook_array<'a>(
         .unwrap()
 }
 
-/// Check if a rule is in the old flat format: `{"type":"command","command":"..."}` without a `hooks` key.
-fn is_old_format(rule: &Value) -> bool {
-    rule.get("command").is_some() && rule.get("hooks").is_none()
-}
-
-/// A rule is well-formed if it has no matcher or the matcher is a string.
-fn is_well_formed_rule(rule: &Value) -> bool {
-    match rule.get("matcher") {
-        None => true,
-        Some(m) => m.is_string(),
-    }
-}
-
-fn has_valid_new_format_rule(rules: &[Value]) -> bool {
-    rules.iter().any(|rule| {
-        !is_old_format(rule) && is_well_formed_rule(rule) && rule_contains_dot_agent_deck(rule)
-    })
-}
-
 fn install_impl(settings: &mut Value, binary_path: &str) -> (Vec<&'static str>, Vec<&'static str>) {
     let hooks_obj = ensure_hooks_object(settings);
 
@@ -127,18 +108,21 @@ fn install_impl(settings: &mut Value, binary_path: &str) -> (Vec<&'static str>, 
 
     for &hook_type in HOOK_TYPES {
         let rules = ensure_hook_array(hooks_obj, hook_type);
+        let expected = make_rule(binary_path, hook_type);
 
-        // If we already have a valid new-format entry, skip
-        if has_valid_new_format_rule(rules) {
-            skipped.push(hook_type);
-            continue;
-        }
+        let already_current = rules.iter().any(|rule| rule == &expected);
+        let before = rules.len();
 
-        // Remove any old-format or malformed dot-agent-deck entries before adding
+        // Always normalize dot-agent-deck entries down to a single fresh rule.
         rules.retain(|rule| !rule_contains_dot_agent_deck(rule));
+        let removed = before - rules.len();
+        rules.push(expected);
 
-        rules.push(make_rule(binary_path, hook_type));
-        installed.push(hook_type);
+        if already_current && removed == 1 {
+            skipped.push(hook_type);
+        } else {
+            installed.push(hook_type);
+        }
     }
 
     (installed, skipped)

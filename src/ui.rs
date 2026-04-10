@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Tabs},
 };
 
 use crate::config;
@@ -18,7 +18,9 @@ use crate::config::{BellConfig, DashboardConfig};
 use crate::embedded_pane::EmbeddedPaneController;
 use crate::event::EventType;
 use crate::pane::{PaneController, PaneError};
+use crate::project_config::{ModeConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
+use crate::tab::{Tab, TabManager};
 use crate::terminal_widget::TerminalWidget;
 use crate::theme::ColorPalette;
 
@@ -110,6 +112,7 @@ enum UiMode {
     NewPaneForm,
     PaneInput,
     StarPrompt,
+    ConfigGenPrompt,
     QuitConfirm,
 }
 
@@ -117,6 +120,27 @@ enum UiMode {
 enum PaneLayout {
     Stacked,
     Tiled,
+}
+
+/// Describes which panes to render and how to lay them out, based on the active tab.
+enum ActiveTabView {
+    /// Dashboard tab: show all panes except those managed by mode tabs.
+    Dashboard { exclude_pane_ids: Vec<String> },
+    /// Mode tab: agent pane on left (50%), side panes stacked on right (50%).
+    Mode {
+        mode_name: String,
+        agent_pane_id: String,
+        side_pane_ids: Vec<String>,
+        /// Which side pane has visual focus (`None` = agent pane).
+        focused_side_pane_index: Option<usize>,
+    },
+}
+
+/// Lightweight snapshot of tab state for rendering, decoupled from TabManager.
+struct TabBarInfo {
+    show: bool,
+    labels: Vec<String>,
+    active_index: usize,
 }
 
 struct DirPickerState {
@@ -270,8 +294,13 @@ impl DirPickerState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Unified new-pane form (mode selection + name/command in one modal)
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormField {
+    Mode,
     Name,
     Command,
 }
@@ -280,7 +309,88 @@ struct NewPaneFormState {
     dir: PathBuf,
     name: String,
     command: String,
+    // Mode selection fields
+    modes: Vec<ModeConfig>,
+    mode_selected: usize, // 0 = "No mode", 1..N = modes
+    has_mode_field: bool,
     focused: FormField,
+}
+
+impl NewPaneFormState {
+    fn new(dir: PathBuf, name: String, command: String, modes: Vec<ModeConfig>) -> Self {
+        let has_mode_field = !modes.is_empty();
+        Self {
+            dir,
+            name,
+            command,
+            modes,
+            mode_selected: 0,
+            has_mode_field,
+            focused: if has_mode_field {
+                FormField::Mode
+            } else {
+                FormField::Name
+            },
+        }
+    }
+
+    fn mode_option_count(&self) -> usize {
+        1 + self.modes.len()
+    }
+
+    fn select_next_mode(&mut self) {
+        if self.mode_selected + 1 < self.mode_option_count() {
+            self.mode_selected += 1;
+        }
+    }
+
+    fn select_previous_mode(&mut self) {
+        self.mode_selected = self.mode_selected.saturating_sub(1);
+    }
+
+    fn selected_mode(&self) -> Option<&ModeConfig> {
+        if self.mode_selected == 0 {
+            None
+        } else {
+            self.modes.get(self.mode_selected - 1)
+        }
+    }
+
+    fn mode_display_name(&self) -> &str {
+        if self.mode_selected == 0 {
+            "No mode"
+        } else {
+            &self.modes[self.mode_selected - 1].name
+        }
+    }
+
+    fn next_field(&self) -> FormField {
+        match self.focused {
+            FormField::Mode => FormField::Name,
+            FormField::Name => FormField::Command,
+            FormField::Command => {
+                if self.has_mode_field {
+                    FormField::Mode
+                } else {
+                    FormField::Name
+                }
+            }
+        }
+    }
+
+    fn prev_field(&self) -> FormField {
+        match self.focused {
+            FormField::Mode => FormField::Command,
+            FormField::Name => {
+                if self.has_mode_field {
+                    FormField::Mode
+                } else {
+                    FormField::Command
+                }
+            }
+            FormField::Command => FormField::Name,
+        }
+    }
 }
 
 struct UiState {
@@ -313,10 +423,22 @@ struct UiState {
     selection: Option<TextSelection>,
     /// Screen rect of the focused pane (set during render, used for mouse mapping).
     focused_pane_rect: Option<Rect>,
+    /// Screen rects of side panes in mode tabs (set during render, used for scroll hit-testing).
+    side_pane_rects: Vec<(String, Rect)>,
+    /// Screen rect of the agent pane in mode tabs (set during render, used for click-to-focus).
+    agent_pane_rect: Option<Rect>,
     /// Tracks last click time and position for double/triple-click detection.
     last_click: Option<(std::time::Instant, u16, u16, u8)>, // (time, col, row, click_count)
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
+    /// Config generation state — tracks directories where user chose "Never".
+    config_gen_state: config::ConfigGenState,
+    /// Pane ID + cwd for the pending config-gen modal prompt.
+    config_gen_target: Option<(String, String)>,
+    /// Selected option index in the config-gen modal (0=Yes, 1=No, 2=Never).
+    config_gen_selected: usize,
+    /// Selected option in quit confirm modal (0=Quit, 1=Cancel).
+    quit_confirm_selected: usize,
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -358,8 +480,14 @@ impl UiState {
             session_warnings: Vec::new(),
             selection: None,
             focused_pane_rect: None,
+            side_pane_rects: Vec::new(),
+            agent_pane_rect: None,
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
+            config_gen_state: config::ConfigGenState::load(),
+            config_gen_target: None,
+            config_gen_selected: 0,
+            quit_confirm_selected: 0,
         }
     }
 }
@@ -374,61 +502,52 @@ impl Default for UiState {
 // Grid navigation
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Direction {
-    Up,
-    Down,
-    Left,
-    Right,
-}
-
-fn navigate_grid(current: usize, dir: Direction, columns: usize, total: usize) -> usize {
-    if total == 0 {
-        return 0;
-    }
-    let row = current / columns;
-    let col = current % columns;
-    let total_rows = total.div_ceil(columns);
-
-    match dir {
-        Direction::Up => {
-            if row > 0 {
-                (row - 1) * columns + col
-            } else {
-                current
-            }
-        }
-        Direction::Down => {
-            let new_idx = (row + 1) * columns + col;
-            if row + 1 < total_rows && new_idx < total {
-                new_idx
-            } else if row + 1 < total_rows {
-                // Last row has fewer items; go to last item
-                total - 1
-            } else {
-                current
-            }
-        }
-        Direction::Left => {
-            if col > 0 {
-                current - 1
-            } else {
-                current
-            }
-        }
-        Direction::Right => {
-            if col + 1 < columns && current + 1 < total {
-                current + 1
-            } else {
-                current
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Session filtering
 // ---------------------------------------------------------------------------
+
+/// Resize dashboard panes to match the dashboard layout after a tab switch.
+fn resize_dashboard_panes(
+    pane: &dyn PaneController,
+    ui: &UiState,
+    tab_manager: &TabManager,
+    area: Rect,
+) {
+    if !matches!(tab_manager.active_tab(), Tab::Dashboard) {
+        return;
+    }
+    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+        let exclude = tab_manager.all_managed_pane_ids();
+        let pane_ids: Vec<String> = embedded
+            .pane_ids()
+            .into_iter()
+            .filter(|id| !exclude.contains(id))
+            .collect();
+        if pane_ids.is_empty() {
+            return;
+        }
+        let right_width = (area.width * 67 / 100).saturating_sub(2);
+        let pane_count = pane_ids.len() as u16;
+        for pane_id in &pane_ids {
+            let is_focused = embedded.focused_pane_id().as_deref() == Some(pane_id.as_str());
+            let rows = match ui.pane_layout {
+                PaneLayout::Tiled => (area.height / pane_count).saturating_sub(2),
+                PaneLayout::Stacked => {
+                    if is_focused
+                        || (embedded.focused_pane_id().is_none() && pane_id == &pane_ids[0])
+                    {
+                        area.height.saturating_sub(2 + pane_count.saturating_sub(1))
+                    } else {
+                        0
+                    }
+                }
+            };
+            if rows > 0 {
+                let _ = embedded.resize_pane_pty(pane_id, rows, right_width);
+            }
+        }
+    }
+}
 
 fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
     let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
@@ -507,6 +626,7 @@ struct NewPaneRequest {
     dir: PathBuf,
     name: String,
     command: String,
+    mode_config: Option<ModeConfig>,
 }
 
 #[derive(Debug)]
@@ -515,6 +635,8 @@ enum KeyResult {
     Quit,
     Focus,
     NewPane(NewPaneRequest),
+    SendConfigGenPrompt { pane_id: String, cwd: String },
+    RequestConfigGen,
     ForwardToPane(Vec<u8>),
 }
 
@@ -719,9 +841,24 @@ fn handle_pane_input_key(key: KeyEvent) -> KeyResult {
 
 fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     match key.code {
-        // Ctrl+C again: actually quit
+        // Ctrl+C again: actually quit (legacy shortcut)
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyResult::Quit,
-        // Esc: cancel, return to dashboard
+        KeyCode::Up | KeyCode::Char('k') => {
+            ui.quit_confirm_selected = 0;
+            KeyResult::Continue
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            ui.quit_confirm_selected = 1;
+            KeyResult::Continue
+        }
+        KeyCode::Enter => {
+            if ui.quit_confirm_selected == 0 {
+                KeyResult::Quit
+            } else {
+                ui.mode = UiMode::Normal;
+                KeyResult::Continue
+            }
+        }
         KeyCode::Esc => {
             ui.mode = UiMode::Normal;
             KeyResult::Continue
@@ -750,6 +887,56 @@ fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         }
         KeyCode::Char('d') => {
             ui.star_prompt_state.dismiss_permanently();
+            ui.mode = UiMode::Normal;
+            KeyResult::Continue
+        }
+        _ => KeyResult::Continue,
+    }
+}
+
+fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            ui.config_gen_selected = ui.config_gen_selected.saturating_sub(1);
+            KeyResult::Continue
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if ui.config_gen_selected < 2 {
+                ui.config_gen_selected += 1;
+            }
+            KeyResult::Continue
+        }
+        KeyCode::Enter => match ui.config_gen_selected {
+            0 => {
+                // Yes — send prompt and focus pane.
+                ui.mode = UiMode::Normal;
+                if let Some((pane_id, cwd)) = ui.config_gen_target.take() {
+                    return KeyResult::SendConfigGenPrompt { pane_id, cwd };
+                }
+                KeyResult::Continue
+            }
+            1 => {
+                // No — dismiss for now, hint stays on card.
+                ui.config_gen_target = None;
+                ui.mode = UiMode::Normal;
+                KeyResult::Continue
+            }
+            _ => {
+                // Never — suppress hint permanently for this directory.
+                if let Some((_, ref cwd)) = ui.config_gen_target {
+                    ui.config_gen_state.suppress_dir(cwd);
+                }
+                ui.config_gen_target = None;
+                ui.mode = UiMode::Normal;
+                ui.status_message = Some((
+                    "Config prompt suppressed for this directory.".to_string(),
+                    std::time::Instant::now(),
+                ));
+                KeyResult::Continue
+            }
+        },
+        KeyCode::Esc => {
+            ui.config_gen_target = None;
             ui.mode = UiMode::Normal;
             KeyResult::Continue
         }
@@ -845,47 +1032,25 @@ fn focus_deck(
 fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
     // Ctrl+C from dashboard: show quit confirmation
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
         return KeyResult::Continue;
     }
     match key.code {
-        // Dashboard navigation
+        // Dashboard card navigation (linear cycling)
         KeyCode::Char('j') | KeyCode::Down => {
-            let new = navigate_grid(ui.selected_index, Direction::Down, ui.columns, total);
-            ui.selected_index = new;
             if total > 0 {
-                KeyResult::Focus
-            } else {
-                KeyResult::Continue
+                ui.selected_index = (ui.selected_index + 1) % total;
             }
+            KeyResult::Continue
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            let new = navigate_grid(ui.selected_index, Direction::Up, ui.columns, total);
-            ui.selected_index = new;
             if total > 0 {
-                KeyResult::Focus
-            } else {
-                KeyResult::Continue
+                ui.selected_index = (ui.selected_index + total - 1) % total;
             }
+            KeyResult::Continue
         }
-        KeyCode::Char('h') | KeyCode::Left => {
-            let new = navigate_grid(ui.selected_index, Direction::Left, ui.columns, total);
-            ui.selected_index = new;
-            if total > 0 {
-                KeyResult::Focus
-            } else {
-                KeyResult::Continue
-            }
-        }
-        KeyCode::Char('l') | KeyCode::Right => {
-            let new = navigate_grid(ui.selected_index, Direction::Right, ui.columns, total);
-            ui.selected_index = new;
-            if total > 0 {
-                KeyResult::Focus
-            } else {
-                KeyResult::Continue
-            }
-        }
+        // Left/Right/h/l handled in main loop for tab switching
         KeyCode::Char('/') => {
             ui.mode = UiMode::Filter;
             ui.filter_text.clear();
@@ -901,6 +1066,7 @@ fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult
             KeyResult::Continue
         }
         KeyCode::Enter if total > 0 => KeyResult::Focus,
+        KeyCode::Char('g') if total > 0 => KeyResult::RequestConfigGen,
         KeyCode::Esc => {
             if !ui.filter_text.is_empty() {
                 ui.filter_text.clear();
@@ -913,6 +1079,7 @@ fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult
 
 fn handle_filter_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
         return KeyResult::Continue;
     }
@@ -951,6 +1118,7 @@ fn handle_rename_key(
     selected_session_id: Option<&str>,
 ) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
         return KeyResult::Continue;
     }
@@ -984,6 +1152,7 @@ fn handle_rename_key(
 
 fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
         return KeyResult::Continue;
     }
@@ -1053,7 +1222,7 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
             // If no subdirs, select current directory
             if !picker.has_subdirs() {
-                transition_to_form(ui);
+                transition_after_dir_pick(ui);
                 return KeyResult::Continue;
             }
             if picker.filtered_indices.is_empty() {
@@ -1068,7 +1237,7 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             picker.filtering = true;
         }
         KeyCode::Char(' ') => {
-            transition_to_form(ui);
+            transition_after_dir_pick(ui);
             return KeyResult::Continue;
         }
         _ => {}
@@ -1076,29 +1245,34 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     KeyResult::Continue
 }
 
-fn transition_to_form(ui: &mut UiState) {
+/// Check for `.dot-agent-deck.toml` in the selected directory.
+/// Open the unified new-pane form, with mode field when modes are available.
+fn transition_after_dir_pick(ui: &mut UiState) {
     let dir = ui
         .dir_picker
         .as_ref()
         .map(|p| p.current_dir.clone())
         .unwrap_or_default();
+
     let name = dir
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     let command = ui.config.default_command.clone();
+
+    let modes = match load_project_config(&dir) {
+        Ok(Some(config)) if !config.modes.is_empty() => config.modes,
+        _ => vec![],
+    };
+
     ui.dir_picker = None;
-    ui.new_pane_form = Some(NewPaneFormState {
-        dir,
-        name,
-        command,
-        focused: FormField::Name,
-    });
+    ui.new_pane_form = Some(NewPaneFormState::new(dir, name, command, modes));
     ui.mode = UiMode::NewPaneForm;
 }
 
 fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
         return KeyResult::Continue;
     }
@@ -1114,13 +1288,23 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             ui.new_pane_form = None;
             ui.mode = UiMode::Normal;
         }
-        KeyCode::Tab | KeyCode::BackTab => {
-            form.focused = match form.focused {
-                FormField::Name => FormField::Command,
-                FormField::Command => FormField::Name,
-            };
+        KeyCode::Tab => {
+            form.focused = form.next_field();
+        }
+        KeyCode::BackTab => {
+            form.focused = form.prev_field();
+        }
+        // Left/Right cycle mode when Mode field is focused
+        KeyCode::Left | KeyCode::Char('h') if form.focused == FormField::Mode => {
+            form.select_previous_mode();
+        }
+        KeyCode::Right | KeyCode::Char('l') if form.focused == FormField::Mode => {
+            form.select_next_mode();
         }
         KeyCode::Enter => match form.focused {
+            FormField::Mode => {
+                form.focused = FormField::Name;
+            }
             FormField::Name => {
                 form.focused = FormField::Command;
             }
@@ -1129,23 +1313,26 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
                     dir: form.dir.clone(),
                     name: form.name.clone(),
                     command: form.command.clone(),
+                    mode_config: form.selected_mode().cloned(),
                 };
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
                 return KeyResult::NewPane(req);
             }
         },
-        KeyCode::Backspace => {
+        KeyCode::Backspace if form.focused != FormField::Mode => {
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
+                FormField::Mode => unreachable!(),
             };
             field.pop();
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if form.focused != FormField::Mode => {
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
+                FormField::Mode => unreachable!(),
             };
             field.push(c);
         }
@@ -1155,12 +1342,16 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
 }
 
 // ---------------------------------------------------------------------------
+// Reactive pane routing — extract new Bash commands from session events
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // TUI entry point
 // ---------------------------------------------------------------------------
 
 pub fn run_tui(
     state: SharedState,
-    pane: Box<dyn PaneController>,
+    pane: Arc<dyn PaneController>,
     config: DashboardConfig,
     palette: ColorPalette,
     continue_session: bool,
@@ -1186,6 +1377,7 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, palette);
+    let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
     let should_show_star = star_state.increment_and_check();
@@ -1246,6 +1438,46 @@ pub fn run_tui(
         }
 
         let snapshot = state.blocking_read().clone();
+
+        // Route new Bash commands through mode tabs for reactive panes.
+        let pane_changes = tab_manager.route_reactive_commands(&snapshot.sessions);
+        for (old_id, new_id) in &pane_changes {
+            let mut st = state.blocking_write();
+            st.unregister_pane(old_id);
+            st.register_pane(new_id.clone());
+            drop(st);
+            // Resize the new pane PTY to match the current side pane dimensions.
+            if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                let frame_area = terminal.get_frame().area();
+                let half_width = (frame_area.width / 2).saturating_sub(2);
+                let side_pane_count = embedded.pane_ids().len().saturating_sub(1) as u16; // exclude agent
+                let pane_rows = if side_pane_count > 0 {
+                    (frame_area.height / side_pane_count).saturating_sub(2)
+                } else {
+                    frame_area.height.saturating_sub(3)
+                };
+                if pane_rows > 0 && half_width > 0 {
+                    let _ = embedded.resize_pane_pty(new_id, pane_rows, half_width);
+                }
+            }
+        }
+
+        // Clamp focused side pane index after reactive pane pool changes.
+        if !pane_changes.is_empty()
+            && let Tab::Mode {
+                focused_side_pane_index,
+                mode_manager,
+                ..
+            } = tab_manager.active_tab_mut()
+            && let Some(idx) = *focused_side_pane_index
+        {
+            let count = mode_manager.managed_pane_ids().len();
+            if count == 0 {
+                *focused_side_pane_index = None;
+            } else if idx >= count {
+                *focused_side_pane_index = Some(count - 1);
+            }
+        }
 
         // Pick up version-check result once
         if ui.update_available.is_none() {
@@ -1312,6 +1544,44 @@ pub fn run_tui(
 
         let has_pane_control = pane.is_available();
         let pane_layout = ui.pane_layout;
+        let tab_view = match tab_manager.active_tab() {
+            Tab::Dashboard => ActiveTabView::Dashboard {
+                exclude_pane_ids: tab_manager.all_managed_pane_ids(),
+            },
+            Tab::Mode {
+                name,
+                agent_pane_id,
+                mode_manager,
+                focused_side_pane_index,
+                ..
+            } => ActiveTabView::Mode {
+                mode_name: name.clone(),
+                agent_pane_id: agent_pane_id.clone(),
+                side_pane_ids: mode_manager.managed_pane_ids(),
+                focused_side_pane_index: *focused_side_pane_index,
+            },
+        };
+        let tab_bar_labels: Vec<String> = tab_manager
+            .tabs()
+            .iter()
+            .map(|tab| match tab {
+                Tab::Dashboard => "Dashboard".to_string(),
+                Tab::Mode {
+                    name,
+                    agent_pane_id,
+                    ..
+                } => ui
+                    .pane_metadata
+                    .get(agent_pane_id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| name.clone()),
+            })
+            .collect();
+        let tab_bar_info = TabBarInfo {
+            show: tab_manager.show_tab_bar(),
+            labels: tab_bar_labels,
+            active_index: tab_manager.active_index(),
+        };
         terminal.draw(|frame| {
             render_frame(
                 frame,
@@ -1322,6 +1592,8 @@ pub fn run_tui(
                 has_pane_control,
                 &*pane,
                 pane_layout,
+                &tab_view,
+                &tab_bar_info,
             );
         })?;
         tick = tick.wrapping_add(1);
@@ -1352,8 +1624,15 @@ pub fn run_tui(
                 if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
                     let pane_ids = embedded.pane_ids();
                     if !pane_ids.is_empty() {
-                        // Right panel is 67% of width, minus 2 for borders.
-                        let right_width = (w * 67 / 100).saturating_sub(2);
+                        // Width depends on active tab layout:
+                        // - Dashboard: right panel is 67% of width
+                        // - Mode tab: both agent and side panes are 50% of width
+                        let is_mode_tab = tab_manager.active_mode_name().is_some();
+                        let pane_width = if is_mode_tab {
+                            (w * 50 / 100).saturating_sub(2)
+                        } else {
+                            (w * 67 / 100).saturating_sub(2)
+                        };
                         let pane_count = pane_ids.len() as u16;
                         for pane_id in &pane_ids {
                             let is_focused =
@@ -1372,7 +1651,7 @@ pub fn run_tui(
                                 }
                             };
                             if rows > 0 {
-                                let _ = embedded.resize_pane_pty(pane_id, rows, right_width);
+                                let _ = embedded.resize_pane_pty(pane_id, rows, pane_width);
                             }
                         }
                     }
@@ -1382,7 +1661,74 @@ pub fn run_tui(
 
             // Handle mouse events: scroll, text selection, and copy.
             if let Event::Mouse(mouse) = ev {
-                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                // Side pane scroll: works in any UI mode by hit-testing rects
+                let mut side_scrolled = false;
+                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                    let side_rects = ui.side_pane_rects.clone();
+                    let scroll_delta = match mouse.kind {
+                        crossterm::event::MouseEventKind::ScrollUp => Some(3_isize),
+                        crossterm::event::MouseEventKind::ScrollDown => Some(-3_isize),
+                        _ => None,
+                    };
+                    if let Some(delta) = scroll_delta {
+                        for (side_id, rect) in &side_rects {
+                            if mouse.column >= rect.x
+                                && mouse.column < rect.x + rect.width
+                                && mouse.row >= rect.y
+                                && mouse.row < rect.y + rect.height
+                            {
+                                embedded.scroll_pane(side_id, delta);
+                                side_scrolled = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Click-to-focus for mode tab panes (Normal mode only).
+                if ui.mode == UiMode::Normal
+                    && matches!(
+                        mouse.kind,
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                    )
+                {
+                    let mut clicked_focus = false;
+                    // Check side panes.
+                    for (idx, (_side_id, rect)) in ui.side_pane_rects.iter().enumerate() {
+                        if mouse.column >= rect.x
+                            && mouse.column < rect.x + rect.width
+                            && mouse.row >= rect.y
+                            && mouse.row < rect.y + rect.height
+                        {
+                            if let Tab::Mode {
+                                focused_side_pane_index,
+                                ..
+                            } = tab_manager.active_tab_mut()
+                            {
+                                *focused_side_pane_index = Some(idx);
+                                clicked_focus = true;
+                            }
+                            break;
+                        }
+                    }
+                    // Check agent pane area.
+                    if !clicked_focus
+                        && let Some(rect) = ui.agent_pane_rect
+                        && mouse.column >= rect.x
+                        && mouse.column < rect.x + rect.width
+                        && mouse.row >= rect.y
+                        && mouse.row < rect.y + rect.height
+                        && let Tab::Mode {
+                            focused_side_pane_index,
+                            ..
+                        } = tab_manager.active_tab_mut()
+                    {
+                        *focused_side_pane_index = None;
+                    }
+                }
+
+                if !side_scrolled
+                    && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
                     && let Some(pane_id) = embedded.focused_pane_id()
                 {
                     match mouse.kind {
@@ -1631,7 +1977,7 @@ pub fn run_tui(
             // ---------------------------------------------------------------
             if !shortcut_handled && key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
-                    // Ctrl+d: jump to dashboard (ensure Normal mode)
+                    // Ctrl+d: enter Normal (command) mode, stay on current tab
                     KeyCode::Char('d') => {
                         ui.mode = UiMode::Normal;
                         shortcut_handled = true;
@@ -1719,12 +2065,137 @@ pub fn run_tui(
                         }
                         shortcut_handled = true;
                     }
+                    // Ctrl+PageDown: next tab
+                    KeyCode::PageDown => {
+                        if tab_manager.show_tab_bar() {
+                            let next = tab_manager.active_index() + 1;
+                            tab_manager.switch_to(next);
+                        }
+                        shortcut_handled = true;
+                    }
+                    // Ctrl+PageUp: previous tab
+                    KeyCode::PageUp => {
+                        if tab_manager.show_tab_bar() {
+                            let current = tab_manager.active_index();
+                            if current > 0 {
+                                tab_manager.switch_to(current - 1);
+                            }
+                        }
+                        shortcut_handled = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Tab / Shift+Tab / Left / Right / h / l: cycle tabs in Normal mode
+            if !shortcut_handled && ui.mode == UiMode::Normal {
+                match key.code {
+                    KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                        let count = tab_manager.tab_count();
+                        if count > 0 {
+                            let prev_idx = tab_manager.active_index();
+                            let next = (prev_idx + 1) % count;
+                            tab_manager.switch_to(next);
+                            if prev_idx != tab_manager.active_index() {
+                                resize_dashboard_panes(
+                                    &*pane,
+                                    &ui,
+                                    &tab_manager,
+                                    terminal.get_frame().area(),
+                                );
+                            }
+                        }
+                        shortcut_handled = true;
+                    }
+                    KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                        let count = tab_manager.tab_count();
+                        if count > 0 {
+                            let prev_idx = tab_manager.active_index();
+                            let prev = (prev_idx + count - 1) % count;
+                            tab_manager.switch_to(prev);
+                            if prev_idx != tab_manager.active_index() {
+                                resize_dashboard_panes(
+                                    &*pane,
+                                    &ui,
+                                    &tab_manager,
+                                    terminal.get_frame().area(),
+                                );
+                            }
+                        }
+                        shortcut_handled = true;
+                    }
                     _ => {}
                 }
             }
 
             let selected_id: Option<String> =
                 filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+
+            // On a mode tab in Normal mode, j/k navigate side panes, Enter focuses, Esc resets.
+            if !shortcut_handled
+                && ui.mode == UiMode::Normal
+                && let Tab::Mode {
+                    focused_side_pane_index,
+                    mode_manager,
+                    agent_pane_id,
+                    ..
+                } = tab_manager.active_tab_mut()
+            {
+                let side_ids = mode_manager.managed_pane_ids();
+                let side_count = side_ids.len();
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        *focused_side_pane_index = match *focused_side_pane_index {
+                            None => {
+                                if side_count > 0 {
+                                    Some(0)
+                                } else {
+                                    None
+                                }
+                            }
+                            Some(i) => Some((i + 1).min(side_count.saturating_sub(1))),
+                        };
+                        shortcut_handled = true;
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        *focused_side_pane_index = match *focused_side_pane_index {
+                            None => {
+                                if side_count > 0 {
+                                    Some(side_count - 1)
+                                } else {
+                                    None
+                                }
+                            }
+                            Some(0) => None,
+                            Some(i) => Some(i - 1),
+                        };
+                        shortcut_handled = true;
+                    }
+                    KeyCode::Enter => {
+                        let target_pane_id = match *focused_side_pane_index {
+                            None => agent_pane_id.clone(),
+                            Some(i) => side_ids
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| agent_pane_id.clone()),
+                        };
+                        if pane.focus_pane(&target_pane_id).is_ok() {
+                            ui.mode = UiMode::PaneInput;
+                            ui.status_message = Some((
+                                "PaneInput mode — type to interact, Ctrl+d for dashboard"
+                                    .to_string(),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                        shortcut_handled = true;
+                    }
+                    KeyCode::Esc => {
+                        *focused_side_pane_index = None;
+                        shortcut_handled = true;
+                    }
+                    _ => {}
+                }
+            }
 
             // Mode-specific key handling (skip if a global shortcut was handled).
             let result = if shortcut_handled {
@@ -1739,6 +2210,7 @@ pub fn run_tui(
                     UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
                     UiMode::PaneInput => handle_pane_input_key(key),
                     UiMode::StarPrompt => handle_star_prompt_key(key, &mut ui),
+                    UiMode::ConfigGenPrompt => handle_config_gen_prompt_key(key, &mut ui),
                     UiMode::QuitConfirm => handle_quit_confirm_key(key, &mut ui),
                 }
             };
@@ -1750,6 +2222,9 @@ pub fn run_tui(
                         && let Some(session) = snapshot.sessions.get(sid)
                     {
                         if let Some(ref pane_id) = session.pane_id {
+                            if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
+                                tab_manager.switch_to(tab_idx);
+                            }
                             match pane.focus_pane(pane_id) {
                                 Ok(()) => {
                                     ui.mode = UiMode::PaneInput;
@@ -1779,6 +2254,22 @@ pub fn run_tui(
                                 std::time::Instant::now(),
                             ));
                         }
+                    }
+                }
+                KeyResult::RequestConfigGen => {
+                    if let Some(ref sid) = selected_id
+                        && let Some(session) = snapshot.sessions.get(sid)
+                        && let Some(ref pane_id) = session.pane_id
+                        && let Some(ref cwd) = session.cwd
+                    {
+                        ui.config_gen_target = Some((pane_id.clone(), cwd.clone()));
+                        ui.config_gen_selected = 0;
+                        ui.mode = UiMode::ConfigGenPrompt;
+                    } else {
+                        ui.status_message = Some((
+                            "No active agent session to send prompt to.".to_string(),
+                            std::time::Instant::now(),
+                        ));
                     }
                 }
                 KeyResult::NewPane(req) => {
@@ -1811,39 +2302,98 @@ pub fn run_tui(
                                     new_id.clone(),
                                     config::SavedPane {
                                         dir: dir_str.clone(),
-                                        name: req.name,
+                                        name: req.name.clone(),
                                         command: req.command,
                                     },
                                 );
-                                // Auto-focus the newly created pane and select last card.
-                                let _ = pane.focus_pane(&new_id);
-                                ui.mode = UiMode::PaneInput;
-                                ui.selected_index = filtered.len(); // will point to new card once it appears
-                                // Resize new pane PTY to match current layout dimensions.
-                                if let Some(embedded) =
-                                    pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                                {
-                                    let frame_area = terminal.get_frame().area();
-                                    let right_width =
-                                        (frame_area.width * 67 / 100).saturating_sub(2);
-                                    let pane_count = embedded.pane_ids().len() as u16;
-                                    let rows = match ui.pane_layout {
-                                        PaneLayout::Tiled => (frame_area.height
-                                            / pane_count.max(1))
-                                        .saturating_sub(2),
-                                        PaneLayout::Stacked => frame_area
-                                            .height
-                                            .saturating_sub(2 + pane_count.saturating_sub(1)),
-                                    };
-                                    if rows > 0 && right_width > 0 {
-                                        let _ =
-                                            embedded.resize_pane_pty(&new_id, rows, right_width);
+
+                                if let Some(mode_config) = req.mode_config {
+                                    // Mode selected — open a mode tab.
+                                    let mode_name = mode_config.name.clone();
+                                    match tab_manager.open_mode_tab(
+                                        &mode_config,
+                                        &dir_str,
+                                        new_id.clone(),
+                                    ) {
+                                        Ok((_tab_idx, side_ids)) => {
+                                            for id in &side_ids {
+                                                state.blocking_write().register_pane(id.clone());
+                                            }
+                                            let _ = pane.focus_pane(&new_id);
+                                            ui.mode = UiMode::PaneInput;
+                                            if let Some(embedded) =
+                                                pane.as_any()
+                                                    .downcast_ref::<EmbeddedPaneController>()
+                                            {
+                                                let frame_area = terminal.get_frame().area();
+                                                let half_width =
+                                                    (frame_area.width / 2).saturating_sub(2);
+                                                let agent_rows =
+                                                    frame_area.height.saturating_sub(3);
+                                                if agent_rows > 0 && half_width > 0 {
+                                                    let _ = embedded.resize_pane_pty(
+                                                        &new_id, agent_rows, half_width,
+                                                    );
+                                                }
+                                                let side_count = side_ids.len().max(1) as u16;
+                                                let side_rows = (frame_area.height / side_count)
+                                                    .saturating_sub(2);
+                                                if side_rows > 0 && half_width > 0 {
+                                                    for id in &side_ids {
+                                                        let _ = embedded.resize_pane_pty(
+                                                            id, side_rows, half_width,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            // Start commands now that panes are correctly sized
+                                            let _ = tab_manager.start_mode_commands();
+                                            ui.status_message = Some((
+                                                format!("Activated mode: {mode_name}"),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            let _ = pane.close_pane(&new_id);
+                                            ui.status_message = Some((
+                                                format!("Mode activation failed: {e}"),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
                                     }
+                                } else {
+                                    // No mode — regular dashboard pane.
+                                    let _ = pane.focus_pane(&new_id);
+                                    ui.mode = UiMode::PaneInput;
+                                    ui.selected_index = filtered.len();
+                                    if let Some(embedded) =
+                                        pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                                    {
+                                        let frame_area = terminal.get_frame().area();
+                                        let right_width =
+                                            (frame_area.width * 67 / 100).saturating_sub(2);
+                                        let pane_count = embedded.pane_ids().len() as u16;
+                                        let rows = match ui.pane_layout {
+                                            PaneLayout::Tiled => (frame_area.height
+                                                / pane_count.max(1))
+                                            .saturating_sub(2),
+                                            PaneLayout::Stacked => frame_area
+                                                .height
+                                                .saturating_sub(2 + pane_count.saturating_sub(1)),
+                                        };
+                                        if rows > 0 && right_width > 0 {
+                                            let _ = embedded.resize_pane_pty(
+                                                &new_id,
+                                                rows,
+                                                right_width,
+                                            );
+                                        }
+                                    }
+                                    ui.status_message = Some((
+                                        format!("Created pane {new_id} in {dir_str}"),
+                                        std::time::Instant::now(),
+                                    ));
                                 }
-                                ui.status_message = Some((
-                                    format!("Created pane {new_id} in {dir_str}"),
-                                    std::time::Instant::now(),
-                                ));
                             }
                             Err(e) => {
                                 ui.status_message = Some((
@@ -1851,6 +2401,29 @@ pub fn run_tui(
                                     std::time::Instant::now(),
                                 ));
                             }
+                        }
+                    }
+                }
+                KeyResult::SendConfigGenPrompt { pane_id, cwd } => {
+                    let prompt = crate::config_gen::config_gen_prompt(&cwd);
+                    match pane.write_to_pane(&pane_id, &prompt) {
+                        Ok(()) => {
+                            // Focus the pane so user can press Enter to execute.
+                            if let Some(tab_idx) = tab_manager.tab_index_for_pane(&pane_id) {
+                                tab_manager.switch_to(tab_idx);
+                            }
+                            let _ = pane.focus_pane(&pane_id);
+                            ui.mode = UiMode::PaneInput;
+                            ui.status_message = Some((
+                                "Config prompt sent — press Enter to execute.".to_string(),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                        Err(e) => {
+                            ui.status_message = Some((
+                                format!("Failed to send config prompt: {e}"),
+                                std::time::Instant::now(),
+                            ));
                         }
                     }
                 }
@@ -1891,6 +2464,15 @@ pub fn run_tui(
                 break;
             }
         } // end inner event-drain loop
+    }
+
+    // Tear down all mode tabs (clean up their panes).
+    for i in (1..tab_manager.tab_count()).rev() {
+        if let Ok(ids) = tab_manager.close_tab(i) {
+            for id in ids {
+                state.blocking_write().unregister_pane(&id);
+            }
+        }
     }
 
     // Auto-save current pane session for --continue restore.
@@ -1953,9 +2535,18 @@ fn render_frame(
     has_pane_control: bool,
     pane_controller: &dyn PaneController,
     pane_layout: PaneLayout,
+    tab_view: &ActiveTabView,
+    tab_bar: &TabBarInfo,
 ) {
     let area = frame.area();
     let palette = ui.palette;
+    ui.side_pane_rects.clear();
+    ui.agent_pane_rect = None;
+
+    let active_mode_name = match tab_view {
+        ActiveTabView::Dashboard { .. } => None,
+        ActiveTabView::Mode { mode_name, .. } => Some(mode_name.as_str()),
+    };
 
     // Fill entire frame with terminal background so nothing falls through
     // to the alternate screen default (which may be black on light themes).
@@ -1964,16 +2555,84 @@ fn render_frame(
         area,
     );
 
-    // Hints bar spans the full terminal width (1 row at the bottom).
-    let top_bottom = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
-    let main_area = top_bottom[0];
-    let hints_area = top_bottom[1];
+    // Layout: optional tab bar at top, main content, hints bar at bottom.
+    let (main_area, hints_area) = if tab_bar.show {
+        let chunks = Layout::vertical([
+            Constraint::Length(1), // tab bar
+            Constraint::Fill(1),   // main content
+            Constraint::Length(1), // hints bar
+        ])
+        .split(area);
+
+        // Render the tab bar.
+        let titles: Vec<Line> = tab_bar
+            .labels
+            .iter()
+            .map(|l| Line::from(format!(" {l} ")))
+            .collect();
+        // Fill tab bar row with distinct background.
+        frame.render_widget(
+            Block::default().style(Style::default().bg(palette.tab_bar_bg)),
+            chunks[0],
+        );
+        // Active tab: inverted colors for high contrast.
+        let tabs_widget = Tabs::new(titles)
+            .select(tab_bar.active_index)
+            .style(Style::default().fg(palette.text_muted))
+            .highlight_style(
+                Style::default()
+                    .fg(palette.terminal_bg)
+                    .bg(palette.text_secondary)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .divider("│");
+        frame.render_widget(tabs_widget, chunks[0]);
+
+        (chunks[1], chunks[2])
+    } else {
+        let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
+        (chunks[0], chunks[1])
+    };
 
     // Determine if we have embedded terminal panes to show on the right.
     let embedded = pane_controller
         .as_any()
         .downcast_ref::<EmbeddedPaneController>();
-    let pane_ids = embedded.map(|e| e.pane_ids()).unwrap_or_default();
+
+    // ── Mode tab rendering ─────────────────────────────────────────────
+    if let ActiveTabView::Mode {
+        agent_pane_id,
+        side_pane_ids,
+        focused_side_pane_index,
+        ..
+    } = tab_view
+    {
+        render_mode_tab(
+            frame,
+            ui,
+            embedded,
+            agent_pane_id,
+            side_pane_ids,
+            main_area,
+            hints_area,
+            has_pane_control,
+            active_mode_name,
+            tab_bar.show,
+            *focused_side_pane_index,
+        );
+        return;
+    }
+
+    // ── Dashboard tab rendering ────────────────────────────────────────
+    let all_pane_ids = embedded.map(|e| e.pane_ids()).unwrap_or_default();
+    let exclude = match tab_view {
+        ActiveTabView::Dashboard { exclude_pane_ids } => exclude_pane_ids,
+        _ => unreachable!(),
+    };
+    let pane_ids: Vec<String> = all_pane_ids
+        .into_iter()
+        .filter(|id| !exclude.contains(id))
+        .collect();
     let has_terminal_panes = !pane_ids.is_empty();
 
     let (dashboard_area, panes_area) = if has_terminal_panes {
@@ -1997,22 +2656,24 @@ fn render_frame(
         .style(Style::default().fg(palette.text_secondary))
         .centered();
         frame.render_widget(msg, vertical[1]);
-        render_bottom_bar(frame, ui, hints_area, has_pane_control);
+        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
 
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
                 frame,
                 embedded,
                 right,
+                &pane_ids,
                 pane_layout,
                 &ui.pane_display_names,
                 &ui.selection,
                 palette,
+                None,
             );
         }
 
         if ui.mode == UiMode::Help {
-            render_help_overlay(frame, has_pane_control, palette);
+            render_help_overlay(frame, has_pane_control, active_mode_name, palette);
         }
         if ui.mode == UiMode::DirPicker
             && let Some(picker) = ui.dir_picker.as_mut()
@@ -2027,8 +2688,11 @@ fn render_frame(
         if ui.mode == UiMode::StarPrompt {
             render_star_prompt(frame, palette);
         }
+        if ui.mode == UiMode::ConfigGenPrompt {
+            render_config_gen_prompt(frame, ui.config_gen_selected, palette);
+        }
         if ui.mode == UiMode::QuitConfirm {
-            render_quit_confirm(frame, palette);
+            render_quit_confirm(frame, ui.quit_confirm_selected, palette);
         }
         return;
     }
@@ -2086,18 +2750,26 @@ fn render_frame(
         .split(vertical[1]);
         frame.render_widget(msg, inner[1]);
 
-        render_stats_bar(frame, &state.aggregate_stats(), vertical[2], palette);
-        render_bottom_bar(frame, ui, hints_area, has_pane_control);
+        render_stats_bar(
+            frame,
+            &state.aggregate_stats(),
+            vertical[2],
+            active_mode_name,
+            palette,
+        );
+        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
                 frame,
                 embedded,
                 right,
+                &pane_ids,
                 pane_layout,
                 &ui.pane_display_names,
                 &ui.selection,
                 palette,
+                None,
             );
         }
         return;
@@ -2147,6 +2819,17 @@ fn render_frame(
                 let n = flat_index + 1;
                 if n <= 9 { Some(n as u8) } else { None }
             };
+            let show_config_hint = ui.config.auto_config_prompt
+                && session
+                    .cwd
+                    .as_deref()
+                    .map(|cwd| {
+                        !ui.config_gen_state.is_suppressed(cwd)
+                            && !std::path::Path::new(cwd)
+                                .join(".dot-agent-deck.toml")
+                                .exists()
+                    })
+                    .unwrap_or(false);
             render_session_card(
                 frame,
                 col_chunks[col_idx],
@@ -2156,6 +2839,7 @@ fn render_frame(
                 display_name,
                 card_number,
                 density,
+                show_config_hint,
                 palette,
             );
         }
@@ -2163,10 +2847,16 @@ fn render_frame(
 
     // Stats bar at bottom of dashboard area
     let stats_area = row_chunks[row_chunks.len() - 1];
-    render_stats_bar(frame, &state.aggregate_stats(), stats_area, palette);
+    render_stats_bar(
+        frame,
+        &state.aggregate_stats(),
+        stats_area,
+        active_mode_name,
+        palette,
+    );
 
     // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control);
+    render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
 
     // Render terminal panes on the right side
     if let Some(right) = panes_area {
@@ -2174,16 +2864,18 @@ fn render_frame(
             frame,
             embedded,
             right,
+            &pane_ids,
             pane_layout,
             &ui.pane_display_names,
             &ui.selection,
             palette,
+            None,
         );
     }
 
     // Overlays (drawn last, on top)
     if ui.mode == UiMode::Help {
-        render_help_overlay(frame, has_pane_control, palette);
+        render_help_overlay(frame, has_pane_control, active_mode_name, palette);
     }
     if ui.mode == UiMode::DirPicker
         && let Some(picker) = ui.dir_picker.as_mut()
@@ -2198,26 +2890,33 @@ fn render_frame(
     if ui.mode == UiMode::StarPrompt {
         render_star_prompt(frame, palette);
     }
+    if ui.mode == UiMode::ConfigGenPrompt {
+        render_config_gen_prompt(frame, ui.config_gen_selected, palette);
+    }
     if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame, palette);
+        render_quit_confirm(frame, ui.quit_confirm_selected, palette);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_terminal_panes(
     frame: &mut Frame,
     embedded: Option<&EmbeddedPaneController>,
     area: Rect,
+    pane_ids: &[String],
     layout: PaneLayout,
     display_names: &HashMap<String, String>,
     selection: &Option<TextSelection>,
     palette: ColorPalette,
+    visual_focus_id: Option<&str>,
 ) -> Option<Rect> {
     let ctrl = embedded?;
-    let pane_ids = ctrl.pane_ids();
     if pane_ids.is_empty() {
         return None;
     }
-    let focused_id = ctrl.focused_pane_id();
+    let focused_id = visual_focus_id
+        .map(|s| s.to_string())
+        .or_else(|| ctrl.focused_pane_id());
 
     // Get pane info for display names
     let pane_infos = ctrl.list_panes().unwrap_or_default();
@@ -2366,7 +3065,119 @@ fn render_terminal_panes(
     focused_pane_rect
 }
 
-fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect, palette: ColorPalette) {
+/// Render a mode tab: agent pane on left 50%, side panes stacked on right 50%.
+#[allow(clippy::too_many_arguments)]
+fn render_mode_tab(
+    frame: &mut Frame,
+    ui: &mut UiState,
+    embedded: Option<&EmbeddedPaneController>,
+    agent_pane_id: &str,
+    side_pane_ids: &[String],
+    main_area: Rect,
+    hints_area: Rect,
+    has_pane_control: bool,
+    active_mode_name: Option<&str>,
+    show_tab_bar: bool,
+    focused_side_pane_index: Option<usize>,
+) {
+    let palette = ui.palette;
+
+    // Determine which pane ID should appear visually focused.
+    let agent_visual_focus: Option<&str> = if focused_side_pane_index.is_none() {
+        Some(agent_pane_id)
+    } else {
+        None
+    };
+    let side_visual_focus: Option<String> =
+        focused_side_pane_index.and_then(|i| side_pane_ids.get(i).cloned());
+
+    // 50/50 horizontal split
+    let chunks = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(main_area);
+    let agent_area = chunks[0];
+    let side_area = chunks[1];
+
+    // Track agent pane rect for click-to-focus.
+    ui.agent_pane_rect = Some(agent_area);
+
+    // Left side: single agent pane
+    if !agent_pane_id.is_empty() {
+        let agent_ids = vec![agent_pane_id.to_string()];
+        let rect = render_terminal_panes(
+            frame,
+            embedded,
+            agent_area,
+            &agent_ids,
+            PaneLayout::Stacked,
+            &ui.pane_display_names,
+            &ui.selection,
+            palette,
+            agent_visual_focus,
+        );
+        if rect.is_some() {
+            ui.focused_pane_rect = rect;
+        }
+    }
+
+    // Right side: side panes stacked (all visible simultaneously)
+    if !side_pane_ids.is_empty() {
+        let rect = render_terminal_panes(
+            frame,
+            embedded,
+            side_area,
+            side_pane_ids,
+            PaneLayout::Tiled,
+            &ui.pane_display_names,
+            &ui.selection,
+            palette,
+            side_visual_focus.as_deref(),
+        );
+        // Use side pane rect when a side pane is visually focused, or as fallback.
+        if side_visual_focus.is_some() || ui.focused_pane_rect.is_none() {
+            ui.focused_pane_rect = rect;
+        }
+
+        // Track side pane rects for scroll hit-testing
+        let count = side_pane_ids.len() as u32;
+        let constraints: Vec<Constraint> = side_pane_ids
+            .iter()
+            .map(|_| Constraint::Ratio(1, count))
+            .collect();
+        let chunks = Layout::vertical(constraints).split(side_area);
+        for (i, pane_id) in side_pane_ids.iter().enumerate() {
+            ui.side_pane_rects.push((pane_id.clone(), chunks[i]));
+        }
+    }
+
+    // Full-width hints bar
+    render_bottom_bar(frame, ui, hints_area, has_pane_control, show_tab_bar, true);
+
+    // Overlays (drawn last, on top)
+    if ui.mode == UiMode::Help {
+        render_help_overlay(frame, has_pane_control, active_mode_name, palette);
+    }
+    if ui.mode == UiMode::DirPicker
+        && let Some(picker) = ui.dir_picker.as_mut()
+    {
+        render_dir_picker(frame, picker, palette);
+    }
+    if ui.mode == UiMode::NewPaneForm
+        && let Some(ref form) = ui.new_pane_form
+    {
+        render_new_pane_form(frame, form, palette);
+    }
+    if ui.mode == UiMode::QuitConfirm {
+        render_quit_confirm(frame, ui.quit_confirm_selected, palette);
+    }
+}
+
+fn render_stats_bar(
+    frame: &mut Frame,
+    stats: &DashboardStats,
+    area: Rect,
+    active_mode_name: Option<&str>,
+    palette: ColorPalette,
+) {
     let mut spans: Vec<Span> = Vec::new();
 
     // Always show active count
@@ -2409,10 +3220,30 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect, palet
         Style::default().fg(palette.text_secondary),
     ));
 
+    if let Some(name) = active_mode_name {
+        spans.push(Span::styled(
+            "  \u{2502}  ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            format!("mode: {name}"),
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_control: bool) {
+fn render_bottom_bar(
+    frame: &mut Frame,
+    ui: &UiState,
+    area: Rect,
+    has_pane_control: bool,
+    show_tab_bar: bool,
+    is_mode_tab: bool,
+) {
     match ui.mode {
         UiMode::Filter => {
             let line = Line::from(vec![
@@ -2448,12 +3279,21 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
             } else {
-                let hints = if has_pane_control {
+                let tab_hint = if show_tab_bar {
+                    format!("  {MOD_KEY}+PgUp/PgDn: tabs")
+                } else {
+                    String::new()
+                };
+                let hints = if is_mode_tab {
                     format!(
-                        "{MOD_KEY}+n: new  {MOD_KEY}+w: close  {MOD_KEY}+t: layout  {MOD_KEY}+d: dashboard (1-9 ? /)  {MOD_KEY}+c: quit"
+                        "j/k: navigate panes  Enter: interact  Esc: agent pane  {MOD_KEY}+w: close tab  ?: help  {MOD_KEY}+c: quit{tab_hint}"
+                    )
+                } else if has_pane_control {
+                    format!(
+                        "{MOD_KEY}+n: new  {MOD_KEY}+w: close  {MOD_KEY}+t: layout  {MOD_KEY}+d: dashboard (1-9 ? /)  {MOD_KEY}+c: quit{tab_hint}"
                     )
                 } else {
-                    format!("?: help  1-9: jump  {MOD_KEY}+c: quit")
+                    format!("?: help  1-9: jump  {MOD_KEY}+c: quit{tab_hint}")
                 };
                 let mut spans = vec![Span::styled(
                     hints,
@@ -2479,17 +3319,22 @@ fn render_bottom_bar(frame: &mut Frame, ui: &UiState, area: Rect, has_pane_contr
     }
 }
 
-fn render_quit_confirm(frame: &mut Frame, palette: ColorPalette) {
+fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 44.min(area.width.saturating_sub(4));
-    let popup_height = 7u16.min(area.height.saturating_sub(4));
+    let popup_height = 9u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
-    let text = vec![
+    let options = [
+        ("Quit", "exit the application"),
+        ("Cancel", "return to dashboard"),
+    ];
+
+    let mut text = vec![
         Line::from(""),
         Line::styled(
             "  Are you sure you want to quit?",
@@ -2498,9 +3343,28 @@ fn render_quit_confirm(frame: &mut Frame, palette: ColorPalette) {
                 .add_modifier(Modifier::BOLD),
         ),
         Line::from(""),
-        Line::from("  Ctrl+c  Confirm quit"),
-        Line::from("  Esc     Cancel"),
     ];
+
+    for (i, (label, desc)) in options.iter().enumerate() {
+        let cursor = if i == selected { ">" } else { " " };
+        let style = if i == selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        text.push(Line::styled(
+            format!("  {cursor} {label:<7} \u{2014} {desc}"),
+            style,
+        ));
+    }
+
+    text.push(Line::from(""));
+    text.push(Line::styled(
+        "  Up/Down: navigate  Enter: confirm  Esc: cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
 
     let block = Block::default()
         .title(" Quit ")
@@ -2565,10 +3429,91 @@ fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_help_overlay(frame: &mut Frame, has_pane_control: bool, palette: ColorPalette) {
+fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPalette) {
+    let area = frame.area();
+    let popup_width = 60u16.min(area.width.saturating_sub(4));
+    let popup_height = 14u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let options = [
+        ("Yes", "generate config for this project"),
+        ("No", "skip for now"),
+        ("Never", "never ask for this directory"),
+    ];
+
+    let mut text = vec![
+        Line::from(""),
+        Line::styled(
+            "  No workspace modes config found for this",
+            Style::default().fg(Color::White),
+        ),
+        Line::styled(
+            "  project. Want to instruct your agent to",
+            Style::default().fg(Color::White),
+        ),
+        Line::styled(
+            "  analyze the project and create one?",
+            Style::default().fg(Color::White),
+        ),
+        Line::from(""),
+    ];
+
+    for (i, (label, desc)) in options.iter().enumerate() {
+        let cursor = if i == selected { ">" } else { " " };
+        let style = if i == selected {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        text.push(Line::styled(
+            format!("  {cursor} {label:<6} \u{2014} {desc}"),
+            style,
+        ));
+    }
+
+    text.push(Line::from(""));
+    text.push(Line::styled(
+        "  Disable: dot-agent-deck config set auto_config_prompt false",
+        Style::default().fg(Color::DarkGray),
+    ));
+    text.push(Line::from(""));
+    text.push(Line::styled(
+        "  Up/Down: navigate  Enter: confirm  Esc: cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let block = Block::default()
+        .title(" Generate .dot-agent-deck.toml ")
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(palette.terminal_bg));
+
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_help_overlay(
+    frame: &mut Frame,
+    has_pane_control: bool,
+    active_mode_name: Option<&str>,
+    palette: ColorPalette,
+) {
     let area = frame.area();
     let popup_width = 52.min(area.width.saturating_sub(4));
-    let base_height: u16 = if has_pane_control { 43 } else { 28 };
+    let tab_nav_lines: u16 = if active_mode_name.is_some() { 6 } else { 0 };
+    let mode_lines: u16 = if active_mode_name.is_some() { 8 } else { 6 };
+    let base_height: u16 = if has_pane_control { 44 } else { 28 } + mode_lines + tab_nav_lines;
     let popup_height = base_height.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -2584,7 +3529,7 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool, palette: Color
                 .add_modifier(Modifier::BOLD),
         ),
         Line::from(""),
-        Line::from(format!("  {MOD_KEY}+d         Focus dashboard")),
+        Line::from(format!("  {MOD_KEY}+d         Command mode (dashboard)")),
         Line::from(format!("  {MOD_KEY}+n         Create new pane")),
         Line::from(format!("  {MOD_KEY}+w         Close selected pane")),
         Line::from(format!(
@@ -2592,26 +3537,65 @@ fn render_help_overlay(frame: &mut Frame, has_pane_control: bool, palette: Color
         )),
     ];
 
+    if active_mode_name.is_some() {
+        help_text.push(Line::from(""));
+        help_text.push(Line::styled(
+            "  Tab Navigation (command mode)",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        help_text.push(Line::from(""));
+        help_text.push(Line::from("  Tab / Right / l     Next tab"));
+        help_text.push(Line::from("  Shift+Tab / Left / h  Prev tab"));
+        help_text.push(Line::from(format!(
+            "  {MOD_KEY}+PgDn/PgUp  Next / prev tab"
+        )));
+    }
+
     if has_pane_control {
         help_text.push(Line::from(""));
         help_text.push(Line::styled(
-            "  Dashboard (Ctrl+d to focus)",
+            "  Dashboard (command mode)",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ));
         help_text.push(Line::from(""));
         help_text.push(Line::from("  1-9           Jump to pane N"));
-        help_text.push(Line::from("  j/k / arrows  Navigate cards"));
+        help_text.push(Line::from("  j/k / Up/Down Navigate cards"));
         help_text.push(Line::from("  Enter         Focus selected pane"));
         help_text.push(Line::from("  /             Filter sessions"));
         help_text.push(Line::from("  r             Rename session"));
+        help_text.push(Line::from("  g             Generate .dot-agent-deck.toml"));
         help_text.push(Line::from("  ?             Toggle this help"));
         help_text.push(Line::from("  Esc           Clear filter"));
         help_text.push(Line::from(format!("  {MOD_KEY}+c         Quit")));
     }
 
     help_text.push(Line::from(""));
+    help_text.push(Line::from(""));
+    help_text.push(Line::styled(
+        "  New Agent Form",
+        Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+    ));
+    help_text.push(Line::from(""));
+    help_text.push(Line::from("  Tab           Switch field"));
+    help_text.push(Line::from("  \u{25c0}/\u{25b6}           Cycle mode"));
+    help_text.push(Line::from("  Enter         Next field / confirm"));
+    help_text.push(Line::from("  Esc           Cancel"));
+    if let Some(name) = active_mode_name {
+        help_text.push(Line::from(""));
+        help_text.push(Line::styled(
+            format!("  Active: {name}"),
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     help_text.push(Line::from(""));
     help_text.push(Line::styled(
         "  Session",
@@ -2758,7 +3742,8 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
 fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 56.min(area.width.saturating_sub(4));
-    let popup_height = 12u16.min(area.height.saturating_sub(4));
+    let mode_extra: u16 = if form.has_mode_field { 2 } else { 0 };
+    let popup_height = (12 + mode_extra).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -2767,86 +3752,127 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
 
     let inner_width = popup_width.saturating_sub(4) as usize;
 
-    let name_style = if form.focused == FormField::Name {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+    let focused_label = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let unfocused_label = Style::default().fg(palette.text_secondary);
+
+    let mode_style = if form.focused == FormField::Mode {
+        focused_label
     } else {
-        Style::default().fg(palette.text_secondary)
+        unfocused_label
+    };
+    let name_style = if form.focused == FormField::Name {
+        focused_label
+    } else {
+        unfocused_label
     };
     let cmd_style = if form.focused == FormField::Command {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        focused_label
     } else {
-        Style::default().fg(palette.text_secondary)
+        unfocused_label
     };
 
     let dir_display = form.dir.display().to_string();
-    let lines = vec![
+    let mut lines = vec![
         Line::styled(
             format!("  Dir: {dir_display}"),
             Style::default().fg(Color::Yellow),
         ),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  Name:    ", name_style),
-            Span::styled(
-                format!(
-                    "{:<width$}",
-                    form.name,
-                    width = inner_width.saturating_sub(11)
-                ),
-                if form.focused == FormField::Name {
-                    Style::default().fg(palette.text_primary)
-                } else {
-                    Style::default().fg(palette.text_secondary)
-                },
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Command: ", cmd_style),
-            Span::styled(
-                format!(
-                    "{:<width$}",
-                    form.command,
-                    width = inner_width.saturating_sub(11)
-                ),
-                if form.focused == FormField::Command {
-                    Style::default().fg(palette.text_primary)
-                } else {
-                    Style::default().fg(palette.text_secondary)
-                },
-            ),
-        ]),
-        Line::from(""),
-        Line::from(""),
-        Line::styled(
-            "  Tab: switch field  Enter: next/confirm  Esc: cancel",
-            Style::default().fg(palette.text_secondary),
-        ),
     ];
 
+    // Mode field (only when modes or generate option available)
+    if form.has_mode_field {
+        let mode_name = form.mode_display_name();
+        let mode_value = if form.focused == FormField::Mode {
+            format!("\u{25c0} {mode_name} \u{25b6}")
+        } else {
+            mode_name.to_string()
+        };
+        let mode_value_style = if form.focused == FormField::Mode {
+            Style::default().fg(palette.text_primary)
+        } else {
+            unfocused_label
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Mode:    ", mode_style),
+            Span::styled(mode_value, mode_value_style),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("  Name:    ", name_style),
+        Span::styled(
+            format!(
+                "{:<width$}",
+                form.name,
+                width = inner_width.saturating_sub(11)
+            ),
+            if form.focused == FormField::Name {
+                Style::default().fg(palette.text_primary)
+            } else {
+                unfocused_label
+            },
+        ),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  Command: ", cmd_style),
+        Span::styled(
+            format!(
+                "{:<width$}",
+                form.command,
+                width = inner_width.saturating_sub(11)
+            ),
+            if form.focused == FormField::Command {
+                Style::default().fg(palette.text_primary)
+            } else {
+                unfocused_label
+            },
+        ),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(""));
+
+    let footer = if form.has_mode_field {
+        "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: next  Esc: cancel"
+    } else {
+        "  Tab: switch field  Enter: next/confirm  Esc: cancel"
+    };
+    lines.push(Line::styled(
+        footer,
+        Style::default().fg(palette.text_secondary),
+    ));
+
+    let title = match form.selected_mode() {
+        Some(cfg) => format!(" New Agent \u{2014} {} mode ", cfg.name),
+        None => " New Agent ".to_string(),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" New Pane ")
+        .title(title)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 
-    // Show cursor in the active field
-    let cursor_y = match form.focused {
-        FormField::Name => popup_area.y + 3,
-        FormField::Command => popup_area.y + 5,
-    };
-    let field_text = match form.focused {
-        FormField::Name => &form.name,
-        FormField::Command => &form.command,
-    };
-    let cursor_x = popup_area.x + 12 + field_text.len() as u16;
-    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    // Show cursor in the active text field (not for Mode which uses arrow cycling)
+    if form.focused != FormField::Mode {
+        let cursor_y = match form.focused {
+            FormField::Name => popup_area.y + 3 + mode_extra,
+            FormField::Command => popup_area.y + 5 + mode_extra,
+            FormField::Mode => unreachable!(),
+        };
+        let field_text = match form.focused {
+            FormField::Name => &form.name,
+            FormField::Command => &form.command,
+            FormField::Mode => unreachable!(),
+        };
+        let cursor_x = popup_area.x + 12 + field_text.len() as u16;
+        frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    }
 }
 
 fn grid_columns(width: u16) -> usize {
@@ -2869,6 +3895,7 @@ fn render_session_card(
     display_name: Option<&String>,
     card_number: Option<u8>,
     density: CardDensity,
+    show_config_hint: bool,
     palette: ColorPalette,
 ) {
     let is_placeholder = session.agent_type == crate::event::AgentType::None;
@@ -3009,6 +4036,13 @@ fn render_session_card(
     }
     let tool_lines = recent_tool_lines(session, density.max_tools(), palette);
     lines.extend(tool_lines);
+
+    if show_config_hint {
+        lines.push(Line::styled(
+            "g: generate .dot-agent-deck.toml",
+            Style::default().fg(palette.hint_accent),
+        ));
+    }
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
@@ -3194,6 +4228,14 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
                 )
             })
             .unwrap();
@@ -3253,6 +4295,14 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
                 )
             })
             .unwrap();
@@ -3359,6 +4409,14 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
                 )
             })
             .unwrap();
@@ -3441,6 +4499,14 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
                 )
             })
             .unwrap();
@@ -3449,63 +4515,6 @@ mod tests {
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_navigate_grid_single_column() {
-        // 5 items, 1 column
-        assert_eq!(navigate_grid(0, Direction::Down, 1, 5), 1);
-        assert_eq!(navigate_grid(4, Direction::Down, 1, 5), 4); // at bottom
-        assert_eq!(navigate_grid(0, Direction::Up, 1, 5), 0); // at top
-        assert_eq!(navigate_grid(3, Direction::Up, 1, 5), 2);
-        // Left/Right are no-ops in single column
-        assert_eq!(navigate_grid(2, Direction::Left, 1, 5), 2);
-        assert_eq!(navigate_grid(2, Direction::Right, 1, 5), 2);
-    }
-
-    #[test]
-    fn test_navigate_grid_two_columns() {
-        // 5 items, 2 columns:
-        // [0] [1]
-        // [2] [3]
-        // [4]
-        assert_eq!(navigate_grid(0, Direction::Right, 2, 5), 1);
-        assert_eq!(navigate_grid(1, Direction::Left, 2, 5), 0);
-        assert_eq!(navigate_grid(0, Direction::Down, 2, 5), 2);
-        assert_eq!(navigate_grid(2, Direction::Up, 2, 5), 0);
-        // Down from col 1 row 1 to col 1 row 2 — but index 5 doesn't exist, clamp to 4
-        assert_eq!(navigate_grid(3, Direction::Down, 2, 5), 4);
-        // Right from last item
-        assert_eq!(navigate_grid(4, Direction::Right, 2, 5), 4);
-        // Left from first col
-        assert_eq!(navigate_grid(0, Direction::Left, 2, 5), 0);
-    }
-
-    #[test]
-    fn test_navigate_grid_three_columns() {
-        // 7 items, 3 columns:
-        // [0] [1] [2]
-        // [3] [4] [5]
-        // [6]
-        assert_eq!(navigate_grid(1, Direction::Down, 3, 7), 4);
-        assert_eq!(navigate_grid(4, Direction::Up, 3, 7), 1);
-        assert_eq!(navigate_grid(5, Direction::Down, 3, 7), 6); // col 2 row 2 -> last item
-        assert_eq!(navigate_grid(6, Direction::Up, 3, 7), 3);
-        assert_eq!(navigate_grid(2, Direction::Right, 3, 7), 2); // at right edge
-    }
-
-    #[test]
-    fn test_navigate_grid_empty() {
-        assert_eq!(navigate_grid(0, Direction::Down, 2, 0), 0);
-        assert_eq!(navigate_grid(0, Direction::Up, 2, 0), 0);
-    }
-
-    #[test]
-    fn test_navigate_grid_single_item() {
-        assert_eq!(navigate_grid(0, Direction::Down, 2, 1), 0);
-        assert_eq!(navigate_grid(0, Direction::Up, 2, 1), 0);
-        assert_eq!(navigate_grid(0, Direction::Left, 2, 1), 0);
-        assert_eq!(navigate_grid(0, Direction::Right, 2, 1), 0);
-    }
 
     // ---------------------------------------------------------------------------
     // Dir picker tests
@@ -3727,8 +4736,13 @@ mod tests {
             &mut ui,
         );
 
+        // Goes directly to unified NewPaneForm
         assert_eq!(ui.mode, UiMode::NewPaneForm);
         assert!(ui.new_pane_form.is_some());
+        let form = ui.new_pane_form.as_ref().unwrap();
+        assert!(form.modes.is_empty());
+        assert!(!form.has_mode_field);
+        assert_eq!(form.focused, FormField::Name);
     }
 
     #[test]
@@ -4425,5 +5439,400 @@ mod tests {
             KeyResult::ForwardToPane(bytes) => assert_eq!(bytes, vec![b'l']),
             other => panic!("Expected ForwardToPane, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Unified NewPaneFormState tests
+    // -----------------------------------------------------------------------
+
+    fn make_mode(name: &str) -> ModeConfig {
+        ModeConfig {
+            name: name.to_string(),
+            init_command: None,
+            panes: vec![],
+            rules: vec![],
+            reactive_panes: 2,
+        }
+    }
+
+    #[test]
+    fn unified_form_mode_option_count() {
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+        );
+        assert_eq!(f.mode_option_count(), 2); // "No mode" + 1 mode
+
+        let f = NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
+        assert_eq!(f.mode_option_count(), 1); // "No mode" only
+    }
+
+    #[test]
+    fn unified_form_mode_cycling() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("alpha"), make_mode("beta")],
+        );
+        assert_eq!(f.mode_selected, 0);
+
+        // Can't go below 0
+        f.select_previous_mode();
+        assert_eq!(f.mode_selected, 0);
+
+        f.select_next_mode();
+        assert_eq!(f.mode_selected, 1);
+        f.select_next_mode();
+        assert_eq!(f.mode_selected, 2);
+
+        // Can't go past last
+        f.select_next_mode();
+        assert_eq!(f.mode_selected, 2);
+    }
+
+    #[test]
+    fn unified_form_selected_mode() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("k8s"), make_mode("rust-tdd")],
+        );
+
+        // Index 0 = "No mode"
+        assert!(f.selected_mode().is_none());
+        assert_eq!(f.mode_display_name(), "No mode");
+
+        f.mode_selected = 1;
+        assert_eq!(f.selected_mode().unwrap().name, "k8s");
+        assert_eq!(f.mode_display_name(), "k8s");
+
+        f.mode_selected = 2;
+        assert_eq!(f.selected_mode().unwrap().name, "rust-tdd");
+    }
+
+    #[test]
+    fn unified_form_tab_cycles_with_mode() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+        );
+        assert_eq!(f.focused, FormField::Mode);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Name);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Command);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Mode); // wraps
+
+        // Reverse
+        f.focused = f.prev_field();
+        assert_eq!(f.focused, FormField::Command);
+    }
+
+    #[test]
+    fn unified_form_tab_cycles_without_mode() {
+        let mut f =
+            NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
+        assert!(!f.has_mode_field);
+        assert_eq!(f.focused, FormField::Name);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Command);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Name); // wraps, skips Mode
+
+        f.focused = f.prev_field();
+        assert_eq!(f.focused, FormField::Command);
+    }
+
+    #[test]
+    fn unified_form_initial_focus_with_modes() {
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+        );
+        assert_eq!(f.focused, FormField::Mode);
+    }
+
+    #[test]
+    fn unified_form_initial_focus_without_modes() {
+        let f = NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
+        assert_eq!(f.focused, FormField::Name);
+    }
+
+    #[test]
+    fn unified_form_arrow_cycles_mode() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a"), make_mode("b")],
+        ));
+
+        // Right arrow cycles forward
+        let key = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().mode_selected, 1);
+
+        // Left arrow cycles back
+        let key = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().mode_selected, 0);
+    }
+
+    #[test]
+    fn unified_form_enter_navigates_fields() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            "agent".to_string(),
+            "claude".to_string(),
+            vec![make_mode("a")],
+        ));
+
+        // Enter on Mode → Name
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Name);
+
+        // Enter on Name → Command
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().focused,
+            FormField::Command
+        );
+
+        // Enter on Command → submit
+        let result = handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.new_pane_form.is_none());
+        assert!(matches!(result, KeyResult::NewPane(_)));
+    }
+
+    #[test]
+    fn unified_form_submit_with_mode() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/proj"),
+            "agent".to_string(),
+            "claude".to_string(),
+            vec![make_mode("k8s-ops")],
+        ));
+
+        // Select mode "k8s-ops" (index 1)
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui);
+
+        // Navigate to Command field and submit
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        handle_new_pane_form_key(enter, &mut ui); // Name → Command
+        let result = handle_new_pane_form_key(enter, &mut ui); // submit
+
+        match result {
+            KeyResult::NewPane(req) => {
+                assert_eq!(req.dir, PathBuf::from("/tmp/proj"));
+                assert!(
+                    req.mode_config
+                        .as_ref()
+                        .is_some_and(|c| c.name == "k8s-ops")
+                );
+            }
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unified_form_submit_no_mode() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            "agent".to_string(),
+            "claude".to_string(),
+            vec![make_mode("a")],
+        ));
+
+        // Stay on "No mode" (index 0), navigate through fields
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        handle_new_pane_form_key(enter, &mut ui); // Name → Command
+        let result = handle_new_pane_form_key(enter, &mut ui);
+
+        match result {
+            KeyResult::NewPane(req) => {
+                assert!(req.mode_config.is_none());
+            }
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unified_form_esc_cancels() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+        ));
+
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.new_pane_form.is_none());
+    }
+
+    #[test]
+    fn unified_form_typing_in_text_fields() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+        ));
+
+        // Move to Name field
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui);
+
+        // Type into Name field
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().name, "x");
+
+        // Backspace
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().name, "");
+    }
+
+    #[test]
+    fn unified_form_h_l_types_chars_in_name() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+        ));
+
+        // Move to Name field
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui);
+
+        // h and l should type characters, not cycle modes
+        let key_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        handle_new_pane_form_key(key_h, &mut ui);
+        let key_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        handle_new_pane_form_key(key_l, &mut ui);
+
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().name, "hl");
+    }
+
+    #[test]
+    fn config_gen_prompt_enter_on_yes_sends_prompt() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_selected = 0; // Yes
+        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_config_gen_prompt_key(enter, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.config_gen_target.is_none());
+        assert!(
+            matches!(result, KeyResult::SendConfigGenPrompt { ref pane_id, ref cwd }
+                if pane_id == "pane-1" && cwd == "/my/project")
+        );
+    }
+
+    #[test]
+    fn config_gen_prompt_enter_on_no_dismisses() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_selected = 1; // No
+        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_config_gen_prompt_key(enter, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.config_gen_target.is_none());
+        assert!(matches!(result, KeyResult::Continue));
+    }
+
+    #[test]
+    fn config_gen_prompt_enter_on_never_suppresses_dir() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_selected = 2; // Never
+        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_config_gen_prompt_key(enter, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.config_gen_target.is_none());
+        assert!(ui.config_gen_state.is_suppressed("/my/project"));
+        assert!(matches!(result, KeyResult::Continue));
+        assert!(ui.status_message.is_some());
+    }
+
+    #[test]
+    fn config_gen_prompt_arrow_navigation() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_selected = 0;
+
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_config_gen_prompt_key(down, &mut ui);
+        assert_eq!(ui.config_gen_selected, 1);
+
+        handle_config_gen_prompt_key(down, &mut ui);
+        assert_eq!(ui.config_gen_selected, 2);
+
+        // Can't go past last
+        handle_config_gen_prompt_key(down, &mut ui);
+        assert_eq!(ui.config_gen_selected, 2);
+
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        handle_config_gen_prompt_key(up, &mut ui);
+        assert_eq!(ui.config_gen_selected, 1);
+    }
+
+    #[test]
+    fn config_gen_prompt_esc_dismisses() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let result = handle_config_gen_prompt_key(esc, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(matches!(result, KeyResult::Continue));
     }
 }

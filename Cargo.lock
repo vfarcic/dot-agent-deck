@@ -472,6 +472,7 @@ dependencies = [
  "open",
  "portable-pty",
  "ratatui",
+ "regex",
  "reqwest",
  "semver",
  "serde",

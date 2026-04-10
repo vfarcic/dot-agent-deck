@@ -150,6 +150,15 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
         metadata.insert("tool_use_id".to_string(), tool_use_id);
     }
 
+    // Store full bash command for reactive pane routing (tool_detail truncates).
+    if matches!(event_type, EventType::ToolStart)
+        && tool_name.as_deref() == Some("Bash")
+        && let Some(ref input) = tool_input
+        && let Some(cmd) = input.get("command").and_then(|v| v.as_str())
+    {
+        metadata.insert("bash_command".to_string(), cmd.to_string());
+    }
+
     Some(AgentEvent {
         session_id,
         agent_type: AgentType::ClaudeCode,
@@ -194,6 +203,28 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     let user_prompt = input.prompt.map(|p| truncate(&p, 200));
     let pane_id = std::env::var("DOT_AGENT_DECK_PANE_ID").ok();
 
+    let mut metadata = HashMap::new();
+    if matches!(event_type, EventType::PermissionRequest) {
+        metadata.insert("permission_state".to_string(), "pending".to_string());
+        metadata.insert(
+            "tool_use_id".to_string(),
+            format!(
+                "perm-{}-{}",
+                input.session_id,
+                Utc::now().timestamp_millis()
+            ),
+        );
+    }
+
+    // Store full bash command for reactive pane routing (tool_detail truncates).
+    if matches!(event_type, EventType::ToolStart)
+        && input.tool_name.as_deref() == Some("Bash")
+        && let Some(ref tool_input) = input.tool_input
+        && let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str())
+    {
+        metadata.insert("bash_command".to_string(), cmd.to_string());
+    }
+
     Some(AgentEvent {
         session_id: input.session_id,
         agent_type: AgentType::OpenCode,
@@ -203,7 +234,7 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
         cwd: input.cwd,
         timestamp: Utc::now(),
         user_prompt,
-        metadata: HashMap::new(),
+        metadata,
         pane_id,
     })
 }
@@ -647,12 +678,14 @@ mod tests {
         assert!(input.cwd.is_none());
     }
 
+    /// Serialize env-var-mutating tests to avoid races.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn pane_id_propagated_from_env_claude_code() {
-        // Temporarily set the env var and restore afterwards.
+        let _lock = ENV_MUTEX.lock().unwrap();
         let key = "DOT_AGENT_DECK_PANE_ID";
         let prev = std::env::var(key).ok();
-        // SAFETY: test is single-threaded for this env var; no other thread reads it.
         unsafe { std::env::set_var(key, "pane-42") };
 
         let input = ClaudeCodeHookInput {
@@ -668,7 +701,6 @@ mod tests {
         let event = build_event(input).unwrap();
         assert_eq!(event.pane_id.as_deref(), Some("pane-42"));
 
-        // Restore
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(key, v),
@@ -679,9 +711,9 @@ mod tests {
 
     #[test]
     fn pane_id_propagated_from_env_opencode() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let key = "DOT_AGENT_DECK_PANE_ID";
         let prev = std::env::var(key).ok();
-        // SAFETY: test is single-threaded for this env var; no other thread reads it.
         unsafe { std::env::set_var(key, "pane-99") };
 
         let input = OpenCodeHookInput {
@@ -703,5 +735,82 @@ mod tests {
                 None => std::env::remove_var(key),
             }
         }
+    }
+
+    #[test]
+    fn build_event_bash_tool_start_stores_full_command() {
+        let full_cmd = "kubectl get pods -n production\nkubectl get svc -n production";
+        let input = ClaudeCodeHookInput {
+            session_id: "s1".into(),
+            hook_event_name: "PreToolUse".into(),
+            cwd: None,
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": full_cmd})),
+            tool_use_id: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        assert_eq!(
+            event.metadata.get("bash_command").map(String::as_str),
+            Some(full_cmd),
+        );
+        // tool_detail should only have the first line (truncated)
+        assert_eq!(
+            event.tool_detail.as_deref(),
+            Some("kubectl get pods -n production"),
+        );
+    }
+
+    #[test]
+    fn build_event_non_bash_tool_start_no_bash_command() {
+        let input = ClaudeCodeHookInput {
+            session_id: "s1".into(),
+            hook_event_name: "PreToolUse".into(),
+            cwd: None,
+            tool_name: Some("Read".into()),
+            tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
+            tool_use_id: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        assert!(event.metadata.get("bash_command").is_none());
+    }
+
+    #[test]
+    fn build_event_bash_tool_end_no_bash_command() {
+        let input = ClaudeCodeHookInput {
+            session_id: "s1".into(),
+            hook_event_name: "PostToolUse".into(),
+            cwd: None,
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": "ls -la"})),
+            tool_use_id: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_event(input).unwrap();
+        assert!(event.metadata.get("bash_command").is_none());
+    }
+
+    #[test]
+    fn build_opencode_event_bash_tool_start_stores_full_command() {
+        let full_cmd = "helm status my-release --namespace prod";
+        let input = OpenCodeHookInput {
+            session_id: "oc-1".into(),
+            event: "tool.execute.before".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": full_cmd})),
+            status: None,
+            cwd: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_opencode_event(input).unwrap();
+        assert_eq!(
+            event.metadata.get("bash_command").map(String::as_str),
+            Some(full_cmd),
+        );
     }
 }

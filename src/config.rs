@@ -51,12 +51,24 @@ impl BellConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DashboardConfig {
     pub default_command: String,
     pub bell: BellConfig,
     pub theme: Theme,
+    pub auto_config_prompt: bool,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            default_command: String::new(),
+            bell: BellConfig::default(),
+            theme: Theme::default(),
+            auto_config_prompt: true,
+        }
+    }
 }
 
 impl DashboardConfig {
@@ -94,6 +106,7 @@ impl DashboardConfig {
         match key {
             "default_command" => Ok(self.default_command.clone()),
             "theme" => Ok(self.theme.to_string()),
+            "auto_config_prompt" => Ok(self.auto_config_prompt.to_string()),
             _ => Err(format!("Unknown config key: {key}")),
         }
     }
@@ -106,6 +119,12 @@ impl DashboardConfig {
             }
             "theme" => {
                 self.theme = value.parse().map_err(|e: String| e)?;
+                Ok(())
+            }
+            "auto_config_prompt" => {
+                self.auto_config_prompt = value
+                    .parse()
+                    .map_err(|_| "Expected 'true' or 'false'".to_string())?;
                 Ok(())
             }
             _ => Err(format!("Unknown config key: {key}")),
@@ -251,6 +270,74 @@ impl StarPromptState {
     pub fn dismiss_permanently(&mut self) {
         self.permanently_dismissed = true;
         let _ = self.save();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config generation state — tracks directories where the user chose "Never"
+// for the auto-config-prompt modal.
+// ---------------------------------------------------------------------------
+
+fn config_gen_state_path() -> PathBuf {
+    if let Ok(p) = std::env::var("DOT_AGENT_DECK_CONFIG_GEN_STATE") {
+        return PathBuf::from(p);
+    }
+    dirs_home().join(".config/dot-agent-deck/config-gen-state.json")
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConfigGenState {
+    pub suppressed_dirs: Vec<String>,
+}
+
+impl ConfigGenState {
+    pub fn load() -> Self {
+        let path = config_gen_state_path();
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => match serde_json::from_str(&contents) {
+                Ok(state) => state,
+                Err(err) => {
+                    eprintln!("Invalid config gen state at {}: {err}", path.display());
+                    Self::default()
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => {
+                eprintln!(
+                    "Failed to read config gen state at {}: {err}",
+                    path.display()
+                );
+                Self::default()
+            }
+        }
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let path = config_gen_state_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create config gen state directory: {e}"))?;
+        }
+        let contents = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize config gen state: {e}"))?;
+        std::fs::write(&path, contents).map_err(|e| {
+            format!(
+                "Failed to write config gen state at {}: {e}",
+                path.display()
+            )
+        })
+    }
+
+    pub fn is_suppressed(&self, dir: &str) -> bool {
+        self.suppressed_dirs.iter().any(|d| d == dir)
+    }
+
+    pub fn suppress_dir(&mut self, dir: &str) {
+        if !self.is_suppressed(dir) {
+            self.suppressed_dirs.push(dir.to_string());
+            let _ = self.save();
+        }
     }
 }
 
@@ -543,6 +630,111 @@ on_idle = true
             match prev {
                 Some(v) => std::env::set_var("DOT_AGENT_DECK_STAR_PROMPT", v),
                 None => std::env::remove_var("DOT_AGENT_DECK_STAR_PROMPT"),
+            }
+        }
+    }
+
+    #[test]
+    fn auto_config_prompt_defaults_to_true() {
+        let dc = DashboardConfig::default();
+        assert!(dc.auto_config_prompt);
+    }
+
+    #[test]
+    fn auto_config_prompt_deserialize_missing() {
+        let dc: DashboardConfig = toml::from_str("").unwrap();
+        assert!(dc.auto_config_prompt);
+    }
+
+    #[test]
+    fn auto_config_prompt_deserialize_false() {
+        let dc: DashboardConfig = toml::from_str("auto_config_prompt = false").unwrap();
+        assert!(!dc.auto_config_prompt);
+    }
+
+    #[test]
+    fn auto_config_prompt_get_set_field() {
+        let mut dc = DashboardConfig::default();
+        assert_eq!(dc.get_field("auto_config_prompt").unwrap(), "true");
+        dc.set_field("auto_config_prompt", "false").unwrap();
+        assert!(!dc.auto_config_prompt);
+        assert_eq!(dc.get_field("auto_config_prompt").unwrap(), "false");
+        assert!(dc.set_field("auto_config_prompt", "notbool").is_err());
+    }
+
+    #[test]
+    fn config_gen_state_default_empty() {
+        let state = ConfigGenState::default();
+        assert!(state.suppressed_dirs.is_empty());
+    }
+
+    #[test]
+    fn config_gen_state_suppress_and_check() {
+        let mut state = ConfigGenState::default();
+        assert!(!state.is_suppressed("/some/dir"));
+        state.suppressed_dirs.push("/some/dir".to_string());
+        assert!(state.is_suppressed("/some/dir"));
+        assert!(!state.is_suppressed("/other/dir"));
+    }
+
+    #[test]
+    fn config_gen_state_suppress_dir_deduplicates() {
+        let mut state = ConfigGenState::default();
+        state.suppressed_dirs.push("/dup".to_string());
+        state.suppressed_dirs.push("/dup".to_string()); // manual dup
+        // suppress_dir should not add again
+        assert_eq!(state.suppressed_dirs.len(), 2);
+        // But the method itself checks before adding
+        let mut state2 = ConfigGenState::default();
+        state2.suppressed_dirs.push("/dup".to_string());
+        state2.suppress_dir("/dup");
+        assert_eq!(state2.suppressed_dirs.len(), 1);
+    }
+
+    #[test]
+    fn config_gen_state_serde_round_trip() {
+        let state = ConfigGenState {
+            suppressed_dirs: vec!["/a".to_string(), "/b".to_string()],
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let loaded: ConfigGenState = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.suppressed_dirs.len(), 2);
+        assert!(loaded.is_suppressed("/a"));
+        assert!(loaded.is_suppressed("/b"));
+    }
+
+    #[test]
+    fn config_gen_state_load_save_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config-gen-state.json");
+        let prev = std::env::var("DOT_AGENT_DECK_CONFIG_GEN_STATE").ok();
+        // SAFETY: test is single-threaded; no other code reads this var concurrently.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", path.to_str().unwrap());
+        }
+
+        // Load returns default when file missing
+        let state = ConfigGenState::load();
+        assert!(state.suppressed_dirs.is_empty());
+
+        // Save then load round-trips
+        let mut state = ConfigGenState::default();
+        state.suppressed_dirs.push("/test/dir".to_string());
+        state.save().unwrap();
+        let loaded = ConfigGenState::load();
+        assert_eq!(loaded.suppressed_dirs.len(), 1);
+        assert!(loaded.is_suppressed("/test/dir"));
+
+        // Load from corrupted file returns default
+        std::fs::write(&path, "not valid json!!!").unwrap();
+        let loaded = ConfigGenState::load();
+        assert!(loaded.suppressed_dirs.is_empty());
+
+        // SAFETY: test cleanup — restore original env var.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_CONFIG_GEN_STATE"),
             }
         }
     }
