@@ -6,6 +6,7 @@ const sidebars = {
     'installation',
     'session-management',
     'keyboard-shortcuts',
+    'workspace-modes',
     'configuration',
     'license',
   ],
