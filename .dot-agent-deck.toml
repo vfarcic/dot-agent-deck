@@ -1,0 +1,16 @@
+[[modes]]
+name = "dev"
+init_command = "devbox shell"
+reactive_panes = 2
+
+[[modes.panes]]
+command = "cargo clippy --message-format short 2>&1 | head -30"
+name = "Clippy"
+
+[[modes.rules]]
+pattern = "cargo test"
+watch = false
+
+[[modes.rules]]
+pattern = "git (log|diff|status|show)"
+watch = false
