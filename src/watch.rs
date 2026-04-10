@@ -1,11 +1,11 @@
 use std::io::Write;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, Stdio};
 
 /// Run a command repeatedly at a fixed interval, clearing the screen between runs.
 ///
 /// Used internally by mode manager for persistent panes (`watch = true`) and
 /// reactive watch rules (`watch = true` in `.dot-agent-deck.toml`).
-pub fn run_watch(interval_secs: u64, command: &str) -> ExitCode {
+pub fn run_watch(interval_secs: u64, command: &str) -> ! {
     let mut first = true;
     loop {
         if !first {

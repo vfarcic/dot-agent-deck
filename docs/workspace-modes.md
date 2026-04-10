@@ -98,10 +98,12 @@ name = "rust-tdd"
 [[modes.panes]]
 command = "cargo watch -x test"
 name = "Tests"
+watch = false
 
 [[modes.panes]]
 command = "cargo watch -x clippy"
 name = "Lint"
+watch = false
 
 [[modes.rules]]
 pattern = "cargo\\s+build"

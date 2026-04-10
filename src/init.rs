@@ -65,7 +65,6 @@ pub fn run_init(path: &Path) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::ExitCode;
     use tempfile::tempdir;
 
     #[test]

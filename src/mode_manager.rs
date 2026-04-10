@@ -149,52 +149,73 @@ impl ModeManager {
         // Phase 1: Create all panes as empty shells. Commands are NOT sent yet —
         // the caller must resize panes to correct dimensions, then call
         // start_mode_commands() to send commands at the right PTY size.
-        let mut persistent_pane_ids = Vec::with_capacity(config.panes.len());
-        let mut pending_commands = Vec::new();
+        // Track all created panes so we can clean up on partial failure.
+        let mut created_pane_ids: Vec<String> = Vec::new();
 
-        for pane_cfg in &config.panes {
-            let effective_cmd = if pane_cfg.watch {
-                let exe = std::env::current_exe()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("dot-agent-deck"));
-                format!(
-                    "{} watch --interval 10 {:?}",
-                    exe.display(),
-                    pane_cfg.command
-                )
-            } else {
-                pane_cfg.command.clone()
-            };
+        let result =
+            (|| -> Result<(Vec<String>, Vec<PendingCommand>, ReactivePool), ModeManagerError> {
+                let mut persistent_ids = Vec::with_capacity(config.panes.len());
+                let mut pending = Vec::new();
 
-            let pane_id = self.pane_controller.create_pane(None, cwd)?;
-            let display_name = pane_cfg.name.as_deref().unwrap_or(&pane_cfg.command);
-            self.pane_controller.rename_pane(&pane_id, display_name)?;
+                for pane_cfg in &config.panes {
+                    let effective_cmd = if pane_cfg.watch {
+                        let exe = std::env::current_exe()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("dot-agent-deck"));
+                        format!(
+                            "{} watch --interval 10 {:?}",
+                            exe.display(),
+                            pane_cfg.command
+                        )
+                    } else {
+                        pane_cfg.command.clone()
+                    };
 
-            pending_commands.push(PendingCommand {
-                pane_id: pane_id.clone(),
-                init_command: config.init_command.clone(),
-                command: effective_cmd,
-            });
+                    let pane_id = self.pane_controller.create_pane(None, cwd)?;
+                    created_pane_ids.push(pane_id.clone());
+                    let display_name = pane_cfg.name.as_deref().unwrap_or(&pane_cfg.command);
+                    self.pane_controller.rename_pane(&pane_id, display_name)?;
 
-            persistent_pane_ids.push(pane_id);
-        }
+                    pending.push(PendingCommand {
+                        pane_id: pane_id.clone(),
+                        init_command: config.init_command.clone(),
+                        command: effective_cmd,
+                    });
 
-        let mut reactive_pool = ReactivePool::new();
-        for i in 0..self.reactive_pool_size {
-            let pane_id = self.pane_controller.create_pane(None, cwd)?;
-            self.pane_controller
-                .rename_pane(&pane_id, &format!("reactive-{i}"))?;
+                    persistent_ids.push(pane_id);
+                }
 
-            // Reactive panes only need init_command (no command until a rule matches)
-            if config.init_command.is_some() {
-                pending_commands.push(PendingCommand {
-                    pane_id: pane_id.clone(),
-                    init_command: config.init_command.clone(),
-                    command: String::new(),
-                });
+                let mut pool = ReactivePool::new();
+                for i in 0..self.reactive_pool_size {
+                    let pane_id = self.pane_controller.create_pane(None, cwd)?;
+                    created_pane_ids.push(pane_id.clone());
+                    self.pane_controller
+                        .rename_pane(&pane_id, &format!("reactive-{i}"))?;
+
+                    // Reactive panes only need init_command (no command until a rule matches)
+                    if config.init_command.is_some() {
+                        pending.push(PendingCommand {
+                            pane_id: pane_id.clone(),
+                            init_command: config.init_command.clone(),
+                            command: String::new(),
+                        });
+                    }
+
+                    pool.add(pane_id);
+                }
+
+                Ok((persistent_ids, pending, pool))
+            })();
+
+        let (persistent_pane_ids, pending_commands, reactive_pool) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                // Clean up any panes created before the failure.
+                for id in &created_pane_ids {
+                    let _ = self.pane_controller.close_pane(id);
+                }
+                return Err(e);
             }
-
-            reactive_pool.add(pane_id);
-        }
+        };
 
         self.active_mode = Some(ActiveMode {
             name: config.name.clone(),
@@ -315,14 +336,15 @@ impl ModeManager {
                 created: None,
             }))
         } else {
-            // No init_command — close and recreate for clean output.
-            self.pane_controller.close_pane(&old_pane_id)?;
+            // No init_command — create replacement before closing old pane so the
+            // pool never contains a dead slot if creation fails.
             let new_pane_id = self
                 .pane_controller
                 .create_pane(Some(&pane_cmd), self.cwd.as_deref())?;
             let _ = self.pane_controller.rename_pane(&new_pane_id, command);
             mode.reactive_pool
                 .replace(&old_pane_id, new_pane_id.clone());
+            let _ = self.pane_controller.close_pane(&old_pane_id);
             Ok(Some(PaneChange {
                 closed: Some(old_pane_id),
                 created: Some(new_pane_id),

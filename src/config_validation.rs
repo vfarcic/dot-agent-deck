@@ -43,6 +43,16 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
     }
 
     for mode in &config.modes {
+        // Reject modes with rules but zero reactive panes.
+        if !mode.rules.is_empty() && mode.reactive_panes == 0 {
+            issues.push(ValidationIssue {
+                severity: Severity::Error,
+                mode_name: mode.name.clone(),
+                message: "modes with reactive rules must configure at least one reactive pane"
+                    .to_string(),
+            });
+        }
+
         // Validate regex patterns.
         for rule in &mode.rules {
             if let Err(e) = Regex::new(&rule.pattern) {
@@ -180,6 +190,22 @@ mod tests {
         };
         let s = format!("{issue}");
         assert_eq!(s, "[error] mode 'dev': bad regex");
+    }
+
+    #[test]
+    fn rules_with_zero_reactive_panes_produces_error() {
+        let config = make_config(vec![ModeConfig {
+            name: "dev".to_string(),
+            init_command: None,
+            panes: vec![],
+            rules: vec![make_rule("cargo\\s+test", false, None)],
+            reactive_panes: 0,
+        }]);
+        let issues = validate_config(&config);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(issues[0].message.contains("reactive pane"));
+        assert!(has_errors(&issues));
     }
 
     #[test]

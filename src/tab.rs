@@ -227,6 +227,7 @@ impl TabManager {
     }
 
     /// Route reactive commands to all active mode tabs.
+    /// Each tab only receives commands from its own agent session (scoped by agent_pane_id).
     /// Returns pairs of (closed_pane_id, new_pane_id) for panes that were recreated.
     pub fn route_reactive_commands(
         &mut self,
@@ -238,10 +239,17 @@ impl TabManager {
                 mode_manager,
                 last_routed_timestamp,
                 name,
+                agent_pane_id,
                 ..
             } = tab
             {
-                let new_commands = extract_new_bash_commands(sessions, last_routed_timestamp);
+                // Only route commands from this tab's own agent session.
+                let scoped: HashMap<String, SessionState> = sessions
+                    .iter()
+                    .filter(|(_, s)| s.pane_id.as_deref() == Some(agent_pane_id.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let new_commands = extract_new_bash_commands(&scoped, last_routed_timestamp);
                 for cmd in &new_commands {
                     tracing::info!("Routing command to tab '{name}': {cmd}");
                     match mode_manager.handle_command(cmd) {

@@ -110,18 +110,19 @@ fn install_impl(settings: &mut Value, binary_path: &str) -> (Vec<&'static str>, 
         let rules = ensure_hook_array(hooks_obj, hook_type);
         let expected = make_rule(binary_path, hook_type);
 
-        // Check if we already have an identical entry (same binary path and format).
         let already_current = rules.iter().any(|rule| rule == &expected);
-        if already_current {
-            skipped.push(hook_type);
-            continue;
-        }
+        let before = rules.len();
 
-        // Remove any old/stale/malformed dot-agent-deck entries before adding fresh one
+        // Always normalize dot-agent-deck entries down to a single fresh rule.
         rules.retain(|rule| !rule_contains_dot_agent_deck(rule));
-
+        let removed = before - rules.len();
         rules.push(expected);
-        installed.push(hook_type);
+
+        if already_current && removed == 1 {
+            skipped.push(hook_type);
+        } else {
+            installed.push(hook_type);
+        }
     }
 
     (installed, skipped)
