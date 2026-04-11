@@ -1,6 +1,6 @@
 # PRD #53: AI-Generated ASCII Art for Idle Dashboard Cards
 
-**Status**: Draft
+**Status**: Done
 **Priority**: Low
 **Created**: 2026-04-08
 
@@ -112,4 +112,4 @@ timeout_secs = 300           # idle time before triggering
 - [x] Dimension validation and retry loop (up to 3 attempts) with flashing-dot fallback
 - [x] Art rendering gated on `CardDensity::Spacious` — Normal/Compact show flashing dot only
 - [x] Tests covering CLI command, idle detection trigger, frame rendering, and validation/retry logic
-- [ ] Getting-started or user guide updated with feature description and config examples
+- [x] Getting-started or user guide updated with feature description and config examples

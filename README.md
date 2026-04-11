@@ -1,6 +1,6 @@
 # dot-agent-deck
 
-A terminal dashboard for monitoring and controlling multiple AI coding agent sessions.
+A terminal dashboard for monitoring and controlling multiple AI coding agent sessions — with optional AI-generated ASCII art for idle sessions.
 
 [![CI](https://github.com/vfarcic/dot-agent-deck/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/vfarcic/dot-agent-deck/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/vfarcic/dot-agent-deck)](https://github.com/vfarcic/dot-agent-deck/releases/latest)
