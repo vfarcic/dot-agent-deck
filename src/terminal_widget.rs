@@ -91,13 +91,30 @@ impl Widget for TerminalWidget {
         let screen = parser.screen();
 
         // Render each row of the terminal screen into the inner area.
+        // Clamp to the actual PTY dimensions to avoid reading stale cells
+        // from a wider/taller buffer before a resize event fires.
         let rows = inner.height as usize;
-        let cols = inner.width as usize;
+        let screen_size = screen.size();
+        let cols = (inner.width as usize).min(screen_size.1 as usize);
 
-        // Calculate the visible portion: show the bottom of the screen
-        // (most recent output) if the terminal has more rows than we can display.
-        let screen_rows = screen.size().0 as usize;
-        let start_row = screen_rows.saturating_sub(rows);
+        // Find the last row with actual content so we don't anchor to the
+        // bottom of a large empty PTY buffer. This ensures that when a command
+        // clears the screen and writes N lines from the top, we show rows 0..N
+        // instead of the bottom of the buffer.
+        let screen_rows = screen_size.0 as usize;
+        let last_content_row = (0..screen_rows)
+            .rev()
+            .find(|&r| {
+                (0..cols).any(|c| {
+                    screen
+                        .cell(r as u16, c as u16)
+                        .is_some_and(|cell| !cell.contents().is_empty() && cell.contents() != " ")
+                })
+            })
+            .map(|r| r + 1)
+            .unwrap_or(0);
+        let effective_rows = last_content_row.max(rows);
+        let start_row = effective_rows.saturating_sub(rows);
 
         for (y, row_idx) in (start_row..screen_rows).enumerate() {
             if y >= rows {

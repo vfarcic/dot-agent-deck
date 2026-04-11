@@ -1,5 +1,5 @@
 ---
-sidebar_position: 6
+sidebar_position: 7
 title: Configuration
 ---
 
@@ -23,6 +23,39 @@ dot-agent-deck config get default_command
 | `DOT_AGENT_DECK_CONFIG` | `~/.config/dot-agent-deck/config.toml` | Config file path |
 | `DOT_AGENT_DECK_SESSION` | `~/.config/dot-agent-deck/session.toml` | Session file path |
 | `DOT_AGENT_DECK_LOG` | *(unset)* | Set to any value to enable tracing logs on stderr |
+
+## Project Configuration
+
+Per-project workspace modes are defined in `.dot-agent-deck.toml` at the project root. This file is loaded automatically when you select a directory in the new-pane flow.
+
+### Quick Example
+
+```toml
+[[modes]]
+name = "dev"
+
+[[modes.panes]]
+command = "git log --oneline -20"
+name = "Recent Commits"
+
+[[modes.rules]]
+pattern = "cargo\\s+(build|test|check)"
+watch = false
+```
+
+### Schema Overview
+
+| Block | Key Fields |
+|---|---|
+| `[[modes]]` | `name` (required), `init_command` (optional), `panes`, `rules`, `reactive_panes` (default: 2) |
+| `[[modes.panes]]` | `command` (required), `name` (optional label), `watch` (default: true) |
+| `[[modes.rules]]` | `pattern` (regex, required), `watch` (bool), `interval` (seconds) |
+
+For the full reference and more examples, see [Workspace Modes](workspace-modes.md).
+
+### Scaffolding
+
+Run `dot-agent-deck init` inside a project directory to generate a starter `.dot-agent-deck.toml`.
 
 ## Idle ASCII Art
 

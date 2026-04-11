@@ -1,5 +1,5 @@
 ---
-sidebar_position: 5
+sidebar_position: 6
 title: Keyboard Shortcuts
 ---
 
@@ -9,26 +9,50 @@ title: Keyboard Shortcuts
 
 | Key | Action |
 |---|---|
-| `Ctrl+d` | Return to dashboard |
+| `Ctrl+d` | Enter command / navigation mode |
 | `Ctrl+n` | New pane (directory picker, then name + command form) |
 | `Ctrl+w` | Close selected agent pane |
 | `Ctrl+t` | Toggle stacked / tiled layout |
 
 In PaneInput mode, `Ctrl+c` is delivered to the terminal as SIGINT (0x03). From the dashboard, pressing `Ctrl+c` twice triggers the quit confirmation dialog.
 
+## Tab Navigation
+
+The tab bar appears when more than one tab is open.
+
+| Key | Action |
+|---|---|
+| `Tab` / `Right` / `l` | Next tab (cycles) |
+| `Shift+Tab` / `Left` / `h` | Previous tab (cycles) |
+| `Ctrl+PageDown` | Next tab (secondary) |
+| `Ctrl+PageUp` | Previous tab (secondary) |
+
+## Mode Tab
+
+These shortcuts work in Normal mode when a mode tab is active.
+
+| Key | Action |
+|---|---|
+| `j` / `Down` | Select next side pane |
+| `k` / `Up` | Select previous side pane (from first pane, returns focus to agent) |
+| `Enter` | Enter PaneInput mode on selected pane (agent pane if none selected) |
+| `Esc` | Deselect side pane (return focus indicator to agent) |
+| Mouse click | Click a side pane to select it; click agent pane to deselect |
+
+In PaneInput mode, use `Ctrl+d` to return to Normal mode.
+
 ## Dashboard
 
 | Key | Action |
 |---|---|
-| `j` / `Down` | Move down |
-| `k` / `Up` | Move up |
-| `h` / `Left` | Move left |
-| `l` / `Right` | Move right |
+| `j` / `Down` | Select next card |
+| `k` / `Up` | Select previous card |
 | `1`–`9` | Jump to card N and focus its pane |
-| `Enter` | Focus selected agent pane |
+| `Enter` | Focus selected agent pane (switches to mode tab if applicable) |
 | `/` | Filter sessions |
 | `Esc` | Clear filter |
 | `r` | Rename session |
+| `g` | Generate `.dot-agent-deck.toml` (opens config generation dialog) |
 | `?` | Toggle help overlay |
 | `y` / `n` | Approve / deny pending permission request |
 
@@ -47,10 +71,11 @@ In PaneInput mode, `Ctrl+c` is delivered to the terminal as SIGINT (0x03). From 
 
 Directory lists loop end-to-end, so pressing `Up` on the first entry jumps to the last (and vice versa). The `..` parent entry always remains visible even when a filter is active.
 
-## New Pane Form
+## New Pane / Mode Form
 
 | Key | Action |
 |---|---|
-| `Tab` / `Shift+Tab` | Switch between Name and Command fields |
+| `Tab` / `Shift+Tab` | Switch between fields |
+| `Left` / `Right` / `h` / `l` | Cycle mode selector (when modes available) |
 | `Enter` | Confirm field / submit form |
 | `Esc` | Cancel |

@@ -62,4 +62,48 @@ No external terminal multiplexer is required — dot-agent-deck is a single bina
 4. Watch session statuses update in real-time on the dashboard
 5. Press `Enter` on a card to jump to that agent's pane
 
-> **Tip:** Press `Ctrl+d` from any pane to jump back to the dashboard.
+> **Tip:** Press `Ctrl+d` from any pane to enter command / navigation mode.
+
+## Working with Modes
+
+Modes let you pair an agent session with live command output in a tabbed workspace. They are defined per-project in `.dot-agent-deck.toml`.
+
+### Setting Up a Mode Config
+
+Option A — scaffold a template, then edit:
+
+```bash
+cd your-project
+dot-agent-deck init
+```
+
+Option B — create `.dot-agent-deck.toml` manually. Here is a minimal example:
+
+```toml
+[[modes]]
+name = "dev"
+
+[[modes.panes]]
+command = "cargo watch -x test"
+name = "Tests"
+
+[[modes.rules]]
+pattern = "cargo\\s+build"
+watch = false
+```
+
+### Activating a Mode
+
+1. Press `Ctrl+n` to start the new-pane flow.
+2. Select a directory that contains `.dot-agent-deck.toml`.
+3. In the unified form, use `Left`/`Right` (or `h`/`l`) to cycle the **Mode** field to your desired mode.
+4. Fill in the agent name and command, then press `Enter`.
+5. A new tab opens with the agent on the left and side panes on the right.
+
+### Navigating Mode Tabs
+
+Use `Tab`/`Shift+Tab` to cycle between tabs. The tab bar appears at the top when multiple tabs are open. See [Keyboard Shortcuts](keyboard-shortcuts.md) for all tab navigation keybindings.
+
+> **Tip:** Press `Enter` on a mode agent's card in the dashboard to jump directly to its tab.
+
+For the full configuration reference and more examples, see [Workspace Modes](workspace-modes.md).
