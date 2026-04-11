@@ -103,6 +103,8 @@ pub struct IdleArtConfig {
     pub timeout_secs: u64,
 }
 
+const MAX_IDLE_ART_TIMEOUT_SECS: u64 = i64::MAX as u64;
+
 impl Default for IdleArtConfig {
     fn default() -> Self {
         Self {
@@ -226,9 +228,15 @@ impl DashboardConfig {
                 Ok(())
             }
             "idle_art.timeout_secs" => {
-                self.idle_art.timeout_secs = value
+                let secs: u64 = value
                     .parse()
                     .map_err(|_| format!("Invalid number: {value}"))?;
+                if secs > MAX_IDLE_ART_TIMEOUT_SECS {
+                    return Err(format!(
+                        "idle_art.timeout_secs must be <= {MAX_IDLE_ART_TIMEOUT_SECS}"
+                    ));
+                }
+                self.idle_art.timeout_secs = secs;
                 Ok(())
             }
             "auto_config_prompt" => {
