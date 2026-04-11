@@ -235,9 +235,13 @@ impl ModeManager {
             .as_mut()
             .ok_or(ModeManagerError::NoActiveMode)?;
 
+        // Collect reactive IDs so we can suppress their prompts after commands.
+        let reactive_ids: Vec<String> = mode.reactive_pool.all_ids().to_vec();
+
         let mut failed = Vec::new();
         let pending = std::mem::take(&mut mode.pending_commands);
         for cmd in pending {
+            let is_reactive = reactive_ids.contains(&cmd.pane_id);
             let ok = (|| -> Result<(), ModeManagerError> {
                 if let Some(ref init) = cmd.init_command {
                     self.pane_controller.write_to_pane(&cmd.pane_id, init)?;
@@ -245,6 +249,16 @@ impl ModeManager {
                 if !cmd.command.is_empty() {
                     self.pane_controller
                         .write_to_pane(&cmd.pane_id, &cmd.command)?;
+                }
+                // Hide the shell prompt in reactive panes so automated
+                // command output is not cluttered by prompt strings.
+                // Clear the screen afterwards so the export command itself
+                // and any prior prompt output are not visible.
+                if is_reactive {
+                    self.pane_controller.write_to_pane(
+                        &cmd.pane_id,
+                        "export PS1= PS2= PROMPT= && printf '\\x1b[3J\\x1b[2J\\x1b[H'",
+                    )?;
                 }
                 Ok(())
             })();
@@ -334,7 +348,9 @@ impl ModeManager {
             let _ = self.pane_controller.write_to_pane(&old_pane_id, "\x03");
             self.pane_controller.write_to_pane(
                 &old_pane_id,
-                &format!("printf '\\x1b[3J\\x1b[2J\\x1b[H' && {pane_cmd}"),
+                &format!(
+                    "export PS1= PS2= PROMPT= && printf '\\x1b[3J\\x1b[2J\\x1b[H' && {pane_cmd}"
+                ),
             )?;
             let _ = self.pane_controller.rename_pane(&old_pane_id, command);
             Ok(Some(PaneChange {
@@ -371,6 +387,13 @@ impl ModeManager {
             }
             None => Vec::new(),
         }
+    }
+
+    /// Returns `true` if the given pane belongs to the reactive pool.
+    pub fn is_reactive_pane(&self, pane_id: &str) -> bool {
+        self.active_mode
+            .as_ref()
+            .is_some_and(|m| m.reactive_pool.all_ids().iter().any(|id| id == pane_id))
     }
 }
 

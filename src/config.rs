@@ -269,6 +269,10 @@ pub struct SavedPane {
     pub dir: String,
     pub name: String,
     pub command: String,
+    /// When set, this pane was the agent pane of a mode tab.
+    /// The value is the mode name from the project config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -555,11 +559,13 @@ on_idle = true
                     dir: "/repo/api".to_string(),
                     name: "api".to_string(),
                     command: "claude".to_string(),
+                    mode: None,
                 },
                 SavedPane {
                     dir: "/repo/ui".to_string(),
                     name: "ui".to_string(),
                     command: "".to_string(),
+                    mode: None,
                 },
             ],
         };
@@ -604,6 +610,7 @@ on_idle = true
                 dir: "/tmp/test".to_string(),
                 name: "test".to_string(),
                 command: "echo hi".to_string(),
+                mode: None,
             }],
         };
         session.save().unwrap();

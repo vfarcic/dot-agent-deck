@@ -30,4 +30,8 @@ dot-agent-deck --continue
 
 Without `--continue`, the dashboard starts with a blank slate. If a saved directory no longer exists, that pane is skipped with a warning.
 
+Mode tabs are also restored: each agent pane records which mode it belonged to, and `--continue` reopens the full mode tab (agent + side panes) by looking up the mode config from the project's `.dot-agent-deck.toml`. If the mode config is missing or was renamed, the pane falls back to a plain dashboard pane with a warning.
+
+After restore the dashboard is shown first so you get an overview before switching to a specific tab.
+
 Session data is stored in `~/.config/dot-agent-deck/session.toml`.

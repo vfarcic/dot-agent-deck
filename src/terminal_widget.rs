@@ -97,23 +97,23 @@ impl Widget for TerminalWidget {
         let screen_size = screen.size();
         let cols = (inner.width as usize).min(screen_size.1 as usize);
 
-        // Find the last row with actual content so we don't anchor to the
-        // bottom of a large empty PTY buffer. This ensures that when a command
-        // clears the screen and writes N lines from the top, we show rows 0..N
-        // instead of the bottom of the buffer.
+        // Determine which portion of the PTY buffer to display.
+        //
+        // Use the cursor row as the primary anchor — it reliably marks where
+        // the "active" content ends.  A pure last-content-row scan can be
+        // fooled by stray characters left over from shell init or escape
+        // sequence artifacts, causing the viewport to jump away from the
+        // real output.
+        //
+        // When the cursor is near the top (content fits in the visible area)
+        // we show from row 0.  When the cursor is further down we show the
+        // window ending at the cursor row.
         let screen_rows = screen_size.0 as usize;
-        let last_content_row = (0..screen_rows)
-            .rev()
-            .find(|&r| {
-                (0..cols).any(|c| {
-                    screen
-                        .cell(r as u16, c as u16)
-                        .is_some_and(|cell| !cell.contents().is_empty() && cell.contents() != " ")
-                })
-            })
-            .map(|r| r + 1)
-            .unwrap_or(0);
-        let effective_rows = last_content_row.max(rows);
+        let cursor_row = screen.cursor_position().0 as usize;
+        // The anchor is just past the cursor row (so the cursor line is
+        // included), but never beyond the screen height.
+        let anchor = (cursor_row + 1).min(screen_rows);
+        let effective_rows = anchor.max(rows);
         let start_row = effective_rows.saturating_sub(rows);
 
         for (y, row_idx) in (start_row..screen_rows).enumerate() {

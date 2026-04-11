@@ -138,7 +138,7 @@ Side panes in a mode tab support focus, selection, and direct interaction.
 
 ### Focus & Navigation
 
-A visual indicator highlights the currently selected side pane. Use `j`/`k` (or `Down`/`Up`) to move the selection between panes. Press `Esc` to deselect and return focus to the agent pane. You can also click a side pane to select it, or click the agent pane to deselect.
+A cyan border highlights the currently focused pane. Use `j`/`k` (or `Down`/`Up`) to cycle focus through all panes — agent and side panes — in a continuous loop. Press `Esc` to jump focus back to the agent pane. You can also click any pane to focus it.
 
 ### PaneInput Mode
 
@@ -161,9 +161,9 @@ The generated file contains a commented example you can edit. It will not overwr
 
 ### Agent-Assisted Config Generation
 
-When an agent session is running in a directory without a `.dot-agent-deck.toml`, its dashboard card shows a yellow hint: **`g: generate .dot-agent-deck.toml`**.
+When opening the new-pane form (`Ctrl+n`) for a directory without a `.dot-agent-deck.toml`, a yellow tip appears: **Tip: press g on dashboard to create modes**.
 
-Press `g` on the card to open a dialog with three options (navigate with arrow keys, confirm with Enter):
+From the dashboard, press `g` on an agent's card to open a dialog with three options (navigate with arrow keys, confirm with Enter):
 
 - **Yes** — sends a prompt to the agent asking it to analyze the project, propose a config, and write it after your approval.
 - **No** — dismisses the dialog; the hint stays on the card.

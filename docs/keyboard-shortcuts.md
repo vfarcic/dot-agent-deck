@@ -33,8 +33,8 @@ These shortcuts work in Normal mode when a mode tab is active.
 
 | Key | Action |
 |---|---|
-| `j` / `Down` | Select next side pane |
-| `k` / `Up` | Select previous side pane (from first pane, returns focus to agent) |
+| `j` / `Down` | Focus next pane (cycles: agent → side panes → agent) |
+| `k` / `Up` | Focus previous pane (cycles: agent → last side pane → … → agent) |
 | `Enter` | Enter PaneInput mode on selected pane (agent pane if none selected) |
 | `Esc` | Deselect side pane (return focus indicator to agent) |
 | Mouse click | Click a side pane to select it; click agent pane to deselect |

@@ -534,6 +534,32 @@ impl Default for UiState {
 // ---------------------------------------------------------------------------
 
 /// Resize dashboard panes to match the dashboard layout after a tab switch.
+/// Resize PTYs for a mode tab's agent + side panes to 50% width.
+fn resize_mode_tab_panes(pane: &dyn PaneController, tab_manager: &TabManager, area: Rect) {
+    let (agent_pane_id, side_pane_ids) = match tab_manager.active_tab() {
+        Tab::Mode {
+            agent_pane_id,
+            mode_manager,
+            ..
+        } => (agent_pane_id.clone(), mode_manager.managed_pane_ids()),
+        _ => return,
+    };
+    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+        let half_width = (area.width / 2).saturating_sub(2);
+        let agent_rows = area.height.saturating_sub(3);
+        if agent_rows > 0 && half_width > 0 {
+            let _ = embedded.resize_pane_pty(&agent_pane_id, agent_rows, half_width);
+        }
+        let side_count = side_pane_ids.len().max(1) as u16;
+        let side_rows = (area.height / side_count).saturating_sub(2);
+        if side_rows > 0 && half_width > 0 {
+            for id in &side_pane_ids {
+                let _ = embedded.resize_pane_pty(id, side_rows, half_width);
+            }
+        }
+    }
+}
+
 fn resize_dashboard_panes(
     pane: &dyn PaneController,
     ui: &UiState,
@@ -1414,7 +1440,15 @@ pub fn run_tui(
     }
 
     if continue_session {
+        // Ensure the terminal has up-to-date dimensions before we resize
+        // any PTYs — without this, get_frame().area() may return stale or
+        // default values because no draw() call has happened yet.
+        let _ = terminal.autoresize();
+
         let saved = config::SavedSession::load();
+        // Collect deferred mode pane restores — we need the terminal ready
+        // before we can resize PTYs, so mode tabs are opened after the loop.
+        let mut deferred_mode_panes: Vec<(config::SavedPane, ModeConfig)> = Vec::new();
         for saved_pane in &saved.panes {
             let dir = std::path::Path::new(&saved_pane.dir);
             if !dir.is_dir() {
@@ -1423,6 +1457,36 @@ pub fn run_tui(
                     saved_pane.name, saved_pane.dir
                 ));
                 continue;
+            }
+            // If the pane belonged to a mode tab, defer it so we can open a
+            // full mode tab (with side panes) instead of a plain dashboard pane.
+            if let Some(ref mode_name) = saved_pane.mode {
+                match load_project_config(dir) {
+                    Ok(Some(cfg)) => {
+                        if let Some(mode_cfg) =
+                            cfg.modes.iter().find(|m| m.name == *mode_name).cloned()
+                        {
+                            deferred_mode_panes.push((saved_pane.clone(), mode_cfg));
+                            continue;
+                        }
+                        ui.session_warnings.push(format!(
+                            "Warning: mode '{}' not found in {}, restoring as plain pane",
+                            mode_name, saved_pane.dir
+                        ));
+                    }
+                    Ok(None) => {
+                        ui.session_warnings.push(format!(
+                            "Warning: no project config in {}, restoring as plain pane",
+                            saved_pane.dir
+                        ));
+                    }
+                    Err(e) => {
+                        ui.session_warnings.push(format!(
+                            "Warning: failed to load project config from {}: {e}",
+                            saved_pane.dir
+                        ));
+                    }
+                }
             }
             let cmd = if saved_pane.command.is_empty() {
                 None
@@ -1454,6 +1518,70 @@ pub fn run_tui(
                 }
             }
         }
+        // Restore mode tabs — create agent pane (empty shell), open mode tab,
+        // resize PTYs, then send init + agent commands at the right size.
+        for (saved_pane, mode_config) in deferred_mode_panes {
+            match pane.create_pane(None, Some(&saved_pane.dir)) {
+                Ok(new_id) => {
+                    state.blocking_write().register_pane(new_id.clone());
+                    if !saved_pane.name.is_empty() {
+                        let _ = pane.rename_pane(&new_id, &saved_pane.name);
+                        ui.pane_display_names
+                            .insert(new_id.clone(), saved_pane.name.clone());
+                        ui.pane_names
+                            .insert(new_id.clone(), saved_pane.name.clone());
+                    }
+                    ui.pane_metadata.insert(new_id.clone(), saved_pane.clone());
+                    match tab_manager.open_mode_tab(&mode_config, &saved_pane.dir, new_id.clone()) {
+                        Ok((_tab_idx, side_ids)) => {
+                            for id in &side_ids {
+                                state.blocking_write().register_pane(id.clone());
+                            }
+                            if let Some(embedded) =
+                                pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                            {
+                                let frame_area = terminal.get_frame().area();
+                                let half_width = (frame_area.width / 2).saturating_sub(2);
+                                let agent_rows = frame_area.height.saturating_sub(3);
+                                if agent_rows > 0 && half_width > 0 {
+                                    let _ =
+                                        embedded.resize_pane_pty(&new_id, agent_rows, half_width);
+                                }
+                                let side_count = side_ids.len().max(1) as u16;
+                                let side_rows = (frame_area.height / side_count).saturating_sub(2);
+                                if side_rows > 0 && half_width > 0 {
+                                    for id in &side_ids {
+                                        let _ = embedded.resize_pane_pty(id, side_rows, half_width);
+                                    }
+                                }
+                            }
+                            let _ = tab_manager.start_mode_commands();
+                            if let Some(ref init_cmd) = mode_config.init_command {
+                                let _ = pane.write_to_pane(&new_id, init_cmd);
+                            }
+                            if !saved_pane.command.is_empty() {
+                                let _ = pane.write_to_pane(&new_id, &saved_pane.command);
+                            }
+                        }
+                        Err(e) => {
+                            let _ = pane.close_pane(&new_id);
+                            ui.session_warnings.push(format!(
+                                "Warning: failed to restore mode '{}': {e}",
+                                mode_config.name
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    ui.session_warnings.push(format!(
+                        "Warning: failed to restore mode pane '{}': {e}",
+                        saved_pane.name
+                    ));
+                }
+            }
+        }
+        // Always start on the dashboard so the user gets an overview first.
+        tab_manager.switch_to(0);
     }
 
     'outer: loop {
@@ -1721,12 +1849,13 @@ pub fn run_tui(
                 {
                     let mut clicked_focus = false;
                     // Check side panes.
-                    for (idx, (_side_id, rect)) in ui.side_pane_rects.iter().enumerate() {
+                    for (idx, (side_id, rect)) in ui.side_pane_rects.iter().enumerate() {
                         if mouse.column >= rect.x
                             && mouse.column < rect.x + rect.width
                             && mouse.row >= rect.y
                             && mouse.row < rect.y + rect.height
                         {
+                            let side_id = side_id.clone();
                             if let Tab::Mode {
                                 focused_side_pane_index,
                                 ..
@@ -1735,6 +1864,7 @@ pub fn run_tui(
                                 *focused_side_pane_index = Some(idx);
                                 clicked_focus = true;
                             }
+                            let _ = pane.focus_pane(&side_id);
                             break;
                         }
                     }
@@ -1747,10 +1877,12 @@ pub fn run_tui(
                         && mouse.row < rect.y + rect.height
                         && let Tab::Mode {
                             focused_side_pane_index,
+                            agent_pane_id,
                             ..
                         } = tab_manager.active_tab_mut()
                     {
                         *focused_side_pane_index = None;
+                        let _ = pane.focus_pane(agent_pane_id);
                     }
                 }
 
@@ -2012,6 +2144,20 @@ pub fn run_tui(
                 match key.code {
                     // Ctrl+d: enter Normal (command) mode, stay on current tab
                     KeyCode::Char('d') => {
+                        // Re-suppress the prompt in reactive panes when
+                        // leaving PaneInput so automated output stays clean.
+                        if ui.mode == UiMode::PaneInput
+                            && let Some(embedded) =
+                                pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                            && let Some(focused_id) = embedded.focused_pane_id()
+                            && let Tab::Mode { mode_manager, .. } = tab_manager.active_tab_mut()
+                            && mode_manager.is_reactive_pane(&focused_id)
+                        {
+                            let _ = pane.write_to_pane(
+                                &focused_id,
+                                "export PS1= PS2= PROMPT= && printf '\\x1b[3J\\x1b[2J\\x1b[H'",
+                            );
+                        }
                         ui.mode = UiMode::Normal;
                         shortcut_handled = true;
                     }
@@ -2026,11 +2172,17 @@ pub fn run_tui(
                             PaneLayout::Tiled => "tiled",
                         };
                         // Resize PTYs to match new layout dimensions.
+                        // Mode tabs use 50% width; dashboard uses 67%.
                         if let Some(embedded) =
                             pane.as_any().downcast_ref::<EmbeddedPaneController>()
                         {
                             let frame_area = terminal.get_frame().area();
-                            let right_width = (frame_area.width * 67 / 100).saturating_sub(2);
+                            let is_mode_tab = tab_manager.active_mode_name().is_some();
+                            let pane_width = if is_mode_tab {
+                                (frame_area.width / 2).saturating_sub(2)
+                            } else {
+                                (frame_area.width * 67 / 100).saturating_sub(2)
+                            };
                             let pane_ids = embedded.pane_ids();
                             let pane_count = pane_ids.len() as u16;
                             if pane_count > 0 {
@@ -2055,8 +2207,7 @@ pub fn run_tui(
                                         }
                                     };
                                     if rows > 0 {
-                                        let _ =
-                                            embedded.resize_pane_pty(pane_id, rows, right_width);
+                                        let _ = embedded.resize_pane_pty(pane_id, rows, pane_width);
                                     }
                                 }
                             }
@@ -2101,17 +2252,27 @@ pub fn run_tui(
                     // Ctrl+PageDown: next tab
                     KeyCode::PageDown => {
                         if tab_manager.show_tab_bar() {
-                            let next = tab_manager.active_index() + 1;
-                            tab_manager.switch_to(next);
+                            let prev_idx = tab_manager.active_index();
+                            tab_manager.switch_to(prev_idx + 1);
+                            if prev_idx != tab_manager.active_index() {
+                                let area = terminal.get_frame().area();
+                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                                resize_mode_tab_panes(&*pane, &tab_manager, area);
+                            }
                         }
                         shortcut_handled = true;
                     }
                     // Ctrl+PageUp: previous tab
                     KeyCode::PageUp => {
                         if tab_manager.show_tab_bar() {
-                            let current = tab_manager.active_index();
-                            if current > 0 {
-                                tab_manager.switch_to(current - 1);
+                            let prev_idx = tab_manager.active_index();
+                            if prev_idx > 0 {
+                                tab_manager.switch_to(prev_idx - 1);
+                                if prev_idx != tab_manager.active_index() {
+                                    let area = terminal.get_frame().area();
+                                    resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                                    resize_mode_tab_panes(&*pane, &tab_manager, area);
+                                }
                             }
                         }
                         shortcut_handled = true;
@@ -2130,12 +2291,9 @@ pub fn run_tui(
                             let next = (prev_idx + 1) % count;
                             tab_manager.switch_to(next);
                             if prev_idx != tab_manager.active_index() {
-                                resize_dashboard_panes(
-                                    &*pane,
-                                    &ui,
-                                    &tab_manager,
-                                    terminal.get_frame().area(),
-                                );
+                                let area = terminal.get_frame().area();
+                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                                resize_mode_tab_panes(&*pane, &tab_manager, area);
                             }
                         }
                         shortcut_handled = true;
@@ -2147,12 +2305,9 @@ pub fn run_tui(
                             let prev = (prev_idx + count - 1) % count;
                             tab_manager.switch_to(prev);
                             if prev_idx != tab_manager.active_index() {
-                                resize_dashboard_panes(
-                                    &*pane,
-                                    &ui,
-                                    &tab_manager,
-                                    terminal.get_frame().area(),
-                                );
+                                let area = terminal.get_frame().area();
+                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                                resize_mode_tab_panes(&*pane, &tab_manager, area);
                             }
                         }
                         shortcut_handled = true;
@@ -2186,8 +2341,19 @@ pub fn run_tui(
                                     None
                                 }
                             }
-                            Some(i) => Some((i + 1).min(side_count.saturating_sub(1))),
+                            Some(i) if i + 1 < side_count => Some(i + 1),
+                            Some(_) => None, // wrap back to agent pane
                         };
+                        // Sync embedded controller focus so the visual highlight
+                        // matches (prevents stale cyan border on a previous pane).
+                        let focus_id = match *focused_side_pane_index {
+                            None => agent_pane_id.clone(),
+                            Some(i) => side_ids
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| agent_pane_id.clone()),
+                        };
+                        let _ = pane.focus_pane(&focus_id);
                         shortcut_handled = true;
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
@@ -2202,6 +2368,14 @@ pub fn run_tui(
                             Some(0) => None,
                             Some(i) => Some(i - 1),
                         };
+                        let focus_id = match *focused_side_pane_index {
+                            None => agent_pane_id.clone(),
+                            Some(i) => side_ids
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| agent_pane_id.clone()),
+                        };
+                        let _ = pane.focus_pane(&focus_id);
                         shortcut_handled = true;
                     }
                     KeyCode::Enter => {
@@ -2212,8 +2386,17 @@ pub fn run_tui(
                                 .cloned()
                                 .unwrap_or_else(|| agent_pane_id.clone()),
                         };
+                        let is_reactive = mode_manager.is_reactive_pane(&target_pane_id);
                         if pane.focus_pane(&target_pane_id).is_ok() {
                             ui.mode = UiMode::PaneInput;
+                            // Restore a minimal prompt so the user can
+                            // interact with the shell in this reactive pane.
+                            if is_reactive {
+                                let _ = pane.write_to_pane(
+                                    &target_pane_id,
+                                    "export PS1='$ ' PS2='> ' PROMPT='$ '",
+                                );
+                            }
                             ui.status_message = Some((
                                 "PaneInput mode — type to interact, Ctrl+d for dashboard"
                                     .to_string(),
@@ -2224,6 +2407,7 @@ pub fn run_tui(
                     }
                     KeyCode::Esc => {
                         *focused_side_pane_index = None;
+                        let _ = pane.focus_pane(agent_pane_id);
                         shortcut_handled = true;
                     }
                     _ => {}
@@ -2263,6 +2447,9 @@ pub fn run_tui(
                         if let Some(ref pane_id) = session.pane_id {
                             if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
                                 tab_manager.switch_to(tab_idx);
+                                let area = terminal.get_frame().area();
+                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                                resize_mode_tab_panes(&*pane, &tab_manager, area);
                             }
                             match pane.focus_pane(pane_id) {
                                 Ok(()) => {
@@ -2319,7 +2506,12 @@ pub fn run_tui(
                 KeyResult::NewPane(req) => {
                     if pane.is_available() {
                         let dir_str = req.dir.display().to_string();
-                        let cmd = if req.command.is_empty() {
+                        // For mode tabs, create the agent pane as an empty
+                        // shell so the PTY can be resized to the correct
+                        // dimensions before the command starts.  This avoids
+                        // the process seeing the default 80×24 size.
+                        let is_mode = req.mode_config.is_some();
+                        let cmd = if req.command.is_empty() || is_mode {
                             None
                         } else {
                             Some(req.command.as_str())
@@ -2342,12 +2534,15 @@ pub fn run_tui(
                                         .insert(new_id.clone(), req.name.clone());
                                     ui.pane_names.insert(new_id.clone(), req.name.clone());
                                 }
+                                let mode_name_for_save =
+                                    req.mode_config.as_ref().map(|m| m.name.clone());
                                 ui.pane_metadata.insert(
                                     new_id.clone(),
                                     config::SavedPane {
                                         dir: dir_str.clone(),
                                         name: req.name.clone(),
                                         command: req.command,
+                                        mode: mode_name_for_save,
                                     },
                                 );
 
@@ -2392,6 +2587,17 @@ pub fn run_tui(
                                             }
                                             // Start commands now that panes are correctly sized
                                             let _ = tab_manager.start_mode_commands();
+                                            // Send the agent pane command after resize
+                                            // so it starts at the correct PTY dimensions.
+                                            if let Some(ref init_cmd) = mode_config.init_command {
+                                                let _ = pane.write_to_pane(&new_id, init_cmd);
+                                            }
+                                            if let Some(saved) = ui.pane_metadata.get(&new_id) {
+                                                let agent_cmd = saved.command.clone();
+                                                if !agent_cmd.is_empty() {
+                                                    let _ = pane.write_to_pane(&new_id, &agent_cmd);
+                                                }
+                                            }
                                             ui.status_message = Some((
                                                 format!("Activated mode: {mode_name}"),
                                                 std::time::Instant::now(),
@@ -2455,6 +2661,9 @@ pub fn run_tui(
                             // Focus the pane so user can press Enter to execute.
                             if let Some(tab_idx) = tab_manager.tab_index_for_pane(&pane_id) {
                                 tab_manager.switch_to(tab_idx);
+                                let area = terminal.get_frame().area();
+                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                                resize_mode_tab_panes(&*pane, &tab_manager, area);
                             }
                             let _ = pane.focus_pane(&pane_id);
                             ui.mode = UiMode::PaneInput;
@@ -2872,17 +3081,6 @@ fn render_frame(
                 if n <= 9 { Some(n as u8) } else { None }
             };
             let idle_art = ids.get(col_idx).and_then(|id| ui.idle_art_cache.get(*id));
-            let show_config_hint = ui.config.auto_config_prompt
-                && session
-                    .cwd
-                    .as_deref()
-                    .map(|cwd| {
-                        !ui.config_gen_state.is_suppressed(cwd)
-                            && !std::path::Path::new(cwd)
-                                .join(".dot-agent-deck.toml")
-                                .exists()
-                    })
-                    .unwrap_or(false);
             render_session_card(
                 frame,
                 col_chunks[col_idx],
@@ -2892,7 +3090,6 @@ fn render_frame(
                 display_name,
                 card_number,
                 density,
-                show_config_hint,
                 palette,
                 idle_art,
             );
@@ -3796,7 +3993,9 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
 fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 56.min(area.width.saturating_sub(4));
-    let mode_extra: u16 = if form.has_mode_field { 2 } else { 0 };
+    // The mode field (when modes exist) or the tip line (when they don't)
+    // each need 2 extra rows.  Always reserve them.
+    let mode_extra: u16 = 2;
     let popup_height = (12 + mode_extra).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -3836,7 +4035,17 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
         Line::from(""),
     ];
 
-    // Mode field (only when modes or generate option available)
+    // Mode field (only when modes are available)
+    if !form.has_mode_field {
+        // No .dot-agent-deck.toml or no modes — show a contextual hint.
+        lines.push(Line::styled(
+            "  Tip: press g on dashboard to create modes",
+            Style::default()
+                .fg(palette.hint_accent)
+                .add_modifier(Modifier::ITALIC),
+        ));
+        lines.push(Line::from(""));
+    }
     if form.has_mode_field {
         let mode_name = form.mode_display_name();
         let mode_value = if form.focused == FormField::Mode {
@@ -3949,7 +4158,6 @@ fn render_session_card(
     display_name: Option<&String>,
     card_number: Option<u8>,
     density: CardDensity,
-    show_config_hint: bool,
     palette: ColorPalette,
     idle_art: Option<&IdleArtEntry>,
 ) {
@@ -4091,13 +4299,6 @@ fn render_session_card(
     }
     let tool_lines = recent_tool_lines(session, density.max_tools(), palette);
     lines.extend(tool_lines);
-
-    if show_config_hint {
-        lines.push(Line::styled(
-            "g: generate .dot-agent-deck.toml",
-            Style::default().fg(palette.hint_accent),
-        ));
-    }
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
