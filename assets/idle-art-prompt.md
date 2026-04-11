@@ -4,7 +4,7 @@ INPUT: first prompts (intent), last prompts (outcome), agent response (summary).
 OUTPUT: 1-3 frames of ASCII art. Be funny and specific to the context.
 
 FORMAT CONSTRAINTS:
-- At most 8 lines per frame, at most 38 chars per line. Keep it tight.
+- At most 10 lines per frame, at most 38 chars per line. Keep it tight.
 - Frames separated by ---FRAME--- on its own line.
 - Plain ASCII only (no unicode, no backticks, no markdown fences).
 - Output art lines only — no explanations, no labels, no commentary.

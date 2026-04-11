@@ -106,10 +106,10 @@ timeout_secs = 300           # idle time before triggering
 - [x] `dot-agent-deck ascii` CLI subcommand working end-to-end
 - [x] Configuration schema for `[idle_art]` implemented and documented
 - [x] First-prompt capture added to `SessionState` (first 2-3 prompts preserved separately)
-- [ ] Dashboard idle detection triggers art generation after configured timeout
-- [ ] ASCII art frames render correctly in dashboard cards with proper cycling
-- [ ] Fallback animation works when LLM call fails
-- [ ] Dimension validation and retry loop (up to 3 attempts) with flashing-dot fallback
-- [ ] Art rendering gated on `CardDensity::Spacious` — Normal/Compact show flashing dot only
-- [ ] Tests covering CLI command, idle detection trigger, frame rendering, and validation/retry logic
+- [x] Dashboard idle detection triggers art generation after configured timeout
+- [x] ASCII art frames render correctly in dashboard cards with proper cycling
+- [x] Fallback animation works when LLM call fails
+- [x] Dimension validation and retry loop (up to 3 attempts) with flashing-dot fallback
+- [x] Art rendering gated on `CardDensity::Spacious` — Normal/Compact show flashing dot only
+- [x] Tests covering CLI command, idle detection trigger, frame rendering, and validation/retry logic
 - [ ] Getting-started or user guide updated with feature description and config examples

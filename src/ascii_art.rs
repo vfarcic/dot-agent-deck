@@ -3,7 +3,7 @@ use crate::llm::{LlmError, LlmRequest};
 
 const SYSTEM_PROMPT: &str = include_str!("../assets/idle-art-prompt.md");
 const FRAME_DELIMITER: &str = "---FRAME---";
-const MAX_LINES_PER_FRAME: usize = 8;
+const MAX_LINES_PER_FRAME: usize = 10;
 const MAX_CHARS_PER_LINE: usize = 38;
 const MAX_RETRIES: usize = 3;
 
@@ -147,9 +147,9 @@ mod tests {
 
     #[test]
     fn validate_too_many_lines() {
-        let frame = "1\n2\n3\n4\n5\n6\n7\n8\n9";
+        let frame = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11";
         let err = validate_frame(frame).unwrap_err();
-        assert!(err.contains("9 lines"));
+        assert!(err.contains("11 lines"));
     }
 
     #[test]

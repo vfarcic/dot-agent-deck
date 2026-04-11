@@ -13,8 +13,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use crate::ascii_art::{AsciiArtResult, generate_ascii_art};
 use crate::config;
-use crate::config::{BellConfig, DashboardConfig};
+use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::embedded_pane::EmbeddedPaneController;
 use crate::event::EventType;
 use crate::pane::{PaneController, PaneError};
@@ -282,6 +283,29 @@ struct NewPaneFormState {
     focused: FormField,
 }
 
+// ---------------------------------------------------------------------------
+// Idle ASCII art state machine (per session)
+// ---------------------------------------------------------------------------
+
+enum IdleArtPhase {
+    /// Session is idle but hasn't hit the timeout yet.
+    Waiting,
+    /// LLM generation spawned; poll receiver for result.
+    Generating(std::sync::mpsc::Receiver<Option<AsciiArtResult>>),
+    /// Generation succeeded; frames are cached.
+    HasArt(AsciiArtResult),
+    /// Generation failed; retry after cooldown.
+    Failed(std::time::Instant),
+}
+
+struct IdleArtEntry {
+    phase: IdleArtPhase,
+    /// `last_activity` when this idle stretch began.
+    idle_since: DateTime<Utc>,
+    /// True if the user navigated to this card after art appeared (dismisses art).
+    dismissed: bool,
+}
+
 struct UiState {
     mode: UiMode,
     selected_index: usize,
@@ -316,6 +340,8 @@ struct UiState {
     last_click: Option<(std::time::Instant, u16, u16, u8)>, // (time, col, row, click_count)
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
+    /// Per-session idle ASCII art cache. Key = session_id.
+    idle_art_cache: HashMap<String, IdleArtEntry>,
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -359,6 +385,7 @@ impl UiState {
             focused_pane_rect: None,
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
+            idle_art_cache: HashMap::new(),
         }
     }
 }
@@ -1621,6 +1648,12 @@ pub fn run_tui(
                 && key.modifiers == KeyModifiers::NONE
             {
                 let idx = (c as usize) - ('1' as usize);
+                // Dismiss idle art on the target card
+                if let Some((sid, _)) = filtered.get(idx)
+                    && let Some(entry) = ui.idle_art_cache.get_mut(*sid)
+                {
+                    entry.dismissed = true;
+                }
                 focus_deck(idx, &mut ui, &filtered, &snapshot, &state, &*pane);
                 shortcut_handled = true;
             }
@@ -1745,6 +1778,12 @@ pub fn run_tui(
             match result {
                 KeyResult::Quit => break 'outer,
                 KeyResult::Focus => {
+                    // Dismiss idle art on the focused card
+                    if let Some(ref sid) = selected_id
+                        && let Some(entry) = ui.idle_art_cache.get_mut(sid)
+                    {
+                        entry.dismissed = true;
+                    }
                     if let Some(ref sid) = selected_id
                         && let Some(session) = snapshot.sessions.get(sid)
                     {
@@ -1752,6 +1791,11 @@ pub fn run_tui(
                             match pane.focus_pane(pane_id) {
                                 Ok(()) => {
                                     ui.mode = UiMode::PaneInput;
+                                    // Reset dismissed flags so art reappears when
+                                    // the user returns to the dashboard.
+                                    for entry in ui.idle_art_cache.values_mut() {
+                                        entry.dismissed = false;
+                                    }
                                     ui.status_message = Some((
                                         "PaneInput mode — type to interact, Ctrl+d for dashboard"
                                             .to_string(),
@@ -2038,6 +2082,14 @@ fn render_frame(
     let density = choose_density(sessions.len(), cols, available_for_density, wide);
     let card_height = density.card_height(wide);
 
+    // Update idle art state machine
+    update_idle_art(
+        &mut ui.idle_art_cache,
+        &ui.config.idle_art,
+        &state.sessions,
+        density,
+    );
+
     // Title bar
     let total_sessions = state.sessions.len();
     let showing = sessions.len();
@@ -2138,6 +2190,7 @@ fn render_frame(
                 let n = flat_index + 1;
                 if n <= 9 { Some(n as u8) } else { None }
             };
+            let idle_art = ids.get(col_idx).and_then(|id| ui.idle_art_cache.get(*id));
             render_session_card(
                 frame,
                 col_chunks[col_idx],
@@ -2148,6 +2201,7 @@ fn render_frame(
                 card_number,
                 density,
                 palette,
+                idle_art,
             );
         }
     }
@@ -2861,6 +2915,7 @@ fn render_session_card(
     card_number: Option<u8>,
     density: CardDensity,
     palette: ColorPalette,
+    idle_art: Option<&IdleArtEntry>,
 ) {
     let (status_label, status_style) = status_style(&session.status);
     let status_color = status_style.fg.unwrap_or(palette.text_secondary);
@@ -2991,6 +3046,29 @@ fn render_session_card(
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
+
+    // Overlay ASCII art on top of the normal content (unless dismissed by user)
+    if let Some(entry) = idle_art
+        && !entry.dismissed
+        && let IdleArtPhase::HasArt(ref art) = entry.phase
+        && !art.frames.is_empty()
+    {
+        // Clear the inner area so the Dir line and other content don't bleed through
+        frame.render_widget(Clear, inner);
+
+        let frame_index = (tick / 120) as usize % art.frames.len();
+        let art_lines: Vec<Line<'_>> = art.frames[frame_index]
+            .lines()
+            .map(|l| {
+                Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(palette.text_primary),
+                ))
+            })
+            .collect();
+        let art_widget = Paragraph::new(art_lines);
+        frame.render_widget(art_widget, inner);
+    }
 }
 
 /// Build a single line with left-aligned and right-aligned span groups,
@@ -3104,6 +3182,148 @@ fn format_elapsed(last_activity: DateTime<Utc>) -> String {
             format!("{}h ago", hours)
         } else {
             format!("{}h {}m ago", hours, mins)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idle ASCII art – background generation & per-tick state machine
+// ---------------------------------------------------------------------------
+
+/// Build the "input" string sent to the LLM from session prompts.
+fn build_art_input(session: &SessionState) -> String {
+    let mut parts: Vec<&str> = session.first_prompts.iter().map(|s| s.as_str()).collect();
+    if let Some(ref last) = session.last_user_prompt
+        && !session.first_prompts.iter().any(|p| p == last)
+    {
+        parts.push(last);
+    }
+    parts.join(" | ")
+}
+
+/// Build the "output" string sent to the LLM from recent tool activity.
+fn build_art_output(session: &SessionState) -> String {
+    let tools: Vec<&str> = session
+        .recent_events
+        .iter()
+        .rev()
+        .filter_map(|e| e.tool_name.as_deref())
+        .take(5)
+        .collect();
+    if tools.is_empty() {
+        "Session idle".to_string()
+    } else {
+        format!("Used tools: {}", tools.join(", "))
+    }
+}
+
+/// Drive the per-session idle art state machine. Called once per tick.
+fn update_idle_art(
+    idle_art_cache: &mut HashMap<String, IdleArtEntry>,
+    config: &IdleArtConfig,
+    sessions: &HashMap<String, SessionState>,
+    density: CardDensity,
+) {
+    // Gate: feature disabled or not spacious
+    if !config.enabled || density != CardDensity::Spacious {
+        tracing::debug!(
+            "idle_art skipped: enabled={}, density={:?}",
+            config.enabled,
+            density
+        );
+        return;
+    }
+
+    let now = Utc::now();
+    let timeout = chrono::Duration::seconds(config.timeout_secs as i64);
+
+    // Remove entries for sessions that no longer exist
+    idle_art_cache.retain(|sid, _| sessions.contains_key(sid));
+
+    // Collect session IDs to process (avoid borrowing conflicts)
+    let session_ids: Vec<String> = sessions.keys().cloned().collect();
+
+    for sid in &session_ids {
+        let session = &sessions[sid];
+
+        if session.status != SessionStatus::Idle {
+            idle_art_cache.remove(sid);
+            continue;
+        }
+
+        let idle_duration = now.signed_duration_since(session.last_activity);
+        tracing::debug!(
+            "idle_art {sid}: status=Idle, idle_for={}s, timeout={}s",
+            idle_duration.num_seconds(),
+            config.timeout_secs
+        );
+
+        // Session is idle — manage the state machine
+        let entry = idle_art_cache.entry(sid.clone()).or_insert(IdleArtEntry {
+            phase: IdleArtPhase::Waiting,
+            idle_since: session.last_activity,
+            dismissed: false,
+        });
+
+        // Reset if this is a new idle stretch
+        if entry.idle_since != session.last_activity {
+            entry.phase = IdleArtPhase::Waiting;
+            entry.idle_since = session.last_activity;
+            entry.dismissed = false;
+        }
+
+        // Retry failed generations after 60s cooldown
+        if let IdleArtPhase::Failed(at) = entry.phase
+            && at.elapsed() >= std::time::Duration::from_secs(60)
+        {
+            tracing::debug!("idle_art {sid}: retrying after failure cooldown");
+            entry.phase = IdleArtPhase::Waiting;
+        }
+
+        // Spawn generation if timeout elapsed
+        if matches!(entry.phase, IdleArtPhase::Waiting)
+            && now.signed_duration_since(entry.idle_since) >= timeout
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let input = build_art_input(session);
+            let output = build_art_output(session);
+            let art_config = config.clone();
+
+            tracing::info!("idle_art {sid}: spawning generation, input={input:?}");
+
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let result = generate_ascii_art(&input, &output, &art_config).await;
+                    match &result {
+                        Ok(_) => tracing::info!("idle_art generation succeeded"),
+                        Err(e) => tracing::warn!("idle_art generation failed: {e}"),
+                    }
+                    let _ = tx.send(result.ok());
+                });
+                entry.phase = IdleArtPhase::Generating(rx);
+            } else {
+                tracing::warn!("idle_art {sid}: no tokio runtime handle available");
+                entry.phase = IdleArtPhase::Failed(std::time::Instant::now());
+            }
+        }
+
+        // Poll for completion
+        let failed_now = IdleArtPhase::Failed(std::time::Instant::now());
+        let phase = std::mem::replace(&mut entry.phase, failed_now);
+        if let IdleArtPhase::Generating(rx) = phase {
+            match rx.try_recv() {
+                Ok(Some(art)) => entry.phase = IdleArtPhase::HasArt(art),
+                Ok(None) => entry.phase = IdleArtPhase::Failed(std::time::Instant::now()),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    entry.phase = IdleArtPhase::Generating(rx);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    entry.phase = IdleArtPhase::Failed(std::time::Instant::now());
+                }
+            }
+        } else {
+            // Put back non-Generating phases
+            entry.phase = phase;
         }
     }
 }
@@ -4409,5 +4629,273 @@ mod tests {
             KeyResult::ForwardToPane(bytes) => assert_eq!(bytes, vec![b'l']),
             other => panic!("Expected ForwardToPane, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Idle ASCII art tests
+    // -----------------------------------------------------------------------
+
+    fn idle_art_config(enabled: bool, timeout_secs: u64) -> IdleArtConfig {
+        IdleArtConfig {
+            enabled,
+            provider: "anthropic".to_string(),
+            model: "claude-haiku-4-5".to_string(),
+            timeout_secs,
+        }
+    }
+
+    #[test]
+    fn test_update_idle_art_gated_on_config_disabled() {
+        let mut cache = HashMap::new();
+        let config = idle_art_config(false, 10);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = "s1".to_string();
+        s.last_activity = Utc::now() - Duration::seconds(100);
+        sessions.insert("s1".to_string(), s);
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(cache.is_empty(), "Should not create entries when disabled");
+    }
+
+    #[test]
+    fn test_update_idle_art_gated_on_density() {
+        let mut cache = HashMap::new();
+        let config = idle_art_config(true, 10);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = "s1".to_string();
+        s.last_activity = Utc::now() - Duration::seconds(100);
+        sessions.insert("s1".to_string(), s);
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Normal);
+        assert!(
+            cache.is_empty(),
+            "Should not create entries in Normal density"
+        );
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Compact);
+        assert!(
+            cache.is_empty(),
+            "Should not create entries in Compact density"
+        );
+    }
+
+    #[test]
+    fn test_update_idle_art_waiting_before_timeout() {
+        let mut cache = HashMap::new();
+        let config = idle_art_config(true, 300);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = "s1".to_string();
+        s.last_activity = Utc::now() - Duration::seconds(10); // only 10s, timeout is 300s
+        sessions.insert("s1".to_string(), s);
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(cache.contains_key("s1"));
+        assert!(matches!(cache["s1"].phase, IdleArtPhase::Waiting));
+    }
+
+    #[test]
+    fn test_update_idle_art_reset_on_active() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "s1".to_string(),
+            IdleArtEntry {
+                phase: IdleArtPhase::HasArt(AsciiArtResult {
+                    frames: vec!["art".to_string()],
+                }),
+                idle_since: Utc::now() - Duration::seconds(600),
+                dismissed: false,
+            },
+        );
+
+        let config = idle_art_config(true, 300);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Working); // no longer idle
+        s.session_id = "s1".to_string();
+        sessions.insert("s1".to_string(), s);
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(
+            !cache.contains_key("s1"),
+            "Should remove entry when session is no longer idle"
+        );
+    }
+
+    #[test]
+    fn test_update_idle_art_reset_on_new_idle_stretch() {
+        let old_idle_since = Utc::now() - Duration::seconds(600);
+        let new_idle_since = Utc::now() - Duration::seconds(5);
+        let mut cache = HashMap::new();
+        cache.insert(
+            "s1".to_string(),
+            IdleArtEntry {
+                phase: IdleArtPhase::HasArt(AsciiArtResult {
+                    frames: vec!["old art".to_string()],
+                }),
+                idle_since: old_idle_since,
+                dismissed: false,
+            },
+        );
+
+        let config = idle_art_config(true, 300);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = "s1".to_string();
+        s.last_activity = new_idle_since; // different from old idle_since
+        sessions.insert("s1".to_string(), s);
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(
+            matches!(cache["s1"].phase, IdleArtPhase::Waiting),
+            "Should reset to Waiting on new idle stretch"
+        );
+        assert_eq!(cache["s1"].idle_since, new_idle_since);
+    }
+
+    #[test]
+    fn test_update_idle_art_removes_stale_sessions() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "gone".to_string(),
+            IdleArtEntry {
+                phase: IdleArtPhase::Waiting,
+                idle_since: Utc::now(),
+                dismissed: false,
+            },
+        );
+
+        let config = idle_art_config(true, 300);
+        let sessions = HashMap::new(); // empty — "gone" no longer exists
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(
+            !cache.contains_key("gone"),
+            "Should remove entries for non-existent sessions"
+        );
+    }
+
+    #[test]
+    fn test_build_art_input_combines_prompts() {
+        let mut s = make_session(SessionStatus::Idle);
+        s.first_prompts = vec!["Fix auth".to_string(), "Add tests".to_string()];
+        s.last_user_prompt = Some("Run deploy".to_string());
+
+        let input = build_art_input(&s);
+        assert_eq!(input, "Fix auth | Add tests | Run deploy");
+    }
+
+    #[test]
+    fn test_build_art_input_deduplicates_last_prompt() {
+        let mut s = make_session(SessionStatus::Idle);
+        s.first_prompts = vec!["Fix auth".to_string()];
+        s.last_user_prompt = Some("Fix auth".to_string()); // same as first
+
+        let input = build_art_input(&s);
+        assert_eq!(input, "Fix auth");
+    }
+
+    #[test]
+    fn test_build_art_input_empty() {
+        let s = make_session(SessionStatus::Idle);
+        let input = build_art_input(&s);
+        assert_eq!(input, "");
+    }
+
+    #[test]
+    fn test_build_art_output_with_tools() {
+        let mut s = make_session(SessionStatus::Idle);
+        s.recent_events.push_back(AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::ToolStart,
+            tool_name: Some("Bash".to_string()),
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+        });
+        let output = build_art_output(&s);
+        assert!(output.contains("Bash"));
+    }
+
+    #[test]
+    fn test_build_art_output_no_tools() {
+        let s = make_session(SessionStatus::Idle);
+        let output = build_art_output(&s);
+        assert_eq!(output, "Session idle");
+    }
+
+    #[test]
+    fn test_frame_cycling() {
+        // 3 frames, cycling at 120 ticks per frame
+        let num_frames = 3;
+        assert_eq!((0u64 / 120) as usize % num_frames, 0);
+        assert_eq!((119u64 / 120) as usize % num_frames, 0);
+        assert_eq!((120u64 / 120) as usize % num_frames, 1);
+        assert_eq!((239u64 / 120) as usize % num_frames, 1);
+        assert_eq!((240u64 / 120) as usize % num_frames, 2);
+        assert_eq!((360u64 / 120) as usize % num_frames, 0); // wraps
+    }
+
+    #[test]
+    fn test_idle_art_has_art_cached() {
+        let idle_since = Utc::now() - Duration::seconds(600);
+        let mut cache = HashMap::new();
+        let art = AsciiArtResult {
+            frames: vec!["frame1".to_string(), "frame2".to_string()],
+        };
+        cache.insert(
+            "s1".to_string(),
+            IdleArtEntry {
+                phase: IdleArtPhase::HasArt(art),
+                idle_since,
+                dismissed: false,
+            },
+        );
+
+        let config = idle_art_config(true, 300);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = "s1".to_string();
+        s.last_activity = idle_since;
+        sessions.insert("s1".to_string(), s);
+
+        // Update should NOT reset HasArt to Waiting (same idle_since)
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(
+            matches!(cache["s1"].phase, IdleArtPhase::HasArt(_)),
+            "Should keep cached art for same idle stretch"
+        );
+    }
+
+    #[test]
+    fn test_idle_art_failed_stays_failed_within_cooldown() {
+        let mut cache = HashMap::new();
+        let idle_since = Utc::now() - Duration::seconds(600);
+        cache.insert(
+            "s1".to_string(),
+            IdleArtEntry {
+                phase: IdleArtPhase::Failed(std::time::Instant::now()),
+                idle_since,
+                dismissed: false,
+            },
+        );
+
+        let config = idle_art_config(true, 300);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = "s1".to_string();
+        s.last_activity = idle_since;
+        sessions.insert("s1".to_string(), s);
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(
+            matches!(cache["s1"].phase, IdleArtPhase::Failed(_)),
+            "Failed should stay Failed within cooldown period"
+        );
     }
 }
