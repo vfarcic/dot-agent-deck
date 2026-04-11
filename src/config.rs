@@ -9,6 +9,10 @@ pub const CONFIG_KEYS: &[(&str, &str)] = &[
     ("default_command", "Default shell command for new panes"),
     ("theme", "Color theme: auto, light, dark (default: auto)"),
     (
+        "auto_config_prompt",
+        "Enable/disable the config generation prompt (default: true)",
+    ),
+    (
         "bell.enabled",
         "Enable/disable terminal bell (default: true)",
     ),

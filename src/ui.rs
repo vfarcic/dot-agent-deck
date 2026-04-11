@@ -4258,17 +4258,25 @@ fn build_art_input(session: &SessionState) -> String {
 
 /// Build the "output" string sent to the LLM from recent tool activity.
 fn build_art_output(session: &SessionState) -> String {
-    let tools: Vec<&str> = session
+    let tool_summaries: Vec<String> = session
         .recent_events
         .iter()
         .rev()
-        .filter_map(|e| e.tool_name.as_deref())
+        .filter_map(|e| {
+            e.tool_name.as_deref().map(|name| {
+                if let Some(ref detail) = e.tool_detail {
+                    format!("{name}({detail})")
+                } else {
+                    name.to_string()
+                }
+            })
+        })
         .take(5)
         .collect();
-    if tools.is_empty() {
+    if tool_summaries.is_empty() {
         "Session idle".to_string()
     } else {
-        format!("Used tools: {}", tools.join(", "))
+        format!("Used tools: {}", tool_summaries.join(", "))
     }
 }
 
@@ -4281,6 +4289,7 @@ fn update_idle_art(
 ) {
     // Gate: feature disabled or not spacious
     if !config.enabled || density != CardDensity::Spacious {
+        idle_art_cache.clear();
         tracing::debug!(
             "idle_art skipped: enabled={}, density={:?}",
             config.enabled,
@@ -4344,7 +4353,11 @@ fn update_idle_art(
             let output = build_art_output(session);
             let art_config = config.clone();
 
-            tracing::info!("idle_art {sid}: spawning generation, input={input:?}");
+            tracing::info!(
+                "idle_art {sid}: spawning generation (input_len={}, output_len={})",
+                input.len(),
+                output.len()
+            );
 
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {

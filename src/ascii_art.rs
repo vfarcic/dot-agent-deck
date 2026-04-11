@@ -22,8 +22,8 @@ pub struct AsciiArtResult {
 
 pub fn parse_frames(raw: &str) -> Vec<String> {
     raw.split(FRAME_DELIMITER)
-        .map(|f| f.trim().to_string())
-        .filter(|f| !f.is_empty())
+        .map(|f| f.trim_matches(|c| c == '\r' || c == '\n').to_string())
+        .filter(|f| !f.trim().is_empty())
         .collect()
 }
 
@@ -36,6 +36,9 @@ pub fn validate_frame(frame: &str) -> Result<(), String> {
         ));
     }
     for (i, line) in lines.iter().enumerate() {
+        if !line.is_ascii() {
+            return Err(format!("line {} contains non-ASCII characters", i + 1));
+        }
         if line.len() > MAX_CHARS_PER_LINE {
             return Err(format!(
                 "line {} has {} chars, max is {MAX_CHARS_PER_LINE}",
@@ -112,7 +115,7 @@ mod tests {
         let raw = "  hello\n  world  ";
         let frames = parse_frames(raw);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0], "hello\n  world");
+        assert_eq!(frames[0], "  hello\n  world  ");
     }
 
     #[test]
@@ -157,6 +160,13 @@ mod tests {
         let frame = "123456789012345678901234567890123456789"; // 39 chars
         let err = validate_frame(frame).unwrap_err();
         assert!(err.contains("39 chars"));
+    }
+
+    #[test]
+    fn validate_non_ascii_rejected() {
+        let frame = "hello 🎉 world";
+        let err = validate_frame(frame).unwrap_err();
+        assert!(err.contains("non-ASCII"));
     }
 
     #[test]
