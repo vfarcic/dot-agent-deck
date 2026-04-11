@@ -597,6 +597,7 @@ mod tests {
                 recent_events,
                 tool_count: 1,
                 last_user_prompt: None,
+                first_prompts: Vec::new(),
                 pane_id: None,
             },
         )
@@ -657,6 +658,7 @@ mod tests {
                 recent_events,
                 tool_count: 0,
                 last_user_prompt: None,
+                first_prompts: Vec::new(),
                 pane_id: None,
             },
         );

@@ -1,3 +1,4 @@
+pub mod ascii_art;
 pub mod config;
 pub mod config_gen;
 pub mod config_validation;
@@ -8,6 +9,7 @@ pub mod event;
 pub mod hook;
 pub mod hooks_manage;
 pub mod init;
+pub mod llm;
 pub mod mode_manager;
 pub mod opencode_manage;
 pub mod pane;
