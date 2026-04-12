@@ -2224,7 +2224,7 @@ pub fn run_tui(
                         ));
                         shortcut_handled = true;
                     }
-                    // Ctrl+w: close selected pane
+                    // Ctrl+w: close selected pane (or entire mode tab if it's the agent pane)
                     KeyCode::Char('w') => {
                         if let Some(sid) =
                             filtered.get(ui.selected_index).map(|(id, _)| (*id).clone())
@@ -2232,13 +2232,32 @@ pub fn run_tui(
                             && let Some(ref pane_id) = session.pane_id
                         {
                             let closed_pane_id = pane_id.clone();
-                            let _ = pane.close_pane(pane_id);
-                            let mut st = state.blocking_write();
-                            st.sessions.remove(&sid);
-                            st.unregister_pane(&closed_pane_id);
-                            drop(st);
-                            ui.pane_metadata.remove(&closed_pane_id);
-                            // Reset mode if the closed pane was focused.
+                            // Check if this pane is the agent of a mode tab.
+                            let mode_tab_idx = tab_manager.tab_index_for_agent_pane(pane_id);
+                            if let Some(tab_idx) = mode_tab_idx {
+                                // Close the entire mode tab (agent + side panes).
+                                if let Ok(side_ids) = tab_manager.close_tab(tab_idx) {
+                                    let mut st = state.blocking_write();
+                                    for id in &side_ids {
+                                        st.unregister_pane(id);
+                                    }
+                                    st.sessions.remove(&sid);
+                                    st.unregister_pane(&closed_pane_id);
+                                    drop(st);
+                                }
+                                let _ = pane.close_pane(&closed_pane_id);
+                                ui.pane_metadata.remove(&closed_pane_id);
+                                let area = terminal.get_frame().area();
+                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                            } else {
+                                // Plain dashboard pane — close just this one.
+                                let _ = pane.close_pane(pane_id);
+                                let mut st = state.blocking_write();
+                                st.sessions.remove(&sid);
+                                st.unregister_pane(&closed_pane_id);
+                                drop(st);
+                                ui.pane_metadata.remove(&closed_pane_id);
+                            }
                             if ui.mode == UiMode::PaneInput {
                                 ui.mode = UiMode::Normal;
                             }

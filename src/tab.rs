@@ -217,6 +217,18 @@ impl TabManager {
         None
     }
 
+    /// Find the mode tab that has this pane as its agent pane.
+    pub fn tab_index_for_agent_pane(&self, pane_id: &str) -> Option<usize> {
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if let Tab::Mode { agent_pane_id, .. } = tab
+                && agent_pane_id == pane_id
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     /// Get the active mode name (None if Dashboard is active).
     pub fn active_mode_name(&self) -> Option<&str> {
         match &self.tabs[self.active_index] {
