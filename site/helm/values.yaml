@@ -1,7 +1,7 @@
 replicaCount: 1
 image:
   repository: ghcr.io/vfarcic/dot-agent-deck-docs
-  tag: "v0.20.1"
+  tag: "v0.20.2"
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 service:
