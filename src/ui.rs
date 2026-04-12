@@ -2261,6 +2261,11 @@ pub fn run_tui(
                             if ui.mode == UiMode::PaneInput {
                                 ui.mode = UiMode::Normal;
                             }
+                            // Clamp selected_index so it doesn't point past
+                            // the now-shorter card list.
+                            if ui.selected_index > 0 {
+                                ui.selected_index = ui.selected_index.saturating_sub(1);
+                            }
                             ui.status_message = Some((
                                 format!("Closed pane {closed_pane_id}"),
                                 std::time::Instant::now(),
