@@ -5,7 +5,8 @@
     "vals@0.43.7",
     "go-task@3.48.0",
     "nodejs@20",
-    "kubernetes-helm@3.19.1"
+    "kubernetes-helm@3.19.1",
+    "git@2.53.0"
   ],
   "shell": {
     "init_hook": [
@@ -14,7 +15,7 @@
       "[ -f .env ] && source .env || true"
     ],
     "scripts": {
-      "agent": ["claude --continue"],
+      "agent":     ["claude --continue"],
       "agent-new": ["claude"]
     }
   }
