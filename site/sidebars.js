@@ -8,6 +8,7 @@ const sidebars = {
     'keyboard-shortcuts',
     'workspace-modes',
     'configuration',
+    'troubleshooting',
     'license',
   ],
 };
