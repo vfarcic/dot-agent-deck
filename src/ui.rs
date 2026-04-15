@@ -2950,7 +2950,7 @@ fn render_frame(
         }
 
         if ui.mode == UiMode::Help {
-            render_help_overlay(frame, has_pane_control, active_mode_name, palette);
+            render_help_overlay(frame, active_mode_name, palette);
         }
         if ui.mode == UiMode::DirPicker
             && let Some(picker) = ui.dir_picker.as_mut()
@@ -3150,7 +3150,7 @@ fn render_frame(
 
     // Overlays (drawn last, on top)
     if ui.mode == UiMode::Help {
-        render_help_overlay(frame, has_pane_control, active_mode_name, palette);
+        render_help_overlay(frame, active_mode_name, palette);
     }
     if ui.mode == UiMode::DirPicker
         && let Some(picker) = ui.dir_picker.as_mut()
@@ -3429,7 +3429,7 @@ fn render_mode_tab(
 
     // Overlays (drawn last, on top)
     if ui.mode == UiMode::Help {
-        render_help_overlay(frame, has_pane_control, active_mode_name, palette);
+        render_help_overlay(frame, active_mode_name, palette);
     }
     if ui.mode == UiMode::DirPicker
         && let Some(picker) = ui.dir_picker.as_mut()
@@ -3778,123 +3778,124 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPa
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_help_overlay(
-    frame: &mut Frame,
-    has_pane_control: bool,
-    active_mode_name: Option<&str>,
-    palette: ColorPalette,
-) {
+fn render_help_overlay(frame: &mut Frame, active_mode_name: Option<&str>, palette: ColorPalette) {
+    let cyan = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    let left: Vec<Line> = vec![
+        Line::styled("  Global (works from any pane)", cyan),
+        Line::from(""),
+        Line::from(format!("  {MOD_KEY}+d           Command mode (dashboard)")),
+        Line::from(format!("  {MOD_KEY}+n           Create new pane")),
+        Line::from(format!("  {MOD_KEY}+w           Close selected pane")),
+        Line::from(format!(
+            "  {MOD_KEY}+t           Toggle layout (stacked/tiled)"
+        )),
+        Line::from(format!("  {MOD_KEY}+c           Quit")),
+        Line::from(""),
+        Line::styled("  Tab Navigation", cyan),
+        Line::from(""),
+        Line::from("  Tab / Right / l       Next tab"),
+        Line::from("  Shift+Tab / Left / h  Prev tab"),
+        Line::from(format!("  {MOD_KEY}+PgDn            Next tab")),
+        Line::from(format!("  {MOD_KEY}+PgUp            Prev tab")),
+        Line::from(""),
+        Line::styled("  Dashboard (command mode)", cyan),
+        Line::from(""),
+        Line::from("  1-9             Jump to pane N"),
+        Line::from("  j/k / Up/Down   Navigate cards"),
+        Line::from("  Enter           Focus selected pane"),
+        Line::from("  /               Filter sessions"),
+        Line::from("  Esc             Clear filter"),
+        Line::from("  r               Rename session"),
+        Line::from("  g               Generate .dot-agent-deck.toml"),
+        Line::from("  y / n           Approve / deny permission"),
+        Line::from("  ?               Toggle this help"),
+    ];
+
+    let mut right: Vec<Line> = vec![
+        Line::styled("  Mode Tab (in-tab navigation)", cyan),
+        Line::from(""),
+        Line::from("  j / Down        Focus next pane"),
+        Line::from("  k / Up          Focus previous pane"),
+        Line::from("  Enter           Enter PaneInput on selected"),
+        Line::from("  Esc             Deselect side pane"),
+        Line::from("  Mouse click     Focus pane"),
+        Line::from(format!("  {MOD_KEY}+d            Return to Normal mode")),
+        Line::from(""),
+        Line::styled("  New Agent Form", cyan),
+        Line::from(""),
+        Line::from("  Tab             Switch field"),
+        Line::from("  \u{25c0}/\u{25b6}             Cycle mode"),
+        Line::from("  Enter           Next field / confirm"),
+        Line::from("  Esc             Cancel"),
+        Line::from(""),
+        Line::styled("  Directory Picker", cyan),
+        Line::from(""),
+        Line::from("  j / Down        Select next"),
+        Line::from("  k / Up          Select previous"),
+        Line::from("  l / Right / Enter   Enter directory"),
+        Line::from("  h / Left / Bksp     Go up one level"),
+        Line::from("  Space           Confirm current directory"),
+        Line::from("  /               Filter (case-insensitive)"),
+        Line::from("  Esc             Clear filter (twice = close)"),
+        Line::from("  q               Cancel"),
+        Line::from(""),
+        Line::styled("  Session", cyan),
+        Line::from(""),
+        Line::from("  Panes auto-saved on exit."),
+        Line::from("  Restore: dot-agent-deck --continue"),
+    ];
+
+    if let Some(name) = active_mode_name {
+        right.push(Line::from(""));
+        right.push(Line::styled(format!("  Active mode: {name}"), cyan));
+    }
+
     let area = frame.area();
-    let popup_width = 52.min(area.width.saturating_sub(4));
-    let tab_nav_lines: u16 = if active_mode_name.is_some() { 6 } else { 0 };
-    let mode_lines: u16 = if active_mode_name.is_some() { 8 } else { 6 };
-    let base_height: u16 = if has_pane_control { 44 } else { 28 } + mode_lines + tab_nav_lines;
-    let popup_height = base_height.min(area.height.saturating_sub(4));
+    let column_width: u16 = 50;
+    let popup_width = (column_width * 2 + 3).min(area.width.saturating_sub(2));
+    let content_height = left.len().max(right.len()) as u16;
+    let popup_height = (content_height + 4).min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
-    let mut help_text = vec![
-        Line::styled(
-            "  Global (works from any pane)",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::from(""),
-        Line::from(format!("  {MOD_KEY}+d         Command mode (dashboard)")),
-        Line::from(format!("  {MOD_KEY}+n         Create new pane")),
-        Line::from(format!("  {MOD_KEY}+w         Close selected pane")),
-        Line::from(format!(
-            "  {MOD_KEY}+t         Toggle layout (stacked/tiled)"
-        )),
-    ];
-
-    if active_mode_name.is_some() {
-        help_text.push(Line::from(""));
-        help_text.push(Line::styled(
-            "  Tab Navigation (command mode)",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        help_text.push(Line::from(""));
-        help_text.push(Line::from("  Tab / Right / l     Next tab"));
-        help_text.push(Line::from("  Shift+Tab / Left / h  Prev tab"));
-        help_text.push(Line::from(format!(
-            "  {MOD_KEY}+PgDn/PgUp  Next / prev tab"
-        )));
-    }
-
-    if has_pane_control {
-        help_text.push(Line::from(""));
-        help_text.push(Line::styled(
-            "  Dashboard (command mode)",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        help_text.push(Line::from(""));
-        help_text.push(Line::from("  1-9           Jump to pane N"));
-        help_text.push(Line::from("  j/k / Up/Down Navigate cards"));
-        help_text.push(Line::from("  Enter         Focus selected pane"));
-        help_text.push(Line::from("  /             Filter sessions"));
-        help_text.push(Line::from("  r             Rename session"));
-        help_text.push(Line::from("  g             Generate .dot-agent-deck.toml"));
-        help_text.push(Line::from("  ?             Toggle this help"));
-        help_text.push(Line::from("  Esc           Clear filter"));
-        help_text.push(Line::from(format!("  {MOD_KEY}+c         Quit")));
-    }
-
-    help_text.push(Line::from(""));
-    help_text.push(Line::from(""));
-    help_text.push(Line::styled(
-        "  New Agent Form",
-        Style::default()
-            .fg(Color::LightMagenta)
-            .add_modifier(Modifier::BOLD),
-    ));
-    help_text.push(Line::from(""));
-    help_text.push(Line::from("  Tab           Switch field"));
-    help_text.push(Line::from("  \u{25c0}/\u{25b6}           Cycle mode"));
-    help_text.push(Line::from("  Enter         Next field / confirm"));
-    help_text.push(Line::from("  Esc           Cancel"));
-    if let Some(name) = active_mode_name {
-        help_text.push(Line::from(""));
-        help_text.push(Line::styled(
-            format!("  Active: {name}"),
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    help_text.push(Line::from(""));
-    help_text.push(Line::styled(
-        "  Session",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ));
-    help_text.push(Line::from(""));
-    help_text.push(Line::from("  Panes auto-saved on exit."));
-    help_text.push(Line::from("  Restore: dot-agent-deck --continue"));
-
-    help_text.push(Line::from(""));
-    help_text.push(Line::styled(
-        "  Press ? or Esc to close",
-        Style::default().fg(palette.text_secondary),
-    ));
-
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Help ")
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(palette.terminal_bg));
-    let paragraph = Paragraph::new(help_text).block(block);
-    frame.render_widget(paragraph, popup_area);
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    // Reserve last 2 rows for footer
+    let footer_height: u16 = 2;
+    let columns_height = inner.height.saturating_sub(footer_height);
+    let columns_area = Rect::new(inner.x, inner.y, inner.width, columns_height);
+    let footer_area = Rect::new(
+        inner.x,
+        inner.y + columns_height,
+        inner.width,
+        footer_height.min(inner.height),
+    );
+
+    let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(columns_area);
+    frame.render_widget(Paragraph::new(left), halves[0]);
+    frame.render_widget(Paragraph::new(right), halves[1]);
+
+    let footer = Paragraph::new(vec![
+        Line::from(""),
+        Line::styled(
+            "  Press ? or Esc to close",
+            Style::default().fg(palette.text_secondary),
+        ),
+    ]);
+    frame.render_widget(footer, footer_area);
 }
 
 fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: ColorPalette) {
