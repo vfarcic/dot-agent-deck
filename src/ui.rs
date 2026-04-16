@@ -315,7 +315,7 @@ struct NewPaneFormState {
     // Mode/orchestration selection fields
     modes: Vec<ModeConfig>,
     orchestrations: Vec<OrchestrationConfig>,
-    mode_selected: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations
+    selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations
     has_mode_field: bool,
     focused: FormField,
 }
@@ -358,7 +358,7 @@ impl NewPaneFormState {
             command,
             modes,
             orchestrations,
-            mode_selected: 0,
+            selection_index: 0,
             has_mode_field,
             focused: if has_mode_field {
                 FormField::Mode
@@ -373,39 +373,39 @@ impl NewPaneFormState {
     }
 
     fn select_next_mode(&mut self) {
-        if self.mode_selected + 1 < self.mode_option_count() {
-            self.mode_selected += 1;
+        if self.selection_index + 1 < self.mode_option_count() {
+            self.selection_index += 1;
         }
     }
 
     fn select_previous_mode(&mut self) {
-        self.mode_selected = self.mode_selected.saturating_sub(1);
+        self.selection_index = self.selection_index.saturating_sub(1);
     }
 
     fn selected_mode(&self) -> Option<&ModeConfig> {
-        if self.mode_selected == 0 || self.mode_selected > self.modes.len() {
+        if self.selection_index == 0 || self.selection_index > self.modes.len() {
             None
         } else {
-            self.modes.get(self.mode_selected - 1)
+            self.modes.get(self.selection_index - 1)
         }
     }
 
     fn selected_orchestration(&self) -> Option<&OrchestrationConfig> {
         let orch_start = 1 + self.modes.len();
-        if self.mode_selected >= orch_start {
-            self.orchestrations.get(self.mode_selected - orch_start)
+        if self.selection_index >= orch_start {
+            self.orchestrations.get(self.selection_index - orch_start)
         } else {
             None
         }
     }
 
     fn mode_display_name(&self) -> String {
-        if self.mode_selected == 0 {
+        if self.selection_index == 0 {
             "No mode".to_string()
-        } else if self.mode_selected <= self.modes.len() {
-            self.modes[self.mode_selected - 1].name.clone()
+        } else if self.selection_index <= self.modes.len() {
+            self.modes[self.selection_index - 1].name.clone()
         } else {
-            let orch_idx = self.mode_selected - 1 - self.modes.len();
+            let orch_idx = self.selection_index - 1 - self.modes.len();
             let name = &self.orchestrations[orch_idx].name;
             if name.is_empty() {
                 "Orchestration".to_string()
@@ -3071,28 +3071,7 @@ fn render_frame(
             );
         }
 
-        if ui.mode == UiMode::Help {
-            render_help_overlay(frame, active_mode_name, palette);
-        }
-        if ui.mode == UiMode::DirPicker
-            && let Some(picker) = ui.dir_picker.as_mut()
-        {
-            render_dir_picker(frame, picker, palette);
-        }
-        if ui.mode == UiMode::NewPaneForm
-            && let Some(ref form) = ui.new_pane_form
-        {
-            render_new_pane_form(frame, form, palette);
-        }
-        if ui.mode == UiMode::StarPrompt {
-            render_star_prompt(frame, palette);
-        }
-        if ui.mode == UiMode::ConfigGenPrompt {
-            render_config_gen_prompt(frame, ui.config_gen_selected, palette);
-        }
-        if ui.mode == UiMode::QuitConfirm {
-            render_quit_confirm(frame, ui.quit_confirm_selected, palette);
-        }
+        render_overlays(frame, ui, active_mode_name, palette);
         return;
     }
 
@@ -3179,29 +3158,7 @@ fn render_frame(
                 None,
             );
         }
-        // Overlays (drawn last, on top)
-        if ui.mode == UiMode::Help {
-            render_help_overlay(frame, active_mode_name, palette);
-        }
-        if ui.mode == UiMode::DirPicker
-            && let Some(picker) = ui.dir_picker.as_mut()
-        {
-            render_dir_picker(frame, picker, palette);
-        }
-        if ui.mode == UiMode::NewPaneForm
-            && let Some(ref form) = ui.new_pane_form
-        {
-            render_new_pane_form(frame, form, palette);
-        }
-        if ui.mode == UiMode::StarPrompt {
-            render_star_prompt(frame, palette);
-        }
-        if ui.mode == UiMode::ConfigGenPrompt {
-            render_config_gen_prompt(frame, ui.config_gen_selected, palette);
-        }
-        if ui.mode == UiMode::QuitConfirm {
-            render_quit_confirm(frame, ui.quit_confirm_selected, palette);
-        }
+        render_overlays(frame, ui, active_mode_name, palette);
         return;
     }
 
@@ -3293,7 +3250,15 @@ fn render_frame(
         );
     }
 
-    // Overlays (drawn last, on top)
+    render_overlays(frame, ui, active_mode_name, palette);
+}
+
+fn render_overlays(
+    frame: &mut Frame,
+    ui: &mut UiState,
+    active_mode_name: Option<&str>,
+    palette: ColorPalette,
+) {
     if ui.mode == UiMode::Help {
         render_help_overlay(frame, active_mode_name, palette);
     }
@@ -3572,23 +3537,7 @@ fn render_mode_tab(
     // Full-width hints bar
     render_bottom_bar(frame, ui, hints_area, has_pane_control, show_tab_bar, true);
 
-    // Overlays (drawn last, on top)
-    if ui.mode == UiMode::Help {
-        render_help_overlay(frame, active_mode_name, palette);
-    }
-    if ui.mode == UiMode::DirPicker
-        && let Some(picker) = ui.dir_picker.as_mut()
-    {
-        render_dir_picker(frame, picker, palette);
-    }
-    if ui.mode == UiMode::NewPaneForm
-        && let Some(ref form) = ui.new_pane_form
-    {
-        render_new_pane_form(frame, form, palette);
-    }
-    if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame, ui.quit_confirm_selected, palette);
-    }
+    render_overlays(frame, ui, active_mode_name, palette);
 }
 
 fn render_stats_bar(
@@ -4771,6 +4720,7 @@ fn update_idle_art(
 mod tests {
     use super::*;
     use crate::event::{AgentEvent, AgentType, EventType};
+    use crate::project_config::OrchestrationRoleConfig;
     use chrono::{Duration, Utc};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -6077,6 +6027,28 @@ mod tests {
         }
     }
 
+    fn make_orchestration(name: &str) -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: name.to_string(),
+            max_rounds: 3,
+            auto: false,
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "coder".to_string(),
+                    command: "claude".to_string(),
+                    start: true,
+                    prompt_template: "Code.".to_string(),
+                },
+                OrchestrationRoleConfig {
+                    name: "reviewer".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    prompt_template: "Review.".to_string(),
+                },
+            ],
+        }
+    }
+
     #[test]
     fn test_update_idle_art_gated_on_config_disabled() {
         let mut cache = HashMap::new();
@@ -6144,20 +6116,20 @@ mod tests {
             vec![make_mode("alpha"), make_mode("beta")],
             vec![],
         );
-        assert_eq!(f.mode_selected, 0);
+        assert_eq!(f.selection_index, 0);
 
         // Can't go below 0
         f.select_previous_mode();
-        assert_eq!(f.mode_selected, 0);
+        assert_eq!(f.selection_index, 0);
 
         f.select_next_mode();
-        assert_eq!(f.mode_selected, 1);
+        assert_eq!(f.selection_index, 1);
         f.select_next_mode();
-        assert_eq!(f.mode_selected, 2);
+        assert_eq!(f.selection_index, 2);
 
         // Can't go past last
         f.select_next_mode();
-        assert_eq!(f.mode_selected, 2);
+        assert_eq!(f.selection_index, 2);
     }
 
     #[test]
@@ -6174,12 +6146,62 @@ mod tests {
         assert!(f.selected_mode().is_none());
         assert_eq!(f.mode_display_name(), "No mode");
 
-        f.mode_selected = 1;
+        f.selection_index = 1;
         assert_eq!(f.selected_mode().unwrap().name, "k8s");
         assert_eq!(f.mode_display_name(), "k8s");
 
-        f.mode_selected = 2;
+        f.selection_index = 2;
         assert_eq!(f.selected_mode().unwrap().name, "rust-tdd");
+    }
+
+    #[test]
+    fn unified_form_selected_orchestration() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("dev")],
+            vec![make_orchestration("tdd"), make_orchestration("review")],
+        );
+
+        // Index 0 = "No mode", 1 = mode "dev", 2+ = orchestrations
+        assert!(f.selected_orchestration().is_none());
+        assert!(f.selected_mode().is_none());
+
+        f.selection_index = 1;
+        assert!(f.selected_orchestration().is_none());
+        assert_eq!(f.selected_mode().unwrap().name, "dev");
+
+        f.selection_index = 2;
+        assert!(f.selected_mode().is_none());
+        assert_eq!(f.selected_orchestration().unwrap().name, "tdd");
+        assert_eq!(f.mode_display_name(), "Orch: tdd");
+
+        f.selection_index = 3;
+        assert_eq!(f.selected_orchestration().unwrap().name, "review");
+        assert_eq!(f.mode_display_name(), "Orch: review");
+    }
+
+    #[test]
+    fn unified_form_orchestration_cycling() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("dev")],
+            vec![make_orchestration("tdd")],
+        );
+        // 0=No mode, 1=dev, 2=tdd
+        assert_eq!(f.mode_option_count(), 3);
+
+        f.select_next_mode();
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 2);
+        assert_eq!(f.selected_orchestration().unwrap().name, "tdd");
+
+        // Can't go past last
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 2);
     }
 
     #[test]
@@ -6268,12 +6290,12 @@ mod tests {
         // Right arrow cycles forward
         let key = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         handle_new_pane_form_key(key, &mut ui);
-        assert_eq!(ui.new_pane_form.as_ref().unwrap().mode_selected, 1);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().selection_index, 1);
 
         // Left arrow cycles back
         let key = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
         handle_new_pane_form_key(key, &mut ui);
-        assert_eq!(ui.new_pane_form.as_ref().unwrap().mode_selected, 0);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().selection_index, 0);
     }
 
     #[test]

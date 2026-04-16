@@ -1,5 +1,6 @@
 /target
 tmp/
+.dot-agent-deck/
 
 # Documentation site
 site/node_modules/

@@ -23,10 +23,10 @@ auto = false
 name = "coder"
 command = "devbox run agent-new"
 start = true
-prompt_template = "Implement the requested changes."
+prompt_template = "Validate and implement all the requested changes you think are valid."
 
 [[orchestrations.roles]]
 name = "reviewer"
 command = "devbox run agent-new"
 start = false
-prompt_template = "Review the code changes for correctness, style, and potential issues."
+prompt_template = "Review the code changes for correctness, style, and potential issues. Report your findings but do not make any changes yourself."

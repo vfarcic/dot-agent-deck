@@ -39,10 +39,10 @@ prompt_template = "Make the tests pass."
 
 ### Work-Done Skill
 
-A single, generic `/work-done` skill is deployed as a project-scoped command file (e.g., `.claude/commands/work-done.md` for Claude Code, `.opencode/commands/work-done.md` for OpenCode). Both CLIs support custom slash commands via markdown files.
+A single, generic `/work-done` skill is deployed as a project-scoped skill (e.g., `.claude/skills/agent-deck-work-done/SKILL.md` for Claude Code, `.opencode/commands/work-done.md` for OpenCode). Both CLIs support custom slash commands via markdown files.
 
 The skill instructs the agent to:
-1. Write a summary file (e.g., `.ai/work-done.md`) describing what it accomplished
+1. Write a summary file (e.g., `.dot-agent-deck/work-done.md`) describing what it accomplished
 2. Run `dot-agent-deck work-done` to notify the orchestrator
 
 The orchestrator then:
@@ -163,11 +163,11 @@ Note: `handoff_dir`, `writes`, and `reads` fields have been removed. The orchest
 ### Work-Done Skill and CLI Subcommand
 
 **Skill files** (project-scoped, deployed when orchestration starts):
-- `.claude/commands/work-done.md` — for Claude Code agents
+- `.claude/skills/agent-deck-work-done/SKILL.md` — for Claude Code agents
 - `.opencode/commands/work-done.md` — for OpenCode agents
 
 Each skill instructs the agent to:
-1. Write a free-form summary to `.ai/work-done.md` describing what it accomplished
+1. Write a free-form summary to `.dot-agent-deck/work-done.md` describing what it accomplished
 2. Run `dot-agent-deck work-done` to notify the orchestrator
 
 **`dot-agent-deck work-done` CLI subcommand**:
@@ -234,18 +234,28 @@ Add orchestration guidance to the prompt template:
 
 Milestones are ordered to reach a usable two-agent workflow as fast as possible ("Phase 1: Dogfood"), so we can use the orchestration system on this very PRD while building the remaining features.
 
-### Phase 1: Dogfood — minimal working two-agent orchestration
+### Phase 1a: Manual validation — prove the workflow before automating
 
-Goal: two agents launch, first gets a prompt, user manually advances after each turn. Rough edges are fine — the point is to start using it.
+Goal: validate the full orchestration chain manually. User coordinates handoffs by invoking `/work-done`, generating context files via Claude, and pasting prompts. Zero automation needed.
 
 - [x] **M1: Config parsing** — `OrchestrationConfig` and `OrchestrationRoleConfig` structs with validation (exactly one `start = true`, unique role names) in `src/project_config.rs`
-- [ ] **M2: Orchestration state machine** — `OrchestrationState` with pane-to-role mapping, round tracking, current role index in new `src/orchestration.rs`
 - [x] **M3a: Basic orchestration tab (pane launch)** — new `Tab::Orchestration` variant that launches all role panes side by side (split view only, no role cards yet), no prompt injection — user types manually
-- [ ] **M3b: Prompt injection for start role** — inject `prompt_template` into the `start = true` role's pane on orchestration launch (depends on M2 for state tracking). Note: role commands are already launched and start role gets focus in M3a; this milestone adds prompt_template injection after state machine exists.
-- [ ] **M4: Work-done skill + CLI subcommand** — generic `/work-done` command files for Claude Code and OpenCode; `dot-agent-deck work-done` subcommand that notifies the orchestrator; orchestrator reads summary and updates state
+- [x] **M4a: Work-done skill file** — generic `/work-done` skill for Claude Code (`.claude/skills/agent-deck-work-done/SKILL.md`) that instructs the agent to write a summary to `.dot-agent-deck/work-done.md`
+- [x] **M4b: Handoff file format design** — handoff file format documented in Design Decisions section; `.dot-agent-deck/handoff-to-{role-name}.md` combines next role's `prompt_template` with previous role's summary
+
+**Manual test loop**: Launch orchestration tab → manually prompt coder → coder calls `/work-done` → user asks Claude to generate reviewer context file → user pastes reviewer prompt into reviewer pane. This validates the entire chain end-to-end.
+
+### Phase 1b: Automation — wire up the handoffs
+
+Goal: automate what was validated manually. Two agents launch, first gets a prompt, user presses `o` to advance after each turn.
+
+- [ ] **M1b: Orchestration routing design** — design how agents determine the next role: conditional branching (reviewer sends back to coder vs. advancing to next agent), agent-driven routing (agent declares next step in work-done summary), early termination (reviewer approves, no more rounds needed). This is a design task — document the routing model in Design Decisions before implementing in M2.
+- [ ] **M2: Orchestration state machine** — `OrchestrationState` with pane-to-role mapping, round tracking, routing logic in new `src/orchestration.rs`
+- [ ] **M3b: Prompt injection for start role** — inject `prompt_template` into the `start = true` role's pane on orchestration launch (depends on M2 for state tracking)
+- [ ] **M4c: Work-done CLI subcommand** — `dot-agent-deck work-done` subcommand that notifies the orchestrator via daemon; orchestrator reads summary and updates state
 - [ ] **M5: Manual advance (`o` key)** — on keypress, orchestrator reads previous role's summary, constructs next role's prompt (`prompt_template` + summary context), injects it via PTY stdin, shifts focus
 
-**At this point**: you can define a two-role orchestration in TOML, launch it, and manually cycle between agents. Good enough to dogfood on PRD #58 tasks.
+**At this point**: you can define a two-role orchestration in TOML, launch it, and manually cycle between agents with a single keypress. Good enough to dogfood on PRD #58 tasks.
 
 ### Phase 2: Polish — UI, automation, and integration
 
@@ -290,6 +300,29 @@ Goal: two agents launch, first gets a prompt, user manually advances after each 
 - **Rationale**: We can use the orchestration system on this very PRD while building the remaining features. Dogfooding surfaces design issues early and provides immediate value. The new dir dialog integration, role cards, auto mode, and config generation are nice-to-haves that don't block a working workflow.
 - **Impact**: Phase 1 (M1–M5) delivers a usable but rough two-agent cycle. Phase 2 (M6–M11) adds polish. Phase 3 (M12–M13) ensures quality.
 
+### 2026-04-17: Manual-first validation before automation
+- **Decision**: Instead of building the full state machine (M2) next, focus on creating the `/work-done` skill and designing the handoff file format. Validate the entire orchestration workflow manually before automating any step.
+- **Rationale**: The user can already launch orchestration tabs with multiple agents (M3a). By creating the `/work-done` skill and defining the handoff file logic, the full workflow can be tested manually: (1) give coder agent its task, (2) invoke `/work-done` in the agent's pane, (3) ask Claude to generate the reviewer's context file from the summary, (4) paste the reviewer's prompt into its pane. This validates the chain end-to-end with zero automation risk and surfaces design issues before committing to implementation.
+- **Impact**: M4 (work-done skill) is partially prioritized ahead of M2 (state machine). The skill file and summary file format are implemented first. The CLI subcommand (`dot-agent-deck work-done`) and daemon notification are deferred until automation is needed. M2, M3b, and M5 remain unchanged but are deferred until the manual workflow is validated. A new interim step exists: manually generating handoff context files based on the designed format/logic.
+- **Manual test loop**: Launch orchestration tab → manually prompt coder → `/work-done` in coder pane → manually generate reviewer context → paste reviewer prompt. Once validated, proceed to automate (M2 → M3b → M5).
+
+### 2026-04-17: Handoff prompt format for inter-agent context passing
+- **Decision**: When the orchestrator advances to the next role, it constructs a handoff file at `.dot-agent-deck/handoff-to-{role-name}.md` and injects a reference-based prompt into the next agent's pane. The orchestrator also auto-appends a `/work-done` instruction so agents know how to signal completion.
+- **Injected prompt format**:
+  ```
+  {next role's prompt_template from TOML}
+
+  The context from the previous role ({previous_role_name}) is in `.dot-agent-deck/handoff-to-{role-name}.md`. Read it first.
+
+  When you are finished, run /work-done to summarize your work.
+  ```
+- **Handoff file format** (`.dot-agent-deck/handoff-to-{role-name}.md`):
+  ```markdown
+  {verbatim contents of .dot-agent-deck/work-done.md}
+  ```
+- **Rationale**: Reference-based prompt avoids blowing up PTY stdin with large pastes — the agent reads the file at its own pace. The `/work-done` instruction is auto-appended by the orchestrator so users don't need to include it in every `prompt_template`. Agents may also discover `/work-done` from its skill description, but the explicit instruction guarantees it.
+- **Impact**: Defines the contract between M4a (work-done skill writes `.dot-agent-deck/work-done.md`) and M5 (manual advance constructs handoff and injects prompt). During manual validation, the user constructs this handoff themselves; M5 automates it.
+
 ## Risks
 
 - **PTY prompt injection timing**: If the agent is mid-output when a prompt is injected, text may interleave. Mitigation: wait for agent idle/waiting status before injecting.
@@ -297,4 +330,4 @@ Goal: two agents launch, first gets a prompt, user manually advances after each 
 - **Max rounds edge case**: If agents keep cycling without converging, the orchestration should terminate cleanly at max_rounds with a clear message rather than leaving agents in limbo.
 - **Embedded pane write**: The prompt injection mechanism depends on writing to pane stdin. Need to verify this works reliably for all supported agent CLIs (Claude Code, OpenCode, etc.).
 - **Config backward compatibility**: Adding optional `orchestrations` field to `ProjectConfig` must not break existing configs that only define modes. Using `#[serde(default)]` ensures this.
-- **Skill file deployment**: The orchestrator must deploy `/work-done` skill files to the correct CLI-specific directories when an orchestration starts. Different CLIs use different paths (`.claude/commands/` vs `.opencode/commands/`).
+- **Skill file deployment**: The orchestrator must deploy `/work-done` skill files to the correct CLI-specific directories when an orchestration starts. Different CLIs use different paths (`.claude/skills/` vs `.opencode/commands/`).
