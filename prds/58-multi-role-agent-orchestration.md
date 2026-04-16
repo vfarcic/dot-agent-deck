@@ -1,6 +1,6 @@
 # PRD #58: Multi-Role Agent Orchestration with Skill-Based Handoff
 
-**Status**: Draft
+**Status**: In Progress
 **Priority**: High
 **Created**: 2026-04-16
 **GitHub Issue**: [#58](https://github.com/vfarcic/dot-agent-deck/issues/58)
@@ -240,7 +240,8 @@ Goal: two agents launch, first gets a prompt, user manually advances after each 
 
 - [x] **M1: Config parsing** — `OrchestrationConfig` and `OrchestrationRoleConfig` structs with validation (exactly one `start = true`, unique role names) in `src/project_config.rs`
 - [ ] **M2: Orchestration state machine** — `OrchestrationState` with pane-to-role mapping, round tracking, current role index in new `src/orchestration.rs`
-- [ ] **M3: Basic orchestration tab** — new `Tab::Orchestration` variant that launches all role panes side by side (split view only, no role cards yet), injects `prompt_template` into the `start = true` role
+- [x] **M3a: Basic orchestration tab (pane launch)** — new `Tab::Orchestration` variant that launches all role panes side by side (split view only, no role cards yet), no prompt injection — user types manually
+- [ ] **M3b: Prompt injection for start role** — inject `prompt_template` into the `start = true` role's pane on orchestration launch (depends on M2 for state tracking). Note: role commands are already launched and start role gets focus in M3a; this milestone adds prompt_template injection after state machine exists.
 - [ ] **M4: Work-done skill + CLI subcommand** — generic `/work-done` command files for Claude Code and OpenCode; `dot-agent-deck work-done` subcommand that notifies the orchestrator; orchestrator reads summary and updates state
 - [ ] **M5: Manual advance (`o` key)** — on keypress, orchestrator reads previous role's summary, constructs next role's prompt (`prompt_template` + summary context), injects it via PTY stdin, shifts focus
 
@@ -278,6 +279,11 @@ Goal: two agents launch, first gets a prompt, user manually advances after each 
 - **Rationale**: Agents are trained to use tools/skills — it's more natural and reliable than "write a markdown file with STATUS on line 1". A single generic skill works across all agent CLIs (Claude Code, OpenCode) without per-role customization. The orchestrator owns the routing logic, so agents don't need to know about other roles or handoff formats.
 - **Impact**: Removed `writes`, `reads`, and `handoff_dir` from config. Removed `notify` crate dependency (no file watcher needed). `prompt_template` is now purely task-focused. Added new scope: `/work-done` skill files and `dot-agent-deck work-done` CLI subcommand.
 - **Eliminated risk**: "Handoff file format compliance" risk is gone — agents call a skill instead of writing a specific format.
+
+### 2026-04-16: Split M3 into M3a (pane launch) and M3b (prompt injection)
+- **Decision**: M3a launches panes from config with no prompt injection — user types manually into each role's pane. M3b (after M2) injects `prompt_template` into the start role's pane automatically.
+- **Rationale**: M3a validates M1 (config parsing) end-to-end and gives a usable two-agent setup immediately without needing the state machine. The user can manually coordinate agents, which is the `auto = false` workflow anyway. Prompt injection requires knowing which role to prompt and when — that's state machine territory (M2).
+- **Impact**: M3 split into M3a and M3b in Phase 1 milestones. M3a can be implemented immediately after M1. M3b depends on M2.
 
 ### 2026-04-16: Dogfood-first milestone ordering
 - **Decision**: Reorder milestones to reach a minimal working two-agent orchestration (Phase 1) in ~5 tasks, then polish UI/automation in Phase 2. Manual operations (launching via code, pressing `o` to advance) are acceptable in Phase 1.

@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::event::EventType;
 use crate::mode_manager::{ModeManager, ModeManagerError};
 use crate::pane::PaneController;
-use crate::project_config::ModeConfig;
+use crate::project_config::{ModeConfig, OrchestrationConfig};
 use crate::state::SessionState;
 
 // ---------------------------------------------------------------------------
@@ -46,6 +46,13 @@ pub enum Tab {
         /// Which side pane has visual focus in Normal mode. `None` = agent pane.
         focused_side_pane_index: Option<usize>,
     },
+    Orchestration {
+        id: TabId,
+        name: String,
+        /// Pane IDs for each role, in the same order as config roles.
+        role_pane_ids: Vec<String>,
+        cwd: String,
+    },
 }
 
 impl Tab {
@@ -53,6 +60,7 @@ impl Tab {
         match self {
             Tab::Dashboard => "Dashboard",
             Tab::Mode { name, .. } => name,
+            Tab::Orchestration { name, .. } => name,
         }
     }
 }
@@ -156,6 +164,49 @@ impl TabManager {
         Ok(())
     }
 
+    /// Open a new orchestration tab. Creates one pane per role.
+    /// Returns `(tab_index, role_pane_ids)`.
+    pub fn open_orchestration_tab(
+        &mut self,
+        config: &OrchestrationConfig,
+        cwd: &str,
+    ) -> Result<(usize, Vec<String>), TabError> {
+        let mut role_pane_ids = Vec::with_capacity(config.roles.len());
+
+        for role in &config.roles {
+            let pane_id = self
+                .pane_controller
+                .create_pane(None, Some(cwd))
+                .map_err(ModeManagerError::Pane)?;
+            let _ = self.pane_controller.rename_pane(&pane_id, &role.name);
+            role_pane_ids.push(pane_id);
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let name = if config.name.is_empty() {
+            std::path::Path::new(cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| cwd.to_string())
+        } else {
+            config.name.clone()
+        };
+
+        self.tabs.push(Tab::Orchestration {
+            id,
+            name,
+            role_pane_ids: role_pane_ids.clone(),
+            cwd: cwd.to_string(),
+        });
+
+        let index = self.tabs.len() - 1;
+        self.active_index = index;
+
+        Ok((index, role_pane_ids))
+    }
+
     /// Close a mode tab by index. Returns the pane IDs that were managed.
     pub fn close_tab(&mut self, index: usize) -> Result<Vec<String>, TabError> {
         if index == 0 {
@@ -173,6 +224,12 @@ impl TabManager {
                 let ids = mode_manager.managed_pane_ids();
                 let _ = mode_manager.deactivate_mode();
                 ids
+            }
+            Tab::Orchestration { role_pane_ids, .. } => {
+                for id in &role_pane_ids {
+                    let _ = self.pane_controller.close_pane(id);
+                }
+                role_pane_ids
             }
             Tab::Dashboard => Vec::new(),
         };
@@ -196,8 +253,14 @@ impl TabManager {
     pub fn all_managed_pane_ids(&self) -> Vec<String> {
         let mut ids = Vec::new();
         for tab in &self.tabs {
-            if let Tab::Mode { mode_manager, .. } = tab {
-                ids.extend(mode_manager.managed_pane_ids());
+            match tab {
+                Tab::Mode { mode_manager, .. } => {
+                    ids.extend(mode_manager.managed_pane_ids());
+                }
+                Tab::Orchestration { role_pane_ids, .. } => {
+                    ids.extend(role_pane_ids.iter().cloned());
+                }
+                Tab::Dashboard => {}
             }
         }
         ids
@@ -206,12 +269,20 @@ impl TabManager {
     /// Find which tab index owns a given pane ID.
     pub fn tab_index_for_pane(&self, pane_id: &str) -> Option<usize> {
         for (i, tab) in self.tabs.iter().enumerate() {
-            if let Tab::Mode { mode_manager, .. } = tab
-                && mode_manager
-                    .managed_pane_ids()
-                    .contains(&pane_id.to_string())
-            {
-                return Some(i);
+            match tab {
+                Tab::Mode { mode_manager, .. }
+                    if mode_manager
+                        .managed_pane_ids()
+                        .contains(&pane_id.to_string()) =>
+                {
+                    return Some(i);
+                }
+                Tab::Orchestration { role_pane_ids, .. }
+                    if role_pane_ids.contains(&pane_id.to_string()) =>
+                {
+                    return Some(i);
+                }
+                _ => {}
             }
         }
         None
@@ -234,6 +305,7 @@ impl TabManager {
         match &self.tabs[self.active_index] {
             Tab::Dashboard => None,
             Tab::Mode { name, .. } => Some(name),
+            Tab::Orchestration { .. } => None,
         }
     }
 
@@ -320,7 +392,9 @@ pub(crate) fn extract_new_bash_commands(
 mod tests {
     use super::*;
     use crate::pane::{PaneDirection, PaneError, PaneInfo};
-    use crate::project_config::{ModePersistentPane, ModeRule};
+    use crate::project_config::{
+        ModePersistentPane, ModeRule, OrchestrationConfig, OrchestrationRoleConfig,
+    };
     use std::any::Any;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -693,5 +767,98 @@ mod tests {
         sessions.clear();
         let _ = extract_new_bash_commands(&sessions, &mut last_routed);
         assert!(!last_routed.contains_key("s1"));
+    }
+
+    // -- Orchestration tab tests --
+
+    fn test_orchestration_config() -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: "tdd-cycle".to_string(),
+            max_rounds: 3,
+            auto: false,
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "tester".to_string(),
+                    command: "claude".to_string(),
+                    start: true,
+                    prompt_template: "Write failing tests.".to_string(),
+                },
+                OrchestrationRoleConfig {
+                    name: "coder".to_string(),
+                    command: "claude --model sonnet".to_string(),
+                    start: false,
+                    prompt_template: "Make the tests pass.".to_string(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn open_orchestration_tab_creates_tab() {
+        let mut tm = make_manager();
+        let (idx, ids) = tm
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp")
+            .unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(tm.tab_count(), 2);
+        assert_eq!(tm.active_index(), 1);
+        assert!(tm.show_tab_bar());
+        assert_eq!(tm.tab_labels(), vec!["Dashboard", "tdd-cycle"]);
+        // Orchestrations are not modes.
+        assert!(tm.active_mode_name().is_none());
+    }
+
+    #[test]
+    fn open_orchestration_tab_unnamed_uses_dir() {
+        let mut tm = make_manager();
+        let config = OrchestrationConfig {
+            name: String::new(),
+            ..test_orchestration_config()
+        };
+        tm.open_orchestration_tab(&config, "/home/user/my-project")
+            .unwrap();
+        assert_eq!(tm.tab_labels(), vec!["Dashboard", "my-project"]);
+    }
+
+    #[test]
+    fn close_orchestration_tab() {
+        let mock = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(mock.clone());
+        let (_, ids) = tm
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp")
+            .unwrap();
+        assert_eq!(tm.tab_count(), 2);
+
+        let closed_ids = tm.close_tab(1).unwrap();
+        assert_eq!(closed_ids, ids);
+        assert_eq!(tm.tab_count(), 1);
+        assert_eq!(tm.active_index(), 0);
+        let closed = mock.closed.lock().unwrap();
+        assert_eq!(closed.len(), 2);
+    }
+
+    #[test]
+    fn orchestration_pane_ids_in_all_managed() {
+        let mut tm = make_manager();
+        let (_, ids) = tm
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp")
+            .unwrap();
+        let all = tm.all_managed_pane_ids();
+        for id in &ids {
+            assert!(all.contains(id));
+        }
+    }
+
+    #[test]
+    fn tab_index_for_orchestration_pane() {
+        let mut tm = make_manager();
+        let (_, ids) = tm
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp")
+            .unwrap();
+        for id in &ids {
+            assert_eq!(tm.tab_index_for_pane(id), Some(1));
+        }
+        assert_eq!(tm.tab_index_for_pane("nonexistent"), None);
     }
 }

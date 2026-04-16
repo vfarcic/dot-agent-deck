@@ -14,3 +14,19 @@ watch = false
 [[modes.rules]]
 pattern = "git (log|status|show)"
 watch = false
+
+[[orchestrations]]
+max_rounds = 3
+auto = false
+
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-new"
+start = true
+prompt_template = "Implement the requested changes."
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run agent-new"
+start = false
+prompt_template = "Review the code changes for correctness, style, and potential issues."

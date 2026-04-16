@@ -19,7 +19,7 @@ use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::embedded_pane::EmbeddedPaneController;
 use crate::event::EventType;
 use crate::pane::{PaneController, PaneError};
-use crate::project_config::{ModeConfig, load_project_config};
+use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{Tab, TabManager};
 use crate::terminal_widget::TerminalWidget;
@@ -135,6 +135,8 @@ enum ActiveTabView {
         /// Which side pane has visual focus (`None` = agent pane).
         focused_side_pane_index: Option<usize>,
     },
+    /// Orchestration tab: same layout as dashboard, scoped to role panes only.
+    Orchestration { role_pane_ids: Vec<String> },
 }
 
 /// Lightweight snapshot of tab state for rendering, decoupled from TabManager.
@@ -310,9 +312,10 @@ struct NewPaneFormState {
     dir: PathBuf,
     name: String,
     command: String,
-    // Mode selection fields
+    // Mode/orchestration selection fields
     modes: Vec<ModeConfig>,
-    mode_selected: usize, // 0 = "No mode", 1..N = modes
+    orchestrations: Vec<OrchestrationConfig>,
+    mode_selected: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations
     has_mode_field: bool,
     focused: FormField,
 }
@@ -341,13 +344,20 @@ struct IdleArtEntry {
 }
 
 impl NewPaneFormState {
-    fn new(dir: PathBuf, name: String, command: String, modes: Vec<ModeConfig>) -> Self {
-        let has_mode_field = !modes.is_empty();
+    fn new(
+        dir: PathBuf,
+        name: String,
+        command: String,
+        modes: Vec<ModeConfig>,
+        orchestrations: Vec<OrchestrationConfig>,
+    ) -> Self {
+        let has_mode_field = !modes.is_empty() || !orchestrations.is_empty();
         Self {
             dir,
             name,
             command,
             modes,
+            orchestrations,
             mode_selected: 0,
             has_mode_field,
             focused: if has_mode_field {
@@ -359,7 +369,7 @@ impl NewPaneFormState {
     }
 
     fn mode_option_count(&self) -> usize {
-        1 + self.modes.len()
+        1 + self.modes.len() + self.orchestrations.len()
     }
 
     fn select_next_mode(&mut self) {
@@ -373,18 +383,35 @@ impl NewPaneFormState {
     }
 
     fn selected_mode(&self) -> Option<&ModeConfig> {
-        if self.mode_selected == 0 {
+        if self.mode_selected == 0 || self.mode_selected > self.modes.len() {
             None
         } else {
             self.modes.get(self.mode_selected - 1)
         }
     }
 
-    fn mode_display_name(&self) -> &str {
-        if self.mode_selected == 0 {
-            "No mode"
+    fn selected_orchestration(&self) -> Option<&OrchestrationConfig> {
+        let orch_start = 1 + self.modes.len();
+        if self.mode_selected >= orch_start {
+            self.orchestrations.get(self.mode_selected - orch_start)
         } else {
-            &self.modes[self.mode_selected - 1].name
+            None
+        }
+    }
+
+    fn mode_display_name(&self) -> String {
+        if self.mode_selected == 0 {
+            "No mode".to_string()
+        } else if self.mode_selected <= self.modes.len() {
+            self.modes[self.mode_selected - 1].name.clone()
+        } else {
+            let orch_idx = self.mode_selected - 1 - self.modes.len();
+            let name = &self.orchestrations[orch_idx].name;
+            if name.is_empty() {
+                "Orchestration".to_string()
+            } else {
+                format!("Orch: {name}")
+            }
         }
     }
 
@@ -566,16 +593,19 @@ fn resize_dashboard_panes(
     tab_manager: &TabManager,
     area: Rect,
 ) {
-    if !matches!(tab_manager.active_tab(), Tab::Dashboard) {
-        return;
-    }
+    let orch_pane_ids = match tab_manager.active_tab() {
+        Tab::Dashboard => None,
+        Tab::Orchestration { role_pane_ids, .. } => Some(role_pane_ids.clone()),
+        _ => return,
+    };
     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-        let exclude = tab_manager.all_managed_pane_ids();
-        let pane_ids: Vec<String> = embedded
-            .pane_ids()
-            .into_iter()
-            .filter(|id| !exclude.contains(id))
-            .collect();
+        let all = embedded.pane_ids();
+        let pane_ids: Vec<String> = if let Some(ref include) = orch_pane_ids {
+            all.into_iter().filter(|id| include.contains(id)).collect()
+        } else {
+            let exclude = tab_manager.all_managed_pane_ids();
+            all.into_iter().filter(|id| !exclude.contains(id)).collect()
+        };
         if pane_ids.is_empty() {
             return;
         }
@@ -680,6 +710,7 @@ struct NewPaneRequest {
     name: String,
     command: String,
     mode_config: Option<ModeConfig>,
+    orchestration_config: Option<OrchestrationConfig>,
 }
 
 #[derive(Debug)]
@@ -1313,13 +1344,19 @@ fn transition_after_dir_pick(ui: &mut UiState) {
         .unwrap_or_default();
     let command = ui.config.default_command.clone();
 
-    let modes = match load_project_config(&dir) {
-        Ok(Some(config)) if !config.modes.is_empty() => config.modes,
-        _ => vec![],
+    let (modes, orchestrations) = match load_project_config(&dir) {
+        Ok(Some(config)) => (config.modes, config.orchestrations),
+        _ => (vec![], vec![]),
     };
 
     ui.dir_picker = None;
-    ui.new_pane_form = Some(NewPaneFormState::new(dir, name, command, modes));
+    ui.new_pane_form = Some(NewPaneFormState::new(
+        dir,
+        name,
+        command,
+        modes,
+        orchestrations,
+    ));
     ui.mode = UiMode::NewPaneForm;
 }
 
@@ -1367,6 +1404,7 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
                     name: form.name.clone(),
                     command: form.command.clone(),
                     mode_config: form.selected_mode().cloned(),
+                    orchestration_config: form.selected_orchestration().cloned(),
                 };
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
@@ -1662,7 +1700,26 @@ pub fn run_tui(
             }
         }
 
-        let filtered = filter_sessions(&snapshot, &ui);
+        let all_filtered = filter_sessions(&snapshot, &ui);
+        // Scope sessions to only those visible in the active tab.
+        let filtered: Vec<(&String, &SessionState)> = match tab_manager.active_tab() {
+            Tab::Dashboard => {
+                let exclude = tab_manager.all_managed_pane_ids();
+                all_filtered
+                    .into_iter()
+                    .filter(|(_, s)| s.pane_id.as_ref().is_none_or(|pid| !exclude.contains(pid)))
+                    .collect()
+            }
+            Tab::Orchestration { role_pane_ids, .. } => all_filtered
+                .into_iter()
+                .filter(|(_, s)| {
+                    s.pane_id
+                        .as_ref()
+                        .is_some_and(|pid| role_pane_ids.contains(pid))
+                })
+                .collect(),
+            _ => all_filtered,
+        };
         let total = filtered.len();
 
         // Clamp selection
@@ -1715,6 +1772,9 @@ pub fn run_tui(
                 side_pane_ids: mode_manager.managed_pane_ids(),
                 focused_side_pane_index: *focused_side_pane_index,
             },
+            Tab::Orchestration { role_pane_ids, .. } => ActiveTabView::Orchestration {
+                role_pane_ids: role_pane_ids.clone(),
+            },
         };
         let tab_bar_labels: Vec<String> = tab_manager
             .tabs()
@@ -1730,6 +1790,7 @@ pub fn run_tui(
                     .get(agent_pane_id)
                     .map(|m| m.name.clone())
                     .unwrap_or_else(|| name.clone()),
+                Tab::Orchestration { name, .. } => name.clone(),
             })
             .collect();
         let tab_bar_info = TabBarInfo {
@@ -2232,10 +2293,12 @@ pub fn run_tui(
                             && let Some(ref pane_id) = session.pane_id
                         {
                             let closed_pane_id = pane_id.clone();
-                            // Check if this pane is the agent of a mode tab.
-                            let mode_tab_idx = tab_manager.tab_index_for_agent_pane(pane_id);
+                            // Check if this pane belongs to a mode or orchestration tab.
+                            let mode_tab_idx = tab_manager
+                                .tab_index_for_agent_pane(pane_id)
+                                .or_else(|| tab_manager.tab_index_for_pane(pane_id));
                             if let Some(tab_idx) = mode_tab_idx {
-                                // Close the entire mode tab (agent + side panes).
+                                // Close the entire tab (agent + side panes, or all role panes).
                                 if let Ok(side_ids) = tab_manager.close_tab(tab_idx) {
                                     let mut st = state.blocking_write();
                                     for id in &side_ids {
@@ -2530,152 +2593,208 @@ pub fn run_tui(
                 KeyResult::NewPane(req) => {
                     if pane.is_available() {
                         let dir_str = req.dir.display().to_string();
-                        // For mode tabs, create the agent pane as an empty
-                        // shell so the PTY can be resized to the correct
-                        // dimensions before the command starts.  This avoids
-                        // the process seeing the default 80×24 size.
-                        let is_mode = req.mode_config.is_some();
-                        let cmd = if req.command.is_empty() || is_mode {
-                            None
-                        } else {
-                            Some(req.command.as_str())
-                        };
-                        match pane.create_pane(cmd, Some(&dir_str)) {
-                            Ok(new_id) => {
-                                // Register so only events from our panes are accepted,
-                                // and create a placeholder session for an immediate dashboard card.
-                                {
-                                    let mut st = state.blocking_write();
-                                    st.register_pane(new_id.clone());
-                                    st.insert_placeholder_session(
-                                        new_id.clone(),
-                                        Some(dir_str.clone()),
-                                    );
-                                }
-                                if !req.name.is_empty() {
-                                    let _ = pane.rename_pane(&new_id, &req.name);
-                                    ui.pane_display_names
-                                        .insert(new_id.clone(), req.name.clone());
-                                    ui.pane_names.insert(new_id.clone(), req.name.clone());
-                                }
-                                let mode_name_for_save =
-                                    req.mode_config.as_ref().map(|m| m.name.clone());
-                                ui.pane_metadata.insert(
-                                    new_id.clone(),
-                                    config::SavedPane {
-                                        dir: dir_str.clone(),
-                                        name: req.name.clone(),
-                                        command: req.command,
-                                        mode: mode_name_for_save,
-                                    },
-                                );
 
-                                if let Some(mode_config) = req.mode_config {
-                                    // Mode selected — open a mode tab.
-                                    let mode_name = mode_config.name.clone();
-                                    match tab_manager.open_mode_tab(
-                                        &mode_config,
-                                        &dir_str,
-                                        new_id.clone(),
-                                    ) {
-                                        Ok((_tab_idx, side_ids)) => {
-                                            for id in &side_ids {
-                                                state.blocking_write().register_pane(id.clone());
-                                            }
-                                            let _ = pane.focus_pane(&new_id);
-                                            ui.mode = UiMode::PaneInput;
-                                            if let Some(embedded) =
-                                                pane.as_any()
-                                                    .downcast_ref::<EmbeddedPaneController>()
-                                            {
-                                                let frame_area = terminal.get_frame().area();
-                                                let half_width =
-                                                    (frame_area.width / 2).saturating_sub(2);
-                                                let agent_rows =
-                                                    frame_area.height.saturating_sub(3);
-                                                if agent_rows > 0 && half_width > 0 {
-                                                    let _ = embedded.resize_pane_pty(
-                                                        &new_id, agent_rows, half_width,
-                                                    );
-                                                }
-                                                let side_count = side_ids.len().max(1) as u16;
-                                                let side_rows = (frame_area.height / side_count)
-                                                    .saturating_sub(2);
-                                                if side_rows > 0 && half_width > 0 {
-                                                    for id in &side_ids {
-                                                        let _ = embedded.resize_pane_pty(
-                                                            id, side_rows, half_width,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            // Start commands now that panes are correctly sized
-                                            let _ = tab_manager.start_mode_commands();
-                                            // Send the agent pane command after resize
-                                            // so it starts at the correct PTY dimensions.
-                                            if let Some(ref init_cmd) = mode_config.init_command {
-                                                let _ = pane.write_to_pane(&new_id, init_cmd);
-                                            }
-                                            if let Some(saved) = ui.pane_metadata.get(&new_id) {
-                                                let agent_cmd = saved.command.clone();
-                                                if !agent_cmd.is_empty() {
-                                                    let _ = pane.write_to_pane(&new_id, &agent_cmd);
-                                                }
-                                            }
-                                            ui.status_message = Some((
-                                                format!("Activated mode: {mode_name}"),
-                                                std::time::Instant::now(),
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            let _ = pane.close_pane(&new_id);
-                                            ui.status_message = Some((
-                                                format!("Mode activation failed: {e}"),
-                                                std::time::Instant::now(),
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    // No mode — regular dashboard pane.
-                                    let _ = pane.focus_pane(&new_id);
-                                    ui.mode = UiMode::PaneInput;
-                                    ui.selected_index = filtered.len();
-                                    if let Some(embedded) =
-                                        pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                        // Orchestration path — manage own panes, no agent pane.
+                        if let Some(orch_config) = req.orchestration_config {
+                            match tab_manager.open_orchestration_tab(&orch_config, &dir_str) {
+                                Ok((_tab_idx, role_pane_ids)) => {
                                     {
-                                        let frame_area = terminal.get_frame().area();
-                                        let right_width =
-                                            (frame_area.width * 67 / 100).saturating_sub(2);
-                                        let pane_count = embedded.pane_ids().len() as u16;
-                                        let rows = match ui.pane_layout {
-                                            PaneLayout::Tiled => (frame_area.height
-                                                / pane_count.max(1))
-                                            .saturating_sub(2),
-                                            PaneLayout::Stacked => frame_area
-                                                .height
-                                                .saturating_sub(2 + pane_count.saturating_sub(1)),
-                                        };
-                                        if rows > 0 && right_width > 0 {
-                                            let _ = embedded.resize_pane_pty(
-                                                &new_id,
-                                                rows,
-                                                right_width,
-                                            );
+                                        let mut st = state.blocking_write();
+                                        for id in &role_pane_ids {
+                                            st.register_pane(id.clone());
                                         }
                                     }
+                                    // Register display names for role panes.
+                                    for (i, role) in orch_config.roles.iter().enumerate() {
+                                        ui.pane_display_names
+                                            .insert(role_pane_ids[i].clone(), role.name.clone());
+                                        ui.pane_names
+                                            .insert(role_pane_ids[i].clone(), role.name.clone());
+                                    }
+
+                                    // Focus the start role's pane.
+                                    let start_idx =
+                                        orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                                    let _ = pane.focus_pane(&role_pane_ids[start_idx]);
+                                    ui.mode = UiMode::PaneInput;
+
+                                    // Resize role panes to dashboard layout.
+                                    let area = terminal.get_frame().area();
+                                    resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+
+                                    // Start role commands after resize.
+                                    for (i, role) in orch_config.roles.iter().enumerate() {
+                                        let _ =
+                                            pane.write_to_pane(&role_pane_ids[i], &role.command);
+                                    }
+
                                     ui.status_message = Some((
-                                        format!("Created pane {new_id} in {dir_str}"),
+                                        format!("Activated orchestration: {}", orch_config.name),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    ui.status_message = Some((
+                                        format!("Orchestration failed: {e}"),
                                         std::time::Instant::now(),
                                     ));
                                 }
                             }
-                            Err(e) => {
-                                ui.status_message = Some((
-                                    format!("New pane failed: {e}"),
-                                    std::time::Instant::now(),
-                                ));
+                        } else {
+                            // For mode tabs, create the agent pane as an empty
+                            // shell so the PTY can be resized to the correct
+                            // dimensions before the command starts.  This avoids
+                            // the process seeing the default 80×24 size.
+                            let is_mode = req.mode_config.is_some();
+                            let cmd = if req.command.is_empty() || is_mode {
+                                None
+                            } else {
+                                Some(req.command.as_str())
+                            };
+                            match pane.create_pane(cmd, Some(&dir_str)) {
+                                Ok(new_id) => {
+                                    // Register so only events from our panes are accepted,
+                                    // and create a placeholder session for an immediate dashboard card.
+                                    {
+                                        let mut st = state.blocking_write();
+                                        st.register_pane(new_id.clone());
+                                        st.insert_placeholder_session(
+                                            new_id.clone(),
+                                            Some(dir_str.clone()),
+                                        );
+                                    }
+                                    if !req.name.is_empty() {
+                                        let _ = pane.rename_pane(&new_id, &req.name);
+                                        ui.pane_display_names
+                                            .insert(new_id.clone(), req.name.clone());
+                                        ui.pane_names.insert(new_id.clone(), req.name.clone());
+                                    }
+                                    let mode_name_for_save =
+                                        req.mode_config.as_ref().map(|m| m.name.clone());
+                                    ui.pane_metadata.insert(
+                                        new_id.clone(),
+                                        config::SavedPane {
+                                            dir: dir_str.clone(),
+                                            name: req.name.clone(),
+                                            command: req.command,
+                                            mode: mode_name_for_save,
+                                        },
+                                    );
+
+                                    if let Some(mode_config) = req.mode_config {
+                                        // Mode selected — open a mode tab.
+                                        let mode_name = mode_config.name.clone();
+                                        match tab_manager.open_mode_tab(
+                                            &mode_config,
+                                            &dir_str,
+                                            new_id.clone(),
+                                        ) {
+                                            Ok((_tab_idx, side_ids)) => {
+                                                for id in &side_ids {
+                                                    state
+                                                        .blocking_write()
+                                                        .register_pane(id.clone());
+                                                }
+                                                let _ = pane.focus_pane(&new_id);
+                                                ui.mode = UiMode::PaneInput;
+                                                if let Some(embedded) =
+                                                    pane.as_any()
+                                                        .downcast_ref::<EmbeddedPaneController>()
+                                                {
+                                                    let frame_area = terminal.get_frame().area();
+                                                    let half_width =
+                                                        (frame_area.width / 2).saturating_sub(2);
+                                                    let agent_rows =
+                                                        frame_area.height.saturating_sub(3);
+                                                    if agent_rows > 0 && half_width > 0 {
+                                                        let _ = embedded.resize_pane_pty(
+                                                            &new_id, agent_rows, half_width,
+                                                        );
+                                                    }
+                                                    let side_count = side_ids.len().max(1) as u16;
+                                                    let side_rows = (frame_area.height
+                                                        / side_count)
+                                                        .saturating_sub(2);
+                                                    if side_rows > 0 && half_width > 0 {
+                                                        for id in &side_ids {
+                                                            let _ = embedded.resize_pane_pty(
+                                                                id, side_rows, half_width,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                // Start commands now that panes are correctly sized
+                                                let _ = tab_manager.start_mode_commands();
+                                                // Send the agent pane command after resize
+                                                // so it starts at the correct PTY dimensions.
+                                                if let Some(ref init_cmd) = mode_config.init_command
+                                                {
+                                                    let _ = pane.write_to_pane(&new_id, init_cmd);
+                                                }
+                                                if let Some(saved) = ui.pane_metadata.get(&new_id) {
+                                                    let agent_cmd = saved.command.clone();
+                                                    if !agent_cmd.is_empty() {
+                                                        let _ =
+                                                            pane.write_to_pane(&new_id, &agent_cmd);
+                                                    }
+                                                }
+                                                ui.status_message = Some((
+                                                    format!("Activated mode: {mode_name}"),
+                                                    std::time::Instant::now(),
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                let _ = pane.close_pane(&new_id);
+                                                ui.status_message = Some((
+                                                    format!("Mode activation failed: {e}"),
+                                                    std::time::Instant::now(),
+                                                ));
+                                            }
+                                        }
+                                    } else {
+                                        // No mode — regular dashboard pane.
+                                        let _ = pane.focus_pane(&new_id);
+                                        ui.mode = UiMode::PaneInput;
+                                        ui.selected_index = filtered.len();
+                                        if let Some(embedded) =
+                                            pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                                        {
+                                            let frame_area = terminal.get_frame().area();
+                                            let right_width =
+                                                (frame_area.width * 67 / 100).saturating_sub(2);
+                                            let pane_count = embedded.pane_ids().len() as u16;
+                                            let rows = match ui.pane_layout {
+                                                PaneLayout::Tiled => (frame_area.height
+                                                    / pane_count.max(1))
+                                                .saturating_sub(2),
+                                                PaneLayout::Stacked => {
+                                                    frame_area.height.saturating_sub(
+                                                        2 + pane_count.saturating_sub(1),
+                                                    )
+                                                }
+                                            };
+                                            if rows > 0 && right_width > 0 {
+                                                let _ = embedded.resize_pane_pty(
+                                                    &new_id,
+                                                    rows,
+                                                    right_width,
+                                                );
+                                            }
+                                        }
+                                        ui.status_message = Some((
+                                            format!("Created pane {new_id} in {dir_str}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    ui.status_message = Some((
+                                        format!("New pane failed: {e}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
                             }
-                        }
+                        } // close else (non-orchestration path)
                     }
                 }
                 KeyResult::SendConfigGenPrompt { pane_id, cwd } => {
@@ -2821,7 +2940,7 @@ fn render_frame(
     ui.agent_pane_rect = None;
 
     let active_mode_name = match tab_view {
-        ActiveTabView::Dashboard { .. } => None,
+        ActiveTabView::Dashboard { .. } | ActiveTabView::Orchestration { .. } => None,
         ActiveTabView::Mode { mode_name, .. } => Some(mode_name.as_str()),
     };
 
@@ -2900,16 +3019,19 @@ fn render_frame(
         return;
     }
 
-    // ── Dashboard tab rendering ────────────────────────────────────────
+    // ── Dashboard / Orchestration tab rendering ──────────────────────
     let all_pane_ids = embedded.map(|e| e.pane_ids()).unwrap_or_default();
-    let exclude = match tab_view {
-        ActiveTabView::Dashboard { exclude_pane_ids } => exclude_pane_ids,
+    let pane_ids: Vec<String> = match tab_view {
+        ActiveTabView::Dashboard { exclude_pane_ids } => all_pane_ids
+            .into_iter()
+            .filter(|id| !exclude_pane_ids.contains(id))
+            .collect(),
+        ActiveTabView::Orchestration { role_pane_ids } => all_pane_ids
+            .into_iter()
+            .filter(|id| role_pane_ids.contains(id))
+            .collect(),
         _ => unreachable!(),
     };
-    let pane_ids: Vec<String> = all_pane_ids
-        .into_iter()
-        .filter(|id| !exclude.contains(id))
-        .collect();
     let has_terminal_panes = !pane_ids.is_empty();
 
     let (dashboard_area, panes_area) = if has_terminal_panes {
@@ -3056,6 +3178,29 @@ fn render_frame(
                 palette,
                 None,
             );
+        }
+        // Overlays (drawn last, on top)
+        if ui.mode == UiMode::Help {
+            render_help_overlay(frame, active_mode_name, palette);
+        }
+        if ui.mode == UiMode::DirPicker
+            && let Some(picker) = ui.dir_picker.as_mut()
+        {
+            render_dir_picker(frame, picker, palette);
+        }
+        if ui.mode == UiMode::NewPaneForm
+            && let Some(ref form) = ui.new_pane_form
+        {
+            render_new_pane_form(frame, form, palette);
+        }
+        if ui.mode == UiMode::StarPrompt {
+            render_star_prompt(frame, palette);
+        }
+        if ui.mode == UiMode::ConfigGenPrompt {
+            render_config_gen_prompt(frame, ui.config_gen_selected, palette);
+        }
+        if ui.mode == UiMode::QuitConfirm {
+            render_quit_confirm(frame, ui.quit_confirm_selected, palette);
         }
         return;
     }
@@ -5976,10 +6121,17 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
+            vec![],
         );
         assert_eq!(f.mode_option_count(), 2); // "No mode" + 1 mode
 
-        let f = NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![],
+        );
         assert_eq!(f.mode_option_count(), 1); // "No mode" only
     }
 
@@ -5990,6 +6142,7 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("alpha"), make_mode("beta")],
+            vec![],
         );
         assert_eq!(f.mode_selected, 0);
 
@@ -6014,6 +6167,7 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("k8s"), make_mode("rust-tdd")],
+            vec![],
         );
 
         // Index 0 = "No mode"
@@ -6035,6 +6189,7 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
+            vec![],
         );
         assert_eq!(f.focused, FormField::Mode);
 
@@ -6054,8 +6209,13 @@ mod tests {
 
     #[test]
     fn unified_form_tab_cycles_without_mode() {
-        let mut f =
-            NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![],
+        );
         assert!(!f.has_mode_field);
         assert_eq!(f.focused, FormField::Name);
 
@@ -6076,13 +6236,20 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
+            vec![],
         );
         assert_eq!(f.focused, FormField::Mode);
     }
 
     #[test]
     fn unified_form_initial_focus_without_modes() {
-        let f = NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![],
+        );
         assert_eq!(f.focused, FormField::Name);
     }
 
@@ -6095,6 +6262,7 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a"), make_mode("b")],
+            vec![],
         ));
 
         // Right arrow cycles forward
@@ -6117,6 +6285,7 @@ mod tests {
             "agent".to_string(),
             "claude".to_string(),
             vec![make_mode("a")],
+            vec![],
         ));
 
         // Enter on Mode → Name
@@ -6147,6 +6316,7 @@ mod tests {
             "agent".to_string(),
             "claude".to_string(),
             vec![make_mode("k8s-ops")],
+            vec![],
         ));
 
         // Select mode "k8s-ops" (index 1)
@@ -6181,6 +6351,7 @@ mod tests {
             "agent".to_string(),
             "claude".to_string(),
             vec![make_mode("a")],
+            vec![],
         ));
 
         // Stay on "No mode" (index 0), navigate through fields
@@ -6206,6 +6377,7 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
+            vec![],
         ));
 
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -6224,6 +6396,7 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
+            vec![],
         ));
 
         // Move to Name field
@@ -6250,6 +6423,7 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
+            vec![],
         ));
 
         // Move to Name field

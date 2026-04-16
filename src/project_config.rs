@@ -65,6 +65,7 @@ pub struct ModeRule {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrchestrationConfig {
+    #[serde(default)]
     pub name: String,
     #[serde(default = "default_max_rounds")]
     pub max_rounds: usize,
