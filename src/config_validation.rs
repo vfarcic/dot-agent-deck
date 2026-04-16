@@ -11,7 +11,7 @@ pub enum Severity {
 #[derive(Debug, Clone)]
 pub struct ValidationIssue {
     pub severity: Severity,
-    pub mode_name: String,
+    pub scope: String,
     pub message: String,
 }
 
@@ -21,7 +21,7 @@ impl std::fmt::Display for ValidationIssue {
             Severity::Error => "error",
             Severity::Warning => "warning",
         };
-        write!(f, "[{}] mode '{}': {}", level, self.mode_name, self.message)
+        write!(f, "[{}] '{}': {}", level, self.scope, self.message)
     }
 }
 
@@ -36,7 +36,7 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
         if !seen_names.insert(&mode.name) {
             issues.push(ValidationIssue {
                 severity: Severity::Warning,
-                mode_name: mode.name.clone(),
+                scope: mode.name.clone(),
                 message: "duplicate mode name".to_string(),
             });
         }
@@ -47,7 +47,7 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
         if !mode.rules.is_empty() && mode.reactive_panes == 0 {
             issues.push(ValidationIssue {
                 severity: Severity::Error,
-                mode_name: mode.name.clone(),
+                scope: mode.name.clone(),
                 message: "modes with reactive rules must configure at least one reactive pane"
                     .to_string(),
             });
@@ -58,7 +58,7 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
             if let Err(e) = Regex::new(&rule.pattern) {
                 issues.push(ValidationIssue {
                     severity: Severity::Error,
-                    mode_name: mode.name.clone(),
+                    scope: mode.name.clone(),
                     message: format!("invalid regex '{}': {}", rule.pattern, e),
                 });
             }
@@ -69,13 +69,67 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
             if rule.interval.is_some() && !rule.watch {
                 issues.push(ValidationIssue {
                     severity: Severity::Warning,
-                    mode_name: mode.name.clone(),
+                    scope: mode.name.clone(),
                     message: format!(
                         "rule '{}' has interval but watch is false — interval will be ignored",
                         rule.pattern
                     ),
                 });
             }
+        }
+    }
+
+    // Check for duplicate orchestration names.
+    let mut seen_orch_names = HashSet::new();
+    for orch in &config.orchestrations {
+        if !seen_orch_names.insert(&orch.name) {
+            issues.push(ValidationIssue {
+                severity: Severity::Warning,
+                scope: orch.name.clone(),
+                message: "duplicate orchestration name".to_string(),
+            });
+        }
+    }
+
+    for orch in &config.orchestrations {
+        // Must have at least 2 roles.
+        if orch.roles.len() < 2 {
+            issues.push(ValidationIssue {
+                severity: Severity::Error,
+                scope: orch.name.clone(),
+                message: "orchestration must have at least 2 roles".to_string(),
+            });
+        }
+
+        // Exactly one start role.
+        let start_count = orch.roles.iter().filter(|r| r.start).count();
+        if start_count != 1 {
+            issues.push(ValidationIssue {
+                severity: Severity::Error,
+                scope: orch.name.clone(),
+                message: "orchestration must have exactly one role with start = true".to_string(),
+            });
+        }
+
+        // Unique role names.
+        let mut seen_role_names = HashSet::new();
+        for role in &orch.roles {
+            if !seen_role_names.insert(&role.name) {
+                issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    scope: orch.name.clone(),
+                    message: format!("duplicate role name '{}'", role.name),
+                });
+            }
+        }
+
+        // max_rounds must be > 0.
+        if orch.max_rounds == 0 {
+            issues.push(ValidationIssue {
+                severity: Severity::Error,
+                scope: orch.name.clone(),
+                message: "max_rounds must be greater than 0".to_string(),
+            });
         }
     }
 
@@ -90,10 +144,40 @@ pub fn has_errors(issues: &[ValidationIssue]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project_config::{ModeConfig, ModeRule, ProjectConfig};
+    use crate::project_config::{
+        ModeConfig, ModeRule, OrchestrationConfig, OrchestrationRoleConfig, ProjectConfig,
+    };
 
     fn make_config(modes: Vec<ModeConfig>) -> ProjectConfig {
-        ProjectConfig { modes }
+        ProjectConfig {
+            modes,
+            orchestrations: vec![],
+        }
+    }
+
+    fn make_role(name: &str, start: bool) -> OrchestrationRoleConfig {
+        OrchestrationRoleConfig {
+            name: name.to_string(),
+            command: "claude".to_string(),
+            start,
+            prompt_template: format!("Do {name}."),
+        }
+    }
+
+    fn make_orchestration(name: &str, roles: Vec<OrchestrationRoleConfig>) -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: name.to_string(),
+            max_rounds: 3,
+            auto: false,
+            roles,
+        }
+    }
+
+    fn make_orch_config(orchestrations: Vec<OrchestrationConfig>) -> ProjectConfig {
+        ProjectConfig {
+            modes: vec![],
+            orchestrations,
+        }
     }
 
     fn make_mode(name: &str, rules: Vec<ModeRule>) -> ModeConfig {
@@ -185,11 +269,11 @@ mod tests {
     fn display_format() {
         let issue = ValidationIssue {
             severity: Severity::Error,
-            mode_name: "dev".to_string(),
+            scope: "dev".to_string(),
             message: "bad regex".to_string(),
         };
         let s = format!("{issue}");
-        assert_eq!(s, "[error] mode 'dev': bad regex");
+        assert_eq!(s, "[error] 'dev': bad regex");
     }
 
     #[test]
@@ -226,5 +310,95 @@ mod tests {
         }]);
         let issues = validate_config(&config);
         assert!(issues.is_empty());
+    }
+
+    // --- Orchestration validation tests ---
+
+    #[test]
+    fn valid_orchestration_has_no_issues() {
+        let config = make_orch_config(vec![make_orchestration(
+            "tdd",
+            vec![make_role("tester", true), make_role("coder", false)],
+        )]);
+        let issues = validate_config(&config);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn orchestration_fewer_than_two_roles_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "solo",
+            vec![make_role("only", true)],
+        )]);
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("at least 2 roles"))
+        );
+    }
+
+    #[test]
+    fn orchestration_no_start_role_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "nostart",
+            vec![make_role("a", false), make_role("b", false)],
+        )]);
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("start = true"))
+        );
+    }
+
+    #[test]
+    fn orchestration_multiple_start_roles_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "multistart",
+            vec![make_role("a", true), make_role("b", true)],
+        )]);
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("start = true"))
+        );
+    }
+
+    #[test]
+    fn orchestration_duplicate_role_names_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "duproles",
+            vec![make_role("worker", true), make_role("worker", false)],
+        )]);
+        let issues = validate_config(&config);
+        assert!(issues
+            .iter()
+            .any(|i| i.severity == Severity::Error && i.message.contains("duplicate role name")));
+    }
+
+    #[test]
+    fn orchestration_duplicate_names_produce_warning() {
+        let config = make_orch_config(vec![
+            make_orchestration("dup", vec![make_role("a", true), make_role("b", false)]),
+            make_orchestration("dup", vec![make_role("c", true), make_role("d", false)]),
+        ]);
+        let issues = validate_config(&config);
+        assert!(issues.iter().any(|i| i.severity == Severity::Warning
+            && i.message.contains("duplicate orchestration name")));
+    }
+
+    #[test]
+    fn orchestration_max_rounds_zero_is_error() {
+        let config = make_orch_config(vec![OrchestrationConfig {
+            name: "zero".to_string(),
+            max_rounds: 0,
+            auto: false,
+            roles: vec![make_role("a", true), make_role("b", false)],
+        }]);
+        let issues = validate_config(&config);
+        assert!(issues.iter().any(|i| i.severity == Severity::Error
+            && i.message.contains("max_rounds must be greater than 0")));
     }
 }
