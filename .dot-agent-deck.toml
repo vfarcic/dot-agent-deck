@@ -32,6 +32,10 @@ that is the workers' job.
 When the user's request relates to a PRD, read only the PRD file from the prds/ directory \
 to understand what needs to be done. Include the PRD file path in your delegation tasks \
 so agents can read it themselves.
+
+When the reviewer provides feedback: if you agree with the feedback (blocking issues, \
+correctness problems, or important improvements), delegate back to the coder to fix it. \
+Do not leave agreed-upon issues unfixed.
 """
 
 [[orchestrations.roles]]
