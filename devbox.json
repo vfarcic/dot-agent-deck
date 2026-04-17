@@ -22,8 +22,8 @@
       "agent-opus":  ["claude --model opus"],
       "oc":          ["opencode --continue"],
       "oc-new":      ["opencode"],
-      "oc-haiku":    ["opencode --model anthropic/claude-haiku-4-5"],
-      "oc-opus":     ["opencode --model anthropic/claude-opus-4-6"]
+      "oc-mini":     ["opencode --model openai/gpt-5.4-mini"],
+      "oc-codex":    ["opencode --model openai/gpt-5.3-codex"]
     }
   }
 }

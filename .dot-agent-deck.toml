@@ -20,7 +20,7 @@ name = "code-review"
 
 [[orchestrations.roles]]
 name = "orchestrator"
-command = "devbox run oc-haiku"
+command = "devbox run oc-mini"
 start = true
 prompt_template = """
 You coordinate the team. You NEVER do work yourself — only delegate to available agents.
@@ -38,18 +38,18 @@ After the coder finishes, delegate to both the reviewer and auditor in parallel.
 
 [[orchestrations.roles]]
 name = "coder"
-command = "devbox run oc-opus"
+command = "devbox run oc-codex"
 description = "Implements code changes, fixes bugs, writes features"
 prompt_template = "You are a coding agent. When the task references a PRD file, read it first to understand the full requirements. Implement with clean, minimal code. Run tests before finishing. If the task is related to a PRD, run /prd-update-progress before signaling work-done."
 
 [[orchestrations.roles]]
 name = "reviewer"
-command = "devbox run oc-opus"
+command = "devbox run oc-codex"
 description = "Reviews code for correctness, style, and potential issues"
 prompt_template = "Report findings but do not make changes yourself. When the task references a PRD file, read it to verify the implementation matches the documented requirements and acceptance criteria."
 
 [[orchestrations.roles]]
 name = "auditor"
-command = "devbox run oc-opus"
+command = "devbox run oc-codex"
 description = "Audits for security vulnerabilities, unsafe code, and OWASP top 10 issues"
 prompt_template = "Audit for security vulnerabilities, unsafe code, and OWASP top 10 issues. When the task references a PRD file, read it to understand the security context and any security-related requirements."
