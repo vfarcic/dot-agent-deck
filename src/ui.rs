@@ -752,9 +752,15 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     content
 }
 
-/// Build the orchestrator prompt to inject directly into the start role's pane.
-fn prepare_orchestrator_prompt(config: &OrchestrationConfig) -> String {
-    build_orchestrator_context(config)
+/// Write the orchestrator context to a file and return a one-liner to inject.
+/// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
+fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
+    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
+    std::fs::create_dir_all(&dir).ok()?;
+    let file_path = dir.join("orchestrator-context.md");
+    let content = build_orchestrator_context(config);
+    std::fs::write(&file_path, &content).ok()?;
+    Some("Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and delegation protocol. Acknowledge your role and wait for instructions.".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -767,6 +773,24 @@ fn build_worker_prompt(prompt_template: Option<&str>, task: &str) -> String {
         Some(tpl) => format!("{tpl}\n\n## Task\n\n{task}"),
         None => task.to_string(),
     }
+}
+
+/// Write the worker task to a file and return a one-liner to inject.
+/// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
+fn prepare_worker_prompt(
+    role_name: &str,
+    prompt_template: Option<&str>,
+    task: &str,
+    cwd: &str,
+) -> Option<String> {
+    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
+    std::fs::create_dir_all(&dir).ok()?;
+    let file_path = dir.join(format!("worker-task-{role_name}.md"));
+    let content = build_worker_prompt(prompt_template, task);
+    std::fs::write(&file_path, &content).ok()?;
+    Some(format!(
+        "Read .dot-agent-deck/worker-task-{role_name}.md for your task and execute it immediately."
+    ))
 }
 
 /// Drain delegate signals and dispatch work to worker panes.
@@ -817,7 +841,13 @@ fn dispatch_delegate_events(
             };
 
             let role = &config.roles[role_idx];
-            let prompt = build_worker_prompt(role.prompt_template.as_deref(), &signal.task);
+            let prompt = prepare_worker_prompt(
+                &role.name,
+                role.prompt_template.as_deref(),
+                &signal.task,
+                &cwd,
+            )
+            .unwrap_or_else(|| build_worker_prompt(role.prompt_template.as_deref(), &signal.task));
 
             if role.clear {
                 // Restart pane: close old, create new, update all mappings.
@@ -2974,12 +3004,9 @@ pub fn run_tui(
 
                         // Orchestration path — manage own panes, no agent pane.
                         if let Some(orch_config) = req.orchestration_config {
-                            let prompt = prepare_orchestrator_prompt(&orch_config);
-                            match tab_manager.open_orchestration_tab(
-                                &orch_config,
-                                &dir_str,
-                                Some(prompt),
-                            ) {
+                            let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
+                            match tab_manager.open_orchestration_tab(&orch_config, &dir_str, prompt)
+                            {
                                 Ok((_tab_idx, role_pane_ids)) => {
                                     {
                                         let mut st = state.blocking_write();
@@ -5481,10 +5508,20 @@ mod tests {
             ],
         };
 
-        let prompt = prepare_orchestrator_prompt(&config);
-        assert!(prompt.contains("Available agents"));
-        assert!(prompt.contains("**worker**: Does work"));
-        assert!(prompt.contains("Delegation protocol"));
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let prompt = prepare_orchestrator_prompt(&config, cwd);
+        assert!(prompt.is_some());
+        let prompt = prompt.unwrap();
+        // One-liner referencing the file.
+        assert!(prompt.contains("orchestrator-context.md"));
+        assert!(!prompt.contains('\n'));
+        // File was written with full content.
+        let file_path = dir.path().join(".dot-agent-deck/orchestrator-context.md");
+        assert!(file_path.exists());
+        let content = std::fs::read_to_string(file_path).unwrap();
+        assert!(content.contains("Available agents"));
+        assert!(content.contains("**worker**: Does work"));
     }
 
     #[test]
