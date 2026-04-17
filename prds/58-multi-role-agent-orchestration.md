@@ -289,16 +289,16 @@ Goal: update config structs to match the orchestrator pattern, build the orchest
 
 Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orchestrator delegates, workers execute, results flow back.
 
-- [ ] **M4c: Work-done CLI subcommand** — `dot-agent-deck work-done` subcommand that notifies the running daemon; daemon maps pane ID → role name; writes summary to `work-done-{role-name}.md` (per-role files to support parallel agents)
-- [ ] **M4d: Work-done skill update** — update `/work-done` skill to write per-role files (`work-done-{role-name}.md`) instead of single `work-done.md`; role name injected by dot-agent-deck as environment variable or similar mechanism
+- [x] **M4c: Work-done CLI subcommand** — `dot-agent-deck work-done` subcommand with `--task`, `--delegate` (repeatable), and `--done` flags; sends `DaemonMessage::WorkDone` via Unix socket; daemon maps pane ID → role name via `pane_role_map`; writes summary to `work-done-{role-name}.md`; stores signals in `orchestration_events` for M5 dispatch
+- [x] **M4d: Work-done skill update** — `/work-done` skill rewritten to use CLI flags (`dot-agent-deck work-done --task "..."`, `--delegate <role>`, `--done`); per-role files written by daemon via `handle_work_done()`; role name resolved daemon-side from pane-to-role mapping (no env var needed)
 - [ ] **M5: Delegation dispatch** — when orchestrator calls `/work-done` with a delegation payload (target agents + prompt), dot-agent-deck parses it, optionally restarts worker sessions (`clear = true`), prepends worker's `prompt_template` if present, and injects the combined prompt into target pane(s) via PTY stdin
 - [ ] **M5b: Orchestrator feedback loop** — when a worker calls `/work-done`, dot-agent-deck reads its summary file; if parallel delegation is active, waits for all pending workers; then injects combined summaries into the orchestrator pane
 - [ ] **M5c: Orchestration completion** — when orchestrator signals `DONE` in its `/work-done` output, dot-agent-deck marks the orchestration as complete and shows a completion notification
 
-**Open design questions for Phase 1c:**
-- Exact format of the delegation payload in `/work-done` (structured fields? free-form with markers?)
-- How the orchestrator distinguishes "delegate to agents" from "orchestration complete" in its `/work-done` output
-- How dot-agent-deck passes the role name to the agent (env var? skill parameter? file naming convention?)
+**Design questions resolved (M4c/M4d):**
+- **Delegation payload**: CLI flags — `--delegate <role>` (repeatable for fan-out), `--task <description>`
+- **Completion signal**: `--done` flag on the CLI command
+- **Role name resolution**: Daemon resolves pane ID → role name via `pane_role_map` in `AppState` (populated when orchestration tab opens). No env var or skill parameter needed.
 
 **At this point**: orchestrator-driven workflow is functional. User talks to orchestrator, orchestrator delegates to workers (including parallel), results flow back, orchestrator decides next steps or completes.
 

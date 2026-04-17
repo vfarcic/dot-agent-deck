@@ -47,6 +47,31 @@ pub struct AgentEvent {
     pub pane_id: Option<String>,
 }
 
+/// Envelope for messages sent to the daemon over the Unix socket.
+///
+/// Existing hook senders transmit raw `AgentEvent` JSON (no `message_type` field).
+/// New message types (e.g. `WorkDone`) include `"message_type": "work_done"` so the
+/// daemon can distinguish them.  The daemon tries `DaemonMessage` first, then falls
+/// back to `AgentEvent`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "message_type")]
+pub enum DaemonMessage {
+    #[serde(rename = "work_done")]
+    WorkDone(WorkDoneSignal),
+}
+
+/// Signal sent by an agent via `dot-agent-deck work-done`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkDoneSignal {
+    pub pane_id: String,
+    pub task: String,
+    #[serde(default)]
+    pub delegate: Vec<String>,
+    #[serde(default)]
+    pub done: bool,
+    pub timestamp: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +157,57 @@ mod tests {
         let event: AgentEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.agent_type, AgentType::OpenCode);
         assert_eq!(event.event_type, EventType::SessionStart);
+    }
+
+    #[test]
+    fn serialize_deserialize_work_done_signal() {
+        let signal = WorkDoneSignal {
+            pane_id: "pane-1".into(),
+            task: "Implemented login".into(),
+            delegate: vec!["reviewer".into()],
+            done: false,
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let msg = DaemonMessage::WorkDone(signal);
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: DaemonMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonMessage::WorkDone(s) => {
+                assert_eq!(s.pane_id, "pane-1");
+                assert_eq!(s.task, "Implemented login");
+                assert_eq!(s.delegate, vec!["reviewer"]);
+                assert!(!s.done);
+            }
+        }
+    }
+
+    #[test]
+    fn work_done_signal_defaults() {
+        let json = r#"{
+            "message_type": "work_done",
+            "pane_id": "pane-2",
+            "task": "Done",
+            "timestamp": "2026-04-17T10:00:00Z"
+        }"#;
+        let msg: DaemonMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            DaemonMessage::WorkDone(s) => {
+                assert!(s.delegate.is_empty());
+                assert!(!s.done);
+            }
+        }
+    }
+
+    #[test]
+    fn agent_event_not_parseable_as_daemon_message() {
+        let json = r#"{
+            "session_id": "abc-123",
+            "agent_type": "claude_code",
+            "event_type": "idle",
+            "timestamp": "2026-03-22T10:00:00Z"
+        }"#;
+        assert!(serde_json::from_str::<DaemonMessage>(json).is_err());
     }
 }

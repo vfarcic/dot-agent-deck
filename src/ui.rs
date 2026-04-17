@@ -708,13 +708,18 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     // 3. Delegation protocol.
     content.push_str("\n## Delegation protocol\n\n");
     content.push_str(
-        "When you are ready to delegate work to one or more agents, run the `/work-done` \
-         command. In your summary, specify:\n\
-         - **Target role(s)**: which agent(s) should pick up the work\n\
-         - **Task description**: what each agent should do\n\
-         - **Context**: any relevant file paths, decisions, or constraints\n\n\
-         When all delegated work is complete and you are satisfied with the results, \
-         run `/work-done` with `DONE` in your summary to signal orchestration completion.\n",
+        "To delegate work to an agent, run:\n\
+         ```bash\n\
+         dot-agent-deck work-done --delegate <role-name> --task \"Task description with context, file paths, and constraints.\"\n\
+         ```\n\n\
+         To delegate to multiple agents in parallel:\n\
+         ```bash\n\
+         dot-agent-deck work-done --delegate <role1> --delegate <role2> --task \"Task description.\"\n\
+         ```\n\n\
+         When all work is complete and you are satisfied with the results:\n\
+         ```bash\n\
+         dot-agent-deck work-done --done --task \"Final summary of what was accomplished.\"\n\
+         ```\n",
     );
 
     // 4. Wait for user instructions.
@@ -2396,9 +2401,13 @@ pub fn run_tui(
                                     let mut st = state.blocking_write();
                                     for id in &side_ids {
                                         st.unregister_pane(id);
+                                        st.pane_role_map.remove(id);
+                                        st.pane_cwd_map.remove(id);
                                     }
                                     st.sessions.remove(&sid);
                                     st.unregister_pane(&closed_pane_id);
+                                    st.pane_role_map.remove(&closed_pane_id);
+                                    st.pane_cwd_map.remove(&closed_pane_id);
                                     drop(st);
                                 }
                                 let _ = pane.close_pane(&closed_pane_id);
@@ -2697,6 +2706,15 @@ pub fn run_tui(
                                         let mut st = state.blocking_write();
                                         for id in &role_pane_ids {
                                             st.register_pane(id.clone());
+                                        }
+                                        // Register pane-to-role and pane-to-cwd mappings for work-done resolution.
+                                        for (i, role) in orch_config.roles.iter().enumerate() {
+                                            st.pane_role_map.insert(
+                                                role_pane_ids[i].clone(),
+                                                role.name.clone(),
+                                            );
+                                            st.pane_cwd_map
+                                                .insert(role_pane_ids[i].clone(), dir_str.clone());
                                         }
                                     }
                                     // Register display names for role panes.
@@ -5117,7 +5135,7 @@ mod tests {
         assert!(!content.contains("**orchestrator**"));
         // Contains delegation protocol.
         assert!(content.contains("Delegation protocol"));
-        assert!(content.contains("/work-done"));
+        assert!(content.contains("dot-agent-deck work-done"));
         // Instructs orchestrator to wait.
         assert!(content.contains("wait for the user to provide instructions"));
     }

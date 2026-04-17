@@ -1,22 +1,44 @@
 ---
 name: work-done
-description: "Signal that you have completed your current task. Writes a structured summary of your work to .dot-agent-deck/work-done.md for the next agent or person picking up this work."
+description: "Signal that you have completed your current task. Notifies the orchestration daemon with a structured summary of your work."
 user-invocable: true
 ---
 
 # Work Done
 
-You have completed your current task. Write a summary of what you accomplished so the next person or agent picking up this work has full context.
+You have completed your current task. Summarize your work and signal completion via the CLI.
 
 ## Instructions
 
-Delete `.dot-agent-deck/work-done.md` if it exists, then create it fresh (relative to the project root).
+Compose a concise summary of what you accomplished, then run the appropriate command below.
 
-Write down everything relevant about what you did, your findings, and anything the next agent or person should know. Structure the content however makes sense for the work you performed. Be specific about outcomes, not just activities.
+### Worker agent (completed your assigned task)
 
-Include references (file paths, URLs, issue numbers, etc.) for everything you mention. The next agent needs to be able to find and read the actual sources, not just take your word for it.
+```bash
+dot-agent-deck work-done --task "Your summary here. Include file paths, outcomes, and anything the next agent needs to know."
+```
+
+### Orchestrator (delegating work to one agent)
+
+```bash
+dot-agent-deck work-done --delegate <role-name> --task "Task description with relevant context, file paths, and constraints."
+```
+
+### Orchestrator (delegating to multiple agents in parallel)
+
+```bash
+dot-agent-deck work-done --delegate <role1> --delegate <role2> --task "Task description for all delegated agents."
+```
+
+### Orchestrator (all work is complete)
+
+```bash
+dot-agent-deck work-done --done --task "Final summary of what was accomplished across all agents."
+```
 
 ## Rules
 
-- Do NOT include the full content of files in the summary. The next agent can read them directly — just provide the paths.
-- Write in plain markdown with no YAML frontmatter or special formatting.
+- Always include specific file paths, issue numbers, and other references in your `--task` summary.
+- Do NOT include full file contents in the summary. The next agent can read files directly.
+- The `--task` value should be a single string. Use quotes to wrap multi-sentence summaries.
+- The `--delegate` flag accepts role names that match the orchestration config (e.g., `coder`, `reviewer`, `auditor`).

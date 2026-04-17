@@ -239,7 +239,7 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     })
 }
 
-fn send_to_socket(json: &str) -> Option<()> {
+pub fn send_to_socket(json: &str) -> Option<()> {
     let path = socket_path();
     let mut stream = UnixStream::connect(path).ok()?;
     let msg = format!("{json}\n");

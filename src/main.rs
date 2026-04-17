@@ -87,6 +87,18 @@ enum Commands {
         /// Command to execute
         command: String,
     },
+    /// Signal task completion, delegate work, or end orchestration
+    WorkDone {
+        /// Task summary or description for delegation
+        #[arg(long)]
+        task: String,
+        /// Role(s) to delegate work to (repeatable)
+        #[arg(long)]
+        delegate: Vec<String>,
+        /// Signal orchestration complete
+        #[arg(long)]
+        done: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -221,6 +233,38 @@ fn main() -> ExitCode {
         Some(Commands::Init { path }) => dot_agent_deck::init::run_init(&path),
         Some(Commands::Watch { interval, command }) => {
             dot_agent_deck::watch::run_watch(interval, &command)
+        }
+        Some(Commands::WorkDone {
+            task,
+            delegate,
+            done,
+        }) => {
+            let pane_id = match std::env::var("DOT_AGENT_DECK_PANE_ID") {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!(
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            let signal = dot_agent_deck::event::WorkDoneSignal {
+                pane_id,
+                task,
+                delegate,
+                done,
+                timestamp: chrono::Utc::now(),
+            };
+            let msg = dot_agent_deck::event::DaemonMessage::WorkDone(signal);
+            let json = match serde_json::to_string(&msg) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Failed to serialize work-done signal: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let _ = dot_agent_deck::hook::send_to_socket(&json);
+            ExitCode::SUCCESS
         }
         Some(Commands::Validate { path }) => {
             use dot_agent_deck::config_validation::{has_errors, validate_config};
