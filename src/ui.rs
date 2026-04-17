@@ -1986,13 +1986,15 @@ pub fn run_tui(
         // Always start on the dashboard so the user gets an overview first.
         tab_manager.switch_to(0);
 
-        // Resize all restored panes to match the terminal layout and focus the first.
+        // Resize all restored panes to match the terminal layout, focus the first,
+        // and enter PaneInput mode so the user can type immediately.
         if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
             let frame_area = terminal.get_frame().area();
             resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
             let ids = embedded.pane_ids();
             if let Some(first_id) = ids.first() {
                 let _ = pane.focus_pane(first_id);
+                ui.mode = UiMode::PaneInput;
             }
         }
         ui.selected_index = 0;
