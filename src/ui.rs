@@ -614,15 +614,19 @@ fn resize_dashboard_panes(
         }
         let right_width = (area.width * 67 / 100).saturating_sub(2);
         let pane_count = pane_ids.len() as u16;
+        // Account for UI chrome: tab bar (1 row when shown), info bar (1 row),
+        // and hints bar (1 row) so panes don't push the status line off screen.
+        let chrome_rows: u16 = if tab_manager.show_tab_bar() { 3 } else { 2 };
+        let usable_height = area.height.saturating_sub(chrome_rows);
         for pane_id in &pane_ids {
             let is_focused = embedded.focused_pane_id().as_deref() == Some(pane_id.as_str());
             let rows = match ui.pane_layout {
-                PaneLayout::Tiled => (area.height / pane_count).saturating_sub(2),
+                PaneLayout::Tiled => (usable_height / pane_count).saturating_sub(2),
                 PaneLayout::Stacked => {
                     if is_focused
                         || (embedded.focused_pane_id().is_none() && pane_id == &pane_ids[0])
                     {
-                        area.height.saturating_sub(2 + pane_count.saturating_sub(1))
+                        usable_height.saturating_sub(2 + pane_count.saturating_sub(1))
                     } else {
                         0
                     }
@@ -1141,15 +1145,18 @@ fn focus_deck(
                     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
                         let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
                         let right_width = (term_w * 67 / 100).saturating_sub(2);
+                        // Account for UI chrome (tab bar + info bar + hints bar).
+                        // Use 3 as safe default; tab bar is shown whenever tabs exist.
+                        let usable_h = term_h.saturating_sub(3);
                         let pane_ids = embedded.pane_ids();
                         let pane_count = pane_ids.len() as u16;
                         for pid in &pane_ids {
                             let is_focused = pid == pane_id;
                             let rows = match ui.pane_layout {
-                                PaneLayout::Tiled => (term_h / pane_count).saturating_sub(2),
+                                PaneLayout::Tiled => (usable_h / pane_count).saturating_sub(2),
                                 PaneLayout::Stacked => {
                                     if is_focused {
-                                        term_h.saturating_sub(2 + pane_count.saturating_sub(1))
+                                        usable_h.saturating_sub(2 + pane_count.saturating_sub(1))
                                     } else {
                                         0
                                     }
@@ -2706,6 +2713,10 @@ pub fn run_tui(
                                         let mut st = state.blocking_write();
                                         for id in &role_pane_ids {
                                             st.register_pane(id.clone());
+                                            st.insert_placeholder_session(
+                                                id.clone(),
+                                                Some(dir_str.clone()),
+                                            );
                                         }
                                         // Register pane-to-role and pane-to-cwd mappings for work-done resolution.
                                         for (i, role) in orch_config.roles.iter().enumerate() {
