@@ -8,9 +8,11 @@ user-invocable: true
 
 You have completed your current task. Summarize your work and signal completion via the CLI.
 
+**CRITICAL: You MUST run the bash command below. Loading this skill is NOT enough — the signal only sends when the CLI command executes.**
+
 ## Instructions
 
-Compose a concise summary of what you accomplished, then run:
+Compose a concise summary of what you accomplished, then **run the command via Bash**:
 
 ```bash
 dot-agent-deck work-done --task "Your summary here. Include file paths, outcomes, and anything the orchestrator needs to know."
@@ -18,6 +20,7 @@ dot-agent-deck work-done --task "Your summary here. Include file paths, outcomes
 
 ## Rules
 
+- **You MUST execute the CLI command via Bash.** Do not just describe the work — run the command.
 - Always include specific file paths, issue numbers, and other references in your `--task` summary.
 - Do NOT include full file contents in the summary. The orchestrator can read files directly.
 - The `--task` value should be a single string. Use quotes to wrap multi-sentence summaries.

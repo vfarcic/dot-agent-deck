@@ -8,9 +8,11 @@ user-invocable: true
 
 You are the orchestrator. Delegate work to one or more worker agents.
 
+**CRITICAL: You MUST run the bash command below. Loading this skill is NOT enough — the delegation only happens when the CLI command executes.**
+
 ## Instructions
 
-### Delegate to one agent
+Compose the task description, then **run the command via Bash**:
 
 ```bash
 dot-agent-deck delegate --to <role-name> --task "Task description with relevant context, file paths, and constraints."
@@ -41,6 +43,7 @@ dot-agent-deck work-done --done --task "Final summary of what was accomplished a
 
 ## Rules
 
+- **You MUST execute the CLI command via Bash.** Do not just describe the delegation — run the command.
 - Always include specific file paths, issue numbers, and other references in your `--task` description.
 - Do NOT include full file contents. Workers can read files directly.
 - The `--task` value should be a single string. Use quotes to wrap multi-sentence descriptions.
