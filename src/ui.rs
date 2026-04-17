@@ -2415,12 +2415,30 @@ pub fn run_tui(
                         crossterm::event::MouseEventKind::ScrollUp
                             if ui.mode == UiMode::PaneInput =>
                         {
-                            embedded.scroll_pane(&pane_id, 3);
+                            if embedded.mouse_mode_enabled(&pane_id) {
+                                let (col, row) = pane_relative_coords(
+                                    mouse.column,
+                                    mouse.row,
+                                    &ui.focused_pane_rect,
+                                );
+                                let _ = embedded.forward_mouse_scroll(&pane_id, true, col, row);
+                            } else {
+                                embedded.scroll_pane(&pane_id, 3);
+                            }
                         }
                         crossterm::event::MouseEventKind::ScrollDown
                             if ui.mode == UiMode::PaneInput =>
                         {
-                            embedded.scroll_pane(&pane_id, -3);
+                            if embedded.mouse_mode_enabled(&pane_id) {
+                                let (col, row) = pane_relative_coords(
+                                    mouse.column,
+                                    mouse.row,
+                                    &ui.focused_pane_rect,
+                                );
+                                let _ = embedded.forward_mouse_scroll(&pane_id, false, col, row);
+                            } else {
+                                embedded.scroll_pane(&pane_id, -3);
+                            }
                         }
                         crossterm::event::MouseEventKind::Down(
                             crossterm::event::MouseButton::Left,
@@ -4762,6 +4780,18 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
         };
         let cursor_x = popup_area.x + 12 + field_text.len() as u16;
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    }
+}
+
+/// Convert screen-absolute mouse coordinates to pane-relative coordinates.
+/// Returns (col, row) relative to the pane's inner area (inside border).
+fn pane_relative_coords(screen_col: u16, screen_row: u16, pane_rect: &Option<Rect>) -> (u16, u16) {
+    if let Some(rect) = pane_rect {
+        let col = screen_col.saturating_sub(rect.x + 1); // +1 for border
+        let row = screen_row.saturating_sub(rect.y + 1);
+        (col, row)
+    } else {
+        (screen_col, screen_row)
     }
 }
 
