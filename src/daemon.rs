@@ -28,11 +28,18 @@ pub async fn run_daemon(socket_path: &Path, state: SharedState) -> Result<(), Da
                     while let Ok(Some(line)) = lines.next_line().await {
                         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
                             match msg {
+                                DaemonMessage::Delegate(signal) => {
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        targets = ?signal.to,
+                                        "Received delegate signal"
+                                    );
+                                    state.write().await.handle_delegate(signal);
+                                }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
                                         pane_id = %signal.pane_id,
                                         done = signal.done,
-                                        delegates = ?signal.delegate,
                                         "Received work-done signal"
                                     );
                                     state.write().await.handle_work_done(signal);

@@ -56,17 +56,30 @@ pub struct AgentEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "message_type")]
 pub enum DaemonMessage {
+    /// Orchestrator delegates work to one or more worker roles.
+    #[serde(rename = "delegate")]
+    Delegate(DelegateSignal),
+    /// Worker (or orchestrator with `done`) reports task completion.
     #[serde(rename = "work_done")]
     WorkDone(WorkDoneSignal),
 }
 
-/// Signal sent by an agent via `dot-agent-deck work-done`.
+/// Signal sent by the orchestrator via `dot-agent-deck delegate`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegateSignal {
+    pub pane_id: String,
+    pub task: String,
+    /// Role names to delegate to (one or more).
+    pub to: Vec<String>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Signal sent by a worker via `dot-agent-deck work-done`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkDoneSignal {
     pub pane_id: String,
     pub task: String,
-    #[serde(default)]
-    pub delegate: Vec<String>,
+    /// When true, the orchestrator signals that the entire orchestration is complete.
     #[serde(default)]
     pub done: bool,
     pub timestamp: DateTime<Utc>,
@@ -160,11 +173,33 @@ mod tests {
     }
 
     #[test]
+    fn serialize_deserialize_delegate_signal() {
+        let signal = DelegateSignal {
+            pane_id: "pane-1".into(),
+            task: "Implement login".into(),
+            to: vec!["coder".into()],
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let msg = DaemonMessage::Delegate(signal);
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: DaemonMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonMessage::Delegate(s) => {
+                assert_eq!(s.pane_id, "pane-1");
+                assert_eq!(s.task, "Implement login");
+                assert_eq!(s.to, vec!["coder"]);
+            }
+            _ => panic!("expected Delegate"),
+        }
+    }
+
+    #[test]
     fn serialize_deserialize_work_done_signal() {
         let signal = WorkDoneSignal {
-            pane_id: "pane-1".into(),
+            pane_id: "pane-2".into(),
             task: "Implemented login".into(),
-            delegate: vec!["reviewer".into()],
             done: false,
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
                 .unwrap()
@@ -175,11 +210,11 @@ mod tests {
         let parsed: DaemonMessage = serde_json::from_str(&json).unwrap();
         match parsed {
             DaemonMessage::WorkDone(s) => {
-                assert_eq!(s.pane_id, "pane-1");
+                assert_eq!(s.pane_id, "pane-2");
                 assert_eq!(s.task, "Implemented login");
-                assert_eq!(s.delegate, vec!["reviewer"]);
                 assert!(!s.done);
             }
+            _ => panic!("expected WorkDone"),
         }
     }
 
@@ -194,9 +229,9 @@ mod tests {
         let msg: DaemonMessage = serde_json::from_str(json).unwrap();
         match msg {
             DaemonMessage::WorkDone(s) => {
-                assert!(s.delegate.is_empty());
                 assert!(!s.done);
             }
+            _ => panic!("expected WorkDone"),
         }
     }
 

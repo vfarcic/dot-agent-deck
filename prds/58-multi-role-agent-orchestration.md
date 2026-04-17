@@ -289,16 +289,18 @@ Goal: update config structs to match the orchestrator pattern, build the orchest
 
 Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orchestrator delegates, workers execute, results flow back.
 
-- [x] **M4c: Work-done CLI subcommand** — `dot-agent-deck work-done` subcommand with `--task`, `--delegate` (repeatable), and `--done` flags; sends `DaemonMessage::WorkDone` via Unix socket; daemon maps pane ID → role name via `pane_role_map`; writes summary to `work-done-{role-name}.md`; stores signals in `orchestration_events` for M5 dispatch
-- [x] **M4d: Work-done skill update** — `/work-done` skill rewritten to use CLI flags (`dot-agent-deck work-done --task "..."`, `--delegate <role>`, `--done`); per-role files written by daemon via `handle_work_done()`; role name resolved daemon-side from pane-to-role mapping (no env var needed)
-- [ ] **M5: Delegation dispatch** — when orchestrator calls `/work-done` with a delegation payload (target agents + prompt), dot-agent-deck parses it, optionally restarts worker sessions (`clear = true`), prepends worker's `prompt_template` if present, and injects the combined prompt into target pane(s) via PTY stdin
-- [ ] **M5b: Orchestrator feedback loop** — when a worker calls `/work-done`, dot-agent-deck reads its summary file; if parallel delegation is active, waits for all pending workers; then injects combined summaries into the orchestrator pane
-- [ ] **M5c: Orchestration completion** — when orchestrator signals `DONE` in its `/work-done` output, dot-agent-deck marks the orchestration as complete and shows a completion notification
+- [x] **M4c: CLI subcommands** — two separate subcommands: `dot-agent-deck delegate --to <role> --task "..."` (orchestrator sends work to workers) and `dot-agent-deck work-done --task "..." [--done]` (workers report results back); sends `DaemonMessage::Delegate` or `DaemonMessage::WorkDone` via Unix socket; daemon maps pane ID → role name via `pane_role_map`; writes summary to `work-done-{role-name}.md`
+- [x] **M4d: Separate skill files** — `/work-done` skill (`.claude/skills/agent-deck-work-done/`) for workers only; `/delegate` skill (`.claude/skills/agent-deck-delegate/`) for orchestrator only; clean separation prevents workers from accidentally delegating
+- [x] **M5: Delegation dispatch** — `dispatch_delegate_events()` in `src/ui.rs` drains `DelegateSignal` events, resolves target roles from config, restarts panes if `clear = true` (close + create + update all mappings), prepends worker's `prompt_template` to task, injects prompt via PTY stdin; `PendingDispatch` queue handles deferred injection for restarted panes; `OrchestrationConfig` stored in `Tab::Orchestration` for dispatch access
+- [x] **M5b: Orchestrator feedback loop** — `feedback_worker_results()` in `src/ui.rs` drains `WorkDoneSignal` events from workers, immediately injects result summary into orchestrator pane (no batching — each worker result forwarded as it arrives); orchestrator decides when it has enough info to proceed
+- [ ] **M5c: Orchestration completion** — when orchestrator signals `--done` via `work-done`, dot-agent-deck marks the orchestration as complete and shows a completion notification
 
-**Design questions resolved (M4c/M4d):**
-- **Delegation payload**: CLI flags — `--delegate <role>` (repeatable for fan-out), `--task <description>`
-- **Completion signal**: `--done` flag on the CLI command
+**Design questions resolved (M4c/M4d/M5/M5b):**
+- **Delegation**: Separate `delegate` command — `--to <role>` (repeatable for fan-out), `--task <description>`
+- **Work completion**: Separate `work-done` command — `--task <summary>`, `--done` (orchestrator completion)
+- **Completion signal**: `--done` flag on the `work-done` command (orchestrator only)
 - **Role name resolution**: Daemon resolves pane ID → role name via `pane_role_map` in `AppState` (populated when orchestration tab opens). No env var or skill parameter needed.
+- **Feedback model**: Immediate per-worker feedback — no batching or waiting for parallel workers. Orchestrator receives each result as it arrives and decides when to proceed.
 
 **At this point**: orchestrator-driven workflow is functional. User talks to orchestrator, orchestrator delegates to workers (including parallel), results flow back, orchestrator decides next steps or completes.
 
@@ -313,8 +315,8 @@ Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orche
 
 ### Phase 3: Quality
 
-- [ ] **M12: Tests** — config parsing, message bus, work-done handling, delegation dispatch, parallel fan-out
-- [ ] **M13: No regressions** — all existing tests passing
+- [ ] **M12: Tests** — config parsing ✓, message bus ✓, work-done handling ✓, delegation dispatch ✓; still needed: parallel fan-out integration test, feedback loop integration test
+- [x] **M13: No regressions** — all 384 existing tests passing after M5/M5b implementation
 
 ## Key Files
 
@@ -387,6 +389,22 @@ Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orche
   8. Orchestrator decides next step (delegate again, or `DONE`)
 
 - **What dot-agent-deck does NOT do**: routing decisions, round counting, approval/rejection parsing. The orchestrator LLM owns all of that.
+
+### 2026-04-17: Split `work-done` into `delegate` and `work-done` commands
+
+- **Decision**: Replace the single overloaded `work-done` command (with `--delegate` flag) with two separate CLI subcommands: `delegate --to <role> --task "..."` (orchestrator → workers) and `work-done --task "..."` (workers → orchestrator). Separate `DaemonMessage` variants (`Delegate` and `WorkDone`) and separate skill files.
+
+- **Rationale**: The original `work-done --delegate <role>` conflated two different intents — "here's work for you" and "I'm done with my work". This made it ambiguous at the CLI level and required the daemon to infer intent from flag combinations + sender identity. Separate commands make intent explicit, prevent workers from accidentally delegating, and produce cleaner skill files (workers only see `work-done`, orchestrator only sees `delegate`).
+
+- **Impact**: `DaemonMessage` enum gains `Delegate(DelegateSignal)` alongside `WorkDone(WorkDoneSignal)`. `WorkDoneSignal` loses its `delegate: Vec<String>` field. New `DelegateSignal` struct with `to: Vec<String>`. Separate skill directories: `agent-deck-work-done/` (workers) and `agent-deck-delegate/` (orchestrator). Orchestrator context file updated to reference `delegate` command.
+
+### 2026-04-17: Immediate worker feedback (no batching)
+
+- **Decision**: When a worker calls `work-done`, its result is forwarded to the orchestrator pane immediately. No waiting for other parallel workers to finish.
+
+- **Rationale**: Batching assumes the orchestrator needs all results before deciding, but in practice: (1) sequential delegation (one worker at a time) would be blocked waiting for nothing, (2) the orchestrator is the smart agent — it can track what it's waiting for and decide when to proceed, (3) simpler implementation with no pending-worker tracking state. Workers always report to the orchestrator; workers never delegate to other workers.
+
+- **Impact**: No `pending_workers` tracking in state. `feedback_worker_results()` is a simple drain-and-forward loop. The "parallel fan-out: wait for all" behavior described in the orchestrator pattern design decision is superseded — the orchestrator handles coordination itself.
 
 - **Impact**: Removed `max_rounds`, `auto` from config and validation. Removed manual advance (`o` key). Parallel execution now in-scope. Milestones restructured: M1b (routing design) resolved by this decision, M2 becomes message bus instead of state machine, M5 (manual advance) removed.
 

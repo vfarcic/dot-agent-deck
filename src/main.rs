@@ -87,15 +87,21 @@ enum Commands {
         /// Command to execute
         command: String,
     },
-    /// Signal task completion, delegate work, or end orchestration
-    WorkDone {
-        /// Task summary or description for delegation
+    /// Delegate work to one or more worker roles (orchestrator only)
+    Delegate {
+        /// Task description with context, file paths, and constraints
         #[arg(long)]
         task: String,
-        /// Role(s) to delegate work to (repeatable)
+        /// Role name(s) to delegate to (repeatable)
         #[arg(long)]
-        delegate: Vec<String>,
-        /// Signal orchestration complete
+        to: Vec<String>,
+    },
+    /// Signal task completion back to the orchestrator
+    WorkDone {
+        /// Summary of what was accomplished
+        #[arg(long)]
+        task: String,
+        /// Signal that the entire orchestration is complete (orchestrator only)
         #[arg(long)]
         done: bool,
     },
@@ -234,11 +240,38 @@ fn main() -> ExitCode {
         Some(Commands::Watch { interval, command }) => {
             dot_agent_deck::watch::run_watch(interval, &command)
         }
-        Some(Commands::WorkDone {
-            task,
-            delegate,
-            done,
-        }) => {
+        Some(Commands::Delegate { task, to }) => {
+            let pane_id = match std::env::var("DOT_AGENT_DECK_PANE_ID") {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!(
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            if to.is_empty() {
+                eprintln!("Error: at least one --to <role> is required.");
+                return ExitCode::FAILURE;
+            }
+            let signal = dot_agent_deck::event::DelegateSignal {
+                pane_id,
+                task,
+                to,
+                timestamp: chrono::Utc::now(),
+            };
+            let msg = dot_agent_deck::event::DaemonMessage::Delegate(signal);
+            let json = match serde_json::to_string(&msg) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Failed to serialize delegate signal: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let _ = dot_agent_deck::hook::send_to_socket(&json);
+            ExitCode::SUCCESS
+        }
+        Some(Commands::WorkDone { task, done }) => {
             let pane_id = match std::env::var("DOT_AGENT_DECK_PANE_ID") {
                 Ok(id) => id,
                 Err(_) => {
@@ -251,7 +284,6 @@ fn main() -> ExitCode {
             let signal = dot_agent_deck::event::WorkDoneSignal {
                 pane_id,
                 task,
-                delegate,
                 done,
                 timestamp: chrono::Utc::now(),
             };

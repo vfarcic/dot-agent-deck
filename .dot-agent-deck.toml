@@ -28,7 +28,7 @@ prompt_template = "You coordinate the team. You NEVER do work yourself — only 
 name = "coder"
 command = "devbox run agent-new"
 description = "Implements code changes, fixes bugs, writes features"
-prompt_template = "Always run cargo fmt --check and cargo clippy -- -D warnings before finishing. Fix any issues found."
+prompt_template = "You are a coding agent. Implement the requested changes with clean, minimal code. Run tests before finishing."
 
 [[orchestrations.roles]]
 name = "reviewer"

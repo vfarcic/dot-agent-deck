@@ -444,6 +444,14 @@ impl NewPaneFormState {
     }
 }
 
+/// A prompt queued for injection into a pane once its agent is ready.
+/// Used by M5 delegation dispatch when `clear = true` restarts a pane.
+struct PendingDispatch {
+    pane_id: String,
+    prompt: String,
+    created_at: std::time::Instant,
+}
+
 struct UiState {
     mode: UiMode,
     selected_index: usize,
@@ -494,6 +502,8 @@ struct UiState {
     quit_confirm_selected: usize,
     /// Orchestration tab IDs whose start-role prompt has already been injected.
     orchestration_prompted: HashSet<TabId>,
+    /// Prompts waiting to be injected into panes once their agent is ready (M5 dispatch).
+    pending_dispatches: Vec<PendingDispatch>,
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -545,6 +555,7 @@ impl UiState {
             config_gen_selected: 0,
             quit_confirm_selected: 0,
             orchestration_prompted: HashSet::new(),
+            pending_dispatches: Vec::new(),
         }
     }
 }
@@ -712,18 +723,18 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     // 3. Delegation protocol.
     content.push_str("\n## Delegation protocol\n\n");
     content.push_str(
-        "To delegate work to an agent, run one command per agent:\n\
+        "To delegate work to an agent, use `delegate` with one command per agent:\n\
          ```bash\n\
-         dot-agent-deck work-done --delegate <role-name> --task \"Task description with context, file paths, and constraints.\"\n\
+         dot-agent-deck delegate --to <role-name> --task \"Task description with context, file paths, and constraints.\"\n\
          ```\n\n\
          To delegate to multiple agents in parallel, make **one call per agent** so each gets its own task:\n\
          ```bash\n\
-         dot-agent-deck work-done --delegate coder --task \"Implement the login endpoint...\"\n\
-         dot-agent-deck work-done --delegate reviewer --task \"Review the auth module...\"\n\
+         dot-agent-deck delegate --to coder --task \"Implement the login endpoint...\"\n\
+         dot-agent-deck delegate --to reviewer --task \"Review the auth module...\"\n\
          ```\n\n\
          If all agents should receive the **exact same task**, you may combine them in one call:\n\
          ```bash\n\
-         dot-agent-deck work-done --delegate <role1> --delegate <role2> --task \"Same task for all.\"\n\
+         dot-agent-deck delegate --to <role1> --to <role2> --task \"Same task for all.\"\n\
          ```\n\n\
          When all work is complete and you are satisfied with the results:\n\
          ```bash\n\
@@ -751,6 +762,236 @@ fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Optio
     let content = build_orchestrator_context(config);
     std::fs::write(&file_path, &content).ok()?;
     Some("Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and delegation protocol. Acknowledge your role and wait for instructions.".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// M5: Delegation dispatch
+// ---------------------------------------------------------------------------
+
+/// Construct the prompt to inject into a worker pane.
+fn build_worker_prompt(prompt_template: Option<&str>, task: &str) -> String {
+    match prompt_template {
+        Some(tpl) => format!("{tpl}\n\n## Task\n\n{task}"),
+        None => task.to_string(),
+    }
+}
+
+/// Drain delegate signals and dispatch work to worker panes.
+///
+/// For each `DelegateSignal`, look up the target role(s), optionally restart
+/// their pane (`clear = true`), and inject the constructed prompt.  When a pane
+/// is restarted the prompt is deferred to `ui.pending_dispatches` because the
+/// agent needs time to initialise.
+fn dispatch_delegate_events(
+    state: &SharedState,
+    pane: &Arc<dyn PaneController>,
+    tab_manager: &mut TabManager,
+    ui: &mut UiState,
+) {
+    // 1. Drain all pending delegate events under a short write-lock.
+    let events: Vec<_> = state.blocking_write().delegate_events.drain(..).collect();
+
+    for signal in events {
+        // 2. Find the orchestration tab that owns this pane.
+        let tab_idx = tab_manager
+            .tabs()
+            .iter()
+            .position(|t| matches!(t, Tab::Orchestration { role_pane_ids, .. } if role_pane_ids.contains(&signal.pane_id)));
+
+        let Some(tab_idx) = tab_idx else {
+            tracing::warn!(pane_id = %signal.pane_id, "dispatch: pane not in any orchestration tab");
+            continue;
+        };
+
+        // 3. Extract what we need from the tab (borrow-safely).
+        let (config, cwd) = match &tab_manager.tabs()[tab_idx] {
+            Tab::Orchestration { config, cwd, .. } => (config.clone(), cwd.clone()),
+            _ => unreachable!(),
+        };
+
+        // 4. Dispatch to each target role.
+        for target_role_name in &signal.to {
+            let Some(role_idx) = config
+                .roles
+                .iter()
+                .position(|r| &r.name == target_role_name)
+            else {
+                tracing::warn!(
+                    role = %target_role_name,
+                    "dispatch: delegation target role not found in config"
+                );
+                continue;
+            };
+
+            let role = &config.roles[role_idx];
+            let prompt = build_worker_prompt(role.prompt_template.as_deref(), &signal.task);
+
+            if role.clear {
+                // Restart pane: close old, create new, update all mappings.
+                let old_pane_id = match &tab_manager.tabs()[tab_idx] {
+                    Tab::Orchestration { role_pane_ids, .. } => role_pane_ids[role_idx].clone(),
+                    _ => unreachable!(),
+                };
+
+                let _ = pane.close_pane(&old_pane_id);
+
+                let new_pane_id = match pane.create_pane(None, Some(&cwd)) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!(role = %role.name, error = %e, "dispatch: failed to create pane");
+                        continue;
+                    }
+                };
+                let _ = pane.rename_pane(&new_pane_id, &role.name);
+
+                // Update Tab::Orchestration role_pane_ids.
+                if let Tab::Orchestration { role_pane_ids, .. } =
+                    &mut tab_manager.tabs_mut()[tab_idx]
+                {
+                    role_pane_ids[role_idx] = new_pane_id.clone();
+                }
+
+                // Update state mappings.
+                {
+                    let mut st = state.blocking_write();
+                    st.unregister_pane(&old_pane_id);
+                    st.register_pane(new_pane_id.clone());
+                    st.pane_role_map.remove(&old_pane_id);
+                    st.pane_role_map
+                        .insert(new_pane_id.clone(), role.name.clone());
+                    st.pane_cwd_map.remove(&old_pane_id);
+                    st.pane_cwd_map.insert(new_pane_id.clone(), cwd.clone());
+                    st.insert_placeholder_session(new_pane_id.clone(), Some(cwd.clone()));
+                }
+
+                // Update UI display names.
+                ui.pane_display_names.remove(&old_pane_id);
+                ui.pane_display_names
+                    .insert(new_pane_id.clone(), role.name.clone());
+
+                // Launch the agent command in the new pane.
+                let _ = pane.write_to_pane(&new_pane_id, &role.command);
+
+                // Defer prompt injection until agent is ready.
+                ui.pending_dispatches.push(PendingDispatch {
+                    pane_id: new_pane_id,
+                    prompt,
+                    created_at: std::time::Instant::now(),
+                });
+            } else {
+                // Agent is already running — inject prompt directly.
+                let pane_id = match &tab_manager.tabs()[tab_idx] {
+                    Tab::Orchestration { role_pane_ids, .. } => role_pane_ids[role_idx].clone(),
+                    _ => unreachable!(),
+                };
+                let _ = pane.write_to_pane(&pane_id, &prompt);
+            }
+        }
+    }
+}
+
+/// Drain work-done signals from workers and inject their results into the
+/// orchestrator pane.  Each worker result is forwarded immediately — no
+/// batching or waiting for parallel completions.
+fn feedback_worker_results(
+    state: &SharedState,
+    pane: &Arc<dyn PaneController>,
+    tab_manager: &TabManager,
+    ui: &mut UiState,
+) {
+    let events: Vec<_> = state.blocking_write().work_done_events.drain(..).collect();
+
+    for signal in events {
+        // Find the orchestration tab that owns this pane.
+        let tab_idx = tab_manager.tabs().iter().position(|t| {
+            matches!(t, Tab::Orchestration { role_pane_ids, .. } if role_pane_ids.contains(&signal.pane_id))
+        });
+
+        let Some(tab_idx) = tab_idx else {
+            tracing::warn!(pane_id = %signal.pane_id, "feedback: pane not in any orchestration tab");
+            continue;
+        };
+
+        let (start_role_index, role_pane_ids, _cwd) = match &tab_manager.tabs()[tab_idx] {
+            Tab::Orchestration {
+                start_role_index,
+                role_pane_ids,
+                cwd,
+                ..
+            } => (*start_role_index, role_pane_ids.clone(), cwd.clone()),
+            _ => unreachable!(),
+        };
+
+        let orchestrator_pane_id = &role_pane_ids[start_role_index];
+
+        // If the signal came from the orchestrator itself (--done), skip feedback.
+        if signal.pane_id == *orchestrator_pane_id {
+            if signal.done {
+                tracing::info!("Orchestration complete: {}", signal.task);
+                // M5c will handle completion UI here.
+            }
+            continue;
+        }
+
+        // Resolve the worker's role name for the feedback message.
+        let role_name = state
+            .blocking_read()
+            .pane_role_map
+            .get(&signal.pane_id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Build feedback prompt: tell the orchestrator what the worker reported.
+        // Point to the work-done file rather than inlining the full content.
+        let feedback = format!(
+            "Worker **{role_name}** has completed their task. \
+             Read `.dot-agent-deck/work-done-{role_name}.md` for their full report. \
+             Summary: {task}",
+            task = signal.task,
+        );
+
+        // Check if orchestrator agent is ready; if not, queue for deferred injection.
+        let ready = {
+            let st = state.blocking_read();
+            st.sessions.values().any(|s| {
+                s.pane_id.as_deref() == Some(orchestrator_pane_id.as_str())
+                    && s.agent_type != AgentType::None
+            })
+        };
+
+        if ready {
+            let _ = pane.write_to_pane(orchestrator_pane_id, &feedback);
+        } else {
+            ui.pending_dispatches.push(PendingDispatch {
+                pane_id: orchestrator_pane_id.clone(),
+                prompt: feedback,
+                created_at: std::time::Instant::now(),
+            });
+        }
+    }
+}
+
+/// Process pending dispatches — inject prompt once the agent in the pane is ready.
+fn process_pending_dispatches(
+    ui: &mut UiState,
+    pane: &Arc<dyn PaneController>,
+    snapshot: &AppState,
+) {
+    ui.pending_dispatches.retain(|pd| {
+        let ready = snapshot.sessions.values().any(|s| {
+            s.pane_id.as_deref() == Some(pd.pane_id.as_str()) && s.agent_type != AgentType::None
+        });
+        if ready {
+            let _ = pane.write_to_pane(&pd.pane_id, &pd.prompt);
+            return false;
+        }
+        // Timeout after 30 seconds.
+        if pd.created_at.elapsed() > std::time::Duration::from_secs(30) {
+            tracing::warn!(pane_id = %pd.pane_id, "dispatch: timed out waiting for agent");
+            return false;
+        }
+        true
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1933,6 +2174,15 @@ pub fn run_tui(
                 }
             }
         }
+
+        // M5: Dispatch delegation events from orchestrator to workers.
+        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+
+        // M5b: Forward worker results back to the orchestrator.
+        feedback_worker_results(&state, &pane, &tab_manager, &mut ui);
+
+        // Process pending dispatches (clear=true roles waiting for agent ready).
+        process_pending_dispatches(&mut ui, &pane, &snapshot);
 
         // Drain all pending events before re-rendering. This avoids a full
         // render cycle between each keystroke, which eliminates perceived typing
@@ -7017,5 +7267,137 @@ mod tests {
 
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(matches!(result, KeyResult::Continue));
+    }
+
+    // -----------------------------------------------------------------------
+    // M5: Delegation dispatch tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_worker_prompt_with_template() {
+        let prompt = build_worker_prompt(Some("You are a code reviewer."), "Review auth module");
+        assert_eq!(
+            prompt,
+            "You are a code reviewer.\n\n## Task\n\nReview auth module"
+        );
+    }
+
+    #[test]
+    fn build_worker_prompt_without_template() {
+        let prompt = build_worker_prompt(None, "Implement login endpoint");
+        assert_eq!(prompt, "Implement login endpoint");
+    }
+
+    #[test]
+    fn dispatch_drains_delegate_events() {
+        let state = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
+        let pane: Arc<dyn PaneController> = pane_ctrl;
+        let mut tab_manager = crate::tab::TabManager::new(Arc::clone(&pane));
+        let mut ui = default_ui();
+
+        // Push a delegate signal for a pane not in any tab — should drain and warn.
+        {
+            let mut st = state.blocking_write();
+            st.delegate_events.push(crate::event::DelegateSignal {
+                pane_id: "1".to_string(),
+                task: "Do work".to_string(),
+                to: vec!["coder".to_string()],
+                timestamp: Utc::now(),
+            });
+        }
+
+        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+
+        assert!(ui.pending_dispatches.is_empty());
+        assert!(state.blocking_read().delegate_events.is_empty());
+    }
+
+    #[test]
+    fn dispatch_warns_on_unknown_role() {
+        let state = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
+        let pane: Arc<dyn PaneController> = Arc::clone(&pane_ctrl) as Arc<dyn PaneController>;
+
+        let config = OrchestrationConfig {
+            name: "test".to_string(),
+            roles: vec![OrchestrationRoleConfig {
+                name: "orchestrator".to_string(),
+                command: "echo hi".to_string(),
+                start: true,
+                description: None,
+                prompt_template: None,
+                clear: true,
+            }],
+        };
+
+        let mut tab_manager = crate::tab::TabManager::new(Arc::clone(&pane));
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let (_, role_pane_ids) = tab_manager
+            .open_orchestration_tab(&config, cwd, None)
+            .unwrap();
+
+        let orch_pane_id = role_pane_ids[0].clone();
+
+        // Register pane in state.
+        {
+            let mut st = state.blocking_write();
+            st.register_pane(orch_pane_id.clone());
+            st.pane_role_map
+                .insert(orch_pane_id.clone(), "orchestrator".to_string());
+            // Delegate to a non-existent role.
+            st.delegate_events.push(crate::event::DelegateSignal {
+                pane_id: orch_pane_id,
+                task: "Do something".to_string(),
+                to: vec!["nonexistent-role".to_string()],
+                timestamp: Utc::now(),
+            });
+        }
+
+        let mut ui = default_ui();
+        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+
+        // Should not panic or queue anything — just warn and skip.
+        assert!(ui.pending_dispatches.is_empty());
+    }
+
+    #[test]
+    fn pending_dispatch_timeout() {
+        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
+        let pane: Arc<dyn PaneController> = pane_ctrl;
+        let snapshot = AppState::default();
+        let mut ui = default_ui();
+
+        // Add a pending dispatch with an expired timeout.
+        ui.pending_dispatches.push(PendingDispatch {
+            pane_id: "999".to_string(),
+            prompt: "Do work".to_string(),
+            created_at: std::time::Instant::now() - std::time::Duration::from_secs(60),
+        });
+
+        process_pending_dispatches(&mut ui, &pane, &snapshot);
+
+        // Should be removed due to timeout.
+        assert!(ui.pending_dispatches.is_empty());
+    }
+
+    #[test]
+    fn pending_dispatch_waits_for_agent_ready() {
+        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
+        let pane: Arc<dyn PaneController> = pane_ctrl;
+        let snapshot = AppState::default(); // No sessions → agent not ready
+        let mut ui = default_ui();
+
+        ui.pending_dispatches.push(PendingDispatch {
+            pane_id: "1".to_string(),
+            prompt: "Do work".to_string(),
+            created_at: std::time::Instant::now(),
+        });
+
+        process_pending_dispatches(&mut ui, &pane, &snapshot);
+
+        // Should still be pending — agent not ready and not timed out.
+        assert_eq!(ui.pending_dispatches.len(), 1);
     }
 }

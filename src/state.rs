@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use crate::event::{AgentEvent, AgentType, EventType, WorkDoneSignal};
+use crate::event::{AgentEvent, AgentType, DelegateSignal, EventType, WorkDoneSignal};
 
 const MAX_RECENT_EVENTS: usize = 50;
 const MAX_FIRST_PROMPTS: usize = 3;
@@ -67,8 +67,10 @@ pub struct AppState {
     pub pane_role_map: HashMap<String, String>,
     /// Maps pane_id → working directory for orchestration panes.
     pub pane_cwd_map: HashMap<String, String>,
-    /// Work-done signals received from orchestration agents, consumed by dispatch (M5).
-    pub orchestration_events: Vec<WorkDoneSignal>,
+    /// Delegate signals from the orchestrator, consumed by dispatch (M5).
+    pub delegate_events: Vec<DelegateSignal>,
+    /// Work-done signals from workers (or orchestrator --done), consumed by feedback (M5b).
+    pub work_done_events: Vec<WorkDoneSignal>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -128,9 +130,19 @@ impl AppState {
         self.managed_pane_ids.remove(pane_id);
     }
 
-    /// Handle a work-done signal from an orchestration agent.
+    /// Handle a delegate signal from the orchestrator.
+    /// Stores the signal for dispatch (M5).
+    pub fn handle_delegate(&mut self, signal: DelegateSignal) {
+        if !self.pane_role_map.contains_key(&signal.pane_id) {
+            warn!(pane_id = %signal.pane_id, "delegate from unknown pane");
+            return;
+        }
+        self.delegate_events.push(signal);
+    }
+
+    /// Handle a work-done signal from a worker (or orchestrator --done).
     /// Resolves pane_id → role name, writes a per-role summary file, and
-    /// stores the signal for downstream dispatch (M5).
+    /// stores the signal for feedback to the orchestrator (M5b).
     pub fn handle_work_done(&mut self, signal: WorkDoneSignal) {
         let role_name = match self.pane_role_map.get(&signal.pane_id) {
             Some(name) => name.clone(),
@@ -148,7 +160,7 @@ impl AppState {
             let _ = std::fs::write(&file_path, &signal.task);
         }
 
-        self.orchestration_events.push(signal);
+        self.work_done_events.push(signal);
     }
 
     pub fn apply_event(&mut self, mut event: AgentEvent) {
@@ -802,6 +814,41 @@ mod tests {
     }
 
     #[test]
+    fn handle_delegate_stores_event() {
+        let mut state = AppState::default();
+        state
+            .pane_role_map
+            .insert("pane-1".into(), "orchestrator".into());
+
+        let signal = crate::event::DelegateSignal {
+            pane_id: "pane-1".into(),
+            task: "Implement login".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        };
+        state.handle_delegate(signal);
+
+        assert_eq!(state.delegate_events.len(), 1);
+        assert_eq!(state.delegate_events[0].task, "Implement login");
+        assert_eq!(state.delegate_events[0].to, vec!["coder"]);
+    }
+
+    #[test]
+    fn handle_delegate_unknown_pane_is_noop() {
+        let mut state = AppState::default();
+
+        let signal = crate::event::DelegateSignal {
+            pane_id: "unknown-pane".into(),
+            task: "Do something".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        };
+        state.handle_delegate(signal);
+
+        assert!(state.delegate_events.is_empty());
+    }
+
+    #[test]
     fn handle_work_done_resolves_role_and_stores_event() {
         let mut state = AppState::default();
         state.pane_role_map.insert("pane-1".into(), "coder".into());
@@ -812,15 +859,13 @@ mod tests {
         let signal = crate::event::WorkDoneSignal {
             pane_id: "pane-1".into(),
             task: "Implemented login".into(),
-            delegate: vec!["reviewer".into()],
             done: false,
             timestamp: Utc::now(),
         };
         state.handle_work_done(signal);
 
-        assert_eq!(state.orchestration_events.len(), 1);
-        assert_eq!(state.orchestration_events[0].task, "Implemented login");
-        assert_eq!(state.orchestration_events[0].delegate, vec!["reviewer"]);
+        assert_eq!(state.work_done_events.len(), 1);
+        assert_eq!(state.work_done_events[0].task, "Implemented login");
 
         // Verify summary file was written
         let file = std::path::Path::new("/tmp/test-wd/.dot-agent-deck/work-done-coder.md");
@@ -839,13 +884,12 @@ mod tests {
         let signal = crate::event::WorkDoneSignal {
             pane_id: "unknown-pane".into(),
             task: "Some work".into(),
-            delegate: vec![],
             done: false,
             timestamp: Utc::now(),
         };
         state.handle_work_done(signal);
 
-        assert!(state.orchestration_events.is_empty());
+        assert!(state.work_done_events.is_empty());
     }
 
     #[test]
@@ -858,13 +902,12 @@ mod tests {
         let signal = crate::event::WorkDoneSignal {
             pane_id: "pane-1".into(),
             task: "All complete".into(),
-            delegate: vec![],
             done: true,
             timestamp: Utc::now(),
         };
         state.handle_work_done(signal);
 
-        assert_eq!(state.orchestration_events.len(), 1);
-        assert!(state.orchestration_events[0].done);
+        assert_eq!(state.work_done_events.len(), 1);
+        assert!(state.work_done_events[0].done);
     }
 }

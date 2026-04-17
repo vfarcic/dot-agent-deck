@@ -56,6 +56,9 @@ pub enum Tab {
         start_role_index: usize,
         /// Pre-built prompt to inject into the start role once it is ready.
         orchestrator_prompt: Option<String>,
+        /// Full orchestration config, kept for dispatch (M5) access to
+        /// role prompt_template, clear flag, and command.
+        config: OrchestrationConfig,
     },
 }
 
@@ -213,6 +216,7 @@ impl TabManager {
             cwd: cwd.to_string(),
             start_role_index,
             orchestrator_prompt,
+            config: config.clone(),
         });
 
         let index = self.tabs.len() - 1;
