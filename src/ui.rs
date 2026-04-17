@@ -1894,7 +1894,11 @@ pub fn run_tui(
             };
             match pane.create_pane(cmd, Some(&saved_pane.dir)) {
                 Ok(new_id) => {
-                    state.blocking_write().register_pane(new_id.clone());
+                    {
+                        let mut st = state.blocking_write();
+                        st.register_pane(new_id.clone());
+                        st.insert_placeholder_session(new_id.clone(), Some(saved_pane.dir.clone()));
+                    }
                     if !saved_pane.name.is_empty() {
                         if let Err(e) = pane.rename_pane(&new_id, &saved_pane.name) {
                             ui.session_warnings.push(format!(
@@ -1982,8 +1986,10 @@ pub fn run_tui(
         // Always start on the dashboard so the user gets an overview first.
         tab_manager.switch_to(0);
 
-        // Focus the first pane so the right panel shows it immediately.
+        // Resize all restored panes to match the terminal layout and focus the first.
         if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+            let frame_area = terminal.get_frame().area();
+            resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
             let ids = embedded.pane_ids();
             if let Some(first_id) = ids.first() {
                 let _ = pane.focus_pane(first_id);
