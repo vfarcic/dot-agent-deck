@@ -18,13 +18,13 @@
       "agent":       ["claude --continue"],
       "agent-new":   ["claude"],
       "agent-plan":  ["claude --model opus --permission-mode plan"],
-      "agent-haiku": ["claude --model haiku"],
-      "agent-opus":  ["claude --model opus"],
+      "agent-small": ["claude --model haiku"],
+      "agent-big":  ["claude --model opus"],
       "oc":          ["opencode --continue"],
       "oc-new":      ["opencode"],
       "oc-plan":     ["opencode --model openai/gpt-5.3-codex"],
-      "oc-mini":     ["opencode --model openai/gpt-5.4-mini"],
-      "oc-codex":    ["opencode --model openai/gpt-5.3-codex"]
+      "oc-small":     ["opencode --model openai/gpt-5.4-mini"],
+      "oc-big":    ["opencode --model openai/gpt-5.3-codex"]
     }
   }
 }
