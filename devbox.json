@@ -15,8 +15,9 @@
       "[ -f .env ] && source .env || true"
     ],
     "scripts": {
-      "agent":     ["claude --continue"],
-      "agent-new": ["claude"]
+      "agent":      ["claude --continue"],
+      "agent-new":  ["claude"],
+      "agent-plan": ["claude --permission-mode plan"]
     }
   }
 }
