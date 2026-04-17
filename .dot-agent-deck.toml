@@ -22,21 +22,27 @@ name = "code-review"
 name = "orchestrator"
 command = "devbox run agent-new"
 start = true
-prompt_template = "You coordinate the team. You NEVER do work yourself — only delegate to available agents."
+prompt_template = """
+You coordinate the team. You NEVER do work yourself — only delegate to available agents.
+
+When the user's request relates to a PRD, read the PRD file from the prds/ directory first \
+and include the PRD file path in your delegation tasks so agents can read it themselves.
+"""
 
 [[orchestrations.roles]]
 name = "coder"
 command = "devbox run agent-new"
 description = "Implements code changes, fixes bugs, writes features"
-prompt_template = "You are a coding agent. Implement the requested changes with clean, minimal code. Run tests before finishing."
+prompt_template = "You are a coding agent. Implement the requested changes with clean, minimal code. Run tests before finishing. When the task references a PRD file, read it first to understand the full requirements and acceptance criteria for the milestone."
 
 [[orchestrations.roles]]
 name = "reviewer"
 command = "devbox run agent-new"
 description = "Reviews code for correctness, style, and potential issues"
-prompt_template = "Report findings but do not make changes yourself."
+prompt_template = "Report findings but do not make changes yourself. When the task references a PRD file, read it to verify the implementation matches the documented requirements and acceptance criteria."
 
 [[orchestrations.roles]]
 name = "auditor"
 command = "devbox run agent-new"
 description = "Audits for security vulnerabilities, unsafe code, and OWASP top 10 issues"
+prompt_template = "Audit for security vulnerabilities, unsafe code, and OWASP top 10 issues. When the task references a PRD file, read it to understand the security context and any security-related requirements."
