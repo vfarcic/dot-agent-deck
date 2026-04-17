@@ -843,16 +843,23 @@ dot-agent-deck work-done --done --task "Final summary of what was accomplished a
 "#;
 
 /// Detect the agent CLI from a role's command string.
+/// Matches only when a known CLI name appears as an exact whitespace-delimited token,
+/// preventing false positives from substrings (e.g. "myclaudetool" won't match "claude").
 fn detect_agent_cli(command: &str) -> Option<&'static str> {
-    // Check the first word or any word for known CLI names.
-    // Commands may be e.g. "claude", "claude --model sonnet", "devbox run agent-haiku" (wraps claude).
-    if command.contains("opencode") {
-        Some("opencode")
-    } else if command.contains("claude") {
-        Some("claude")
-    } else {
-        None
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    // Check each token for an exact match against known CLI names.
+    // The first exact match wins; "opencode" is checked before "claude" for consistency.
+    for token in &tokens {
+        // Strip any leading path component (e.g. "/usr/local/bin/claude" -> "claude").
+        let basename = token.rsplit('/').next().unwrap_or(token);
+        if basename == "opencode" {
+            return Some("opencode");
+        }
+        if basename == "claude" {
+            return Some("claude");
+        }
     }
+    None
 }
 
 /// Deploy orchestration skill files to the target directory for each agent CLI.
@@ -889,28 +896,36 @@ fn deploy_orchestration_skills(config: &OrchestrationConfig, cwd: &str) {
     // Deploy Claude Code skills.
     if claude_needs_work_done {
         let dir = base.join(".claude/skills/agent-deck-work-done");
-        if std::fs::create_dir_all(&dir).is_ok() {
-            let _ = std::fs::write(dir.join("SKILL.md"), SKILL_WORK_DONE);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), error = %e, "failed to create skill directory");
+        } else if let Err(e) = std::fs::write(dir.join("SKILL.md"), SKILL_WORK_DONE) {
+            tracing::warn!(path = %dir.join("SKILL.md").display(), error = %e, "failed to write skill file");
         }
     }
     if claude_needs_delegate {
         let dir = base.join(".claude/skills/agent-deck-delegate");
-        if std::fs::create_dir_all(&dir).is_ok() {
-            let _ = std::fs::write(dir.join("SKILL.md"), SKILL_DELEGATE);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), error = %e, "failed to create skill directory");
+        } else if let Err(e) = std::fs::write(dir.join("SKILL.md"), SKILL_DELEGATE) {
+            tracing::warn!(path = %dir.join("SKILL.md").display(), error = %e, "failed to write skill file");
         }
     }
 
     // Deploy OpenCode skills.
     if opencode_needs_work_done {
         let dir = base.join(".opencode/commands");
-        if std::fs::create_dir_all(&dir).is_ok() {
-            let _ = std::fs::write(dir.join("work-done.md"), SKILL_WORK_DONE);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), error = %e, "failed to create skill directory");
+        } else if let Err(e) = std::fs::write(dir.join("work-done.md"), SKILL_WORK_DONE) {
+            tracing::warn!(path = %dir.join("work-done.md").display(), error = %e, "failed to write skill file");
         }
     }
     if opencode_needs_delegate {
         let dir = base.join(".opencode/commands");
-        if std::fs::create_dir_all(&dir).is_ok() {
-            let _ = std::fs::write(dir.join("delegate.md"), SKILL_DELEGATE);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), error = %e, "failed to create skill directory");
+        } else if let Err(e) = std::fs::write(dir.join("delegate.md"), SKILL_DELEGATE) {
+            tracing::warn!(path = %dir.join("delegate.md").display(), error = %e, "failed to write skill file");
         }
     }
 }
@@ -7664,12 +7679,22 @@ mod tests {
         assert_eq!(detect_agent_cli("claude"), Some("claude"));
         assert_eq!(detect_agent_cli("claude --model sonnet"), Some("claude"));
         assert_eq!(detect_agent_cli("devbox run agent-plan"), None);
+        // Substring should NOT match — "myclaudetool" is not "claude".
+        assert_eq!(detect_agent_cli("myclaudetool"), None);
+        assert_eq!(detect_agent_cli("claude-wrapper"), None);
+        // Full path should match the basename.
+        assert_eq!(
+            detect_agent_cli("/usr/local/bin/claude --model sonnet"),
+            Some("claude")
+        );
     }
 
     #[test]
     fn test_detect_agent_cli_opencode() {
         assert_eq!(detect_agent_cli("opencode"), Some("opencode"));
         assert_eq!(detect_agent_cli("opencode --flag"), Some("opencode"));
+        // Substring should NOT match.
+        assert_eq!(detect_agent_cli("myopencodetool"), None);
     }
 
     #[test]
