@@ -135,21 +135,8 @@ enum ActiveTabView {
         /// Which side pane has visual focus (`None` = agent pane).
         focused_side_pane_index: Option<usize>,
     },
-    /// Orchestration tab: sidebar with role cards plus scoped role panes.
-    Orchestration {
-        name: String,
-        status: OrchestrationStatus,
-        roles: Vec<OrchestrationRoleView>,
-        role_pane_ids: Vec<String>,
-    },
-}
-
-struct OrchestrationRoleView {
-    name: String,
-    command: String,
-    description: Option<String>,
-    pane_id: String,
-    status: OrchestrationRoleStatus,
+    /// Orchestration tab: same card layout as dashboard, scoped to role panes.
+    Orchestration { role_pane_ids: Vec<String> },
 }
 
 /// Lightweight snapshot of tab state for rendering, decoupled from TabManager.
@@ -663,127 +650,6 @@ fn resize_dashboard_panes(
                 let _ = embedded.resize_pane_pty(pane_id, rows, right_width);
             }
         }
-    }
-}
-
-fn orchestration_role_status_label(status: OrchestrationRoleStatus) -> (&'static str, Color) {
-    match status {
-        OrchestrationRoleStatus::Waiting => ("waiting", Color::Yellow),
-        OrchestrationRoleStatus::Working => ("working", Color::Green),
-        OrchestrationRoleStatus::Done => ("done", Color::Blue),
-    }
-}
-
-fn render_orchestration_sidebar(
-    frame: &mut Frame,
-    area: Rect,
-    name: &str,
-    status: OrchestrationStatus,
-    roles: &[OrchestrationRoleView],
-    focused_pane_id: Option<&str>,
-    palette: ColorPalette,
-) {
-    let status_text = match status {
-        OrchestrationStatus::WaitingForOrchestrator => ("waiting", Color::Yellow),
-        OrchestrationStatus::Delegated => ("active", Color::Green),
-        OrchestrationStatus::Completed => ("done", Color::Blue),
-    };
-
-    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
-
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            name.to_string(),
-            Style::default()
-                .fg(palette.text_primary)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" [{}]", status_text.0),
-            Style::default().fg(status_text.1),
-        ),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette.text_muted)),
-    );
-    frame.render_widget(title, chunks[0]);
-
-    if roles.is_empty() {
-        return;
-    }
-
-    let body_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette.text_muted))
-        .title("Roles");
-    let body = body_block.inner(chunks[1]);
-    frame.render_widget(body_block, chunks[1]);
-
-    let header = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(body);
-    let header_text = Paragraph::new("Role cards").style(
-        Style::default()
-            .fg(palette.text_secondary)
-            .add_modifier(Modifier::BOLD),
-    );
-    frame.render_widget(header_text, header[0]);
-
-    let constraints: Vec<Constraint> = roles
-        .iter()
-        .map(|_| Constraint::Ratio(1, roles.len() as u32))
-        .collect();
-    let cards = Layout::vertical(constraints).split(header[1]);
-
-    for (role, card_area) in roles.iter().zip(cards.iter()) {
-        let (status_label, status_color) = orchestration_role_status_label(role.status);
-        let is_active = focused_pane_id.is_some_and(|id| id == role.pane_id.as_str());
-        let border_color = if is_active { Color::Cyan } else { status_color };
-        let mut lines = vec![Line::from(vec![
-            Span::styled(
-                role.name.clone(),
-                Style::default()
-                    .fg(palette.text_primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  [{status_label}]"),
-                Style::default().fg(status_color),
-            ),
-        ])];
-
-        lines.push(Line::from(vec![Span::styled(
-            role.command.clone(),
-            Style::default().fg(palette.text_secondary),
-        )]));
-
-        if let Some(desc) = role.description.as_deref() {
-            lines.push(Line::from(vec![Span::styled(
-                desc.to_string(),
-                Style::default().fg(palette.text_muted),
-            )]));
-        }
-
-        lines.push(Line::from(vec![Span::styled(
-            if is_active { "focused" } else { "pane ready" },
-            Style::default().fg(if is_active {
-                Color::Cyan
-            } else {
-                palette.text_muted
-            }),
-        )]));
-
-        let card = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .style(if is_active {
-                    Style::default().bg(palette.selected_bg)
-                } else {
-                    Style::default()
-                }),
-        );
-        frame.render_widget(card, *card_area);
     }
 }
 
@@ -2506,31 +2372,7 @@ pub fn run_tui(
                 side_pane_ids: mode_manager.managed_pane_ids(),
                 focused_side_pane_index: *focused_side_pane_index,
             },
-            Tab::Orchestration {
-                name,
-                status,
-                config,
-                role_pane_ids,
-                role_statuses,
-                ..
-            } => ActiveTabView::Orchestration {
-                name: name.clone(),
-                status: *status,
-                roles: config
-                    .roles
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, role)| OrchestrationRoleView {
-                        name: role.name.clone(),
-                        command: role.command.clone(),
-                        description: role.description.clone(),
-                        pane_id: role_pane_ids[idx].clone(),
-                        status: role_statuses
-                            .get(idx)
-                            .copied()
-                            .unwrap_or(OrchestrationRoleStatus::Waiting),
-                    })
-                    .collect(),
+            Tab::Orchestration { role_pane_ids, .. } => ActiveTabView::Orchestration {
                 role_pane_ids: role_pane_ids.clone(),
             },
         };
@@ -3895,42 +3737,7 @@ fn render_frame(
         _ => unreachable!(),
     };
 
-    if let ActiveTabView::Orchestration {
-        name,
-        status,
-        roles,
-        ..
-    } = tab_view
-    {
-        let focused_pane_id = embedded.and_then(|e| e.focused_pane_id());
-        render_orchestration_sidebar(
-            frame,
-            dashboard_area,
-            name,
-            *status,
-            roles,
-            focused_pane_id.as_deref(),
-            palette,
-        );
-
-        if let Some(right) = panes_area {
-            ui.focused_pane_rect = render_terminal_panes(
-                frame,
-                embedded,
-                right,
-                &pane_ids,
-                pane_layout,
-                &ui.pane_display_names,
-                &ui.selection,
-                palette,
-                None,
-            );
-        }
-
-        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
-        render_overlays(frame, ui, active_mode_name, palette);
-        return;
-    }
+    // Orchestration tabs use the same dashboard card rendering as the main dashboard.
 
     if state.sessions.is_empty() {
         let vertical = Layout::vertical([
