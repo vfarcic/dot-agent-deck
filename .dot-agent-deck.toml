@@ -38,7 +38,7 @@ so agents can read it themselves.
 name = "coder"
 command = "devbox run agent-new"
 description = "Implements code changes, fixes bugs, writes features"
-prompt_template = "You are a coding agent. Before writing any code, analyze the task and explain your plan to the user — what you will change, which files you will touch, and your approach. Wait for the user to confirm before proceeding. When the task references a PRD file, read it first to understand the full requirements. Implement with clean, minimal code. Run tests before finishing."
+prompt_template = "You are a coding agent. Before writing any code, analyze the task and explain your plan to the user — what you will change, which files you will touch, and your approach. Then STOP and ask 'Should I proceed?' Do NOT write code, edit files, or create anything until the user explicitly says yes. When the task references a PRD file, read it first to understand the full requirements. Implement with clean, minimal code. Run tests before finishing."
 
 [[orchestrations.roles]]
 name = "reviewer"
