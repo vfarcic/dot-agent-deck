@@ -283,7 +283,7 @@ Goal: validate the full orchestration chain manually. User coordinates handoffs 
 Goal: update config structs to match the orchestrator pattern, build the orchestrator's prompt with auto-appended agents list.
 
 - [x] **M1c: Config struct update** — remove `max_rounds` and `auto` from `OrchestrationConfig`; add `description: Option<String>`, `clear: bool` (default true), make `prompt_template: Option<String>` on `OrchestrationRoleConfig`; update validation and all tests
-- [ ] **M3b: Orchestrator prompt construction** — on orchestration launch, construct the orchestrator's full prompt: base `prompt_template` + auto-generated "Available agents" list (from worker `name` + `description`) + delegation protocol instructions; inject into the `start = true` pane
+- [x] **M3b: Orchestrator prompt construction** — on orchestration launch, construct the orchestrator's full prompt: base `prompt_template` + auto-generated "Available agents" list (from worker `name` + `description`) + delegation protocol instructions; write to `.dot-agent-deck/orchestrator-context.md` and inject one-liner into the `start = true` pane once agent starts
 
 ### Phase 1c: Message bus — work-done handling and delegation dispatch
 
@@ -309,6 +309,7 @@ Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orche
 - [ ] **M9: Focused/split view toggle** — keybinding to switch between full-width active role pane and side-by-side split
 - [ ] **M10: Status bar** — show orchestration-level info in bottom status bar (e.g., "code-review: coder working, reviewer waiting")
 - [ ] **M11: Config generation extension** — update `src/config_gen.rs` prompt to suggest orchestrations alongside modes
+- [ ] **M14: Documentation** — update README and/or user-facing docs with orchestration usage: `[[orchestrations]]` TOML format, role configuration (`start`, `description`, `prompt_template`, `clear`), delegation workflow, and example orchestrations (code-review, TDD)
 
 ### Phase 3: Quality
 

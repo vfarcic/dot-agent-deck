@@ -52,6 +52,10 @@ pub enum Tab {
         /// Pane IDs for each role, in the same order as config roles.
         role_pane_ids: Vec<String>,
         cwd: String,
+        /// Index into `role_pane_ids` for the start (orchestrator) role.
+        start_role_index: usize,
+        /// Pre-built prompt to inject into the start role once it is ready.
+        orchestrator_prompt: Option<String>,
     },
 }
 
@@ -123,6 +127,10 @@ impl TabManager {
         &self.tabs
     }
 
+    pub fn tabs_mut(&mut self) -> &mut [Tab] {
+        &mut self.tabs
+    }
+
     /// Open a new mode tab. Returns `(tab_index, managed_pane_ids)`.
     pub fn open_mode_tab(
         &mut self,
@@ -165,11 +173,13 @@ impl TabManager {
     }
 
     /// Open a new orchestration tab. Creates one pane per role.
+    /// `orchestrator_prompt` is injected into the start role once its agent is ready.
     /// Returns `(tab_index, role_pane_ids)`.
     pub fn open_orchestration_tab(
         &mut self,
         config: &OrchestrationConfig,
         cwd: &str,
+        orchestrator_prompt: Option<String>,
     ) -> Result<(usize, Vec<String>), TabError> {
         let mut role_pane_ids = Vec::with_capacity(config.roles.len());
 
@@ -185,6 +195,8 @@ impl TabManager {
         let id = self.next_id;
         self.next_id += 1;
 
+        let start_role_index = config.roles.iter().position(|r| r.start).unwrap_or(0);
+
         let name = if config.name.is_empty() {
             std::path::Path::new(cwd)
                 .file_name()
@@ -199,6 +211,8 @@ impl TabManager {
             name,
             role_pane_ids: role_pane_ids.clone(),
             cwd: cwd.to_string(),
+            start_role_index,
+            orchestrator_prompt,
         });
 
         let index = self.tabs.len() - 1;
@@ -799,7 +813,7 @@ mod tests {
     fn open_orchestration_tab_creates_tab() {
         let mut tm = make_manager();
         let (idx, ids) = tm
-            .open_orchestration_tab(&test_orchestration_config(), "/tmp")
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None)
             .unwrap();
         assert_eq!(idx, 1);
         assert_eq!(ids.len(), 2);
@@ -809,6 +823,38 @@ mod tests {
         assert_eq!(tm.tab_labels(), vec!["Dashboard", "tdd-cycle"]);
         // Orchestrations are not modes.
         assert!(tm.active_mode_name().is_none());
+        // Verify start_role_index and prompt storage.
+        if let Tab::Orchestration {
+            start_role_index,
+            orchestrator_prompt,
+            ..
+        } = tm.active_tab()
+        {
+            assert_eq!(*start_role_index, 0); // "tester" has start=true at index 0
+            assert!(orchestrator_prompt.is_none());
+        } else {
+            panic!("expected Orchestration tab");
+        }
+    }
+
+    #[test]
+    fn open_orchestration_tab_stores_prompt() {
+        let mut tm = make_manager();
+        let prompt = "You are the orchestrator.".to_string();
+        tm.open_orchestration_tab(&test_orchestration_config(), "/tmp", Some(prompt.clone()))
+            .unwrap();
+        if let Tab::Orchestration {
+            orchestrator_prompt,
+            ..
+        } = tm.active_tab()
+        {
+            assert_eq!(
+                orchestrator_prompt.as_deref(),
+                Some("You are the orchestrator.")
+            );
+        } else {
+            panic!("expected Orchestration tab");
+        }
     }
 
     #[test]
@@ -818,7 +864,7 @@ mod tests {
             name: String::new(),
             ..test_orchestration_config()
         };
-        tm.open_orchestration_tab(&config, "/home/user/my-project")
+        tm.open_orchestration_tab(&config, "/home/user/my-project", None)
             .unwrap();
         assert_eq!(tm.tab_labels(), vec!["Dashboard", "my-project"]);
     }
@@ -828,7 +874,7 @@ mod tests {
         let mock = Arc::new(MockPaneController::new());
         let mut tm = TabManager::new(mock.clone());
         let (_, ids) = tm
-            .open_orchestration_tab(&test_orchestration_config(), "/tmp")
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None)
             .unwrap();
         assert_eq!(tm.tab_count(), 2);
 
@@ -844,7 +890,7 @@ mod tests {
     fn orchestration_pane_ids_in_all_managed() {
         let mut tm = make_manager();
         let (_, ids) = tm
-            .open_orchestration_tab(&test_orchestration_config(), "/tmp")
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None)
             .unwrap();
         let all = tm.all_managed_pane_ids();
         for id in &ids {
@@ -856,7 +902,7 @@ mod tests {
     fn tab_index_for_orchestration_pane() {
         let mut tm = make_manager();
         let (_, ids) = tm
-            .open_orchestration_tab(&test_orchestration_config(), "/tmp")
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None)
             .unwrap();
         for id in &ids {
             assert_eq!(tm.tab_index_for_pane(id), Some(1));

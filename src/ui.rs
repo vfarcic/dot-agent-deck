@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,11 +17,11 @@ use crate::ascii_art::{AsciiArtResult, generate_ascii_art};
 use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::embedded_pane::EmbeddedPaneController;
-use crate::event::EventType;
+use crate::event::{AgentType, EventType};
 use crate::pane::{PaneController, PaneError};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
-use crate::tab::{Tab, TabManager};
+use crate::tab::{Tab, TabId, TabManager};
 use crate::terminal_widget::TerminalWidget;
 use crate::theme::ColorPalette;
 
@@ -492,6 +492,8 @@ struct UiState {
     config_gen_selected: usize,
     /// Selected option in quit confirm modal (0=Quit, 1=Cancel).
     quit_confirm_selected: usize,
+    /// Orchestration tab IDs whose start-role prompt has already been injected.
+    orchestration_prompted: HashSet<TabId>,
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -542,6 +544,7 @@ impl UiState {
             config_gen_target: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
+            orchestration_prompted: HashSet::new(),
         }
     }
 }
@@ -672,6 +675,68 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
         id_match || cwd_match || status_match || name_match
     });
     sessions
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrator prompt construction
+// ---------------------------------------------------------------------------
+
+/// Build the orchestrator context file content.
+/// Includes the role's own prompt_template, the available-agents list, and
+/// delegation protocol instructions.
+fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
+    let mut content = String::new();
+
+    // 1. Orchestrator's own prompt_template.
+    if let Some(start_role) = config.roles.iter().find(|r| r.start)
+        && let Some(ref tpl) = start_role.prompt_template
+    {
+        content.push_str(tpl);
+        content.push_str("\n\n");
+    }
+
+    // 2. Available agents list.
+    content.push_str("## Available agents\n\n");
+    for role in &config.roles {
+        if role.start {
+            continue;
+        }
+        let desc = role.description.as_deref().unwrap_or("(no description)");
+        content.push_str(&format!("- **{}**: {}\n", role.name, desc));
+    }
+
+    // 3. Delegation protocol.
+    content.push_str("\n## Delegation protocol\n\n");
+    content.push_str(
+        "When you are ready to delegate work to one or more agents, run the `/work-done` \
+         command. In your summary, specify:\n\
+         - **Target role(s)**: which agent(s) should pick up the work\n\
+         - **Task description**: what each agent should do\n\
+         - **Context**: any relevant file paths, decisions, or constraints\n\n\
+         When all delegated work is complete and you are satisfied with the results, \
+         run `/work-done` with `DONE` in your summary to signal orchestration completion.\n",
+    );
+
+    // 4. Wait for user instructions.
+    content.push_str(
+        "\n## Important\n\n\
+         Do NOT take any action yet. Read and acknowledge your role and available agents, \
+         then wait for the user to provide instructions on what to work on.\n",
+    );
+
+    content
+}
+
+/// Write the orchestrator context file and return the one-line prompt to inject.
+/// The file is written to `.dot-agent-deck/orchestrator-context.md` inside `cwd`.
+/// Returns `None` if the file cannot be written.
+fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
+    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
+    std::fs::create_dir_all(&dir).ok()?;
+    let file_path = dir.join("orchestrator-context.md");
+    let content = build_orchestrator_context(config);
+    std::fs::write(&file_path, &content).ok()?;
+    Some("Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and delegation protocol. Acknowledge your role and wait for instructions.".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1824,6 +1889,34 @@ pub fn run_tui(
             let _ = std::io::stdout().flush();
         }
 
+        // Inject orchestrator prompt when start role agent becomes ready.
+        // Claude Code fires SessionStart immediately on launch (via hook),
+        // transitioning the placeholder from AgentType::None to a real type.
+        for tab in tab_manager.tabs_mut() {
+            if let Tab::Orchestration {
+                id,
+                role_pane_ids,
+                start_role_index,
+                orchestrator_prompt,
+                ..
+            } = tab
+                && orchestrator_prompt.is_some()
+                && !ui.orchestration_prompted.contains(id)
+            {
+                let start_pane_id = &role_pane_ids[*start_role_index];
+                // Agent is ready when its session has a real agent type (not placeholder).
+                let ready = snapshot.sessions.values().any(|s| {
+                    s.pane_id.as_deref() == Some(start_pane_id) && s.agent_type != AgentType::None
+                });
+                if ready {
+                    if let Some(prompt) = orchestrator_prompt.take() {
+                        let _ = pane.write_to_pane(start_pane_id, &prompt);
+                    }
+                    ui.orchestration_prompted.insert(*id);
+                }
+            }
+        }
+
         // Drain all pending events before re-rendering. This avoids a full
         // render cycle between each keystroke, which eliminates perceived typing
         // latency in PaneInput mode.
@@ -2596,7 +2689,9 @@ pub fn run_tui(
 
                         // Orchestration path — manage own panes, no agent pane.
                         if let Some(orch_config) = req.orchestration_config {
-                            match tab_manager.open_orchestration_tab(&orch_config, &dir_str) {
+                            let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
+                            match tab_manager.open_orchestration_tab(&orch_config, &dir_str, prompt)
+                            {
                                 Ok((_tab_idx, role_pane_ids)) => {
                                     {
                                         let mut st = state.blocking_write();
@@ -4975,6 +5070,130 @@ mod tests {
                 )
             })
             .unwrap();
+    }
+
+    #[test]
+    fn orchestrator_context_includes_agents_and_protocol() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+
+        let config = OrchestrationConfig {
+            name: "code-review".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "claude".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: Some("You coordinate the team.".to_string()),
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "coder".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("Implements code changes".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "reviewer".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        };
+
+        let content = build_orchestrator_context(&config);
+
+        // Contains the orchestrator's own template.
+        assert!(content.contains("You coordinate the team."));
+        // Lists worker agents with descriptions.
+        assert!(content.contains("**coder**: Implements code changes"));
+        assert!(content.contains("**reviewer**: (no description)"));
+        // Does NOT list the orchestrator itself.
+        assert!(!content.contains("**orchestrator**"));
+        // Contains delegation protocol.
+        assert!(content.contains("Delegation protocol"));
+        assert!(content.contains("/work-done"));
+        // Instructs orchestrator to wait.
+        assert!(content.contains("wait for the user to provide instructions"));
+    }
+
+    #[test]
+    fn orchestrator_context_no_template() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+
+        let config = OrchestrationConfig {
+            name: "test".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "lead".to_string(),
+                    command: "claude".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "worker".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("Does work".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        };
+
+        let content = build_orchestrator_context(&config);
+        // Starts directly with available agents (no template preamble).
+        assert!(content.starts_with("## Available agents"));
+        assert!(content.contains("**worker**: Does work"));
+    }
+
+    #[test]
+    fn prepare_orchestrator_prompt_writes_file() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = OrchestrationConfig {
+            name: "test".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "lead".to_string(),
+                    command: "claude".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "worker".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("Does work".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        };
+
+        let cwd = dir.path().to_str().unwrap();
+        let prompt = prepare_orchestrator_prompt(&config, cwd);
+        assert!(prompt.is_some());
+        let prompt = prompt.unwrap();
+        // One-liner referencing the file.
+        assert!(prompt.contains("orchestrator-context.md"));
+        assert!(!prompt.contains('\n'));
+        // File was written.
+        let file_path = dir.path().join(".dot-agent-deck/orchestrator-context.md");
+        assert!(file_path.exists());
+        let content = std::fs::read_to_string(file_path).unwrap();
+        assert!(content.contains("Available agents"));
+        assert!(content.contains("**worker**: Does work"));
     }
 
     #[test]
