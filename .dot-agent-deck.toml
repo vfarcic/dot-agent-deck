@@ -53,3 +53,9 @@ name = "auditor"
 command = "devbox run oc-codex"
 description = "Audits for security vulnerabilities, unsafe code, and OWASP top 10 issues"
 prompt_template = "Audit for security vulnerabilities, unsafe code, and OWASP top 10 issues. When the task references a PRD file, read it to understand the security context and any security-related requirements."
+
+[[orchestrations.roles]]
+name = "release"
+command = "devbox run oc-mini"
+description = "Runs the release process: /prd-done to create PR, merge, and close issue"
+prompt_template = "You are a release agent. Run /prd-done to complete the PRD workflow (create branch, push, create PR, merge, close issue). If any step fails (e.g., failing CI checks, merge conflicts, or reviewer-requested changes), report the issue clearly so the orchestrator can delegate fixes."
