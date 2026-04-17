@@ -791,32 +791,8 @@ fn dispatch_delegate_events(
     // 1. Drain all pending delegate events under a short write-lock.
     let events: Vec<_> = state.blocking_write().delegate_events.drain(..).collect();
 
-    if !events.is_empty() {
-        tracing::info!(count = events.len(), "dispatch: drained delegate events");
-    }
-
     for signal in events {
-        tracing::info!(
-            pane_id = %signal.pane_id,
-            targets = ?signal.to,
-            "dispatch: processing delegate signal"
-        );
-
         // 2. Find the orchestration tab that owns this pane.
-        let all_tab_pane_ids: Vec<_> = tab_manager
-            .tabs()
-            .iter()
-            .filter_map(|t| match t {
-                Tab::Orchestration { role_pane_ids, .. } => Some(role_pane_ids.clone()),
-                _ => None,
-            })
-            .collect();
-        tracing::info!(
-            signal_pane_id = %signal.pane_id,
-            orchestration_tabs_pane_ids = ?all_tab_pane_ids,
-            "dispatch: searching for matching tab"
-        );
-
         let tab_idx = tab_manager
             .tabs()
             .iter()
@@ -826,7 +802,6 @@ fn dispatch_delegate_events(
             tracing::warn!(pane_id = %signal.pane_id, "dispatch: pane not in any orchestration tab");
             continue;
         };
-        tracing::info!(tab_idx, "dispatch: found matching orchestration tab");
 
         // 3. Extract what we need from the tab (borrow-safely).
         let (config, cwd) = match &tab_manager.tabs()[tab_idx] {
@@ -898,12 +873,6 @@ fn dispatch_delegate_events(
                 let _ = pane.write_to_pane(&new_pane_id, &role.command);
 
                 // Defer prompt injection until agent is ready.
-                tracing::info!(
-                    role = %role.name,
-                    old_pane = %old_pane_id,
-                    new_pane = %new_pane_id,
-                    "dispatch: restarted pane (clear=true), prompt queued"
-                );
                 ui.pending_dispatches.push(PendingDispatch {
                     pane_id: new_pane_id,
                     prompt,
@@ -915,11 +884,6 @@ fn dispatch_delegate_events(
                     Tab::Orchestration { role_pane_ids, .. } => role_pane_ids[role_idx].clone(),
                     _ => unreachable!(),
                 };
-                tracing::info!(
-                    role = %role.name,
-                    pane_id = %pane_id,
-                    "dispatch: injecting prompt directly (clear=false)"
-                );
                 let _ = pane.write_to_pane(&pane_id, &prompt);
             }
         }
@@ -1013,19 +977,11 @@ fn process_pending_dispatches(
     pane: &Arc<dyn PaneController>,
     snapshot: &AppState,
 ) {
-    if !ui.pending_dispatches.is_empty() {
-        tracing::info!(
-            count = ui.pending_dispatches.len(),
-            pane_ids = ?ui.pending_dispatches.iter().map(|pd| &pd.pane_id).collect::<Vec<_>>(),
-            "pending_dispatches: checking readiness"
-        );
-    }
     ui.pending_dispatches.retain(|pd| {
         let ready = snapshot.sessions.values().any(|s| {
             s.pane_id.as_deref() == Some(pd.pane_id.as_str()) && s.agent_type != AgentType::None
         });
         if ready {
-            tracing::info!(pane_id = %pd.pane_id, "pending_dispatches: agent ready, injecting prompt");
             let _ = pane.write_to_pane(&pd.pane_id, &pd.prompt);
             return false;
         }
@@ -2077,14 +2033,25 @@ pub fn run_tui(
                     .filter(|(_, s)| s.pane_id.as_ref().is_none_or(|pid| !exclude.contains(pid)))
                     .collect()
             }
-            Tab::Orchestration { role_pane_ids, .. } => all_filtered
-                .into_iter()
-                .filter(|(_, s)| {
+            Tab::Orchestration { role_pane_ids, .. } => {
+                let mut orch_filtered: Vec<_> = all_filtered
+                    .into_iter()
+                    .filter(|(_, s)| {
+                        s.pane_id
+                            .as_ref()
+                            .is_some_and(|pid| role_pane_ids.contains(pid))
+                    })
+                    .collect();
+                // Sort by role config order, not numeric pane ID, so recreated
+                // panes (clear=true) keep their original card position.
+                orch_filtered.sort_by_key(|(_, s)| {
                     s.pane_id
                         .as_ref()
-                        .is_some_and(|pid| role_pane_ids.contains(pid))
-                })
-                .collect(),
+                        .and_then(|pid| role_pane_ids.iter().position(|p| p == pid))
+                        .unwrap_or(usize::MAX)
+                });
+                orch_filtered
+            }
             _ => all_filtered,
         };
         let total = filtered.len();

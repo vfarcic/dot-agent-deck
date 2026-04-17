@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::event::{AgentEvent, AgentType, DelegateSignal, EventType, WorkDoneSignal};
 
@@ -133,17 +133,10 @@ impl AppState {
     /// Handle a delegate signal from the orchestrator.
     /// Stores the signal for dispatch (M5).
     pub fn handle_delegate(&mut self, signal: DelegateSignal) {
-        info!(
-            pane_id = %signal.pane_id,
-            targets = ?signal.to,
-            known_panes = ?self.pane_role_map.keys().collect::<Vec<_>>(),
-            "handle_delegate: checking pane_role_map"
-        );
         if !self.pane_role_map.contains_key(&signal.pane_id) {
             warn!(pane_id = %signal.pane_id, "delegate from unknown pane");
             return;
         }
-        info!(pane_id = %signal.pane_id, "handle_delegate: accepted, queued for dispatch");
         self.delegate_events.push(signal);
     }
 
