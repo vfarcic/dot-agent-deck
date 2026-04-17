@@ -742,11 +742,14 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          ```\n",
     );
 
-    // 4. Wait for user instructions.
+    // 4. Important guidelines.
     content.push_str(
         "\n## Important\n\n\
          Do NOT take any action yet. Read and acknowledge your role and available agents, \
-         then wait for the user to provide instructions on what to work on.\n",
+         then wait for the user to provide instructions on what to work on.\n\n\
+         After identifying the next task, delegate immediately. Do not propose an analysis step, \
+         design discussion, or implementation plan — workers own that. Your job is to frame the \
+         task clearly (what to do, relevant file paths, constraints) and hand it off.\n",
     );
 
     content
