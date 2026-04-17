@@ -626,28 +626,36 @@ fn resize_dashboard_panes(
         if pane_ids.is_empty() {
             return;
         }
-        let right_width = (area.width * 67 / 100).saturating_sub(2);
+
+        // Mirror the render layout exactly: tab bar + main content + hints bar.
+        let chrome_rows: u16 = if tab_manager.show_tab_bar() { 1 } else { 0 };
+        let main_height = area.height.saturating_sub(chrome_rows + 1); // +1 for hints bar
+        // Right panel is 67% of width.
+        let right_width = area.width * 67 / 100;
         let pane_count = pane_ids.len() as u16;
-        // Account for UI chrome: tab bar (1 row when shown), info bar (1 row),
-        // and hints bar (1 row) so panes don't push the status line off screen.
-        let chrome_rows: u16 = if tab_manager.show_tab_bar() { 3 } else { 2 };
-        let usable_height = area.height.saturating_sub(chrome_rows);
+
+        // Mirror the stacked/tiled layout from render_terminal_panes.
         for pane_id in &pane_ids {
-            let is_focused = embedded.focused_pane_id().as_deref() == Some(pane_id.as_str());
-            let rows = match ui.pane_layout {
-                PaneLayout::Tiled => (usable_height / pane_count).saturating_sub(2),
+            let is_focused = embedded.focused_pane_id().as_deref() == Some(pane_id.as_str())
+                || (embedded.focused_pane_id().is_none() && pane_id == &pane_ids[0]);
+            let chunk_height = match ui.pane_layout {
+                PaneLayout::Tiled => main_height / pane_count,
                 PaneLayout::Stacked => {
-                    if is_focused
-                        || (embedded.focused_pane_id().is_none() && pane_id == &pane_ids[0])
-                    {
-                        usable_height.saturating_sub(2 + pane_count.saturating_sub(1))
+                    if is_focused {
+                        // Fill(1) gets: total - (unfocused_count * 1)
+                        let unfocused = pane_count.saturating_sub(1);
+                        main_height.saturating_sub(unfocused)
                     } else {
-                        0
+                        1 // collapsed title bar
                     }
                 }
             };
-            if rows > 0 {
-                let _ = embedded.resize_pane_pty(pane_id, rows, right_width);
+            // Inner rows = chunk height minus border (2 rows for top+bottom).
+            let rows = chunk_height.saturating_sub(2);
+            // Inner cols = right panel width minus border (2 cols for left+right).
+            let cols = right_width.saturating_sub(2);
+            if rows > 0 && cols > 0 {
+                let _ = embedded.resize_pane_pty(pane_id, rows, cols);
             }
         }
     }
@@ -2296,42 +2304,10 @@ pub fn run_tui(
             let ev = event::read()?;
 
             // Handle terminal resize: update PTY dimensions for all embedded panes.
-            if let Event::Resize(w, h) = ev {
-                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-                    let pane_ids = embedded.pane_ids();
-                    if !pane_ids.is_empty() {
-                        // Width depends on active tab layout:
-                        // - Dashboard: right panel is 67% of width
-                        // - Mode tab: both agent and side panes are 50% of width
-                        let is_mode_tab = tab_manager.active_mode_name().is_some();
-                        let pane_width = if is_mode_tab {
-                            (w * 50 / 100).saturating_sub(2)
-                        } else {
-                            (w * 67 / 100).saturating_sub(2)
-                        };
-                        let pane_count = pane_ids.len() as u16;
-                        for pane_id in &pane_ids {
-                            let is_focused =
-                                embedded.focused_pane_id().as_deref() == Some(pane_id.as_str());
-                            let rows = match ui.pane_layout {
-                                PaneLayout::Tiled => (h / pane_count).saturating_sub(2),
-                                PaneLayout::Stacked => {
-                                    if is_focused
-                                        || (embedded.focused_pane_id().is_none()
-                                            && pane_id == &pane_ids[0])
-                                    {
-                                        h.saturating_sub(2 + pane_count.saturating_sub(1))
-                                    } else {
-                                        0 // collapsed panes don't need resize
-                                    }
-                                }
-                            };
-                            if rows > 0 {
-                                let _ = embedded.resize_pane_pty(pane_id, rows, pane_width);
-                            }
-                        }
-                    }
-                }
+            if let Event::Resize(_w, _h) = ev {
+                let frame_area = terminal.get_frame().area();
+                resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
+                resize_mode_tab_panes(&*pane, &tab_manager, frame_area);
                 break; // re-render after resize
             }
 
