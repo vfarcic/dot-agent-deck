@@ -6030,20 +6030,22 @@ mod tests {
     fn make_orchestration(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
             name: name.to_string(),
-            max_rounds: 3,
-            auto: false,
             roles: vec![
                 OrchestrationRoleConfig {
                     name: "coder".to_string(),
                     command: "claude".to_string(),
                     start: true,
-                    prompt_template: "Code.".to_string(),
+                    description: None,
+                    prompt_template: Some("Code.".to_string()),
+                    clear: true,
                 },
                 OrchestrationRoleConfig {
                     name: "reviewer".to_string(),
                     command: "claude".to_string(),
                     start: false,
-                    prompt_template: "Review.".to_string(),
+                    description: Some("Reviews code".to_string()),
+                    prompt_template: Some("Review.".to_string()),
+                    clear: true,
                 },
             ],
         }

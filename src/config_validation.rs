@@ -123,13 +123,18 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
             }
         }
 
-        // max_rounds must be > 0.
-        if orch.max_rounds == 0 {
-            issues.push(ValidationIssue {
-                severity: Severity::Error,
-                scope: orch.name.clone(),
-                message: "max_rounds must be greater than 0".to_string(),
-            });
+        // Warn about worker roles without descriptions (helps orchestrator know capabilities).
+        for role in &orch.roles {
+            if !role.start && role.description.is_none() {
+                issues.push(ValidationIssue {
+                    severity: Severity::Warning,
+                    scope: orch.name.clone(),
+                    message: format!(
+                        "worker role '{}' has no description — orchestrator won't know its capabilities",
+                        role.name
+                    ),
+                });
+            }
         }
     }
 
@@ -160,15 +165,19 @@ mod tests {
             name: name.to_string(),
             command: "claude".to_string(),
             start,
-            prompt_template: format!("Do {name}."),
+            description: if start {
+                None
+            } else {
+                Some(format!("Does {name} tasks"))
+            },
+            prompt_template: None,
+            clear: true,
         }
     }
 
     fn make_orchestration(name: &str, roles: Vec<OrchestrationRoleConfig>) -> OrchestrationConfig {
         OrchestrationConfig {
             name: name.to_string(),
-            max_rounds: 3,
-            auto: false,
             roles,
         }
     }
@@ -390,15 +399,26 @@ mod tests {
     }
 
     #[test]
-    fn orchestration_max_rounds_zero_is_error() {
-        let config = make_orch_config(vec![OrchestrationConfig {
-            name: "zero".to_string(),
-            max_rounds: 0,
-            auto: false,
-            roles: vec![make_role("a", true), make_role("b", false)],
-        }]);
+    fn orchestration_worker_without_description_warns() {
+        let config = make_orch_config(vec![make_orchestration(
+            "test",
+            vec![
+                make_role("orchestrator", true),
+                OrchestrationRoleConfig {
+                    name: "worker".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        )]);
         let issues = validate_config(&config);
-        assert!(issues.iter().any(|i| i.severity == Severity::Error
-            && i.message.contains("max_rounds must be greater than 0")));
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Warning && i.message.contains("no description"))
+        );
     }
 }

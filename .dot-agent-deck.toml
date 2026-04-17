@@ -16,17 +16,27 @@ pattern = "git (log|status|show)"
 watch = false
 
 [[orchestrations]]
-max_rounds = 3
-auto = false
+name = "code-review"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-new"
+start = true
+prompt_template = "You coordinate the team. You NEVER do work yourself — only delegate to available agents."
 
 [[orchestrations.roles]]
 name = "coder"
 command = "devbox run agent-new"
-start = true
-prompt_template = "Validate and implement all the requested changes you think are valid."
+description = "Implements code changes, fixes bugs, writes features"
+prompt_template = "Always run cargo fmt --check and cargo clippy -- -D warnings before finishing. Fix any issues found."
 
 [[orchestrations.roles]]
 name = "reviewer"
 command = "devbox run agent-new"
-start = false
-prompt_template = "Review the code changes for correctness, style, and potential issues. Report your findings but do not make any changes yourself."
+description = "Reviews code for correctness, style, and potential issues"
+prompt_template = "Report findings but do not make changes yourself."
+
+[[orchestrations.roles]]
+name = "auditor"
+command = "devbox run agent-new"
+description = "Audits for security vulnerabilities, unsafe code, and OWASP top 10 issues"

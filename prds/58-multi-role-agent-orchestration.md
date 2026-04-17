@@ -13,29 +13,49 @@ The primitives exist (agents can read/write files, git diffs are natural handoff
 
 ## Solution Overview
 
-Add an **orchestration system** to dot-agent-deck that coordinates multi-role agent workflows through a **skill-based handoff** mechanism. Orchestrations are defined in `.dot-agent-deck.toml` alongside existing modes. A new **Orchestration tab** launches all role agents simultaneously, and coordinates turn-taking — either automatically or with manual user approval — while every agent remains fully interactive.
+Add an **orchestration system** to dot-agent-deck that coordinates multi-role agent workflows through a **dedicated orchestrator agent**. Orchestrations are defined in `.dot-agent-deck.toml` alongside existing modes. A new **Orchestration tab** launches all role agents simultaneously, while a designated orchestrator agent (the `start = true` role) drives all delegation decisions dynamically. Every agent remains fully interactive — the user can talk to any pane at any time.
 
-Instead of requiring agents to write structured handoff files with specific formats, a generic `/work-done` skill (deployed as a project-scoped command) signals completion. When an agent invokes `/work-done`, it writes a free-form summary of what it did. The **orchestrator** handles all routing: it identifies which role finished (via pane-to-role mapping), reads the summary, constructs the next role's prompt with the relevant context, and injects it. Agents never need to know about other roles, handoff formats, or the orchestration topology.
+The orchestrator agent is an LLM that never does work itself — it only delegates to worker agents and coordinates their collaboration. dot-agent-deck acts as the **message bus**: it intercepts the orchestrator's delegation commands, injects prompts into worker panes, monitors `/work-done` signals from workers, and reports results back to the orchestrator. The orchestrator decides routing (who to call next), parallel fan-out (multiple agents at once), and termination (when the orchestration is complete). Worker agents signal completion via a generic `/work-done` skill that writes a per-role summary file (`work-done-{role-name}.md`).
 
 ### Config Format
 
 ```toml
 [[orchestrations]]
-name = "tdd-cycle"
-max_rounds = 3
-auto = false  # false = user presses key to advance, true = auto-inject on handoff detection
+name = "code-review"
 
 [[orchestrations.roles]]
-name = "tester"
+name = "orchestrator"
 command = "claude"
-start = true
-prompt_template = "Write failing tests for the feature."
+start = true  # the orchestrator — delegates work, never does it
+prompt_template = """
+You are an orchestration manager. You NEVER do work yourself.
+You only delegate to available agents and coordinate their work.
+"""
 
 [[orchestrations.roles]]
 name = "coder"
 command = "claude --model sonnet"
-prompt_template = "Make the tests pass."
+description = "Implements code changes, fixes bugs, writes features"
+prompt_template = "Always run cargo test before finishing."  # optional standing instructions
+# clear = true  (default — restart agent session between delegations)
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "claude"
+description = "Reviews code for correctness, style, and edge cases"
+
+[[orchestrations.roles]]
+name = "security-auditor"
+command = "claude"
+description = "Audits for security vulnerabilities"
+
+[[orchestrations.roles]]
+name = "release"
+command = "claude"
+description = "Runs release workflow: changelog, tag, PR"
 ```
+
+The `start = true` role is the orchestrator — it receives the user's initial request and delegates to worker roles. dot-agent-deck auto-appends the available agents list (built from worker `name` + `description`) and the delegation protocol to the orchestrator's `prompt_template`.
 
 ### Work-Done Skill
 
@@ -62,34 +82,33 @@ This design means:
 
 1. User opens new dir dialog, selects a directory
 2. If `.dot-agent-deck.toml` has `[[orchestrations]]`, they appear as options alongside modes
-3. User selects an orchestration (e.g., "tdd-cycle")
+3. User selects an orchestration (e.g., "code-review")
 4. New Orchestration tab opens — all role panes are created, each role's `command` launches
-5. The role with `start = true` gets focus and its `prompt_template` is injected
-6. Agent works interactively (user approves tool calls, answers questions)
-7. Agent calls `/work-done` → writes summary file, runs `dot-agent-deck work-done`
-8. Orchestrator detects completion via pane-to-role mapping:
-   - **`auto = true`**: Reads summary, builds next role's prompt, injects it, shifts focus
-   - **`auto = false`**: Shows notification in UI; user presses keybinding (`o`) to advance
-9. Next role receives prompt (task instructions + previous role's summary), works interactively
-10. Cycle repeats until max_rounds reached or user stops the orchestration
-11. User pushes to git when satisfied
+5. The orchestrator (`start = true`) gets focus; its prompt is injected (base `prompt_template` + auto-appended agents list + delegation protocol)
+6. User types a request to the orchestrator (e.g., "implement task 1 of this PRD")
+7. Orchestrator calls `/work-done` with a delegation payload (target agents + task prompt)
+8. dot-agent-deck parses the delegation, optionally restarts worker sessions (`clear = true`), prepends worker's `prompt_template` if present, injects combined prompt into target pane(s)
+9. Worker agent(s) work interactively — user can interact with any pane at any time
+10. Worker calls `/work-done` → writes `work-done-{role-name}.md`; if parallel delegation, system waits for all workers
+11. dot-agent-deck combines worker summaries and injects them into the orchestrator pane
+12. Orchestrator decides: delegate again (back to step 7) or signal `DONE`
+13. On `DONE`, orchestration is marked complete
 
 ### Orchestration Tab Layout
 
 **Left sidebar** — role cards stacked vertically:
-- Role name + command (e.g., "tester — claude")
+- Role name + command (e.g., "coder — claude")
 - Current status (Working, Waiting, Done)
-- Round indicator (Round 2/3)
-- Last handoff status (NEEDS_CHANGES)
-- Active role highlighted
+- Active role(s) highlighted
 
 **Right area** — two view modes toggled by keybinding:
-- **Focused**: Full-width pane for the active role's agent, follows turn automatically
+- **Focused**: Full-width pane for the active role's agent
 - **Split**: All agent panes visible side by side
 
 **Bottom status bar** — orchestration-level info:
-- `"tdd-cycle: Round 2/3 — Coder's turn (auto)"`
-- Or in manual mode: `"Press 'o' to send prompt to Coder"`
+- `"code-review: coder working, reviewer waiting"`
+- `"code-review: reviewer + security-auditor working (parallel)"`
+- `"code-review: complete"`
 
 ### Config Generation Extension
 
@@ -101,26 +120,25 @@ The existing config generation flow (`config_gen.rs`) that guides agents to crea
 ## Scope
 
 ### In Scope
-- `OrchestrationConfig` and `OrchestrationRoleConfig` structs in `project_config.rs`
-- Config validation: exactly one `start = true` role, unique role names
-- Generic `/work-done` skill: project-scoped command files for Claude Code and OpenCode
-- `dot-agent-deck work-done` CLI subcommand: notifies the orchestrator that an agent finished
-- Orchestration state machine: track current role, round count, pane-to-role mapping
+- `OrchestrationConfig` and `OrchestrationRoleConfig` structs in `project_config.rs` with `description`, `clear`, optional `prompt_template`
+- Config validation: exactly one `start = true` role, unique role names, worker description warnings
+- Orchestrator prompt construction: auto-append available agents list and delegation protocol to `start = true` role's `prompt_template`
+- Generic `/work-done` skill: project-scoped command files for Claude Code and OpenCode, per-role files (`work-done-{role-name}.md`)
+- `dot-agent-deck work-done` CLI subcommand: notifies the daemon that an agent finished
+- Message bus: intercept orchestrator delegation commands, dispatch prompts to worker panes, report work-done summaries back to orchestrator
+- Parallel fan-out: orchestrator delegates to multiple agents, system waits for all `/work-done` signals before reporting back
+- Worker context isolation: restart agent session between delegations when `clear = true` (default)
 - Orchestration tab type in the tab manager with role cards and pane layout
 - Focused and split view modes for the orchestration tab
-- Prompt construction: combine `prompt_template` with previous role's summary for context
 - Prompt injection via PTY stdin (reusing embedded pane write mechanism)
-- Manual mode: keybinding (`o`) to advance to next role
-- Auto mode: automatic prompt injection on work-done detection
-- Termination: stop on max_rounds or user-initiated stop, show completion notification
+- Orchestration completion when orchestrator signals `DONE`
 - New dir dialog: show orchestrations when toml defines them
 - Config generation: extend prompt to suggest orchestrations
 
 ### Out of Scope
 - Multi-directory orchestrations (all roles work in same directory)
 - Remote agent orchestration (all agents run locally)
-- Conditional role chains (role A → B or C based on status) — future enhancement
-- Parallel role execution (roles run sequentially, one at a time) — future enhancement
+- TDD orchestration with unit tests (unit tests too tightly coupled to implementation; functional/integration testing possible but infrastructure doesn't exist yet)
 - Integration with external CI/CD or git push automation
 
 ## Technical Approach
@@ -141,10 +159,6 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrchestrationConfig {
     pub name: String,
-    #[serde(default = "default_max_rounds")]
-    pub max_rounds: usize,
-    #[serde(default)]
-    pub auto: bool,
     pub roles: Vec<OrchestrationRoleConfig>,
 }
 
@@ -154,11 +168,16 @@ pub struct OrchestrationRoleConfig {
     pub command: String,
     #[serde(default)]
     pub start: bool,
-    pub prompt_template: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+    #[serde(default = "default_clear")]
+    pub clear: bool,  // default true — restart agent session between delegations
 }
 ```
 
-Note: `handoff_dir`, `writes`, and `reads` fields have been removed. The orchestrator manages all handoff content internally — agents just call `/work-done` and the orchestrator handles routing.
+The orchestrator agent (`start = true`) drives all routing. `description` on worker roles is used to auto-build the orchestrator's available agents list. `prompt_template` on workers is optional standing instructions prepended to each task prompt. `clear` controls whether the agent session is restarted between delegations for context isolation.
 
 ### Work-Done Skill and CLI Subcommand
 
@@ -167,40 +186,54 @@ Note: `handoff_dir`, `writes`, and `reads` fields have been removed. The orchest
 - `.opencode/commands/work-done.md` — for OpenCode agents
 
 Each skill instructs the agent to:
-1. Write a free-form summary to `.dot-agent-deck/work-done.md` describing what it accomplished
-2. Run `dot-agent-deck work-done` to notify the orchestrator
+1. Write a free-form summary to `.dot-agent-deck/work-done-{role-name}.md` describing what it accomplished
+2. Run `dot-agent-deck work-done` to notify the daemon
+
+Per-role files (`work-done-{role-name}.md`) prevent parallel agents from overwriting each other's summaries.
 
 **`dot-agent-deck work-done` CLI subcommand**:
 - Sends a notification to the running daemon (via the existing daemon communication channel)
 - Includes the pane ID of the calling agent (derived from environment or PTY context)
-- The orchestrator receives the notification, maps pane ID → role, and handles the transition
+- The daemon maps pane ID → role name and processes the work-done signal
 
-### Orchestration State Machine (new `src/orchestration.rs`)
+### Message Bus (new `src/orchestration.rs`)
+
+dot-agent-deck acts as a message bus between the orchestrator agent and worker agents:
 
 ```rust
 pub struct OrchestrationState {
     pub config: OrchestrationConfig,
-    pub current_role_index: usize,
-    pub round: usize,
+    pub role_pane_ids: HashMap<String, String>,  // role name → pane ID
+    pub pending_workers: HashSet<String>,          // role names we're waiting on
     pub status: OrchestrationStatus,
-    pub role_pane_ids: Vec<String>,     // role index → pane ID
-    pub last_summary: Option<String>,   // previous role's work-done summary
 }
 
 pub enum OrchestrationStatus {
-    Running,
-    WaitingForUser,    // manual mode, work-done detected
-    Completed(String), // reason: max rounds, user stopped
+    WaitingForOrchestrator,  // orchestrator is thinking/working
+    Delegated,               // workers are executing, waiting for work-done signals
+    Completed,               // orchestrator signaled DONE
 }
 ```
 
+**Message bus responsibilities:**
+1. Parse orchestrator's `/work-done` output to identify delegation (targets + prompt) or completion (`DONE`)
+2. Dispatch prompts to target worker panes (with optional session restart and `prompt_template` prepend)
+3. Track pending workers in parallel fan-out
+4. Combine worker summaries when all pending workers complete
+5. Inject combined results into orchestrator pane
+
 ### Prompt Construction and Injection
 
-When a role completes and the next role should start:
-1. Read the summary file written by the completed role
-2. Build the next role's prompt: `prompt_template` + "\n\n## Context from previous role\n" + summary
-3. Write the constructed prompt to the next role's pane via PTY stdin
-4. Shift focus to that pane
+**Orchestrator prompt** (constructed once at orchestration launch):
+1. Start with the orchestrator's `prompt_template` from config
+2. Auto-append available agents list built from worker roles' `name` + `description`
+3. Auto-append delegation protocol instructions (hardcoded by dot-agent-deck)
+
+**Worker prompt** (constructed on each delegation):
+1. If worker has `prompt_template`: prepend as standing instructions
+2. Append the orchestrator's task prompt from the delegation
+3. Append `/work-done` instruction
+4. Inject via PTY stdin into the worker's pane
 
 ### New Dir Dialog Integration
 
@@ -218,21 +251,23 @@ Add orchestration guidance to the prompt template:
 
 ## Success Criteria
 
-- User can define orchestrations in `.dot-agent-deck.toml` and select them from the new dir dialog
+- User can define orchestrations in `.dot-agent-deck.toml` with an orchestrator role and worker roles
 - All role agents launch simultaneously in their own panes
-- The `start = true` role receives its prompt and gets focus automatically
-- Agent calling `/work-done` triggers the orchestrator to route to the next role
-- In manual mode, user sees notification and presses key to advance
-- In auto mode, next role's prompt is injected automatically with previous role's summary
-- Orchestration terminates on max_rounds or user-initiated stop
-- Role cards show current status, round, and summary info
+- The orchestrator (`start = true`) receives its prompt with auto-appended agents list and delegation protocol
+- Orchestrator delegates to worker(s) via `/work-done` with delegation payload; dot-agent-deck injects prompts into target panes
+- Parallel fan-out works: orchestrator delegates to multiple agents, system waits for all `/work-done` signals before reporting back
+- Worker agent sessions are restarted between delegations when `clear = true` (default)
+- Worker `prompt_template` (standing instructions) is prepended to task prompt when present
+- Orchestration terminates when orchestrator signals `DONE`
+- User can interact with any pane at any time during the orchestration
+- Role cards show current status (Working/Waiting/Done)
 - Focused/split view toggle works
 - Config generation suggests orchestrations for applicable projects
 - Existing modes and dashboard functionality are unaffected
 
 ## Milestones
 
-Milestones are ordered to reach a usable two-agent workflow as fast as possible ("Phase 1: Dogfood"), so we can use the orchestration system on this very PRD while building the remaining features.
+Milestones are ordered to reach a usable orchestrator-driven workflow as fast as possible ("Phase 1: Dogfood"), so we can use the orchestration system on this very PRD while building the remaining features.
 
 ### Phase 1a: Manual validation — prove the workflow before automating
 
@@ -241,46 +276,55 @@ Goal: validate the full orchestration chain manually. User coordinates handoffs 
 - [x] **M1: Config parsing** — `OrchestrationConfig` and `OrchestrationRoleConfig` structs with validation (exactly one `start = true`, unique role names) in `src/project_config.rs`
 - [x] **M3a: Basic orchestration tab (pane launch)** — new `Tab::Orchestration` variant that launches all role panes side by side (split view only, no role cards yet), no prompt injection — user types manually
 - [x] **M4a: Work-done skill file** — generic `/work-done` skill for Claude Code (`.claude/skills/agent-deck-work-done/SKILL.md`) that instructs the agent to write a summary to `.dot-agent-deck/work-done.md`
-- [x] **M4b: Handoff file format design** — handoff file format documented in Design Decisions section; `.dot-agent-deck/handoff-to-{role-name}.md` combines next role's `prompt_template` with previous role's summary
+- [x] **M4b: Handoff file format design** — handoff file format documented in Design Decisions section (note: superseded by orchestrator pattern — see design decision "2026-04-17: Orchestrator agent pattern")
 
-**Manual test loop**: Launch orchestration tab → manually prompt coder → coder calls `/work-done` → user asks Claude to generate reviewer context file → user pastes reviewer prompt into reviewer pane. This validates the entire chain end-to-end.
+### Phase 1b: Config update and orchestrator prompt construction
 
-### Phase 1b: Automation — wire up the handoffs
+Goal: update config structs to match the orchestrator pattern, build the orchestrator's prompt with auto-appended agents list.
 
-Goal: automate what was validated manually. Two agents launch, first gets a prompt, user presses `o` to advance after each turn.
+- [x] **M1c: Config struct update** — remove `max_rounds` and `auto` from `OrchestrationConfig`; add `description: Option<String>`, `clear: bool` (default true), make `prompt_template: Option<String>` on `OrchestrationRoleConfig`; update validation and all tests
+- [ ] **M3b: Orchestrator prompt construction** — on orchestration launch, construct the orchestrator's full prompt: base `prompt_template` + auto-generated "Available agents" list (from worker `name` + `description`) + delegation protocol instructions; inject into the `start = true` pane
 
-- [ ] **M1b: Orchestration routing design** — design how agents determine the next role: conditional branching (reviewer sends back to coder vs. advancing to next agent), agent-driven routing (agent declares next step in work-done summary), early termination (reviewer approves, no more rounds needed). This is a design task — document the routing model in Design Decisions before implementing in M2.
-- [ ] **M2: Orchestration state machine** — `OrchestrationState` with pane-to-role mapping, round tracking, routing logic in new `src/orchestration.rs`
-- [ ] **M3b: Prompt injection for start role** — inject `prompt_template` into the `start = true` role's pane on orchestration launch (depends on M2 for state tracking)
-- [ ] **M4c: Work-done CLI subcommand** — `dot-agent-deck work-done` subcommand that notifies the orchestrator via daemon; orchestrator reads summary and updates state
-- [ ] **M5: Manual advance (`o` key)** — on keypress, orchestrator reads previous role's summary, constructs next role's prompt (`prompt_template` + summary context), injects it via PTY stdin, shifts focus
+### Phase 1c: Message bus — work-done handling and delegation dispatch
 
-**At this point**: you can define a two-role orchestration in TOML, launch it, and manually cycle between agents with a single keypress. Good enough to dogfood on PRD #58 tasks.
+Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orchestrator delegates, workers execute, results flow back.
 
-### Phase 2: Polish — UI, automation, and integration
+- [ ] **M4c: Work-done CLI subcommand** — `dot-agent-deck work-done` subcommand that notifies the running daemon; daemon maps pane ID → role name; writes summary to `work-done-{role-name}.md` (per-role files to support parallel agents)
+- [ ] **M4d: Work-done skill update** — update `/work-done` skill to write per-role files (`work-done-{role-name}.md`) instead of single `work-done.md`; role name injected by dot-agent-deck as environment variable or similar mechanism
+- [ ] **M5: Delegation dispatch** — when orchestrator calls `/work-done` with a delegation payload (target agents + prompt), dot-agent-deck parses it, optionally restarts worker sessions (`clear = true`), prepends worker's `prompt_template` if present, and injects the combined prompt into target pane(s) via PTY stdin
+- [ ] **M5b: Orchestrator feedback loop** — when a worker calls `/work-done`, dot-agent-deck reads its summary file; if parallel delegation is active, waits for all pending workers; then injects combined summaries into the orchestrator pane
+- [ ] **M5c: Orchestration completion** — when orchestrator signals `DONE` in its `/work-done` output, dot-agent-deck marks the orchestration as complete and shows a completion notification
+
+**Open design questions for Phase 1c:**
+- Exact format of the delegation payload in `/work-done` (structured fields? free-form with markers?)
+- How the orchestrator distinguishes "delegate to agents" from "orchestration complete" in its `/work-done` output
+- How dot-agent-deck passes the role name to the agent (env var? skill parameter? file naming convention?)
+
+**At this point**: orchestrator-driven workflow is functional. User talks to orchestrator, orchestrator delegates to workers (including parallel), results flow back, orchestrator decides next steps or completes.
+
+### Phase 2: Polish — UI and integration
 
 - [ ] **M6: New dir dialog integration** — show orchestrations alongside modes when TOML defines them, launch Orchestration tab on selection, deploy `/work-done` skill files automatically
-- [ ] **M7: Role cards sidebar** — left sidebar with role name, command, status (Working/Waiting/Done), round indicator, active role highlight
-- [ ] **M8: Auto mode** — when `auto = true`, automatically inject next role's prompt on work-done detection without waiting for `o` keypress
+- [ ] **M7: Role cards sidebar** — left sidebar with role name, status (Working/Waiting/Done), active role highlight
 - [ ] **M9: Focused/split view toggle** — keybinding to switch between full-width active role pane and side-by-side split
-- [ ] **M10: Termination and status bar** — stop on max_rounds or user-initiated stop, show orchestration-level info in bottom status bar
+- [ ] **M10: Status bar** — show orchestration-level info in bottom status bar (e.g., "code-review: coder working, reviewer waiting")
 - [ ] **M11: Config generation extension** — update `src/config_gen.rs` prompt to suggest orchestrations alongside modes
 
 ### Phase 3: Quality
 
-- [ ] **M12: Tests** — config parsing, state machine, work-done handling, orchestration lifecycle
+- [ ] **M12: Tests** — config parsing, message bus, work-done handling, delegation dispatch, parallel fan-out
 - [ ] **M13: No regressions** — all existing tests passing
 
 ## Key Files
 
 - `src/project_config.rs` — Orchestration config structs and TOML parsing
-- `src/orchestration.rs` — New module: state machine, work-done handling, prompt construction, turn coordination
+- `src/orchestration.rs` — New module: message bus, delegation dispatch, work-done handling, prompt construction
 - `src/tab.rs` — Orchestration tab type, role card rendering, pane layout
-- `src/ui.rs` — Orchestration tab UI, focused/split toggle, status bar, `o` keybinding
+- `src/ui.rs` — Orchestration tab UI, focused/split toggle, status bar
 - `src/config_gen.rs` — Extended prompt template with orchestration guidance
 - `src/lib.rs` — Export new orchestration module
 - `src/main.rs` — Wire orchestration into event loop, handle `work-done` subcommand
-- `skills/work-done.md` — Generic work-done skill template (deployed per-project)
+- `.claude/skills/agent-deck-work-done/SKILL.md` — Work-done skill template (deployed per-project)
 
 ## Design Decisions
 
@@ -306,6 +350,47 @@ Goal: automate what was validated manually. Two agents launch, first gets a prom
 - **Impact**: M4 (work-done skill) is partially prioritized ahead of M2 (state machine). The skill file and summary file format are implemented first. The CLI subcommand (`dot-agent-deck work-done`) and daemon notification are deferred until automation is needed. M2, M3b, and M5 remain unchanged but are deferred until the manual workflow is validated. A new interim step exists: manually generating handoff context files based on the designed format/logic.
 - **Manual test loop**: Launch orchestration tab → manually prompt coder → `/work-done` in coder pane → manually generate reviewer context → paste reviewer prompt. Once validated, proceed to automate (M2 → M3b → M5).
 
+### 2026-04-17: Orchestrator agent pattern replaces config-based routing
+
+- **Decision**: Replace config-encoded routing (sequential role lists, `max_rounds`, `auto` flag, manual `o` key advance) with a dedicated **orchestrator agent** — the `start = true` role — that drives all delegation dynamically. dot-agent-deck becomes a message bus, not a router.
+
+- **Rationale**: Routing decisions (who to call next, whether to fan out in parallel, when to terminate) are judgment calls that an LLM handles better than a config file. A reviewer sending work back to a coder because of critical issues vs. approving and moving to release is contextual — encoding every possible path in TOML is brittle and complex. The orchestrator agent understands context and decides.
+
+- **Key principle — context isolation**: Separate agents are valuable when a fresh perspective produces better results (reviewer evaluating code without the coder's reasoning, security auditor with no "I know this is safe" bias). Not valuable when the next agent needs the reasoning (architect→coder). The orchestrator pattern handles both since the orchestrator controls how much context to pass in each delegation.
+
+- **Config changes**:
+  - **Removed**: `max_rounds` (orchestrator decides when to stop via `DONE`), `auto` (all orchestrations are orchestrator-driven)
+  - **Added**: `description` on worker roles (optional; used to build the orchestrator's available agents list automatically)
+  - **Added**: `clear` on worker roles (optional, default `true`; whether to restart the agent session between delegations for context isolation)
+  - **Changed**: `prompt_template` on workers becomes optional standing instructions (behavior/constraints like "always run tests before finishing"), not task instructions. The orchestrator provides task instructions each time via delegation.
+  - **Changed**: `prompt_template` on the orchestrator (start=true) is base instructions. dot-agent-deck auto-appends the available agents list (built from worker `name` + `description`) and the delegation protocol.
+
+- **Delegation protocol** (hardcoded by dot-agent-deck, not user-configurable):
+  - Orchestrator delegates via `/work-done` with a delegation payload (targets + prompt)
+  - Worker agents signal completion via `/work-done` with a summary payload
+  - Orchestrator signals orchestration complete via `DONE` in its `/work-done` output
+  - All communication goes through work-done files — no PTY output parsing
+
+- **Parallel fan-out**: When the orchestrator delegates to multiple agents, dot-agent-deck injects prompts into all target panes, then waits for ALL to call `/work-done` before combining summaries and reporting back to the orchestrator. No mid-conversation injection (would corrupt agent state).
+
+- **Per-role work-done files**: `work-done-{role-name}.md` instead of a single `work-done.md`, so parallel agents don't overwrite each other.
+
+- **The flow**:
+  1. User talks to orchestrator pane
+  2. Orchestrator calls `/work-done` with delegation: targets + prompt
+  3. dot-agent-deck parses delegation, injects prompt into target pane(s) (prepending worker's `prompt_template` if present)
+  4. If `clear = true` (default), agent session is restarted before injection
+  5. Agents work; user interacts with any pane freely
+  6. Agent calls `/work-done` → writes `work-done-{role}.md`
+  7. If parallel delegation: wait for all. Then combine summaries, inject into orchestrator pane
+  8. Orchestrator decides next step (delegate again, or `DONE`)
+
+- **What dot-agent-deck does NOT do**: routing decisions, round counting, approval/rejection parsing. The orchestrator LLM owns all of that.
+
+- **Impact**: Removed `max_rounds`, `auto` from config and validation. Removed manual advance (`o` key). Parallel execution now in-scope. Milestones restructured: M1b (routing design) resolved by this decision, M2 becomes message bus instead of state machine, M5 (manual advance) removed.
+
+- **Not supported via orchestration**: TDD with separate agents — unit tests are too tightly coupled to function signatures/struct fields. A tester agent writing tests from a spec will guess at the implementation shape, then the coder contorts code to match or rewrites the tests. Functional/integration testing could work but the infrastructure doesn't exist yet.
+
 ### 2026-04-17: Handoff prompt format for inter-agent context passing
 - **Decision**: When the orchestrator advances to the next role, it constructs a handoff file at `.dot-agent-deck/handoff-to-{role-name}.md` and injects a reference-based prompt into the next agent's pane. The orchestrator also auto-appends a `/work-done` instruction so agents know how to signal completion.
 - **Injected prompt format**:
@@ -326,8 +411,10 @@ Goal: automate what was validated manually. Two agents launch, first gets a prom
 ## Risks
 
 - **PTY prompt injection timing**: If the agent is mid-output when a prompt is injected, text may interleave. Mitigation: wait for agent idle/waiting status before injecting.
-- **Work-done skill discovery**: Agents must discover and invoke the `/work-done` skill when they finish. Mitigation: the initial `prompt_template` can mention "call /work-done when you're finished" as a gentle hint.
-- **Max rounds edge case**: If agents keep cycling without converging, the orchestration should terminate cleanly at max_rounds with a clear message rather than leaving agents in limbo.
+- **Work-done skill discovery**: Agents must discover and invoke the `/work-done` skill when they finish. Mitigation: the orchestrator's delegation prompt includes a `/work-done` instruction; the skill is also discoverable via agent CLI's skill listing.
+- **Orchestrator delegation parsing**: dot-agent-deck must reliably parse DELEGATE and DONE signals from the orchestrator's `/work-done` output. LLM output may vary in format. Mitigation: define a clear structured format in the delegation protocol; validate agent names against config; reject malformed delegations with error feedback to orchestrator.
+- **Parallel fan-out deadlock**: If one agent in a parallel delegation never calls `/work-done`, the orchestrator blocks indefinitely waiting for all results. Mitigation: user can interact with the stuck agent directly; future enhancement could add a timeout.
 - **Embedded pane write**: The prompt injection mechanism depends on writing to pane stdin. Need to verify this works reliably for all supported agent CLIs (Claude Code, OpenCode, etc.).
 - **Config backward compatibility**: Adding optional `orchestrations` field to `ProjectConfig` must not break existing configs that only define modes. Using `#[serde(default)]` ensures this.
-- **Skill file deployment**: The orchestrator must deploy `/work-done` skill files to the correct CLI-specific directories when an orchestration starts. Different CLIs use different paths (`.claude/skills/` vs `.opencode/commands/`).
+- **Skill file deployment**: dot-agent-deck must deploy `/work-done` skill files to the correct CLI-specific directories when an orchestration starts. Different CLIs use different paths (`.claude/skills/` vs `.opencode/commands/`).
+- **Worker session restart**: When `clear = true`, restarting the agent session (killing and relaunching the command) must be clean — no orphaned processes, no lost PTY state. Need to verify the PTY teardown/recreation is reliable.

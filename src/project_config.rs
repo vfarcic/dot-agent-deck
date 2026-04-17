@@ -67,10 +67,6 @@ pub struct ModeRule {
 pub struct OrchestrationConfig {
     #[serde(default)]
     pub name: String,
-    #[serde(default = "default_max_rounds")]
-    pub max_rounds: usize,
-    #[serde(default)]
-    pub auto: bool,
     pub roles: Vec<OrchestrationRoleConfig>,
 }
 
@@ -80,11 +76,16 @@ pub struct OrchestrationRoleConfig {
     pub command: String,
     #[serde(default)]
     pub start: bool,
-    pub prompt_template: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+    #[serde(default = "default_clear")]
+    pub clear: bool,
 }
 
-fn default_max_rounds() -> usize {
-    3
+fn default_clear() -> bool {
+    true
 }
 
 pub fn load_project_config(dir: &Path) -> Result<Option<ProjectConfig>, ProjectConfigError> {
@@ -289,34 +290,42 @@ reactive_panes = 4
     fn parse_full_orchestration_config() {
         let toml = r#"
 [[orchestrations]]
-name = "tdd-cycle"
-max_rounds = 5
-auto = true
+name = "code-review"
 
 [[orchestrations.roles]]
-name = "tester"
+name = "orchestrator"
 command = "claude"
 start = true
-prompt_template = "Write failing tests."
+prompt_template = "You coordinate the team."
 
 [[orchestrations.roles]]
 name = "coder"
 command = "claude --model sonnet"
-prompt_template = "Make the tests pass."
+description = "Implements code changes"
+prompt_template = "Always run cargo test before finishing."
+clear = false
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.orchestrations.len(), 1);
         let orch = &config.orchestrations[0];
-        assert_eq!(orch.name, "tdd-cycle");
-        assert_eq!(orch.max_rounds, 5);
-        assert!(orch.auto);
+        assert_eq!(orch.name, "code-review");
         assert_eq!(orch.roles.len(), 2);
-        assert_eq!(orch.roles[0].name, "tester");
+        assert_eq!(orch.roles[0].name, "orchestrator");
         assert_eq!(orch.roles[0].command, "claude");
         assert!(orch.roles[0].start);
-        assert_eq!(orch.roles[0].prompt_template, "Write failing tests.");
+        assert_eq!(
+            orch.roles[0].prompt_template.as_deref(),
+            Some("You coordinate the team.")
+        );
+        assert!(orch.roles[0].description.is_none());
+        assert!(orch.roles[0].clear); // default true
         assert_eq!(orch.roles[1].name, "coder");
         assert!(!orch.roles[1].start);
+        assert_eq!(
+            orch.roles[1].description.as_deref(),
+            Some("Implements code changes")
+        );
+        assert!(!orch.roles[1].clear); // explicitly false
     }
 
     #[test]
@@ -335,12 +344,10 @@ name = "review"
 name = "writer"
 command = "claude"
 start = true
-prompt_template = "Write code."
 
 [[orchestrations.roles]]
 name = "reviewer"
 command = "claude"
-prompt_template = "Review code."
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.modes.len(), 1);
@@ -348,7 +355,7 @@ prompt_template = "Review code."
     }
 
     #[test]
-    fn orchestration_max_rounds_defaults_to_three() {
+    fn orchestration_clear_defaults_to_true() {
         let toml = r#"
 [[orchestrations]]
 name = "test"
@@ -357,19 +364,13 @@ name = "test"
 name = "a"
 command = "claude"
 start = true
-prompt_template = "Do A."
-
-[[orchestrations.roles]]
-name = "b"
-command = "claude"
-prompt_template = "Do B."
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.orchestrations[0].max_rounds, 3);
+        assert!(config.orchestrations[0].roles[0].clear);
     }
 
     #[test]
-    fn orchestration_auto_defaults_to_false() {
+    fn orchestration_description_defaults_to_none() {
         let toml = r#"
 [[orchestrations]]
 name = "test"
@@ -378,15 +379,24 @@ name = "test"
 name = "a"
 command = "claude"
 start = true
-prompt_template = "Do A."
-
-[[orchestrations.roles]]
-name = "b"
-command = "claude"
-prompt_template = "Do B."
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert!(!config.orchestrations[0].auto);
+        assert!(config.orchestrations[0].roles[0].description.is_none());
+    }
+
+    #[test]
+    fn orchestration_prompt_template_defaults_to_none() {
+        let toml = r#"
+[[orchestrations]]
+name = "test"
+
+[[orchestrations.roles]]
+name = "a"
+command = "claude"
+start = true
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert!(config.orchestrations[0].roles[0].prompt_template.is_none());
     }
 
     #[test]
@@ -398,7 +408,6 @@ name = "test"
 [[orchestrations.roles]]
 name = "worker"
 command = "claude"
-prompt_template = "Work."
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
         assert!(!config.orchestrations[0].roles[0].start);
@@ -428,12 +437,10 @@ name = "test"
 name = "a"
 command = "claude"
 start = true
-prompt_template = "Do A."
 
 [[orchestrations.roles]]
 name = "b"
 command = "claude"
-prompt_template = "Do B."
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
         assert!(config.modes.is_empty());

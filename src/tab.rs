@@ -774,20 +774,22 @@ mod tests {
     fn test_orchestration_config() -> OrchestrationConfig {
         OrchestrationConfig {
             name: "tdd-cycle".to_string(),
-            max_rounds: 3,
-            auto: false,
             roles: vec![
                 OrchestrationRoleConfig {
                     name: "tester".to_string(),
                     command: "claude".to_string(),
                     start: true,
-                    prompt_template: "Write failing tests.".to_string(),
+                    description: None,
+                    prompt_template: Some("Write failing tests.".to_string()),
+                    clear: true,
                 },
                 OrchestrationRoleConfig {
                     name: "coder".to_string(),
                     command: "claude --model sonnet".to_string(),
                     start: false,
-                    prompt_template: "Make the tests pass.".to_string(),
+                    description: Some("Implements code changes".to_string()),
+                    prompt_template: Some("Make the tests pass.".to_string()),
+                    clear: true,
                 },
             ],
         }
