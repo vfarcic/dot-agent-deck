@@ -307,7 +307,7 @@ Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orche
 ### Phase 2: Polish — UI and integration
 
 - [x] **M6: New dir dialog integration** — show orchestrations alongside modes when TOML defines them, launch Orchestration tab on selection, deploy `/work-done` skill files automatically
-- [ ] **M7: Role cards sidebar** — left sidebar with role name, status (Working/Waiting/Done), active role highlight
+- [x] **M7: Role cards sidebar** — left sidebar with role name, status (Working/Waiting/Done), active role highlight
 - [ ] **M9: Focused/split view toggle** — keybinding to switch between full-width active role pane and side-by-side split
 - [ ] **M10: Status bar** — show orchestration-level info in bottom status bar (e.g., "code-review: coder working, reviewer waiting")
 - [ ] **M11: Config generation extension** — update `src/config_gen.rs` prompt to suggest orchestrations alongside modes
