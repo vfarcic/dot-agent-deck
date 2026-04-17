@@ -756,6 +756,165 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     content
 }
 
+// ---------------------------------------------------------------------------
+// M6: Skill file auto-deployment
+// ---------------------------------------------------------------------------
+
+const SKILL_WORK_DONE: &str = r#"---
+name: work-done
+description: "Signal that you have completed your current task. Notifies the orchestration daemon with a structured summary of your work."
+user-invocable: true
+---
+
+# Work Done
+
+You have completed your current task. Summarize your work and signal completion via the CLI.
+
+**CRITICAL: You MUST run the bash command below. Loading this skill is NOT enough — the signal only sends when the CLI command executes.**
+
+## Instructions
+
+Compose a concise summary of what you accomplished, then **run the command via Bash**:
+
+```bash
+dot-agent-deck work-done --task "Your summary here. Include file paths, outcomes, and anything the orchestrator needs to know."
+```
+
+## Rules
+
+- **You MUST execute the CLI command via Bash.** Do not just describe the work — run the command.
+- Always include specific file paths, issue numbers, and other references in your `--task` summary.
+- Do NOT include full file contents in the summary. The orchestrator can read files directly.
+- The `--task` value should be a single string. Use quotes to wrap multi-sentence summaries.
+- Do NOT use the `delegate` command. Only the orchestrator delegates work.
+"#;
+
+const SKILL_DELEGATE: &str = r#"---
+name: delegate
+description: "Delegate work to one or more worker agents. Only the orchestrator should use this command."
+user-invocable: true
+---
+
+# Delegate
+
+You are the orchestrator. Delegate work to one or more worker agents.
+
+**CRITICAL: You MUST run the bash command below. Loading this skill is NOT enough — the delegation only happens when the CLI command executes.**
+
+## Instructions
+
+Compose the task description, then **run the command via Bash**:
+
+```bash
+dot-agent-deck delegate --to <role-name> --task "Task description with relevant context, file paths, and constraints."
+```
+
+### Delegate to multiple agents in parallel
+
+Make **one call per agent** so each gets its own task description:
+
+```bash
+dot-agent-deck delegate --to coder --task "Implement the login endpoint..."
+dot-agent-deck delegate --to reviewer --task "Review the auth module..."
+```
+
+If all agents should receive the **exact same task**, you may combine them:
+
+```bash
+dot-agent-deck delegate --to <role1> --to <role2> --task "Same task for all."
+```
+
+### Signal orchestration complete
+
+When all work is done and you are satisfied with the results:
+
+```bash
+dot-agent-deck work-done --done --task "Final summary of what was accomplished across all agents."
+```
+
+## Rules
+
+- **You MUST execute the CLI command via Bash.** Do not just describe the delegation — run the command.
+- Always include specific file paths, issue numbers, and other references in your `--task` description.
+- Do NOT include full file contents. Workers can read files directly.
+- The `--task` value should be a single string. Use quotes to wrap multi-sentence descriptions.
+- The `--to` flag accepts role names from your orchestration config (e.g., `coder`, `reviewer`, `auditor`).
+- Wait for worker results before delegating follow-up work that depends on their output.
+"#;
+
+/// Detect the agent CLI from a role's command string.
+fn detect_agent_cli(command: &str) -> Option<&'static str> {
+    // Check the first word or any word for known CLI names.
+    // Commands may be e.g. "claude", "claude --model sonnet", "devbox run agent-haiku" (wraps claude).
+    if command.contains("opencode") {
+        Some("opencode")
+    } else if command.contains("claude") {
+        Some("claude")
+    } else {
+        None
+    }
+}
+
+/// Deploy orchestration skill files to the target directory for each agent CLI.
+/// Orchestrator gets the `delegate` skill; workers get the `work-done` skill.
+fn deploy_orchestration_skills(config: &OrchestrationConfig, cwd: &str) {
+    let base = std::path::Path::new(cwd);
+
+    // Collect which CLIs need which skills to avoid duplicate writes.
+    let mut claude_needs_delegate = false;
+    let mut claude_needs_work_done = false;
+    let mut opencode_needs_delegate = false;
+    let mut opencode_needs_work_done = false;
+
+    for role in &config.roles {
+        match detect_agent_cli(&role.command) {
+            Some("claude") => {
+                if role.start {
+                    claude_needs_delegate = true;
+                } else {
+                    claude_needs_work_done = true;
+                }
+            }
+            Some("opencode") => {
+                if role.start {
+                    opencode_needs_delegate = true;
+                } else {
+                    opencode_needs_work_done = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Deploy Claude Code skills.
+    if claude_needs_work_done {
+        let dir = base.join(".claude/skills/agent-deck-work-done");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::write(dir.join("SKILL.md"), SKILL_WORK_DONE);
+        }
+    }
+    if claude_needs_delegate {
+        let dir = base.join(".claude/skills/agent-deck-delegate");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::write(dir.join("SKILL.md"), SKILL_DELEGATE);
+        }
+    }
+
+    // Deploy OpenCode skills.
+    if opencode_needs_work_done {
+        let dir = base.join(".opencode/commands");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::write(dir.join("work-done.md"), SKILL_WORK_DONE);
+        }
+    }
+    if opencode_needs_delegate {
+        let dir = base.join(".opencode/commands");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::write(dir.join("delegate.md"), SKILL_DELEGATE);
+        }
+    }
+}
+
 /// Write the orchestrator context to a file and return a one-liner to inject.
 /// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
 fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
@@ -3041,6 +3200,8 @@ pub fn run_tui(
 
                         // Orchestration path — manage own panes, no agent pane.
                         if let Some(orch_config) = req.orchestration_config {
+                            // M6: Deploy skill files for agent CLIs before launching.
+                            deploy_orchestration_skills(&orch_config, &dir_str);
                             let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
                             match tab_manager.open_orchestration_tab(&orch_config, &dir_str, prompt)
                             {
@@ -7481,5 +7642,139 @@ mod tests {
 
         // Should still be pending — agent not ready and not timed out.
         assert_eq!(ui.pending_dispatches.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // M6: Skill file deployment tests
+    // -----------------------------------------------------------------------
+
+    fn make_role(name: &str, command: &str, start: bool) -> OrchestrationRoleConfig {
+        OrchestrationRoleConfig {
+            name: name.to_string(),
+            command: command.to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        }
+    }
+
+    #[test]
+    fn test_detect_agent_cli_claude() {
+        assert_eq!(detect_agent_cli("claude"), Some("claude"));
+        assert_eq!(detect_agent_cli("claude --model sonnet"), Some("claude"));
+        assert_eq!(detect_agent_cli("devbox run agent-plan"), None);
+    }
+
+    #[test]
+    fn test_detect_agent_cli_opencode() {
+        assert_eq!(detect_agent_cli("opencode"), Some("opencode"));
+        assert_eq!(detect_agent_cli("opencode --flag"), Some("opencode"));
+    }
+
+    #[test]
+    fn test_detect_agent_cli_unknown() {
+        assert_eq!(detect_agent_cli("aider"), None);
+        assert_eq!(detect_agent_cli("vim"), None);
+    }
+
+    #[test]
+    fn test_deploy_claude_skills() {
+        let tmp = tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let config = OrchestrationConfig {
+            name: "test".to_string(),
+            roles: vec![
+                make_role("orchestrator", "claude", true),
+                make_role("coder", "claude --model sonnet", false),
+            ],
+        };
+        deploy_orchestration_skills(&config, cwd);
+
+        // Orchestrator gets delegate skill.
+        let delegate = tmp
+            .path()
+            .join(".claude/skills/agent-deck-delegate/SKILL.md");
+        assert!(delegate.exists(), "delegate skill not deployed");
+        let content = std::fs::read_to_string(&delegate).unwrap();
+        assert!(content.contains("name: delegate"));
+
+        // Worker gets work-done skill.
+        let work_done = tmp
+            .path()
+            .join(".claude/skills/agent-deck-work-done/SKILL.md");
+        assert!(work_done.exists(), "work-done skill not deployed");
+        let content = std::fs::read_to_string(&work_done).unwrap();
+        assert!(content.contains("name: work-done"));
+    }
+
+    #[test]
+    fn test_deploy_opencode_skills() {
+        let tmp = tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let config = OrchestrationConfig {
+            name: "test".to_string(),
+            roles: vec![
+                make_role("orchestrator", "opencode", true),
+                make_role("worker", "opencode", false),
+            ],
+        };
+        deploy_orchestration_skills(&config, cwd);
+
+        let delegate = tmp.path().join(".opencode/commands/delegate.md");
+        assert!(delegate.exists(), "opencode delegate skill not deployed");
+
+        let work_done = tmp.path().join(".opencode/commands/work-done.md");
+        assert!(work_done.exists(), "opencode work-done skill not deployed");
+    }
+
+    #[test]
+    fn test_deploy_skips_unknown_cli() {
+        let tmp = tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let config = OrchestrationConfig {
+            name: "test".to_string(),
+            roles: vec![
+                make_role("orchestrator", "aider", true),
+                make_role("worker", "vim", false),
+            ],
+        };
+        deploy_orchestration_skills(&config, cwd);
+
+        // No skill directories should be created.
+        assert!(!tmp.path().join(".claude").exists());
+        assert!(!tmp.path().join(".opencode").exists());
+    }
+
+    #[test]
+    fn test_deploy_mixed_cli_orchestration() {
+        let tmp = tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let config = OrchestrationConfig {
+            name: "test".to_string(),
+            roles: vec![
+                make_role("orchestrator", "claude", true),
+                make_role("coder", "opencode", false),
+            ],
+        };
+        deploy_orchestration_skills(&config, cwd);
+
+        // Claude gets delegate (orchestrator).
+        assert!(
+            tmp.path()
+                .join(".claude/skills/agent-deck-delegate/SKILL.md")
+                .exists()
+        );
+        // Claude should NOT get work-done (no claude workers).
+        assert!(
+            !tmp.path()
+                .join(".claude/skills/agent-deck-work-done")
+                .exists()
+        );
+
+        // OpenCode gets work-done (worker).
+        assert!(tmp.path().join(".opencode/commands/work-done.md").exists());
+        // OpenCode should NOT get delegate (no opencode orchestrator).
+        assert!(!tmp.path().join(".opencode/commands/delegate.md").exists());
     }
 }
