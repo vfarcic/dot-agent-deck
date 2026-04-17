@@ -768,12 +768,32 @@ fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Optio
 // M5: Delegation dispatch
 // ---------------------------------------------------------------------------
 
-/// Construct the prompt to inject into a worker pane.
+/// Construct the full worker prompt content (written to file).
 fn build_worker_prompt(prompt_template: Option<&str>, task: &str) -> String {
     match prompt_template {
         Some(tpl) => format!("{tpl}\n\n## Task\n\n{task}"),
         None => task.to_string(),
     }
+}
+
+/// Write the worker task to a file and return a one-liner to inject into the pane.
+/// Uses the same file-based approach as the orchestrator prompt to avoid multi-line
+/// paste issues (Claude Code shows multi-line pastes as "[Pasted text...]" without
+/// submitting them).
+fn prepare_worker_prompt(
+    role_name: &str,
+    prompt_template: Option<&str>,
+    task: &str,
+    cwd: &str,
+) -> Option<String> {
+    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
+    std::fs::create_dir_all(&dir).ok()?;
+    let file_path = dir.join(format!("worker-task-{role_name}.md"));
+    let content = build_worker_prompt(prompt_template, task);
+    std::fs::write(&file_path, &content).ok()?;
+    Some(format!(
+        "Read .dot-agent-deck/worker-task-{role_name}.md for your role instructions and task. Execute the task immediately."
+    ))
 }
 
 /// Drain delegate signals and dispatch work to worker panes.
@@ -824,7 +844,13 @@ fn dispatch_delegate_events(
             };
 
             let role = &config.roles[role_idx];
-            let prompt = build_worker_prompt(role.prompt_template.as_deref(), &signal.task);
+            let prompt = prepare_worker_prompt(
+                &role.name,
+                role.prompt_template.as_deref(),
+                &signal.task,
+                &cwd,
+            )
+            .unwrap_or_else(|| build_worker_prompt(role.prompt_template.as_deref(), &signal.task));
 
             if role.clear {
                 // Restart pane: close old, create new, update all mappings.
@@ -855,6 +881,9 @@ fn dispatch_delegate_events(
                 {
                     let mut st = state.blocking_write();
                     st.unregister_pane(&old_pane_id);
+                    // Remove the old pane's session so it doesn't leak to the dashboard.
+                    st.sessions
+                        .retain(|_, s| s.pane_id.as_deref() != Some(&old_pane_id));
                     st.register_pane(new_pane_id.clone());
                     st.pane_role_map.remove(&old_pane_id);
                     st.pane_role_map
