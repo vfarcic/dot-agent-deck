@@ -85,12 +85,114 @@ Do NOT use the `watch` binary, `while true` loops, or any other external polling
 
 6. **After writing the file, tell the user the next steps:** "Config created! To use it, press Ctrl+w to close this pane, then Ctrl+n to create a new one. Select the same directory and choose your mode from the Mode field."
 
+## Orchestrations (Optional)
+
+After proposing modes, ask the user if they want to set up **agent orchestrations** — multi-agent workflows where a designated orchestrator agent delegates tasks to worker agents. Examples: code + review, TDD cycles, code + security audit.
+
+If the user wants orchestrations, guide them through defining one:
+
+### Orchestration Config Format
+
+```toml
+[[orchestrations]]
+name = "orchestration-name"   # e.g., "code-review", "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"         # The orchestrator role — delegates work, never does it
+command = "claude"            # CLI command to launch the agent
+start = true                  # Exactly one role MUST have start = true
+prompt_template = """         # Optional: base instructions for the orchestrator
+You are an orchestration manager. You NEVER do work yourself.
+You only delegate to available agents and coordinate their work.
+"""
+
+[[orchestrations.roles]]
+name = "coder"                # Worker role name (must be unique across all roles)
+command = "claude --model sonnet"
+description = "Implements code changes, fixes bugs, writes features"  # Used to build the orchestrator's agent list
+prompt_template = "Always run cargo test before finishing."  # Optional: standing instructions prepended to each task
+# clear = true                # Default true — restart agent session between delegations for context isolation
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "claude"
+description = "Reviews code for correctness, style, and edge cases"
+```
+
+### Orchestration Guidelines
+
+- **Exactly one `start = true` role**: This is the orchestrator. It receives the user's initial request and delegates to workers. dot-agent-deck auto-appends the available agents list and delegation protocol to the orchestrator's prompt.
+- **All role names must be unique** within the orchestration.
+- **Worker `description`** is important — it's used to auto-build the orchestrator's available agents list. Be specific about what each worker does.
+- **Worker `prompt_template`** is optional standing instructions (e.g., "always run tests before finishing"), NOT task instructions. The orchestrator provides task instructions each time via delegation.
+- **`clear = true` (default)**: Restarts the agent session between delegations for context isolation. Set `clear = false` if the agent needs to retain state across delegations.
+- **`command`**: The CLI command to launch the agent. Use the agent CLIs available on the system (e.g., `claude`, `opencode`). Run `which <binary>` to verify availability.
+- **Suggest orchestrations that match the project's workflow**: code + review for teams that care about code quality, code + security audit for security-sensitive projects, etc.
+
+### Example Orchestrations
+
+**Code Review** (code + review):
+```toml
+[[orchestrations]]
+name = "code-review"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "claude --model sonnet"
+description = "Implements code changes, fixes bugs, writes features"
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "claude"
+description = "Reviews code for correctness, style, and edge cases"
+```
+
+**Code + Security Audit**:
+```toml
+[[orchestrations]]
+name = "secure-dev"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "claude --model sonnet"
+description = "Implements code changes and features"
+
+[[orchestrations.roles]]
+name = "security-auditor"
+command = "claude"
+description = "Audits code for security vulnerabilities and OWASP top 10 issues"
+```
+
+### Orchestration Task
+
+1. After the modes section is confirmed, ask: "Would you also like to set up an agent orchestration? This lets multiple AI agents collaborate — e.g., one writes code while another reviews it."
+2. If yes, ask about:
+   - Orchestration name (a short workflow name like "code-review")
+   - Worker roles: name, command, description for each
+   - Whether any workers need custom `prompt_template` (standing instructions)
+   - Whether `clear = false` is needed for any worker (uncommon)
+3. Always include an orchestrator role with `start = true`
+4. Validate: exactly one `start = true`, all role names unique
+5. Present the proposed orchestration config and get user approval
+6. Write the `[[orchestrations]]` section into `.dot-agent-deck.toml` alongside the `[[modes]]` section
+
 ## Quality Guidelines
 
 - **Discover, don't assume.** Only propose commands for tools the project actually uses. Never check for or include tools from unrelated ecosystems.
 - **Focused output over broad output.** Persistent panes should show actionable, scoped information — not everything.
 - **Only use installed tools.** Every command in the config must work on this system right now.
-- **Fewer is better.** The user can always add more panes later."#;
+- **Fewer is better.** The user can always add more panes later.
+- **Orchestrations are optional.** Only suggest them if the user is interested. Don't force multi-agent workflows on simple projects."#;
 
 /// Build the config generation prompt for a specific directory.
 pub fn config_gen_prompt(dir: &str) -> String {
@@ -115,5 +217,32 @@ mod tests {
         assert!(prompt.contains("[[modes.panes]]"));
         assert!(prompt.contains("[[modes.rules]]"));
         assert!(prompt.contains(".dot-agent-deck.toml"));
+    }
+
+    #[test]
+    fn prompt_contains_orchestration_sections() {
+        let prompt = config_gen_prompt("/tmp/test");
+        assert!(prompt.contains("[[orchestrations]]"));
+        assert!(prompt.contains("[[orchestrations.roles]]"));
+        assert!(prompt.contains("start = true"));
+        assert!(prompt.contains("Orchestrations (Optional)"));
+    }
+
+    #[test]
+    fn prompt_contains_orchestration_guidelines() {
+        let prompt = config_gen_prompt("/tmp/test");
+        assert!(prompt.contains("Exactly one `start = true` role"));
+        assert!(prompt.contains("All role names must be unique"));
+        assert!(prompt.contains("prompt_template"));
+        assert!(prompt.contains("description"));
+        assert!(prompt.contains("clear"));
+    }
+
+    #[test]
+    fn prompt_contains_orchestration_examples() {
+        let prompt = config_gen_prompt("/tmp/test");
+        assert!(prompt.contains("code-review"));
+        assert!(prompt.contains("secure-dev"));
+        assert!(prompt.contains("security-auditor"));
     }
 }

@@ -41,6 +41,13 @@ pub enum OrchestrationStatus {
     Completed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestrationRoleStatus {
+    Waiting,
+    Working,
+    Done,
+}
+
 // ---------------------------------------------------------------------------
 // Tab enum
 // ---------------------------------------------------------------------------
@@ -62,6 +69,8 @@ pub enum Tab {
         name: String,
         /// Pane IDs for each role, in the same order as config roles.
         role_pane_ids: Vec<String>,
+        /// Per-role status for the orchestration sidebar.
+        role_statuses: Vec<OrchestrationRoleStatus>,
         cwd: String,
         /// Index into `role_pane_ids` for the start (orchestrator) role.
         start_role_index: usize,
@@ -226,6 +235,7 @@ impl TabManager {
             id,
             name,
             role_pane_ids: role_pane_ids.clone(),
+            role_statuses: vec![OrchestrationRoleStatus::Waiting; config.roles.len()],
             cwd: cwd.to_string(),
             start_role_index,
             orchestrator_prompt,
@@ -845,11 +855,19 @@ mod tests {
         if let Tab::Orchestration {
             start_role_index,
             orchestrator_prompt,
+            role_statuses,
             ..
         } = tm.active_tab()
         {
             assert_eq!(*start_role_index, 0); // "tester" has start=true at index 0
             assert!(orchestrator_prompt.is_none());
+            assert_eq!(
+                role_statuses,
+                &[
+                    OrchestrationRoleStatus::Waiting,
+                    OrchestrationRoleStatus::Waiting
+                ]
+            );
         } else {
             panic!("expected Orchestration tab");
         }

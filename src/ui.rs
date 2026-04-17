@@ -868,9 +868,6 @@ fn dispatch_delegate_events(
             };
 
             let role = &config.roles[role_idx];
-            if let Tab::Orchestration { role_statuses, .. } = &mut tab_manager.tabs_mut()[tab_idx] {
-                role_statuses[role_idx] = OrchestrationRoleStatus::Working;
-            }
             let prompt = prepare_worker_prompt(
                 &role.name,
                 role.prompt_template.as_deref(),
@@ -985,16 +982,8 @@ fn feedback_worker_results(
             if signal.done {
                 tracing::info!("Orchestration complete: {}", signal.task);
                 // Set the orchestration tab status to Completed.
-                if let Tab::Orchestration {
-                    status,
-                    role_statuses,
-                    ..
-                } = &mut tab_manager.tabs_mut()[tab_idx]
-                {
+                if let Tab::Orchestration { status, .. } = &mut tab_manager.tabs_mut()[tab_idx] {
                     *status = OrchestrationStatus::Completed;
-                    for role_status in role_statuses.iter_mut() {
-                        *role_status = OrchestrationRoleStatus::Done;
-                    }
                 }
                 ui.status_message = Some((
                     format!("Orchestration complete: {}", signal.task),
@@ -1011,20 +1000,6 @@ fn feedback_worker_results(
             .get(&signal.pane_id)
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
-
-        if let Tab::Orchestration {
-            config,
-            role_pane_ids,
-            role_statuses,
-            ..
-        } = &mut tab_manager.tabs_mut()[tab_idx]
-            && let Some(role_idx) = config.roles.iter().position(|role| role.name == role_name)
-            && role_pane_ids
-                .get(role_idx)
-                .is_some_and(|pane_id| pane_id == &signal.pane_id)
-        {
-            role_statuses[role_idx] = OrchestrationRoleStatus::Done;
-        }
 
         // Build feedback prompt: one-liner pointing to the work-done file.
         // Must be single-line so write_to_pane submits it correctly.
