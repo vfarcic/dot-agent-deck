@@ -314,10 +314,17 @@ impl PaneController for EmbeddedPaneController {
     fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
         let mut panes = self.panes.lock().unwrap();
         if let Some(pane) = panes.get_mut(pane_id) {
+            // Wrap in bracketed paste so the terminal treats multi-line text
+            // as a single paste event, then send CR separately to submit.
+            pane.writer.write_all(b"\x1b[200~").map_err(PaneError::Io)?;
             pane.writer
                 .write_all(text.as_bytes())
                 .map_err(PaneError::Io)?;
-            // Send CR (Enter)
+            pane.writer.write_all(b"\x1b[201~").map_err(PaneError::Io)?;
+            pane.writer.flush().map_err(PaneError::Io)?;
+            // Small delay so the terminal processes the paste before receiving Enter.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // Send CR (Enter) to submit.
             pane.writer.write_all(b"\r").map_err(PaneError::Io)?;
             pane.writer.flush().map_err(PaneError::Io)?;
             Ok(())
