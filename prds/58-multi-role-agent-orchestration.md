@@ -293,7 +293,7 @@ Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orche
 - [x] **M4d: Separate skill files** — `/work-done` skill (`.claude/skills/agent-deck-work-done/`) for workers only; `/delegate` skill (`.claude/skills/agent-deck-delegate/`) for orchestrator only; clean separation prevents workers from accidentally delegating
 - [x] **M5: Delegation dispatch** — `dispatch_delegate_events()` in `src/ui.rs` drains `DelegateSignal` events, resolves target roles from config, restarts panes if `clear = true` (close + create + update all mappings), prepends worker's `prompt_template` to task, injects prompt via PTY stdin; `PendingDispatch` queue handles deferred injection for restarted panes; `OrchestrationConfig` stored in `Tab::Orchestration` for dispatch access
 - [x] **M5b: Orchestrator feedback loop** — `feedback_worker_results()` in `src/ui.rs` drains `WorkDoneSignal` events from workers, immediately injects result summary into orchestrator pane (no batching — each worker result forwarded as it arrives); orchestrator decides when it has enough info to proceed
-- [ ] **M5c: Orchestration completion** — when orchestrator signals `--done` via `work-done`, dot-agent-deck marks the orchestration as complete and shows a completion notification
+- [x] **M5c: Orchestration completion** — when orchestrator signals `--done` via `work-done`, dot-agent-deck marks the orchestration as complete and shows a completion notification
 
 **Design questions resolved (M4c/M4d/M5/M5b):**
 - **Delegation**: Separate `delegate` command — `--to <role>` (repeatable for fan-out), `--task <description>`

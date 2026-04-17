@@ -21,7 +21,7 @@ use crate::event::{AgentType, EventType};
 use crate::pane::{PaneController, PaneError};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
-use crate::tab::{Tab, TabId, TabManager};
+use crate::tab::{OrchestrationStatus, Tab, TabId, TabManager};
 use crate::terminal_widget::TerminalWidget;
 use crate::theme::ColorPalette;
 
@@ -821,8 +821,16 @@ fn dispatch_delegate_events(
         };
 
         // 3. Extract what we need from the tab (borrow-safely).
-        let (config, cwd) = match &tab_manager.tabs()[tab_idx] {
-            Tab::Orchestration { config, cwd, .. } => (config.clone(), cwd.clone()),
+        let (config, cwd) = match &mut tab_manager.tabs_mut()[tab_idx] {
+            Tab::Orchestration {
+                config,
+                cwd,
+                status,
+                ..
+            } => {
+                *status = OrchestrationStatus::Delegated;
+                (config.clone(), cwd.clone())
+            }
             _ => unreachable!(),
         };
 
@@ -922,7 +930,7 @@ fn dispatch_delegate_events(
 fn feedback_worker_results(
     state: &SharedState,
     pane: &Arc<dyn PaneController>,
-    tab_manager: &TabManager,
+    tab_manager: &mut TabManager,
     ui: &mut UiState,
 ) {
     let events: Vec<_> = state.blocking_write().work_done_events.drain(..).collect();
@@ -950,11 +958,18 @@ fn feedback_worker_results(
 
         let orchestrator_pane_id = &role_pane_ids[start_role_index];
 
-        // If the signal came from the orchestrator itself (--done), skip feedback.
+        // If the signal came from the orchestrator itself (--done), handle completion.
         if signal.pane_id == *orchestrator_pane_id {
             if signal.done {
                 tracing::info!("Orchestration complete: {}", signal.task);
-                // M5c will handle completion UI here.
+                // Set the orchestration tab status to Completed.
+                if let Tab::Orchestration { status, .. } = &mut tab_manager.tabs_mut()[tab_idx] {
+                    *status = OrchestrationStatus::Completed;
+                }
+                ui.status_message = Some((
+                    format!("Orchestration complete: {}", signal.task),
+                    std::time::Instant::now(),
+                ));
             }
             continue;
         }
@@ -2150,7 +2165,11 @@ pub fn run_tui(
                     .get(agent_pane_id)
                     .map(|m| m.name.clone())
                     .unwrap_or_else(|| name.clone()),
-                Tab::Orchestration { name, .. } => name.clone(),
+                Tab::Orchestration { name, status, .. } => match status {
+                    OrchestrationStatus::Completed => format!("{name} [done]"),
+                    OrchestrationStatus::Delegated => format!("{name} [active]"),
+                    OrchestrationStatus::WaitingForOrchestrator => name.clone(),
+                },
             })
             .collect();
         let tab_bar_info = TabBarInfo {
@@ -2216,7 +2235,7 @@ pub fn run_tui(
         dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
 
         // M5b: Forward worker results back to the orchestrator.
-        feedback_worker_results(&state, &pane, &tab_manager, &mut ui);
+        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
 
         // Process pending dispatches (clear=true roles waiting for agent ready).
         process_pending_dispatches(&mut ui, &pane, &snapshot);

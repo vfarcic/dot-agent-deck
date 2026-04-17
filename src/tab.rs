@@ -31,6 +31,17 @@ pub enum TabError {
 }
 
 // ---------------------------------------------------------------------------
+// Orchestration status
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestrationStatus {
+    WaitingForOrchestrator,
+    Delegated,
+    Completed,
+}
+
+// ---------------------------------------------------------------------------
 // Tab enum
 // ---------------------------------------------------------------------------
 
@@ -59,6 +70,8 @@ pub enum Tab {
         /// Full orchestration config, kept for dispatch (M5) access to
         /// role prompt_template, clear flag, and command.
         config: OrchestrationConfig,
+        /// Tracks whether the orchestration is waiting, delegated, or completed.
+        status: OrchestrationStatus,
     },
 }
 
@@ -217,6 +230,7 @@ impl TabManager {
             start_role_index,
             orchestrator_prompt,
             config: config.clone(),
+            status: OrchestrationStatus::WaitingForOrchestrator,
         });
 
         let index = self.tabs.len() - 1;
