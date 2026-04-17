@@ -982,13 +982,10 @@ fn feedback_worker_results(
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Build feedback prompt: tell the orchestrator what the worker reported.
-        // Point to the work-done file rather than inlining the full content.
+        // Build feedback prompt: one-liner pointing to the work-done file.
+        // Must be single-line so write_to_pane submits it correctly.
         let feedback = format!(
-            "Worker **{role_name}** has completed their task. \
-             Read `.dot-agent-deck/work-done-{role_name}.md` for their full report. \
-             Summary: {task}",
-            task = signal.task,
+            "Worker {role_name} has completed their task. Read .dot-agent-deck/work-done-{role_name}.md for their full report."
         );
 
         // Check if orchestrator agent is ready; if not, queue for deferred injection.
