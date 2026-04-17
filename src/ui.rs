@@ -1989,6 +1989,7 @@ pub fn run_tui(
                 let _ = pane.focus_pane(first_id);
             }
         }
+        ui.selected_index = 0;
     }
 
     'outer: loop {
