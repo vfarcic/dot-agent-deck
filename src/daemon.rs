@@ -49,6 +49,8 @@ pub async fn run_daemon(socket_path: &Path, state: SharedState) -> Result<(), Da
                             info!(
                                 session_id = %event.session_id,
                                 event_type = ?event.event_type,
+                                pane_id = ?event.pane_id,
+                                agent_type = ?event.agent_type,
                                 "Received event"
                             );
                             state.write().await.apply_event(event);

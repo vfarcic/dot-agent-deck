@@ -21,7 +21,7 @@ use crate::event::{AgentType, EventType};
 use crate::pane::{PaneController, PaneError};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
-use crate::tab::{OrchestrationStatus, Tab, TabId, TabManager};
+use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
 use crate::terminal_widget::TerminalWidget;
 use crate::theme::ColorPalette;
 
@@ -135,8 +135,21 @@ enum ActiveTabView {
         /// Which side pane has visual focus (`None` = agent pane).
         focused_side_pane_index: Option<usize>,
     },
-    /// Orchestration tab: same layout as dashboard, scoped to role panes only.
-    Orchestration { role_pane_ids: Vec<String> },
+    /// Orchestration tab: sidebar with role cards plus scoped role panes.
+    Orchestration {
+        name: String,
+        status: OrchestrationStatus,
+        roles: Vec<OrchestrationRoleView>,
+        role_pane_ids: Vec<String>,
+    },
+}
+
+struct OrchestrationRoleView {
+    name: String,
+    command: String,
+    description: Option<String>,
+    pane_id: String,
+    status: OrchestrationRoleStatus,
 }
 
 /// Lightweight snapshot of tab state for rendering, decoupled from TabManager.
@@ -502,6 +515,8 @@ struct UiState {
     quit_confirm_selected: usize,
     /// Orchestration tab IDs whose start-role prompt has already been injected.
     orchestration_prompted: HashSet<TabId>,
+    /// Tracks when orchestration tabs were created (for delayed prompt injection).
+    orchestration_created_at: HashMap<TabId, std::time::Instant>,
     /// Prompts waiting to be injected into panes once their agent is ready (M5 dispatch).
     pending_dispatches: Vec<PendingDispatch>,
 }
@@ -555,6 +570,7 @@ impl UiState {
             config_gen_selected: 0,
             quit_confirm_selected: 0,
             orchestration_prompted: HashSet::new(),
+            orchestration_created_at: HashMap::new(),
             pending_dispatches: Vec::new(),
         }
     }
@@ -647,6 +663,127 @@ fn resize_dashboard_panes(
                 let _ = embedded.resize_pane_pty(pane_id, rows, right_width);
             }
         }
+    }
+}
+
+fn orchestration_role_status_label(status: OrchestrationRoleStatus) -> (&'static str, Color) {
+    match status {
+        OrchestrationRoleStatus::Waiting => ("waiting", Color::Yellow),
+        OrchestrationRoleStatus::Working => ("working", Color::Green),
+        OrchestrationRoleStatus::Done => ("done", Color::Blue),
+    }
+}
+
+fn render_orchestration_sidebar(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    status: OrchestrationStatus,
+    roles: &[OrchestrationRoleView],
+    focused_pane_id: Option<&str>,
+    palette: ColorPalette,
+) {
+    let status_text = match status {
+        OrchestrationStatus::WaitingForOrchestrator => ("waiting", Color::Yellow),
+        OrchestrationStatus::Delegated => ("active", Color::Green),
+        OrchestrationStatus::Completed => ("done", Color::Blue),
+    };
+
+    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
+
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            name.to_string(),
+            Style::default()
+                .fg(palette.text_primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" [{}]", status_text.0),
+            Style::default().fg(status_text.1),
+        ),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.text_muted)),
+    );
+    frame.render_widget(title, chunks[0]);
+
+    if roles.is_empty() {
+        return;
+    }
+
+    let body_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.text_muted))
+        .title("Roles");
+    let body = body_block.inner(chunks[1]);
+    frame.render_widget(body_block, chunks[1]);
+
+    let header = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(body);
+    let header_text = Paragraph::new("Role cards").style(
+        Style::default()
+            .fg(palette.text_secondary)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_widget(header_text, header[0]);
+
+    let constraints: Vec<Constraint> = roles
+        .iter()
+        .map(|_| Constraint::Ratio(1, roles.len() as u32))
+        .collect();
+    let cards = Layout::vertical(constraints).split(header[1]);
+
+    for (role, card_area) in roles.iter().zip(cards.iter()) {
+        let (status_label, status_color) = orchestration_role_status_label(role.status);
+        let is_active = focused_pane_id.is_some_and(|id| id == role.pane_id.as_str());
+        let border_color = if is_active { Color::Cyan } else { status_color };
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                role.name.clone(),
+                Style::default()
+                    .fg(palette.text_primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  [{status_label}]"),
+                Style::default().fg(status_color),
+            ),
+        ])];
+
+        lines.push(Line::from(vec![Span::styled(
+            role.command.clone(),
+            Style::default().fg(palette.text_secondary),
+        )]));
+
+        if let Some(desc) = role.description.as_deref() {
+            lines.push(Line::from(vec![Span::styled(
+                desc.to_string(),
+                Style::default().fg(palette.text_muted),
+            )]));
+        }
+
+        lines.push(Line::from(vec![Span::styled(
+            if is_active { "focused" } else { "pane ready" },
+            Style::default().fg(if is_active {
+                Color::Cyan
+            } else {
+                palette.text_muted
+            }),
+        )]));
+
+        let card = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .style(if is_active {
+                    Style::default().bg(palette.selected_bg)
+                } else {
+                    Style::default()
+                }),
+        );
+        frame.render_widget(card, *card_area);
     }
 }
 
@@ -1027,6 +1164,9 @@ fn dispatch_delegate_events(
             };
 
             let role = &config.roles[role_idx];
+            if let Tab::Orchestration { role_statuses, .. } = &mut tab_manager.tabs_mut()[tab_idx] {
+                role_statuses[role_idx] = OrchestrationRoleStatus::Working;
+            }
             let prompt = prepare_worker_prompt(
                 &role.name,
                 role.prompt_template.as_deref(),
@@ -1141,8 +1281,16 @@ fn feedback_worker_results(
             if signal.done {
                 tracing::info!("Orchestration complete: {}", signal.task);
                 // Set the orchestration tab status to Completed.
-                if let Tab::Orchestration { status, .. } = &mut tab_manager.tabs_mut()[tab_idx] {
+                if let Tab::Orchestration {
+                    status,
+                    role_statuses,
+                    ..
+                } = &mut tab_manager.tabs_mut()[tab_idx]
+                {
                     *status = OrchestrationStatus::Completed;
+                    for role_status in role_statuses.iter_mut() {
+                        *role_status = OrchestrationRoleStatus::Done;
+                    }
                 }
                 ui.status_message = Some((
                     format!("Orchestration complete: {}", signal.task),
@@ -1159,6 +1307,20 @@ fn feedback_worker_results(
             .get(&signal.pane_id)
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
+
+        if let Tab::Orchestration {
+            config,
+            role_pane_ids,
+            role_statuses,
+            ..
+        } = &mut tab_manager.tabs_mut()[tab_idx]
+            && let Some(role_idx) = config.roles.iter().position(|role| role.name == role_name)
+            && role_pane_ids
+                .get(role_idx)
+                .is_some_and(|pane_id| pane_id == &signal.pane_id)
+        {
+            role_statuses[role_idx] = OrchestrationRoleStatus::Done;
+        }
 
         // Build feedback prompt: one-liner pointing to the work-done file.
         // Must be single-line so write_to_pane submits it correctly.
@@ -1194,15 +1356,20 @@ fn process_pending_dispatches(
     snapshot: &AppState,
 ) {
     ui.pending_dispatches.retain(|pd| {
-        let ready = snapshot.sessions.values().any(|s| {
+        // Fast path: agent fired SessionStart (e.g., Claude Code).
+        let agent_ready = snapshot.sessions.values().any(|s| {
             s.pane_id.as_deref() == Some(pd.pane_id.as_str()) && s.agent_type != AgentType::None
         });
-        if ready {
+        // Slow path: no SessionStart after 10 seconds (e.g., opencode).
+        // The agent is likely running but hasn't signaled — inject anyway.
+        let timeout_ready =
+            !agent_ready && pd.created_at.elapsed() > std::time::Duration::from_secs(10);
+        if agent_ready || timeout_ready {
             let _ = pane.write_to_pane(&pd.pane_id, &pd.prompt);
             return false;
         }
-        // Timeout after 30 seconds.
-        if pd.created_at.elapsed() > std::time::Duration::from_secs(30) {
+        // Hard timeout after 60 seconds — give up.
+        if pd.created_at.elapsed() > std::time::Duration::from_secs(60) {
             tracing::warn!(pane_id = %pd.pane_id, "dispatch: timed out waiting for agent");
             return false;
         }
@@ -2339,7 +2506,31 @@ pub fn run_tui(
                 side_pane_ids: mode_manager.managed_pane_ids(),
                 focused_side_pane_index: *focused_side_pane_index,
             },
-            Tab::Orchestration { role_pane_ids, .. } => ActiveTabView::Orchestration {
+            Tab::Orchestration {
+                name,
+                status,
+                config,
+                role_pane_ids,
+                role_statuses,
+                ..
+            } => ActiveTabView::Orchestration {
+                name: name.clone(),
+                status: *status,
+                roles: config
+                    .roles
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, role)| OrchestrationRoleView {
+                        name: role.name.clone(),
+                        command: role.command.clone(),
+                        description: role.description.clone(),
+                        pane_id: role_pane_ids[idx].clone(),
+                        status: role_statuses
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(OrchestrationRoleStatus::Waiting),
+                    })
+                    .collect(),
                 role_pane_ids: role_pane_ids.clone(),
             },
         };
@@ -2396,13 +2587,14 @@ pub fn run_tui(
         }
 
         // Inject orchestrator prompt when start role agent becomes ready.
-        // Claude Code fires SessionStart immediately on launch (via hook),
-        // transitioning the placeholder from AgentType::None to a real type.
+        // Fast path: Claude Code fires SessionStart immediately (agent_type != None).
+        // Slow path: agents like opencode don't signal — fall back after 10 seconds.
         for tab in tab_manager.tabs_mut() {
             if let Tab::Orchestration {
                 id,
                 role_pane_ids,
                 start_role_index,
+                role_statuses,
                 orchestrator_prompt,
                 ..
             } = tab
@@ -2410,14 +2602,19 @@ pub fn run_tui(
                 && !ui.orchestration_prompted.contains(id)
             {
                 let start_pane_id = &role_pane_ids[*start_role_index];
-                // Agent is ready when its session has a real agent type (not placeholder).
-                let ready = snapshot.sessions.values().any(|s| {
+                let agent_ready = snapshot.sessions.values().any(|s| {
                     s.pane_id.as_deref() == Some(start_pane_id) && s.agent_type != AgentType::None
                 });
-                if ready {
+                let timeout_ready = !agent_ready
+                    && ui
+                        .orchestration_created_at
+                        .get(id)
+                        .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(10));
+                if agent_ready || timeout_ready {
                     if let Some(prompt) = orchestrator_prompt.take() {
                         let _ = pane.write_to_pane(start_pane_id, &prompt);
                     }
+                    role_statuses[*start_role_index] = OrchestrationRoleStatus::Working;
                     ui.orchestration_prompted.insert(*id);
                 }
             }
@@ -3258,6 +3455,13 @@ pub fn run_tui(
                                     let area = terminal.get_frame().area();
                                     resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
 
+                                    // Record creation time for delayed prompt injection fallback.
+                                    if let Tab::Orchestration { id, .. } = tab_manager.active_tab()
+                                    {
+                                        ui.orchestration_created_at
+                                            .insert(*id, std::time::Instant::now());
+                                    }
+
                                     // Start role commands after resize.
                                     for (i, role) in orch_config.roles.iter().enumerate() {
                                         let _ =
@@ -3657,26 +3861,76 @@ fn render_frame(
 
     // ── Dashboard / Orchestration tab rendering ──────────────────────
     let all_pane_ids = embedded.map(|e| e.pane_ids()).unwrap_or_default();
-    let pane_ids: Vec<String> = match tab_view {
-        ActiveTabView::Dashboard { exclude_pane_ids } => all_pane_ids
-            .into_iter()
-            .filter(|id| !exclude_pane_ids.contains(id))
-            .collect(),
-        ActiveTabView::Orchestration { role_pane_ids } => all_pane_ids
-            .into_iter()
-            .filter(|id| role_pane_ids.contains(id))
-            .collect(),
+    let (pane_ids, dashboard_area, panes_area) = match tab_view {
+        ActiveTabView::Dashboard { exclude_pane_ids } => {
+            let pane_ids: Vec<String> = all_pane_ids
+                .into_iter()
+                .filter(|id| !exclude_pane_ids.contains(id))
+                .collect();
+            let (dashboard_area, panes_area) = if pane_ids.is_empty() {
+                (main_area, None)
+            } else {
+                let chunks =
+                    Layout::horizontal([Constraint::Percentage(33), Constraint::Percentage(67)])
+                        .split(main_area);
+                (chunks[0], Some(chunks[1]))
+            };
+            (pane_ids, dashboard_area, panes_area)
+        }
+        ActiveTabView::Orchestration { role_pane_ids, .. } => {
+            let pane_ids: Vec<String> = all_pane_ids
+                .into_iter()
+                .filter(|id| role_pane_ids.contains(id))
+                .collect();
+            let (dashboard_area, panes_area) = if pane_ids.is_empty() {
+                (main_area, None)
+            } else {
+                let chunks =
+                    Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)])
+                        .split(main_area);
+                (chunks[0], Some(chunks[1]))
+            };
+            (pane_ids, dashboard_area, panes_area)
+        }
         _ => unreachable!(),
     };
-    let has_terminal_panes = !pane_ids.is_empty();
 
-    let (dashboard_area, panes_area) = if has_terminal_panes {
-        let chunks = Layout::horizontal([Constraint::Percentage(33), Constraint::Percentage(67)])
-            .split(main_area);
-        (chunks[0], Some(chunks[1]))
-    } else {
-        (main_area, None)
-    };
+    if let ActiveTabView::Orchestration {
+        name,
+        status,
+        roles,
+        ..
+    } = tab_view
+    {
+        let focused_pane_id = embedded.and_then(|e| e.focused_pane_id());
+        render_orchestration_sidebar(
+            frame,
+            dashboard_area,
+            name,
+            *status,
+            roles,
+            focused_pane_id.as_deref(),
+            palette,
+        );
+
+        if let Some(right) = panes_area {
+            ui.focused_pane_rect = render_terminal_panes(
+                frame,
+                embedded,
+                right,
+                &pane_ids,
+                pane_layout,
+                &ui.pane_display_names,
+                &ui.selection,
+                palette,
+                None,
+            );
+        }
+
+        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
+        render_overlays(frame, ui, active_mode_name, palette);
+        return;
+    }
 
     if state.sessions.is_empty() {
         let vertical = Layout::vertical([
