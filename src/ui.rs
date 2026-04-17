@@ -712,13 +712,18 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     // 3. Delegation protocol.
     content.push_str("\n## Delegation protocol\n\n");
     content.push_str(
-        "To delegate work to an agent, run:\n\
+        "To delegate work to an agent, run one command per agent:\n\
          ```bash\n\
          dot-agent-deck work-done --delegate <role-name> --task \"Task description with context, file paths, and constraints.\"\n\
          ```\n\n\
-         To delegate to multiple agents in parallel:\n\
+         To delegate to multiple agents in parallel, make **one call per agent** so each gets its own task:\n\
          ```bash\n\
-         dot-agent-deck work-done --delegate <role1> --delegate <role2> --task \"Task description.\"\n\
+         dot-agent-deck work-done --delegate coder --task \"Implement the login endpoint...\"\n\
+         dot-agent-deck work-done --delegate reviewer --task \"Review the auth module...\"\n\
+         ```\n\n\
+         If all agents should receive the **exact same task**, you may combine them in one call:\n\
+         ```bash\n\
+         dot-agent-deck work-done --delegate <role1> --delegate <role2> --task \"Same task for all.\"\n\
          ```\n\n\
          When all work is complete and you are satisfied with the results:\n\
          ```bash\n\

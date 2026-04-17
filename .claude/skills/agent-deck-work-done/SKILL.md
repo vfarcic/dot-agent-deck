@@ -26,8 +26,17 @@ dot-agent-deck work-done --delegate <role-name> --task "Task description with re
 
 ### Orchestrator (delegating to multiple agents in parallel)
 
+Make **one call per agent** so each gets its own task description:
+
 ```bash
-dot-agent-deck work-done --delegate <role1> --delegate <role2> --task "Task description for all delegated agents."
+dot-agent-deck work-done --delegate coder --task "Implement the login endpoint..."
+dot-agent-deck work-done --delegate reviewer --task "Review the auth module..."
+```
+
+If all agents should receive the **exact same task**, you may combine them:
+
+```bash
+dot-agent-deck work-done --delegate <role1> --delegate <role2> --task "Same task for all."
 ```
 
 ### Orchestrator (all work is complete)
