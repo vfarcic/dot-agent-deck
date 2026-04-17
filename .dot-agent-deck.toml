@@ -36,7 +36,7 @@ so agents can read it themselves.
 
 [[orchestrations.roles]]
 name = "coder"
-command = "devbox run agent-opus-plan"
+command = "devbox run agent-plan"
 description = "Implements code changes, fixes bugs, writes features"
 prompt_template = "You are a coding agent. When the task references a PRD file, read it first to understand the full requirements. Implement with clean, minimal code. Run tests before finishing."
 

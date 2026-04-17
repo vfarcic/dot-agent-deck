@@ -17,10 +17,9 @@
     "scripts": {
       "agent":      ["claude --continue"],
       "agent-new":  ["claude"],
-      "agent-plan": ["claude --permission-mode plan"],
-      "agent-haiku":      ["claude --model haiku"],
-      "agent-opus":       ["claude --model opus"],
-      "agent-opus-plan":  ["claude --model opus --permission-mode plan"]
+      "agent-plan":  ["claude --model opus --permission-mode plan"],
+      "agent-haiku": ["claude --model haiku"],
+      "agent-opus":  ["claude --model opus"]
     }
   }
 }
