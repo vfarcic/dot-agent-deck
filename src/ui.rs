@@ -752,16 +752,9 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     content
 }
 
-/// Write the orchestrator context file and return the one-line prompt to inject.
-/// The file is written to `.dot-agent-deck/orchestrator-context.md` inside `cwd`.
-/// Returns `None` if the file cannot be written.
-fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
-    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-    std::fs::create_dir_all(&dir).ok()?;
-    let file_path = dir.join("orchestrator-context.md");
-    let content = build_orchestrator_context(config);
-    std::fs::write(&file_path, &content).ok()?;
-    Some("Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and delegation protocol. Acknowledge your role and wait for instructions.".to_string())
+/// Build the orchestrator prompt to inject directly into the start role's pane.
+fn prepare_orchestrator_prompt(config: &OrchestrationConfig) -> String {
+    build_orchestrator_context(config)
 }
 
 // ---------------------------------------------------------------------------
@@ -2981,9 +2974,12 @@ pub fn run_tui(
 
                         // Orchestration path — manage own panes, no agent pane.
                         if let Some(orch_config) = req.orchestration_config {
-                            let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
-                            match tab_manager.open_orchestration_tab(&orch_config, &dir_str, prompt)
-                            {
+                            let prompt = prepare_orchestrator_prompt(&orch_config);
+                            match tab_manager.open_orchestration_tab(
+                                &orch_config,
+                                &dir_str,
+                                Some(prompt),
+                            ) {
                                 Ok((_tab_idx, role_pane_ids)) => {
                                     {
                                         let mut st = state.blocking_write();
@@ -5460,10 +5456,9 @@ mod tests {
     }
 
     #[test]
-    fn prepare_orchestrator_prompt_writes_file() {
+    fn prepare_orchestrator_prompt_returns_full_content() {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
 
-        let dir = tempfile::tempdir().unwrap();
         let config = OrchestrationConfig {
             name: "test".to_string(),
             roles: vec![
@@ -5486,19 +5481,10 @@ mod tests {
             ],
         };
 
-        let cwd = dir.path().to_str().unwrap();
-        let prompt = prepare_orchestrator_prompt(&config, cwd);
-        assert!(prompt.is_some());
-        let prompt = prompt.unwrap();
-        // One-liner referencing the file.
-        assert!(prompt.contains("orchestrator-context.md"));
-        assert!(!prompt.contains('\n'));
-        // File was written.
-        let file_path = dir.path().join(".dot-agent-deck/orchestrator-context.md");
-        assert!(file_path.exists());
-        let content = std::fs::read_to_string(file_path).unwrap();
-        assert!(content.contains("Available agents"));
-        assert!(content.contains("**worker**: Does work"));
+        let prompt = prepare_orchestrator_prompt(&config);
+        assert!(prompt.contains("Available agents"));
+        assert!(prompt.contains("**worker**: Does work"));
+        assert!(prompt.contains("Delegation protocol"));
     }
 
     #[test]
