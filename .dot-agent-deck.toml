@@ -33,9 +33,7 @@ When the user's request relates to a PRD, read only the PRD file from the prds/ 
 to understand what needs to be done. Include the PRD file path in your delegation tasks \
 so agents can read it themselves.
 
-When the reviewer provides feedback: if you agree with the feedback (blocking issues, \
-correctness problems, or important improvements), delegate back to the coder to fix it. \
-Do not leave agreed-upon issues unfixed.
+After the coder finishes, delegate to both the reviewer and auditor in parallel.
 """
 
 [[orchestrations.roles]]
