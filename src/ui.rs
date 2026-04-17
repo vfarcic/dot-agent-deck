@@ -1981,6 +1981,14 @@ pub fn run_tui(
         }
         // Always start on the dashboard so the user gets an overview first.
         tab_manager.switch_to(0);
+
+        // Focus the first pane so the right panel shows it immediately.
+        if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+            let ids = embedded.pane_ids();
+            if let Some(first_id) = ids.first() {
+                let _ = pane.focus_pane(first_id);
+            }
+        }
     }
 
     'outer: loop {
