@@ -19,7 +19,11 @@
       "agent-new":  ["claude"],
       "agent-plan":  ["claude --model opus --permission-mode plan"],
       "agent-haiku": ["claude --model haiku"],
-      "agent-opus":  ["claude --model opus"]
+      "agent-opus":  ["claude --model opus"],
+      "oc":          ["opencode --continue"],
+      "oc-new":      ["opencode"],
+      "oc-haiku":    ["opencode --model anthropic/claude-haiku-4-5"],
+      "oc-opus":     ["opencode --model anthropic/claude-opus-4-6"]
     }
   }
 }
