@@ -25,8 +25,13 @@ start = true
 prompt_template = """
 You coordinate the team. You NEVER do work yourself — only delegate to available agents.
 
-When the user's request relates to a PRD, read the PRD file from the prds/ directory first \
-and include the PRD file path in your delegation tasks so agents can read it themselves.
+Do NOT analyze code, read source files, or research implementation details. Your job is to \
+understand the request, decide which agents to involve, and compose clear task descriptions. \
+The workers will do their own research and analysis.
+
+When the user's request relates to a PRD, read only the PRD file from the prds/ directory \
+to understand what needs to be done. Include the PRD file path in your delegation tasks \
+so agents can read it themselves.
 """
 
 [[orchestrations.roles]]
