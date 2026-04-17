@@ -2670,20 +2670,27 @@ pub fn run_tui(
                                 .or_else(|| tab_manager.tab_index_for_pane(pane_id));
                             if let Some(tab_idx) = mode_tab_idx {
                                 // Close the entire tab (agent + side panes, or all role panes).
-                                if let Ok(side_ids) = tab_manager.close_tab(tab_idx) {
+                                // close_tab already calls close_pane on orchestration role panes.
+                                if let Ok(all_ids) = tab_manager.close_tab(tab_idx) {
                                     let mut st = state.blocking_write();
-                                    for id in &side_ids {
+                                    // Collect all pane IDs to clean up (returned + selected).
+                                    let mut pane_ids_to_remove: Vec<String> = all_ids;
+                                    if !pane_ids_to_remove.contains(&closed_pane_id) {
+                                        pane_ids_to_remove.push(closed_pane_id.clone());
+                                    }
+                                    for id in &pane_ids_to_remove {
                                         st.unregister_pane(id);
                                         st.pane_role_map.remove(id);
                                         st.pane_cwd_map.remove(id);
                                     }
-                                    st.sessions.remove(&sid);
-                                    st.unregister_pane(&closed_pane_id);
-                                    st.pane_role_map.remove(&closed_pane_id);
-                                    st.pane_cwd_map.remove(&closed_pane_id);
+                                    // Remove all sessions whose pane_id is in the closed set.
+                                    st.sessions.retain(|_, s| {
+                                        s.pane_id
+                                            .as_ref()
+                                            .is_none_or(|pid| !pane_ids_to_remove.contains(pid))
+                                    });
                                     drop(st);
                                 }
-                                let _ = pane.close_pane(&closed_pane_id);
                                 ui.pane_metadata.remove(&closed_pane_id);
                                 let area = terminal.get_frame().area();
                                 resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
