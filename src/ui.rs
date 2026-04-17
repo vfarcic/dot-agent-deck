@@ -2649,6 +2649,8 @@ pub fn run_tui(
                     entry.dismissed = true;
                 }
                 focus_deck(idx, &mut ui, &filtered, &snapshot, &state, &*pane);
+                let area = terminal.get_frame().area();
+                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
                 shortcut_handled = true;
             }
 
