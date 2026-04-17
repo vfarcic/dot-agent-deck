@@ -334,14 +334,27 @@ fn main() -> ExitCode {
 
 #[tokio::main]
 async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
-    // Optional file-based logging when DOT_AGENT_DECK_LOG is set
-    if std::env::var("DOT_AGENT_DECK_LOG").is_ok() {
+    // Optional file-based logging when DOT_AGENT_DECK_LOG is set.
+    // Logs go to the file path specified (e.g., DOT_AGENT_DECK_LOG=/tmp/dad.log).
+    // If the value is "1" or empty, defaults to /tmp/dot-agent-deck.log.
+    if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
+        let log_path = if log_val.is_empty() || log_val == "1" {
+            "/tmp/dot-agent-deck.log".to_string()
+        } else {
+            log_val
+        };
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("Failed to open log file");
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
                     .add_directive("dot_agent_deck=info".parse().unwrap()),
             )
-            .with_writer(std::io::stderr)
+            .with_writer(log_file)
+            .with_ansi(false)
             .init();
     }
 
