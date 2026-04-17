@@ -776,26 +776,6 @@ fn build_worker_prompt(prompt_template: Option<&str>, task: &str) -> String {
     }
 }
 
-/// Write the worker task to a file and return a one-liner to inject into the pane.
-/// Uses the same file-based approach as the orchestrator prompt to avoid multi-line
-/// paste issues (Claude Code shows multi-line pastes as "[Pasted text...]" without
-/// submitting them).
-fn prepare_worker_prompt(
-    role_name: &str,
-    prompt_template: Option<&str>,
-    task: &str,
-    cwd: &str,
-) -> Option<String> {
-    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-    std::fs::create_dir_all(&dir).ok()?;
-    let file_path = dir.join(format!("worker-task-{role_name}.md"));
-    let content = build_worker_prompt(prompt_template, task);
-    std::fs::write(&file_path, &content).ok()?;
-    Some(format!(
-        "Read .dot-agent-deck/worker-task-{role_name}.md for your role instructions and task. Execute the task immediately."
-    ))
-}
-
 /// Drain delegate signals and dispatch work to worker panes.
 ///
 /// For each `DelegateSignal`, look up the target role(s), optionally restart
@@ -844,13 +824,7 @@ fn dispatch_delegate_events(
             };
 
             let role = &config.roles[role_idx];
-            let prompt = prepare_worker_prompt(
-                &role.name,
-                role.prompt_template.as_deref(),
-                &signal.task,
-                &cwd,
-            )
-            .unwrap_or_else(|| build_worker_prompt(role.prompt_template.as_deref(), &signal.task));
+            let prompt = build_worker_prompt(role.prompt_template.as_deref(), &signal.task);
 
             if role.clear {
                 // Restart pane: close old, create new, update all mappings.
