@@ -21,7 +21,9 @@ use crate::event::{AgentType, EventType};
 use crate::pane::{PaneController, PaneError};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
-use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
+use crate::tab::{
+    OrchestrationRoleStatus, OrchestrationStatus, OrchestrationViewMode, Tab, TabId, TabManager,
+};
 use crate::terminal_widget::TerminalWidget;
 use crate::theme::ColorPalette;
 
@@ -139,6 +141,7 @@ enum ActiveTabView {
     Orchestration {
         role_pane_ids: Vec<String>,
         roles: Vec<RoleCardInfo>,
+        view_mode: OrchestrationViewMode,
     },
 }
 
@@ -667,6 +670,59 @@ fn resize_dashboard_panes(
             let cols = right_width.saturating_sub(2);
             if rows > 0 && cols > 0 {
                 let _ = embedded.resize_pane_pty(pane_id, rows, cols);
+            }
+        }
+    }
+}
+
+fn resize_orchestration_panes(
+    embedded: &EmbeddedPaneController,
+    tab_manager: &TabManager,
+    area: Rect,
+) {
+    let (role_pane_ids, view_mode, roles) = match tab_manager.active_tab() {
+        Tab::Orchestration {
+            role_pane_ids,
+            view_mode,
+            role_statuses,
+            ..
+        } => (role_pane_ids.clone(), *view_mode, role_statuses.clone()),
+        _ => return,
+    };
+
+    let sidebar_width = 22u16;
+    let chrome_rows: u16 = if tab_manager.show_tab_bar() { 1 } else { 0 };
+    let main_height = area.height.saturating_sub(chrome_rows + 1);
+    let panes_width = area.width.saturating_sub(sidebar_width + 2);
+
+    match view_mode {
+        OrchestrationViewMode::Split => {
+            let pane_count = role_pane_ids.len().max(1) as u16;
+            for pane_id in &role_pane_ids {
+                let rows = (main_height / pane_count).saturating_sub(2);
+                if rows > 0 && panes_width > 0 {
+                    let _ = embedded.resize_pane_pty(pane_id, rows, panes_width);
+                }
+            }
+        }
+        OrchestrationViewMode::Focused => {
+            // Only the focused pane gets full height.
+            let focused_id = roles
+                .iter()
+                .enumerate()
+                .find(|(_, s)| **s == OrchestrationRoleStatus::Working)
+                .and_then(|(i, _)| role_pane_ids.get(i).cloned())
+                .or_else(|| {
+                    embedded
+                        .focused_pane_id()
+                        .filter(|id| role_pane_ids.contains(id))
+                })
+                .or_else(|| role_pane_ids.first().cloned());
+            if let Some(ref fid) = focused_id {
+                let rows = main_height.saturating_sub(2);
+                if rows > 0 && panes_width > 0 {
+                    let _ = embedded.resize_pane_pty(fid, rows, panes_width);
+                }
             }
         }
     }
@@ -2244,6 +2300,7 @@ pub fn run_tui(
                 role_pane_ids,
                 role_statuses,
                 config,
+                view_mode,
                 ..
             } => ActiveTabView::Orchestration {
                 role_pane_ids: role_pane_ids.clone(),
@@ -2258,6 +2315,7 @@ pub fn run_tui(
                         is_start: role.start,
                     })
                     .collect(),
+                view_mode: *view_mode,
             },
         };
         let tab_bar_labels: Vec<String> = tab_manager
@@ -3031,6 +3089,30 @@ pub fn run_tui(
                 }
             }
 
+            // On an orchestration tab in Normal mode, 'v' toggles focused/split view.
+            if !shortcut_handled
+                && ui.mode == UiMode::Normal
+                && key.code == KeyCode::Char('v')
+                && key.modifiers == KeyModifiers::NONE
+                && let Tab::Orchestration { view_mode, .. } = tab_manager.active_tab_mut()
+            {
+                *view_mode = match *view_mode {
+                    OrchestrationViewMode::Split => OrchestrationViewMode::Focused,
+                    OrchestrationViewMode::Focused => OrchestrationViewMode::Split,
+                };
+                let mode_name = match *view_mode {
+                    OrchestrationViewMode::Split => "split",
+                    OrchestrationViewMode::Focused => "focused",
+                };
+                // Resize PTYs to match the new view.
+                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                    let area = terminal.get_frame().area();
+                    resize_orchestration_panes(embedded, &tab_manager, area);
+                }
+                ui.status_message = Some((format!("View: {mode_name}"), std::time::Instant::now()));
+                shortcut_handled = true;
+            }
+
             // Mode-specific key handling (skip if a global shortcut was handled).
             let result = if shortcut_handled {
                 KeyResult::Continue
@@ -3575,6 +3657,7 @@ fn render_frame(
     if let ActiveTabView::Orchestration {
         role_pane_ids,
         roles,
+        view_mode,
     } = tab_view
     {
         render_orchestration_tab(
@@ -3588,6 +3671,7 @@ fn render_frame(
             has_pane_control,
             pane_layout,
             tab_bar.show,
+            *view_mode,
         );
         return;
     }
@@ -3628,7 +3712,15 @@ fn render_frame(
         .style(Style::default().fg(palette.text_secondary))
         .centered();
         frame.render_widget(msg, vertical[1]);
-        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
+        render_bottom_bar(
+            frame,
+            ui,
+            hints_area,
+            has_pane_control,
+            tab_bar.show,
+            false,
+            false,
+        );
 
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -3716,7 +3808,15 @@ fn render_frame(
             active_mode_name,
             palette,
         );
-        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
+        render_bottom_bar(
+            frame,
+            ui,
+            hints_area,
+            has_pane_control,
+            tab_bar.show,
+            false,
+            false,
+        );
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -3806,7 +3906,15 @@ fn render_frame(
     );
 
     // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
+    render_bottom_bar(
+        frame,
+        ui,
+        hints_area,
+        has_pane_control,
+        tab_bar.show,
+        false,
+        false,
+    );
 
     // Render terminal panes on the right side
     if let Some(right) = panes_area {
@@ -4108,7 +4216,15 @@ fn render_mode_tab(
     }
 
     // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control, show_tab_bar, true);
+    render_bottom_bar(
+        frame,
+        ui,
+        hints_area,
+        has_pane_control,
+        show_tab_bar,
+        true,
+        false,
+    );
 
     render_overlays(frame, ui, active_mode_name, palette);
 }
@@ -4126,6 +4242,7 @@ fn render_orchestration_tab(
     has_pane_control: bool,
     pane_layout: PaneLayout,
     show_tab_bar: bool,
+    view_mode: OrchestrationViewMode,
 ) {
     let palette = ui.palette;
 
@@ -4195,7 +4312,9 @@ fn render_orchestration_tab(
         // Truncate role name to fit inside card borders.
         let inner_width = area.width.saturating_sub(2) as usize; // border takes 2 chars
         let display_name = if role.name.len() > inner_width {
-            format!("{}\u{2026}", &role.name[..inner_width.saturating_sub(1)])
+            let truncate_at = inner_width.saturating_sub(1);
+            let safe_end = role.name.floor_char_boundary(truncate_at);
+            format!("{}\u{2026}", &role.name[..safe_end])
         } else {
             role.name.clone()
         };
@@ -4216,7 +4335,9 @@ fn render_orchestration_tab(
         // Build content: "cmd  status_label" on one line.
         let cmd_width = inner_width.saturating_sub(status_label.len() + 2);
         let display_cmd = if short_cmd.len() > cmd_width {
-            format!("{}\u{2026}", &short_cmd[..cmd_width.saturating_sub(1)])
+            let truncate_at = cmd_width.saturating_sub(1);
+            let safe_end = short_cmd.floor_char_boundary(truncate_at);
+            format!("{}\u{2026}", &short_cmd[..safe_end])
         } else {
             short_cmd.to_string()
         };
@@ -4241,12 +4362,34 @@ fn render_orchestration_tab(
         .filter(|id| role_pane_ids.contains(id))
         .collect();
 
-    if !pane_ids.is_empty() {
+    // In Focused mode, show only the active (working) role's pane.
+    // Falls back to the first Working role, then the embedded controller's
+    // focused pane, then the first pane.
+    let display_pane_ids: Vec<String> = match view_mode {
+        OrchestrationViewMode::Split => pane_ids,
+        OrchestrationViewMode::Focused => {
+            // Find the first Working role's pane ID.
+            let focused_id = roles
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.status == OrchestrationRoleStatus::Working)
+                .and_then(|(i, _)| role_pane_ids.get(i).cloned())
+                .or_else(|| {
+                    embedded
+                        .and_then(|e| e.focused_pane_id())
+                        .filter(|id| pane_ids.contains(id))
+                })
+                .or_else(|| pane_ids.first().cloned());
+            focused_id.into_iter().collect()
+        }
+    };
+
+    if !display_pane_ids.is_empty() {
         ui.focused_pane_rect = render_terminal_panes(
             frame,
             embedded,
             panes_area,
-            &pane_ids,
+            &display_pane_ids,
             pane_layout,
             &ui.pane_display_names,
             &ui.selection,
@@ -4255,8 +4398,16 @@ fn render_orchestration_tab(
         );
     }
 
-    // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control, show_tab_bar, false);
+    // Full-width hints bar — pass orchestration=true for view-toggle hint.
+    render_bottom_bar(
+        frame,
+        ui,
+        hints_area,
+        has_pane_control,
+        show_tab_bar,
+        false,
+        true,
+    );
 
     render_overlays(frame, ui, None, palette);
 }
@@ -4333,6 +4484,7 @@ fn render_bottom_bar(
     has_pane_control: bool,
     show_tab_bar: bool,
     is_mode_tab: bool,
+    is_orchestration_tab: bool,
 ) {
     match ui.mode {
         UiMode::Filter => {
@@ -4374,7 +4526,11 @@ fn render_bottom_bar(
                 } else {
                     String::new()
                 };
-                let hints = if is_mode_tab {
+                let hints = if is_orchestration_tab {
+                    format!(
+                        "v: toggle view  Enter: interact  {MOD_KEY}+w: close tab  ?: help  {MOD_KEY}+c: quit{tab_hint}"
+                    )
+                } else if is_mode_tab {
                     format!(
                         "j/k: navigate panes  Enter: interact  Esc: agent pane  {MOD_KEY}+w: close tab  ?: help  {MOD_KEY}+c: quit{tab_hint}"
                     )
