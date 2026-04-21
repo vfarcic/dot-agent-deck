@@ -311,7 +311,7 @@ Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orche
 - [~] **M9: Focused/split view toggle** — deferred; standard stacked/tiled layout (Ctrl+t) already handles this
 - [~] **M10: Status bar** — deferred; role cards already show current status (Working, Waiting, Done) and active role highlighting
 - [x] **M11: Config generation extension** — update `src/config_gen.rs` prompt to suggest orchestrations alongside modes
-- [ ] **M14: Documentation** — update README and/or user-facing docs with orchestration usage: `[[orchestrations]]` TOML format, role configuration (`start`, `description`, `prompt_template`, `clear`), delegation workflow, and example orchestrations (code-review, TDD)
+- [~] **M14: Documentation** — deferred to separate PRD #59 (Orchestration Documentation). See [prds/59-orchestration-documentation.md](prds/59-orchestration-documentation.md)
 
 ### Phase 3: Quality
 
@@ -417,6 +417,14 @@ Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orche
 - **Rationale**: Status information is already visible and accessible to users via the role card UI. The bottom status bar would duplicate this without adding new value. Role cards provide both per-role status and orchestration-level overview (which roles are active, waiting, or done).
 
 - **Impact**: M10 is marked as deferred `[~]` in the Phase 2 milestones. This does not affect orchestration functionality — all core features (M1–M6) are complete and operational. If future UX research shows users need at-a-glance status in a different location, M10 can be revisited, but it is not required for a functional orchestration system.
+
+### 2026-04-21: Spin M14 (Documentation) into separate PRD #59
+
+- **Decision**: Move M14 (Documentation) out of PRD #58 scope and create a separate PRD #59 (Orchestration Documentation) to manage it independently.
+
+- **Rationale**: Documentation is a distinct deliverable with its own milestones (concept, config reference, protocol, workflow, examples, troubleshooting). Separating it allows: (1) concurrent work on documentation while PRD #58 core implementation is complete, (2) independent tracking and prioritization of documentation tasks, (3) cleaner milestone structure for PRD #58 (focus on feature implementation), (4) ability to start documentation work immediately without blocking on PRD #58 completion.
+
+- **Impact**: M14 is marked as deferred `[~]` in the Phase 2 milestones with a link to PRD #59. PRD #58 is now feature-complete (Phase 1–3 all done or deferred appropriately). PRD #59 provides 8 milestones for comprehensive user-facing documentation of the orchestration system.
 
 ### 2026-04-17: Handoff prompt format for inter-agent context passing
 - **Decision**: When the orchestrator advances to the next role, it constructs a handoff file at `.dot-agent-deck/handoff-to-{role-name}.md` and injects a reference-based prompt into the next agent's pane. The orchestrator also auto-appends a `/work-done` instruction so agents know how to signal completion.
