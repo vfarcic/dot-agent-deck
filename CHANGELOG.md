@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.22.0] - 2026-04-21
+
+### Added
+
+  Add multi-role agent orchestration system that enables coordinated multi-agent workflows with a dedicated orchestrator agent driving delegation decisions. Supports parallel fan-out, worker context isolation, and interactive panes.
+
+
+
 ## [0.21.0] - 2026-04-15
 
 ### Added
