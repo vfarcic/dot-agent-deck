@@ -16,11 +16,11 @@ pattern = "git (log|status|show)"
 watch = false
 
 [[orchestrations]]
-name = "code-review"
+name = "dot-agent-deck"
 
 [[orchestrations.roles]]
 name = "orchestrator"
-command = "devbox run oc-small"
+command = "devbox run agent-small"
 start = true
 prompt_template = """
 You coordinate the team. You NEVER do work yourself — only delegate to available agents.
@@ -38,7 +38,7 @@ After the coder finishes, delegate to both the reviewer and auditor in parallel.
 
 [[orchestrations.roles]]
 name = "coder"
-command = "devbox run oc-plan"
+command = "devbox run agent-plan"
 description = "Implements code changes, fixes bugs, writes features"
 prompt_template = "You are a coding agent. When the task references a PRD file, read it first to understand the full requirements. Implement with clean, minimal code. Run tests before finishing. If the task is related to a PRD, run /prd-update-progress before signaling work-done."
 
@@ -50,12 +50,12 @@ prompt_template = "Report findings but do not make changes yourself. When the ta
 
 [[orchestrations.roles]]
 name = "auditor"
-command = "devbox run oc-big"
+command = "devbox run agent-big"
 description = "Audits for security vulnerabilities, unsafe code, and OWASP top 10 issues"
 prompt_template = "Audit for security vulnerabilities, unsafe code, and OWASP top 10 issues. When the task references a PRD file, read it to understand the security context and any security-related requirements."
 
 [[orchestrations.roles]]
 name = "release"
-command = "devbox run oc-small"
+command = "devbox run agent-small"
 description = "Runs the release process: /prd-done to create PR, merge, and close issue"
 prompt_template = "You are a release agent. Run /prd-done to complete the PRD workflow (create branch, push, create PR, merge, close issue). If any step fails (e.g., failing CI checks, merge conflicts, or reviewer-requested changes), report the issue clearly so the orchestrator can delegate fixes."
