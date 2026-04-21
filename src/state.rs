@@ -68,6 +68,8 @@ pub struct AppState {
     pub pane_role_map: HashMap<String, String>,
     /// Maps pane_id → working directory for orchestration panes.
     pub pane_cwd_map: HashMap<String, String>,
+    /// Pane IDs that are orchestrator (start=true) roles — only these can delegate.
+    pub orchestrator_pane_ids: HashSet<String>,
     /// Delegate signals from the orchestrator, consumed by dispatch (M5).
     pub delegate_events: Vec<DelegateSignal>,
     /// Work-done signals from workers (or orchestrator --done), consumed by feedback (M5b).
@@ -129,13 +131,25 @@ impl AppState {
     /// Unregister a pane ID (e.g., when closing a pane).
     pub fn unregister_pane(&mut self, pane_id: &str) {
         self.managed_pane_ids.remove(pane_id);
+        self.pane_role_map.remove(pane_id);
+        self.pane_cwd_map.remove(pane_id);
+        self.orchestrator_pane_ids.remove(pane_id);
     }
 
     /// Handle a delegate signal from the orchestrator.
-    /// Stores the signal for dispatch (M5).
+    /// Validates that the sender is an orchestrator (start=true) role before enqueuing.
     pub fn handle_delegate(&mut self, signal: DelegateSignal) {
         if !self.pane_role_map.contains_key(&signal.pane_id) {
             warn!(pane_id = %signal.pane_id, "delegate from unknown pane");
+            return;
+        }
+        if !self.orchestrator_pane_ids.contains(&signal.pane_id) {
+            let role = self
+                .pane_role_map
+                .get(&signal.pane_id)
+                .cloned()
+                .unwrap_or_default();
+            warn!(pane_id = %signal.pane_id, role = %role, "delegate from non-orchestrator pane");
             return;
         }
         self.delegate_events.push(signal);
@@ -157,9 +171,13 @@ impl AppState {
         if let Some(cwd) = self.pane_cwd_map.get(&signal.pane_id) {
             let safe_name = sanitize_role_name(&role_name);
             let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                warn!(dir = %dir.display(), role = %role_name, error = %e, "failed to create work-done directory");
+            }
             let file_path = dir.join(format!("work-done-{safe_name}.md"));
-            let _ = std::fs::write(&file_path, &signal.task);
+            if let Err(e) = std::fs::write(&file_path, &signal.task) {
+                warn!(path = %file_path.display(), role = %role_name, error = %e, "failed to write work-done summary");
+            }
         }
 
         self.work_done_events.push(signal);
@@ -821,6 +839,7 @@ mod tests {
         state
             .pane_role_map
             .insert("pane-1".into(), "orchestrator".into());
+        state.orchestrator_pane_ids.insert("pane-1".into());
 
         let signal = crate::event::DelegateSignal {
             pane_id: "pane-1".into(),

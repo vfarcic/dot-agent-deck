@@ -119,9 +119,15 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
             });
         }
 
-        // Reject role names containing filesystem-unsafe characters.
+        // Reject empty/whitespace role names and commands, and filesystem-unsafe characters.
         for role in &orch.roles {
-            if role.name.contains("..")
+            if role.name.trim().is_empty() {
+                issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    scope: orch.name.clone(),
+                    message: "role name is empty or whitespace".to_string(),
+                });
+            } else if role.name.contains("..")
                 || role.name.contains('/')
                 || role.name.contains('\\')
                 || role.name.contains('\0')
@@ -133,6 +139,13 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
                         "role name '{}' contains unsafe path characters (../, /, or \\)",
                         role.name
                     ),
+                });
+            }
+            if role.command.trim().is_empty() {
+                issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    scope: orch.name.clone(),
+                    message: format!("role '{}' has an empty command", role.name),
                 });
             }
         }

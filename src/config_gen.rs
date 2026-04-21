@@ -122,7 +122,10 @@ description = "Reviews code for correctness, style, and edge cases"
 ### Orchestration Guidelines
 
 - **Exactly one `start = true` role**: This is the orchestrator. It receives the user's initial request and delegates to workers. dot-agent-deck auto-appends the available agents list and delegation protocol to the orchestrator's prompt.
+- **At least 2 roles** per orchestration (one orchestrator + at least one worker).
 - **All role names must be unique** within the orchestration.
+- **Role names must not be empty** and must not contain `..`, `/`, `\`, or null characters (they are used in file paths).
+- **Every role must have a non-empty `command`**.
 - **Worker `description`** is important — it's used to auto-build the orchestrator's available agents list. Be specific about what each worker does.
 - **Worker `prompt_template`** is optional standing instructions (e.g., "always run tests before finishing"), NOT task instructions. The orchestrator provides task instructions each time via delegation.
 - **`clear = true` (default)**: Restarts the agent session between delegations for context isolation. Set `clear = false` if the agent needs to retain state across delegations.
@@ -182,7 +185,7 @@ description = "Audits code for security vulnerabilities and OWASP top 10 issues"
    - Whether any workers need custom `prompt_template` (standing instructions)
    - Whether `clear = false` is needed for any worker (uncommon)
 3. Always include an orchestrator role with `start = true`
-4. Validate: exactly one `start = true`, all role names unique
+4. Validate: exactly one `start = true`, at least 2 roles, all role names unique and non-empty (no `..`, `/`, `\`), all commands non-empty
 5. Present the proposed orchestration config and get user approval
 6. Write the `[[orchestrations]]` section into `.dot-agent-deck.toml` alongside the `[[modes]]` section
 

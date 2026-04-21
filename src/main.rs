@@ -268,7 +268,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let _ = dot_agent_deck::hook::send_to_socket(&json);
+            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
+                eprintln!("Failed to send delegate signal to daemon socket.");
+                return ExitCode::FAILURE;
+            }
             ExitCode::SUCCESS
         }
         Some(Commands::WorkDone { task, done }) => {
@@ -295,7 +298,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let _ = dot_agent_deck::hook::send_to_socket(&json);
+            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
+                eprintln!("Failed to send work-done signal to daemon socket.");
+                return ExitCode::FAILURE;
+            }
             ExitCode::SUCCESS
         }
         Some(Commands::Validate { path }) => {
@@ -343,19 +349,25 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
         } else {
             log_val
         };
-        let log_file = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_path)
-            .expect("Failed to open log file");
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive("dot_agent_deck=info".parse().unwrap()),
-            )
-            .with_writer(log_file)
-            .with_ansi(false)
-            .init();
+        {
+            Ok(log_file) => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::from_default_env()
+                            .add_directive("dot_agent_deck=info".parse().unwrap()),
+                    )
+                    .with_writer(log_file)
+                    .with_ansi(false)
+                    .init();
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to open log file {log_path}: {e}");
+            }
+        }
     }
 
     let state = Arc::new(RwLock::new(AppState::default()));

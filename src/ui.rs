@@ -924,11 +924,12 @@ fn dispatch_delegate_events(
                     st.sessions
                         .retain(|_, s| s.pane_id.as_deref() != Some(&old_pane_id));
                     st.register_pane(new_pane_id.clone());
-                    st.pane_role_map.remove(&old_pane_id);
                     st.pane_role_map
                         .insert(new_pane_id.clone(), role.name.clone());
-                    st.pane_cwd_map.remove(&old_pane_id);
                     st.pane_cwd_map.insert(new_pane_id.clone(), cwd.clone());
+                    if role.start {
+                        st.orchestrator_pane_ids.insert(new_pane_id.clone());
+                    }
                     st.insert_placeholder_session(new_pane_id.clone(), Some(cwd.clone()));
                 }
 
@@ -2773,8 +2774,6 @@ pub fn run_tui(
                                     }
                                     for id in &pane_ids_to_remove {
                                         st.unregister_pane(id);
-                                        st.pane_role_map.remove(id);
-                                        st.pane_cwd_map.remove(id);
                                     }
                                     // Remove all sessions whose pane_id is in the closed set.
                                     st.sessions.retain(|_, s| {
@@ -3092,6 +3091,10 @@ pub fn run_tui(
                                             );
                                             st.pane_cwd_map
                                                 .insert(role_pane_ids[i].clone(), dir_str.clone());
+                                            if role.start {
+                                                st.orchestrator_pane_ids
+                                                    .insert(role_pane_ids[i].clone());
+                                            }
                                         }
                                     }
                                     // Register display names for role panes.
@@ -7492,6 +7495,7 @@ mod tests {
             st.register_pane(orch_pane_id.clone());
             st.pane_role_map
                 .insert(orch_pane_id.clone(), "orchestrator".to_string());
+            st.orchestrator_pane_ids.insert(orch_pane_id.clone());
             // Delegate to a non-existent role.
             st.delegate_events.push(crate::event::DelegateSignal {
                 pane_id: orch_pane_id,
@@ -7705,6 +7709,9 @@ mod tests {
                 st.register_pane(pane_id.clone());
                 st.pane_role_map.insert(pane_id.clone(), role.name.clone());
                 st.pane_cwd_map.insert(pane_id.clone(), cwd.to_string());
+                if role.start {
+                    st.orchestrator_pane_ids.insert(pane_id.clone());
+                }
             }
         }
 

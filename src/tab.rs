@@ -206,13 +206,22 @@ impl TabManager {
         cwd: &str,
         orchestrator_prompt: Option<String>,
     ) -> Result<(usize, Vec<String>), TabError> {
-        let mut role_pane_ids = Vec::with_capacity(config.roles.len());
+        let mut role_pane_ids: Vec<String> = Vec::with_capacity(config.roles.len());
 
         for role in &config.roles {
-            let pane_id = self
+            let pane_id = match self
                 .pane_controller
-                .create_pane(None, Some(cwd))
-                .map_err(ModeManagerError::Pane)?;
+                .create_pane(Some(&role.command), Some(cwd))
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    // Clean up any panes already created.
+                    for id in &role_pane_ids {
+                        let _ = self.pane_controller.close_pane(id);
+                    }
+                    return Err(ModeManagerError::Pane(e).into());
+                }
+            };
             let _ = self.pane_controller.rename_pane(&pane_id, &role.name);
             role_pane_ids.push(pane_id);
         }
