@@ -3,8 +3,10 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
+use tracing::warn;
 
-use crate::event::{AgentEvent, AgentType, EventType};
+use crate::config_validation::sanitize_role_name;
+use crate::event::{AgentEvent, AgentType, DelegateSignal, EventType, WorkDoneSignal};
 
 const MAX_RECENT_EVENTS: usize = 50;
 const MAX_FIRST_PROMPTS: usize = 3;
@@ -62,6 +64,16 @@ pub struct AppState {
     pub update_available: Option<String>,
     /// Pane IDs created by our app — events from unknown panes are rejected.
     pub managed_pane_ids: HashSet<String>,
+    /// Maps pane_id → orchestration role name (set when orchestration tab opens).
+    pub pane_role_map: HashMap<String, String>,
+    /// Maps pane_id → working directory for orchestration panes.
+    pub pane_cwd_map: HashMap<String, String>,
+    /// Pane IDs that are orchestrator (start=true) roles — only these can delegate.
+    pub orchestrator_pane_ids: HashSet<String>,
+    /// Delegate signals from the orchestrator, consumed by dispatch (M5).
+    pub delegate_events: Vec<DelegateSignal>,
+    /// Work-done signals from workers (or orchestrator --done), consumed by feedback (M5b).
+    pub work_done_events: Vec<WorkDoneSignal>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -119,6 +131,56 @@ impl AppState {
     /// Unregister a pane ID (e.g., when closing a pane).
     pub fn unregister_pane(&mut self, pane_id: &str) {
         self.managed_pane_ids.remove(pane_id);
+        self.pane_role_map.remove(pane_id);
+        self.pane_cwd_map.remove(pane_id);
+        self.orchestrator_pane_ids.remove(pane_id);
+    }
+
+    /// Handle a delegate signal from the orchestrator.
+    /// Validates that the sender is an orchestrator (start=true) role before enqueuing.
+    pub fn handle_delegate(&mut self, signal: DelegateSignal) {
+        if !self.pane_role_map.contains_key(&signal.pane_id) {
+            warn!(pane_id = %signal.pane_id, "delegate from unknown pane");
+            return;
+        }
+        if !self.orchestrator_pane_ids.contains(&signal.pane_id) {
+            let role = self
+                .pane_role_map
+                .get(&signal.pane_id)
+                .cloned()
+                .unwrap_or_default();
+            warn!(pane_id = %signal.pane_id, role = %role, "delegate from non-orchestrator pane");
+            return;
+        }
+        self.delegate_events.push(signal);
+    }
+
+    /// Handle a work-done signal from a worker (or orchestrator --done).
+    /// Resolves pane_id → role name, writes a per-role summary file, and
+    /// stores the signal for feedback to the orchestrator (M5b).
+    pub fn handle_work_done(&mut self, signal: WorkDoneSignal) {
+        let role_name = match self.pane_role_map.get(&signal.pane_id) {
+            Some(name) => name.clone(),
+            None => {
+                warn!(pane_id = %signal.pane_id, "work-done from unknown pane");
+                return;
+            }
+        };
+
+        // Write summary to .dot-agent-deck/work-done-{role}.md
+        if let Some(cwd) = self.pane_cwd_map.get(&signal.pane_id) {
+            let safe_name = sanitize_role_name(&role_name);
+            let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                warn!(dir = %dir.display(), role = %role_name, error = %e, "failed to create work-done directory");
+            }
+            let file_path = dir.join(format!("work-done-{safe_name}.md"));
+            if let Err(e) = std::fs::write(&file_path, &signal.task) {
+                warn!(path = %file_path.display(), role = %role_name, error = %e, "failed to write work-done summary");
+            }
+        }
+
+        self.work_done_events.push(signal);
     }
 
     pub fn apply_event(&mut self, mut event: AgentEvent) {
@@ -769,5 +831,104 @@ mod tests {
 
         assert!(state.sessions.is_empty());
         assert!(!state.managed_pane_ids.contains("42"));
+    }
+
+    #[test]
+    fn handle_delegate_stores_event() {
+        let mut state = AppState::default();
+        state
+            .pane_role_map
+            .insert("pane-1".into(), "orchestrator".into());
+        state.orchestrator_pane_ids.insert("pane-1".into());
+
+        let signal = crate::event::DelegateSignal {
+            pane_id: "pane-1".into(),
+            task: "Implement login".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        };
+        state.handle_delegate(signal);
+
+        assert_eq!(state.delegate_events.len(), 1);
+        assert_eq!(state.delegate_events[0].task, "Implement login");
+        assert_eq!(state.delegate_events[0].to, vec!["coder"]);
+    }
+
+    #[test]
+    fn handle_delegate_unknown_pane_is_noop() {
+        let mut state = AppState::default();
+
+        let signal = crate::event::DelegateSignal {
+            pane_id: "unknown-pane".into(),
+            task: "Do something".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        };
+        state.handle_delegate(signal);
+
+        assert!(state.delegate_events.is_empty());
+    }
+
+    #[test]
+    fn handle_work_done_resolves_role_and_stores_event() {
+        let mut state = AppState::default();
+        state.pane_role_map.insert("pane-1".into(), "coder".into());
+        state
+            .pane_cwd_map
+            .insert("pane-1".into(), "/tmp/test-wd".into());
+
+        let signal = crate::event::WorkDoneSignal {
+            pane_id: "pane-1".into(),
+            task: "Implemented login".into(),
+            done: false,
+            timestamp: Utc::now(),
+        };
+        state.handle_work_done(signal);
+
+        assert_eq!(state.work_done_events.len(), 1);
+        assert_eq!(state.work_done_events[0].task, "Implemented login");
+
+        // Verify summary file was written
+        let file = std::path::Path::new("/tmp/test-wd/.dot-agent-deck/work-done-coder.md");
+        assert!(file.exists());
+        let content = std::fs::read_to_string(file).unwrap();
+        assert_eq!(content, "Implemented login");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all("/tmp/test-wd/.dot-agent-deck");
+    }
+
+    #[test]
+    fn handle_work_done_unknown_pane_is_noop() {
+        let mut state = AppState::default();
+
+        let signal = crate::event::WorkDoneSignal {
+            pane_id: "unknown-pane".into(),
+            task: "Some work".into(),
+            done: false,
+            timestamp: Utc::now(),
+        };
+        state.handle_work_done(signal);
+
+        assert!(state.work_done_events.is_empty());
+    }
+
+    #[test]
+    fn handle_work_done_done_flag_stored() {
+        let mut state = AppState::default();
+        state
+            .pane_role_map
+            .insert("pane-1".into(), "orchestrator".into());
+
+        let signal = crate::event::WorkDoneSignal {
+            pane_id: "pane-1".into(),
+            task: "All complete".into(),
+            done: true,
+            timestamp: Utc::now(),
+        };
+        state.handle_work_done(signal);
+
+        assert_eq!(state.work_done_events.len(), 1);
+        assert!(state.work_done_events[0].done);
     }
 }

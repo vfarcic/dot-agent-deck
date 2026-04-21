@@ -15,8 +15,16 @@
       "[ -f .env ] && source .env || true"
     ],
     "scripts": {
-      "agent":     ["claude --continue"],
-      "agent-new": ["claude"]
+      "agent":       ["claude --continue"],
+      "agent-new":   ["claude"],
+      "agent-plan":  ["claude --model opus --permission-mode plan"],
+      "agent-small": ["claude --model haiku"],
+      "agent-big":  ["claude --model opus"],
+      "oc":          ["opencode --continue"],
+      "oc-new":      ["opencode"],
+      "oc-plan":     ["opencode --model openai/gpt-5.3-codex"],
+      "oc-small":     ["opencode --model openai/gpt-5.4-mini"],
+      "oc-big":    ["opencode --model openai/gpt-5.3-codex"]
     }
   }
 }

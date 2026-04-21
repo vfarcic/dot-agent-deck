@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
@@ -24,6 +25,8 @@ struct Pane {
     is_focused: bool,
     /// The command that was used to create this pane.
     command: Option<String>,
+    /// Whether the child app has enabled mouse reporting (e.g., TUI apps like opencode).
+    mouse_mode: Arc<AtomicBool>,
 }
 
 /// Thread-safe pane registry.
@@ -137,12 +140,75 @@ impl EmbeddedPaneController {
         Ok(())
     }
 
+    /// Check if a pane's child app has enabled mouse reporting.
+    pub fn mouse_mode_enabled(&self, pane_id: &str) -> bool {
+        let panes = self.panes.lock().unwrap();
+        panes
+            .get(pane_id)
+            .is_some_and(|p| p.mouse_mode.load(Ordering::Relaxed))
+    }
+
+    /// Forward a mouse scroll event to the child app via SGR extended mouse encoding.
+    /// Coordinates are pane-relative (0-indexed) and converted to 1-indexed for the protocol.
+    /// Also resets vt100 scrollback to 0 so the terminal widget shows live output.
+    pub fn forward_mouse_scroll(
+        &self,
+        pane_id: &str,
+        up: bool,
+        col: u16,
+        row: u16,
+    ) -> Result<(), PaneError> {
+        // Ensure we're showing live output, not a stale scrollback position.
+        self.reset_scrollback(pane_id);
+        let button = if up { 64 } else { 65 };
+        let seq = format!("\x1b[<{};{};{}M", button, col + 1, row + 1);
+        self.write_raw_bytes(pane_id, seq.as_bytes())
+    }
+
     fn allocate_id(&self) -> String {
         let mut id = self.next_id.lock().unwrap();
         let current = *id;
         *id += 1;
         current.to_string()
     }
+}
+
+/// Scan PTY output bytes for mouse mode enable/disable escape sequences.
+/// Sets the atomic flag when the child app requests mouse reporting.
+fn scan_mouse_mode(data: &[u8], flag: &AtomicBool) {
+    // Mouse mode sequences: \x1b[?{mode}h (enable) or \x1b[?{mode}l (disable)
+    // Modes: 1000 (basic), 1002 (button-motion), 1003 (any-motion), 1006 (SGR extended)
+    let enable_patterns: &[&[u8]] = &[
+        b"\x1b[?1000h",
+        b"\x1b[?1002h",
+        b"\x1b[?1003h",
+        b"\x1b[?1006h",
+    ];
+    let disable_patterns: &[&[u8]] = &[
+        b"\x1b[?1000l",
+        b"\x1b[?1002l",
+        b"\x1b[?1003l",
+        b"\x1b[?1006l",
+    ];
+    for pat in enable_patterns {
+        if contains_bytes(data, pat) {
+            flag.store(true, Ordering::Relaxed);
+            return;
+        }
+    }
+    for pat in disable_patterns {
+        if contains_bytes(data, pat) {
+            flag.store(false, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Simple byte pattern search.
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 impl PaneController for EmbeddedPaneController {
@@ -211,17 +277,23 @@ impl PaneController for EmbeddedPaneController {
             .map_err(|e| PaneError::CommandFailed(format!("Failed to get PTY reader: {e}")))?;
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
+        let mouse_mode = Arc::new(AtomicBool::new(false));
 
         // Spawn a background thread to read PTY output and feed it to the vt100 parser.
+        // Also scan for mouse-enable/disable escape sequences to track mouse mode.
         let parser_clone = Arc::clone(&parser);
+        let mouse_mode_clone = Arc::clone(&mouse_mode);
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        let data = &buf[..n];
+                        // Scan for mouse mode enable/disable sequences.
+                        scan_mouse_mode(data, &mouse_mode_clone);
                         if let Ok(mut p) = parser_clone.lock() {
-                            p.process(&buf[..n]);
+                            p.process(data);
                         }
                     }
                     Err(_) => break,
@@ -237,6 +309,7 @@ impl PaneController for EmbeddedPaneController {
             name: command.unwrap_or("shell").to_string(),
             is_focused: false,
             command: command.map(|c| c.to_string()),
+            mouse_mode,
         };
 
         self.panes.lock().unwrap().insert(pane_id.clone(), pane);

@@ -2,6 +2,14 @@ use crate::project_config::ProjectConfig;
 use regex::Regex;
 use std::collections::HashSet;
 
+/// Sanitize a role name for safe use in filenames.
+/// Strips path separators, null bytes, and parent-directory sequences.
+/// Path separators are removed first so that inputs like `./.` cannot
+/// produce `..` after slash removal.
+pub fn sanitize_role_name(name: &str) -> String {
+    name.replace(['/', '\\', '\0'], "").replace("..", "")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Severity {
     Error,
@@ -11,7 +19,7 @@ pub enum Severity {
 #[derive(Debug, Clone)]
 pub struct ValidationIssue {
     pub severity: Severity,
-    pub mode_name: String,
+    pub scope: String,
     pub message: String,
 }
 
@@ -21,7 +29,7 @@ impl std::fmt::Display for ValidationIssue {
             Severity::Error => "error",
             Severity::Warning => "warning",
         };
-        write!(f, "[{}] mode '{}': {}", level, self.mode_name, self.message)
+        write!(f, "[{}] '{}': {}", level, self.scope, self.message)
     }
 }
 
@@ -36,7 +44,7 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
         if !seen_names.insert(&mode.name) {
             issues.push(ValidationIssue {
                 severity: Severity::Warning,
-                mode_name: mode.name.clone(),
+                scope: mode.name.clone(),
                 message: "duplicate mode name".to_string(),
             });
         }
@@ -47,7 +55,7 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
         if !mode.rules.is_empty() && mode.reactive_panes == 0 {
             issues.push(ValidationIssue {
                 severity: Severity::Error,
-                mode_name: mode.name.clone(),
+                scope: mode.name.clone(),
                 message: "modes with reactive rules must configure at least one reactive pane"
                     .to_string(),
             });
@@ -58,7 +66,7 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
             if let Err(e) = Regex::new(&rule.pattern) {
                 issues.push(ValidationIssue {
                     severity: Severity::Error,
-                    mode_name: mode.name.clone(),
+                    scope: mode.name.clone(),
                     message: format!("invalid regex '{}': {}", rule.pattern, e),
                 });
             }
@@ -69,10 +77,100 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
             if rule.interval.is_some() && !rule.watch {
                 issues.push(ValidationIssue {
                     severity: Severity::Warning,
-                    mode_name: mode.name.clone(),
+                    scope: mode.name.clone(),
                     message: format!(
                         "rule '{}' has interval but watch is false — interval will be ignored",
                         rule.pattern
+                    ),
+                });
+            }
+        }
+    }
+
+    // Check for duplicate orchestration names.
+    let mut seen_orch_names = HashSet::new();
+    for orch in &config.orchestrations {
+        if !seen_orch_names.insert(&orch.name) {
+            issues.push(ValidationIssue {
+                severity: Severity::Warning,
+                scope: orch.name.clone(),
+                message: "duplicate orchestration name".to_string(),
+            });
+        }
+    }
+
+    for orch in &config.orchestrations {
+        // Must have at least 2 roles.
+        if orch.roles.len() < 2 {
+            issues.push(ValidationIssue {
+                severity: Severity::Error,
+                scope: orch.name.clone(),
+                message: "orchestration must have at least 2 roles".to_string(),
+            });
+        }
+
+        // Exactly one start role.
+        let start_count = orch.roles.iter().filter(|r| r.start).count();
+        if start_count != 1 {
+            issues.push(ValidationIssue {
+                severity: Severity::Error,
+                scope: orch.name.clone(),
+                message: "orchestration must have exactly one role with start = true".to_string(),
+            });
+        }
+
+        // Reject empty/whitespace role names and commands, and filesystem-unsafe characters.
+        for role in &orch.roles {
+            if role.name.trim().is_empty() {
+                issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    scope: orch.name.clone(),
+                    message: "role name is empty or whitespace".to_string(),
+                });
+            } else if role.name.contains("..")
+                || role.name.contains('/')
+                || role.name.contains('\\')
+                || role.name.contains('\0')
+            {
+                issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    scope: orch.name.clone(),
+                    message: format!(
+                        "role name '{}' contains unsafe path characters (../, /, or \\)",
+                        role.name
+                    ),
+                });
+            }
+            if role.command.trim().is_empty() {
+                issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    scope: orch.name.clone(),
+                    message: format!("role '{}' has an empty command", role.name),
+                });
+            }
+        }
+
+        // Unique role names.
+        let mut seen_role_names = HashSet::new();
+        for role in &orch.roles {
+            if !seen_role_names.insert(&role.name) {
+                issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    scope: orch.name.clone(),
+                    message: format!("duplicate role name '{}'", role.name),
+                });
+            }
+        }
+
+        // Warn about worker roles without descriptions (helps orchestrator know capabilities).
+        for role in &orch.roles {
+            if !role.start && role.description.is_none() {
+                issues.push(ValidationIssue {
+                    severity: Severity::Warning,
+                    scope: orch.name.clone(),
+                    message: format!(
+                        "worker role '{}' has no description — orchestrator won't know its capabilities",
+                        role.name
                     ),
                 });
             }
@@ -90,10 +188,44 @@ pub fn has_errors(issues: &[ValidationIssue]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project_config::{ModeConfig, ModeRule, ProjectConfig};
+    use crate::project_config::{
+        ModeConfig, ModeRule, OrchestrationConfig, OrchestrationRoleConfig, ProjectConfig,
+    };
 
     fn make_config(modes: Vec<ModeConfig>) -> ProjectConfig {
-        ProjectConfig { modes }
+        ProjectConfig {
+            modes,
+            orchestrations: vec![],
+        }
+    }
+
+    fn make_role(name: &str, start: bool) -> OrchestrationRoleConfig {
+        OrchestrationRoleConfig {
+            name: name.to_string(),
+            command: "claude".to_string(),
+            start,
+            description: if start {
+                None
+            } else {
+                Some(format!("Does {name} tasks"))
+            },
+            prompt_template: None,
+            clear: true,
+        }
+    }
+
+    fn make_orchestration(name: &str, roles: Vec<OrchestrationRoleConfig>) -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: name.to_string(),
+            roles,
+        }
+    }
+
+    fn make_orch_config(orchestrations: Vec<OrchestrationConfig>) -> ProjectConfig {
+        ProjectConfig {
+            modes: vec![],
+            orchestrations,
+        }
     }
 
     fn make_mode(name: &str, rules: Vec<ModeRule>) -> ModeConfig {
@@ -185,11 +317,11 @@ mod tests {
     fn display_format() {
         let issue = ValidationIssue {
             severity: Severity::Error,
-            mode_name: "dev".to_string(),
+            scope: "dev".to_string(),
             message: "bad regex".to_string(),
         };
         let s = format!("{issue}");
-        assert_eq!(s, "[error] mode 'dev': bad regex");
+        assert_eq!(s, "[error] 'dev': bad regex");
     }
 
     #[test]
@@ -226,5 +358,197 @@ mod tests {
         }]);
         let issues = validate_config(&config);
         assert!(issues.is_empty());
+    }
+
+    // --- Orchestration validation tests ---
+
+    #[test]
+    fn valid_orchestration_has_no_issues() {
+        let config = make_orch_config(vec![make_orchestration(
+            "tdd",
+            vec![make_role("tester", true), make_role("coder", false)],
+        )]);
+        let issues = validate_config(&config);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn orchestration_fewer_than_two_roles_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "solo",
+            vec![make_role("only", true)],
+        )]);
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("at least 2 roles"))
+        );
+    }
+
+    #[test]
+    fn orchestration_no_start_role_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "nostart",
+            vec![make_role("a", false), make_role("b", false)],
+        )]);
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("start = true"))
+        );
+    }
+
+    #[test]
+    fn orchestration_multiple_start_roles_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "multistart",
+            vec![make_role("a", true), make_role("b", true)],
+        )]);
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("start = true"))
+        );
+    }
+
+    #[test]
+    fn orchestration_duplicate_role_names_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "duproles",
+            vec![make_role("worker", true), make_role("worker", false)],
+        )]);
+        let issues = validate_config(&config);
+        assert!(issues
+            .iter()
+            .any(|i| i.severity == Severity::Error && i.message.contains("duplicate role name")));
+    }
+
+    #[test]
+    fn orchestration_duplicate_names_produce_warning() {
+        let config = make_orch_config(vec![
+            make_orchestration("dup", vec![make_role("a", true), make_role("b", false)]),
+            make_orchestration("dup", vec![make_role("c", true), make_role("d", false)]),
+        ]);
+        let issues = validate_config(&config);
+        assert!(issues.iter().any(|i| i.severity == Severity::Warning
+            && i.message.contains("duplicate orchestration name")));
+    }
+
+    #[test]
+    fn orchestration_worker_without_description_warns() {
+        let config = make_orch_config(vec![make_orchestration(
+            "test",
+            vec![
+                make_role("orchestrator", true),
+                OrchestrationRoleConfig {
+                    name: "worker".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        )]);
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Warning && i.message.contains("no description"))
+        );
+    }
+
+    #[test]
+    fn orchestration_role_name_with_path_traversal_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "test",
+            vec![
+                make_role("orchestrator", true),
+                OrchestrationRoleConfig {
+                    name: "../evil".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("malicious".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        )]);
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("unsafe path"))
+        );
+    }
+
+    #[test]
+    fn orchestration_role_name_with_slash_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "test",
+            vec![
+                make_role("orchestrator", true),
+                OrchestrationRoleConfig {
+                    name: "sub/dir".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("slashy".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        )]);
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("unsafe path"))
+        );
+    }
+
+    #[test]
+    fn orchestration_role_name_with_backslash_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "test",
+            vec![
+                make_role("orchestrator", true),
+                OrchestrationRoleConfig {
+                    name: "sub\\dir".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("backslash".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        )]);
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("unsafe path"))
+        );
+    }
+
+    #[test]
+    fn sanitize_role_name_removes_traversal() {
+        assert_eq!(sanitize_role_name("../evil"), "evil");
+        assert_eq!(sanitize_role_name("sub/dir"), "subdir");
+        assert_eq!(sanitize_role_name("sub\\dir"), "subdir");
+        assert_eq!(sanitize_role_name("normal-name"), "normal-name");
+        assert_eq!(sanitize_role_name("../../etc/passwd"), "etcpasswd");
+        assert_eq!(sanitize_role_name("safe_name"), "safe_name");
+    }
+
+    #[test]
+    fn sanitize_role_name_slash_removal_cannot_create_dotdot() {
+        // Slash between dots: removing the slash must not leave ".."
+        assert_eq!(sanitize_role_name("./."), "");
+        assert_eq!(sanitize_role_name(".\\."), "");
+        assert_eq!(sanitize_role_name("./../."), "");
+        assert_eq!(sanitize_role_name("a./.b"), "ab");
     }
 }

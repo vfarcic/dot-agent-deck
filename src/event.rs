@@ -47,6 +47,44 @@ pub struct AgentEvent {
     pub pane_id: Option<String>,
 }
 
+/// Envelope for messages sent to the daemon over the Unix socket.
+///
+/// Existing hook senders transmit raw `AgentEvent` JSON (no `message_type` field).
+/// New message types (e.g. `WorkDone`) include `"message_type": "work_done"` so the
+/// daemon can distinguish them.  The daemon tries `DaemonMessage` first, then falls
+/// back to `AgentEvent`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "message_type")]
+pub enum DaemonMessage {
+    /// Orchestrator delegates work to one or more worker roles.
+    #[serde(rename = "delegate")]
+    Delegate(DelegateSignal),
+    /// Worker (or orchestrator with `done`) reports task completion.
+    #[serde(rename = "work_done")]
+    WorkDone(WorkDoneSignal),
+}
+
+/// Signal sent by the orchestrator via `dot-agent-deck delegate`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegateSignal {
+    pub pane_id: String,
+    pub task: String,
+    /// Role names to delegate to (one or more).
+    pub to: Vec<String>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Signal sent by a worker via `dot-agent-deck work-done`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkDoneSignal {
+    pub pane_id: String,
+    pub task: String,
+    /// When true, the orchestrator signals that the entire orchestration is complete.
+    #[serde(default)]
+    pub done: bool,
+    pub timestamp: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +170,79 @@ mod tests {
         let event: AgentEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.agent_type, AgentType::OpenCode);
         assert_eq!(event.event_type, EventType::SessionStart);
+    }
+
+    #[test]
+    fn serialize_deserialize_delegate_signal() {
+        let signal = DelegateSignal {
+            pane_id: "pane-1".into(),
+            task: "Implement login".into(),
+            to: vec!["coder".into()],
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let msg = DaemonMessage::Delegate(signal);
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: DaemonMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonMessage::Delegate(s) => {
+                assert_eq!(s.pane_id, "pane-1");
+                assert_eq!(s.task, "Implement login");
+                assert_eq!(s.to, vec!["coder"]);
+            }
+            _ => panic!("expected Delegate"),
+        }
+    }
+
+    #[test]
+    fn serialize_deserialize_work_done_signal() {
+        let signal = WorkDoneSignal {
+            pane_id: "pane-2".into(),
+            task: "Implemented login".into(),
+            done: false,
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let msg = DaemonMessage::WorkDone(signal);
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: DaemonMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonMessage::WorkDone(s) => {
+                assert_eq!(s.pane_id, "pane-2");
+                assert_eq!(s.task, "Implemented login");
+                assert!(!s.done);
+            }
+            _ => panic!("expected WorkDone"),
+        }
+    }
+
+    #[test]
+    fn work_done_signal_defaults() {
+        let json = r#"{
+            "message_type": "work_done",
+            "pane_id": "pane-2",
+            "task": "Done",
+            "timestamp": "2026-04-17T10:00:00Z"
+        }"#;
+        let msg: DaemonMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            DaemonMessage::WorkDone(s) => {
+                assert!(!s.done);
+            }
+            _ => panic!("expected WorkDone"),
+        }
+    }
+
+    #[test]
+    fn agent_event_not_parseable_as_daemon_message() {
+        let json = r#"{
+            "session_id": "abc-123",
+            "agent_type": "claude_code",
+            "event_type": "idle",
+            "timestamp": "2026-03-22T10:00:00Z"
+        }"#;
+        assert!(serde_json::from_str::<DaemonMessage>(json).is_err());
     }
 }

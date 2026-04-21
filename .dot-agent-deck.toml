@@ -14,3 +14,51 @@ watch = false
 [[modes.rules]]
 pattern = "git (log|status|show)"
 watch = false
+
+[[orchestrations]]
+name = "dot-agent-deck"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-small"
+start = true
+prompt_template = """
+You coordinate the team. You NEVER do work yourself — only delegate to available agents.
+
+Only do enough analysis to understand what needs to be done and provide clear context to \
+the agents who will do the work. Do not deep-dive into source code or implementation details — \
+that is the workers' job.
+
+When the user's request relates to a PRD, read only the PRD file from the prds/ directory \
+to understand what needs to be done. Include the PRD file path in your delegation tasks \
+so agents can read it themselves.
+
+After the coder finishes, delegate to both the reviewer and auditor in parallel.
+
+After reviewer and auditor both complete with no critical issues, delegate to release to finalize.
+"""
+
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-plan"
+description = "Implements code changes, fixes bugs, writes features"
+prompt_template = "You are a coding agent. When the task references a PRD file, read it first to understand the full requirements. Implement with clean, minimal code. Run tests before finishing."
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run oc-big"
+description = "Reviews code for correctness, style, and potential issues"
+prompt_template = "Report findings but do not make changes yourself. When the task references a PRD file, read it to verify the implementation matches the documented requirements and acceptance criteria."
+
+[[orchestrations.roles]]
+name = "auditor"
+command = "devbox run agent-big"
+description = "Audits for security vulnerabilities, unsafe code, and OWASP top 10 issues"
+prompt_template = "Audit for security vulnerabilities, unsafe code, and OWASP top 10 issues. When the task references a PRD file, read it to understand the security context and any security-related requirements."
+
+[[orchestrations.roles]]
+name = "release"
+command = "devbox run agent-small"
+clear = false
+description = "Runs the release process after all implementation work is reviewed and approved: /prd-done to create PR, merge, and close issue. Delegate here when coder/reviewer/auditor work is complete."
+prompt_template = "You are a release agent. Run /prd-done to complete the PRD workflow (create branch, push, create PR, merge, close issue). Do NOT modify code or fix issues yourself. If any step fails (e.g., failing CI checks, merge conflicts, or reviewer-requested changes), stop and report the issue clearly so the orchestrator can delegate fixes to the coder."

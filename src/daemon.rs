@@ -5,7 +5,7 @@ use tokio::net::UnixListener;
 use tracing::{error, info, warn};
 
 use crate::error::DaemonError;
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, DaemonMessage};
 use crate::state::SharedState;
 
 pub async fn run_daemon(socket_path: &Path, state: SharedState) -> Result<(), DaemonError> {
@@ -26,18 +26,36 @@ pub async fn run_daemon(socket_path: &Path, state: SharedState) -> Result<(), Da
                     let mut lines = reader.lines();
 
                     while let Ok(Some(line)) = lines.next_line().await {
-                        match serde_json::from_str::<AgentEvent>(&line) {
-                            Ok(event) => {
-                                info!(
-                                    session_id = %event.session_id,
-                                    event_type = ?event.event_type,
-                                    "Received event"
-                                );
-                                state.write().await.apply_event(event);
+                        if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
+                            match msg {
+                                DaemonMessage::Delegate(signal) => {
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        targets = ?signal.to,
+                                        "Received delegate signal"
+                                    );
+                                    state.write().await.handle_delegate(signal);
+                                }
+                                DaemonMessage::WorkDone(signal) => {
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        done = signal.done,
+                                        "Received work-done signal"
+                                    );
+                                    state.write().await.handle_work_done(signal);
+                                }
                             }
-                            Err(e) => {
-                                warn!("Malformed event: {e} — input: {line}");
-                            }
+                        } else if let Ok(event) = serde_json::from_str::<AgentEvent>(&line) {
+                            info!(
+                                session_id = %event.session_id,
+                                event_type = ?event.event_type,
+                                pane_id = ?event.pane_id,
+                                agent_type = ?event.agent_type,
+                                "Received event"
+                            );
+                            state.write().await.apply_event(event);
+                        } else {
+                            warn!("Malformed event: {line}");
                         }
                     }
                 });

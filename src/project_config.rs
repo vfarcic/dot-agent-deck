@@ -20,7 +20,10 @@ pub enum ProjectConfigError {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectConfig {
+    #[serde(default)]
     pub modes: Vec<ModeConfig>,
+    #[serde(default)]
+    pub orchestrations: Vec<OrchestrationConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,6 +61,31 @@ pub struct ModeRule {
     #[serde(default)]
     pub watch: bool,
     pub interval: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrchestrationConfig {
+    #[serde(default)]
+    pub name: String,
+    pub roles: Vec<OrchestrationRoleConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrchestrationRoleConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub start: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+    #[serde(default = "default_clear")]
+    pub clear: bool,
+}
+
+fn default_clear() -> bool {
+    true
 }
 
 pub fn load_project_config(dir: &Path) -> Result<Option<ProjectConfig>, ProjectConfigError> {
@@ -256,6 +284,167 @@ reactive_panes = 4
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.modes[0].reactive_panes, 4);
+    }
+
+    #[test]
+    fn parse_full_orchestration_config() {
+        let toml = r#"
+[[orchestrations]]
+name = "code-review"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude"
+start = true
+prompt_template = "You coordinate the team."
+
+[[orchestrations.roles]]
+name = "coder"
+command = "claude --model sonnet"
+description = "Implements code changes"
+prompt_template = "Always run cargo test before finishing."
+clear = false
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.orchestrations.len(), 1);
+        let orch = &config.orchestrations[0];
+        assert_eq!(orch.name, "code-review");
+        assert_eq!(orch.roles.len(), 2);
+        assert_eq!(orch.roles[0].name, "orchestrator");
+        assert_eq!(orch.roles[0].command, "claude");
+        assert!(orch.roles[0].start);
+        assert_eq!(
+            orch.roles[0].prompt_template.as_deref(),
+            Some("You coordinate the team.")
+        );
+        assert!(orch.roles[0].description.is_none());
+        assert!(orch.roles[0].clear); // default true
+        assert_eq!(orch.roles[1].name, "coder");
+        assert!(!orch.roles[1].start);
+        assert_eq!(
+            orch.roles[1].description.as_deref(),
+            Some("Implements code changes")
+        );
+        assert!(!orch.roles[1].clear); // explicitly false
+    }
+
+    #[test]
+    fn parse_orchestration_alongside_modes() {
+        let toml = r#"
+[[modes]]
+name = "dev"
+
+[[modes.panes]]
+command = "echo hi"
+
+[[orchestrations]]
+name = "review"
+
+[[orchestrations.roles]]
+name = "writer"
+command = "claude"
+start = true
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "claude"
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.modes.len(), 1);
+        assert_eq!(config.orchestrations.len(), 1);
+    }
+
+    #[test]
+    fn orchestration_clear_defaults_to_true() {
+        let toml = r#"
+[[orchestrations]]
+name = "test"
+
+[[orchestrations.roles]]
+name = "a"
+command = "claude"
+start = true
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert!(config.orchestrations[0].roles[0].clear);
+    }
+
+    #[test]
+    fn orchestration_description_defaults_to_none() {
+        let toml = r#"
+[[orchestrations]]
+name = "test"
+
+[[orchestrations.roles]]
+name = "a"
+command = "claude"
+start = true
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert!(config.orchestrations[0].roles[0].description.is_none());
+    }
+
+    #[test]
+    fn orchestration_prompt_template_defaults_to_none() {
+        let toml = r#"
+[[orchestrations]]
+name = "test"
+
+[[orchestrations.roles]]
+name = "a"
+command = "claude"
+start = true
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert!(config.orchestrations[0].roles[0].prompt_template.is_none());
+    }
+
+    #[test]
+    fn orchestration_role_start_defaults_to_false() {
+        let toml = r#"
+[[orchestrations]]
+name = "test"
+
+[[orchestrations.roles]]
+name = "worker"
+command = "claude"
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert!(!config.orchestrations[0].roles[0].start);
+    }
+
+    #[test]
+    fn modes_only_config_still_works() {
+        let toml = r#"
+[[modes]]
+name = "dev"
+
+[[modes.panes]]
+command = "echo hi"
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.modes.len(), 1);
+        assert!(config.orchestrations.is_empty());
+    }
+
+    #[test]
+    fn orchestrations_only_config_works() {
+        let toml = r#"
+[[orchestrations]]
+name = "test"
+
+[[orchestrations.roles]]
+name = "a"
+command = "claude"
+start = true
+
+[[orchestrations.roles]]
+name = "b"
+command = "claude"
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert!(config.modes.is_empty());
+        assert_eq!(config.orchestrations.len(), 1);
     }
 
     #[test]

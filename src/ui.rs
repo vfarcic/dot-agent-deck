@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,12 +16,13 @@ use ratatui::{
 use crate::ascii_art::{AsciiArtResult, generate_ascii_art};
 use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
+use crate::config_validation::sanitize_role_name;
 use crate::embedded_pane::EmbeddedPaneController;
-use crate::event::EventType;
+use crate::event::{AgentType, EventType};
 use crate::pane::{PaneController, PaneError};
-use crate::project_config::{ModeConfig, load_project_config};
+use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
-use crate::tab::{Tab, TabManager};
+use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
 use crate::terminal_widget::TerminalWidget;
 use crate::theme::ColorPalette;
 
@@ -135,6 +136,8 @@ enum ActiveTabView {
         /// Which side pane has visual focus (`None` = agent pane).
         focused_side_pane_index: Option<usize>,
     },
+    /// Orchestration tab: same card layout as dashboard, scoped to role panes.
+    Orchestration { role_pane_ids: Vec<String> },
 }
 
 /// Lightweight snapshot of tab state for rendering, decoupled from TabManager.
@@ -310,9 +313,10 @@ struct NewPaneFormState {
     dir: PathBuf,
     name: String,
     command: String,
-    // Mode selection fields
+    // Mode/orchestration selection fields
     modes: Vec<ModeConfig>,
-    mode_selected: usize, // 0 = "No mode", 1..N = modes
+    orchestrations: Vec<OrchestrationConfig>,
+    selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations
     has_mode_field: bool,
     focused: FormField,
 }
@@ -341,14 +345,21 @@ struct IdleArtEntry {
 }
 
 impl NewPaneFormState {
-    fn new(dir: PathBuf, name: String, command: String, modes: Vec<ModeConfig>) -> Self {
-        let has_mode_field = !modes.is_empty();
+    fn new(
+        dir: PathBuf,
+        name: String,
+        command: String,
+        modes: Vec<ModeConfig>,
+        orchestrations: Vec<OrchestrationConfig>,
+    ) -> Self {
+        let has_mode_field = !modes.is_empty() || !orchestrations.is_empty();
         Self {
             dir,
             name,
             command,
             modes,
-            mode_selected: 0,
+            orchestrations,
+            selection_index: 0,
             has_mode_field,
             focused: if has_mode_field {
                 FormField::Mode
@@ -359,32 +370,49 @@ impl NewPaneFormState {
     }
 
     fn mode_option_count(&self) -> usize {
-        1 + self.modes.len()
+        1 + self.modes.len() + self.orchestrations.len()
     }
 
     fn select_next_mode(&mut self) {
-        if self.mode_selected + 1 < self.mode_option_count() {
-            self.mode_selected += 1;
+        if self.selection_index + 1 < self.mode_option_count() {
+            self.selection_index += 1;
         }
     }
 
     fn select_previous_mode(&mut self) {
-        self.mode_selected = self.mode_selected.saturating_sub(1);
+        self.selection_index = self.selection_index.saturating_sub(1);
     }
 
     fn selected_mode(&self) -> Option<&ModeConfig> {
-        if self.mode_selected == 0 {
+        if self.selection_index == 0 || self.selection_index > self.modes.len() {
             None
         } else {
-            self.modes.get(self.mode_selected - 1)
+            self.modes.get(self.selection_index - 1)
         }
     }
 
-    fn mode_display_name(&self) -> &str {
-        if self.mode_selected == 0 {
-            "No mode"
+    fn selected_orchestration(&self) -> Option<&OrchestrationConfig> {
+        let orch_start = 1 + self.modes.len();
+        if self.selection_index >= orch_start {
+            self.orchestrations.get(self.selection_index - orch_start)
         } else {
-            &self.modes[self.mode_selected - 1].name
+            None
+        }
+    }
+
+    fn mode_display_name(&self) -> String {
+        if self.selection_index == 0 {
+            "No mode".to_string()
+        } else if self.selection_index <= self.modes.len() {
+            self.modes[self.selection_index - 1].name.clone()
+        } else {
+            let orch_idx = self.selection_index - 1 - self.modes.len();
+            let name = &self.orchestrations[orch_idx].name;
+            if name.is_empty() {
+                "Orchestration".to_string()
+            } else {
+                format!("Orch: {name}")
+            }
         }
     }
 
@@ -415,6 +443,14 @@ impl NewPaneFormState {
             FormField::Command => FormField::Name,
         }
     }
+}
+
+/// A prompt queued for injection into a pane once its agent is ready.
+/// Used by M5 delegation dispatch when `clear = true` restarts a pane.
+struct PendingDispatch {
+    pane_id: String,
+    prompt: String,
+    created_at: std::time::Instant,
 }
 
 struct UiState {
@@ -465,6 +501,12 @@ struct UiState {
     config_gen_selected: usize,
     /// Selected option in quit confirm modal (0=Quit, 1=Cancel).
     quit_confirm_selected: usize,
+    /// Orchestration tab IDs whose start-role prompt has already been injected.
+    orchestration_prompted: HashSet<TabId>,
+    /// Tracks when orchestration tabs were created (for delayed prompt injection).
+    orchestration_created_at: HashMap<TabId, std::time::Instant>,
+    /// Prompts waiting to be injected into panes once their agent is ready (M5 dispatch).
+    pending_dispatches: Vec<PendingDispatch>,
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -515,6 +557,9 @@ impl UiState {
             config_gen_target: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
+            orchestration_prompted: HashSet::new(),
+            orchestration_created_at: HashMap::new(),
+            pending_dispatches: Vec::new(),
         }
     }
 }
@@ -566,37 +611,52 @@ fn resize_dashboard_panes(
     tab_manager: &TabManager,
     area: Rect,
 ) {
-    if !matches!(tab_manager.active_tab(), Tab::Dashboard) {
-        return;
-    }
+    let orch_pane_ids = match tab_manager.active_tab() {
+        Tab::Dashboard => None,
+        Tab::Orchestration { role_pane_ids, .. } => Some(role_pane_ids.clone()),
+        _ => return,
+    };
     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-        let exclude = tab_manager.all_managed_pane_ids();
-        let pane_ids: Vec<String> = embedded
-            .pane_ids()
-            .into_iter()
-            .filter(|id| !exclude.contains(id))
-            .collect();
+        let all = embedded.pane_ids();
+        let pane_ids: Vec<String> = if let Some(ref include) = orch_pane_ids {
+            all.into_iter().filter(|id| include.contains(id)).collect()
+        } else {
+            let exclude = tab_manager.all_managed_pane_ids();
+            all.into_iter().filter(|id| !exclude.contains(id)).collect()
+        };
         if pane_ids.is_empty() {
             return;
         }
-        let right_width = (area.width * 67 / 100).saturating_sub(2);
+
+        // Mirror the render layout exactly: tab bar + main content + hints bar.
+        let chrome_rows: u16 = if tab_manager.show_tab_bar() { 1 } else { 0 };
+        let main_height = area.height.saturating_sub(chrome_rows + 1); // +1 for hints bar
+        // Right panel is 67% of width.
+        let right_width = area.width * 67 / 100;
         let pane_count = pane_ids.len() as u16;
+
+        // Mirror the stacked/tiled layout from render_terminal_panes.
         for pane_id in &pane_ids {
-            let is_focused = embedded.focused_pane_id().as_deref() == Some(pane_id.as_str());
-            let rows = match ui.pane_layout {
-                PaneLayout::Tiled => (area.height / pane_count).saturating_sub(2),
+            let is_focused = embedded.focused_pane_id().as_deref() == Some(pane_id.as_str())
+                || (embedded.focused_pane_id().is_none() && pane_id == &pane_ids[0]);
+            let chunk_height = match ui.pane_layout {
+                PaneLayout::Tiled => main_height / pane_count,
                 PaneLayout::Stacked => {
-                    if is_focused
-                        || (embedded.focused_pane_id().is_none() && pane_id == &pane_ids[0])
-                    {
-                        area.height.saturating_sub(2 + pane_count.saturating_sub(1))
+                    if is_focused {
+                        // Fill(1) gets: total - (unfocused_count * 1)
+                        let unfocused = pane_count.saturating_sub(1);
+                        main_height.saturating_sub(unfocused)
                     } else {
-                        0
+                        1 // collapsed title bar
                     }
                 }
             };
-            if rows > 0 {
-                let _ = embedded.resize_pane_pty(pane_id, rows, right_width);
+            // Inner rows = chunk height minus border (2 rows for top+bottom).
+            let rows = chunk_height.saturating_sub(2);
+            // Inner cols = right panel width minus border (2 cols for left+right).
+            let cols = right_width.saturating_sub(2);
+            if rows > 0 && cols > 0 {
+                let _ = embedded.resize_pane_pty(pane_id, rows, cols);
             }
         }
     }
@@ -645,6 +705,375 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
 }
 
 // ---------------------------------------------------------------------------
+// Orchestrator prompt construction
+// ---------------------------------------------------------------------------
+
+/// Build the orchestrator context file content.
+/// Includes the role's own prompt_template, the available-agents list, and
+/// delegation protocol instructions.
+fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
+    let mut content = String::new();
+
+    // 1. Orchestrator's own prompt_template.
+    if let Some(start_role) = config.roles.iter().find(|r| r.start)
+        && let Some(ref tpl) = start_role.prompt_template
+    {
+        content.push_str(tpl);
+        content.push_str("\n\n");
+    }
+
+    // 2. Available agents list.
+    content.push_str("## Available agents\n\n");
+    for role in &config.roles {
+        if role.start {
+            continue;
+        }
+        let desc = role.description.as_deref().unwrap_or("(no description)");
+        content.push_str(&format!("- **{}**: {}\n", role.name, desc));
+    }
+
+    // 3. Delegation protocol.
+    content.push_str("\n## Delegation protocol\n\n");
+    content.push_str(
+        "To delegate work to an agent, use `delegate` with one command per agent:\n\
+         ```bash\n\
+         dot-agent-deck delegate --to <role-name> --task \"Task description with context, file paths, and constraints.\"\n\
+         ```\n\n\
+         To delegate to multiple agents in parallel, make **one call per agent** so each gets its own task:\n\
+         ```bash\n\
+         dot-agent-deck delegate --to coder --task \"Implement the login endpoint...\"\n\
+         dot-agent-deck delegate --to reviewer --task \"Review the auth module...\"\n\
+         ```\n\n\
+         If all agents should receive the **exact same task**, you may combine them in one call:\n\
+         ```bash\n\
+         dot-agent-deck delegate --to <role1> --to <role2> --task \"Same task for all.\"\n\
+         ```\n\n\
+         When all work is complete and you are satisfied with the results:\n\
+         ```bash\n\
+         dot-agent-deck work-done --done --task \"Final summary of what was accomplished.\"\n\
+         ```\n",
+    );
+
+    // 4. Important guidelines.
+    content.push_str(
+        "\n## Important\n\n\
+         Wait for the user to tell you what to work on.\n\n\
+         Once you know the task, delegate immediately via the CLI commands above. \
+         Do NOT ask for confirmation before delegating. \
+         Do NOT offer to design, analyze, or plan — that is the workers' job. \
+         Do NOT ask 'should I proceed?' or 'do you want me to delegate?' — just delegate. \
+         Your only job: understand what needs doing, frame clear task descriptions, and hand off.\n\n\
+         Never send a new task to a worker that is still working on a previous task. \
+         Wait for its work-done signal before delegating again to the same worker. \
+         Delegating to different workers in parallel is fine.\n\n\
+         When a task related to a PRD is fully completed (all workers done, reviews passed), \
+         run `/prd-update-progress` yourself before signaling `--done` or moving to the next task.\n",
+    );
+
+    content
+}
+
+// ---------------------------------------------------------------------------
+// M6: Skill file auto-deployment
+// ---------------------------------------------------------------------------
+
+/// Write the orchestrator context to a file and return a one-liner to inject.
+/// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
+fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
+    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
+    std::fs::create_dir_all(&dir).ok()?;
+    let file_path = dir.join("orchestrator-context.md");
+    let content = build_orchestrator_context(config);
+    std::fs::write(&file_path, &content).ok()?;
+    Some("Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and delegation protocol. Acknowledge your role and wait for instructions.".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// M5: Delegation dispatch
+// ---------------------------------------------------------------------------
+
+/// Construct the full worker prompt content (written to file).
+/// Includes the task, optional role instructions, and work-done signaling instructions.
+fn build_worker_prompt(prompt_template: Option<&str>, task: &str) -> String {
+    let base = match prompt_template {
+        Some(tpl) => format!("{tpl}\n\n## Task\n\n{task}"),
+        None => task.to_string(),
+    };
+    format!(
+        "{base}\n\n## When done\n\n\
+         Signal completion by running this command via Bash:\n\
+         ```bash\n\
+         dot-agent-deck work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
+         ```"
+    )
+}
+
+/// Write the worker task to a file and return a one-liner to inject.
+/// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
+fn prepare_worker_prompt(
+    role_name: &str,
+    prompt_template: Option<&str>,
+    task: &str,
+    cwd: &str,
+) -> Option<String> {
+    let safe_name = sanitize_role_name(role_name);
+    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
+    std::fs::create_dir_all(&dir).ok()?;
+    let file_path = dir.join(format!("worker-task-{safe_name}.md"));
+    let content = build_worker_prompt(prompt_template, task);
+    std::fs::write(&file_path, &content).ok()?;
+    Some(format!(
+        "Read .dot-agent-deck/worker-task-{safe_name}.md for your task."
+    ))
+}
+
+/// Drain delegate signals and dispatch work to worker panes.
+///
+/// For each `DelegateSignal`, look up the target role(s), optionally restart
+/// their pane (`clear = true`), and inject the constructed prompt.  When a pane
+/// is restarted the prompt is deferred to `ui.pending_dispatches` because the
+/// agent needs time to initialise.
+fn dispatch_delegate_events(
+    state: &SharedState,
+    pane: &Arc<dyn PaneController>,
+    tab_manager: &mut TabManager,
+    ui: &mut UiState,
+) {
+    // 1. Drain all pending delegate events under a short write-lock.
+    let events: Vec<_> = state.blocking_write().delegate_events.drain(..).collect();
+
+    for signal in events {
+        // 2. Find the orchestration tab that owns this pane.
+        let tab_idx = tab_manager
+            .tabs()
+            .iter()
+            .position(|t| matches!(t, Tab::Orchestration { role_pane_ids, .. } if role_pane_ids.contains(&signal.pane_id)));
+
+        let Some(tab_idx) = tab_idx else {
+            tracing::warn!(pane_id = %signal.pane_id, "dispatch: pane not in any orchestration tab");
+            continue;
+        };
+
+        // 3. Extract what we need from the tab (borrow-safely).
+        let (config, cwd) = match &mut tab_manager.tabs_mut()[tab_idx] {
+            Tab::Orchestration {
+                config,
+                cwd,
+                status,
+                ..
+            } => {
+                *status = OrchestrationStatus::Delegated;
+                (config.clone(), cwd.clone())
+            }
+            _ => unreachable!(),
+        };
+
+        // 4. Dispatch to each target role.
+        for target_role_name in &signal.to {
+            let Some(role_idx) = config
+                .roles
+                .iter()
+                .position(|r| &r.name == target_role_name)
+            else {
+                tracing::warn!(
+                    role = %target_role_name,
+                    "dispatch: delegation target role not found in config"
+                );
+                continue;
+            };
+
+            let role = &config.roles[role_idx];
+            let prompt = prepare_worker_prompt(
+                &role.name,
+                role.prompt_template.as_deref(),
+                &signal.task,
+                &cwd,
+            )
+            .unwrap_or_else(|| build_worker_prompt(role.prompt_template.as_deref(), &signal.task));
+
+            if role.clear {
+                // Restart pane: close old, create new, update all mappings.
+                let old_pane_id = match &tab_manager.tabs()[tab_idx] {
+                    Tab::Orchestration { role_pane_ids, .. } => role_pane_ids[role_idx].clone(),
+                    _ => unreachable!(),
+                };
+
+                let _ = pane.close_pane(&old_pane_id);
+
+                let new_pane_id = match pane.create_pane(None, Some(&cwd)) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!(role = %role.name, error = %e, "dispatch: failed to create pane");
+                        continue;
+                    }
+                };
+                let _ = pane.rename_pane(&new_pane_id, &role.name);
+
+                // Update Tab::Orchestration role_pane_ids.
+                if let Tab::Orchestration { role_pane_ids, .. } =
+                    &mut tab_manager.tabs_mut()[tab_idx]
+                {
+                    role_pane_ids[role_idx] = new_pane_id.clone();
+                }
+
+                // Update state mappings.
+                {
+                    let mut st = state.blocking_write();
+                    st.unregister_pane(&old_pane_id);
+                    // Remove the old pane's session so it doesn't leak to the dashboard.
+                    st.sessions
+                        .retain(|_, s| s.pane_id.as_deref() != Some(&old_pane_id));
+                    st.register_pane(new_pane_id.clone());
+                    st.pane_role_map
+                        .insert(new_pane_id.clone(), role.name.clone());
+                    st.pane_cwd_map.insert(new_pane_id.clone(), cwd.clone());
+                    if role.start {
+                        st.orchestrator_pane_ids.insert(new_pane_id.clone());
+                    }
+                    st.insert_placeholder_session(new_pane_id.clone(), Some(cwd.clone()));
+                }
+
+                // Update UI display names.
+                ui.pane_display_names.remove(&old_pane_id);
+                ui.pane_display_names
+                    .insert(new_pane_id.clone(), role.name.clone());
+
+                // Launch the agent command in the new pane.
+                let _ = pane.write_to_pane(&new_pane_id, &role.command);
+
+                // Defer prompt injection until agent is ready.
+                ui.pending_dispatches.push(PendingDispatch {
+                    pane_id: new_pane_id,
+                    prompt,
+                    created_at: std::time::Instant::now(),
+                });
+            } else {
+                // Agent is already running — inject prompt directly.
+                let pane_id = match &tab_manager.tabs()[tab_idx] {
+                    Tab::Orchestration { role_pane_ids, .. } => role_pane_ids[role_idx].clone(),
+                    _ => unreachable!(),
+                };
+                let _ = pane.write_to_pane(&pane_id, &prompt);
+            }
+        }
+    }
+}
+
+/// Drain work-done signals from workers and inject their results into the
+/// orchestrator pane.  Each worker result is forwarded immediately — no
+/// batching or waiting for parallel completions.
+fn feedback_worker_results(
+    state: &SharedState,
+    pane: &Arc<dyn PaneController>,
+    tab_manager: &mut TabManager,
+    ui: &mut UiState,
+) {
+    let events: Vec<_> = state.blocking_write().work_done_events.drain(..).collect();
+
+    for signal in events {
+        // Find the orchestration tab that owns this pane.
+        let tab_idx = tab_manager.tabs().iter().position(|t| {
+            matches!(t, Tab::Orchestration { role_pane_ids, .. } if role_pane_ids.contains(&signal.pane_id))
+        });
+
+        let Some(tab_idx) = tab_idx else {
+            tracing::warn!(pane_id = %signal.pane_id, "feedback: pane not in any orchestration tab");
+            continue;
+        };
+
+        let (start_role_index, role_pane_ids, _cwd) = match &tab_manager.tabs()[tab_idx] {
+            Tab::Orchestration {
+                start_role_index,
+                role_pane_ids,
+                cwd,
+                ..
+            } => (*start_role_index, role_pane_ids.clone(), cwd.clone()),
+            _ => unreachable!(),
+        };
+
+        let orchestrator_pane_id = &role_pane_ids[start_role_index];
+
+        // If the signal came from the orchestrator itself (--done), handle completion.
+        if signal.pane_id == *orchestrator_pane_id {
+            if signal.done {
+                tracing::info!("Orchestration complete: {}", signal.task);
+                // Set the orchestration tab status to Completed.
+                if let Tab::Orchestration { status, .. } = &mut tab_manager.tabs_mut()[tab_idx] {
+                    *status = OrchestrationStatus::Completed;
+                }
+                ui.status_message = Some((
+                    format!("Orchestration complete: {}", signal.task),
+                    std::time::Instant::now(),
+                ));
+            }
+            continue;
+        }
+
+        // Resolve the worker's role name for the feedback message.
+        let role_name = state
+            .blocking_read()
+            .pane_role_map
+            .get(&signal.pane_id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Build feedback prompt: one-liner pointing to the work-done file.
+        // Must be single-line so write_to_pane submits it correctly.
+        let safe_name = sanitize_role_name(&role_name);
+        let feedback = format!(
+            "Worker {safe_name} has completed their task. Read .dot-agent-deck/work-done-{safe_name}.md for their full report."
+        );
+
+        // Check if orchestrator agent is ready; if not, queue for deferred injection.
+        let ready = {
+            let st = state.blocking_read();
+            st.sessions.values().any(|s| {
+                s.pane_id.as_deref() == Some(orchestrator_pane_id.as_str())
+                    && s.agent_type != AgentType::None
+            })
+        };
+
+        if ready {
+            let _ = pane.write_to_pane(orchestrator_pane_id, &feedback);
+        } else {
+            ui.pending_dispatches.push(PendingDispatch {
+                pane_id: orchestrator_pane_id.clone(),
+                prompt: feedback,
+                created_at: std::time::Instant::now(),
+            });
+        }
+    }
+}
+
+/// Process pending dispatches — inject prompt once the agent in the pane is ready.
+fn process_pending_dispatches(
+    ui: &mut UiState,
+    pane: &Arc<dyn PaneController>,
+    snapshot: &AppState,
+) {
+    ui.pending_dispatches.retain(|pd| {
+        // Fast path: agent fired SessionStart (e.g., Claude Code).
+        let agent_ready = snapshot.sessions.values().any(|s| {
+            s.pane_id.as_deref() == Some(pd.pane_id.as_str()) && s.agent_type != AgentType::None
+        });
+        // Slow path: no SessionStart after 10 seconds (e.g., opencode).
+        // The agent is likely running but hasn't signaled — inject anyway.
+        let timeout_ready =
+            !agent_ready && pd.created_at.elapsed() > std::time::Duration::from_secs(10);
+        if agent_ready || timeout_ready {
+            let _ = pane.write_to_pane(&pd.pane_id, &pd.prompt);
+            return false;
+        }
+        // Hard timeout after 60 seconds — give up.
+        if pd.created_at.elapsed() > std::time::Duration::from_secs(60) {
+            tracing::warn!(pane_id = %pd.pane_id, "dispatch: timed out waiting for agent");
+            return false;
+        }
+        true
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Bell transition detection
 // ---------------------------------------------------------------------------
 
@@ -680,6 +1109,7 @@ struct NewPaneRequest {
     name: String,
     command: String,
     mode_config: Option<ModeConfig>,
+    orchestration_config: Option<OrchestrationConfig>,
 }
 
 #[derive(Debug)]
@@ -1040,15 +1470,18 @@ fn focus_deck(
                     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
                         let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
                         let right_width = (term_w * 67 / 100).saturating_sub(2);
+                        // Account for UI chrome (tab bar + info bar + hints bar).
+                        // Use 3 as safe default; tab bar is shown whenever tabs exist.
+                        let usable_h = term_h.saturating_sub(3);
                         let pane_ids = embedded.pane_ids();
                         let pane_count = pane_ids.len() as u16;
                         for pid in &pane_ids {
                             let is_focused = pid == pane_id;
                             let rows = match ui.pane_layout {
-                                PaneLayout::Tiled => (term_h / pane_count).saturating_sub(2),
+                                PaneLayout::Tiled => (usable_h / pane_count).saturating_sub(2),
                                 PaneLayout::Stacked => {
                                     if is_focused {
-                                        term_h.saturating_sub(2 + pane_count.saturating_sub(1))
+                                        usable_h.saturating_sub(2 + pane_count.saturating_sub(1))
                                     } else {
                                         0
                                     }
@@ -1313,13 +1746,19 @@ fn transition_after_dir_pick(ui: &mut UiState) {
         .unwrap_or_default();
     let command = ui.config.default_command.clone();
 
-    let modes = match load_project_config(&dir) {
-        Ok(Some(config)) if !config.modes.is_empty() => config.modes,
-        _ => vec![],
+    let (modes, orchestrations) = match load_project_config(&dir) {
+        Ok(Some(config)) => (config.modes, config.orchestrations),
+        _ => (vec![], vec![]),
     };
 
     ui.dir_picker = None;
-    ui.new_pane_form = Some(NewPaneFormState::new(dir, name, command, modes));
+    ui.new_pane_form = Some(NewPaneFormState::new(
+        dir,
+        name,
+        command,
+        modes,
+        orchestrations,
+    ));
     ui.mode = UiMode::NewPaneForm;
 }
 
@@ -1367,6 +1806,7 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
                     name: form.name.clone(),
                     command: form.command.clone(),
                     mode_config: form.selected_mode().cloned(),
+                    orchestration_config: form.selected_orchestration().cloned(),
                 };
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
@@ -1495,7 +1935,11 @@ pub fn run_tui(
             };
             match pane.create_pane(cmd, Some(&saved_pane.dir)) {
                 Ok(new_id) => {
-                    state.blocking_write().register_pane(new_id.clone());
+                    {
+                        let mut st = state.blocking_write();
+                        st.register_pane(new_id.clone());
+                        st.insert_placeholder_session(new_id.clone(), Some(saved_pane.dir.clone()));
+                    }
                     if !saved_pane.name.is_empty() {
                         if let Err(e) = pane.rename_pane(&new_id, &saved_pane.name) {
                             ui.session_warnings.push(format!(
@@ -1582,6 +2026,19 @@ pub fn run_tui(
         }
         // Always start on the dashboard so the user gets an overview first.
         tab_manager.switch_to(0);
+
+        // Resize all restored panes to match the terminal layout, focus the first,
+        // and enter PaneInput mode so the user can type immediately.
+        if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+            let frame_area = terminal.get_frame().area();
+            resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
+            let ids = embedded.pane_ids();
+            if let Some(first_id) = ids.first() {
+                let _ = pane.focus_pane(first_id);
+                ui.mode = UiMode::PaneInput;
+            }
+        }
+        ui.selected_index = 0;
     }
 
     'outer: loop {
@@ -1606,11 +2063,11 @@ pub fn run_tui(
                 let frame_area = terminal.get_frame().area();
                 let half_width = (frame_area.width / 2).saturating_sub(2);
                 let side_pane_count = embedded.pane_ids().len().saturating_sub(1) as u16; // exclude agent
-                let pane_rows = if side_pane_count > 0 {
-                    (frame_area.height / side_pane_count).saturating_sub(2)
-                } else {
-                    frame_area.height.saturating_sub(3)
-                };
+                let pane_rows = frame_area
+                    .height
+                    .checked_div(side_pane_count)
+                    .map(|v| v.saturating_sub(2))
+                    .unwrap_or_else(|| frame_area.height.saturating_sub(3));
                 if pane_rows > 0 && half_width > 0 {
                     let _ = embedded.resize_pane_pty(new_id, pane_rows, half_width);
                 }
@@ -1662,7 +2119,37 @@ pub fn run_tui(
             }
         }
 
-        let filtered = filter_sessions(&snapshot, &ui);
+        let all_filtered = filter_sessions(&snapshot, &ui);
+        // Scope sessions to only those visible in the active tab.
+        let filtered: Vec<(&String, &SessionState)> = match tab_manager.active_tab() {
+            Tab::Dashboard => {
+                let exclude = tab_manager.all_managed_pane_ids();
+                all_filtered
+                    .into_iter()
+                    .filter(|(_, s)| s.pane_id.as_ref().is_none_or(|pid| !exclude.contains(pid)))
+                    .collect()
+            }
+            Tab::Orchestration { role_pane_ids, .. } => {
+                let mut orch_filtered: Vec<_> = all_filtered
+                    .into_iter()
+                    .filter(|(_, s)| {
+                        s.pane_id
+                            .as_ref()
+                            .is_some_and(|pid| role_pane_ids.contains(pid))
+                    })
+                    .collect();
+                // Sort by role config order, not numeric pane ID, so recreated
+                // panes (clear=true) keep their original card position.
+                orch_filtered.sort_by_key(|(_, s)| {
+                    s.pane_id
+                        .as_ref()
+                        .and_then(|pid| role_pane_ids.iter().position(|p| p == pid))
+                        .unwrap_or(usize::MAX)
+                });
+                orch_filtered
+            }
+            _ => all_filtered,
+        };
         let total = filtered.len();
 
         // Clamp selection
@@ -1715,6 +2202,9 @@ pub fn run_tui(
                 side_pane_ids: mode_manager.managed_pane_ids(),
                 focused_side_pane_index: *focused_side_pane_index,
             },
+            Tab::Orchestration { role_pane_ids, .. } => ActiveTabView::Orchestration {
+                role_pane_ids: role_pane_ids.clone(),
+            },
         };
         let tab_bar_labels: Vec<String> = tab_manager
             .tabs()
@@ -1730,6 +2220,11 @@ pub fn run_tui(
                     .get(agent_pane_id)
                     .map(|m| m.name.clone())
                     .unwrap_or_else(|| name.clone()),
+                Tab::Orchestration { name, status, .. } => match status {
+                    OrchestrationStatus::Completed => format!("{name} [done]"),
+                    OrchestrationStatus::Delegated => format!("{name} [active]"),
+                    OrchestrationStatus::WaitingForOrchestrator => name.clone(),
+                },
             })
             .collect();
         let tab_bar_info = TabBarInfo {
@@ -1763,6 +2258,49 @@ pub fn run_tui(
             let _ = std::io::stdout().flush();
         }
 
+        // Inject orchestrator prompt when start role agent becomes ready.
+        // Fast path: Claude Code fires SessionStart immediately (agent_type != None).
+        // Slow path: agents like opencode don't signal — fall back after 10 seconds.
+        for tab in tab_manager.tabs_mut() {
+            if let Tab::Orchestration {
+                id,
+                role_pane_ids,
+                start_role_index,
+                role_statuses,
+                orchestrator_prompt,
+                ..
+            } = tab
+                && orchestrator_prompt.is_some()
+                && !ui.orchestration_prompted.contains(id)
+            {
+                let start_pane_id = &role_pane_ids[*start_role_index];
+                let agent_ready = snapshot.sessions.values().any(|s| {
+                    s.pane_id.as_deref() == Some(start_pane_id) && s.agent_type != AgentType::None
+                });
+                let timeout_ready = !agent_ready
+                    && ui
+                        .orchestration_created_at
+                        .get(id)
+                        .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(10));
+                if agent_ready || timeout_ready {
+                    if let Some(prompt) = orchestrator_prompt.take() {
+                        let _ = pane.write_to_pane(start_pane_id, &prompt);
+                    }
+                    role_statuses[*start_role_index] = OrchestrationRoleStatus::Working;
+                    ui.orchestration_prompted.insert(*id);
+                }
+            }
+        }
+
+        // M5: Dispatch delegation events from orchestrator to workers.
+        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+
+        // M5b: Forward worker results back to the orchestrator.
+        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
+
+        // Process pending dispatches (clear=true roles waiting for agent ready).
+        process_pending_dispatches(&mut ui, &pane, &snapshot);
+
         // Drain all pending events before re-rendering. This avoids a full
         // render cycle between each keystroke, which eliminates perceived typing
         // latency in PaneInput mode.
@@ -1775,42 +2313,10 @@ pub fn run_tui(
             let ev = event::read()?;
 
             // Handle terminal resize: update PTY dimensions for all embedded panes.
-            if let Event::Resize(w, h) = ev {
-                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-                    let pane_ids = embedded.pane_ids();
-                    if !pane_ids.is_empty() {
-                        // Width depends on active tab layout:
-                        // - Dashboard: right panel is 67% of width
-                        // - Mode tab: both agent and side panes are 50% of width
-                        let is_mode_tab = tab_manager.active_mode_name().is_some();
-                        let pane_width = if is_mode_tab {
-                            (w * 50 / 100).saturating_sub(2)
-                        } else {
-                            (w * 67 / 100).saturating_sub(2)
-                        };
-                        let pane_count = pane_ids.len() as u16;
-                        for pane_id in &pane_ids {
-                            let is_focused =
-                                embedded.focused_pane_id().as_deref() == Some(pane_id.as_str());
-                            let rows = match ui.pane_layout {
-                                PaneLayout::Tiled => (h / pane_count).saturating_sub(2),
-                                PaneLayout::Stacked => {
-                                    if is_focused
-                                        || (embedded.focused_pane_id().is_none()
-                                            && pane_id == &pane_ids[0])
-                                    {
-                                        h.saturating_sub(2 + pane_count.saturating_sub(1))
-                                    } else {
-                                        0 // collapsed panes don't need resize
-                                    }
-                                }
-                            };
-                            if rows > 0 {
-                                let _ = embedded.resize_pane_pty(pane_id, rows, pane_width);
-                            }
-                        }
-                    }
-                }
+            if let Event::Resize(_w, _h) = ev {
+                let frame_area = terminal.get_frame().area();
+                resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
+                resize_mode_tab_panes(&*pane, &tab_manager, frame_area);
                 break; // re-render after resize
             }
 
@@ -1894,12 +2400,30 @@ pub fn run_tui(
                         crossterm::event::MouseEventKind::ScrollUp
                             if ui.mode == UiMode::PaneInput =>
                         {
-                            embedded.scroll_pane(&pane_id, 3);
+                            if embedded.mouse_mode_enabled(&pane_id) {
+                                let (col, row) = pane_relative_coords(
+                                    mouse.column,
+                                    mouse.row,
+                                    &ui.focused_pane_rect,
+                                );
+                                let _ = embedded.forward_mouse_scroll(&pane_id, true, col, row);
+                            } else {
+                                embedded.scroll_pane(&pane_id, 3);
+                            }
                         }
                         crossterm::event::MouseEventKind::ScrollDown
                             if ui.mode == UiMode::PaneInput =>
                         {
-                            embedded.scroll_pane(&pane_id, -3);
+                            if embedded.mouse_mode_enabled(&pane_id) {
+                                let (col, row) = pane_relative_coords(
+                                    mouse.column,
+                                    mouse.row,
+                                    &ui.focused_pane_rect,
+                                );
+                                let _ = embedded.forward_mouse_scroll(&pane_id, false, col, row);
+                            } else {
+                                embedded.scroll_pane(&pane_id, -3);
+                            }
                         }
                         crossterm::event::MouseEventKind::Down(
                             crossterm::event::MouseButton::Left,
@@ -2134,6 +2658,8 @@ pub fn run_tui(
                     entry.dismissed = true;
                 }
                 focus_deck(idx, &mut ui, &filtered, &snapshot, &state, &*pane);
+                let area = terminal.get_frame().area();
+                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
                 shortcut_handled = true;
             }
 
@@ -2185,30 +2711,30 @@ pub fn run_tui(
                             };
                             let pane_ids = embedded.pane_ids();
                             let pane_count = pane_ids.len() as u16;
-                            if pane_count > 0 {
-                                for pane_id in &pane_ids {
-                                    let rows = match ui.pane_layout {
-                                        PaneLayout::Tiled => {
-                                            (frame_area.height / pane_count).saturating_sub(2)
+                            for pane_id in &pane_ids {
+                                let rows = match ui.pane_layout {
+                                    PaneLayout::Tiled => frame_area
+                                        .height
+                                        .checked_div(pane_count)
+                                        .unwrap_or(0)
+                                        .saturating_sub(2),
+                                    PaneLayout::Stacked => {
+                                        let is_focused = embedded.focused_pane_id().as_deref()
+                                            == Some(pane_id.as_str());
+                                        if is_focused
+                                            || (embedded.focused_pane_id().is_none()
+                                                && pane_id == &pane_ids[0])
+                                        {
+                                            frame_area
+                                                .height
+                                                .saturating_sub(2 + pane_count.saturating_sub(1))
+                                        } else {
+                                            0
                                         }
-                                        PaneLayout::Stacked => {
-                                            let is_focused = embedded.focused_pane_id().as_deref()
-                                                == Some(pane_id.as_str());
-                                            if is_focused
-                                                || (embedded.focused_pane_id().is_none()
-                                                    && pane_id == &pane_ids[0])
-                                            {
-                                                frame_area.height.saturating_sub(
-                                                    2 + pane_count.saturating_sub(1),
-                                                )
-                                            } else {
-                                                0
-                                            }
-                                        }
-                                    };
-                                    if rows > 0 {
-                                        let _ = embedded.resize_pane_pty(pane_id, rows, pane_width);
                                     }
+                                };
+                                if rows > 0 {
+                                    let _ = embedded.resize_pane_pty(pane_id, rows, pane_width);
                                 }
                             }
                         }
@@ -2232,20 +2758,31 @@ pub fn run_tui(
                             && let Some(ref pane_id) = session.pane_id
                         {
                             let closed_pane_id = pane_id.clone();
-                            // Check if this pane is the agent of a mode tab.
-                            let mode_tab_idx = tab_manager.tab_index_for_agent_pane(pane_id);
+                            // Check if this pane belongs to a mode or orchestration tab.
+                            let mode_tab_idx = tab_manager
+                                .tab_index_for_agent_pane(pane_id)
+                                .or_else(|| tab_manager.tab_index_for_pane(pane_id));
                             if let Some(tab_idx) = mode_tab_idx {
-                                // Close the entire mode tab (agent + side panes).
-                                if let Ok(side_ids) = tab_manager.close_tab(tab_idx) {
+                                // Close the entire tab (agent + side panes, or all role panes).
+                                // close_tab already calls close_pane on orchestration role panes.
+                                if let Ok(all_ids) = tab_manager.close_tab(tab_idx) {
                                     let mut st = state.blocking_write();
-                                    for id in &side_ids {
+                                    // Collect all pane IDs to clean up (returned + selected).
+                                    let mut pane_ids_to_remove: Vec<String> = all_ids;
+                                    if !pane_ids_to_remove.contains(&closed_pane_id) {
+                                        pane_ids_to_remove.push(closed_pane_id.clone());
+                                    }
+                                    for id in &pane_ids_to_remove {
                                         st.unregister_pane(id);
                                     }
-                                    st.sessions.remove(&sid);
-                                    st.unregister_pane(&closed_pane_id);
+                                    // Remove all sessions whose pane_id is in the closed set.
+                                    st.sessions.retain(|_, s| {
+                                        s.pane_id
+                                            .as_ref()
+                                            .is_none_or(|pid| !pane_ids_to_remove.contains(pid))
+                                    });
                                     drop(st);
                                 }
-                                let _ = pane.close_pane(&closed_pane_id);
                                 ui.pane_metadata.remove(&closed_pane_id);
                                 let area = terminal.get_frame().area();
                                 resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
@@ -2530,152 +3067,234 @@ pub fn run_tui(
                 KeyResult::NewPane(req) => {
                     if pane.is_available() {
                         let dir_str = req.dir.display().to_string();
-                        // For mode tabs, create the agent pane as an empty
-                        // shell so the PTY can be resized to the correct
-                        // dimensions before the command starts.  This avoids
-                        // the process seeing the default 80×24 size.
-                        let is_mode = req.mode_config.is_some();
-                        let cmd = if req.command.is_empty() || is_mode {
-                            None
-                        } else {
-                            Some(req.command.as_str())
-                        };
-                        match pane.create_pane(cmd, Some(&dir_str)) {
-                            Ok(new_id) => {
-                                // Register so only events from our panes are accepted,
-                                // and create a placeholder session for an immediate dashboard card.
-                                {
-                                    let mut st = state.blocking_write();
-                                    st.register_pane(new_id.clone());
-                                    st.insert_placeholder_session(
-                                        new_id.clone(),
-                                        Some(dir_str.clone()),
-                                    );
-                                }
-                                if !req.name.is_empty() {
-                                    let _ = pane.rename_pane(&new_id, &req.name);
-                                    ui.pane_display_names
-                                        .insert(new_id.clone(), req.name.clone());
-                                    ui.pane_names.insert(new_id.clone(), req.name.clone());
-                                }
-                                let mode_name_for_save =
-                                    req.mode_config.as_ref().map(|m| m.name.clone());
-                                ui.pane_metadata.insert(
-                                    new_id.clone(),
-                                    config::SavedPane {
-                                        dir: dir_str.clone(),
-                                        name: req.name.clone(),
-                                        command: req.command,
-                                        mode: mode_name_for_save,
-                                    },
-                                );
 
-                                if let Some(mode_config) = req.mode_config {
-                                    // Mode selected — open a mode tab.
-                                    let mode_name = mode_config.name.clone();
-                                    match tab_manager.open_mode_tab(
-                                        &mode_config,
-                                        &dir_str,
-                                        new_id.clone(),
-                                    ) {
-                                        Ok((_tab_idx, side_ids)) => {
-                                            for id in &side_ids {
-                                                state.blocking_write().register_pane(id.clone());
-                                            }
-                                            let _ = pane.focus_pane(&new_id);
-                                            ui.mode = UiMode::PaneInput;
-                                            if let Some(embedded) =
-                                                pane.as_any()
-                                                    .downcast_ref::<EmbeddedPaneController>()
-                                            {
-                                                let frame_area = terminal.get_frame().area();
-                                                let half_width =
-                                                    (frame_area.width / 2).saturating_sub(2);
-                                                let agent_rows =
-                                                    frame_area.height.saturating_sub(3);
-                                                if agent_rows > 0 && half_width > 0 {
-                                                    let _ = embedded.resize_pane_pty(
-                                                        &new_id, agent_rows, half_width,
-                                                    );
-                                                }
-                                                let side_count = side_ids.len().max(1) as u16;
-                                                let side_rows = (frame_area.height / side_count)
-                                                    .saturating_sub(2);
-                                                if side_rows > 0 && half_width > 0 {
-                                                    for id in &side_ids {
-                                                        let _ = embedded.resize_pane_pty(
-                                                            id, side_rows, half_width,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            // Start commands now that panes are correctly sized
-                                            let _ = tab_manager.start_mode_commands();
-                                            // Send the agent pane command after resize
-                                            // so it starts at the correct PTY dimensions.
-                                            if let Some(ref init_cmd) = mode_config.init_command {
-                                                let _ = pane.write_to_pane(&new_id, init_cmd);
-                                            }
-                                            if let Some(saved) = ui.pane_metadata.get(&new_id) {
-                                                let agent_cmd = saved.command.clone();
-                                                if !agent_cmd.is_empty() {
-                                                    let _ = pane.write_to_pane(&new_id, &agent_cmd);
-                                                }
-                                            }
-                                            ui.status_message = Some((
-                                                format!("Activated mode: {mode_name}"),
-                                                std::time::Instant::now(),
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            let _ = pane.close_pane(&new_id);
-                                            ui.status_message = Some((
-                                                format!("Mode activation failed: {e}"),
-                                                std::time::Instant::now(),
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    // No mode — regular dashboard pane.
-                                    let _ = pane.focus_pane(&new_id);
-                                    ui.mode = UiMode::PaneInput;
-                                    ui.selected_index = filtered.len();
-                                    if let Some(embedded) =
-                                        pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                        // Orchestration path — manage own panes, no agent pane.
+                        if let Some(orch_config) = req.orchestration_config {
+                            let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
+                            match tab_manager.open_orchestration_tab(&orch_config, &dir_str, prompt)
+                            {
+                                Ok((_tab_idx, role_pane_ids)) => {
                                     {
-                                        let frame_area = terminal.get_frame().area();
-                                        let right_width =
-                                            (frame_area.width * 67 / 100).saturating_sub(2);
-                                        let pane_count = embedded.pane_ids().len() as u16;
-                                        let rows = match ui.pane_layout {
-                                            PaneLayout::Tiled => (frame_area.height
-                                                / pane_count.max(1))
-                                            .saturating_sub(2),
-                                            PaneLayout::Stacked => frame_area
-                                                .height
-                                                .saturating_sub(2 + pane_count.saturating_sub(1)),
-                                        };
-                                        if rows > 0 && right_width > 0 {
-                                            let _ = embedded.resize_pane_pty(
-                                                &new_id,
-                                                rows,
-                                                right_width,
+                                        let mut st = state.blocking_write();
+                                        for id in &role_pane_ids {
+                                            st.register_pane(id.clone());
+                                            st.insert_placeholder_session(
+                                                id.clone(),
+                                                Some(dir_str.clone()),
                                             );
                                         }
+                                        // Register pane-to-role and pane-to-cwd mappings for work-done resolution.
+                                        for (i, role) in orch_config.roles.iter().enumerate() {
+                                            st.pane_role_map.insert(
+                                                role_pane_ids[i].clone(),
+                                                role.name.clone(),
+                                            );
+                                            st.pane_cwd_map
+                                                .insert(role_pane_ids[i].clone(), dir_str.clone());
+                                            if role.start {
+                                                st.orchestrator_pane_ids
+                                                    .insert(role_pane_ids[i].clone());
+                                            }
+                                        }
                                     }
+                                    // Register display names for role panes.
+                                    for (i, role) in orch_config.roles.iter().enumerate() {
+                                        ui.pane_display_names
+                                            .insert(role_pane_ids[i].clone(), role.name.clone());
+                                        ui.pane_names
+                                            .insert(role_pane_ids[i].clone(), role.name.clone());
+                                    }
+
+                                    // Focus the start role's pane.
+                                    let start_idx =
+                                        orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                                    let _ = pane.focus_pane(&role_pane_ids[start_idx]);
+                                    ui.mode = UiMode::PaneInput;
+
+                                    // Resize role panes to dashboard layout.
+                                    let area = terminal.get_frame().area();
+                                    resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+
+                                    // Record creation time for delayed prompt injection fallback.
+                                    if let Tab::Orchestration { id, .. } = tab_manager.active_tab()
+                                    {
+                                        ui.orchestration_created_at
+                                            .insert(*id, std::time::Instant::now());
+                                    }
+
+                                    // Start role commands after resize.
+                                    for (i, role) in orch_config.roles.iter().enumerate() {
+                                        let _ =
+                                            pane.write_to_pane(&role_pane_ids[i], &role.command);
+                                    }
+
                                     ui.status_message = Some((
-                                        format!("Created pane {new_id} in {dir_str}"),
+                                        format!("Activated orchestration: {}", orch_config.name),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    ui.status_message = Some((
+                                        format!("Orchestration failed: {e}"),
                                         std::time::Instant::now(),
                                     ));
                                 }
                             }
-                            Err(e) => {
-                                ui.status_message = Some((
-                                    format!("New pane failed: {e}"),
-                                    std::time::Instant::now(),
-                                ));
+                        } else {
+                            // For mode tabs, create the agent pane as an empty
+                            // shell so the PTY can be resized to the correct
+                            // dimensions before the command starts.  This avoids
+                            // the process seeing the default 80×24 size.
+                            let is_mode = req.mode_config.is_some();
+                            let cmd = if req.command.is_empty() || is_mode {
+                                None
+                            } else {
+                                Some(req.command.as_str())
+                            };
+                            match pane.create_pane(cmd, Some(&dir_str)) {
+                                Ok(new_id) => {
+                                    // Register so only events from our panes are accepted,
+                                    // and create a placeholder session for an immediate dashboard card.
+                                    {
+                                        let mut st = state.blocking_write();
+                                        st.register_pane(new_id.clone());
+                                        st.insert_placeholder_session(
+                                            new_id.clone(),
+                                            Some(dir_str.clone()),
+                                        );
+                                    }
+                                    if !req.name.is_empty() {
+                                        let _ = pane.rename_pane(&new_id, &req.name);
+                                        ui.pane_display_names
+                                            .insert(new_id.clone(), req.name.clone());
+                                        ui.pane_names.insert(new_id.clone(), req.name.clone());
+                                    }
+                                    let mode_name_for_save =
+                                        req.mode_config.as_ref().map(|m| m.name.clone());
+                                    ui.pane_metadata.insert(
+                                        new_id.clone(),
+                                        config::SavedPane {
+                                            dir: dir_str.clone(),
+                                            name: req.name.clone(),
+                                            command: req.command,
+                                            mode: mode_name_for_save,
+                                        },
+                                    );
+
+                                    if let Some(mode_config) = req.mode_config {
+                                        // Mode selected — open a mode tab.
+                                        let mode_name = mode_config.name.clone();
+                                        match tab_manager.open_mode_tab(
+                                            &mode_config,
+                                            &dir_str,
+                                            new_id.clone(),
+                                        ) {
+                                            Ok((_tab_idx, side_ids)) => {
+                                                for id in &side_ids {
+                                                    state
+                                                        .blocking_write()
+                                                        .register_pane(id.clone());
+                                                }
+                                                let _ = pane.focus_pane(&new_id);
+                                                ui.mode = UiMode::PaneInput;
+                                                if let Some(embedded) =
+                                                    pane.as_any()
+                                                        .downcast_ref::<EmbeddedPaneController>()
+                                                {
+                                                    let frame_area = terminal.get_frame().area();
+                                                    let half_width =
+                                                        (frame_area.width / 2).saturating_sub(2);
+                                                    let agent_rows =
+                                                        frame_area.height.saturating_sub(3);
+                                                    if agent_rows > 0 && half_width > 0 {
+                                                        let _ = embedded.resize_pane_pty(
+                                                            &new_id, agent_rows, half_width,
+                                                        );
+                                                    }
+                                                    let side_count = side_ids.len().max(1) as u16;
+                                                    let side_rows = (frame_area.height
+                                                        / side_count)
+                                                        .saturating_sub(2);
+                                                    if side_rows > 0 && half_width > 0 {
+                                                        for id in &side_ids {
+                                                            let _ = embedded.resize_pane_pty(
+                                                                id, side_rows, half_width,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                // Start commands now that panes are correctly sized
+                                                let _ = tab_manager.start_mode_commands();
+                                                // Send the agent pane command after resize
+                                                // so it starts at the correct PTY dimensions.
+                                                if let Some(ref init_cmd) = mode_config.init_command
+                                                {
+                                                    let _ = pane.write_to_pane(&new_id, init_cmd);
+                                                }
+                                                if let Some(saved) = ui.pane_metadata.get(&new_id) {
+                                                    let agent_cmd = saved.command.clone();
+                                                    if !agent_cmd.is_empty() {
+                                                        let _ =
+                                                            pane.write_to_pane(&new_id, &agent_cmd);
+                                                    }
+                                                }
+                                                ui.status_message = Some((
+                                                    format!("Activated mode: {mode_name}"),
+                                                    std::time::Instant::now(),
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                let _ = pane.close_pane(&new_id);
+                                                ui.status_message = Some((
+                                                    format!("Mode activation failed: {e}"),
+                                                    std::time::Instant::now(),
+                                                ));
+                                            }
+                                        }
+                                    } else {
+                                        // No mode — regular dashboard pane.
+                                        let _ = pane.focus_pane(&new_id);
+                                        ui.mode = UiMode::PaneInput;
+                                        ui.selected_index = filtered.len();
+                                        if let Some(embedded) =
+                                            pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                                        {
+                                            let frame_area = terminal.get_frame().area();
+                                            let right_width =
+                                                (frame_area.width * 67 / 100).saturating_sub(2);
+                                            let pane_count = embedded.pane_ids().len() as u16;
+                                            let rows = match ui.pane_layout {
+                                                PaneLayout::Tiled => (frame_area.height
+                                                    / pane_count.max(1))
+                                                .saturating_sub(2),
+                                                PaneLayout::Stacked => {
+                                                    frame_area.height.saturating_sub(
+                                                        2 + pane_count.saturating_sub(1),
+                                                    )
+                                                }
+                                            };
+                                            if rows > 0 && right_width > 0 {
+                                                let _ = embedded.resize_pane_pty(
+                                                    &new_id,
+                                                    rows,
+                                                    right_width,
+                                                );
+                                            }
+                                        }
+                                        ui.status_message = Some((
+                                            format!("Created pane {new_id} in {dir_str}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    ui.status_message = Some((
+                                        format!("New pane failed: {e}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
                             }
-                        }
+                        } // close else (non-orchestration path)
                     }
                 }
                 KeyResult::SendConfigGenPrompt { pane_id, cwd } => {
@@ -2821,7 +3440,7 @@ fn render_frame(
     ui.agent_pane_rect = None;
 
     let active_mode_name = match tab_view {
-        ActiveTabView::Dashboard { .. } => None,
+        ActiveTabView::Dashboard { .. } | ActiveTabView::Orchestration { .. } => None,
         ActiveTabView::Mode { mode_name, .. } => Some(mode_name.as_str()),
     };
 
@@ -2900,25 +3519,43 @@ fn render_frame(
         return;
     }
 
-    // ── Dashboard tab rendering ────────────────────────────────────────
+    // ── Dashboard / Orchestration tab rendering ──────────────────────
     let all_pane_ids = embedded.map(|e| e.pane_ids()).unwrap_or_default();
-    let exclude = match tab_view {
-        ActiveTabView::Dashboard { exclude_pane_ids } => exclude_pane_ids,
+    let (pane_ids, dashboard_area, panes_area) = match tab_view {
+        ActiveTabView::Dashboard { exclude_pane_ids } => {
+            let pane_ids: Vec<String> = all_pane_ids
+                .into_iter()
+                .filter(|id| !exclude_pane_ids.contains(id))
+                .collect();
+            let (dashboard_area, panes_area) = if pane_ids.is_empty() {
+                (main_area, None)
+            } else {
+                let chunks =
+                    Layout::horizontal([Constraint::Percentage(33), Constraint::Percentage(67)])
+                        .split(main_area);
+                (chunks[0], Some(chunks[1]))
+            };
+            (pane_ids, dashboard_area, panes_area)
+        }
+        ActiveTabView::Orchestration { role_pane_ids, .. } => {
+            let pane_ids: Vec<String> = all_pane_ids
+                .into_iter()
+                .filter(|id| role_pane_ids.contains(id))
+                .collect();
+            let (dashboard_area, panes_area) = if pane_ids.is_empty() {
+                (main_area, None)
+            } else {
+                let chunks =
+                    Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)])
+                        .split(main_area);
+                (chunks[0], Some(chunks[1]))
+            };
+            (pane_ids, dashboard_area, panes_area)
+        }
         _ => unreachable!(),
     };
-    let pane_ids: Vec<String> = all_pane_ids
-        .into_iter()
-        .filter(|id| !exclude.contains(id))
-        .collect();
-    let has_terminal_panes = !pane_ids.is_empty();
 
-    let (dashboard_area, panes_area) = if has_terminal_panes {
-        let chunks = Layout::horizontal([Constraint::Percentage(33), Constraint::Percentage(67)])
-            .split(main_area);
-        (chunks[0], Some(chunks[1]))
-    } else {
-        (main_area, None)
-    };
+    // Orchestration tabs use the same dashboard card rendering as the main dashboard.
 
     if state.sessions.is_empty() {
         let vertical = Layout::vertical([
@@ -2949,28 +3586,7 @@ fn render_frame(
             );
         }
 
-        if ui.mode == UiMode::Help {
-            render_help_overlay(frame, active_mode_name, palette);
-        }
-        if ui.mode == UiMode::DirPicker
-            && let Some(picker) = ui.dir_picker.as_mut()
-        {
-            render_dir_picker(frame, picker, palette);
-        }
-        if ui.mode == UiMode::NewPaneForm
-            && let Some(ref form) = ui.new_pane_form
-        {
-            render_new_pane_form(frame, form, palette);
-        }
-        if ui.mode == UiMode::StarPrompt {
-            render_star_prompt(frame, palette);
-        }
-        if ui.mode == UiMode::ConfigGenPrompt {
-            render_config_gen_prompt(frame, ui.config_gen_selected, palette);
-        }
-        if ui.mode == UiMode::QuitConfirm {
-            render_quit_confirm(frame, ui.quit_confirm_selected, palette);
-        }
+        render_overlays(frame, ui, active_mode_name, palette);
         return;
     }
 
@@ -3057,6 +3673,7 @@ fn render_frame(
                 None,
             );
         }
+        render_overlays(frame, ui, active_mode_name, palette);
         return;
     }
 
@@ -3148,7 +3765,15 @@ fn render_frame(
         );
     }
 
-    // Overlays (drawn last, on top)
+    render_overlays(frame, ui, active_mode_name, palette);
+}
+
+fn render_overlays(
+    frame: &mut Frame,
+    ui: &mut UiState,
+    active_mode_name: Option<&str>,
+    palette: ColorPalette,
+) {
     if ui.mode == UiMode::Help {
         render_help_overlay(frame, active_mode_name, palette);
     }
@@ -3427,23 +4052,7 @@ fn render_mode_tab(
     // Full-width hints bar
     render_bottom_bar(frame, ui, hints_area, has_pane_control, show_tab_bar, true);
 
-    // Overlays (drawn last, on top)
-    if ui.mode == UiMode::Help {
-        render_help_overlay(frame, active_mode_name, palette);
-    }
-    if ui.mode == UiMode::DirPicker
-        && let Some(picker) = ui.dir_picker.as_mut()
-    {
-        render_dir_picker(frame, picker, palette);
-    }
-    if ui.mode == UiMode::NewPaneForm
-        && let Some(ref form) = ui.new_pane_form
-    {
-        render_new_pane_form(frame, form, palette);
-    }
-    if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame, ui.quit_confirm_selected, palette);
-    }
+    render_overlays(frame, ui, active_mode_name, palette);
 }
 
 fn render_stats_bar(
@@ -4163,6 +4772,18 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
     }
 }
 
+/// Convert screen-absolute mouse coordinates to pane-relative coordinates.
+/// Returns (col, row) relative to the pane's inner area (inside border).
+fn pane_relative_coords(screen_col: u16, screen_row: u16, pane_rect: &Option<Rect>) -> (u16, u16) {
+    if let Some(rect) = pane_rect {
+        let col = screen_col.saturating_sub(rect.x + 1); // +1 for border
+        let row = screen_row.saturating_sub(rect.y + 1);
+        (col, row)
+    } else {
+        (screen_col, screen_row)
+    }
+}
+
 fn grid_columns(width: u16) -> usize {
     if width >= 180 {
         3
@@ -4626,6 +5247,7 @@ fn update_idle_art(
 mod tests {
     use super::*;
     use crate::event::{AgentEvent, AgentType, EventType};
+    use crate::project_config::OrchestrationRoleConfig;
     use chrono::{Duration, Utc};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -4880,6 +5502,131 @@ mod tests {
                 )
             })
             .unwrap();
+    }
+
+    #[test]
+    fn orchestrator_context_includes_agents_and_protocol() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+
+        let config = OrchestrationConfig {
+            name: "code-review".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "claude".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: Some("You coordinate the team.".to_string()),
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "coder".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("Implements code changes".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "reviewer".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        };
+
+        let content = build_orchestrator_context(&config);
+
+        // Contains the orchestrator's own template.
+        assert!(content.contains("You coordinate the team."));
+        // Lists worker agents with descriptions.
+        assert!(content.contains("**coder**: Implements code changes"));
+        assert!(content.contains("**reviewer**: (no description)"));
+        // Does NOT list the orchestrator itself.
+        assert!(!content.contains("**orchestrator**"));
+        // Contains delegation protocol.
+        assert!(content.contains("Delegation protocol"));
+        assert!(content.contains("dot-agent-deck work-done"));
+        // Instructs orchestrator to wait then delegate.
+        assert!(content.contains("Wait for the user to tell you what to work on"));
+        assert!(content.contains("delegate immediately"));
+    }
+
+    #[test]
+    fn orchestrator_context_no_template() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+
+        let config = OrchestrationConfig {
+            name: "test".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "lead".to_string(),
+                    command: "claude".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "worker".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("Does work".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        };
+
+        let content = build_orchestrator_context(&config);
+        // Starts directly with available agents (no template preamble).
+        assert!(content.starts_with("## Available agents"));
+        assert!(content.contains("**worker**: Does work"));
+    }
+
+    #[test]
+    fn prepare_orchestrator_prompt_returns_full_content() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+
+        let config = OrchestrationConfig {
+            name: "test".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "lead".to_string(),
+                    command: "claude".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "worker".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("Does work".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        };
+
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let prompt = prepare_orchestrator_prompt(&config, cwd);
+        assert!(prompt.is_some());
+        let prompt = prompt.unwrap();
+        // One-liner referencing the file.
+        assert!(prompt.contains("orchestrator-context.md"));
+        assert!(!prompt.contains('\n'));
+        // File was written with full content.
+        let file_path = dir.path().join(".dot-agent-deck/orchestrator-context.md");
+        assert!(file_path.exists());
+        let content = std::fs::read_to_string(file_path).unwrap();
+        assert!(content.contains("Available agents"));
+        assert!(content.contains("**worker**: Does work"));
     }
 
     #[test]
@@ -5932,6 +6679,30 @@ mod tests {
         }
     }
 
+    fn make_orchestration(name: &str) -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: name.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "coder".to_string(),
+                    command: "claude".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: Some("Code.".to_string()),
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "reviewer".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("Reviews code".to_string()),
+                    prompt_template: Some("Review.".to_string()),
+                    clear: true,
+                },
+            ],
+        }
+    }
+
     #[test]
     fn test_update_idle_art_gated_on_config_disabled() {
         let mut cache = HashMap::new();
@@ -5976,10 +6747,17 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
+            vec![],
         );
         assert_eq!(f.mode_option_count(), 2); // "No mode" + 1 mode
 
-        let f = NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![],
+        );
         assert_eq!(f.mode_option_count(), 1); // "No mode" only
     }
 
@@ -5990,21 +6768,22 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("alpha"), make_mode("beta")],
+            vec![],
         );
-        assert_eq!(f.mode_selected, 0);
+        assert_eq!(f.selection_index, 0);
 
         // Can't go below 0
         f.select_previous_mode();
-        assert_eq!(f.mode_selected, 0);
+        assert_eq!(f.selection_index, 0);
 
         f.select_next_mode();
-        assert_eq!(f.mode_selected, 1);
+        assert_eq!(f.selection_index, 1);
         f.select_next_mode();
-        assert_eq!(f.mode_selected, 2);
+        assert_eq!(f.selection_index, 2);
 
         // Can't go past last
         f.select_next_mode();
-        assert_eq!(f.mode_selected, 2);
+        assert_eq!(f.selection_index, 2);
     }
 
     #[test]
@@ -6014,18 +6793,69 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("k8s"), make_mode("rust-tdd")],
+            vec![],
         );
 
         // Index 0 = "No mode"
         assert!(f.selected_mode().is_none());
         assert_eq!(f.mode_display_name(), "No mode");
 
-        f.mode_selected = 1;
+        f.selection_index = 1;
         assert_eq!(f.selected_mode().unwrap().name, "k8s");
         assert_eq!(f.mode_display_name(), "k8s");
 
-        f.mode_selected = 2;
+        f.selection_index = 2;
         assert_eq!(f.selected_mode().unwrap().name, "rust-tdd");
+    }
+
+    #[test]
+    fn unified_form_selected_orchestration() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("dev")],
+            vec![make_orchestration("tdd"), make_orchestration("review")],
+        );
+
+        // Index 0 = "No mode", 1 = mode "dev", 2+ = orchestrations
+        assert!(f.selected_orchestration().is_none());
+        assert!(f.selected_mode().is_none());
+
+        f.selection_index = 1;
+        assert!(f.selected_orchestration().is_none());
+        assert_eq!(f.selected_mode().unwrap().name, "dev");
+
+        f.selection_index = 2;
+        assert!(f.selected_mode().is_none());
+        assert_eq!(f.selected_orchestration().unwrap().name, "tdd");
+        assert_eq!(f.mode_display_name(), "Orch: tdd");
+
+        f.selection_index = 3;
+        assert_eq!(f.selected_orchestration().unwrap().name, "review");
+        assert_eq!(f.mode_display_name(), "Orch: review");
+    }
+
+    #[test]
+    fn unified_form_orchestration_cycling() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("dev")],
+            vec![make_orchestration("tdd")],
+        );
+        // 0=No mode, 1=dev, 2=tdd
+        assert_eq!(f.mode_option_count(), 3);
+
+        f.select_next_mode();
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 2);
+        assert_eq!(f.selected_orchestration().unwrap().name, "tdd");
+
+        // Can't go past last
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 2);
     }
 
     #[test]
@@ -6035,6 +6865,7 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
+            vec![],
         );
         assert_eq!(f.focused, FormField::Mode);
 
@@ -6054,8 +6885,13 @@ mod tests {
 
     #[test]
     fn unified_form_tab_cycles_without_mode() {
-        let mut f =
-            NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![],
+        );
         assert!(!f.has_mode_field);
         assert_eq!(f.focused, FormField::Name);
 
@@ -6076,13 +6912,20 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
+            vec![],
         );
         assert_eq!(f.focused, FormField::Mode);
     }
 
     #[test]
     fn unified_form_initial_focus_without_modes() {
-        let f = NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![],
+        );
         assert_eq!(f.focused, FormField::Name);
     }
 
@@ -6095,17 +6938,18 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a"), make_mode("b")],
+            vec![],
         ));
 
         // Right arrow cycles forward
         let key = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         handle_new_pane_form_key(key, &mut ui);
-        assert_eq!(ui.new_pane_form.as_ref().unwrap().mode_selected, 1);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().selection_index, 1);
 
         // Left arrow cycles back
         let key = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
         handle_new_pane_form_key(key, &mut ui);
-        assert_eq!(ui.new_pane_form.as_ref().unwrap().mode_selected, 0);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().selection_index, 0);
     }
 
     #[test]
@@ -6117,6 +6961,7 @@ mod tests {
             "agent".to_string(),
             "claude".to_string(),
             vec![make_mode("a")],
+            vec![],
         ));
 
         // Enter on Mode → Name
@@ -6147,6 +6992,7 @@ mod tests {
             "agent".to_string(),
             "claude".to_string(),
             vec![make_mode("k8s-ops")],
+            vec![],
         ));
 
         // Select mode "k8s-ops" (index 1)
@@ -6181,6 +7027,7 @@ mod tests {
             "agent".to_string(),
             "claude".to_string(),
             vec![make_mode("a")],
+            vec![],
         ));
 
         // Stay on "No mode" (index 0), navigate through fields
@@ -6206,6 +7053,7 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
+            vec![],
         ));
 
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -6224,6 +7072,7 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
+            vec![],
         ));
 
         // Move to Name field
@@ -6250,6 +7099,7 @@ mod tests {
             String::new(),
             String::new(),
             vec![make_mode("a")],
+            vec![],
         ));
 
         // Move to Name field
@@ -6566,5 +7416,730 @@ mod tests {
 
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(matches!(result, KeyResult::Continue));
+    }
+
+    // -----------------------------------------------------------------------
+    // M5: Delegation dispatch tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_worker_prompt_with_template() {
+        let prompt = build_worker_prompt(Some("You are a code reviewer."), "Review auth module");
+        assert!(prompt.contains("You are a code reviewer."));
+        assert!(prompt.contains("## Task\n\nReview auth module"));
+        assert!(prompt.contains("dot-agent-deck work-done --task"));
+    }
+
+    #[test]
+    fn build_worker_prompt_without_template() {
+        let prompt = build_worker_prompt(None, "Implement login endpoint");
+        assert!(prompt.contains("Implement login endpoint"));
+        assert!(prompt.contains("dot-agent-deck work-done --task"));
+    }
+
+    #[test]
+    fn dispatch_drains_delegate_events() {
+        let state = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
+        let pane: Arc<dyn PaneController> = pane_ctrl;
+        let mut tab_manager = crate::tab::TabManager::new(Arc::clone(&pane));
+        let mut ui = default_ui();
+
+        // Push a delegate signal for a pane not in any tab — should drain and warn.
+        {
+            let mut st = state.blocking_write();
+            st.delegate_events.push(crate::event::DelegateSignal {
+                pane_id: "1".to_string(),
+                task: "Do work".to_string(),
+                to: vec!["coder".to_string()],
+                timestamp: Utc::now(),
+            });
+        }
+
+        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+
+        assert!(ui.pending_dispatches.is_empty());
+        assert!(state.blocking_read().delegate_events.is_empty());
+    }
+
+    #[test]
+    fn dispatch_warns_on_unknown_role() {
+        let state = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
+        let pane: Arc<dyn PaneController> = Arc::clone(&pane_ctrl) as Arc<dyn PaneController>;
+
+        let config = OrchestrationConfig {
+            name: "test".to_string(),
+            roles: vec![OrchestrationRoleConfig {
+                name: "orchestrator".to_string(),
+                command: "echo hi".to_string(),
+                start: true,
+                description: None,
+                prompt_template: None,
+                clear: true,
+            }],
+        };
+
+        let mut tab_manager = crate::tab::TabManager::new(Arc::clone(&pane));
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let (_, role_pane_ids) = tab_manager
+            .open_orchestration_tab(&config, cwd, None)
+            .unwrap();
+
+        let orch_pane_id = role_pane_ids[0].clone();
+
+        // Register pane in state.
+        {
+            let mut st = state.blocking_write();
+            st.register_pane(orch_pane_id.clone());
+            st.pane_role_map
+                .insert(orch_pane_id.clone(), "orchestrator".to_string());
+            st.orchestrator_pane_ids.insert(orch_pane_id.clone());
+            // Delegate to a non-existent role.
+            st.delegate_events.push(crate::event::DelegateSignal {
+                pane_id: orch_pane_id,
+                task: "Do something".to_string(),
+                to: vec!["nonexistent-role".to_string()],
+                timestamp: Utc::now(),
+            });
+        }
+
+        let mut ui = default_ui();
+        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+
+        // Should not panic or queue anything — just warn and skip.
+        assert!(ui.pending_dispatches.is_empty());
+    }
+
+    #[test]
+    fn pending_dispatch_timeout() {
+        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
+        let pane: Arc<dyn PaneController> = pane_ctrl;
+        let snapshot = AppState::default();
+        let mut ui = default_ui();
+
+        // Add a pending dispatch with an expired timeout.
+        ui.pending_dispatches.push(PendingDispatch {
+            pane_id: "999".to_string(),
+            prompt: "Do work".to_string(),
+            created_at: std::time::Instant::now() - std::time::Duration::from_secs(60),
+        });
+
+        process_pending_dispatches(&mut ui, &pane, &snapshot);
+
+        // Should be removed due to timeout.
+        assert!(ui.pending_dispatches.is_empty());
+    }
+
+    #[test]
+    fn pending_dispatch_waits_for_agent_ready() {
+        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
+        let pane: Arc<dyn PaneController> = pane_ctrl;
+        let snapshot = AppState::default(); // No sessions → agent not ready
+        let mut ui = default_ui();
+
+        ui.pending_dispatches.push(PendingDispatch {
+            pane_id: "1".to_string(),
+            prompt: "Do work".to_string(),
+            created_at: std::time::Instant::now(),
+        });
+
+        process_pending_dispatches(&mut ui, &pane, &snapshot);
+
+        // Should still be pending — agent not ready and not timed out.
+        assert_eq!(ui.pending_dispatches.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Recording mock pane controller (for dispatch/feedback integration tests)
+    // -----------------------------------------------------------------------
+
+    struct RecordingPaneController {
+        next_id: std::sync::Mutex<u64>,
+        written: std::sync::Mutex<Vec<(String, String)>>,
+        closed: std::sync::Mutex<Vec<String>>,
+        renamed: std::sync::Mutex<Vec<(String, String)>>,
+        created: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingPaneController {
+        fn new() -> Self {
+            Self {
+                next_id: std::sync::Mutex::new(1),
+                written: std::sync::Mutex::new(Vec::new()),
+                closed: std::sync::Mutex::new(Vec::new()),
+                renamed: std::sync::Mutex::new(Vec::new()),
+                created: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PaneController for RecordingPaneController {
+        fn create_pane(&self, _cmd: Option<&str>, _cwd: Option<&str>) -> Result<String, PaneError> {
+            let mut id = self.next_id.lock().unwrap();
+            let pane_id = format!("mock-{id}");
+            *id += 1;
+            self.created.lock().unwrap().push(pane_id.clone());
+            Ok(pane_id)
+        }
+
+        fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
+            self.written
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), text.to_string()));
+            Ok(())
+        }
+
+        fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+            self.closed.lock().unwrap().push(pane_id.to_string());
+            Ok(())
+        }
+
+        fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError> {
+            self.renamed
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), name.to_string()));
+            Ok(())
+        }
+
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "recording-mock"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Orchestration integration test helpers
+    // -----------------------------------------------------------------------
+
+    fn make_fanout_config(clear: bool) -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: "test-fanout".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "echo orchestrator".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false, // orchestrator is never restarted
+                },
+                OrchestrationRoleConfig {
+                    name: "coder".to_string(),
+                    command: "echo coder".to_string(),
+                    start: false,
+                    description: Some("Implements code".to_string()),
+                    prompt_template: Some("Always run tests.".to_string()),
+                    clear,
+                },
+                OrchestrationRoleConfig {
+                    name: "reviewer".to_string(),
+                    command: "echo reviewer".to_string(),
+                    start: false,
+                    description: Some("Reviews code".to_string()),
+                    prompt_template: Some("Check for bugs.".to_string()),
+                    clear,
+                },
+            ],
+        }
+    }
+
+    /// Set up an orchestration tab with a RecordingPaneController and register
+    /// all panes in state.  Returns the components needed for dispatch/feedback
+    /// tests plus the role_pane_ids for assertions.
+    fn setup_orchestration(
+        config: &OrchestrationConfig,
+    ) -> (
+        SharedState,
+        Arc<RecordingPaneController>,
+        Arc<dyn PaneController>,
+        TabManager,
+        UiState,
+        Vec<String>, // role_pane_ids
+        tempfile::TempDir,
+    ) {
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+
+        let mock = Arc::new(RecordingPaneController::new());
+        let pane: Arc<dyn PaneController> = Arc::clone(&mock) as Arc<dyn PaneController>;
+        let mut tab_manager = TabManager::new(Arc::clone(&pane));
+        let state = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+
+        let (_, role_pane_ids) = tab_manager
+            .open_orchestration_tab(config, cwd, None)
+            .unwrap();
+
+        // Register all panes in state with role and cwd mappings.
+        {
+            let mut st = state.blocking_write();
+            for (i, role) in config.roles.iter().enumerate() {
+                let pane_id = &role_pane_ids[i];
+                st.register_pane(pane_id.clone());
+                st.pane_role_map.insert(pane_id.clone(), role.name.clone());
+                st.pane_cwd_map.insert(pane_id.clone(), cwd.to_string());
+                if role.start {
+                    st.orchestrator_pane_ids.insert(pane_id.clone());
+                }
+            }
+        }
+
+        // Clear setup-phase recordings so tests only see dispatch/feedback activity.
+        mock.written.lock().unwrap().clear();
+        mock.closed.lock().unwrap().clear();
+        mock.created.lock().unwrap().clear();
+        mock.renamed.lock().unwrap().clear();
+
+        let ui = default_ui();
+        (state, mock, pane, tab_manager, ui, role_pane_ids, dir)
+    }
+
+    // -----------------------------------------------------------------------
+    // Parallel fan-out integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_parallel_fan_out_targets_multiple_workers() {
+        let config = make_fanout_config(false); // clear=false → direct injection
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+        let coder_pane = &role_pane_ids[1];
+        let reviewer_pane = &role_pane_ids[2];
+
+        // Orchestrator delegates to both coder and reviewer simultaneously.
+        {
+            let mut st = state.blocking_write();
+            st.delegate_events.push(crate::event::DelegateSignal {
+                pane_id: orchestrator_pane.clone(),
+                task: "Implement and review the auth module".to_string(),
+                to: vec!["coder".to_string(), "reviewer".to_string()],
+                timestamp: Utc::now(),
+            });
+        }
+
+        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+
+        // Both workers should have received prompts.
+        let written = mock.written.lock().unwrap();
+        let coder_writes: Vec<_> = written.iter().filter(|(id, _)| id == coder_pane).collect();
+        let reviewer_writes: Vec<_> = written
+            .iter()
+            .filter(|(id, _)| id == reviewer_pane)
+            .collect();
+
+        assert_eq!(
+            coder_writes.len(),
+            1,
+            "coder pane should receive exactly one prompt"
+        );
+        assert_eq!(
+            reviewer_writes.len(),
+            1,
+            "reviewer pane should receive exactly one prompt"
+        );
+
+        // Orchestration status should be Delegated.
+        if let Tab::Orchestration { status, .. } = &tab_manager.tabs()[1] {
+            assert_eq!(*status, OrchestrationStatus::Delegated);
+        } else {
+            panic!("expected Orchestration tab");
+        }
+
+        // Delegate events should be drained.
+        assert!(state.blocking_read().delegate_events.is_empty());
+    }
+
+    #[test]
+    fn dispatch_parallel_fan_out_with_clear_restarts_panes() {
+        let config = make_fanout_config(true); // clear=true → pane restart
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+        let old_coder_pane = role_pane_ids[1].clone();
+        let old_reviewer_pane = role_pane_ids[2].clone();
+
+        // Orchestrator delegates to both workers.
+        {
+            let mut st = state.blocking_write();
+            st.delegate_events.push(crate::event::DelegateSignal {
+                pane_id: orchestrator_pane.clone(),
+                task: "Implement and review".to_string(),
+                to: vec!["coder".to_string(), "reviewer".to_string()],
+                timestamp: Utc::now(),
+            });
+        }
+
+        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+
+        // Old panes should be closed.
+        let closed = mock.closed.lock().unwrap();
+        assert!(
+            closed.contains(&old_coder_pane),
+            "old coder pane should be closed"
+        );
+        assert!(
+            closed.contains(&old_reviewer_pane),
+            "old reviewer pane should be closed"
+        );
+
+        // New panes should be created (2 new panes for coder and reviewer).
+        let created = mock.created.lock().unwrap();
+        assert_eq!(created.len(), 2, "two new panes should be created");
+
+        // Prompts should be deferred (not directly written) because agent needs startup time.
+        assert_eq!(
+            ui.pending_dispatches.len(),
+            2,
+            "two pending dispatches for deferred prompt injection"
+        );
+
+        // State pane_role_map should have new pane IDs for coder and reviewer.
+        let st = state.blocking_read();
+        assert!(
+            !st.pane_role_map.contains_key(&old_coder_pane),
+            "old coder pane should be removed from role map"
+        );
+        assert!(
+            !st.pane_role_map.contains_key(&old_reviewer_pane),
+            "old reviewer pane should be removed from role map"
+        );
+        // New pane IDs should be mapped to the correct roles.
+        let new_coders: Vec<_> = st
+            .pane_role_map
+            .iter()
+            .filter(|(_, role)| *role == "coder")
+            .collect();
+        let new_reviewers: Vec<_> = st
+            .pane_role_map
+            .iter()
+            .filter(|(_, role)| *role == "reviewer")
+            .collect();
+        assert_eq!(new_coders.len(), 1, "exactly one coder mapping");
+        assert_eq!(new_reviewers.len(), 1, "exactly one reviewer mapping");
+    }
+
+    #[test]
+    fn dispatch_targets_only_specified_roles() {
+        let config = make_fanout_config(false); // clear=false
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+        let coder_pane = &role_pane_ids[1];
+
+        // Delegate only to reviewer — coder should not receive anything.
+        {
+            let mut st = state.blocking_write();
+            st.delegate_events.push(crate::event::DelegateSignal {
+                pane_id: orchestrator_pane.clone(),
+                task: "Review the auth module".to_string(),
+                to: vec!["reviewer".to_string()],
+                timestamp: Utc::now(),
+            });
+        }
+
+        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+
+        let written = mock.written.lock().unwrap();
+
+        // Coder should receive nothing.
+        let coder_writes: Vec<_> = written.iter().filter(|(id, _)| id == coder_pane).collect();
+        assert!(
+            coder_writes.is_empty(),
+            "coder pane should not receive a prompt when not targeted"
+        );
+
+        // Reviewer should receive exactly one prompt.
+        let reviewer_pane = &role_pane_ids[2];
+        let reviewer_writes: Vec<_> = written
+            .iter()
+            .filter(|(id, _)| id == reviewer_pane)
+            .collect();
+        assert_eq!(
+            reviewer_writes.len(),
+            1,
+            "reviewer pane should receive exactly one prompt"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Feedback loop integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn feedback_worker_result_injected_immediately() {
+        let config = make_fanout_config(false);
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+        let coder_pane = &role_pane_ids[1];
+
+        // Make the orchestrator "ready" by inserting a session with agent_type != None.
+        {
+            let mut st = state.blocking_write();
+            let session_id = format!("session-{orchestrator_pane}");
+            st.sessions.insert(
+                session_id.clone(),
+                crate::state::SessionState {
+                    session_id,
+                    agent_type: AgentType::ClaudeCode,
+                    cwd: None,
+                    status: SessionStatus::Idle,
+                    active_tool: None,
+                    started_at: Utc::now(),
+                    last_activity: Utc::now(),
+                    recent_events: std::collections::VecDeque::new(),
+                    tool_count: 0,
+                    last_user_prompt: None,
+                    first_prompts: Vec::new(),
+                    pane_id: Some(orchestrator_pane.clone()),
+                },
+            );
+        }
+
+        // Worker coder signals work-done.
+        {
+            let mut st = state.blocking_write();
+            st.work_done_events.push(crate::event::WorkDoneSignal {
+                pane_id: coder_pane.clone(),
+                task: "Implemented auth module".to_string(),
+                done: false,
+                timestamp: Utc::now(),
+            });
+        }
+
+        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
+
+        // Feedback should be written directly to orchestrator pane.
+        let written = mock.written.lock().unwrap();
+        let orch_writes: Vec<_> = written
+            .iter()
+            .filter(|(id, _)| id == orchestrator_pane)
+            .collect();
+        assert_eq!(
+            orch_writes.len(),
+            1,
+            "orchestrator should receive one feedback message"
+        );
+        assert!(
+            orch_writes[0].1.contains("coder"),
+            "feedback should reference the coder role"
+        );
+
+        // No pending dispatches — message was injected immediately.
+        assert!(
+            ui.pending_dispatches.is_empty(),
+            "feedback should not be deferred when orchestrator is ready"
+        );
+
+        // Work-done events should be drained.
+        assert!(state.blocking_read().work_done_events.is_empty());
+    }
+
+    #[test]
+    fn feedback_multiple_workers_each_forwarded_independently() {
+        let config = make_fanout_config(false);
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+        let coder_pane = &role_pane_ids[1];
+        let reviewer_pane = &role_pane_ids[2];
+
+        // Make orchestrator ready.
+        {
+            let mut st = state.blocking_write();
+            let session_id = format!("session-{orchestrator_pane}");
+            st.sessions.insert(
+                session_id.clone(),
+                crate::state::SessionState {
+                    session_id,
+                    agent_type: AgentType::ClaudeCode,
+                    cwd: None,
+                    status: SessionStatus::Idle,
+                    active_tool: None,
+                    started_at: Utc::now(),
+                    last_activity: Utc::now(),
+                    recent_events: std::collections::VecDeque::new(),
+                    tool_count: 0,
+                    last_user_prompt: None,
+                    first_prompts: Vec::new(),
+                    pane_id: Some(orchestrator_pane.clone()),
+                },
+            );
+        }
+
+        // Both workers signal work-done (simulating parallel completion).
+        {
+            let mut st = state.blocking_write();
+            st.work_done_events.push(crate::event::WorkDoneSignal {
+                pane_id: coder_pane.clone(),
+                task: "Implemented auth".to_string(),
+                done: false,
+                timestamp: Utc::now(),
+            });
+            st.work_done_events.push(crate::event::WorkDoneSignal {
+                pane_id: reviewer_pane.clone(),
+                task: "Reviewed auth".to_string(),
+                done: false,
+                timestamp: Utc::now(),
+            });
+        }
+
+        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
+
+        // Each worker result should be forwarded independently — two separate writes.
+        let written = mock.written.lock().unwrap();
+        let orch_writes: Vec<_> = written
+            .iter()
+            .filter(|(id, _)| id == orchestrator_pane)
+            .collect();
+        assert_eq!(
+            orch_writes.len(),
+            2,
+            "orchestrator should receive two feedback messages (one per worker)"
+        );
+
+        // One message should reference coder, the other reviewer.
+        let mentions_coder = orch_writes.iter().any(|(_, text)| text.contains("coder"));
+        let mentions_reviewer = orch_writes
+            .iter()
+            .any(|(_, text)| text.contains("reviewer"));
+        assert!(mentions_coder, "one feedback should reference coder");
+        assert!(mentions_reviewer, "one feedback should reference reviewer");
+
+        // No batching — no pending dispatches.
+        assert!(ui.pending_dispatches.is_empty());
+    }
+
+    #[test]
+    fn feedback_orchestrator_done_completes_orchestration() {
+        let config = make_fanout_config(false);
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+
+        // Orchestrator signals done.
+        {
+            let mut st = state.blocking_write();
+            st.work_done_events.push(crate::event::WorkDoneSignal {
+                pane_id: orchestrator_pane.clone(),
+                task: "All tasks complete".to_string(),
+                done: true,
+                timestamp: Utc::now(),
+            });
+        }
+
+        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
+
+        // Orchestration should be marked Completed.
+        if let Tab::Orchestration { status, .. } = &tab_manager.tabs()[1] {
+            assert_eq!(
+                *status,
+                OrchestrationStatus::Completed,
+                "orchestration should be completed"
+            );
+        } else {
+            panic!("expected Orchestration tab");
+        }
+
+        // Status message should be set.
+        assert!(
+            ui.status_message.is_some(),
+            "completion should set a status message"
+        );
+        assert!(ui.status_message.as_ref().unwrap().0.contains("complete"));
+
+        // Done signal should NOT cause a write to the orchestrator pane.
+        let written = mock.written.lock().unwrap();
+        let orch_writes: Vec<_> = written
+            .iter()
+            .filter(|(id, _)| id == orchestrator_pane)
+            .collect();
+        assert!(
+            orch_writes.is_empty(),
+            "done signal should not echo back to orchestrator"
+        );
+    }
+
+    #[test]
+    fn feedback_deferred_when_orchestrator_not_ready() {
+        let config = make_fanout_config(false);
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+        let coder_pane = &role_pane_ids[1];
+
+        // Do NOT insert a session for the orchestrator — it's not ready.
+
+        // Worker signals work-done.
+        {
+            let mut st = state.blocking_write();
+            st.work_done_events.push(crate::event::WorkDoneSignal {
+                pane_id: coder_pane.clone(),
+                task: "Implemented feature".to_string(),
+                done: false,
+                timestamp: Utc::now(),
+            });
+        }
+
+        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
+
+        // No direct write — orchestrator not ready.
+        let written = mock.written.lock().unwrap();
+        let orch_writes: Vec<_> = written
+            .iter()
+            .filter(|(id, _)| id == orchestrator_pane)
+            .collect();
+        assert!(
+            orch_writes.is_empty(),
+            "should not write when orchestrator is not ready"
+        );
+
+        // Feedback should be deferred to pending_dispatches.
+        assert_eq!(
+            ui.pending_dispatches.len(),
+            1,
+            "feedback should be queued as pending dispatch"
+        );
+        assert_eq!(ui.pending_dispatches[0].pane_id, *orchestrator_pane);
+        assert!(ui.pending_dispatches[0].prompt.contains("coder"));
     }
 }

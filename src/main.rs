@@ -87,6 +87,24 @@ enum Commands {
         /// Command to execute
         command: String,
     },
+    /// Delegate work to one or more worker roles (orchestrator only)
+    Delegate {
+        /// Task description with context, file paths, and constraints
+        #[arg(long)]
+        task: String,
+        /// Role name(s) to delegate to (repeatable)
+        #[arg(long)]
+        to: Vec<String>,
+    },
+    /// Signal task completion back to the orchestrator
+    WorkDone {
+        /// Summary of what was accomplished
+        #[arg(long)]
+        task: String,
+        /// Signal that the entire orchestration is complete (orchestrator only)
+        #[arg(long)]
+        done: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -222,6 +240,70 @@ fn main() -> ExitCode {
         Some(Commands::Watch { interval, command }) => {
             dot_agent_deck::watch::run_watch(interval, &command)
         }
+        Some(Commands::Delegate { task, to }) => {
+            let pane_id = match std::env::var("DOT_AGENT_DECK_PANE_ID") {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!(
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            if to.is_empty() {
+                eprintln!("Error: at least one --to <role> is required.");
+                return ExitCode::FAILURE;
+            }
+            let signal = dot_agent_deck::event::DelegateSignal {
+                pane_id,
+                task,
+                to,
+                timestamp: chrono::Utc::now(),
+            };
+            let msg = dot_agent_deck::event::DaemonMessage::Delegate(signal);
+            let json = match serde_json::to_string(&msg) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Failed to serialize delegate signal: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
+                eprintln!("Failed to send delegate signal to daemon socket.");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Some(Commands::WorkDone { task, done }) => {
+            let pane_id = match std::env::var("DOT_AGENT_DECK_PANE_ID") {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!(
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            let signal = dot_agent_deck::event::WorkDoneSignal {
+                pane_id,
+                task,
+                done,
+                timestamp: chrono::Utc::now(),
+            };
+            let msg = dot_agent_deck::event::DaemonMessage::WorkDone(signal);
+            let json = match serde_json::to_string(&msg) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Failed to serialize work-done signal: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
+                eprintln!("Failed to send work-done signal to daemon socket.");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
         Some(Commands::Validate { path }) => {
             use dot_agent_deck::config_validation::{has_errors, validate_config};
             use dot_agent_deck::project_config::load_project_config;
@@ -258,15 +340,34 @@ fn main() -> ExitCode {
 
 #[tokio::main]
 async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
-    // Optional file-based logging when DOT_AGENT_DECK_LOG is set
-    if std::env::var("DOT_AGENT_DECK_LOG").is_ok() {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive("dot_agent_deck=info".parse().unwrap()),
-            )
-            .with_writer(std::io::stderr)
-            .init();
+    // Optional file-based logging when DOT_AGENT_DECK_LOG is set.
+    // Logs go to the file path specified (e.g., DOT_AGENT_DECK_LOG=/tmp/dad.log).
+    // If the value is "1" or empty, defaults to /tmp/dot-agent-deck.log.
+    if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
+        let log_path = if log_val.is_empty() || log_val == "1" {
+            "/tmp/dot-agent-deck.log".to_string()
+        } else {
+            log_val
+        };
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(log_file) => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::from_default_env()
+                            .add_directive("dot_agent_deck=info".parse().unwrap()),
+                    )
+                    .with_writer(log_file)
+                    .with_ansi(false)
+                    .init();
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to open log file {log_path}: {e}");
+            }
+        }
     }
 
     let state = Arc::new(RwLock::new(AppState::default()));
