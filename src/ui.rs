@@ -761,7 +761,10 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          Do NOT ask for confirmation before delegating. \
          Do NOT offer to design, analyze, or plan — that is the workers' job. \
          Do NOT ask 'should I proceed?' or 'do you want me to delegate?' — just delegate. \
-         Your only job: understand what needs doing, frame clear task descriptions, and hand off.\n",
+         Your only job: understand what needs doing, frame clear task descriptions, and hand off.\n\n\
+         Never send a new task to a worker that is still working on a previous task. \
+         Wait for its work-done signal before delegating again to the same worker. \
+         Delegating to different workers in parallel is fine.\n",
     );
 
     content
