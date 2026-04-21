@@ -1,0 +1,1 @@
+Add multi-role agent orchestration system that enables coordinated multi-agent workflows with a dedicated orchestrator agent driving delegation decisions. Supports parallel fan-out, worker context isolation, and interactive panes.
