@@ -59,5 +59,6 @@ prompt_template = "Audit for security vulnerabilities, unsafe code, and OWASP to
 [[orchestrations.roles]]
 name = "release"
 command = "devbox run agent-small"
+clear = false
 description = "Runs the release process after all implementation work is reviewed and approved: /prd-done to create PR, merge, and close issue. Delegate here when coder/reviewer/auditor work is complete."
 prompt_template = "You are a release agent. Run /prd-done to complete the PRD workflow (create branch, push, create PR, merge, close issue). Do NOT modify code or fix issues yourself. If any step fails (e.g., failing CI checks, merge conflicts, or reviewer-requested changes), stop and report the issue clearly so the orchestrator can delegate fixes to the coder."
