@@ -16,6 +16,7 @@ use ratatui::{
 use crate::ascii_art::{AsciiArtResult, generate_ascii_art};
 use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
+use crate::config_validation::sanitize_role_name;
 use crate::embedded_pane::EmbeddedPaneController;
 use crate::event::{AgentType, EventType};
 use crate::pane::{PaneController, PaneError};
@@ -813,13 +814,14 @@ fn prepare_worker_prompt(
     task: &str,
     cwd: &str,
 ) -> Option<String> {
+    let safe_name = sanitize_role_name(role_name);
     let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
     std::fs::create_dir_all(&dir).ok()?;
-    let file_path = dir.join(format!("worker-task-{role_name}.md"));
+    let file_path = dir.join(format!("worker-task-{safe_name}.md"));
     let content = build_worker_prompt(prompt_template, task);
     std::fs::write(&file_path, &content).ok()?;
     Some(format!(
-        "Read .dot-agent-deck/worker-task-{role_name}.md for your task and execute it immediately."
+        "Read .dot-agent-deck/worker-task-{safe_name}.md for your task and execute it immediately."
     ))
 }
 
@@ -1014,8 +1016,9 @@ fn feedback_worker_results(
 
         // Build feedback prompt: one-liner pointing to the work-done file.
         // Must be single-line so write_to_pane submits it correctly.
+        let safe_name = sanitize_role_name(&role_name);
         let feedback = format!(
-            "Worker {role_name} has completed their task. Read .dot-agent-deck/work-done-{role_name}.md for their full report."
+            "Worker {safe_name} has completed their task. Read .dot-agent-deck/work-done-{safe_name}.md for their full report."
         );
 
         // Check if orchestrator agent is ready; if not, queue for deferred injection.

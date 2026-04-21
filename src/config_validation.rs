@@ -2,6 +2,14 @@ use crate::project_config::ProjectConfig;
 use regex::Regex;
 use std::collections::HashSet;
 
+/// Sanitize a role name for safe use in filenames.
+/// Strips path separators, null bytes, and parent-directory sequences.
+/// Path separators are removed first so that inputs like `./.` cannot
+/// produce `..` after slash removal.
+pub fn sanitize_role_name(name: &str) -> String {
+    name.replace(['/', '\\', '\0'], "").replace("..", "")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Severity {
     Error,
@@ -109,6 +117,24 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
                 scope: orch.name.clone(),
                 message: "orchestration must have exactly one role with start = true".to_string(),
             });
+        }
+
+        // Reject role names containing filesystem-unsafe characters.
+        for role in &orch.roles {
+            if role.name.contains("..")
+                || role.name.contains('/')
+                || role.name.contains('\\')
+                || role.name.contains('\0')
+            {
+                issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    scope: orch.name.clone(),
+                    message: format!(
+                        "role name '{}' contains unsafe path characters (../, /, or \\)",
+                        role.name
+                    ),
+                });
+            }
         }
 
         // Unique role names.
@@ -420,5 +446,96 @@ mod tests {
                 .iter()
                 .any(|i| i.severity == Severity::Warning && i.message.contains("no description"))
         );
+    }
+
+    #[test]
+    fn orchestration_role_name_with_path_traversal_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "test",
+            vec![
+                make_role("orchestrator", true),
+                OrchestrationRoleConfig {
+                    name: "../evil".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("malicious".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        )]);
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("unsafe path"))
+        );
+    }
+
+    #[test]
+    fn orchestration_role_name_with_slash_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "test",
+            vec![
+                make_role("orchestrator", true),
+                OrchestrationRoleConfig {
+                    name: "sub/dir".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("slashy".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        )]);
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("unsafe path"))
+        );
+    }
+
+    #[test]
+    fn orchestration_role_name_with_backslash_is_error() {
+        let config = make_orch_config(vec![make_orchestration(
+            "test",
+            vec![
+                make_role("orchestrator", true),
+                OrchestrationRoleConfig {
+                    name: "sub\\dir".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("backslash".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        )]);
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("unsafe path"))
+        );
+    }
+
+    #[test]
+    fn sanitize_role_name_removes_traversal() {
+        assert_eq!(sanitize_role_name("../evil"), "evil");
+        assert_eq!(sanitize_role_name("sub/dir"), "subdir");
+        assert_eq!(sanitize_role_name("sub\\dir"), "subdir");
+        assert_eq!(sanitize_role_name("normal-name"), "normal-name");
+        assert_eq!(sanitize_role_name("../../etc/passwd"), "etcpasswd");
+        assert_eq!(sanitize_role_name("safe_name"), "safe_name");
+    }
+
+    #[test]
+    fn sanitize_role_name_slash_removal_cannot_create_dotdot() {
+        // Slash between dots: removing the slash must not leave ".."
+        assert_eq!(sanitize_role_name("./."), "");
+        assert_eq!(sanitize_role_name(".\\."), "");
+        assert_eq!(sanitize_role_name("./../."), "");
+        assert_eq!(sanitize_role_name("a./.b"), "ab");
     }
 }

@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use tracing::warn;
 
+use crate::config_validation::sanitize_role_name;
 use crate::event::{AgentEvent, AgentType, DelegateSignal, EventType, WorkDoneSignal};
 
 const MAX_RECENT_EVENTS: usize = 50;
@@ -154,9 +155,10 @@ impl AppState {
 
         // Write summary to .dot-agent-deck/work-done-{role}.md
         if let Some(cwd) = self.pane_cwd_map.get(&signal.pane_id) {
+            let safe_name = sanitize_role_name(&role_name);
             let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
             let _ = std::fs::create_dir_all(&dir);
-            let file_path = dir.join(format!("work-done-{role_name}.md"));
+            let file_path = dir.join(format!("work-done-{safe_name}.md"));
             let _ = std::fs::write(&file_path, &signal.task);
         }
 
