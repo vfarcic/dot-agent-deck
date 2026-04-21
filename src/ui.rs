@@ -765,7 +765,9 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          Your only job: understand what needs doing, frame clear task descriptions, and hand off.\n\n\
          Never send a new task to a worker that is still working on a previous task. \
          Wait for its work-done signal before delegating again to the same worker. \
-         Delegating to different workers in parallel is fine.\n",
+         Delegating to different workers in parallel is fine.\n\n\
+         When a task related to a PRD is fully completed (all workers done, reviews passed), \
+         run `/prd-update-progress` yourself before signaling `--done` or moving to the next task.\n",
     );
 
     content

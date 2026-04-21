@@ -40,7 +40,7 @@ After the coder finishes, delegate to both the reviewer and auditor in parallel.
 name = "coder"
 command = "devbox run agent-plan"
 description = "Implements code changes, fixes bugs, writes features"
-prompt_template = "You are a coding agent. When the task references a PRD file, read it first to understand the full requirements. Implement with clean, minimal code. Run tests before finishing. If the task is related to a PRD, run /prd-update-progress before signaling work-done."
+prompt_template = "You are a coding agent. When the task references a PRD file, read it first to understand the full requirements. Implement with clean, minimal code. Run tests before finishing."
 
 [[orchestrations.roles]]
 name = "reviewer"
