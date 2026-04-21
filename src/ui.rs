@@ -2062,11 +2062,11 @@ pub fn run_tui(
                 let frame_area = terminal.get_frame().area();
                 let half_width = (frame_area.width / 2).saturating_sub(2);
                 let side_pane_count = embedded.pane_ids().len().saturating_sub(1) as u16; // exclude agent
-                let pane_rows = if side_pane_count > 0 {
-                    (frame_area.height / side_pane_count).saturating_sub(2)
-                } else {
-                    frame_area.height.saturating_sub(3)
-                };
+                let pane_rows = frame_area
+                    .height
+                    .checked_div(side_pane_count)
+                    .map(|v| v.saturating_sub(2))
+                    .unwrap_or_else(|| frame_area.height.saturating_sub(3));
                 if pane_rows > 0 && half_width > 0 {
                     let _ = embedded.resize_pane_pty(new_id, pane_rows, half_width);
                 }
@@ -2710,30 +2710,30 @@ pub fn run_tui(
                             };
                             let pane_ids = embedded.pane_ids();
                             let pane_count = pane_ids.len() as u16;
-                            if pane_count > 0 {
-                                for pane_id in &pane_ids {
-                                    let rows = match ui.pane_layout {
-                                        PaneLayout::Tiled => {
-                                            (frame_area.height / pane_count).saturating_sub(2)
+                            for pane_id in &pane_ids {
+                                let rows = match ui.pane_layout {
+                                    PaneLayout::Tiled => frame_area
+                                        .height
+                                        .checked_div(pane_count)
+                                        .unwrap_or(0)
+                                        .saturating_sub(2),
+                                    PaneLayout::Stacked => {
+                                        let is_focused = embedded.focused_pane_id().as_deref()
+                                            == Some(pane_id.as_str());
+                                        if is_focused
+                                            || (embedded.focused_pane_id().is_none()
+                                                && pane_id == &pane_ids[0])
+                                        {
+                                            frame_area
+                                                .height
+                                                .saturating_sub(2 + pane_count.saturating_sub(1))
+                                        } else {
+                                            0
                                         }
-                                        PaneLayout::Stacked => {
-                                            let is_focused = embedded.focused_pane_id().as_deref()
-                                                == Some(pane_id.as_str());
-                                            if is_focused
-                                                || (embedded.focused_pane_id().is_none()
-                                                    && pane_id == &pane_ids[0])
-                                            {
-                                                frame_area.height.saturating_sub(
-                                                    2 + pane_count.saturating_sub(1),
-                                                )
-                                            } else {
-                                                0
-                                            }
-                                        }
-                                    };
-                                    if rows > 0 {
-                                        let _ = embedded.resize_pane_pty(pane_id, rows, pane_width);
                                     }
+                                };
+                                if rows > 0 {
+                                    let _ = embedded.resize_pane_pty(pane_id, rows, pane_width);
                                 }
                             }
                         }
