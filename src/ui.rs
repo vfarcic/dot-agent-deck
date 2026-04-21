@@ -821,7 +821,7 @@ fn prepare_worker_prompt(
     let content = build_worker_prompt(prompt_template, task);
     std::fs::write(&file_path, &content).ok()?;
     Some(format!(
-        "Read .dot-agent-deck/worker-task-{safe_name}.md for your task and execute it immediately."
+        "Read .dot-agent-deck/worker-task-{safe_name}.md for your task."
     ))
 }
 
