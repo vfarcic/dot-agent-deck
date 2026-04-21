@@ -309,8 +309,8 @@ Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orche
 - [x] **M6: New dir dialog integration** — show orchestrations alongside modes when TOML defines them, launch Orchestration tab on selection, deploy `/work-done` skill files automatically
 - [~] **M7: Role cards sidebar** — deferred; orchestration tabs reuse standard dashboard cards, custom sidebar adds no value
 - [~] **M9: Focused/split view toggle** — deferred; standard stacked/tiled layout (Ctrl+t) already handles this
-- [ ] **M10: Status bar** — show orchestration-level info in bottom status bar (e.g., "code-review: coder working, reviewer waiting")
-- [ ] **M11: Config generation extension** — update `src/config_gen.rs` prompt to suggest orchestrations alongside modes
+- [~] **M10: Status bar** — deferred; role cards already show current status (Working, Waiting, Done) and active role highlighting
+- [x] **M11: Config generation extension** — update `src/config_gen.rs` prompt to suggest orchestrations alongside modes
 - [ ] **M14: Documentation** — update README and/or user-facing docs with orchestration usage: `[[orchestrations]]` TOML format, role configuration (`start`, `description`, `prompt_template`, `clear`), delegation workflow, and example orchestrations (code-review, TDD)
 
 ### Phase 3: Quality
@@ -409,6 +409,14 @@ Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orche
 - **Impact**: Removed `max_rounds`, `auto` from config and validation. Removed manual advance (`o` key). Parallel execution now in-scope. Milestones restructured: M1b (routing design) resolved by this decision, M2 becomes message bus instead of state machine, M5 (manual advance) removed.
 
 - **Not supported via orchestration**: TDD with separate agents — unit tests are too tightly coupled to function signatures/struct fields. A tester agent writing tests from a spec will guess at the implementation shape, then the coder contorts code to match or rewrites the tests. Functional/integration testing could work but the infrastructure doesn't exist yet.
+
+### 2026-04-21: Defer M10 (Status bar) — redundant with role card display
+
+- **Decision**: Defer M10 (Status bar). The role cards on the left sidebar already display current status (Working, Waiting, Done) and active role highlighting. Adding the same information to the bottom status bar would be redundant.
+
+- **Rationale**: Status information is already visible and accessible to users via the role card UI. The bottom status bar would duplicate this without adding new value. Role cards provide both per-role status and orchestration-level overview (which roles are active, waiting, or done).
+
+- **Impact**: M10 is marked as deferred `[~]` in the Phase 2 milestones. This does not affect orchestration functionality — all core features (M1–M6) are complete and operational. If future UX research shows users need at-a-glance status in a different location, M10 can be revisited, but it is not required for a functional orchestration system.
 
 ### 2026-04-17: Handoff prompt format for inter-agent context passing
 - **Decision**: When the orchestrator advances to the next role, it constructs a handoff file at `.dot-agent-deck/handoff-to-{role-name}.md` and injects a reference-based prompt into the next agent's pane. The orchestrator also auto-appends a `/work-done` instruction so agents know how to signal completion.
