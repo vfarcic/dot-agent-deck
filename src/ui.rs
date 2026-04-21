@@ -7544,4 +7544,593 @@ mod tests {
         // Should still be pending — agent not ready and not timed out.
         assert_eq!(ui.pending_dispatches.len(), 1);
     }
+
+    // -----------------------------------------------------------------------
+    // Recording mock pane controller (for dispatch/feedback integration tests)
+    // -----------------------------------------------------------------------
+
+    struct RecordingPaneController {
+        next_id: std::sync::Mutex<u64>,
+        written: std::sync::Mutex<Vec<(String, String)>>,
+        closed: std::sync::Mutex<Vec<String>>,
+        renamed: std::sync::Mutex<Vec<(String, String)>>,
+        created: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingPaneController {
+        fn new() -> Self {
+            Self {
+                next_id: std::sync::Mutex::new(1),
+                written: std::sync::Mutex::new(Vec::new()),
+                closed: std::sync::Mutex::new(Vec::new()),
+                renamed: std::sync::Mutex::new(Vec::new()),
+                created: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PaneController for RecordingPaneController {
+        fn create_pane(&self, _cmd: Option<&str>, _cwd: Option<&str>) -> Result<String, PaneError> {
+            let mut id = self.next_id.lock().unwrap();
+            let pane_id = format!("mock-{id}");
+            *id += 1;
+            self.created.lock().unwrap().push(pane_id.clone());
+            Ok(pane_id)
+        }
+
+        fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
+            self.written
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), text.to_string()));
+            Ok(())
+        }
+
+        fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+            self.closed.lock().unwrap().push(pane_id.to_string());
+            Ok(())
+        }
+
+        fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError> {
+            self.renamed
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), name.to_string()));
+            Ok(())
+        }
+
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "recording-mock"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Orchestration integration test helpers
+    // -----------------------------------------------------------------------
+
+    fn make_fanout_config(clear: bool) -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: "test-fanout".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "echo orchestrator".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false, // orchestrator is never restarted
+                },
+                OrchestrationRoleConfig {
+                    name: "coder".to_string(),
+                    command: "echo coder".to_string(),
+                    start: false,
+                    description: Some("Implements code".to_string()),
+                    prompt_template: Some("Always run tests.".to_string()),
+                    clear,
+                },
+                OrchestrationRoleConfig {
+                    name: "reviewer".to_string(),
+                    command: "echo reviewer".to_string(),
+                    start: false,
+                    description: Some("Reviews code".to_string()),
+                    prompt_template: Some("Check for bugs.".to_string()),
+                    clear,
+                },
+            ],
+        }
+    }
+
+    /// Set up an orchestration tab with a RecordingPaneController and register
+    /// all panes in state.  Returns the components needed for dispatch/feedback
+    /// tests plus the role_pane_ids for assertions.
+    fn setup_orchestration(
+        config: &OrchestrationConfig,
+    ) -> (
+        SharedState,
+        Arc<RecordingPaneController>,
+        Arc<dyn PaneController>,
+        TabManager,
+        UiState,
+        Vec<String>, // role_pane_ids
+        tempfile::TempDir,
+    ) {
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+
+        let mock = Arc::new(RecordingPaneController::new());
+        let pane: Arc<dyn PaneController> = Arc::clone(&mock) as Arc<dyn PaneController>;
+        let mut tab_manager = TabManager::new(Arc::clone(&pane));
+        let state = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+
+        let (_, role_pane_ids) = tab_manager
+            .open_orchestration_tab(config, cwd, None)
+            .unwrap();
+
+        // Register all panes in state with role and cwd mappings.
+        {
+            let mut st = state.blocking_write();
+            for (i, role) in config.roles.iter().enumerate() {
+                let pane_id = &role_pane_ids[i];
+                st.register_pane(pane_id.clone());
+                st.pane_role_map.insert(pane_id.clone(), role.name.clone());
+                st.pane_cwd_map.insert(pane_id.clone(), cwd.to_string());
+            }
+        }
+
+        // Clear setup-phase recordings so tests only see dispatch/feedback activity.
+        mock.written.lock().unwrap().clear();
+        mock.closed.lock().unwrap().clear();
+        mock.created.lock().unwrap().clear();
+        mock.renamed.lock().unwrap().clear();
+
+        let ui = default_ui();
+        (state, mock, pane, tab_manager, ui, role_pane_ids, dir)
+    }
+
+    // -----------------------------------------------------------------------
+    // Parallel fan-out integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_parallel_fan_out_targets_multiple_workers() {
+        let config = make_fanout_config(false); // clear=false → direct injection
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+        let coder_pane = &role_pane_ids[1];
+        let reviewer_pane = &role_pane_ids[2];
+
+        // Orchestrator delegates to both coder and reviewer simultaneously.
+        {
+            let mut st = state.blocking_write();
+            st.delegate_events.push(crate::event::DelegateSignal {
+                pane_id: orchestrator_pane.clone(),
+                task: "Implement and review the auth module".to_string(),
+                to: vec!["coder".to_string(), "reviewer".to_string()],
+                timestamp: Utc::now(),
+            });
+        }
+
+        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+
+        // Both workers should have received prompts.
+        let written = mock.written.lock().unwrap();
+        let coder_writes: Vec<_> = written.iter().filter(|(id, _)| id == coder_pane).collect();
+        let reviewer_writes: Vec<_> = written
+            .iter()
+            .filter(|(id, _)| id == reviewer_pane)
+            .collect();
+
+        assert_eq!(
+            coder_writes.len(),
+            1,
+            "coder pane should receive exactly one prompt"
+        );
+        assert_eq!(
+            reviewer_writes.len(),
+            1,
+            "reviewer pane should receive exactly one prompt"
+        );
+
+        // Orchestration status should be Delegated.
+        if let Tab::Orchestration { status, .. } = &tab_manager.tabs()[1] {
+            assert_eq!(*status, OrchestrationStatus::Delegated);
+        } else {
+            panic!("expected Orchestration tab");
+        }
+
+        // Delegate events should be drained.
+        assert!(state.blocking_read().delegate_events.is_empty());
+    }
+
+    #[test]
+    fn dispatch_parallel_fan_out_with_clear_restarts_panes() {
+        let config = make_fanout_config(true); // clear=true → pane restart
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+        let old_coder_pane = role_pane_ids[1].clone();
+        let old_reviewer_pane = role_pane_ids[2].clone();
+
+        // Orchestrator delegates to both workers.
+        {
+            let mut st = state.blocking_write();
+            st.delegate_events.push(crate::event::DelegateSignal {
+                pane_id: orchestrator_pane.clone(),
+                task: "Implement and review".to_string(),
+                to: vec!["coder".to_string(), "reviewer".to_string()],
+                timestamp: Utc::now(),
+            });
+        }
+
+        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+
+        // Old panes should be closed.
+        let closed = mock.closed.lock().unwrap();
+        assert!(
+            closed.contains(&old_coder_pane),
+            "old coder pane should be closed"
+        );
+        assert!(
+            closed.contains(&old_reviewer_pane),
+            "old reviewer pane should be closed"
+        );
+
+        // New panes should be created (2 new panes for coder and reviewer).
+        let created = mock.created.lock().unwrap();
+        assert_eq!(created.len(), 2, "two new panes should be created");
+
+        // Prompts should be deferred (not directly written) because agent needs startup time.
+        assert_eq!(
+            ui.pending_dispatches.len(),
+            2,
+            "two pending dispatches for deferred prompt injection"
+        );
+
+        // State pane_role_map should have new pane IDs for coder and reviewer.
+        let st = state.blocking_read();
+        assert!(
+            !st.pane_role_map.contains_key(&old_coder_pane),
+            "old coder pane should be removed from role map"
+        );
+        assert!(
+            !st.pane_role_map.contains_key(&old_reviewer_pane),
+            "old reviewer pane should be removed from role map"
+        );
+        // New pane IDs should be mapped to the correct roles.
+        let new_coders: Vec<_> = st
+            .pane_role_map
+            .iter()
+            .filter(|(_, role)| *role == "coder")
+            .collect();
+        let new_reviewers: Vec<_> = st
+            .pane_role_map
+            .iter()
+            .filter(|(_, role)| *role == "reviewer")
+            .collect();
+        assert_eq!(new_coders.len(), 1, "exactly one coder mapping");
+        assert_eq!(new_reviewers.len(), 1, "exactly one reviewer mapping");
+    }
+
+    #[test]
+    fn dispatch_targets_only_specified_roles() {
+        let config = make_fanout_config(false); // clear=false
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+        let coder_pane = &role_pane_ids[1];
+
+        // Delegate only to reviewer — coder should not receive anything.
+        {
+            let mut st = state.blocking_write();
+            st.delegate_events.push(crate::event::DelegateSignal {
+                pane_id: orchestrator_pane.clone(),
+                task: "Review the auth module".to_string(),
+                to: vec!["reviewer".to_string()],
+                timestamp: Utc::now(),
+            });
+        }
+
+        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+
+        let written = mock.written.lock().unwrap();
+
+        // Coder should receive nothing.
+        let coder_writes: Vec<_> = written.iter().filter(|(id, _)| id == coder_pane).collect();
+        assert!(
+            coder_writes.is_empty(),
+            "coder pane should not receive a prompt when not targeted"
+        );
+
+        // Reviewer should receive exactly one prompt.
+        let reviewer_pane = &role_pane_ids[2];
+        let reviewer_writes: Vec<_> = written
+            .iter()
+            .filter(|(id, _)| id == reviewer_pane)
+            .collect();
+        assert_eq!(
+            reviewer_writes.len(),
+            1,
+            "reviewer pane should receive exactly one prompt"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Feedback loop integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn feedback_worker_result_injected_immediately() {
+        let config = make_fanout_config(false);
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+        let coder_pane = &role_pane_ids[1];
+
+        // Make the orchestrator "ready" by inserting a session with agent_type != None.
+        {
+            let mut st = state.blocking_write();
+            let session_id = format!("session-{orchestrator_pane}");
+            st.sessions.insert(
+                session_id.clone(),
+                crate::state::SessionState {
+                    session_id,
+                    agent_type: AgentType::ClaudeCode,
+                    cwd: None,
+                    status: SessionStatus::Idle,
+                    active_tool: None,
+                    started_at: Utc::now(),
+                    last_activity: Utc::now(),
+                    recent_events: std::collections::VecDeque::new(),
+                    tool_count: 0,
+                    last_user_prompt: None,
+                    first_prompts: Vec::new(),
+                    pane_id: Some(orchestrator_pane.clone()),
+                },
+            );
+        }
+
+        // Worker coder signals work-done.
+        {
+            let mut st = state.blocking_write();
+            st.work_done_events.push(crate::event::WorkDoneSignal {
+                pane_id: coder_pane.clone(),
+                task: "Implemented auth module".to_string(),
+                done: false,
+                timestamp: Utc::now(),
+            });
+        }
+
+        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
+
+        // Feedback should be written directly to orchestrator pane.
+        let written = mock.written.lock().unwrap();
+        let orch_writes: Vec<_> = written
+            .iter()
+            .filter(|(id, _)| id == orchestrator_pane)
+            .collect();
+        assert_eq!(
+            orch_writes.len(),
+            1,
+            "orchestrator should receive one feedback message"
+        );
+        assert!(
+            orch_writes[0].1.contains("coder"),
+            "feedback should reference the coder role"
+        );
+
+        // No pending dispatches — message was injected immediately.
+        assert!(
+            ui.pending_dispatches.is_empty(),
+            "feedback should not be deferred when orchestrator is ready"
+        );
+
+        // Work-done events should be drained.
+        assert!(state.blocking_read().work_done_events.is_empty());
+    }
+
+    #[test]
+    fn feedback_multiple_workers_each_forwarded_independently() {
+        let config = make_fanout_config(false);
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+        let coder_pane = &role_pane_ids[1];
+        let reviewer_pane = &role_pane_ids[2];
+
+        // Make orchestrator ready.
+        {
+            let mut st = state.blocking_write();
+            let session_id = format!("session-{orchestrator_pane}");
+            st.sessions.insert(
+                session_id.clone(),
+                crate::state::SessionState {
+                    session_id,
+                    agent_type: AgentType::ClaudeCode,
+                    cwd: None,
+                    status: SessionStatus::Idle,
+                    active_tool: None,
+                    started_at: Utc::now(),
+                    last_activity: Utc::now(),
+                    recent_events: std::collections::VecDeque::new(),
+                    tool_count: 0,
+                    last_user_prompt: None,
+                    first_prompts: Vec::new(),
+                    pane_id: Some(orchestrator_pane.clone()),
+                },
+            );
+        }
+
+        // Both workers signal work-done (simulating parallel completion).
+        {
+            let mut st = state.blocking_write();
+            st.work_done_events.push(crate::event::WorkDoneSignal {
+                pane_id: coder_pane.clone(),
+                task: "Implemented auth".to_string(),
+                done: false,
+                timestamp: Utc::now(),
+            });
+            st.work_done_events.push(crate::event::WorkDoneSignal {
+                pane_id: reviewer_pane.clone(),
+                task: "Reviewed auth".to_string(),
+                done: false,
+                timestamp: Utc::now(),
+            });
+        }
+
+        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
+
+        // Each worker result should be forwarded independently — two separate writes.
+        let written = mock.written.lock().unwrap();
+        let orch_writes: Vec<_> = written
+            .iter()
+            .filter(|(id, _)| id == orchestrator_pane)
+            .collect();
+        assert_eq!(
+            orch_writes.len(),
+            2,
+            "orchestrator should receive two feedback messages (one per worker)"
+        );
+
+        // One message should reference coder, the other reviewer.
+        let mentions_coder = orch_writes.iter().any(|(_, text)| text.contains("coder"));
+        let mentions_reviewer = orch_writes
+            .iter()
+            .any(|(_, text)| text.contains("reviewer"));
+        assert!(mentions_coder, "one feedback should reference coder");
+        assert!(mentions_reviewer, "one feedback should reference reviewer");
+
+        // No batching — no pending dispatches.
+        assert!(ui.pending_dispatches.is_empty());
+    }
+
+    #[test]
+    fn feedback_orchestrator_done_completes_orchestration() {
+        let config = make_fanout_config(false);
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+
+        // Orchestrator signals done.
+        {
+            let mut st = state.blocking_write();
+            st.work_done_events.push(crate::event::WorkDoneSignal {
+                pane_id: orchestrator_pane.clone(),
+                task: "All tasks complete".to_string(),
+                done: true,
+                timestamp: Utc::now(),
+            });
+        }
+
+        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
+
+        // Orchestration should be marked Completed.
+        if let Tab::Orchestration { status, .. } = &tab_manager.tabs()[1] {
+            assert_eq!(
+                *status,
+                OrchestrationStatus::Completed,
+                "orchestration should be completed"
+            );
+        } else {
+            panic!("expected Orchestration tab");
+        }
+
+        // Status message should be set.
+        assert!(
+            ui.status_message.is_some(),
+            "completion should set a status message"
+        );
+        assert!(ui.status_message.as_ref().unwrap().0.contains("complete"));
+
+        // Done signal should NOT cause a write to the orchestrator pane.
+        let written = mock.written.lock().unwrap();
+        let orch_writes: Vec<_> = written
+            .iter()
+            .filter(|(id, _)| id == orchestrator_pane)
+            .collect();
+        assert!(
+            orch_writes.is_empty(),
+            "done signal should not echo back to orchestrator"
+        );
+    }
+
+    #[test]
+    fn feedback_deferred_when_orchestrator_not_ready() {
+        let config = make_fanout_config(false);
+        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
+            setup_orchestration(&config);
+
+        let orchestrator_pane = &role_pane_ids[0];
+        let coder_pane = &role_pane_ids[1];
+
+        // Do NOT insert a session for the orchestrator — it's not ready.
+
+        // Worker signals work-done.
+        {
+            let mut st = state.blocking_write();
+            st.work_done_events.push(crate::event::WorkDoneSignal {
+                pane_id: coder_pane.clone(),
+                task: "Implemented feature".to_string(),
+                done: false,
+                timestamp: Utc::now(),
+            });
+        }
+
+        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
+
+        // No direct write — orchestrator not ready.
+        let written = mock.written.lock().unwrap();
+        let orch_writes: Vec<_> = written
+            .iter()
+            .filter(|(id, _)| id == orchestrator_pane)
+            .collect();
+        assert!(
+            orch_writes.is_empty(),
+            "should not write when orchestrator is not ready"
+        );
+
+        // Feedback should be deferred to pending_dispatches.
+        assert_eq!(
+            ui.pending_dispatches.len(),
+            1,
+            "feedback should be queued as pending dispatch"
+        );
+        assert_eq!(ui.pending_dispatches[0].pane_id, *orchestrator_pane);
+        assert!(ui.pending_dispatches[0].prompt.contains("coder"));
+    }
 }

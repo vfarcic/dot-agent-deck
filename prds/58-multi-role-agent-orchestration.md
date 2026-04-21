@@ -315,8 +315,8 @@ Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orche
 
 ### Phase 3: Quality
 
-- [ ] **M12: Tests** — config parsing ✓, message bus ✓, work-done handling ✓, delegation dispatch ✓; still needed: parallel fan-out integration test, feedback loop integration test
-- [x] **M13: No regressions** — all 384 existing tests passing after M5/M5b implementation
+- [x] **M12: Tests** — config parsing ✓, message bus ✓, work-done handling ✓, delegation dispatch ✓, parallel fan-out ✓ (3 tests: multi-worker dispatch, clear/restart panes, selective role targeting), feedback loop ✓ (4 tests: immediate injection, independent multi-worker forwarding, orchestrator done/completion, deferred when not ready)
+- [x] **M13: No regressions** — all 399 tests passing after M12 implementation
 
 ## Key Files
 
