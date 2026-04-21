@@ -48,14 +48,6 @@ pub enum OrchestrationRoleStatus {
     Done,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrchestrationViewMode {
-    /// All agent panes visible side by side.
-    Split,
-    /// Full-width pane for the active (working) role's agent.
-    Focused,
-}
-
 // ---------------------------------------------------------------------------
 // Tab enum
 // ---------------------------------------------------------------------------
@@ -89,8 +81,6 @@ pub enum Tab {
         config: OrchestrationConfig,
         /// Tracks whether the orchestration is waiting, delegated, or completed.
         status: OrchestrationStatus,
-        /// View mode: focused (single active pane) or split (all panes).
-        view_mode: OrchestrationViewMode,
     },
 }
 
@@ -251,7 +241,6 @@ impl TabManager {
             orchestrator_prompt,
             config: config.clone(),
             status: OrchestrationStatus::WaitingForOrchestrator,
-            view_mode: OrchestrationViewMode::Split,
         });
 
         let index = self.tabs.len() - 1;
