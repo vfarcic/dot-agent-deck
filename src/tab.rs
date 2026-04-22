@@ -277,8 +277,8 @@ impl TabManager {
                 let mut ids = mode_manager.managed_pane_ids();
                 let _ = mode_manager.deactivate_mode();
                 // Close the agent pane PTY so it doesn't linger on the dashboard.
-                let _ = self.pane_controller.close_pane(&agent_pane_id);
                 if !agent_pane_id.is_empty() {
+                    let _ = self.pane_controller.close_pane(&agent_pane_id);
                     ids.push(agent_pane_id);
                 }
                 ids
