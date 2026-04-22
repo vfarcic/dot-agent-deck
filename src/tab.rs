@@ -270,10 +270,17 @@ impl TabManager {
         let tab = self.tabs.remove(index);
         let pane_ids = match tab {
             Tab::Mode {
-                mut mode_manager, ..
+                mut mode_manager,
+                agent_pane_id,
+                ..
             } => {
-                let ids = mode_manager.managed_pane_ids();
+                let mut ids = mode_manager.managed_pane_ids();
                 let _ = mode_manager.deactivate_mode();
+                // Close the agent pane PTY so it doesn't linger on the dashboard.
+                let _ = self.pane_controller.close_pane(&agent_pane_id);
+                if !agent_pane_id.is_empty() {
+                    ids.push(agent_pane_id);
+                }
                 ids
             }
             Tab::Orchestration { role_pane_ids, .. } => {
@@ -596,18 +603,45 @@ mod tests {
     fn close_mode_tab() {
         let mock = Arc::new(MockPaneController::new());
         let mut tm = TabManager::new(mock.clone());
-        let (_, ids) = tm
-            .open_mode_tab(&test_config("k8s"), "/tmp", String::new())
+        let agent_id = mock.create_pane(None, None).unwrap();
+        let (_, side_ids) = tm
+            .open_mode_tab(&test_config("k8s"), "/tmp", agent_id.clone())
             .unwrap();
         assert_eq!(tm.tab_count(), 2);
 
         let closed_ids = tm.close_tab(1).unwrap();
-        assert_eq!(closed_ids, ids);
+        // Should include both side pane IDs AND the agent pane ID.
+        assert!(closed_ids.contains(&agent_id));
+        for id in &side_ids {
+            assert!(closed_ids.contains(id));
+        }
         assert_eq!(tm.tab_count(), 1);
         assert_eq!(tm.active_index(), 0);
-        // Verify panes were closed via the mock.
+        // Verify the agent pane was closed via the mock.
         let closed = mock.closed.lock().unwrap();
-        assert!(!closed.is_empty());
+        assert!(closed.contains(&agent_id));
+    }
+
+    #[test]
+    fn close_all_mode_tabs_closes_agent_panes() {
+        let mock = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(mock.clone());
+        let agent1 = mock.create_pane(None, None).unwrap();
+        let agent2 = mock.create_pane(None, None).unwrap();
+        tm.open_mode_tab(&test_config("a"), "/tmp/a", agent1.clone())
+            .unwrap();
+        tm.open_mode_tab(&test_config("b"), "/tmp/b", agent2.clone())
+            .unwrap();
+
+        // Simulate exit cleanup: close tabs in reverse order.
+        for i in (1..tm.tab_count()).rev() {
+            let _ = tm.close_tab(i).unwrap();
+        }
+
+        let closed = mock.closed.lock().unwrap();
+        assert!(closed.contains(&agent1));
+        assert!(closed.contains(&agent2));
+        assert_eq!(tm.tab_count(), 1);
     }
 
     #[test]
