@@ -7,6 +7,7 @@ use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 use std::any::Any;
 
+use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
 use crate::pane::{PaneController, PaneDirection, PaneError, PaneInfo};
 
 /// State for a single embedded terminal pane.
@@ -27,6 +28,8 @@ struct Pane {
     command: Option<String>,
     /// Whether the child app has enabled mouse reporting (e.g., TUI apps like opencode).
     mouse_mode: Arc<AtomicBool>,
+    /// Hyperlink URLs extracted from OSC 8 escape sequences, keyed by screen row.
+    hyperlinks: Arc<Mutex<HyperlinkMap>>,
 }
 
 /// Thread-safe pane registry.
@@ -59,6 +62,12 @@ impl EmbeddedPaneController {
     pub fn get_screen(&self, pane_id: &str) -> Option<Arc<Mutex<vt100::Parser>>> {
         let panes = self.panes.lock().unwrap();
         panes.get(pane_id).map(|p| Arc::clone(&p.screen))
+    }
+
+    /// Access the hyperlink map for a pane (used for click-to-open).
+    pub fn get_hyperlinks(&self, pane_id: &str) -> Option<Arc<Mutex<HyperlinkMap>>> {
+        let panes = self.panes.lock().unwrap();
+        panes.get(pane_id).map(|p| Arc::clone(&p.hyperlinks))
     }
 
     /// Return all pane IDs in insertion order (by numeric ID).
@@ -278,22 +287,68 @@ impl PaneController for EmbeddedPaneController {
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
         let mouse_mode = Arc::new(AtomicBool::new(false));
+        let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
 
         // Spawn a background thread to read PTY output and feed it to the vt100 parser.
-        // Also scan for mouse-enable/disable escape sequences to track mouse mode.
+        // Strips OSC 8 hyperlink sequences and records row → URL associations.
         let parser_clone = Arc::clone(&parser);
         let mouse_mode_clone = Arc::clone(&mouse_mode);
+        let hyperlinks_clone = Arc::clone(&hyperlinks);
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
+            let mut osc8 = Osc8Filter::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         let data = &buf[..n];
-                        // Scan for mouse mode enable/disable sequences.
                         scan_mouse_mode(data, &mouse_mode_clone);
+
+                        let segments = osc8.process(data);
+                        let mut new_links: Vec<(u16, String)> = Vec::new();
+                        let mut scroll_amount: u16 = 0;
+
                         if let Ok(mut p) = parser_clone.lock() {
-                            p.process(data);
+                            let max_row = p.screen().size().0.saturating_sub(1);
+                            for segment in &segments {
+                                match segment {
+                                    Osc8Segment::Text(bytes) => {
+                                        let rb = p.screen().cursor_position().0;
+                                        p.process(bytes);
+                                        let ra = p.screen().cursor_position().0;
+                                        if rb >= max_row && ra >= max_row {
+                                            let nl = bytes.iter().filter(|&&b| b == b'\n').count()
+                                                as u16;
+                                            scroll_amount += nl;
+                                        }
+                                    }
+                                    Osc8Segment::LinkedText { url, bytes } => {
+                                        // cursor_before is the row where link text starts
+                                        let row = p.screen().cursor_position().0;
+                                        let rb = row;
+                                        p.process(bytes);
+                                        let ra = p.screen().cursor_position().0;
+                                        new_links.push((row, url.clone()));
+                                        if rb >= max_row && ra >= max_row {
+                                            let nl = bytes.iter().filter(|&&b| b == b'\n').count()
+                                                as u16;
+                                            scroll_amount += nl;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // parser lock released
+
+                        if (!new_links.is_empty() || scroll_amount > 0)
+                            && let Ok(mut hmap) = hyperlinks_clone.lock()
+                        {
+                            if scroll_amount > 0 {
+                                hmap.shift_up(scroll_amount);
+                            }
+                            for (row, url) in &new_links {
+                                hmap.set_row(*row, url);
+                            }
                         }
                     }
                     Err(_) => break,
@@ -310,6 +365,7 @@ impl PaneController for EmbeddedPaneController {
             is_focused: false,
             command: command.map(|c| c.to_string()),
             mouse_mode,
+            hyperlinks,
         };
 
         self.panes.lock().unwrap().insert(pane_id.clone(), pane);

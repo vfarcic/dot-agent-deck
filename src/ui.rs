@@ -1194,11 +1194,14 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
 }
 
 /// Compute the row offset between widget-relative coordinates and vt100 screen
-/// coordinates. The widget shows the bottom `inner_h` rows of the screen.
+/// coordinates. Must match the viewport calculation in `terminal_widget.rs`.
 fn screen_row_offset(screen: &vt100::Screen, pane_rect: Rect) -> u16 {
-    let inner_h = pane_rect.height.saturating_sub(2);
-    let screen_rows = screen.size().0;
-    screen_rows.saturating_sub(inner_h)
+    let inner_h = pane_rect.height.saturating_sub(2) as usize;
+    let screen_rows = screen.size().0 as usize;
+    let cursor_row = screen.cursor_position().0 as usize;
+    let anchor = (cursor_row + 1).min(screen_rows);
+    let effective_rows = anchor.max(inner_h);
+    effective_rows.saturating_sub(inner_h) as u16
 }
 
 /// Extract text from a vt100 screen for the given selection region.
@@ -2428,7 +2431,49 @@ pub fn run_tui(
                         crossterm::event::MouseEventKind::Down(
                             crossterm::event::MouseButton::Left,
                         ) => {
-                            if let Some(rect) = ui.focused_pane_rect {
+                            // Ctrl+click opens hyperlinks.
+                            let has_modifier = mouse
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL);
+                            if has_modifier {
+                                if let Some(rect) = ui.focused_pane_rect {
+                                    let inner_x = rect.x + 1;
+                                    let inner_y = rect.y + 1;
+                                    let inner_w = rect.width.saturating_sub(2);
+                                    let inner_h = rect.height.saturating_sub(2);
+                                    if mouse.column >= inner_x
+                                        && mouse.column < inner_x + inner_w
+                                        && mouse.row >= inner_y
+                                        && mouse.row < inner_y + inner_h
+                                    {
+                                        let row = mouse.row - inner_y;
+                                        if let Some(hmap_arc) = embedded.get_hyperlinks(&pane_id)
+                                            && let Ok(hmap) = hmap_arc.lock()
+                                            && let Some(screen_arc) = embedded.get_screen(&pane_id)
+                                            && let Ok(parser) = screen_arc.lock()
+                                        {
+                                            let offset = screen_row_offset(parser.screen(), rect);
+                                            let screen_row = row + offset;
+                                            if let Some(url) = hmap.get_row(screen_row) {
+                                                let url = url.to_string();
+                                                drop(parser);
+                                                drop(hmap);
+                                                if open::that(&url).is_ok() {
+                                                    let display = if url.len() > 60 {
+                                                        format!("{}...", &url[..57])
+                                                    } else {
+                                                        url
+                                                    };
+                                                    ui.status_message = Some((
+                                                        format!("Opened: {display}"),
+                                                        std::time::Instant::now(),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(rect) = ui.focused_pane_rect {
                                 let inner_x = rect.x + 1;
                                 let inner_y = rect.y + 1;
                                 let inner_w = rect.width.saturating_sub(2);
@@ -4431,6 +4476,7 @@ fn render_help_overlay(frame: &mut Frame, active_mode_name: Option<&str>, palett
         Line::from("  Enter           Enter PaneInput on selected"),
         Line::from("  Esc             Deselect side pane"),
         Line::from("  Mouse click     Focus pane"),
+        Line::from("  Ctrl+click      Open hyperlink"),
         Line::from(format!("  {MOD_KEY}+d            Return to Normal mode")),
         Line::from(""),
         Line::styled("  New Agent Form", cyan),
