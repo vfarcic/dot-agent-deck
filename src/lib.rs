@@ -8,6 +8,7 @@ pub mod error;
 pub mod event;
 pub mod hook;
 pub mod hooks_manage;
+pub mod hyperlink;
 pub mod init;
 pub mod llm;
 pub mod mode_manager;
