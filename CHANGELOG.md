@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.23.0] - 2026-04-23
+
+### Added
+
+  Clickable hyperlinks in embedded terminal panes. Tools like Claude Code emit OSC 8 hyperlink sequences for URLs — these are now parsed and tracked so that Ctrl+click on a link row opens the URL in your default browser.
+
+
+
 ## [0.22.1] - 2026-04-22
 
 ### Fixed
