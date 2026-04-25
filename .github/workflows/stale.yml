@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   stale:
-    runs-on: tenki-standard-autoscale
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - uses: actions/stale@v9
         with:
