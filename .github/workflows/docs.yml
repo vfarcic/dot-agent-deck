@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: tenki-standard-autoscale
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - uses: actions/checkout@v5
 
