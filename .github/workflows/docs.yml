@@ -7,7 +7,6 @@ on:
       - 'docs/**'
       - 'site/**'
   workflow_dispatch:
-
 concurrency:
   group: docs-${{ github.ref }}
   cancel-in-progress: true
@@ -17,7 +16,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-autoscale
     steps:
       - uses: actions/checkout@v5
 
