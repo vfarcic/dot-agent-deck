@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   prepare:
-    runs-on: tenki-standard-autoscale
+    runs-on: tenki-standard-medium-4c-8g
     outputs:
       version: ${{ steps.version.outputs.version }}
       changelog: ${{ steps.changelog.outputs.changelog }}
@@ -83,7 +83,7 @@ jobs:
             artifact_suffix: darwin-arm64
             use_cross: false
             binary_ext: ""
-    runs-on: tenki-standard-autoscale
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -114,7 +114,7 @@ jobs:
 
   finalize:
     needs: [prepare, build]
-    runs-on: tenki-standard-autoscale
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - uses: actions/checkout@v5
       - uses: arduino/setup-task@v2
@@ -151,7 +151,7 @@ jobs:
 
   docs:
     needs: [prepare, finalize]
-    runs-on: tenki-standard-autoscale
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - uses: actions/checkout@v5
         with:
