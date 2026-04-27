@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.24.0] - 2026-04-27
+
+### Added
+
+- **Customizable Config-Gen Prompt and Orchestration Role Library**
+  The Ctrl+G config-generation prompt and orchestration role definitions now live in editable asset files instead of being hardcoded in the binary. The prompt template is at `assets/config_gen_prompt.md` and the role library (coder, reviewer, auditor, tester, documenter, release, researcher) is at `assets/roles.toml`. Both are bundled at compile time, so behavior is unchanged for users who don't customize, but contributors can iterate on the prompt without touching Rust source.
+  The default prompt has also been improved: it now teaches the AI to discover project-defined agent launchers (devbox/npm/task scripts, `.claude/`/`opencode.json` configs, etc.), match them to roles by semantic intent, record the full invocation form (e.g. `devbox run agent-big`, never the bare script name), and propose a dedicated `release` role by default whenever the project has release-flow signals — with explicit context-handoff guidance for the orchestrator so workers cold-starting with no shared scratchpad still receive the file paths and prior findings they need.
+  The bundled `.dot-agent-deck.toml` reflects these defaults: a `release` role with `clear = false` so it can resume after CI flakes, and a context-handoff section in the orchestrator's `prompt_template`.
+
+### Fixed
+
+- **Reliable Prompt Submission to Agent Panes**
+  Prompts written to agent panes now self-submit reliably instead of sitting in the agent's input buffer waiting for a manual Enter. Multi-line prompts are wrapped in bracketed paste so embedded newlines stay as input rather than triggering a premature submit, and a brief delay between the payload and the trailing carriage return makes agent CLIs (Claude Code, opencode) honor it as Enter rather than absorbing it as a newline-in-input.
+  This affects two flows: pressing Ctrl+G to generate a `.dot-agent-deck.toml` config, and orchestration startup where the orchestrator's bootstrap prompt is injected into its agent pane. Both previously left the prompt un-submitted in some cases — the orchestration path additionally fused the role launch command into the prompt buffer because the role command was being written twice (once when the pane was spawned, once again after resize). The duplicate write has been removed.
+  Status-bar messages now stay visible for 15 seconds instead of 3, so wrapped error messages such as "Orchestration failed: …" remain readable.
+- **Docs Pod Readiness Probe Failure on Startup**
+  The docs deployment's readiness and liveness probes now include a 5-second initial delay, preventing transient "connection refused" failures during pod startup. Previously, probes fired immediately before nginx had finished initializing and bound to port 8080, causing unhealthy pod events on every new pod creation.
+
+
+
 ## [0.23.0] - 2026-04-23
 
 ### Added
