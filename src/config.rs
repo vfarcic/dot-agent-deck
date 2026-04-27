@@ -463,6 +463,14 @@ impl ConfigGenState {
     }
 }
 
+/// Serializes tests that mutate `DOT_AGENT_DECK_CONFIG_GEN_STATE` or call
+/// `ConfigGenState::save()` / `load()` (directly or through handlers like
+/// `handle_config_gen_prompt_key`). Rust runs unit tests in parallel, so
+/// without this lock those tests race on the shared env var and on whatever
+/// state file each one points it at.
+#[cfg(test)]
+pub(crate) static CONFIG_GEN_STATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -861,6 +869,20 @@ timeout_secs = 600
 
     #[test]
     fn config_gen_state_suppress_dir_deduplicates() {
+        // suppress_dir() calls save(), which reads DOT_AGENT_DECK_CONFIG_GEN_STATE.
+        // Hold the env-var lock and point at a temp path so we neither race
+        // against load_save_cycle nor pollute the real home dir.
+        let _guard = CONFIG_GEN_STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config-gen-state.json");
+        let prev = std::env::var("DOT_AGENT_DECK_CONFIG_GEN_STATE").ok();
+        // SAFETY: env-var lock held for the duration of this test.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", path.to_str().unwrap());
+        }
+
         let mut state = ConfigGenState::default();
         state.suppressed_dirs.push("/dup".to_string());
         state.suppressed_dirs.push("/dup".to_string()); // manual dup
@@ -871,6 +893,14 @@ timeout_secs = 600
         state2.suppressed_dirs.push("/dup".to_string());
         state2.suppress_dir("/dup");
         assert_eq!(state2.suppressed_dirs.len(), 1);
+
+        // SAFETY: env-var lock held; restore prior value.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_CONFIG_GEN_STATE"),
+            }
+        }
     }
 
     #[test]
@@ -887,10 +917,15 @@ timeout_secs = 600
 
     #[test]
     fn config_gen_state_load_save_cycle() {
+        // Serialize against any other test that touches this env var or calls
+        // save()/load() — Rust runs unit tests in parallel.
+        let _guard = CONFIG_GEN_STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config-gen-state.json");
         let prev = std::env::var("DOT_AGENT_DECK_CONFIG_GEN_STATE").ok();
-        // SAFETY: test is single-threaded; no other code reads this var concurrently.
+        // SAFETY: env-var lock held for the duration of this test.
         unsafe {
             std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", path.to_str().unwrap());
         }
