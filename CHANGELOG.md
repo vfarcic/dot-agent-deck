@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.24.1] - 2026-04-27
+
+### Fixed
+
+  Release binaries now report the correct version. Previously the release workflow's build job used a shallow checkout without tag refs, causing `git describe` in `build.rs` to fall back to `CARGO_PKG_VERSION` (`0.1.0`) — so installed binaries always reported `v0.1.0` and the update banner appeared even on the latest release.
+
+
+
 ## [0.24.0] - 2026-04-27
 
 ### Added
