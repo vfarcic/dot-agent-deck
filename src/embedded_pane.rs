@@ -35,6 +35,27 @@ struct Pane {
 /// Thread-safe pane registry.
 type PaneRegistry = Arc<Mutex<HashMap<String, Pane>>>;
 
+/// Encode the payload portion of a pane input (content + bracketed paste markers if
+/// multi-line) without the trailing submit byte. Trailing whitespace is stripped.
+fn encode_pane_payload(text: &str) -> Vec<u8> {
+    let trimmed = text.trim_end_matches(['\n', '\r', ' ', '\t']);
+    let mut out = Vec::with_capacity(trimmed.len() + 16);
+    if trimmed.contains('\n') {
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(trimmed.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+    } else {
+        out.extend_from_slice(trimmed.as_bytes());
+    }
+    out
+}
+
+/// Delay between writing input bytes and the submit CR. Agent TUIs like claude
+/// treat a CR that arrives fused to the preceding text as newline-in-input; only
+/// a CR that arrives as a separate event after a pause is honored as Enter. The
+/// same applies after a bracketed-paste close marker. 150ms tuned empirically.
+const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// Embedded terminal pane controller using portable-pty + vt100.
 ///
 /// Replaces `ZellijController` by spawning PTY processes directly and parsing
@@ -440,21 +461,38 @@ impl PaneController for EmbeddedPaneController {
         Ok(())
     }
 
+    /// Concurrency contract: callers must not invoke `write_to_pane` concurrently
+    /// for the same `pane_id`. The pane lock is released around `SUBMIT_DELAY` so
+    /// other panes can be drawn — but interleaved writes for the *same* pane would
+    /// produce `payload_A + payload_B + CR + CR`, fusing two prompts. The current
+    /// architecture is single-threaded for pane I/O, so this is a latent constraint
+    /// rather than an active hazard; a per-pane submit mutex would enforce it if
+    /// concurrent callers are ever introduced.
     fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
-        let mut panes = self.panes.lock().unwrap();
-        if let Some(pane) = panes.get_mut(pane_id) {
-            pane.writer
-                .write_all(text.as_bytes())
-                .map_err(PaneError::Io)?;
-            // Send CR (Enter)
+        let payload = encode_pane_payload(text);
+        // Write the payload (content, optionally bracketed-paste-wrapped), flush, then
+        // pause briefly before sending the submit CR. Agent TUIs like claude treat a
+        // CR that arrives fused to the preceding text as newline-in-input; only a CR
+        // that arrives as a separate event after a pause is honored as Enter. The
+        // pane lock is released during the sleep so the UI thread can keep drawing.
+        {
+            let mut panes = self.panes.lock().unwrap();
+            let pane = panes
+                .get_mut(pane_id)
+                .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
+            pane.writer.write_all(&payload).map_err(PaneError::Io)?;
+            pane.writer.flush().map_err(PaneError::Io)?;
+        }
+        std::thread::sleep(SUBMIT_DELAY);
+        {
+            let mut panes = self.panes.lock().unwrap();
+            let pane = panes
+                .get_mut(pane_id)
+                .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
             pane.writer.write_all(b"\r").map_err(PaneError::Io)?;
             pane.writer.flush().map_err(PaneError::Io)?;
-            Ok(())
-        } else {
-            Err(PaneError::CommandFailed(format!(
-                "Pane {pane_id} not found"
-            )))
         }
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -543,6 +581,41 @@ mod tests {
         ctrl.write_to_pane(&id, "echo hello").unwrap();
 
         ctrl.close_pane(&id).unwrap();
+    }
+
+    #[test]
+    fn encode_pane_payload_single_line() {
+        assert_eq!(encode_pane_payload("ls -la"), b"ls -la");
+    }
+
+    #[test]
+    fn encode_pane_payload_strips_trailing_whitespace() {
+        assert_eq!(encode_pane_payload("ls -la\n"), b"ls -la");
+        assert_eq!(encode_pane_payload("ls -la  \n\n"), b"ls -la");
+    }
+
+    #[test]
+    fn encode_pane_payload_wraps_multiline() {
+        assert_eq!(
+            encode_pane_payload("line1\nline2\nline3"),
+            b"\x1b[200~line1\nline2\nline3\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn encode_pane_payload_multiline_with_trailing_newline() {
+        // Trailing newline is stripped, but embedded newlines still trigger paste wrapping.
+        assert_eq!(
+            encode_pane_payload("line1\nline2\n"),
+            b"\x1b[200~line1\nline2\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn encode_pane_payload_empty() {
+        assert_eq!(encode_pane_payload(""), b"");
+        // Edge case: trailing whitespace stripped to empty → no embedded newline → no markers.
+        assert_eq!(encode_pane_payload("\n\n"), b"");
     }
 
     #[test]

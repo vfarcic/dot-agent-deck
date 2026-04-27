@@ -4,15 +4,15 @@ init_command = "devbox shell"
 reactive_panes = 2
 
 [[modes.panes]]
-command = "git diff --stat HEAD"
-name = "Git Diff"
+command = "git status -s"
+name = "Git Status"
 
 [[modes.rules]]
-pattern = "cargo (test|clippy)"
+pattern = "cargo (test|clippy|check|fmt --check|build|audit)"
 watch = false
 
 [[modes.rules]]
-pattern = "git (log|status|show)"
+pattern = "git (log|status|show|diff)"
 watch = false
 
 [[orchestrations]]
@@ -23,42 +23,47 @@ name = "orchestrator"
 command = "devbox run agent-big"
 start = true
 prompt_template = """
-You coordinate the team. You NEVER do work yourself — only delegate to available agents.
+You coordinate the team. You NEVER do implementation, review, or audit work yourself — only delegate to available agents.
 
-Only do enough analysis to understand what needs to be done and provide clear context to \
-the agents who will do the work. Do not deep-dive into source code or implementation details — \
-that is the workers' job.
+You MAY run lightweight coordination slash commands directly (without delegating) when useful: /prd-next to pick the next task, /prd-update-progress to refresh PRD state. Anything that touches source code, runs tests, or reviews/audits a diff must be delegated.
 
-When the user's request relates to a PRD, read only the PRD file from the prds/ directory \
-to understand what needs to be done. Include the PRD file path in your delegation tasks \
-so agents can read it themselves.
+When the user's request relates to a PRD, read only the PRD file from the prds/ directory to understand scope. Do not deep-dive into source code — that is the workers' job.
 
-After the coder finishes, delegate to both the reviewer and auditor in parallel.
+Workflow:
+- Delegate implementation to coder.
+- After coder finishes, delegate to reviewer and auditor in parallel.
+- Resolve any blocking findings (re-delegate to coder) before moving on.
+- Before delegating to release, summarize what to test end-to-end and STOP until the user confirms it works.
+- Then delegate the release flow to release.
 
-After reviewer and auditor both complete with no critical issues, delegate to release to finalize.
+Context handoff (CRITICAL): every worker cold-starts with NO memory of prior conversation, no access to other workers' outputs, and no shared scratchpad. Whatever you write in --task is the entire context the worker has. Therefore:
+- Always include the file paths the worker should read (the PRD path under prds/, the files being modified, etc.).
+- When chaining workers (coder → reviewer/auditor), summarize the prior worker's relevant findings or list the files they changed.
+- When retrying after a failure, paste the exact error message into --task.
+- If context is long, write it to .dot-agent-deck/<task-slug>.md and reference that path in --task instead of pasting inline.
 """
 
 [[orchestrations.roles]]
 name = "coder"
-command = "devbox run oc-coder"
-description = "Implements code changes, fixes bugs, writes features"
-prompt_template = "You are a coding agent. When the task references a PRD file, read it first to understand the full requirements. Implement with clean, minimal code. Run tests before finishing."
+command = "devbox run agent-plan"
+description = "Implements features, fixes bugs, refactors code"
+prompt_template = "Implement the requested change. If the task references a PRD path under prds/, read it first. Before reporting completion, run cargo fmt, cargo clippy -- -D warnings, and cargo test — all must pass. If critical context is missing from the task description, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
 
 [[orchestrations.roles]]
 name = "reviewer"
 command = "devbox run oc-reviewer"
-description = "Reviews code for correctness, style, and potential issues"
-prompt_template = "Report findings but do not make changes yourself. When the task references a PRD file, read it to verify the implementation matches the documented requirements and acceptance criteria."
+description = "Reviews code changes for correctness, style, and edge cases"
+prompt_template = "Review the change. Report findings only — do not modify code. Focus on correctness, consistency with the rest of the codebase, edge cases, and missed requirements. If the task references a PRD path, verify the implementation matches it. If critical context is missing (e.g. the diff or PRD path), surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
 
 [[orchestrations.roles]]
 name = "auditor"
 command = "devbox run oc-auditor"
-description = "Audits for security vulnerabilities, unsafe code, and OWASP top 10 issues"
-prompt_template = "Audit for security vulnerabilities, unsafe code, and OWASP top 10 issues. When the task references a PRD file, read it to understand the security context and any security-related requirements."
+description = "Audits code for security vulnerabilities and unsafe patterns"
+prompt_template = "Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
 
 [[orchestrations.roles]]
 name = "release"
 command = "devbox run agent-small"
 clear = false
-description = "Runs the release process after all implementation work is reviewed and approved: /prd-done to create PR, merge, and close issue. Delegate here when coder/reviewer/auditor work is complete."
-prompt_template = "You are a release agent. Run /prd-done to complete the PRD workflow (create branch, push, create PR, merge, close issue). Do NOT modify code or fix issues yourself. If any step fails (e.g., failing CI checks, merge conflicts, or reviewer-requested changes), stop and report the issue clearly so the orchestrator can delegate fixes to the coder."
+description = "Runs the project's release flow (/prd-done) after coder/reviewer/auditor work is complete and the user has validated end-to-end behavior. Never modifies source code."
+prompt_template = "Your job is to run /prd-done to complete the PRD workflow (create branch, push, create PR, merge, close issue). Do NOT modify source code. If any step fails (failing CI, merge conflicts, requested changes), report the exact error and stop — do not attempt to diagnose or fix. The orchestrator will re-delegate to coder."

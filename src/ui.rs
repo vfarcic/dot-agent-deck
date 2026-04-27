@@ -445,6 +445,11 @@ impl NewPaneFormState {
     }
 }
 
+/// How long status-bar messages stay visible before clearing. Long enough that
+/// errors (e.g. orchestration spawn failures) are readable, short enough that
+/// transient info messages don't linger past their usefulness.
+const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// A prompt queued for injection into a pane once its agent is ready.
 /// Used by M5 delegation dispatch when `clear = true` restarts a pane.
 struct PendingDispatch {
@@ -1018,7 +1023,6 @@ fn feedback_worker_results(
             .unwrap_or_else(|| "unknown".to_string());
 
         // Build feedback prompt: one-liner pointing to the work-done file.
-        // Must be single-line so write_to_pane submits it correctly.
         let safe_name = sanitize_role_name(&role_name);
         let feedback = format!(
             "Worker {safe_name} has completed their task. Read .dot-agent-deck/work-done-{safe_name}.md for their full report."
@@ -2047,7 +2051,7 @@ pub fn run_tui(
     'outer: loop {
         // Expire stale status messages
         if let Some((_, created)) = &ui.status_message
-            && created.elapsed() > std::time::Duration::from_secs(3)
+            && created.elapsed() > STATUS_MESSAGE_TTL
         {
             ui.status_message = None;
         }
@@ -3167,11 +3171,11 @@ pub fn run_tui(
                                             .insert(*id, std::time::Instant::now());
                                     }
 
-                                    // Start role commands after resize.
-                                    for (i, role) in orch_config.roles.iter().enumerate() {
-                                        let _ =
-                                            pane.write_to_pane(&role_pane_ids[i], &role.command);
-                                    }
+                                    // Role commands are already running — each pane was
+                                    // spawned with `role.command` as its initial process
+                                    // (see TabManager::open_orchestration_tab in tab.rs).
+                                    // Writing the command again here would land its bytes
+                                    // in the agent's stdin, polluting the prompt buffer.
 
                                     ui.status_message = Some((
                                         format!("Activated orchestration: {}", orch_config.name),
@@ -5980,9 +5984,14 @@ mod tests {
 
     #[test]
     fn dir_picker_enter_confirms_when_no_subdirs() {
+        // Use a fresh tempdir for current_dir so load_project_config can't
+        // pick up a stray .dot-agent-deck.toml from /tmp on the host.
+        let tmp = tempfile::tempdir().unwrap();
         let mut ui = default_ui();
         ui.mode = UiMode::DirPicker;
-        ui.dir_picker = Some(make_dir_picker(&[".."]));
+        let mut picker = make_dir_picker(&[".."]);
+        picker.current_dir = tmp.path().to_path_buf();
+        ui.dir_picker = Some(picker);
 
         handle_dir_picker_key(
             KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
@@ -7414,6 +7423,18 @@ mod tests {
 
     #[test]
     fn config_gen_prompt_enter_on_never_suppresses_dir() {
+        // Picking "Never" calls suppress_dir() → save(), which reads
+        // DOT_AGENT_DECK_CONFIG_GEN_STATE. Hold the shared lock and point at
+        // a temp path so we don't race against other tests touching the same
+        // env var, and don't pollute the real home dir.
+        let _guard = crate::config::CONFIG_GEN_STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config-gen-state.json");
+        // Drop guard restores the env var even if an assertion below panics.
+        let _env_restore = crate::config::ConfigGenStateEnvGuard::set(path.to_str().unwrap());
+
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 2; // Never
