@@ -37,23 +37,17 @@ type PaneRegistry = Arc<Mutex<HashMap<String, Pane>>>;
 
 /// Encode the payload portion of a pane input (content + bracketed paste markers if
 /// multi-line) without the trailing submit byte. Trailing whitespace is stripped.
-///
-/// Returned tuple: `(bytes, is_multiline)`. The `is_multiline` flag tells the caller
-/// whether to insert a brief delay before sending the submit byte — agent TUIs like
-/// claude need a tick after the close marker to transition out of paste-review mode
-/// before they will honor a fresh Enter.
-fn encode_pane_payload(text: &str) -> (Vec<u8>, bool) {
+fn encode_pane_payload(text: &str) -> Vec<u8> {
     let trimmed = text.trim_end_matches(['\n', '\r', ' ', '\t']);
-    let multiline = trimmed.contains('\n');
     let mut out = Vec::with_capacity(trimmed.len() + 16);
-    if multiline {
+    if trimmed.contains('\n') {
         out.extend_from_slice(b"\x1b[200~");
         out.extend_from_slice(trimmed.as_bytes());
         out.extend_from_slice(b"\x1b[201~");
     } else {
         out.extend_from_slice(trimmed.as_bytes());
     }
-    (out, multiline)
+    out
 }
 
 /// Delay between writing input bytes and the submit CR. Agent TUIs like claude
@@ -467,8 +461,15 @@ impl PaneController for EmbeddedPaneController {
         Ok(())
     }
 
+    /// Concurrency contract: callers must not invoke `write_to_pane` concurrently
+    /// for the same `pane_id`. The pane lock is released around `SUBMIT_DELAY` so
+    /// other panes can be drawn — but interleaved writes for the *same* pane would
+    /// produce `payload_A + payload_B + CR + CR`, fusing two prompts. The current
+    /// architecture is single-threaded for pane I/O, so this is a latent constraint
+    /// rather than an active hazard; a per-pane submit mutex would enforce it if
+    /// concurrent callers are ever introduced.
     fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
-        let (payload, _multiline) = encode_pane_payload(text);
+        let payload = encode_pane_payload(text);
         // Write the payload (content, optionally bracketed-paste-wrapped), flush, then
         // pause briefly before sending the submit CR. Agent TUIs like claude treat a
         // CR that arrives fused to the preceding text as newline-in-input; only a CR
@@ -584,47 +585,37 @@ mod tests {
 
     #[test]
     fn encode_pane_payload_single_line() {
-        let (bytes, multiline) = encode_pane_payload("ls -la");
-        assert_eq!(bytes, b"ls -la");
-        assert!(!multiline);
+        assert_eq!(encode_pane_payload("ls -la"), b"ls -la");
     }
 
     #[test]
     fn encode_pane_payload_strips_trailing_whitespace() {
-        let (bytes, multiline) = encode_pane_payload("ls -la\n");
-        assert_eq!(bytes, b"ls -la");
-        assert!(!multiline);
-
-        let (bytes, multiline) = encode_pane_payload("ls -la  \n\n");
-        assert_eq!(bytes, b"ls -la");
-        assert!(!multiline);
+        assert_eq!(encode_pane_payload("ls -la\n"), b"ls -la");
+        assert_eq!(encode_pane_payload("ls -la  \n\n"), b"ls -la");
     }
 
     #[test]
     fn encode_pane_payload_wraps_multiline() {
-        let (bytes, multiline) = encode_pane_payload("line1\nline2\nline3");
-        assert_eq!(bytes, b"\x1b[200~line1\nline2\nline3\x1b[201~");
-        assert!(multiline);
+        assert_eq!(
+            encode_pane_payload("line1\nline2\nline3"),
+            b"\x1b[200~line1\nline2\nline3\x1b[201~"
+        );
     }
 
     #[test]
     fn encode_pane_payload_multiline_with_trailing_newline() {
         // Trailing newline is stripped, but embedded newlines still trigger paste wrapping.
-        let (bytes, multiline) = encode_pane_payload("line1\nline2\n");
-        assert_eq!(bytes, b"\x1b[200~line1\nline2\x1b[201~");
-        assert!(multiline);
+        assert_eq!(
+            encode_pane_payload("line1\nline2\n"),
+            b"\x1b[200~line1\nline2\x1b[201~"
+        );
     }
 
     #[test]
     fn encode_pane_payload_empty() {
-        let (bytes, multiline) = encode_pane_payload("");
-        assert_eq!(bytes, b"");
-        assert!(!multiline);
-
-        let (bytes, multiline) = encode_pane_payload("\n\n");
-        assert_eq!(bytes, b"");
-        // Edge case: stripped to empty, so no embedded newline → single-line.
-        assert!(!multiline);
+        assert_eq!(encode_pane_payload(""), b"");
+        // Edge case: trailing whitespace stripped to empty → no embedded newline → no markers.
+        assert_eq!(encode_pane_payload("\n\n"), b"");
     }
 
     #[test]

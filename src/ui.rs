@@ -7432,11 +7432,8 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config-gen-state.json");
-        let prev = std::env::var("DOT_AGENT_DECK_CONFIG_GEN_STATE").ok();
-        // SAFETY: env-var lock held for the duration of this test.
-        unsafe {
-            std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", path.to_str().unwrap());
-        }
+        // Drop guard restores the env var even if an assertion below panics.
+        let _env_restore = crate::config::ConfigGenStateEnvGuard::set(path.to_str().unwrap());
 
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
@@ -7451,14 +7448,6 @@ mod tests {
         assert!(ui.config_gen_state.is_suppressed("/my/project"));
         assert!(matches!(result, KeyResult::Continue));
         assert!(ui.status_message.is_some());
-
-        // SAFETY: env-var lock held; restore prior value.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_CONFIG_GEN_STATE"),
-            }
-        }
     }
 
     #[test]

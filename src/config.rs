@@ -471,6 +471,40 @@ impl ConfigGenState {
 #[cfg(test)]
 pub(crate) static CONFIG_GEN_STATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Test-only RAII guard that sets `DOT_AGENT_DECK_CONFIG_GEN_STATE` and
+/// restores its prior value on drop, even if the test panics. Callers must
+/// hold `CONFIG_GEN_STATE_ENV_LOCK` for the guard's lifetime.
+#[cfg(test)]
+pub(crate) struct ConfigGenStateEnvGuard {
+    prev: Option<String>,
+}
+
+#[cfg(test)]
+impl ConfigGenStateEnvGuard {
+    pub(crate) fn set(value: &str) -> Self {
+        let prev = std::env::var("DOT_AGENT_DECK_CONFIG_GEN_STATE").ok();
+        // SAFETY: callers must hold CONFIG_GEN_STATE_ENV_LOCK for the
+        // duration of this guard, which serializes env-var access.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", value);
+        }
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ConfigGenStateEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: see ConfigGenStateEnvGuard::set.
+        unsafe {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_CONFIG_GEN_STATE"),
+            }
+        }
+    }
+}
+
 pub(crate) fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -877,11 +911,8 @@ timeout_secs = 600
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config-gen-state.json");
-        let prev = std::env::var("DOT_AGENT_DECK_CONFIG_GEN_STATE").ok();
-        // SAFETY: env-var lock held for the duration of this test.
-        unsafe {
-            std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", path.to_str().unwrap());
-        }
+        // Drop guard restores the env var even if an assertion below panics.
+        let _env_restore = ConfigGenStateEnvGuard::set(path.to_str().unwrap());
 
         let mut state = ConfigGenState::default();
         state.suppressed_dirs.push("/dup".to_string());
@@ -893,14 +924,6 @@ timeout_secs = 600
         state2.suppressed_dirs.push("/dup".to_string());
         state2.suppress_dir("/dup");
         assert_eq!(state2.suppressed_dirs.len(), 1);
-
-        // SAFETY: env-var lock held; restore prior value.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_CONFIG_GEN_STATE"),
-            }
-        }
     }
 
     #[test]
