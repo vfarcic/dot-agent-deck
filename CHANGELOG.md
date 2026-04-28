@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.24.2] - 2026-04-28
+
+### Documentation
+
+  Restructure the docs site with annotated screenshots, accuracy fixes, and a richer home page. The landing page gains a "Why Agent Deck" narrative, design principles, and tabbed installation instructions for macOS / Linux / Windows (WSL). Getting Started, Session Management, and Workspace Modes pages now include screenshots illustrating the dashboard layout, session card details, and mode tabs in action. Several long-standing inaccuracies were corrected: `Ctrl+c` quit-dialog behavior, `Ctrl+w` semantics on dashboard vs. mode tabs, command-mode requirements for `Tab` / `Shift+Tab` / `j` / `k`, and the "Mode tabs are restored on `--continue`" claim (now tracked as a bug — see issues #68 and #69).
+
+
+
 ## [0.24.1] - 2026-04-27
 
 ### Fixed
