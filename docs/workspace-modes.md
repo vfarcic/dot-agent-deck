@@ -127,7 +127,7 @@ watch = false
 The tab bar appears at the top when more than one tab is open. To cycle between tabs:
 
 - **`Ctrl+PageDown`** / **`Ctrl+PageUp`** — work from anywhere, including while typing in an agent pane.
-- **`Tab`** / **`Shift+Tab`** (or arrow keys, `h`/`l`) — only after pressing `Ctrl+d` to leave the pane and enter command mode. Otherwise the keystroke is sent to the agent.
+- **`Tab`** / **`Shift+Tab`** (or `Left`/`Right` arrow keys, `h`/`l`) — only after pressing `Ctrl+d` to leave the pane and enter command mode. Otherwise the keystroke is sent to the agent.
 
 See [Keyboard Shortcuts](keyboard-shortcuts.md) for all keybindings.
 
