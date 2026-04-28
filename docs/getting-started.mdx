@@ -1,0 +1,138 @@
+---
+sidebar_position: 2
+title: Getting Started
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Getting Started
+
+## Quick Start
+
+<Tabs groupId="os" defaultValue="macos">
+<TabItem value="macos" label="macOS">
+
+```bash
+# 1. Install via Homebrew
+brew tap vfarcic/tap && brew install dot-agent-deck
+
+# 2. Launch the dashboard (hooks are auto-installed for detected agents)
+dot-agent-deck
+
+# Or resume your previous session
+dot-agent-deck --continue
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux">
+
+```bash
+# 1. Install via Homebrew (if available)
+brew tap vfarcic/tap && brew install dot-agent-deck
+
+# 2. Launch the dashboard (hooks are auto-installed for detected agents)
+dot-agent-deck
+
+# Or resume your previous session
+dot-agent-deck --continue
+```
+
+</TabItem>
+<TabItem value="windows" label="Windows">
+
+Native Windows is [coming soon](https://github.com/vfarcic/dot-agent-deck/issues/42). For now, install [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) and follow the Linux instructions inside your WSL shell.
+
+</TabItem>
+</Tabs>
+
+:::tip
+**Prebuilt binaries and source builds** are also available for macOS and Linux. See [all install options](installation.md).
+:::
+
+Once the dashboard is running, press `?` inside the app to see all shortcuts.
+
+> On launch, dot-agent-deck installs Claude Code / OpenCode hooks automatically for whichever agents it detects. See [Troubleshooting](troubleshooting.md#hooks) if you need to manage them manually.
+
+## Launching
+
+<div className="row">
+<div className="col col--6">
+
+Running `dot-agent-deck` opens a two-column layout with native embedded terminal panes:
+
+- **Left (1/3)** — the dashboard, displaying a card grid of agent sessions
+- **Right (2/3)** — agent panes where Claude Code or OpenCode instances run (stacked by default, toggle to tiled with `Ctrl+t`)
+
+</div>
+<div className="col col--6">
+
+![Two-column layout showing the dashboard card on the left and a Claude Code agent pane on the right](/img/getting-started-launching.jpg)
+
+</div>
+</div>
+
+## Basic Workflow
+
+1. Launch the dashboard with `dot-agent-deck`
+2. Press `Ctrl+n` to open a new pane — pick a directory, give the pane a name, and enter the command to run (typically `claude` or `opencode`)
+3. Watch the agent's status, tool calls, and prompts update on the dashboard in real-time
+4. To type into an agent, move keyboard focus into its pane: press `Ctrl+d` to enter command mode, then `1`–`9` to jump to that card's pane
+5. To close the pane you're currently working in, press `Ctrl+w` — it closes the selected card and its pane, even while you're still typing in it. The dashboard tab itself can't be closed.
+
+> **Tip:** The command can be any shell command, but real-time status, tool, and prompt tracking on the dashboard only work for `claude` and `opencode` (the agents Agent Deck installs hooks for).
+
+> **Tip:** Press `Ctrl+d` from any pane to enter command / navigation mode.
+
+## Working with Modes
+
+Modes let you pair an agent session with live command output in a tabbed workspace. They are defined per-project in `.dot-agent-deck.toml`.
+
+![A mode tab in action — agent pane on the left, with live Git status, kubectl pods, and kubectl events stacked on the right](/img/modes.png)
+
+### Setting Up a Mode Config
+
+**Option A (recommended) — let an agent generate it for you.** While running an agent on the project, press `Ctrl+d` then `g` on the dashboard. A dialog appears; choose **Yes** and Agent Deck sends a prompt asking the agent to analyze the project and propose a tailored `.dot-agent-deck.toml`. Review the proposal and approve when you're happy with it. See [Workspace Modes › Agent-Assisted Config Generation](workspace-modes.md#agent-assisted-config-generation) for the full flow.
+
+**Option B — scaffold a static template, then edit.** Useful when no agent is running, or when you'd rather start from a known baseline:
+
+```bash
+cd your-project
+dot-agent-deck init
+```
+
+**Option C — write `.dot-agent-deck.toml` manually.** A minimal example:
+
+```toml
+[[modes]]
+name = "dev"
+
+[[modes.panes]]
+command = "cargo watch -x test"
+name = "Tests"
+
+[[modes.rules]]
+pattern = "cargo\\s+build"
+watch = false
+```
+
+### Activating a Mode
+
+1. Press `Ctrl+n` to start the new-pane flow.
+2. Select a directory that contains `.dot-agent-deck.toml`.
+3. In the unified form, use `Left`/`Right` (or `h`/`l`) to cycle the **Mode** field to your desired mode.
+4. Fill in the agent name and command, then press `Enter`.
+5. A new tab opens with the agent on the left and side panes on the right.
+
+### Navigating Mode Tabs
+
+The tab bar appears at the top when multiple tabs are open. To cycle between tabs:
+
+- **`Ctrl+PageDown`** / **`Ctrl+PageUp`** — work from anywhere, including while typing in an agent pane.
+- **`Tab`** / **`Shift+Tab`** (or `Left`/`Right`, `h`/`l`) — only after pressing `Ctrl+d` to leave the pane and enter command mode. Otherwise the keystroke is sent to the agent.
+
+To tear down a mode tab entirely, press `Ctrl+w` while its agent's card is selected (the easiest way to select it is to jump to its pane with `Ctrl+d` then `1`–`9`). This stops the agent and all side panes in one action — closing a mode-tab agent is treated as closing the whole workspace, not just one pane.
+
+See [Keyboard Shortcuts](keyboard-shortcuts.md) for all tab navigation keybindings.
+
+For the full configuration reference and more examples, see [Workspace Modes](workspace-modes.md).
