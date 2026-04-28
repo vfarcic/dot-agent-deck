@@ -7,6 +7,8 @@ title: Workspace Modes
 
 Modes are config-driven workspaces that pair an AI agent with live command output in side panes. Each mode activation creates a new tab — a self-contained workspace with the agent pane on the left (50%) and side panes stacked on the right (50%). Modes are defined per-project in a `.dot-agent-deck.toml` file at the project root.
 
+![A mode tab in action — agent pane on the left, with live Git status, kubectl pods, and kubectl events stacked on the right](/img/modes.png)
+
 ## Concepts
 
 ### Persistent Panes
@@ -122,15 +124,22 @@ watch = false
 
 ### Switching Tabs
 
-The tab bar appears at the top when more than one tab is open. Use `Tab`/`Shift+Tab` or arrow keys to cycle between tabs. See [Keyboard Shortcuts](keyboard-shortcuts.md) for all keybindings.
+The tab bar appears at the top when more than one tab is open. To cycle between tabs:
+
+- **`Ctrl+PageDown`** / **`Ctrl+PageUp`** — work from anywhere, including while typing in an agent pane.
+- **`Tab`** / **`Shift+Tab`** (or arrow keys, `h`/`l`) — only after pressing `Ctrl+d` to leave the pane and enter command mode. Otherwise the keystroke is sent to the agent.
+
+See [Keyboard Shortcuts](keyboard-shortcuts.md) for all keybindings.
 
 ### Closing a Mode Tab
 
 Press `Ctrl+w` on a mode tab to tear down the entire workspace — the agent and all side panes are stopped. The dashboard tab cannot be closed.
 
-### Dashboard Card Navigation
+### Jumping to a Mode Tab from the Dashboard
 
-Press `Enter` on an agent's card in the dashboard to jump directly to that agent's mode tab (if it has one).
+From command mode (press `Ctrl+d` first if you're typing in a pane), press the card number (`1`–`9`) of the mode-tab agent to jump to it. The dashboard automatically switches to the mode tab and focuses the agent pane.
+
+> **Note:** The in-app help also lists `Enter` on a selected card as a way to jump, but card selection (`j`/`k`/`Up`/`Down`) is currently broken — see [#68](https://github.com/vfarcic/dot-agent-deck/issues/68). Use `1`–`9` instead.
 
 ## Side Pane Interaction
 

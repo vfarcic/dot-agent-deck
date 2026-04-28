@@ -18,7 +18,27 @@ Each session card shows the agent's current state:
 | **Idle** | Agent is between tasks |
 | **Error** | Something went wrong |
 
-Cards also display: session ID, agent type, working directory, tool count, and last user prompt.
+Cards also display:
+
+- **Title row** — card number, the pane's display name (or `agent_type · session_id` if it hasn't been renamed), an animated status dot, and the status label
+- **`Dir:`** — the working directory (basename, truncated to fit)
+- **`Last:`** — elapsed time since the agent's last activity, alongside **`Tools:`** showing the total tool-call count
+- **`Prmt:`** — the most recent user prompt(s)
+- **Recent tool calls** — the last commands the agent ran
+
+![Single agent card showing directory, last activity, tool count, recent prompt, and recent tool calls](/img/session-management-card.jpg)
+
+How many prompts and tool calls fit on a card depends on the auto-chosen density, which Agent Deck picks based on how many cards are on the dashboard and how much room is available:
+
+| Density | Prompts shown | Recent tool calls shown |
+|---|---|---|
+| Spacious | up to 3 | up to 3 |
+| Normal | 1 | up to 3 |
+| Compact | 1 | 1 |
+
+The more agents you run in parallel, the more cards Agent Deck has to fit on the screen, so each card automatically becomes more compact. This is deliberate — scrolling through cards would defeat the point of having a single dashboard.
+
+![Five agents running in parallel — cards switch to Compact density to fit them all without scrolling](/img/home-hero-dashboard.jpg)
 
 ## Resuming Sessions
 
@@ -30,8 +50,8 @@ dot-agent-deck --continue
 
 Without `--continue`, the dashboard starts with a blank slate. If a saved directory no longer exists, that pane is skipped with a warning.
 
-Mode tabs are also restored: each agent pane records which mode it belonged to, and `--continue` reopens the full mode tab (agent + side panes) by looking up the mode config from the project's `.dot-agent-deck.toml`. If the mode config is missing or was renamed, the pane falls back to a plain dashboard pane with a warning.
-
 After restore the dashboard is shown first so you get an overview before switching to a specific tab.
+
+> **Note:** Mode tabs (agent pane + side panes from `.dot-agent-deck.toml`) are currently **not** restored — see [#69](https://github.com/vfarcic/dot-agent-deck/issues/69). Plain dashboard panes restore correctly. To get a mode tab back after `--continue`, recreate it via `Ctrl+n` and select the mode in the new-pane form.
 
 Session data is stored in `~/.config/dot-agent-deck/session.toml`.

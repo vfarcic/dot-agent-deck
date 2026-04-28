@@ -47,3 +47,42 @@ After applying the fix:
 ### Note
 
 This configuration only affects Ghostty. Other terminal emulators (iTerm2, Alacritty, Warp, etc.) typically work without additional configuration.
+
+## Hooks
+
+Hooks are **auto-installed on every startup** — most users never need to think about them. The CLI detects which agents are present and installs hooks accordingly:
+
+- **Claude Code** (`~/.claude/` detected) — writes entries into `~/.claude/settings.json` for hook types: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, PreCompact, SubagentStart, SubagentStop.
+- **OpenCode** (`~/.opencode/` detected) — creates a JS plugin at `~/.opencode/plugin/dot-agent-deck/index.js` that forwards session, tool, and permission events.
+
+Auto-install is idempotent and best-effort — if an agent directory is missing the step is silently skipped, and errors are logged without blocking startup.
+
+### Manual Management
+
+The `hooks install` and `hooks uninstall` commands are available when you need to debug or temporarily remove hooks:
+
+```bash
+# Install manually
+dot-agent-deck hooks install                    # Claude Code
+dot-agent-deck hooks install --agent opencode   # OpenCode
+
+# Remove hooks
+dot-agent-deck hooks uninstall                    # Claude Code
+dot-agent-deck hooks uninstall --agent opencode   # OpenCode
+```
+
+> **Note:** If you uninstall hooks manually, the next dashboard launch will re-install them automatically.
+
+## Enabling Debug Logs
+
+When something goes wrong and the dashboard's status messages aren't enough to diagnose it, set the `DOT_AGENT_DECK_LOG` environment variable to capture tracing output to a file:
+
+```bash
+# Default — writes to /tmp/dot-agent-deck.log
+DOT_AGENT_DECK_LOG=1 dot-agent-deck
+
+# Custom path
+DOT_AGENT_DECK_LOG=/tmp/my-debug.log dot-agent-deck
+```
+
+The log file captures session events, hook activity, mode-tab restoration, and any errors logged by the daemon. Attach the relevant excerpt when filing an issue. See [Configuration › Environment Variables](configuration.md#environment-variables) for the full list of variables.

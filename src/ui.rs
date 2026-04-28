@@ -4413,7 +4413,6 @@ fn render_help_overlay(frame: &mut Frame, active_mode_name: Option<&str>, palett
         Line::styled("  Dashboard (command mode)", cyan),
         Line::from(""),
         Line::from("  1-9             Jump to pane N"),
-        Line::from("  j/k / Up/Down   Navigate cards"),
         Line::from("  Enter           Focus selected pane"),
         Line::from("  /               Filter sessions"),
         Line::from("  Esc             Clear filter"),
