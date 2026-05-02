@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -318,6 +319,35 @@ impl SavedSession {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Build a `SavedSession` snapshot from the live UI state.
+    ///
+    /// Must be called *before* tearing down mode/orchestration tabs — i.e., while
+    /// `live_panes` (the authoritative `state.managed_pane_ids`) still contains
+    /// every pane, including mode-tab agent panes that carry `mode = Some(...)`.
+    /// `retain` here only prunes panes the user externally closed before exit;
+    /// running it after teardown would also drop the mode-tab agent pane and lose
+    /// the mode field, breaking `--continue` restoration (PRD #69).
+    pub fn snapshot(
+        pane_metadata: &mut HashMap<String, SavedPane>,
+        pane_display_names: &HashMap<String, String>,
+        live_panes: &HashSet<String>,
+    ) -> Self {
+        pane_metadata.retain(|id, _| live_panes.contains(id));
+        for (id, meta) in pane_metadata.iter_mut() {
+            if let Some(name) = pane_display_names.get(id) {
+                meta.name = name.clone();
+            }
+        }
+        let mut ids: Vec<&String> = pane_metadata.keys().collect();
+        ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
+        Self {
+            panes: ids
+                .into_iter()
+                .filter_map(|id| pane_metadata.get(id).cloned())
+                .collect(),
         }
     }
 }
@@ -749,8 +779,10 @@ on_idle = true
 
     #[test]
     fn star_prompt_dismiss_permanently() {
-        let mut state = StarPromptState::default();
-        state.permanently_dismissed = true;
+        let mut state = StarPromptState {
+            permanently_dismissed: true,
+            ..StarPromptState::default()
+        };
         for i in 1..=20 {
             state.launch_count = i;
             let should_show = !state.permanently_dismissed

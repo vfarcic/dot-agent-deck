@@ -60,10 +60,10 @@ The agent's *internal* state (Claude Code conversation, OpenCode state, role-pan
 ## Acceptance Criteria
 
 ### Mode tabs
-- [ ] Open `dot-agent-deck`, create at least one mode tab via `Ctrl+n` with a `.dot-agent-deck.toml`-backed mode, exit with `Ctrl+c`. Re-launch with `dot-agent-deck --continue`.
-- [ ] The mode tab reappears in the tab bar with the original tab name.
-- [ ] The agent pane is present and the agent command (e.g. `claude`) was re-run.
-- [ ] All side panes from the mode are present and running their configured commands.
+- [x] Open `dot-agent-deck`, create at least one mode tab via `Ctrl+n` with a `.dot-agent-deck.toml`-backed mode, exit with `Ctrl+c`. Re-launch with `dot-agent-deck --continue`.
+- [x] The mode tab reappears in the tab bar with the original tab name.
+- [x] The agent pane is present and the agent command (e.g. `claude`) was re-run.
+- [x] All side panes from the mode are present and running their configured commands.
 - [ ] If the project's `.dot-agent-deck.toml` was deleted or the mode name was changed between exit and restore, a clear warning is shown to the user (not silently swallowed) and the pane falls back to a plain dashboard pane.
 
 ### Orchestration tabs
