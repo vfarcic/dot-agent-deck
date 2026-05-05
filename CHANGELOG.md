@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.24.4] - 2026-05-05
+
+### Fixed
+
+- **Docs site port leak in directory redirects**
+  Clicking links like `/docs/installation` (no trailing slash) on the public docs site no longer bounces users to a non-routable `http://agent-deck.devopstoolkit.ai:8080/...` URL. The docs container now ships a custom nginx config that disables `absolute_redirect` and `port_in_redirect`, so directory 301 redirects emit relative `Location` headers and the upstream Gateway's host, scheme, and port are preserved.
+- **OpenCode worker status updates not appearing on dashboard cards**
+  On systems where OpenCode 1.x is installed under the XDG layout (`~/.config/opencode/` instead of legacy `~/.opencode/`), the dashboard's auto-installer never wrote its plugin, so `session.*` and `tool.execute.*` events from OpenCode workers never reached the daemon and card statuses stayed frozen on their initial state. The installer now resolves the active OpenCode root by checking XDG first (`$XDG_CONFIG_HOME/opencode`, defaulting to `~/.config/opencode`) and falling back to `~/.opencode`. Explicit `dot-agent-deck hooks install --agent opencode` targets the detected root or the XDG default; uninstall sweeps both layouts.
+
+
+
 ## [0.24.2] - 2026-04-28
 
 ### Documentation
