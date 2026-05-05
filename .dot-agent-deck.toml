@@ -46,6 +46,7 @@ Context handoff (CRITICAL): every worker cold-starts with NO memory of prior con
 [[orchestrations.roles]]
 name = "coder"
 command = "devbox run agent-plan"
+# command = "devbox run oc-coder"
 description = "Implements features, fixes bugs, refactors code"
 prompt_template = "Implement the requested change. If the task references a PRD path under prds/, read it first. Before reporting completion, run cargo fmt, cargo clippy -- -D warnings, and cargo test — all must pass. If critical context is missing from the task description, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
 
@@ -64,6 +65,7 @@ prompt_template = "Audit the change for security vulnerabilities, unsafe pattern
 [[orchestrations.roles]]
 name = "release"
 command = "devbox run agent-small"
+# command = "devbox run oc-release"
 clear = false
 description = "Runs the project's release flow (/prd-done) after coder/reviewer/auditor work is complete and the user has validated end-to-end behavior. Never modifies source code."
 prompt_template = "Your job is to run /prd-done to complete the PRD workflow (create branch, push, create PR, merge, close issue). Do NOT modify source code. If any step fails (failing CI, merge conflicts, requested changes), report the exact error and stop — do not attempt to diagnose or fix. The orchestrator will re-delegate to coder."
