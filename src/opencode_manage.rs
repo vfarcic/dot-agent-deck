@@ -1,11 +1,63 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-fn plugin_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home)
-        .join(".opencode")
-        .join("plugin")
-        .join("dot-agent-deck")
+fn plugin_subpath(root: &Path) -> PathBuf {
+    root.join("plugin").join("dot-agent-deck")
+}
+
+fn home_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+}
+
+fn xdg_config_root(home: &Path) -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home.join(".config"))
+}
+
+/// Detect the active OpenCode config root, if any. Priority:
+///  1. XDG layout: `$XDG_CONFIG_HOME/opencode` (defaults to `$HOME/.config/opencode`) — used by OpenCode 1.x
+///  2. Legacy layout: `$HOME/.opencode`
+fn detect_opencode_root_in(home: &Path, xdg_config_home: Option<&Path>) -> Option<PathBuf> {
+    let xdg_root = match xdg_config_home {
+        Some(p) => p.join("opencode"),
+        None => home.join(".config").join("opencode"),
+    };
+    if xdg_root.exists() {
+        return Some(xdg_root);
+    }
+    let legacy_root = home.join(".opencode");
+    if legacy_root.exists() {
+        return Some(legacy_root);
+    }
+    None
+}
+
+fn detect_opencode_root() -> Option<PathBuf> {
+    let home = home_dir();
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok().map(PathBuf::from);
+    detect_opencode_root_in(&home, xdg.as_deref())
+}
+
+/// Plugin dir target for explicit install: detected root, falling back to XDG layout.
+fn plugin_dir_for_install() -> PathBuf {
+    if let Some(root) = detect_opencode_root() {
+        return plugin_subpath(&root);
+    }
+    let home = home_dir();
+    let xdg_default = xdg_config_root(&home).join("opencode");
+    plugin_subpath(&xdg_default)
+}
+
+/// All plugin dirs that currently exist on disk (XDG and legacy). For uninstall.
+fn existing_plugin_dirs() -> Vec<PathBuf> {
+    let home = home_dir();
+    let xdg = xdg_config_root(&home).join("opencode");
+    let legacy = home.join(".opencode");
+    [xdg, legacy]
+        .into_iter()
+        .map(|r| plugin_subpath(&r))
+        .filter(|p| p.exists())
+        .collect()
 }
 
 fn plugin_template(binary_path: &str) -> String {
@@ -332,17 +384,15 @@ fn uninstall_impl(dir: &PathBuf) -> std::io::Result<()> {
 /// Silently install OpenCode plugin if OpenCode is detected.
 /// Intended for dashboard startup — never prints to stdout.
 pub fn auto_install() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let opencode_dir = PathBuf::from(&home).join(".opencode");
-    if !opencode_dir.exists() {
+    let Some(root) = detect_opencode_root() else {
         return;
-    }
+    };
 
     let binary_path = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "dot-agent-deck".into());
 
-    let dir = plugin_dir();
+    let dir = plugin_subpath(&root);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("auto-install: failed to create OpenCode plugin dir: {e}");
         return;
@@ -359,7 +409,8 @@ pub fn auto_install() {
 }
 
 /// Auto-install to a custom dir, checking a custom opencode_dir for detection (for testing).
-pub fn auto_install_to(opencode_dir: &std::path::Path, target_dir: &std::path::Path) {
+#[cfg(test)]
+fn auto_install_to(opencode_dir: &std::path::Path, target_dir: &std::path::Path) {
     if !opencode_dir.exists() {
         return;
     }
@@ -378,11 +429,19 @@ pub fn install() -> std::io::Result<()> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "dot-agent-deck".into());
 
-    install_impl(&plugin_dir(), &binary_path)
+    install_impl(&plugin_dir_for_install(), &binary_path)
 }
 
 pub fn uninstall() -> std::io::Result<()> {
-    uninstall_impl(&plugin_dir())
+    let dirs = existing_plugin_dirs();
+    if dirs.is_empty() {
+        println!("No OpenCode plugin found to remove.");
+        return Ok(());
+    }
+    for dir in &dirs {
+        uninstall_impl(dir)?;
+    }
+    Ok(())
 }
 
 // --- Testable versions that accept a custom path ---
@@ -507,5 +566,56 @@ mod tests {
 
         let index = target_dir.join("index.js");
         assert!(index.exists());
+    }
+
+    #[test]
+    fn detect_opencode_root_prefers_xdg_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let xdg = home.join(".config");
+        std::fs::create_dir_all(xdg.join("opencode")).unwrap();
+        std::fs::create_dir_all(home.join(".opencode")).unwrap();
+
+        let root = detect_opencode_root_in(home, Some(&xdg)).unwrap();
+        assert_eq!(root, xdg.join("opencode"));
+    }
+
+    #[test]
+    fn detect_opencode_root_falls_back_to_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let xdg = home.join(".config");
+        std::fs::create_dir_all(home.join(".opencode")).unwrap();
+
+        let root = detect_opencode_root_in(home, Some(&xdg)).unwrap();
+        assert_eq!(root, home.join(".opencode"));
+    }
+
+    #[test]
+    fn detect_opencode_root_none_when_neither_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let xdg = home.join(".config");
+
+        assert!(detect_opencode_root_in(home, Some(&xdg)).is_none());
+    }
+
+    #[test]
+    fn detect_opencode_root_uses_default_xdg_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::create_dir_all(home.join(".config").join("opencode")).unwrap();
+
+        let root = detect_opencode_root_in(home, None).unwrap();
+        assert_eq!(root, home.join(".config").join("opencode"));
+    }
+
+    #[test]
+    fn plugin_subpath_appends_plugin_and_name() {
+        let root = PathBuf::from("/some/opencode");
+        assert_eq!(
+            plugin_subpath(&root),
+            PathBuf::from("/some/opencode/plugin/dot-agent-deck")
+        );
     }
 }
