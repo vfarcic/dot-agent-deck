@@ -2016,10 +2016,47 @@ pub fn run_tui(
                         }
                         Err(e) => {
                             let _ = pane.close_pane(&new_id);
+                            state.blocking_write().unregister_pane(&new_id);
+                            ui.pane_metadata.remove(&new_id);
+                            ui.pane_display_names.remove(&new_id);
+                            ui.pane_names.remove(&new_id);
                             ui.session_warnings.push(format!(
                                 "Warning: failed to restore mode '{}': {e}",
                                 mode_config.name
                             ));
+                            // Fallback: plain dashboard pane so the user still
+                            // gets a usable pane (PRD #69 acceptance criterion).
+                            let cmd = if saved_pane.command.is_empty() {
+                                None
+                            } else {
+                                Some(saved_pane.command.as_str())
+                            };
+                            match pane.create_pane(cmd, Some(&saved_pane.dir)) {
+                                Ok(fb_id) => {
+                                    {
+                                        let mut st = state.blocking_write();
+                                        st.register_pane(fb_id.clone());
+                                        st.insert_placeholder_session(
+                                            fb_id.clone(),
+                                            Some(saved_pane.dir.clone()),
+                                        );
+                                    }
+                                    if !saved_pane.name.is_empty() {
+                                        let _ = pane.rename_pane(&fb_id, &saved_pane.name);
+                                        ui.pane_display_names
+                                            .insert(fb_id.clone(), saved_pane.name.clone());
+                                        ui.pane_names
+                                            .insert(fb_id.clone(), saved_pane.name.clone());
+                                    }
+                                    ui.pane_metadata.insert(fb_id, saved_pane.clone());
+                                }
+                                Err(fb_err) => {
+                                    ui.session_warnings.push(format!(
+                                        "Warning: also failed to create fallback plain pane for '{}': {fb_err}",
+                                        saved_pane.name
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -2028,6 +2065,36 @@ pub fn run_tui(
                         "Warning: failed to restore mode pane '{}': {e}",
                         saved_pane.name
                     ));
+                    let cmd = if saved_pane.command.is_empty() {
+                        None
+                    } else {
+                        Some(saved_pane.command.as_str())
+                    };
+                    match pane.create_pane(cmd, Some(&saved_pane.dir)) {
+                        Ok(fb_id) => {
+                            {
+                                let mut st = state.blocking_write();
+                                st.register_pane(fb_id.clone());
+                                st.insert_placeholder_session(
+                                    fb_id.clone(),
+                                    Some(saved_pane.dir.clone()),
+                                );
+                            }
+                            if !saved_pane.name.is_empty() {
+                                let _ = pane.rename_pane(&fb_id, &saved_pane.name);
+                                ui.pane_display_names
+                                    .insert(fb_id.clone(), saved_pane.name.clone());
+                                ui.pane_names.insert(fb_id.clone(), saved_pane.name.clone());
+                            }
+                            ui.pane_metadata.insert(fb_id, saved_pane.clone());
+                        }
+                        Err(fb_err) => {
+                            ui.session_warnings.push(format!(
+                                "Warning: also failed to create fallback plain pane for '{}': {fb_err}",
+                                saved_pane.name
+                            ));
+                        }
+                    }
                 }
             }
         }

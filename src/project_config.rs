@@ -459,4 +459,25 @@ watch = true
         let result: Result<ProjectConfig, _> = toml::from_str(toml);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn mode_lookup_by_name_returns_none_when_renamed() {
+        // PRD #69: the mode-tab restore branch in src/ui.rs uses
+        // `cfg.modes.iter().find(|m| m.name == saved_mode_name)` to resolve a
+        // saved mode against the current project config. If the mode was
+        // renamed/removed between exit and restore the lookup must return None
+        // so the restore branch routes to its warning + plain-pane fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"
+[[modes]]
+name = "renamed-mode"
+
+[[modes.panes]]
+command = "echo hi"
+"#;
+        std::fs::write(dir.path().join(CONFIG_FILE_NAME), toml).unwrap();
+        let config = load_project_config(dir.path()).unwrap().unwrap();
+        assert!(config.modes.iter().any(|m| m.name == "renamed-mode"));
+        assert!(!config.modes.iter().any(|m| m.name == "old-name"));
+    }
 }
