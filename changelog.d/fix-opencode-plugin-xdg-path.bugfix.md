@@ -1,0 +1,3 @@
+## OpenCode worker status updates not appearing on dashboard cards
+
+On systems where OpenCode 1.x is installed under the XDG layout (`~/.config/opencode/` instead of legacy `~/.opencode/`), the dashboard's auto-installer never wrote its plugin, so `session.*` and `tool.execute.*` events from OpenCode workers never reached the daemon and card statuses stayed frozen on their initial state. The installer now resolves the active OpenCode root by checking XDG first (`$XDG_CONFIG_HOME/opencode`, defaulting to `~/.config/opencode`) and falling back to `~/.opencode`. Explicit `dot-agent-deck hooks install --agent opencode` targets the detected root or the XDG default; uninstall sweeps both layouts.
