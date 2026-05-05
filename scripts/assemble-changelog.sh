@@ -24,6 +24,32 @@ declare -A TYPE_HEADERS=(
 # Ordered list of types to scan — earlier entries appear first in the changelog.
 TYPES=(breaking added feature changed fixed bugfix removed doc misc)
 
+# Fail loudly if changelog.d/ contains fragments with unrecognized suffixes,
+# rather than silently skipping them. (v0.24.3 shipped with `*.fix.md` fragments
+# that were ignored because only `*.bugfix.md`/`*.fixed.md` are recognized,
+# leaving the GitHub release body and CHANGELOG.md empty for that version.)
+if [ -d "$CHANGELOG_DIR" ]; then
+  unknown_fragments=()
+  while IFS= read -r -d '' f; do
+    name="$(basename "$f")"
+    [[ "$name" == ".gitkeep" ]] && continue
+    matched=false
+    for type in "${TYPES[@]}"; do
+      [[ "$name" == *.${type}.md ]] && { matched=true; break; }
+    done
+    $matched || unknown_fragments+=("$name")
+  done < <(find "$CHANGELOG_DIR" -maxdepth 1 -name '*.md' -print0 2>/dev/null)
+
+  if [ ${#unknown_fragments[@]} -gt 0 ]; then
+    echo "ERROR: changelog.d/ contains fragments with unrecognized type suffix:" >&2
+    printf '  %s\n' "${unknown_fragments[@]}" >&2
+    echo >&2
+    echo "Recognized types: ${TYPES[*]}" >&2
+    echo "Rename each fragment so its suffix matches one of the recognized types (e.g. '.bugfix.md', '.feature.md')." >&2
+    exit 1
+  fi
+fi
+
 section=""
 processed_files=()
 seen_headers=()
