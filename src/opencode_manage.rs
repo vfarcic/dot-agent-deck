@@ -409,7 +409,8 @@ pub fn auto_install() {
 }
 
 /// Auto-install to a custom dir, checking a custom opencode_dir for detection (for testing).
-pub fn auto_install_to(opencode_dir: &std::path::Path, target_dir: &std::path::Path) {
+#[cfg(test)]
+fn auto_install_to(opencode_dir: &std::path::Path, target_dir: &std::path::Path) {
     if !opencode_dir.exists() {
         return;
     }
