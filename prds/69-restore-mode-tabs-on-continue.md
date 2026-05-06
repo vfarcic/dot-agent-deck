@@ -42,8 +42,8 @@ The agent's *internal* state (Claude Code conversation, OpenCode state) is expli
 
 ### Cross-cutting
 - [x] Add a regression test that exercises save → restore for at least one mode tab, asserting side panes are recreated.
-- [ ] Add a regression test that loads an old-format `session.toml` (no `mode` field on any pane) and confirms it still parses without error.
-- [ ] Restore the mode-tab-restoration paragraph in `docs/session-management.md` that was removed when this PRD was filed.
+- [x] Add a regression test that loads an old-format `session.toml` (no `mode` field on any pane) and confirms it still parses without error.
+- [x] Restore the mode-tab-restoration paragraph in `docs/session-management.md` that was removed when this PRD was filed.
 
 ## Out of Scope
 

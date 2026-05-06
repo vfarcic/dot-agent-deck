@@ -352,3 +352,46 @@ fn save_then_restore_recreates_side_panes() {
         "1 agent shell + 2 persistent + 2 reactive = 5 panes created on restore"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 4: pre-PRD-69 session.toml (no `mode` field on any pane) still parses.
+//
+// Pins the backwards-compatibility contract provided by `#[serde(default)]`
+// on `SavedPane.mode`. If a future change breaks that contract,
+// `SavedSession::load()` would log "Invalid session at..." and return
+// `Self::default()` (empty panes), failing the pane-count assertion.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn load_legacy_session_without_mode_field_parses_with_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.toml");
+    let legacy = r#"
+[[panes]]
+dir = "/repo/api"
+name = "api"
+command = "claude"
+
+[[panes]]
+dir = "/repo/ui"
+name = "ui"
+command = ""
+
+[[panes]]
+dir = "/repo/docs"
+name = "docs"
+command = "npm run dev"
+"#;
+    std::fs::write(&path, legacy).unwrap();
+    let _guard = SessionEnvGuard::set(path.to_str().unwrap());
+
+    let loaded = SavedSession::load();
+    assert_eq!(loaded.panes.len(), 3);
+    assert!(
+        loaded.panes.iter().all(|p| p.mode.is_none()),
+        "pre-PRD-69 session.toml must deserialize with mode == None on every pane",
+    );
+    assert_eq!(loaded.panes[0].name, "api");
+    assert_eq!(loaded.panes[1].command, "");
+    assert_eq!(loaded.panes[2].command, "npm run dev");
+}
