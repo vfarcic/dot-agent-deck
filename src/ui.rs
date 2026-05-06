@@ -2016,10 +2016,47 @@ pub fn run_tui(
                         }
                         Err(e) => {
                             let _ = pane.close_pane(&new_id);
+                            state.blocking_write().unregister_pane(&new_id);
+                            ui.pane_metadata.remove(&new_id);
+                            ui.pane_display_names.remove(&new_id);
+                            ui.pane_names.remove(&new_id);
                             ui.session_warnings.push(format!(
                                 "Warning: failed to restore mode '{}': {e}",
                                 mode_config.name
                             ));
+                            // Fallback: plain dashboard pane so the user still
+                            // gets a usable pane (PRD #69 acceptance criterion).
+                            let cmd = if saved_pane.command.is_empty() {
+                                None
+                            } else {
+                                Some(saved_pane.command.as_str())
+                            };
+                            match pane.create_pane(cmd, Some(&saved_pane.dir)) {
+                                Ok(fb_id) => {
+                                    {
+                                        let mut st = state.blocking_write();
+                                        st.register_pane(fb_id.clone());
+                                        st.insert_placeholder_session(
+                                            fb_id.clone(),
+                                            Some(saved_pane.dir.clone()),
+                                        );
+                                    }
+                                    if !saved_pane.name.is_empty() {
+                                        let _ = pane.rename_pane(&fb_id, &saved_pane.name);
+                                        ui.pane_display_names
+                                            .insert(fb_id.clone(), saved_pane.name.clone());
+                                        ui.pane_names
+                                            .insert(fb_id.clone(), saved_pane.name.clone());
+                                    }
+                                    ui.pane_metadata.insert(fb_id, saved_pane.clone());
+                                }
+                                Err(fb_err) => {
+                                    ui.session_warnings.push(format!(
+                                        "Warning: also failed to create fallback plain pane for '{}': {fb_err}",
+                                        saved_pane.name
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -2028,6 +2065,36 @@ pub fn run_tui(
                         "Warning: failed to restore mode pane '{}': {e}",
                         saved_pane.name
                     ));
+                    let cmd = if saved_pane.command.is_empty() {
+                        None
+                    } else {
+                        Some(saved_pane.command.as_str())
+                    };
+                    match pane.create_pane(cmd, Some(&saved_pane.dir)) {
+                        Ok(fb_id) => {
+                            {
+                                let mut st = state.blocking_write();
+                                st.register_pane(fb_id.clone());
+                                st.insert_placeholder_session(
+                                    fb_id.clone(),
+                                    Some(saved_pane.dir.clone()),
+                                );
+                            }
+                            if !saved_pane.name.is_empty() {
+                                let _ = pane.rename_pane(&fb_id, &saved_pane.name);
+                                ui.pane_display_names
+                                    .insert(fb_id.clone(), saved_pane.name.clone());
+                                ui.pane_names.insert(fb_id.clone(), saved_pane.name.clone());
+                            }
+                            ui.pane_metadata.insert(fb_id, saved_pane.clone());
+                        }
+                        Err(fb_err) => {
+                            ui.session_warnings.push(format!(
+                                "Warning: also failed to create fallback plain pane for '{}': {fb_err}",
+                                saved_pane.name
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -3411,35 +3478,19 @@ pub fn run_tui(
         } // end inner event-drain loop
     }
 
-    // Tear down all mode tabs (clean up their panes).
-    for i in (1..tab_manager.tab_count()).rev() {
-        if let Ok(ids) = tab_manager.close_tab(i) {
-            for id in ids {
-                state.blocking_write().unregister_pane(&id);
-            }
-        }
-    }
-
-    // Auto-save current pane session for --continue restore.
-    // Reconcile pane_metadata with the authoritative live pane registry so that
-    // externally-closed panes are pruned and renames are captured.
+    // Snapshot the session for --continue restore *before* tearing down mode
+    // tabs. The teardown loop unregisters every mode-tab pane id from
+    // `state.managed_pane_ids`; if the snapshot ran after teardown, the
+    // `retain` step would drop the mode-tab agent pane (which carries
+    // `mode = Some(...)`) and the mode field would never reach disk (PRD #69).
     {
         let live_panes = state.blocking_read().managed_pane_ids.clone();
-        ui.pane_metadata.retain(|id, _| live_panes.contains(id));
-        for (id, meta) in ui.pane_metadata.iter_mut() {
-            if let Some(name) = ui.pane_display_names.get(id) {
-                meta.name = name.clone();
-            }
-        }
-        let session = config::SavedSession {
-            panes: {
-                let mut ids: Vec<&String> = ui.pane_metadata.keys().collect();
-                ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
-                ids.into_iter()
-                    .filter_map(|id| ui.pane_metadata.get(id).cloned())
-                    .collect()
-            },
-        };
+
+        let session = config::SavedSession::snapshot(
+            &mut ui.pane_metadata,
+            &ui.pane_display_names,
+            &live_panes,
+        );
         if session.panes.is_empty() {
             if let Err(e) = config::SavedSession::clear() {
                 ui.session_warnings
@@ -3448,6 +3499,15 @@ pub fn run_tui(
         } else if let Err(e) = session.save() {
             ui.session_warnings
                 .push(format!("Warning: failed to save session: {e}"));
+        }
+    }
+
+    // Tear down all mode/orchestration tabs (clean up their panes).
+    for i in (1..tab_manager.tab_count()).rev() {
+        if let Ok(ids) = tab_manager.close_tab(i) {
+            for id in ids {
+                state.blocking_write().unregister_pane(&id);
+            }
         }
     }
 
@@ -7339,12 +7399,13 @@ mod tests {
     fn test_frame_cycling() {
         // 3 frames, cycling at 120 ticks per frame
         let num_frames = 3;
-        assert_eq!((0u64 / 120) as usize % num_frames, 0);
-        assert_eq!((119u64 / 120) as usize % num_frames, 0);
-        assert_eq!((120u64 / 120) as usize % num_frames, 1);
-        assert_eq!((239u64 / 120) as usize % num_frames, 1);
-        assert_eq!((240u64 / 120) as usize % num_frames, 2);
-        assert_eq!((360u64 / 120) as usize % num_frames, 0); // wraps
+        let frame_for = |tick: u64| (tick / 120) as usize % num_frames;
+        assert_eq!(frame_for(0), 0);
+        assert_eq!(frame_for(119), 0);
+        assert_eq!(frame_for(120), 1);
+        assert_eq!(frame_for(239), 1);
+        assert_eq!(frame_for(240), 2);
+        assert_eq!(frame_for(360), 0); // wraps
     }
 
     #[test]
@@ -7741,12 +7802,7 @@ mod tests {
         }
     }
 
-    /// Set up an orchestration tab with a RecordingPaneController and register
-    /// all panes in state.  Returns the components needed for dispatch/feedback
-    /// tests plus the role_pane_ids for assertions.
-    fn setup_orchestration(
-        config: &OrchestrationConfig,
-    ) -> (
+    type OrchestrationFixture = (
         SharedState,
         Arc<RecordingPaneController>,
         Arc<dyn PaneController>,
@@ -7754,7 +7810,12 @@ mod tests {
         UiState,
         Vec<String>, // role_pane_ids
         tempfile::TempDir,
-    ) {
+    );
+
+    /// Set up an orchestration tab with a RecordingPaneController and register
+    /// all panes in state.  Returns the components needed for dispatch/feedback
+    /// tests plus the role_pane_ids for assertions.
+    fn setup_orchestration(config: &OrchestrationConfig) -> OrchestrationFixture {
         let dir = tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
 

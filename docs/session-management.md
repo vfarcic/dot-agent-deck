@@ -52,6 +52,6 @@ Without `--continue`, the dashboard starts with a blank slate. If a saved direct
 
 After restore the dashboard is shown first so you get an overview before switching to a specific tab.
 
-> **Note:** Mode tabs (agent pane + side panes from `.dot-agent-deck.toml`) are currently **not** restored — see [#69](https://github.com/vfarcic/dot-agent-deck/issues/69). Plain dashboard panes restore correctly. To get a mode tab back after `--continue`, recreate it via `Ctrl+n` and select the mode in the new-pane form.
+Mode tabs are also restored: each agent pane records which mode it belonged to, and `--continue` reopens the full mode tab — tab name, agent pane and its command, and all side panes with their commands — by looking up the mode config from the project's `.dot-agent-deck.toml`. The agent's internal conversation state is not restored; only the workspace structure is. If `.dot-agent-deck.toml` is missing or the mode was renamed at restore time, a warning is printed to stderr and the pane falls back to a plain dashboard pane.
 
 Session data is stored in `~/.config/dot-agent-deck/session.toml`.

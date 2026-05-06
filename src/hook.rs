@@ -775,7 +775,7 @@ mod tests {
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
-        assert!(event.metadata.get("bash_command").is_none());
+        assert!(!event.metadata.contains_key("bash_command"));
     }
 
     #[test]
@@ -791,7 +791,7 @@ mod tests {
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
-        assert!(event.metadata.get("bash_command").is_none());
+        assert!(!event.metadata.contains_key("bash_command"));
     }
 
     #[test]
