@@ -19,6 +19,7 @@ pub mod mode_manager;
 pub mod opencode_manage;
 pub mod pane;
 pub mod project_config;
+pub mod remote;
 pub mod state;
 pub mod tab;
 pub mod terminal_widget;

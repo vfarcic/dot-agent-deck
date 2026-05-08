@@ -115,6 +115,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
+    /// Manage registered remote agent environments (PRD #76).
+    Remote {
+        #[command(subcommand)]
+        cmd: RemoteCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -123,6 +128,40 @@ enum DaemonCmd {
     /// the remote host so the local TUI can speak the streaming attach
     /// protocol over the ssh pipe (PRD #76, M2.1).
     Attach,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum CliRemoteType {
+    Ssh,
+    Kubernetes,
+}
+
+#[derive(Subcommand)]
+enum RemoteCmd {
+    /// Register a remote ssh-reachable host as a deck environment.
+    Add {
+        /// Friendly name for the registry (e.g. hetzner-1). Must be unique.
+        name: String,
+        /// ssh target: `[user@]host`.
+        target: String,
+        /// Remote type. Only `ssh` is implemented today; `kubernetes` is
+        /// scheduled for Phase 3.
+        #[arg(long = "type", value_enum)]
+        kind: CliRemoteType,
+        /// ssh port.
+        #[arg(long, default_value_t = dot_agent_deck::remote::DEFAULT_SSH_PORT)]
+        port: u16,
+        /// ssh identity file. Optional; if omitted, ssh's default key search applies.
+        #[arg(long)]
+        key: Option<std::path::PathBuf>,
+        /// Daemon binary version to install on the remote.
+        #[arg(long, default_value = env!("DAD_VERSION"))]
+        version: String,
+        /// Skip binary install. Pre-flight will run `dot-agent-deck --version`
+        /// on the remote and require version match.
+        #[arg(long = "no-install")]
+        no_install: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -324,6 +363,40 @@ fn main() -> ExitCode {
         }
         Some(Commands::Daemon { cmd }) => match cmd {
             DaemonCmd::Attach => run_daemon_attach_cli(),
+        },
+        Some(Commands::Remote { cmd }) => match cmd {
+            RemoteCmd::Add {
+                name,
+                target,
+                kind,
+                port,
+                key,
+                version,
+                no_install,
+            } => {
+                let opts = dot_agent_deck::remote::AddOptions {
+                    name,
+                    remote_type: match kind {
+                        CliRemoteType::Ssh => "ssh".to_string(),
+                        CliRemoteType::Kubernetes => "kubernetes".to_string(),
+                    },
+                    target,
+                    port,
+                    key,
+                    version,
+                    no_install,
+                    release_base: dot_agent_deck::remote::RELEASE_BASE.to_string(),
+                };
+                let path = dot_agent_deck::remote::default_remotes_path();
+                let executor = dot_agent_deck::remote::SystemSshExecutor::new();
+                match dot_agent_deck::remote::add(&opts, &executor, &path) {
+                    Ok(_) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
         },
         Some(Commands::Validate { path }) => {
             use dot_agent_deck::config_validation::{has_errors, validate_config};
