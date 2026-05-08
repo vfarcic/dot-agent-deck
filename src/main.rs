@@ -109,6 +109,20 @@ enum Commands {
         #[arg(long)]
         done: bool,
     },
+    /// Daemon-side subcommands. Used internally by remote transports — not
+    /// part of the everyday user surface.
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Bridge stdio to the local daemon's attach socket. ssh execs this on
+    /// the remote host so the local TUI can speak the streaming attach
+    /// protocol over the ssh pipe (PRD #76, M2.1).
+    Attach,
 }
 
 #[derive(Subcommand)]
@@ -308,6 +322,9 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Some(Commands::Daemon { cmd }) => match cmd {
+            DaemonCmd::Attach => run_daemon_attach_cli(),
+        },
         Some(Commands::Validate { path }) => {
             use dot_agent_deck::config_validation::{has_errors, validate_config};
             use dot_agent_deck::project_config::load_project_config;
@@ -464,6 +481,24 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
         eprintln!("TUI task error: {e}");
     } else if let Ok(Err(e)) = tui_result {
         eprintln!("TUI error: {e}");
+    }
+}
+
+#[tokio::main]
+async fn run_daemon_attach_cli() -> ExitCode {
+    let path = attach_socket_path();
+    match dot_agent_deck::daemon_attach::run_daemon_attach(
+        &path,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+    )
+    .await
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
