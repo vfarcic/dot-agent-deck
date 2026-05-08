@@ -62,7 +62,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -263,10 +263,13 @@ impl AttachResponse {
 // Server
 // ---------------------------------------------------------------------------
 
-/// Bind the attach socket and serve protocol connections forever. Cleans up
-/// any stale socket file before binding. Runs until the listener errors out
-/// or the future is dropped.
-pub async fn run_attach_server(path: &Path, registry: Arc<AgentPtyRegistry>) -> io::Result<()> {
+/// Bind the attach socket and return the listener, ready for `serve_attach`.
+/// Cleans up any stale socket file before binding. Split from `run_attach_server`
+/// so callers (notably tests) can synchronously confirm the listener is ready
+/// to accept connections before spawning the async serve loop — this removes
+/// the bind/accept readiness race that the old probe-and-retry pattern was
+/// papering over.
+pub fn bind_attach_listener(path: &Path) -> io::Result<UnixListener> {
     if path.exists() {
         std::fs::remove_file(path)?;
     }
@@ -276,8 +279,15 @@ pub async fn run_attach_server(path: &Path, registry: Arc<AgentPtyRegistry>) -> 
     // code path that bypasses `bind_socket` still ends up with the right
     // permissions.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    info!("Attach protocol listening on {}", path.display());
+    Ok(listener)
+}
 
+/// Accept-loop half of the attach server. Runs until the listener errors out
+/// or the future is dropped. Pairs with `bind_attach_listener`.
+pub async fn serve_attach(
+    listener: UnixListener,
+    registry: Arc<AgentPtyRegistry>,
+) -> io::Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
@@ -294,6 +304,15 @@ pub async fn run_attach_server(path: &Path, registry: Arc<AgentPtyRegistry>) -> 
             }
         }
     }
+}
+
+/// Bind the attach socket and serve protocol connections forever. Cleans up
+/// any stale socket file before binding. Runs until the listener errors out
+/// or the future is dropped.
+pub async fn run_attach_server(path: &Path, registry: Arc<AgentPtyRegistry>) -> io::Result<()> {
+    let listener = bind_attach_listener(path)?;
+    info!("Attach protocol listening on {}", path.display());
+    serve_attach(listener, registry).await
 }
 
 async fn handle_connection(
@@ -406,9 +425,18 @@ async fn handle_attach_stream(
     write_resp(&mut wr, &AttachResponse::ok()).await?;
     // 2. Replay the consistent scrollback snapshot before live bytes start
     //    flowing. `subscribe()` guarantees no overlap or gap with the bytes
-    //    delivered via `rx` below.
-    if !handle.snapshot.is_empty() {
-        write_frame(&mut wr, KIND_STREAM_OUT, &handle.snapshot).await?;
+    //    delivered via `rx` below. The write is bounded by
+    //    `CLIENT_WRITE_TIMEOUT` for the same reason live STREAM_OUT writes
+    //    are: a client wedged at attach time would otherwise pin this task
+    //    forever (kernel send buffer fills, `write_all` never completes,
+    //    and the output task never even starts so lag detection can't
+    //    fire). On timeout, mirror the output-task policy — best-effort
+    //    bounded STREAM_END, then drop the writer and bail.
+    if !handle.snapshot.is_empty()
+        && !write_or_timeout(&mut wr, KIND_STREAM_OUT, &handle.snapshot).await
+    {
+        let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
+        return Ok(());
     }
 
     let mut rx = handle.rx;

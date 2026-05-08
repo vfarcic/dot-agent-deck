@@ -4,7 +4,7 @@
 //! correctly — including concurrent attach-stream subscribers.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tempfile::TempDir;
@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use dot_agent_deck::agent_pty::AgentPtyRegistry;
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
-    KIND_STREAM_IN, KIND_STREAM_OUT, run_attach_server,
+    KIND_STREAM_IN, KIND_STREAM_OUT, bind_attach_listener, serve_attach,
 };
 
 // ---------------------------------------------------------------------------
@@ -35,33 +35,30 @@ impl Drop for Server {
     }
 }
 
+// Serializes the tempdir-creation + bind sequence across parallel tests.
+// `bind_attach_listener` -> `bind_socket` flips the process-global `umask` to
+// 0o177 for the duration of `bind(2)`. If another test creates its tempdir
+// inside that window, the new dir inherits 0o600 (no execute bit) and any
+// later bind beneath it fails with EACCES. Holding this lock around both
+// operations keeps the umask narrowing invisible to other tests' tempdir
+// calls.
+static HARNESS_BIND_LOCK: Mutex<()> = Mutex::new(());
+
 async fn start_server() -> Server {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("attach.sock");
     let registry = Arc::new(AgentPtyRegistry::new());
 
-    let registry_for_task = registry.clone();
-    let path_for_task = path.clone();
-    let handle = tokio::spawn(async move {
-        let _ = run_attach_server(&path_for_task, registry_for_task).await;
-    });
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = bind_attach_listener(&path).expect("bind attach listener");
+        (dir, path, listener)
+    };
 
-    // Wait for the listener to actually accept connections. The socket
-    // inode appearing on disk is *necessary but not sufficient* — under
-    // parallel test load, `bind()` can return before `accept()` is ready
-    // to be called, so we probe with a real connect-and-disconnect.
-    let mut connected = false;
-    for _ in 0..300 {
-        if path.exists()
-            && let Ok(stream) = UnixStream::connect(&path).await
-        {
-            drop(stream);
-            connected = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(connected, "attach socket never accepted a connection");
+    let registry_for_task = registry.clone();
+    let handle = tokio::spawn(async move {
+        let _ = serve_attach(listener, registry_for_task).await;
+    });
 
     Server {
         _dir: dir,
@@ -523,40 +520,16 @@ async fn concurrent_stream_in_writers_both_reach_pty() {
     server.registry.close_agent(&id).unwrap();
 }
 
-#[tokio::test]
-async fn slow_client_dropped_within_bounded_time() {
-    // A wedged client (one that stops draining its socket) must be
-    // disconnected by the daemon within bounded time, otherwise the
-    // output task would pin forever on `write_all` and lag detection
-    // could never fire.
-    //
-    // Setup: spawn a shell running `yes` to flood stdout. Open a "slow"
-    // attach client that consumes the OK response but never reads
-    // STREAM_OUT frames — the kernel recv buffer on the client side
-    // fills up, which back-pressures the daemon's `write_all`, which
-    // hits `CLIENT_WRITE_TIMEOUT`, which closes the connection. The
-    // alternative path (broadcast lag fires first and the daemon writes
-    // STREAM_END) is also acceptable; both result in a bounded close.
-    let server = start_server().await;
-    let id = start_agent(&server, "yes AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").await;
-
-    let slow = connect_attach(&server, &id).await;
-
-    // Wait without reading. CLIENT_WRITE_TIMEOUT in the daemon is 5s;
-    // wait long enough for the kernel recv buffer to fill and the
-    // timeout to trip. Holding the stream without reads is what
-    // simulates a wedged client.
-    tokio::time::sleep(Duration::from_secs(8)).await;
-
-    // Now drain. We must observe STREAM_END or EOF within an additional
-    // bounded window — proving the daemon dropped the connection rather
-    // than wedging on it.
-    let mut slow = slow;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+/// Wait for `slow` to observe STREAM_END or EOF within `budget`. Used by
+/// the slow-client bounded-disconnect tests where the precise close path
+/// (timeout vs. broadcast lag) doesn't matter — both indicate a bounded
+/// drop.
+async fn assert_closed_within(slow: &mut UnixStream, budget: Duration, what: &str) {
+    let deadline = tokio::time::Instant::now() + budget;
     let mut closed = false;
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline - tokio::time::Instant::now();
-        match tokio::time::timeout(remaining, read_frame(&mut slow)).await {
+        match tokio::time::timeout(remaining, read_frame(slow)).await {
             Ok(Some((KIND_STREAM_END, _))) => {
                 closed = true;
                 break;
@@ -569,11 +542,60 @@ async fn slow_client_dropped_within_bounded_time() {
             Err(_) => break,
         }
     }
-
-    server.registry.close_agent(&id).unwrap();
-
     assert!(
         closed,
-        "wedged slow client must observe STREAM_END or EOF within bounded time"
+        "{what} must observe STREAM_END or EOF within bounded time"
     );
+}
+
+#[tokio::test]
+async fn slow_client_dropped_within_bounded_time() {
+    // A wedged client (one that stops draining its socket) must be
+    // disconnected by the daemon within bounded time, otherwise the
+    // output task would pin forever on `write_all` and lag detection
+    // could never fire. Two stages are exercised back-to-back in the
+    // same test:
+    //
+    // 1. Live-output stage. Attach early; the live STREAM_OUT writes
+    //    eventually back-pressure on the wedged client's recv buffer
+    //    and hit `CLIENT_WRITE_TIMEOUT`. (Broadcast lag firing first
+    //    and emitting STREAM_END is an acceptable alternative path —
+    //    both are bounded closes.)
+    //
+    // 2. Initial-snapshot stage. Attach after scrollback has filled to
+    //    its cap, so the *first* STREAM_OUT carrying the snapshot is
+    //    already large enough to overflow the kernel send buffer. This
+    //    is the path that would have wedged before the snapshot write
+    //    was routed through `write_or_timeout`.
+    let server = start_server().await;
+    let id = start_agent(&server, "yes AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").await;
+
+    // Stage 1: live-output. `connect_attach` reads only the OK; the
+    // kernel recv buffer fills as live STREAM_OUT frames arrive.
+    let mut slow = connect_attach(&server, &id).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_closed_within(
+        &mut slow,
+        Duration::from_secs(15),
+        "wedged live-stream slow client",
+    )
+    .await;
+
+    // Stage 2: initial-snapshot. By now `yes` has filled scrollback to
+    // its 1 MiB cap (well above any Unix-socket send buffer), so the
+    // snapshot write itself is large enough to back-pressure on a
+    // non-reading client.
+    let mut slow2 = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut slow2, &AttachRequest::AttachStream { id: id.clone() }).await;
+    let resp = read_response(&mut slow2).await;
+    assert!(resp.ok, "attach-stream failed: {:?}", resp.error);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_closed_within(
+        &mut slow2,
+        Duration::from_secs(15),
+        "wedged snapshot-stage slow client",
+    )
+    .await;
+
+    server.registry.close_agent(&id).unwrap();
 }
