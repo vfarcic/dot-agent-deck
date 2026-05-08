@@ -4,8 +4,8 @@ use std::sync::Arc;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
-use dot_agent_deck::config::{DashboardConfig, socket_path};
-use dot_agent_deck::daemon::run_daemon;
+use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
+use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::hooks_manage;
 use dot_agent_deck::state::AppState;
@@ -372,11 +372,14 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
 
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();
+    let attach_path = attach_socket_path();
 
     let daemon_state = state.clone();
     let daemon_path = path.clone();
+    let daemon_attach_path = attach_path.clone();
     let daemon_handle = tokio::spawn(async move {
-        if let Err(e) = run_daemon(&daemon_path, daemon_state).await {
+        let daemon = Daemon::with_attach(daemon_state, daemon_attach_path);
+        if let Err(e) = run_daemon_with(&daemon_path, daemon).await {
             eprintln!("Daemon error: {e}");
         }
     });
@@ -415,6 +418,9 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
 
     if path.exists() {
         let _ = std::fs::remove_file(&path);
+    }
+    if attach_path.exists() {
+        let _ = std::fs::remove_file(&attach_path);
     }
 
     if let Err(e) = tui_result {

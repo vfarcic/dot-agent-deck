@@ -4,6 +4,7 @@ pub mod config;
 pub mod config_gen;
 pub mod config_validation;
 pub mod daemon;
+pub mod daemon_protocol;
 pub mod embedded_pane;
 pub mod error;
 pub mod event;

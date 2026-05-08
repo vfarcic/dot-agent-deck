@@ -61,6 +61,24 @@ pub fn socket_path() -> PathBuf {
     PathBuf::from("/tmp/dot-agent-deck.sock")
 }
 
+/// Path of the M1.2 streaming-attach Unix socket. Separate from the existing
+/// hook-ingestion socket (PRD #76 line 219) so the two protocols have
+/// disjoint, clearly-typed wire formats: hook ingestion is line-delimited
+/// JSON, attach is a binary frame protocol (see `daemon_protocol`). Same
+/// XDG-aware resolution pattern as `socket_path`, with `DOT_AGENT_DECK_ATTACH_SOCKET`
+/// as the explicit override.
+pub fn attach_socket_path() -> PathBuf {
+    if let Ok(path) = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET") {
+        return PathBuf::from(path);
+    }
+
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime_dir).join("dot-agent-deck-attach.sock");
+    }
+
+    PathBuf::from("/tmp/dot-agent-deck-attach.sock")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BellConfig {

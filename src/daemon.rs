@@ -1,6 +1,6 @@
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::AsyncBufReadExt;
@@ -29,7 +29,10 @@ static UMASK_LOCK: Mutex<()> = Mutex::new(());
 /// directly. Setting umask before `bind(2)` closes the TOCTOU window between
 /// `bind` and a post-bind `chmod`: without this, a local attacker could
 /// connect via the world-readable inode that exists between the two calls.
-fn bind_socket(path: &Path) -> io::Result<UnixListener> {
+///
+/// `pub(crate)` so the M1.2 attach-protocol server (`daemon_protocol`) can
+/// reuse the same restrictive-umask bind dance for its socket.
+pub(crate) fn bind_socket(path: &Path) -> io::Result<UnixListener> {
     let _guard = UMASK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // SAFETY: `umask(2)` is a thread-safe libc call that simply swaps a
     // per-process value. We restore the previous mask immediately after
@@ -49,20 +52,38 @@ fn bind_socket(path: &Path) -> io::Result<UnixListener> {
 }
 
 /// Bundle of daemon state. Owns the hook-event `SharedState` and the agent
-/// PTY registry. M1.1 keeps `run_daemon` as the public entrypoint with the
-/// existing signature; the registry is constructed inside it. Future
-/// milestones (M1.2 streaming attach protocol) will wire the registry into
-/// the socket loop.
+/// PTY registry, plus the path of the M1.2 streaming-attach socket. The
+/// registry is held for the lifetime of the daemon coroutine; on drop it
+/// kills any agents it still owns.
 pub struct Daemon {
     pub state: SharedState,
     pub pty_registry: Arc<AgentPtyRegistry>,
+    /// `None` means "do not start the streaming attach server". This is the
+    /// default for the legacy `run_daemon` convenience entrypoint and for
+    /// tests that only exercise hook ingestion. Production callers
+    /// (`main.rs`) populate this from `config::attach_socket_path()`.
+    pub attach_socket_path: Option<PathBuf>,
 }
 
 impl Daemon {
+    /// Hook-only daemon, no streaming attach server. Preserves the M1.1
+    /// behavior for callers that don't need the M1.2 protocol.
     pub fn new(state: SharedState) -> Self {
         Self {
             state,
             pty_registry: Arc::new(AgentPtyRegistry::new()),
+            attach_socket_path: None,
+        }
+    }
+
+    /// Daemon configured to also serve the M1.2 streaming attach protocol
+    /// on `attach_path`. Hook ingestion still uses the path passed to
+    /// `run_daemon_with`.
+    pub fn with_attach(state: SharedState, attach_path: PathBuf) -> Self {
+        Self {
+            state,
+            pty_registry: Arc::new(AgentPtyRegistry::new()),
+            attach_socket_path: Some(attach_path),
         }
     }
 }
@@ -72,9 +93,10 @@ pub async fn run_daemon(socket_path: &Path, state: SharedState) -> Result<(), Da
 }
 
 /// Same as `run_daemon` but lets callers (and tests) inject a pre-built
-/// `Daemon` so they can hold a clone of the PTY registry alongside it. The
-/// registry is held for the lifetime of the daemon coroutine; on drop it
-/// kills any agents it still owns.
+/// `Daemon` so they can hold a clone of the PTY registry alongside it.
+/// If `daemon.attach_socket_path` is set, the M1.2 streaming attach server
+/// is spawned alongside the hook-ingestion loop and aborted when this
+/// function returns.
 pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), DaemonError> {
     // Clean up stale socket file
     if socket_path.exists() {
@@ -90,9 +112,31 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
 
     // Hold the registry for the lifetime of the loop so its Drop fires
     // (killing any owned agents) when this future is dropped/aborted.
-    let _pty_registry = daemon.pty_registry;
+    let pty_registry = daemon.pty_registry;
     let state = daemon.state;
 
+    // Optionally spawn the M1.2 streaming attach server. We hold its
+    // JoinHandle and abort it on exit so it doesn't outlive the daemon.
+    let attach_handle = daemon.attach_socket_path.map(|path| {
+        let registry = pty_registry.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::daemon_protocol::run_attach_server(&path, registry).await {
+                error!("attach protocol server error: {e}");
+            }
+        })
+    });
+
+    let result = run_hook_loop(listener, state).await;
+
+    if let Some(h) = attach_handle {
+        h.abort();
+    }
+    drop(pty_registry);
+
+    result
+}
+
+async fn run_hook_loop(listener: UnixListener, state: SharedState) -> Result<(), DaemonError> {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
