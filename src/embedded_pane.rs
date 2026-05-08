@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -8,19 +9,74 @@ use portable_pty::PtySize;
 use std::any::Any;
 
 use crate::agent_pty::{self, AgentPty, SpawnOptions};
+use crate::daemon_client::{DaemonClient, StartAgentOptions};
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
 use crate::pane::{PaneController, PaneDirection, PaneError, PaneInfo};
 
-/// State for a single embedded terminal pane.
-struct Pane {
+/// PTY-backed pane state: this process owns the PTY master and child. The
+/// historical (and only) backend before M1.3.
+struct PtyBackend {
     /// Writer to send input to the PTY.
     writer: Box<dyn std::io::Write + Send>,
-    /// Parsed terminal screen (vt100).
-    screen: Arc<Mutex<vt100::Parser>>,
     /// The child process handle.
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Master PTY handle (kept alive for resize).
     master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+/// Stream-backed pane state (PRD #76, M1.3): the PTY lives in the daemon,
+/// and this side owns one [`crate::daemon_client::AttachConnection`] per
+/// pane. Bytes flow daemon → STREAM_OUT → vt100 parser; keystrokes flow
+/// vt100 → input channel → STREAM_IN → daemon. The daemon-side agent
+/// outlives the TUI by design (PRD line 199), so dropping this struct is
+/// implicit detach (the `io_task` stops draining and the socket closes —
+/// the daemon's input-loop treats EOF as DETACH). Sending `stop-agent` is
+/// reserved for the explicit user-driven Ctrl+W close path in `close_pane`.
+struct StreamBackend {
+    /// Daemon-side agent id used for `stop-agent` on close.
+    agent_id: String,
+    /// Channel drained by the per-pane I/O task; each push becomes one
+    /// STREAM_IN frame on the wire. Unbounded because the TUI keystroke
+    /// rate is human-paced; backpressure here would block the input
+    /// thread for no benefit.
+    input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// Aborts the I/O task on Drop. Closing the socket without sending
+    /// `stop-agent` is an implicit detach — the daemon keeps the agent
+    /// alive (M1.3 survival property).
+    io_task: tokio::task::AbortHandle,
+    /// Tokio handle so the (blocking) `close_pane` path can issue
+    /// `stop-agent` over a fresh short-lived connection.
+    runtime: tokio::runtime::Handle,
+    /// Daemon attach socket path used to build the `stop-agent` connection
+    /// — held here rather than referenced from the controller because the
+    /// pane outlives any borrow of the controller's path.
+    daemon_path: PathBuf,
+}
+
+enum PaneBackend {
+    Pty(PtyBackend),
+    Stream(StreamBackend),
+}
+
+impl Drop for StreamBackend {
+    /// Plain drop = implicit detach (PRD #76 line 199 — agents survive the
+    /// TUI). Aborting the io_task closes the attach socket; the daemon
+    /// sees EOF on its read half and treats it as a detach. The
+    /// `stop-agent` path lives only in `close_pane` for the explicit
+    /// Ctrl+W close.
+    fn drop(&mut self) {
+        self.io_task.abort();
+    }
+}
+
+/// State for a single embedded terminal pane.
+struct Pane {
+    /// Either a locally-owned PTY or a connection to a daemon-managed agent.
+    backend: PaneBackend,
+    /// Parsed terminal screen (vt100). Shared between the renderer and the
+    /// background producer task (PTY reader thread or stream-backed I/O
+    /// task).
+    screen: Arc<Mutex<vt100::Parser>>,
     /// Display name for this pane.
     name: String,
     /// Whether this pane is currently focused.
@@ -57,13 +113,28 @@ fn encode_pane_payload(text: &str) -> Vec<u8> {
 /// same applies after a bracketed-paste close marker. 150ms tuned empirically.
 const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// Selects how `create_pane` builds new panes:
+/// - `LocalDeck` spawns a PTY in this process (unchanged from pre-M1.3).
+/// - `RemoteDeckLocal` issues `start-agent` + `attach-stream` against the
+///   daemon at the given socket path. PRD #76, M1.3.
+enum ControllerMode {
+    LocalDeck,
+    RemoteDeckLocal {
+        client: DaemonClient,
+        runtime: tokio::runtime::Handle,
+    },
+}
+
 /// Embedded terminal pane controller using portable-pty + vt100.
 ///
 /// Replaces `ZellijController` by spawning PTY processes directly and parsing
-/// their output with a VT100 terminal emulator.
+/// their output with a VT100 terminal emulator. In M1.3's `RemoteDeckLocal`
+/// mode, panes are stream-backed against the daemon's M1.2 attach protocol
+/// instead — same vt100-based render path, different byte source.
 pub struct EmbeddedPaneController {
     panes: PaneRegistry,
     next_id: Arc<Mutex<u64>>,
+    mode: ControllerMode,
 }
 
 impl Default for EmbeddedPaneController {
@@ -77,6 +148,22 @@ impl EmbeddedPaneController {
         Self {
             panes: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(1)),
+            mode: ControllerMode::LocalDeck,
+        }
+    }
+
+    /// Build a controller whose panes are stream-backed against the daemon
+    /// at `socket_path`. Caller is responsible for ensuring the daemon is
+    /// actually running — `DaemonClient::ensure_socket_exists` is the
+    /// recommended pre-flight from `main`.
+    pub fn with_remote_deck(socket_path: PathBuf, runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            panes: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(Mutex::new(1)),
+            mode: ControllerMode::RemoteDeckLocal {
+                client: DaemonClient::new(socket_path),
+                runtime,
+            },
         }
     }
 
@@ -110,12 +197,25 @@ impl EmbeddedPaneController {
     }
 
     /// Write raw bytes directly to a pane's PTY stdin without appending CR.
-    /// Used for interactive keyboard input forwarding.
+    /// Used for interactive keyboard input forwarding. For stream-backed
+    /// panes the bytes are queued for the per-pane I/O task to forward as
+    /// `STREAM_IN` on the wire.
     pub fn write_raw_bytes(&self, pane_id: &str, bytes: &[u8]) -> Result<(), PaneError> {
         let mut panes = self.panes.lock().unwrap();
         if let Some(pane) = panes.get_mut(pane_id) {
-            pane.writer.write_all(bytes).map_err(PaneError::Io)?;
-            pane.writer.flush().map_err(PaneError::Io)?;
+            match &mut pane.backend {
+                PaneBackend::Pty(p) => {
+                    p.writer.write_all(bytes).map_err(PaneError::Io)?;
+                    p.writer.flush().map_err(PaneError::Io)?;
+                }
+                PaneBackend::Stream(s) => {
+                    if s.input_tx.send(bytes.to_vec()).is_err() {
+                        return Err(PaneError::CommandFailed(format!(
+                            "Pane {pane_id} stream I/O task ended"
+                        )));
+                    }
+                }
+            }
             Ok(())
         } else {
             Err(PaneError::CommandFailed(format!(
@@ -151,20 +251,28 @@ impl EmbeddedPaneController {
         }
     }
 
-    /// Resize a pane's PTY and VT100 parser to the given dimensions.
+    /// Resize a pane's PTY and VT100 parser to the given dimensions. For
+    /// stream-backed panes, the local vt100 parser is resized but the
+    /// daemon-side PTY is *not* — the M1.2 protocol has no resize op yet
+    /// (slated for a later milestone), so the daemon keeps its initial
+    /// rows/cols. The visual mismatch is bounded: vt100 wraps lines to the
+    /// local size and the daemon's PTY-side line wrapping shows through
+    /// only when the agent does width-aware drawing.
     pub fn resize_pane_pty(&self, pane_id: &str, rows: u16, cols: u16) -> Result<(), PaneError> {
         let panes = self.panes.lock().unwrap();
         let pane = panes
             .get(pane_id)
             .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
-        pane.master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| PaneError::CommandFailed(format!("PTY resize failed: {e}")))?;
+        if let PaneBackend::Pty(p) = &pane.backend {
+            p.master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| PaneError::CommandFailed(format!("PTY resize failed: {e}")))?;
+        }
         if let Ok(mut parser) = pane.screen.lock() {
             parser.screen_mut().set_size(rows, cols);
         }
@@ -202,6 +310,222 @@ impl EmbeddedPaneController {
         *id += 1;
         current.to_string()
     }
+
+    /// Build a PTY-backed pane (default `LocalDeck` mode). Behavior is
+    /// byte-identical to the pre-M1.3 path — extracted from `create_pane`
+    /// so the M1.3 `RemoteDeckLocal` mode can sit alongside it without
+    /// disturbing this branch.
+    fn create_local_pane(
+        &self,
+        pane_id: String,
+        command: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<String, PaneError> {
+        // Tag the spawned process so hooks can identify which pane it belongs to.
+        let env = vec![("DOT_AGENT_DECK_PANE_ID".to_string(), pane_id.clone())];
+
+        let AgentPty {
+            child,
+            master,
+            writer,
+            mut reader,
+        } = agent_pty::spawn(SpawnOptions {
+            command,
+            cwd,
+            rows: 24,
+            cols: 80,
+            env,
+        })
+        .map_err(|e| PaneError::CommandFailed(e.to_string()))?;
+
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
+        let mouse_mode = Arc::new(AtomicBool::new(false));
+        let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
+
+        // Background thread: pump PTY bytes through the shared output
+        // pipeline. Same processing path the stream-backed I/O task uses
+        // — see `process_agent_output_chunk`.
+        let parser_clone = Arc::clone(&parser);
+        let mouse_mode_clone = Arc::clone(&mouse_mode);
+        let hyperlinks_clone = Arc::clone(&hyperlinks);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut osc8 = Osc8Filter::new();
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => process_agent_output_chunk(
+                        &buf[..n],
+                        &mut osc8,
+                        &parser_clone,
+                        &mouse_mode_clone,
+                        &hyperlinks_clone,
+                    ),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let pane = Pane {
+            backend: PaneBackend::Pty(PtyBackend {
+                writer,
+                child,
+                master,
+            }),
+            screen: parser,
+            name: command.unwrap_or("shell").to_string(),
+            is_focused: false,
+            command: command.map(|c| c.to_string()),
+            mouse_mode,
+            hyperlinks,
+        };
+
+        self.panes.lock().unwrap().insert(pane_id.clone(), pane);
+
+        Ok(pane_id)
+    }
+
+    /// Build a stream-backed pane against the daemon (M1.3
+    /// `RemoteDeckLocal` mode). The PTY lives in the daemon; this side
+    /// holds an [`crate::daemon_client::AttachConnection`] and feeds the
+    /// shared vt100 parser from STREAM_OUT bytes.
+    fn create_stream_pane(
+        &self,
+        pane_id: String,
+        command: Option<&str>,
+        cwd: Option<&str>,
+        client: DaemonClient,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<String, PaneError> {
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
+        let mouse_mode = Arc::new(AtomicBool::new(false));
+        let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
+
+        // Same hook-tagging as the local path so daemon-spawned agents
+        // see DOT_AGENT_DECK_PANE_ID and can emit hook events back to
+        // this UI's pane.
+        let env = vec![("DOT_AGENT_DECK_PANE_ID".to_string(), pane_id.clone())];
+
+        let opts = StartAgentOptions {
+            command: command.map(|c| c.to_string()),
+            cwd: cwd.map(|c| c.to_string()),
+            rows: 24,
+            cols: 80,
+            env,
+        };
+
+        // Start-agent + attach happen on the daemon's runtime; we
+        // `block_on` here because `create_pane` is called from the TUI's
+        // blocking thread.
+        let daemon_path = client.socket_path().to_path_buf();
+        let client_for_calls = client.clone();
+        let (agent_id, conn) = runtime
+            .block_on(async move {
+                let id = client_for_calls.start_agent(opts).await?;
+                let conn = client_for_calls.attach(&id).await?;
+                Ok::<_, crate::daemon_client::ClientError>((id, conn))
+            })
+            .map_err(|e| PaneError::CommandFailed(format!("daemon: {e}")))?;
+
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        let parser_for_task = Arc::clone(&parser);
+        let mouse_mode_for_task = Arc::clone(&mouse_mode);
+        let hyperlinks_for_task = Arc::clone(&hyperlinks);
+
+        let io_task = runtime.spawn(async move {
+            let (mut rd, mut wr) = conn.into_split();
+
+            // Reader half: STREAM_OUT → process pipeline. Lives in its
+            // own task so output keeps flowing even if the input
+            // forwarder below is mid-`write_all`.
+            let reader_task = tokio::spawn(async move {
+                let mut osc8 = Osc8Filter::new();
+                loop {
+                    match crate::daemon_protocol::read_frame(&mut rd).await {
+                        Ok(None) => break,
+                        Ok(Some((kind, bytes))) => match kind {
+                            crate::daemon_protocol::KIND_STREAM_OUT => {
+                                process_agent_output_chunk(
+                                    &bytes,
+                                    &mut osc8,
+                                    &parser_for_task,
+                                    &mouse_mode_for_task,
+                                    &hyperlinks_for_task,
+                                );
+                            }
+                            crate::daemon_protocol::KIND_STREAM_END => break,
+                            _ => break,
+                        },
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            // Input forwarder: drain the keystroke channel and emit
+            // STREAM_IN frames. A failed write or a closed channel ends
+            // the task — the daemon observes EOF and treats it as
+            // implicit detach (the agent keeps running).
+            while let Some(bytes) = input_rx.recv().await {
+                if crate::daemon_protocol::write_frame(
+                    &mut wr,
+                    crate::daemon_protocol::KIND_STREAM_IN,
+                    &bytes,
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+
+            reader_task.abort();
+        });
+
+        let pane = Pane {
+            backend: PaneBackend::Stream(StreamBackend {
+                agent_id,
+                input_tx,
+                io_task: io_task.abort_handle(),
+                runtime,
+                daemon_path,
+            }),
+            screen: parser,
+            name: command.unwrap_or("shell").to_string(),
+            is_focused: false,
+            command: command.map(|c| c.to_string()),
+            mouse_mode,
+            hyperlinks,
+        };
+
+        self.panes.lock().unwrap().insert(pane_id.clone(), pane);
+
+        Ok(pane_id)
+    }
+}
+
+/// Write `payload` to whichever backend a pane uses. Pulled out as a free
+/// helper so `write_to_pane` can dispatch on `&mut PaneBackend` from inside
+/// the `panes` mutex without a closure that re-locks it.
+fn write_payload_to_backend(
+    backend: &mut PaneBackend,
+    payload: &[u8],
+    pane_id: &str,
+) -> Result<(), PaneError> {
+    match backend {
+        PaneBackend::Pty(p) => {
+            p.writer.write_all(payload).map_err(PaneError::Io)?;
+            p.writer.flush().map_err(PaneError::Io)?;
+        }
+        PaneBackend::Stream(s) => {
+            if s.input_tx.send(payload.to_vec()).is_err() {
+                return Err(PaneError::CommandFailed(format!(
+                    "Pane {pane_id} stream I/O task ended"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Scan PTY output bytes for mouse mode enable/disable escape sequences.
@@ -242,6 +566,63 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Feed a chunk of agent-output bytes through the OSC 8 filter, the vt100
+/// parser, and the hyperlink map. Shared between the local-PTY reader thread
+/// and the stream-backed I/O task so both backends produce identical render
+/// state from identical bytes.
+fn process_agent_output_chunk(
+    data: &[u8],
+    osc8: &mut Osc8Filter,
+    parser: &Mutex<vt100::Parser>,
+    mouse_mode: &AtomicBool,
+    hyperlinks: &Mutex<HyperlinkMap>,
+) {
+    scan_mouse_mode(data, mouse_mode);
+
+    let segments = osc8.process(data);
+    let mut new_links: Vec<(u16, String)> = Vec::new();
+    let mut scroll_amount: u16 = 0;
+
+    if let Ok(mut p) = parser.lock() {
+        let max_row = p.screen().size().0.saturating_sub(1);
+        for segment in &segments {
+            match segment {
+                Osc8Segment::Text(bytes) => {
+                    let rb = p.screen().cursor_position().0;
+                    p.process(bytes);
+                    let ra = p.screen().cursor_position().0;
+                    if rb >= max_row && ra >= max_row {
+                        let nl = bytes.iter().filter(|&&b| b == b'\n').count() as u16;
+                        scroll_amount += nl;
+                    }
+                }
+                Osc8Segment::LinkedText { url, bytes } => {
+                    let row = p.screen().cursor_position().0;
+                    let rb = row;
+                    p.process(bytes);
+                    let ra = p.screen().cursor_position().0;
+                    new_links.push((row, url.clone()));
+                    if rb >= max_row && ra >= max_row {
+                        let nl = bytes.iter().filter(|&&b| b == b'\n').count() as u16;
+                        scroll_amount += nl;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!new_links.is_empty() || scroll_amount > 0)
+        && let Ok(mut hmap) = hyperlinks.lock()
+    {
+        if scroll_amount > 0 {
+            hmap.shift_up(scroll_amount);
+        }
+        for (row, url) in &new_links {
+            hmap.set_row(*row, url);
+        }
+    }
+}
+
 impl PaneController for EmbeddedPaneController {
     fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
         let mut panes = self.panes.lock().unwrap();
@@ -264,113 +645,16 @@ impl PaneController for EmbeddedPaneController {
         // calls to revert the counter).
         let pane_id = self.allocate_id();
 
-        // Tag the spawned process so hooks can identify which pane it belongs to.
-        let env = vec![("DOT_AGENT_DECK_PANE_ID".to_string(), pane_id.clone())];
-
-        let AgentPty {
-            child,
-            master,
-            writer,
-            mut reader,
-        } = agent_pty::spawn(SpawnOptions {
-            command,
-            cwd,
-            rows: 24,
-            cols: 80,
-            env,
-        })
-        .map_err(|e| PaneError::CommandFailed(e.to_string()))?;
-
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
-        let mouse_mode = Arc::new(AtomicBool::new(false));
-        let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
-
-        // Spawn a background thread to read PTY output and feed it to the vt100 parser.
-        // Strips OSC 8 hyperlink sequences and records row → URL associations.
-        let parser_clone = Arc::clone(&parser);
-        let mouse_mode_clone = Arc::clone(&mouse_mode);
-        let hyperlinks_clone = Arc::clone(&hyperlinks);
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let mut osc8 = Osc8Filter::new();
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let data = &buf[..n];
-                        scan_mouse_mode(data, &mouse_mode_clone);
-
-                        let segments = osc8.process(data);
-                        let mut new_links: Vec<(u16, String)> = Vec::new();
-                        let mut scroll_amount: u16 = 0;
-
-                        if let Ok(mut p) = parser_clone.lock() {
-                            let max_row = p.screen().size().0.saturating_sub(1);
-                            for segment in &segments {
-                                match segment {
-                                    Osc8Segment::Text(bytes) => {
-                                        let rb = p.screen().cursor_position().0;
-                                        p.process(bytes);
-                                        let ra = p.screen().cursor_position().0;
-                                        if rb >= max_row && ra >= max_row {
-                                            let nl = bytes.iter().filter(|&&b| b == b'\n').count()
-                                                as u16;
-                                            scroll_amount += nl;
-                                        }
-                                    }
-                                    Osc8Segment::LinkedText { url, bytes } => {
-                                        // cursor_before is the row where link text starts
-                                        let row = p.screen().cursor_position().0;
-                                        let rb = row;
-                                        p.process(bytes);
-                                        let ra = p.screen().cursor_position().0;
-                                        new_links.push((row, url.clone()));
-                                        if rb >= max_row && ra >= max_row {
-                                            let nl = bytes.iter().filter(|&&b| b == b'\n').count()
-                                                as u16;
-                                            scroll_amount += nl;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // parser lock released
-
-                        if (!new_links.is_empty() || scroll_amount > 0)
-                            && let Ok(mut hmap) = hyperlinks_clone.lock()
-                        {
-                            if scroll_amount > 0 {
-                                hmap.shift_up(scroll_amount);
-                            }
-                            for (row, url) in &new_links {
-                                hmap.set_row(*row, url);
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
+        match &self.mode {
+            ControllerMode::LocalDeck => self.create_local_pane(pane_id, command, cwd),
+            ControllerMode::RemoteDeckLocal { client, runtime } => {
+                self.create_stream_pane(pane_id, command, cwd, client.clone(), runtime.clone())
             }
-        });
-
-        let pane = Pane {
-            writer,
-            screen: parser,
-            child,
-            master,
-            name: command.unwrap_or("shell").to_string(),
-            is_focused: false,
-            command: command.map(|c| c.to_string()),
-            mouse_mode,
-            hyperlinks,
-        };
-
-        self.panes.lock().unwrap().insert(pane_id.clone(), pane);
-
-        Ok(pane_id)
+        }
     }
 
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
-        let mut pane = {
+        let pane = {
             let mut panes = self.panes.lock().unwrap();
             match panes.remove(pane_id) {
                 Some(p) => p,
@@ -381,10 +665,33 @@ impl PaneController for EmbeddedPaneController {
                 }
             }
         };
-        // Kill the child process and wait for it to exit after releasing the
-        // lock so we don't hold the mutex during blocking I/O.
-        let _ = pane.child.kill();
-        let _ = pane.child.wait();
+        // Backend-specific teardown. Released the registry lock first so we
+        // don't hold the mutex across blocking child reaping or async
+        // stop-agent calls.
+        match pane.backend {
+            PaneBackend::Pty(mut p) => {
+                let _ = p.child.kill();
+                let _ = p.child.wait();
+            }
+            PaneBackend::Stream(s) => {
+                // Ctrl+W on a stream-backed pane is the explicit
+                // "kill the agent" path per PRD #76 line 220 — it must
+                // send `stop-agent` over the protocol so the daemon
+                // SIGKILLs the underlying child. Plain TUI exit takes a
+                // different path: panes are dropped, `StreamBackend::drop`
+                // aborts the I/O task, and the daemon sees the closed
+                // socket as implicit detach. Order here matters: send
+                // `stop-agent` first (over a fresh connection), then let
+                // the drop abort the I/O task. If we aborted first, the
+                // daemon would treat the dropped attach connection as a
+                // detach and the agent would survive.
+                let client = DaemonClient::new(s.daemon_path.clone());
+                let agent_id = s.agent_id.clone();
+                let _ = s.runtime.block_on(client.stop_agent(&agent_id));
+                // `s` falls out of scope here → Drop fires → io_task
+                // aborts. No explicit abort needed.
+            }
+        }
         Ok(())
     }
 
@@ -455,8 +762,7 @@ impl PaneController for EmbeddedPaneController {
             let pane = panes
                 .get_mut(pane_id)
                 .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
-            pane.writer.write_all(&payload).map_err(PaneError::Io)?;
-            pane.writer.flush().map_err(PaneError::Io)?;
+            write_payload_to_backend(&mut pane.backend, &payload, pane_id)?;
         }
         std::thread::sleep(SUBMIT_DELAY);
         {
@@ -464,8 +770,7 @@ impl PaneController for EmbeddedPaneController {
             let pane = panes
                 .get_mut(pane_id)
                 .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
-            pane.writer.write_all(b"\r").map_err(PaneError::Io)?;
-            pane.writer.flush().map_err(PaneError::Io)?;
+            write_payload_to_backend(&mut pane.backend, b"\r", pane_id)?;
         }
         Ok(())
     }

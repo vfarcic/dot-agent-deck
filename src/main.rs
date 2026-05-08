@@ -6,8 +6,11 @@ use tokio::sync::RwLock;
 
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
+use dot_agent_deck::daemon_client::DaemonClient;
+use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::hooks_manage;
+use dot_agent_deck::pane::PaneController;
 use dot_agent_deck::state::AppState;
 use dot_agent_deck::theme::Theme;
 use dot_agent_deck::ui::run_tui;
@@ -374,15 +377,38 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     let path = socket_path();
     let attach_path = attach_socket_path();
 
-    let daemon_state = state.clone();
-    let daemon_path = path.clone();
-    let daemon_attach_path = attach_path.clone();
-    let daemon_handle = tokio::spawn(async move {
-        let daemon = Daemon::with_attach(daemon_state, daemon_attach_path);
-        if let Err(e) = run_daemon_with(&daemon_path, daemon).await {
-            eprintln!("Daemon error: {e}");
+    // PRD #76, M1.3: developer-facing flag for stream-backed panes against an
+    // already-running daemon. Env (not CLI) so it doesn't show up in --help —
+    // M2.4 introduces the public `connect` subcommand. Truthy values:
+    // "1", "true", "yes" (case-insensitive).
+    let via_daemon = std::env::var("DOT_AGENT_DECK_VIA_DAEMON")
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    let daemon_handle = if via_daemon {
+        // The daemon is expected to already be running; skip the spawn.
+        // Surface a clear error if its attach socket isn't present.
+        let client = DaemonClient::new(attach_path.clone());
+        if let Err(e) = client.ensure_socket_exists() {
+            eprintln!(
+                "remote-deck-local mode: {e}\n\
+                 Start the daemon separately before running with DOT_AGENT_DECK_VIA_DAEMON=1."
+            );
+            return;
         }
-    });
+        None
+    } else {
+        let daemon_state = state.clone();
+        let daemon_path = path.clone();
+        let daemon_attach_path = attach_path.clone();
+        Some(tokio::spawn(async move {
+            let daemon = Daemon::with_attach(daemon_state, daemon_attach_path);
+            if let Err(e) = run_daemon_with(&daemon_path, daemon).await {
+                eprintln!("Daemon error: {e}");
+            }
+        }))
+    };
 
     let version_state = state.clone();
     tokio::spawn(async move {
@@ -400,7 +426,14 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     let effective_theme = cli_theme.unwrap_or(config.theme);
     // Detect terminal theme *before* raw mode / alternate screen takes over.
     let palette = dot_agent_deck::theme::resolve_palette(effective_theme);
-    let pane_controller = dot_agent_deck::pane::detect_multiplexer();
+    let pane_controller: Arc<dyn PaneController> = if via_daemon {
+        Arc::new(EmbeddedPaneController::with_remote_deck(
+            attach_path.clone(),
+            tokio::runtime::Handle::current(),
+        ))
+    } else {
+        dot_agent_deck::pane::detect_multiplexer()
+    };
     let tui_state = state.clone();
     let tui_result = tokio::task::spawn_blocking(move || {
         run_tui(
@@ -413,14 +446,17 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     })
     .await;
 
-    // TUI exited — clean up
-    daemon_handle.abort();
-
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
-    }
-    if attach_path.exists() {
-        let _ = std::fs::remove_file(&attach_path);
+    // TUI exited — clean up. In remote-deck-local mode the daemon was not
+    // spawned by us, so we don't abort it and we don't unlink its sockets
+    // (PRD #76 line 199 — agents survive TUI exit).
+    if let Some(handle) = daemon_handle {
+        handle.abort();
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        if attach_path.exists() {
+            let _ = std::fs::remove_file(&attach_path);
+        }
     }
 
     if let Err(e) = tui_result {
