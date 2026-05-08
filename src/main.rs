@@ -4,6 +4,7 @@ use std::sync::Arc;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
+use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, DOT_AGENT_DECK_VIA_DAEMON};
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::DaemonClient;
@@ -244,7 +245,7 @@ fn main() -> ExitCode {
             dot_agent_deck::watch::run_watch(interval, &command)
         }
         Some(Commands::Delegate { task, to }) => {
-            let pane_id = match std::env::var("DOT_AGENT_DECK_PANE_ID") {
+            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
                 Err(_) => {
                     eprintln!(
@@ -278,7 +279,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(Commands::WorkDone { task, done }) => {
-            let pane_id = match std::env::var("DOT_AGENT_DECK_PANE_ID") {
+            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
                 Err(_) => {
                     eprintln!(
@@ -381,7 +382,7 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     // already-running daemon. Env (not CLI) so it doesn't show up in --help —
     // M2.4 introduces the public `connect` subcommand. Truthy values:
     // "1", "true", "yes" (case-insensitive).
-    let via_daemon = std::env::var("DOT_AGENT_DECK_VIA_DAEMON")
+    let via_daemon = std::env::var(DOT_AGENT_DECK_VIA_DAEMON)
         .ok()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);

@@ -8,7 +8,7 @@ use portable_pty::PtySize;
 
 use std::any::Any;
 
-use crate::agent_pty::{self, AgentPty, SpawnOptions};
+use crate::agent_pty::{self, AgentPty, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use crate::daemon_client::{DaemonClient, StartAgentOptions};
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
 use crate::pane::{PaneController, PaneDirection, PaneError, PaneInfo};
@@ -322,7 +322,7 @@ impl EmbeddedPaneController {
         cwd: Option<&str>,
     ) -> Result<String, PaneError> {
         // Tag the spawned process so hooks can identify which pane it belongs to.
-        let env = vec![("DOT_AGENT_DECK_PANE_ID".to_string(), pane_id.clone())];
+        let env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
 
         let AgentPty {
             child,
@@ -404,7 +404,7 @@ impl EmbeddedPaneController {
         // Same hook-tagging as the local path so daemon-spawned agents
         // see DOT_AGENT_DECK_PANE_ID and can emit hook events back to
         // this UI's pane.
-        let env = vec![("DOT_AGENT_DECK_PANE_ID".to_string(), pane_id.clone())];
+        let env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
 
         let opts = StartAgentOptions {
             command: command.map(|c| c.to_string()),

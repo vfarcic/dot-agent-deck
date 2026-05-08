@@ -14,6 +14,19 @@ use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
+/// Trigger flag the deck client honors to mean "the daemon is already
+/// running; attach over its stream socket instead of spawning one." The
+/// read site (in `main.rs`) and the scrub site (in [`spawn`] below) share
+/// this constant so two string literals can't drift apart.
+pub const DOT_AGENT_DECK_VIA_DAEMON: &str = "DOT_AGENT_DECK_VIA_DAEMON";
+
+/// Per-pane id the TUI injects into agent children so hooks running inside
+/// the agent (or anything that shells out via `dot-agent-deck`) can route
+/// events back to the originating pane. Defined here for the same
+/// drift-safety reason as [`DOT_AGENT_DECK_VIA_DAEMON`], and so the daemon
+/// scrub site below can reference it by name.
+pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
+
 #[derive(Debug, Error)]
 pub enum AgentPtyError {
     #[error("Failed to open PTY: {0}")]
@@ -187,17 +200,25 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     if let Some(dir) = opts.cwd {
         cmd.cwd(dir);
     }
+
+    // Scrub deck-internal env vars from the inherited base *before* applying
+    // `opts.env`, so an explicit caller-supplied value (e.g. embedded_pane
+    // injecting the pane's own `DOT_AGENT_DECK_PANE_ID`) wins over a stale
+    // inherited one. Inheritance is the default for `CommandBuilder`, so
+    // without these explicit unsets the daemon's own environment leaks into
+    // every agent it spawns:
+    //   - `DOT_AGENT_DECK_VIA_DAEMON`: a developer who launched the daemon
+    //     with this set would have every agent shell-out to `dot-agent-deck`
+    //     itself try to act as a stream client.
+    //   - `DOT_AGENT_DECK_PANE_ID`: the daemon may have been launched as a
+    //     child of an existing deck pane, in which case its inherited
+    //     pane-id would tag every spawned agent with the wrong pane.
+    cmd.env_remove(DOT_AGENT_DECK_VIA_DAEMON);
+    cmd.env_remove(DOT_AGENT_DECK_PANE_ID);
+
     for (k, v) in &opts.env {
         cmd.env(k, v);
     }
-
-    // Scrub the remote-deck-local trigger so an agent process that happens to
-    // shell out to `dot-agent-deck` does not itself try to act as a stream
-    // client. Inheritance is the default for `CommandBuilder`, so without
-    // this an explicit unset is required — the daemon may have been launched
-    // with `DOT_AGENT_DECK_VIA_DAEMON=1` set in its own environment (e.g. a
-    // developer running `cargo run` then the deck client).
-    cmd.env_remove("DOT_AGENT_DECK_VIA_DAEMON");
 
     let child = pair
         .slave
@@ -678,7 +699,7 @@ mod tests {
         // child exits 99 instead of 42 and the assertion below fires.
         let pty = spawn(SpawnOptions {
             command: Some("sh -c 'exit ${DOT_AGENT_DECK_PANE_ID:-99}'"),
-            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), "42".into())],
+            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), "42".into())],
             ..SpawnOptions::default()
         })
         .expect("spawn should succeed");
@@ -708,9 +729,9 @@ mod tests {
         // SAFETY: tests in this module are serialized by ENV_TEST_LOCK and
         // we restore the prior value before releasing the lock, so the
         // process-global env mutation is invisible to other tests.
-        let prior = std::env::var("DOT_AGENT_DECK_VIA_DAEMON").ok();
+        let prior = std::env::var(DOT_AGENT_DECK_VIA_DAEMON).ok();
         unsafe {
-            std::env::set_var("DOT_AGENT_DECK_VIA_DAEMON", "1");
+            std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, "1");
         }
 
         // Child exits 0 if the var is absent (the default branch of the
@@ -727,8 +748,8 @@ mod tests {
         // leak the var into subsequent tests within the same process.
         unsafe {
             match prior {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_VIA_DAEMON", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_VIA_DAEMON"),
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_VIA_DAEMON),
             }
         }
 
@@ -736,6 +757,83 @@ mod tests {
             status.exit_code(),
             0,
             "child saw DOT_AGENT_DECK_VIA_DAEMON — agent_pty::spawn must scrub it"
+        );
+    }
+
+    #[test]
+    fn spawn_scrubs_pane_id_env_from_child() {
+        // Mirror of the VIA_DAEMON scrub test for PANE_ID. The footgun: a
+        // daemon spawned as a child of an existing deck pane would inherit
+        // that pane's id and tag every agent it later spawns with the wrong
+        // pane (so hooks would route events to the wrong tab).
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
+        // before the lock is released.
+        let prior = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
+        unsafe {
+            std::env::set_var(DOT_AGENT_DECK_PANE_ID, "stale-pane");
+        }
+
+        // Spawn without setting PANE_ID via opts.env — the child must not
+        // observe the inherited value. Exit 0 if absent, 1 if inherited.
+        let pty = spawn(SpawnOptions {
+            command: Some("sh -c 'exit ${DOT_AGENT_DECK_PANE_ID:+1}'"),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+        let mut child = pty.child;
+        let status = child.wait().expect("wait should succeed");
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_PANE_ID, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_PANE_ID),
+            }
+        }
+
+        assert_eq!(
+            status.exit_code(),
+            0,
+            "child saw inherited DOT_AGENT_DECK_PANE_ID — agent_pty::spawn must scrub it"
+        );
+    }
+
+    #[test]
+    fn spawn_opts_env_overrides_pane_id_scrub() {
+        // The scrub must not clobber a deliberately-supplied PANE_ID via
+        // opts.env — embedded_pane relies on this so daemon-spawned agents
+        // get tagged with the right pane id even when the daemon's own env
+        // happens to carry a stale one.
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
+        // before the lock is released.
+        let prior = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
+        unsafe {
+            std::env::set_var(DOT_AGENT_DECK_PANE_ID, "stale-pane");
+        }
+
+        let pty = spawn(SpawnOptions {
+            command: Some("sh -c 'exit ${DOT_AGENT_DECK_PANE_ID:-99}'"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), "42".into())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+        let mut child = pty.child;
+        let status = child.wait().expect("wait should succeed");
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_PANE_ID, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_PANE_ID),
+            }
+        }
+
+        assert_eq!(
+            status.exit_code(),
+            42,
+            "opts.env PANE_ID was clobbered — scrub must run before opts.env is applied"
         );
     }
 }
