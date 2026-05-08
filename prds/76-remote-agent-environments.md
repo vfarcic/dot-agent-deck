@@ -210,8 +210,8 @@ The TUI (`src/ui.rs`, `src/state.rs`) gains a remote-deck mode where panes are n
 ### Phase 0: Test environment and requirements doc
 
 - [x] **M0.1** — Draft `docs/remote-requirements.md` from scratch based on what the daemon will need (best guess; will be refined as M1+ exposes real requirements).
-- [ ] **M0.2** — Maintainer provisions a personal dev/test VM by following the draft requirements doc end-to-end. **Not** committed to the repo. Anything that had to be done out-of-band is a docs gap to fix.
-- [ ] **M0.3** — Refine the requirements doc until a clean re-provision works without consulting any other source.
+- [x] **M0.2** — Maintainer provisions a personal dev/test VM by following the draft requirements doc end-to-end. **Not** committed to the repo. Anything that had to be done out-of-band is a docs gap to fix.
+- [x] **M0.3** — Refine the requirements doc until a clean re-provision works without consulting any other source.
 
 ### Phase 1: Daemon owns PTYs (local-only)
 
