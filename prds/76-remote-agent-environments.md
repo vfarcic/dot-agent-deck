@@ -221,7 +221,7 @@ The TUI (`src/ui.rs`, `src/state.rs`) gains a remote-deck mode where panes are n
 
 ### Phase 2: ssh transport (MVP remote)
 
-- [ ] **M2.1** — `dot-agent-deck daemon attach` subcommand: speaks the protocol over stdio.
+- [x] **M2.1** — `dot-agent-deck daemon attach` subcommand: speaks the protocol over stdio.
 - [ ] **M2.2** — `remote add --type=ssh` command: verifies ssh, installs binary on the remote, runs `hooks install`, writes registry entry.
 - [ ] **M2.3** — `remote list`, `remote remove`, `remote upgrade` commands.
 - [ ] **M2.4** — `connect [name]` command: picker, ssh exec into the daemon, viewer attaches.
