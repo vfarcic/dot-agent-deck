@@ -170,31 +170,41 @@ async fn stream_pane_keystrokes_reach_agent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_controller_detaches_but_agent_survives() {
     let server = start_server().await;
-    let ctrl = EmbeddedPaneController::with_remote_deck(
-        server.path.clone(),
-        tokio::runtime::Handle::current(),
-    );
 
-    // Start a long-running agent so we can observe its survival after
-    // the controller drops.
-    tokio::task::spawn_blocking({
+    // Start a long-running agent on a blocking thread (`create_pane`
+    // `block_on`s the daemon client). Hand the controller back out of the
+    // closure rather than dropping it inside, so we can capture the
+    // agent's PID *before* the deliberate drop below.
+    let ctrl = tokio::task::spawn_blocking({
         let server_path = server.path.clone();
         let runtime = tokio::runtime::Handle::current();
-        move || {
+        move || -> EmbeddedPaneController {
             let ctrl = EmbeddedPaneController::with_remote_deck(server_path, runtime);
             ctrl.create_pane(Some("sh -c 'sleep 30'"), None).unwrap();
-            // Drop ctrl explicitly to simulate TUI exit while agent runs.
-            drop(ctrl);
+            ctrl
         }
     })
     .await
     .unwrap();
 
-    // Also drop the outer ctrl to be doubly explicit.
+    // Capture the agent's OS-level PID before dropping the controller. A
+    // regression that killed the daemon-side child while leaving the
+    // registry entry intact would slip past a registry-only assertion —
+    // the same flaw pattern that the M1.2 `slow_client` test was rewritten
+    // to catch.
+    let agent_ids = server.registry.agent_ids();
+    assert_eq!(agent_ids.len(), 1, "exactly one daemon-side agent expected");
+    let pid = server
+        .registry
+        .child_pid(&agent_ids[0])
+        .expect("daemon-side child should expose a pid");
+
+    // Simulate TUI exit. Drop closes the attach socket but does NOT issue
+    // stop-agent; the daemon must treat the close as implicit detach (PRD
+    // #76 line 199 — agents survive the viewer).
     drop(ctrl);
 
-    // Survival property (PRD #76 line 199): the daemon-side registry still
-    // owns the agent after the TUI viewer exits. Allow a brief settle.
+    // Survival property: the daemon-side registry still owns the agent.
     let registry_alive = wait_for(
         Duration::from_millis(500),
         Duration::from_millis(20),
@@ -204,6 +214,18 @@ async fn dropping_controller_detaches_but_agent_survives() {
     assert!(
         registry_alive,
         "daemon-side agent must outlive the TUI controller (M1.3 survival property)"
+    );
+
+    // Registry membership is necessary but not sufficient — assert the
+    // child is still alive at the OS level. `kill(pid, 0)` is the standard
+    // existence check: returns 0 if the process is alive, -1/ESRCH if the
+    // kernel has reaped it.
+    let kill_rc = unsafe { libc::kill(pid as i32, 0) };
+    assert_eq!(
+        kill_rc,
+        0,
+        "pid {pid} must still be alive after controller drop (errno={:?})",
+        std::io::Error::last_os_error().raw_os_error()
     );
 
     // Cleanup so the test doesn't leak the `sleep 30` child past test exit.
@@ -231,6 +253,14 @@ async fn close_pane_stops_agent_in_daemon() {
 
     assert_eq!(server.registry.len(), 1);
 
+    // Capture the agent's OS-level PID before issuing close so we can
+    // assert it actually dies, not just that the registry entry vanishes.
+    let agent_ids = server.registry.agent_ids();
+    let pid = server
+        .registry
+        .child_pid(&agent_ids[0])
+        .expect("daemon-side child should expose a pid");
+
     // close_pane on a stream-backed pane sends `stop-agent` over the protocol.
     // This is the Ctrl+W path and the only way an agent should be killed by
     // the controller (as opposed to a plain detach on TUI exit).
@@ -248,5 +278,66 @@ async fn close_pane_stops_agent_in_daemon() {
     assert!(
         stopped,
         "Ctrl+W on a stream-backed pane must issue stop-agent — registry should empty"
+    );
+
+    // Symmetry with `dropping_controller_detaches_but_agent_survives`:
+    // assert OS-level death, not just registry absence. `force_kill_child_and_wait`
+    // SIGKILLs and `wait()`s before the registry entry is dropped, so the
+    // kernel has already reaped the child by the time we see is_empty()
+    // — kill(pid, 0) should immediately report ESRCH.
+    let kill_rc = unsafe { libc::kill(pid as i32, 0) };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!(
+        kill_rc, -1,
+        "pid {pid} should be dead after stop-agent (got rc={kill_rc})"
+    );
+    assert_eq!(
+        errno,
+        Some(libc::ESRCH),
+        "pid {pid} should report ESRCH after stop-agent (got errno={errno:?})"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_pane_surfaces_stop_agent_error() {
+    // Inject a `stop-agent` failure by tearing down the daemon between
+    // attach and Ctrl+W. The close path must surface the error rather
+    // than silently degrade to detach (which would leak the agent on the
+    // remote with no signal to the user).
+    let server = start_server().await;
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let pane_id = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane(Some("sh -c 'sleep 30'"), None).unwrap()
+        })
+        .await
+        .unwrap()
+    };
+
+    // Tear down the daemon: aborts the listener task and deletes the
+    // socket file via the TempDir's Drop. A subsequent `connect` from
+    // close_pane's stop-agent call will fail with ENOENT/ECONNREFUSED.
+    drop(server);
+
+    let ctrl_for_close = ctrl.clone();
+    let pane_id_for_close = pane_id.clone();
+    let result = tokio::task::spawn_blocking(move || ctrl_for_close.close_pane(&pane_id_for_close))
+        .await
+        .unwrap();
+
+    assert!(
+        result.is_err(),
+        "close_pane on a stream-backed pane must return Err when stop-agent fails — got Ok (silent degrade to detach)"
+    );
+
+    // The pane is retained on failure so the user can retry Ctrl+W.
+    assert!(
+        ctrl.pane_ids().contains(&pane_id),
+        "failed close should leave the pane in the registry for retry"
     );
 }

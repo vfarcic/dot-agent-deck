@@ -436,10 +436,8 @@ impl EmbeddedPaneController {
         let io_task = runtime.spawn(async move {
             let (mut rd, mut wr) = conn.into_split();
 
-            // Reader half: STREAM_OUT → process pipeline. Lives in its
-            // own task so output keeps flowing even if the input
-            // forwarder below is mid-`write_all`.
-            let reader_task = tokio::spawn(async move {
+            // Reader half: STREAM_OUT → process pipeline.
+            let reader = async {
                 let mut osc8 = Osc8Filter::new();
                 loop {
                     match crate::daemon_protocol::read_frame(&mut rd).await {
@@ -460,26 +458,39 @@ impl EmbeddedPaneController {
                         Err(_) => break,
                     }
                 }
-            });
+            };
 
             // Input forwarder: drain the keystroke channel and emit
             // STREAM_IN frames. A failed write or a closed channel ends
             // the task — the daemon observes EOF and treats it as
             // implicit detach (the agent keeps running).
-            while let Some(bytes) = input_rx.recv().await {
-                if crate::daemon_protocol::write_frame(
-                    &mut wr,
-                    crate::daemon_protocol::KIND_STREAM_IN,
-                    &bytes,
-                )
-                .await
-                .is_err()
-                {
-                    break;
+            let writer = async {
+                while let Some(bytes) = input_rx.recv().await {
+                    if crate::daemon_protocol::write_frame(
+                        &mut wr,
+                        crate::daemon_protocol::KIND_STREAM_IN,
+                        &bytes,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
                 }
-            }
+            };
 
-            reader_task.abort();
+            // `select!` ensures whichever half completes first takes the
+            // other down with it: the inactive future is cancelled and
+            // both `rd` and `wr` go out of scope here, releasing the
+            // socket FD deterministically. Without this, a STREAM_END
+            // from the daemon would end the reader but leave the writer
+            // parked on `input_rx.recv()` indefinitely, holding the
+            // socket open until the StreamBackend itself was dropped.
+            tokio::pin!(reader, writer);
+            tokio::select! {
+                _ = &mut reader => {},
+                _ = &mut writer => {},
+            }
         });
 
         let pane = Pane {
@@ -654,6 +665,11 @@ impl PaneController for EmbeddedPaneController {
     }
 
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+        // Hold the registry lock across the whole close so a stop-agent
+        // failure can leave the pane in place for the user to retry. The
+        // backend teardown (blocking child reap or async stop-agent) is
+        // performed without the lock by detaching the pane first and only
+        // re-inserting on the failure path.
         let pane = {
             let mut panes = self.panes.lock().unwrap();
             match panes.remove(pane_id) {
@@ -665,13 +681,11 @@ impl PaneController for EmbeddedPaneController {
                 }
             }
         };
-        // Backend-specific teardown. Released the registry lock first so we
-        // don't hold the mutex across blocking child reaping or async
-        // stop-agent calls.
         match pane.backend {
             PaneBackend::Pty(mut p) => {
                 let _ = p.child.kill();
                 let _ = p.child.wait();
+                Ok(())
             }
             PaneBackend::Stream(s) => {
                 // Ctrl+W on a stream-backed pane is the explicit
@@ -687,12 +701,44 @@ impl PaneController for EmbeddedPaneController {
                 // detach and the agent would survive.
                 let client = DaemonClient::new(s.daemon_path.clone());
                 let agent_id = s.agent_id.clone();
-                let _ = s.runtime.block_on(client.stop_agent(&agent_id));
-                // `s` falls out of scope here → Drop fires → io_task
-                // aborts. No explicit abort needed.
+                match s.runtime.block_on(client.stop_agent(&agent_id)) {
+                    Ok(()) => {
+                        // Drop `s` → io_task aborts. No explicit abort needed.
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Don't silently degrade to detach: a swallowed
+                        // stop-agent error would close the socket, the
+                        // daemon would treat the close as implicit detach,
+                        // and the agent would survive on the remote with
+                        // no signal to the user. Re-insert the pane so a
+                        // retry remains possible (the io_task is still
+                        // alive at this point — `s` has not been dropped).
+                        tracing::error!(
+                            agent_id = %agent_id,
+                            error = %e,
+                            "stop-agent failed during Ctrl+W close — pane retained for retry"
+                        );
+                        let restored = Pane {
+                            backend: PaneBackend::Stream(s),
+                            screen: pane.screen,
+                            name: pane.name,
+                            is_focused: pane.is_focused,
+                            command: pane.command,
+                            mouse_mode: pane.mouse_mode,
+                            hyperlinks: pane.hyperlinks,
+                        };
+                        self.panes
+                            .lock()
+                            .unwrap()
+                            .insert(pane_id.to_string(), restored);
+                        Err(PaneError::CommandFailed(format!(
+                            "stop-agent failed for pane {pane_id}: {e}"
+                        )))
+                    }
+                }
             }
         }
-        Ok(())
     }
 
     fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError> {

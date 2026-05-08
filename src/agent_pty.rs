@@ -191,6 +191,14 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
         cmd.env(k, v);
     }
 
+    // Scrub the remote-deck-local trigger so an agent process that happens to
+    // shell out to `dot-agent-deck` does not itself try to act as a stream
+    // client. Inheritance is the default for `CommandBuilder`, so without
+    // this an explicit unset is required — the daemon may have been launched
+    // with `DOT_AGENT_DECK_VIA_DAEMON=1` set in its own environment (e.g. a
+    // developer running `cargo run` then the deck client).
+    cmd.env_remove("DOT_AGENT_DECK_VIA_DAEMON");
+
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -466,6 +474,16 @@ impl AgentPtyRegistry {
         inner.agents.get(id).map(|a| a.bus.receiver_count())
     }
 
+    /// OS-level PID of the agent's child process, if exposed by the
+    /// underlying PTY layer. Used by tests to verify actual process
+    /// liveness (`kill(pid, 0)`) rather than just registry membership —
+    /// catches regressions where the child is killed but the registry
+    /// entry survives, or vice versa.
+    pub fn child_pid(&self, id: &str) -> Option<u32> {
+        let inner = self.inner.lock().unwrap();
+        inner.agents.get(id).and_then(|a| a.child.process_id())
+    }
+
     /// All currently-owned agent ids, sorted ascending.
     pub fn agent_ids(&self) -> Vec<String> {
         let inner = self.inner.lock().unwrap();
@@ -670,6 +688,54 @@ mod tests {
             status.exit_code(),
             42,
             "child did not see DOT_AGENT_DECK_PANE_ID env var"
+        );
+    }
+
+    /// Test mutex covering temporary process-env mutation. `std::env::set_var`
+    /// is process-global, so any test that pokes at the environment must run
+    /// serialized to avoid leaking the value into a sibling test's spawn.
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn spawn_scrubs_via_daemon_env_from_child() {
+        // Set the var on the parent process, then spawn — the child must NOT
+        // see it (this protects against the inheritance footgun where a
+        // daemon launched with DOT_AGENT_DECK_VIA_DAEMON=1 hands the flag to
+        // every agent it spawns, so an agent that shells out to
+        // `dot-agent-deck` would itself try to act as a stream client).
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // SAFETY: tests in this module are serialized by ENV_TEST_LOCK and
+        // we restore the prior value before releasing the lock, so the
+        // process-global env mutation is invisible to other tests.
+        let prior = std::env::var("DOT_AGENT_DECK_VIA_DAEMON").ok();
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_VIA_DAEMON", "1");
+        }
+
+        // Child exits 0 if the var is absent (the default branch of the
+        // `${VAR:+...}` form); 1 if it inherited the value from the parent.
+        let pty = spawn(SpawnOptions {
+            command: Some("sh -c 'exit ${DOT_AGENT_DECK_VIA_DAEMON:+1}'"),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+        let mut child = pty.child;
+        let status = child.wait().expect("wait should succeed");
+
+        // Restore the prior env state before asserting so a failure doesn't
+        // leak the var into subsequent tests within the same process.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_VIA_DAEMON", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_VIA_DAEMON"),
+            }
+        }
+
+        assert_eq!(
+            status.exit_code(),
+            0,
+            "child saw DOT_AGENT_DECK_VIA_DAEMON — agent_pty::spawn must scrub it"
         );
     }
 }
