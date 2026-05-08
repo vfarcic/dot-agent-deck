@@ -45,26 +45,26 @@ Context handoff (CRITICAL): every worker cold-starts with NO memory of prior con
 
 [[orchestrations.roles]]
 name = "coder"
-command = "devbox run agent-big"
+command = "devbox run agent-orchestrator"
 # command = "devbox run oc-coder"
 description = "Implements features, fixes bugs, refactors code"
 prompt_template = "Implement the requested change. If the task references a PRD path under prds/, read it first. Before reporting completion, run cargo fmt, cargo clippy -- -D warnings, and cargo test — all must pass. If critical context is missing from the task description, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
 
 [[orchestrations.roles]]
 name = "reviewer"
-command = "devbox run oc-reviewer"
+command = "devbox run agent-reviewer"
 description = "Reviews code changes for correctness, style, and edge cases"
 prompt_template = "Review the change. Report findings only — do not modify code. Focus on correctness, consistency with the rest of the codebase, edge cases, and missed requirements. If the task references a PRD path, verify the implementation matches it. If critical context is missing (e.g. the diff or PRD path), surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
 
 [[orchestrations.roles]]
 name = "auditor"
-command = "devbox run oc-auditor"
+command = "devbox run agent-auditor"
 description = "Audits code for security vulnerabilities and unsafe patterns"
 prompt_template = "Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
 
 [[orchestrations.roles]]
 name = "release"
-command = "devbox run agent-small"
+command = "devbox run agent-release"
 # command = "devbox run oc-release"
 clear = false
 description = "Runs the project's release flow (/prd-done) after coder/reviewer/auditor work is complete and the user has validated end-to-end behavior. Never modifies source code."
