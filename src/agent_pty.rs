@@ -6,11 +6,13 @@
 //! trapped inside the TUI path. The daemon piece is the foundation for Phase 1
 //! (M1.2 streaming attach protocol) — see PRD #76 lines 140–146.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, VecDeque};
+use std::io::Read as _;
+use std::sync::{Arc, Mutex};
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use thiserror::Error;
+use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
 #[derive(Debug, Error)]
 pub enum AgentPtyError {
@@ -221,16 +223,136 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     })
 }
 
-/// In-process registry of agent PTYs owned by the daemon. M1.1 only exposes
-/// the in-process API; the wire protocol that drives it (`start-agent`,
-/// `stop-agent`, `attach-stream`, …) lands in M1.2.
+/// Cap on the per-agent scrollback buffer (bytes). Keeps reattach affordable
+/// without unbounded memory growth — when a fresh client subscribes, the
+/// daemon emits this many recent bytes as the initial render before live
+/// output resumes. 1 MiB comfortably covers a typical TUI screen plus a few
+/// scrollback pages; the policy is "ring buffer, evict oldest on overflow".
+const SCROLLBACK_CAP_BYTES: usize = 1024 * 1024;
+
+/// Capacity of the per-agent broadcast channel for live PTY output. Lossy
+/// by design (tokio broadcast semantics) — a slow subscriber that lags past
+/// this many messages observes `RecvError::Lagged` and is disconnected by
+/// the protocol layer (the client can reattach and replay the snapshot).
+const BROADCAST_CAPACITY: usize = 4096;
+
+/// Per-agent broadcast bus. Producers (the reader thread) atomically append
+/// to scrollback and publish to subscribers under the same lock so a fresh
+/// subscriber's `(snapshot, receiver)` is always consistent: the snapshot
+/// covers everything written before the subscriber attached, and the
+/// receiver delivers everything written after — no duplicates, no gaps.
+pub struct AgentBus {
+    tx: broadcast::Sender<Arc<Vec<u8>>>,
+    state: Mutex<AgentBusState>,
+}
+
+struct AgentBusState {
+    scrollback: VecDeque<u8>,
+}
+
+impl Default for AgentBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AgentBus {
+    pub fn new() -> Self {
+        let (tx, _rx0) = broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            tx,
+            state: Mutex::new(AgentBusState {
+                scrollback: VecDeque::new(),
+            }),
+        }
+    }
+
+    /// Append bytes to scrollback and publish to subscribers. Held under the
+    /// same lock that subscribers use to take their initial snapshot, so a
+    /// concurrent `subscribe` can never split a write between snapshot and
+    /// live receiver.
+    fn push(&self, data: Vec<u8>) {
+        let arc = Arc::new(data);
+        let mut state = self.state.lock().unwrap();
+        for &b in arc.iter() {
+            state.scrollback.push_back(b);
+        }
+        while state.scrollback.len() > SCROLLBACK_CAP_BYTES {
+            state.scrollback.pop_front();
+        }
+        // Lossy on purpose: we don't block the reader thread on slow
+        // subscribers. `send` returns Err only when there are zero
+        // receivers, which is fine — scrollback still has the bytes.
+        let _ = self.tx.send(arc);
+    }
+
+    /// Atomically take the current scrollback snapshot and a receiver
+    /// positioned just past it. See type-level docs for the consistency
+    /// guarantee.
+    pub fn subscribe(&self) -> (Vec<u8>, broadcast::Receiver<Arc<Vec<u8>>>) {
+        let state = self.state.lock().unwrap();
+        let snapshot: Vec<u8> = state.scrollback.iter().copied().collect();
+        let rx = self.tx.subscribe();
+        drop(state);
+        (snapshot, rx)
+    }
+
+    /// Take just the scrollback snapshot, no subscription.
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.state
+            .lock()
+            .unwrap()
+            .scrollback
+            .iter()
+            .copied()
+            .collect()
+    }
+}
+
+/// Reader-thread loop: pull bytes from the PTY master and publish them to
+/// the bus. Exits cleanly when the PTY returns EOF (the child was killed or
+/// otherwise terminated). The thread is detached — `RunningAgent` does not
+/// hold a `JoinHandle` for it because shutdown is driven entirely by closing
+/// the PTY (see `AgentPtyRegistry::close_agent`).
+fn pump_reader(mut reader: Box<dyn std::io::Read + Send>, bus: Arc<AgentBus>) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => bus.push(buf[..n].to_vec()),
+            Err(_) => break,
+        }
+    }
+}
+
+/// Snapshot of the writer + bus needed to attach a streaming client.
+/// Returned by [`AgentPtyRegistry::subscribe`].
+pub struct AttachHandle {
+    pub snapshot: Vec<u8>,
+    pub rx: broadcast::Receiver<Arc<Vec<u8>>>,
+    pub writer: Arc<AsyncMutex<Box<dyn std::io::Write + Send>>>,
+}
+
+/// One agent owned by the registry: child + master + shared writer + bus.
+/// Field names are stable — tests and tooling that peek into the registry
+/// (e.g. for `process_id()`) rely on `child` existing here.
+pub struct RunningAgent {
+    pub child: Box<dyn portable_pty::Child + Send + Sync>,
+    pub master: Box<dyn portable_pty::MasterPty + Send>,
+    pub writer: Arc<AsyncMutex<Box<dyn std::io::Write + Send>>>,
+    pub bus: Arc<AgentBus>,
+}
+
+/// In-process registry of agent PTYs owned by the daemon. M1.1 only exposed
+/// the in-process API; M1.2 wires it to the streaming attach protocol via
+/// [`AgentBus`] and [`AttachHandle`].
 pub struct AgentPtyRegistry {
     inner: Mutex<RegistryInner>,
 }
 
 struct RegistryInner {
     next_id: u64,
-    agents: HashMap<String, AgentPty>,
+    agents: HashMap<String, RunningAgent>,
 }
 
 impl Default for AgentPtyRegistry {
@@ -260,23 +382,73 @@ impl AgentPtyRegistry {
         // (`AgentPty` has no `Drop`).
         let guard = PtyGuard::new(spawn(opts)?);
         let mut inner = self.inner.lock().unwrap();
+
+        let pty = guard.take();
+        let AgentPty {
+            child,
+            master,
+            writer,
+            reader,
+        } = pty;
+
+        let bus = Arc::new(AgentBus::new());
+        let bus_for_thread = bus.clone();
+        // Detached thread: exits when the PTY returns EOF (child killed).
+        std::thread::spawn(move || pump_reader(reader, bus_for_thread));
+
+        let agent = RunningAgent {
+            child,
+            master,
+            writer: Arc::new(AsyncMutex::new(writer)),
+            bus,
+        };
+
         let id = inner.next_id.to_string();
         inner.next_id += 1;
-        inner.agents.insert(id.clone(), guard.take());
+        inner.agents.insert(id.clone(), agent);
         Ok(id)
     }
 
-    /// Stop an agent: SIGKILL the child, reap it, drop its handles.
+    /// Stop an agent: SIGKILL the child, reap it, drop its handles. Any
+    /// streaming subscribers will observe their broadcast receiver close
+    /// shortly after (once the reader thread sees EOF and drops its bus
+    /// reference).
     pub fn close_agent(&self, id: &str) -> Result<(), AgentPtyError> {
-        let mut pty = {
+        let mut agent = {
             let mut inner = self.inner.lock().unwrap();
             inner
                 .agents
                 .remove(id)
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?
         };
-        force_kill_and_wait(&mut pty);
+        force_kill_child_and_wait(&mut agent.child);
         Ok(())
+    }
+
+    /// Subscribe to an agent's live output and take its scrollback snapshot
+    /// in one atomic step. Used by the attach protocol handler.
+    pub fn subscribe(&self, id: &str) -> Result<AttachHandle, AgentPtyError> {
+        let inner = self.inner.lock().unwrap();
+        let agent = inner
+            .agents
+            .get(id)
+            .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+        let (snapshot, rx) = agent.bus.subscribe();
+        Ok(AttachHandle {
+            snapshot,
+            rx,
+            writer: agent.writer.clone(),
+        })
+    }
+
+    /// Take just the current scrollback snapshot for an agent.
+    pub fn snapshot(&self, id: &str) -> Result<Vec<u8>, AgentPtyError> {
+        let inner = self.inner.lock().unwrap();
+        let agent = inner
+            .agents
+            .get(id)
+            .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+        Ok(agent.bus.snapshot())
     }
 
     /// All currently-owned agent ids, sorted ascending.
@@ -298,12 +470,12 @@ impl AgentPtyRegistry {
 
     /// SIGKILL every agent and drain the registry. Idempotent.
     pub fn shutdown_all(&self) {
-        let agents: Vec<AgentPty> = {
+        let agents: Vec<RunningAgent> = {
             let mut inner = self.inner.lock().unwrap();
-            inner.agents.drain().map(|(_, pty)| pty).collect()
+            inner.agents.drain().map(|(_, a)| a).collect()
         };
-        for mut pty in agents {
-            force_kill_and_wait(&mut pty);
+        for mut agent in agents {
+            force_kill_child_and_wait(&mut agent.child);
         }
     }
 }
