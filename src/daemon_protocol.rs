@@ -58,6 +58,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -83,18 +84,39 @@ pub const KIND_DETACH: u8 = 0x13;
 /// 16 MiB is well above any reasonable PTY chunk or scrollback snapshot.
 const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
+/// Bounded timeout for a single STREAM_OUT/STREAM_END write to a client. If
+/// a client stops draining its socket, the OS send buffer fills and our
+/// `write_all` blocks forever — which would also block lag detection (we
+/// can't drain the broadcast receiver). With a per-write timeout, a wedged
+/// client is dropped within this many seconds instead of pinning the output
+/// task. 5s is a generous upper bound for "client can't accept a frame";
+/// the client can reattach and replay scrollback.
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------
 // Wire I/O
 // ---------------------------------------------------------------------------
 
 /// Read a single frame. Returns `Ok(None)` on clean EOF before any header
-/// bytes have been read (peer closed the connection).
+/// bytes have been read (peer closed the connection cleanly between frames).
+/// EOF *after* one or more header bytes is a truncated frame and returns
+/// `Err(UnexpectedEof)` — the peer closed mid-header. Likewise EOF inside
+/// the payload returns an error via `read_exact`.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<(u8, Vec<u8>)>> {
     let mut header = [0u8; 5];
-    match r.read_exact(&mut header).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
+    let mut filled = 0usize;
+    while filled < header.len() {
+        let n = r.read(&mut header[filled..]).await?;
+        if n == 0 {
+            if filled == 0 {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("truncated frame header: {filled}/5 bytes before EOF"),
+            ));
+        }
+        filled += n;
     }
     let kind = header[0];
     let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
@@ -109,6 +131,16 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<(u
         r.read_exact(&mut payload).await?;
     }
     Ok(Some((kind, payload)))
+}
+
+/// Try to write a single frame within `CLIENT_WRITE_TIMEOUT`. Returns
+/// `true` on success and `false` if the write timed out or errored — the
+/// caller should treat both as "client gone" and bail out.
+async fn write_or_timeout<W: AsyncWrite + Unpin>(w: &mut W, kind: u8, payload: &[u8]) -> bool {
+    matches!(
+        tokio::time::timeout(CLIENT_WRITE_TIMEOUT, write_frame(w, kind, payload)).await,
+        Ok(Ok(()))
+    )
 }
 
 /// Write a single frame.
@@ -141,6 +173,18 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum AttachRequest {
     ListAgents,
+    /// Spawn an agent process attached to a PTY.
+    ///
+    /// **Trust boundary.** The attach socket is bound at mode `0o600` and
+    /// only accepts connections from the same OS user as the daemon, so
+    /// any peer reaching this request can already exec arbitrary code as
+    /// that user. We deliberately do **not** sandbox `command`, `cwd`, or
+    /// `env`: there is no allowlist, no policy layer, no shell-quoting
+    /// validation. Adding any of those here would be security theater —
+    /// the same user has equivalent local-exec capability via `sh -c`,
+    /// and the daemon's job is to expose PTY plumbing, not to be a
+    /// privilege boundary. Multi-tenant or remote scenarios must be
+    /// handled at a different layer (separate UID, container, SSH).
     StartAgent {
         #[serde(default)]
         command: Option<String>,
@@ -286,6 +330,24 @@ async fn handle_connection(
             cols,
             env,
         } => {
+            // Trust boundary: same OS user, same exec capability — see the
+            // `AttachRequest::StartAgent` docs. We forward `command`/`cwd`/
+            // `env` to the spawn path verbatim. The only check here is a
+            // sanity guard against an empty/whitespace-only `command`,
+            // which is almost certainly a client bug rather than an
+            // attack: it would otherwise resolve to a binary named "" or
+            // " " and fail with a confusing OS error. This is *not* an
+            // allowlist.
+            if let Some(c) = command.as_deref()
+                && c.trim().is_empty()
+            {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err("start-agent: command is empty or whitespace-only"),
+                )
+                .await?;
+                return Ok(());
+            }
             let opts = SpawnOptions {
                 command: command.as_deref(),
                 cwd: cwd.as_deref(),
@@ -354,25 +416,39 @@ async fn handle_attach_stream(
 
     // Output task: forward broadcast bytes → STREAM_OUT frames. Owns `wr`
     // for the duration of streaming.
+    //
+    // Every write goes through `CLIENT_WRITE_TIMEOUT`. Without it, a client
+    // that stops draining its socket pins this task on `write_all` (the
+    // kernel send buffer fills and the write never completes) — which also
+    // suppresses lag detection, since we can't reach the next `rx.recv()`
+    // to observe `RecvError::Lagged`. With the timeout, a wedged client is
+    // detected within bounded time and the connection is dropped.
     let output_task = tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(bytes) => {
-                    if write_frame(&mut wr, KIND_STREAM_OUT, &bytes).await.is_err() {
-                        // Client gone; bail out.
+                    if !write_or_timeout(&mut wr, KIND_STREAM_OUT, &bytes).await {
+                        // Client wedged or socket error: try one bounded
+                        // STREAM_END, then give up. If even STREAM_END
+                        // can't get through, dropping `wr` here closes the
+                        // socket — the client observes EOF either way.
+                        let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
                         break;
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     // Agent terminated (reader thread saw EOF).
-                    let _ = write_frame(&mut wr, KIND_STREAM_END, &[]).await;
+                    let _ = write_or_timeout(&mut wr, KIND_STREAM_END, &[]).await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     // This subscriber fell behind beyond BROADCAST_CAPACITY.
                     // Better to disconnect than to deliver corrupted ANSI;
-                    // the client can reattach and replay scrollback.
-                    let _ = write_frame(&mut wr, KIND_STREAM_END, b"lagged").await;
+                    // the client can reattach and replay scrollback. The
+                    // bounded write timeout matters here too: if the client
+                    // also wedged its socket, we still need to drop within
+                    // a known time rather than block on STREAM_END.
+                    let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"lagged").await;
                     break;
                 }
             }
@@ -429,6 +505,40 @@ mod tests {
         let buf: Vec<u8> = Vec::new();
         let mut cursor = std::io::Cursor::new(buf);
         assert!(read_frame(&mut cursor).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn frame_partial_header_returns_err() {
+        // 1, 2, 3, 4 bytes followed by EOF must each be reported as a
+        // truncated frame (Err), not a clean disconnect (Ok(None)). Only
+        // 0-bytes-then-EOF is a clean disconnect.
+        for n in 1usize..=4 {
+            let buf: Vec<u8> = vec![0u8; n];
+            let mut cursor = std::io::Cursor::new(buf);
+            let err = read_frame(&mut cursor)
+                .await
+                .expect_err(&format!("expected Err for {n}-byte partial header"));
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::UnexpectedEof,
+                "wrong error kind for {n}-byte partial header"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_partial_body_returns_err() {
+        // Header claims 16 bytes of payload; only 5 supplied before EOF.
+        // The body read must fail as truncated.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.push(KIND_STREAM_OUT);
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        buf.extend_from_slice(b"hello"); // 5 bytes — short
+        let mut cursor = std::io::Cursor::new(buf);
+        let err = read_frame(&mut cursor)
+            .await
+            .expect_err("expected Err for truncated body");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]

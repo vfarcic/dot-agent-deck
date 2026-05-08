@@ -402,3 +402,178 @@ async fn attach_unknown_agent_returns_err() {
     let resp = read_response(&mut s).await;
     assert!(!resp.ok);
 }
+
+#[tokio::test]
+async fn start_agent_rejects_blank_command() {
+    // Whitespace-only `command` is treated as a client bug, not an attack
+    // — see the trust-boundary doc on AttachRequest::StartAgent. The server
+    // returns an error response without spawning anything.
+    let server = start_server().await;
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut s,
+        &AttachRequest::StartAgent {
+            command: Some("   ".into()),
+            cwd: None,
+            rows: 24,
+            cols: 80,
+            env: vec![],
+        },
+    )
+    .await;
+    let resp = read_response(&mut s).await;
+    assert!(!resp.ok);
+    assert!(
+        resp.error
+            .as_deref()
+            .is_some_and(|e| e.contains("empty") || e.contains("whitespace"))
+    );
+    assert!(server.registry.is_empty());
+}
+
+#[tokio::test]
+async fn unknown_kind_during_stream_closes_connection() {
+    let server = start_server().await;
+    let id = start_agent(&server, "/bin/sh").await;
+    let mut a = connect_attach(&server, &id).await;
+
+    // Send a frame with an unknown kind. The server logs and closes the
+    // connection — the output task is aborted as part of teardown, so the
+    // client should observe EOF (read_frame returns None) within a bounded
+    // time. We don't assert on STREAM_END here because the server's choice
+    // is "close the connection", not "send STREAM_END" for protocol
+    // violations.
+    write_frame(&mut a, 0xEE, b"junk").await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut closed = false;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, read_frame(&mut a)).await {
+            Ok(None) => {
+                closed = true;
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        closed,
+        "connection should close after unknown frame kind on stream"
+    );
+
+    server.registry.close_agent(&id).unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_stream_in_writers_both_reach_pty() {
+    // Two clients send STREAM_IN keystrokes concurrently. The shared PTY
+    // writer is under a tokio Mutex, so individual `write_all` calls don't
+    // interleave at sub-call granularity. Both inputs must reach the PTY
+    // — verified by writing two distinct markers and observing both in the
+    // PTY's echoed output (a third reader client receives the broadcast).
+    let server = start_server().await;
+    let id = start_agent(&server, "/bin/sh").await;
+
+    let mut writer_a = connect_attach(&server, &id).await;
+    let mut writer_b = connect_attach(&server, &id).await;
+    let mut reader = connect_attach(&server, &id).await;
+
+    // Drive both writers in parallel. Each sends an `echo` followed by a
+    // newline so the shell evaluates and echoes the marker back.
+    let send_a = async {
+        write_frame(&mut writer_a, KIND_STREAM_IN, b"echo MARKER-AAA\n").await;
+    };
+    let send_b = async {
+        write_frame(&mut writer_b, KIND_STREAM_IN, b"echo MARKER-BBB\n").await;
+    };
+    tokio::join!(send_a, send_b);
+
+    // Both markers must appear in the reader's STREAM_OUT within a
+    // reasonable timeout. read_until_contains polls until each marker
+    // shows up; ordering between the two is not guaranteed.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut acc: Vec<u8> = Vec::new();
+    let mut saw_a = false;
+    let mut saw_b = false;
+    while tokio::time::Instant::now() < deadline && !(saw_a && saw_b) {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, read_frame(&mut reader)).await {
+            Ok(Some((KIND_STREAM_OUT, bytes))) => {
+                acc.extend_from_slice(&bytes);
+                if acc.windows(b"MARKER-AAA".len()).any(|w| w == b"MARKER-AAA") {
+                    saw_a = true;
+                }
+                if acc.windows(b"MARKER-BBB".len()).any(|w| w == b"MARKER-BBB") {
+                    saw_b = true;
+                }
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_a && saw_b,
+        "both concurrent STREAM_IN writers must reach the PTY; saw_a={saw_a} saw_b={saw_b}, output: {:?}",
+        String::from_utf8_lossy(&acc)
+    );
+
+    server.registry.close_agent(&id).unwrap();
+}
+
+#[tokio::test]
+async fn slow_client_dropped_within_bounded_time() {
+    // A wedged client (one that stops draining its socket) must be
+    // disconnected by the daemon within bounded time, otherwise the
+    // output task would pin forever on `write_all` and lag detection
+    // could never fire.
+    //
+    // Setup: spawn a shell running `yes` to flood stdout. Open a "slow"
+    // attach client that consumes the OK response but never reads
+    // STREAM_OUT frames — the kernel recv buffer on the client side
+    // fills up, which back-pressures the daemon's `write_all`, which
+    // hits `CLIENT_WRITE_TIMEOUT`, which closes the connection. The
+    // alternative path (broadcast lag fires first and the daemon writes
+    // STREAM_END) is also acceptable; both result in a bounded close.
+    let server = start_server().await;
+    let id = start_agent(&server, "yes AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").await;
+
+    let slow = connect_attach(&server, &id).await;
+
+    // Wait without reading. CLIENT_WRITE_TIMEOUT in the daemon is 5s;
+    // wait long enough for the kernel recv buffer to fill and the
+    // timeout to trip. Holding the stream without reads is what
+    // simulates a wedged client.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // Now drain. We must observe STREAM_END or EOF within an additional
+    // bounded window — proving the daemon dropped the connection rather
+    // than wedging on it.
+    let mut slow = slow;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut closed = false;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, read_frame(&mut slow)).await {
+            Ok(Some((KIND_STREAM_END, _))) => {
+                closed = true;
+                break;
+            }
+            Ok(None) => {
+                closed = true;
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Err(_) => break,
+        }
+    }
+
+    server.registry.close_agent(&id).unwrap();
+
+    assert!(
+        closed,
+        "wedged slow client must observe STREAM_END or EOF within bounded time"
+    );
+}
