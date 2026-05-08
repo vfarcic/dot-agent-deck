@@ -216,7 +216,7 @@ The TUI (`src/ui.rs`, `src/state.rs`) gains a remote-deck mode where panes are n
 ### Phase 1: Daemon owns PTYs (local-only)
 
 - [x] **M1.1** — Refactor `src/daemon.rs` to own agent PTYs (currently spawned by the TUI). Local-deck mode keeps working; PTY ownership simply moves. Existing tests pass.
-- [ ] **M1.2** — Define and implement the streaming attach protocol (over Unix socket initially): list-agents, start-agent, stop-agent, attach-stream, detach, snapshot.
+- [x] **M1.2** — Define and implement the streaming attach protocol (over Unix socket initially): list-agents, start-agent, stop-agent, attach-stream, detach, snapshot.
 - [ ] **M1.3** — TUI viewer can attach to its own local daemon over the new protocol (still all on one machine). This proves the protocol works before any network is involved.
 
 ### Phase 2: ssh transport (MVP remote)

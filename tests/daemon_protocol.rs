@@ -520,31 +520,40 @@ async fn concurrent_stream_in_writers_both_reach_pty() {
     server.registry.close_agent(&id).unwrap();
 }
 
-/// Wait for `slow` to observe STREAM_END or EOF within `budget`. Used by
-/// the slow-client bounded-disconnect tests where the precise close path
-/// (timeout vs. broadcast lag) doesn't matter — both indicate a bounded
-/// drop.
-async fn assert_closed_within(slow: &mut UnixStream, budget: Duration, what: &str) {
+/// Poll until the agent's broadcast subscriber count falls back to
+/// `target` (typically 0), or panic after `budget`.
+///
+/// Used by the slow-client bounded-disconnect tests in place of reading
+/// frames off the wedged socket. Reading would drain the kernel recv
+/// buffer and let the server-side write make progress — which means the
+/// test could pass via the broadcast-lag fallback path even when the
+/// per-write timeout is missing. Observing receiver-count from the
+/// server side instead pins the assertion strictly to "the wedged
+/// client's attach handler dropped its `Receiver` within bounded time",
+/// which only happens when the per-write timeout actually fires
+/// (snapshot path) or the output-task per-write timeout fires
+/// (live-output path).
+async fn assert_receiver_count_reaches(
+    registry: &AgentPtyRegistry,
+    id: &str,
+    target: usize,
+    budget: Duration,
+    what: &str,
+) {
     let deadline = tokio::time::Instant::now() + budget;
-    let mut closed = false;
     while tokio::time::Instant::now() < deadline {
-        let remaining = deadline - tokio::time::Instant::now();
-        match tokio::time::timeout(remaining, read_frame(slow)).await {
-            Ok(Some((KIND_STREAM_END, _))) => {
-                closed = true;
-                break;
-            }
-            Ok(None) => {
-                closed = true;
-                break;
-            }
-            Ok(Some(_)) => continue,
-            Err(_) => break,
+        match registry.receiver_count(id) {
+            Some(c) if c <= target => return,
+            // Agent has been removed from the registry — there is no bus
+            // anymore, so by definition no subscriber can be holding a
+            // receiver. Treat as success.
+            None => return,
+            Some(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     }
-    assert!(
-        closed,
-        "{what} must observe STREAM_END or EOF within bounded time"
+    let final_count = registry.receiver_count(id);
+    panic!(
+        "{what}: receiver_count did not drop to {target} within {budget:?} (final: {final_count:?})"
     );
 }
 
@@ -558,25 +567,41 @@ async fn slow_client_dropped_within_bounded_time() {
     //
     // 1. Live-output stage. Attach early; the live STREAM_OUT writes
     //    eventually back-pressure on the wedged client's recv buffer
-    //    and hit `CLIENT_WRITE_TIMEOUT`. (Broadcast lag firing first
-    //    and emitting STREAM_END is an acceptable alternative path —
-    //    both are bounded closes.)
+    //    and hit `CLIENT_WRITE_TIMEOUT` in the output task.
     //
     // 2. Initial-snapshot stage. Attach after scrollback has filled to
     //    its cap, so the *first* STREAM_OUT carrying the snapshot is
-    //    already large enough to overflow the kernel send buffer. This
-    //    is the path that would have wedged before the snapshot write
-    //    was routed through `write_or_timeout`.
+    //    already large enough to overflow the kernel send buffer and
+    //    must hit `CLIENT_WRITE_TIMEOUT` in the snapshot path itself.
+    //
+    // Both stages assert via the server-side broadcast receiver count
+    // rather than by reading from the wedged client. Reading would
+    // drain the kernel buffer and unblock the server's write, allowing
+    // the test to pass via the broadcast-lag close path even if the
+    // per-write timeout had been removed. Receiver-count observation
+    // is strictly tied to the attach handler's `Receiver` being
+    // dropped, which only happens when the bounded write actually
+    // times out and the handler returns / the output task breaks.
     let server = start_server().await;
     let id = start_agent(&server, "yes AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").await;
 
-    // Stage 1: live-output. `connect_attach` reads only the OK; the
-    // kernel recv buffer fills as live STREAM_OUT frames arrive.
-    let mut slow = connect_attach(&server, &id).await;
-    tokio::time::sleep(Duration::from_secs(8)).await;
-    assert_closed_within(
-        &mut slow,
-        Duration::from_secs(15),
+    // Stage 1: live-output. The slow client never reads after the
+    // attach OK response — the kernel recv buffer fills as live
+    // STREAM_OUT frames arrive, eventually wedging the output task's
+    // bounded write.
+    let _slow = connect_attach(&server, &id).await;
+    assert_eq!(
+        server.registry.receiver_count(&id),
+        Some(1),
+        "live-stage attach should register a subscriber"
+    );
+    // Budget is large enough to absorb CLIENT_WRITE_TIMEOUT (5s) plus
+    // the time to fill the kernel send buffer at PTY-output rate.
+    assert_receiver_count_reaches(
+        &server.registry,
+        &id,
+        0,
+        Duration::from_secs(20),
         "wedged live-stream slow client",
     )
     .await;
@@ -584,15 +609,22 @@ async fn slow_client_dropped_within_bounded_time() {
     // Stage 2: initial-snapshot. By now `yes` has filled scrollback to
     // its 1 MiB cap (well above any Unix-socket send buffer), so the
     // snapshot write itself is large enough to back-pressure on a
-    // non-reading client.
+    // non-reading client. Open the connection raw so we can read the
+    // attach OK response without then draining STREAM_OUT.
     let mut slow2 = UnixStream::connect(&server.path).await.unwrap();
     write_request(&mut slow2, &AttachRequest::AttachStream { id: id.clone() }).await;
     let resp = read_response(&mut slow2).await;
     assert!(resp.ok, "attach-stream failed: {:?}", resp.error);
-    tokio::time::sleep(Duration::from_secs(8)).await;
-    assert_closed_within(
-        &mut slow2,
-        Duration::from_secs(15),
+    assert_eq!(
+        server.registry.receiver_count(&id),
+        Some(1),
+        "snapshot-stage attach should register a subscriber"
+    );
+    assert_receiver_count_reaches(
+        &server.registry,
+        &id,
+        0,
+        Duration::from_secs(20),
         "wedged snapshot-stage slow client",
     )
     .await;

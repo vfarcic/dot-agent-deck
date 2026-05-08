@@ -307,6 +307,14 @@ impl AgentBus {
             .copied()
             .collect()
     }
+
+    /// Current number of live broadcast subscribers. Lets diagnostics and
+    /// tests observe when an attach handler has dropped its receiver — e.g.
+    /// after a wedged client triggered the bounded-write timeout — without
+    /// having to read from that client's socket.
+    pub fn receiver_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
 }
 
 /// Reader-thread loop: pull bytes from the PTY master and publish them to
@@ -449,6 +457,13 @@ impl AgentPtyRegistry {
             .get(id)
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
         Ok(agent.bus.snapshot())
+    }
+
+    /// Current number of live broadcast subscribers for an agent. Returns
+    /// `None` if the agent is not in the registry.
+    pub fn receiver_count(&self, id: &str) -> Option<usize> {
+        let inner = self.inner.lock().unwrap();
+        inner.agents.get(id).map(|a| a.bus.receiver_count())
     }
 
     /// All currently-owned agent ids, sorted ascending.
