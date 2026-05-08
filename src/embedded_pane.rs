@@ -3,10 +3,11 @@ use std::io::{Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use portable_pty::PtySize;
 
 use std::any::Any;
 
+use crate::agent_pty::{self, AgentPty, SpawnOptions};
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
 use crate::pane::{PaneController, PaneDirection, PaneError, PaneInfo};
 
@@ -256,55 +257,24 @@ impl PaneController for EmbeddedPaneController {
     }
 
     fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError> {
-        let pty_system = NativePtySystem::default();
-
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| PaneError::CommandFailed(format!("Failed to open PTY: {e}")))?;
-
-        let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-
-        let mut cmd = match command {
-            Some(c) if c.contains(' ') => {
-                let mut cmd = CommandBuilder::new(&default_shell);
-                cmd.arg("-c");
-                cmd.arg(c);
-                cmd
-            }
-            Some(c) => CommandBuilder::new(c),
-            None => CommandBuilder::new(&default_shell),
-        };
-
-        if let Some(dir) = cwd {
-            cmd.cwd(dir);
-        }
-
         let pane_id = self.allocate_id();
+
         // Tag the spawned process so hooks can identify which pane it belongs to.
-        cmd.env("DOT_AGENT_DECK_PANE_ID", &pane_id);
+        let env = vec![("DOT_AGENT_DECK_PANE_ID".to_string(), pane_id.clone())];
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| PaneError::CommandFailed(format!("Failed to spawn command: {e}")))?;
-
-        // Drop the slave — we interact through the master side only.
-        drop(pair.slave);
-
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| PaneError::CommandFailed(format!("Failed to get PTY writer: {e}")))?;
-
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| PaneError::CommandFailed(format!("Failed to get PTY reader: {e}")))?;
+        let AgentPty {
+            child,
+            master,
+            writer,
+            mut reader,
+        } = agent_pty::spawn(SpawnOptions {
+            command,
+            cwd,
+            rows: 24,
+            cols: 80,
+            env,
+        })
+        .map_err(|e| PaneError::CommandFailed(e.to_string()))?;
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
         let mouse_mode = Arc::new(AtomicBool::new(false));
@@ -381,7 +351,7 @@ impl PaneController for EmbeddedPaneController {
             writer,
             screen: parser,
             child,
-            master: pair.master,
+            master,
             name: command.unwrap_or("shell").to_string(),
             is_focused: false,
             command: command.map(|c| c.to_string()),

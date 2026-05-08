@@ -1,3 +1,4 @@
+pub mod agent_pty;
 pub mod ascii_art;
 pub mod config;
 pub mod config_gen;
