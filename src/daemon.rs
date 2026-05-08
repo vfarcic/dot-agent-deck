@@ -1,6 +1,7 @@
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::io::AsyncBufReadExt;
 use tokio::net::UnixListener;
@@ -15,6 +16,33 @@ use crate::state::SharedState;
 /// socket file inherits the process umask, which on most systems leaves it
 /// world-connectable. See PRD #76 line 298.
 const SOCKET_MODE: u32 = 0o600;
+
+/// umask is process-global, so serialize the bind-with-restrictive-umask
+/// dance to keep concurrent tests from racing each other's restore.
+static UMASK_LOCK: Mutex<()> = Mutex::new(());
+
+/// Bind a Unix listener at `path` with the socket inode created at 0o600
+/// directly. Setting umask before `bind(2)` closes the TOCTOU window between
+/// `bind` and a post-bind `chmod`: without this, a local attacker could
+/// connect via the world-readable inode that exists between the two calls.
+fn bind_socket(path: &Path) -> io::Result<UnixListener> {
+    let _guard = UMASK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // SAFETY: `umask(2)` is a thread-safe libc call that simply swaps a
+    // per-process value. We restore the previous mask immediately after
+    // `bind` so other code (file creation elsewhere) is unaffected.
+    //
+    // The kernel creates the socket inode with mode 0o777 & ~umask, so a
+    // mask of 0o177 strips the owner-execute bit and all group/other bits
+    // and produces 0o600 directly. (0o077 would yield 0o700 — owner exec is
+    // meaningless on a socket but the existing chmod target is 0o600, so we
+    // match it.)
+    let prev = unsafe { libc::umask(0o177) };
+    let result = UnixListener::bind(path);
+    unsafe {
+        libc::umask(prev);
+    }
+    result
+}
 
 /// Bundle of daemon state. Owns the hook-event `SharedState` and the agent
 /// PTY registry. M1.1 keeps `run_daemon` as the public entrypoint with the
@@ -49,11 +77,10 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         std::fs::remove_file(socket_path)?;
     }
 
-    let listener = UnixListener::bind(socket_path)?;
-    // Restrict the socket to owner-only access. Without this, the socket file
-    // mode follows the process umask and is typically world-connectable —
-    // which means any local user could deliver hook events into another
-    // user's daemon.
+    let listener = bind_socket(socket_path)?;
+    // Defense in depth: `bind_socket` already created the inode at 0o600 via
+    // umask, but restating the mode here makes the requirement explicit and
+    // would cover any future code path that bypasses `bind_socket`.
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(SOCKET_MODE))?;
     info!("Daemon listening on {}", socket_path.display());
 
@@ -123,6 +150,24 @@ mod tests {
 
     use crate::agent_pty::SpawnOptions;
     use crate::state::AppState;
+
+    #[tokio::test]
+    async fn socket_is_0600_immediately_after_bind() {
+        // Proves the umask-before-bind change closes the TOCTOU window: the
+        // socket inode must already be 0o600 at `bind(2)` time, with no
+        // reliance on a post-bind chmod.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("immediate.sock");
+
+        let _listener = bind_socket(&sock_path).expect("bind should succeed");
+
+        let meta = std::fs::metadata(&sock_path).expect("socket file should exist");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, SOCKET_MODE,
+            "expected 0600 immediately after bind (no chmod), got {mode:o}"
+        );
+    }
 
     #[tokio::test]
     async fn socket_is_chmod_0600_after_bind() {

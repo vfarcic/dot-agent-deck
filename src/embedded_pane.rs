@@ -257,6 +257,11 @@ impl PaneController for EmbeddedPaneController {
     }
 
     fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError> {
+        // The pane ID is allocated up front because it has to be injected into
+        // the child's environment as DOT_AGENT_DECK_PANE_ID. If the spawn
+        // below fails, the ID is intentionally consumed (a gap in the
+        // sequence is harmless and avoids racing concurrent `create_pane`
+        // calls to revert the counter).
         let pane_id = self.allocate_id();
 
         // Tag the spawned process so hooks can identify which pane it belongs to.

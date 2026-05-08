@@ -56,15 +56,66 @@ impl Default for SpawnOptions<'_> {
 }
 
 /// A spawned agent and the handles needed to keep it alive, write to it, read
-/// from it, and resize it. Callers are responsible for explicit `kill`/`wait`
-/// when shutting an agent down — there's no `Drop` impl, since some callers
+/// from it, and resize it. Callers are responsible for explicit cleanup when
+/// shutting an agent down — there's no `Drop` impl, since some callers
 /// (e.g. `embedded_pane`) destructure these fields and store them
-/// individually.
+/// individually. The registry uses [`force_kill_and_wait`] (SIGKILL) when it
+/// owns whole `AgentPty` values, and [`PtyGuard`] to keep the spawn path
+/// leak-free between `spawn()` and registry insertion.
 pub struct AgentPty {
     pub child: Box<dyn portable_pty::Child + Send + Sync>,
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     pub writer: Box<dyn std::io::Write + Send>,
     pub reader: Box<dyn std::io::Read + Send>,
+}
+
+/// Forcefully terminate the child and reap it.
+///
+/// `portable_pty::Child::kill()` sends SIGHUP, which a shell can ignore (some
+/// distros' bash/zsh configurations do exactly that), leaving the subsequent
+/// `wait()` to block forever. SIGKILL cannot be caught or ignored, so the
+/// kernel will tear the process down and `wait()` returns promptly. The
+/// master/writer/reader handles are dropped first so any I/O blocked on the
+/// PTY unblocks before we wait.
+fn force_kill_and_wait(pty: &mut AgentPty) {
+    if let Some(pid) = pty.child.process_id() {
+        // SAFETY: `kill(2)` is async-signal-safe; sending SIGKILL to a pid we
+        // just learned from `process_id()` cannot affect any other process
+        // until the kernel reaps the child below.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    } else {
+        // No PID exposed — fall back to portable-pty's signaller.
+        let _ = pty.child.kill();
+    }
+    let _ = pty.child.wait();
+}
+
+/// RAII guard that owns an `AgentPty` until ownership is explicitly handed
+/// off via [`PtyGuard::take`]. If the guard is dropped while still holding
+/// the `AgentPty` (e.g. because a panic unwinds the spawn path before
+/// insertion into the registry), the child is force-killed and reaped.
+struct PtyGuard {
+    pty: Option<AgentPty>,
+}
+
+impl PtyGuard {
+    fn new(pty: AgentPty) -> Self {
+        Self { pty: Some(pty) }
+    }
+
+    fn take(mut self) -> AgentPty {
+        self.pty.take().expect("PtyGuard already taken")
+    }
+}
+
+impl Drop for PtyGuard {
+    fn drop(&mut self) {
+        if let Some(mut pty) = self.pty.take() {
+            force_kill_and_wait(&mut pty);
+        }
+    }
 }
 
 /// Spawn a new PTY-attached child process.
@@ -156,15 +207,18 @@ impl AgentPtyRegistry {
 
     /// Spawn a new agent and return its registry id.
     pub fn spawn_agent(&self, opts: SpawnOptions<'_>) -> Result<String, AgentPtyError> {
-        let pty = spawn(opts)?;
+        // Hold the freshly spawned PTY in a guard so a panic between here and
+        // the `agents.insert` below (e.g. lock poisoning) cannot orphan the
+        // child.
+        let guard = PtyGuard::new(spawn(opts)?);
         let mut inner = self.inner.lock().unwrap();
         let id = inner.next_id.to_string();
         inner.next_id += 1;
-        inner.agents.insert(id.clone(), pty);
+        inner.agents.insert(id.clone(), guard.take());
         Ok(id)
     }
 
-    /// Stop an agent: kill the child, wait for it to exit, drop its handles.
+    /// Stop an agent: SIGKILL the child, reap it, drop its handles.
     pub fn close_agent(&self, id: &str) -> Result<(), AgentPtyError> {
         let mut pty = {
             let mut inner = self.inner.lock().unwrap();
@@ -173,8 +227,7 @@ impl AgentPtyRegistry {
                 .remove(id)
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?
         };
-        let _ = pty.child.kill();
-        let _ = pty.child.wait();
+        force_kill_and_wait(&mut pty);
         Ok(())
     }
 
@@ -195,15 +248,14 @@ impl AgentPtyRegistry {
         self.inner.lock().unwrap().agents.is_empty()
     }
 
-    /// Kill every agent and drain the registry. Idempotent.
+    /// SIGKILL every agent and drain the registry. Idempotent.
     pub fn shutdown_all(&self) {
         let agents: Vec<AgentPty> = {
             let mut inner = self.inner.lock().unwrap();
             inner.agents.drain().map(|(_, pty)| pty).collect()
         };
         for mut pty in agents {
-            let _ = pty.child.kill();
-            let _ = pty.child.wait();
+            force_kill_and_wait(&mut pty);
         }
     }
 }
@@ -265,43 +317,88 @@ mod tests {
         registry.shutdown_all();
     }
 
+    /// Returns true if `kill(pid, 0)` reports the process is gone (ESRCH).
+    /// `kill(pid, 0)` performs an existence check without actually signalling.
+    fn pid_is_dead(pid: u32) -> bool {
+        let r = unsafe { libc::kill(pid as i32, 0) };
+        if r == 0 {
+            return false;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        errno == Some(libc::ESRCH)
+    }
+
     #[test]
     fn registry_shutdown_all_clears_state() {
         let registry = AgentPtyRegistry::new();
-        let _id1 = registry.spawn_agent(SpawnOptions::default()).unwrap();
-        let _id2 = registry.spawn_agent(SpawnOptions::default()).unwrap();
+        let id1 = registry.spawn_agent(SpawnOptions::default()).unwrap();
+        let id2 = registry.spawn_agent(SpawnOptions::default()).unwrap();
         assert_eq!(registry.len(), 2);
+
+        // Capture child PIDs so we can verify they're actually gone after
+        // shutdown_all (not just absent from the registry map).
+        let pids: Vec<u32> = {
+            let inner = registry.inner.lock().unwrap();
+            [&id1, &id2]
+                .into_iter()
+                .map(|id| inner.agents.get(id).unwrap().child.process_id().unwrap())
+                .collect()
+        };
+
         registry.shutdown_all();
         assert!(registry.is_empty());
+
+        for pid in &pids {
+            assert!(
+                pid_is_dead(*pid),
+                "pid {pid} should be dead after shutdown_all"
+            );
+        }
+
         // Idempotent.
         registry.shutdown_all();
     }
 
     #[test]
     fn registry_drop_kills_agents() {
-        // If Drop didn't kill children, the test process would leak shells —
-        // not directly observable here, but the explicit shutdown_all in Drop
-        // is what M1.1 commits to. Smoke-test that constructing-and-dropping
-        // a registry with a live agent doesn't panic.
+        // Constructing-and-dropping a registry with a live agent must not
+        // hang and must terminate the child. We capture the PID before the
+        // registry goes out of scope, then verify the kernel reaped it.
+        let pid: u32;
         {
             let registry = AgentPtyRegistry::new();
-            let _id = registry.spawn_agent(SpawnOptions::default()).unwrap();
+            let id = registry.spawn_agent(SpawnOptions::default()).unwrap();
+            pid = registry
+                .inner
+                .lock()
+                .unwrap()
+                .agents
+                .get(&id)
+                .unwrap()
+                .child
+                .process_id()
+                .unwrap();
         }
+        assert!(pid_is_dead(pid), "pid {pid} should be dead after Drop");
     }
 
     #[test]
-    fn spawn_options_env_is_propagated() {
-        // Verify SpawnOptions::env is wired through to the child process via
-        // CommandBuilder. We can't easily read env from inside the child PTY,
-        // so this just exercises the code path without panicking.
+    fn spawn_options_env_reaches_child() {
+        // Spawn a shell that exits with a status determined by a value passed
+        // through SpawnOptions::env. If the env var fails to propagate, the
+        // child exits 99 instead of 42 and the assertion below fires.
         let pty = spawn(SpawnOptions {
-            command: Some("/bin/sh"),
-            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), "test-pane".into())],
+            command: Some("sh -c 'exit ${DOT_AGENT_DECK_PANE_ID:-99}'"),
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), "42".into())],
             ..SpawnOptions::default()
         })
         .expect("spawn should succeed");
         let mut child = pty.child;
-        let _ = child.kill();
-        let _ = child.wait();
+        let status = child.wait().expect("wait should succeed");
+        assert_eq!(
+            status.exit_code(),
+            42,
+            "child did not see DOT_AGENT_DECK_PANE_ID env var"
+        );
     }
 }
