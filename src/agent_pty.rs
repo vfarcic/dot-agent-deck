@@ -69,33 +69,71 @@ pub struct AgentPty {
     pub reader: Box<dyn std::io::Read + Send>,
 }
 
-/// Forcefully terminate the child and reap it.
-///
-/// `portable_pty::Child::kill()` sends SIGHUP, which a shell can ignore (some
-/// distros' bash/zsh configurations do exactly that), leaving the subsequent
-/// `wait()` to block forever. SIGKILL cannot be caught or ignored, so the
-/// kernel will tear the process down and `wait()` returns promptly. The
-/// master/writer/reader handles are dropped first so any I/O blocked on the
-/// PTY unblocks before we wait.
-fn force_kill_and_wait(pty: &mut AgentPty) {
-    if let Some(pid) = pty.child.process_id() {
+/// Forcefully terminate the child and reap it. SIGKILL is preferred over
+/// `portable_pty::Child::kill()` (which sends SIGHUP) because a shell can
+/// ignore SIGHUP — some distros' bash/zsh configurations do exactly that —
+/// leaving the subsequent `wait()` to block forever. SIGKILL cannot be
+/// caught or ignored, so the kernel tears the process down and `wait()`
+/// returns promptly. Callers should drop the master/writer/reader handles
+/// before invoking this so any I/O blocked on the PTY unblocks first.
+fn force_kill_child_and_wait(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+    if let Some(pid) = child.process_id() {
         // SAFETY: `kill(2)` is async-signal-safe; sending SIGKILL to a pid we
         // just learned from `process_id()` cannot affect any other process
         // until the kernel reaps the child below.
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
+        let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        if rc != 0 {
+            // Log so a weakened cleanup guarantee is observable. ESRCH on an
+            // already-reaped child is benign; anything else means the child
+            // may outlive us.
+            let err = std::io::Error::last_os_error();
+            tracing::warn!(pid, error = %err, "SIGKILL failed in force_kill_child_and_wait");
         }
     } else {
         // No PID exposed — fall back to portable-pty's signaller.
-        let _ = pty.child.kill();
+        let _ = child.kill();
     }
-    let _ = pty.child.wait();
+    let _ = child.wait();
 }
 
-/// RAII guard that owns an `AgentPty` until ownership is explicitly handed
-/// off via [`PtyGuard::take`]. If the guard is dropped while still holding
-/// the `AgentPty` (e.g. because a panic unwinds the spawn path before
-/// insertion into the registry), the child is force-killed and reaped.
+fn force_kill_and_wait(pty: &mut AgentPty) {
+    force_kill_child_and_wait(&mut pty.child);
+}
+
+/// RAII guard that owns a freshly-spawned child between the `spawn_command`
+/// call and the point at which ownership is handed off to an [`AgentPty`].
+/// If the guard is dropped while still holding the child (e.g. because a
+/// later step in [`spawn`] like `take_writer` or `try_clone_reader` returned
+/// an error, or a panic unwound through the spawn path), the child is
+/// force-killed and reaped so no orphan process is left behind.
+struct ChildGuard {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+}
+
+impl ChildGuard {
+    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn take(mut self) -> Box<dyn portable_pty::Child + Send + Sync> {
+        self.child.take().expect("ChildGuard already taken")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            force_kill_child_and_wait(&mut child);
+        }
+    }
+}
+
+/// RAII guard that owns a fully-built `AgentPty` until ownership is handed
+/// off via [`PtyGuard::take`]. Used by the registry to cover the gap between
+/// [`spawn`] returning an `AgentPty` and the registry's internal `insert`,
+/// where a panic (e.g. from lock poisoning) would otherwise drop the
+/// `AgentPty` on the floor without killing the child (`AgentPty` has no
+/// `Drop` of its own — see the type docs).
 struct PtyGuard {
     pty: Option<AgentPty>,
 }
@@ -156,6 +194,12 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
         .spawn_command(cmd)
         .map_err(|e| AgentPtyError::Spawn(e.to_string()))?;
 
+    // Wrap the freshly-spawned child in an RAII guard *before* any fallible
+    // step below: a failure in `take_writer` / `try_clone_reader` (or a
+    // panic between them) would otherwise orphan the child. The guard is
+    // taken on the success path and its child moved into the AgentPty.
+    let child_guard = ChildGuard::new(child);
+
     // Drop the slave — we interact through the master side only.
     drop(pair.slave);
 
@@ -170,7 +214,7 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
         .map_err(|e| AgentPtyError::Reader(e.to_string()))?;
 
     Ok(AgentPty {
-        child,
+        child: child_guard.take(),
         master: pair.master,
         writer,
         reader,
@@ -207,9 +251,13 @@ impl AgentPtyRegistry {
 
     /// Spawn a new agent and return its registry id.
     pub fn spawn_agent(&self, opts: SpawnOptions<'_>) -> Result<String, AgentPtyError> {
-        // Hold the freshly spawned PTY in a guard so a panic between here and
-        // the `agents.insert` below (e.g. lock poisoning) cannot orphan the
-        // child.
+        // Defense in depth: `spawn` already protects the child internally
+        // via its own `ChildGuard`, so any failure or panic *inside* spawn
+        // cannot orphan the child. This outer `PtyGuard` covers the
+        // remaining gap — between `spawn` returning the `AgentPty` and the
+        // `agents.insert` below — where lock poisoning on `inner.lock()`
+        // would otherwise drop the `AgentPty` without killing the child
+        // (`AgentPty` has no `Drop`).
         let guard = PtyGuard::new(spawn(opts)?);
         let mut inner = self.inner.lock().unwrap();
         let id = inner.next_id.to_string();
@@ -380,6 +428,42 @@ mod tests {
                 .unwrap();
         }
         assert!(pid_is_dead(pid), "pid {pid} should be dead after Drop");
+    }
+
+    #[test]
+    fn child_guard_drop_kills_orphan_child() {
+        // Models the leak scenario the in-`spawn()` ChildGuard now covers:
+        // a child has been spawned, but a *later* fallible step (the real
+        // ones being `take_writer` / `try_clone_reader`) errors out before
+        // the child can be moved into the returned AgentPty. Dropping the
+        // guard on that error path must force-kill and reap the child so
+        // no orphan PID is left behind.
+        let pty_system = NativePtySystem::default();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let cmd = CommandBuilder::new(&default_shell);
+        let child = pair.slave.spawn_command(cmd).expect("spawn should succeed");
+        drop(pair.slave);
+        let pid = child.process_id().expect("child should expose a pid");
+
+        let guard = ChildGuard::new(child);
+        // Drop the master *before* the guard so any PTY I/O the child is
+        // blocked on unblocks before SIGKILL — matching the production
+        // shutdown order.
+        drop(pair.master);
+        drop(guard);
+
+        assert!(
+            pid_is_dead(pid),
+            "pid {pid} should be dead after ChildGuard drop"
+        );
     }
 
     #[test]

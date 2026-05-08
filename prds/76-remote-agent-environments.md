@@ -215,7 +215,7 @@ The TUI (`src/ui.rs`, `src/state.rs`) gains a remote-deck mode where panes are n
 
 ### Phase 1: Daemon owns PTYs (local-only)
 
-- [ ] **M1.1** — Refactor `src/daemon.rs` to own agent PTYs (currently spawned by the TUI). Local-deck mode keeps working; PTY ownership simply moves. Existing tests pass.
+- [x] **M1.1** — Refactor `src/daemon.rs` to own agent PTYs (currently spawned by the TUI). Local-deck mode keeps working; PTY ownership simply moves. Existing tests pass.
 - [ ] **M1.2** — Define and implement the streaming attach protocol (over Unix socket initially): list-agents, start-agent, stop-agent, attach-stream, detach, snapshot.
 - [ ] **M1.3** — TUI viewer can attach to its own local daemon over the new protocol (still all on one machine). This proves the protocol works before any network is involved.
 
@@ -295,7 +295,7 @@ To be resolved during implementation, not blocking PRD acceptance:
 - **Transport order in v1**: ship ssh first (smaller surface, no cluster dependency for testing), then Kubernetes; or both at once. Likely answer: ssh first (Phase 2), Kubernetes follows (Phase 3).
 - **Project filesystem on Kubernetes**: PVC per environment with git as the sync layer (recommended) vs. ephemeral with init-container clone vs. mounted ConfigMap-style. Likely answer: PVC + git.
 - **Picker UX in `connect`**: TUI list inside `dot-agent-deck` (consistent with rest of app) vs. shell-out to `fzf` (zero-effort, requires fzf installed). Likely answer: in-app TUI, fzf as fallback if not interactive.
-- **Daemon-side socket file permissions**: `src/daemon.rs` currently binds the Unix socket without an explicit `set_permissions` / `chmod`, so the socket file mode follows the process umask (typically world-readable/connectable). M0.1 docs work around this with a recommended `umask 077` instruction for shared hosts; daemon-side enforcement (set umask before bind, or chmod immediately after) should land in Phase 1 alongside the daemon-owns-PTYs work.
+- **Daemon-side socket file permissions**: ~~`src/daemon.rs` currently binds the Unix socket without an explicit `set_permissions` / `chmod`, so the socket file mode follows the process umask (typically world-readable/connectable). M0.1 docs work around this with a recommended `umask 077` instruction for shared hosts; daemon-side enforcement (set umask before bind, or chmod immediately after) should land in Phase 1 alongside the daemon-owns-PTYs work.~~ **Resolved in M1.1** — the daemon now sets `umask 0o177` (serialized via `UMASK_LOCK`) before `UnixListener::bind` so the socket inode is created at mode `0o600` directly, with a post-bind `chmod` retained as defense-in-depth. Verified by `daemon::tests::socket_is_0600_immediately_after_bind`.
 
 ## Risks & Mitigations
 

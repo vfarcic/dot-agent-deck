@@ -18,7 +18,11 @@ use crate::state::SharedState;
 const SOCKET_MODE: u32 = 0o600;
 
 /// umask is process-global, so serialize the bind-with-restrictive-umask
-/// dance to keep concurrent tests from racing each other's restore.
+/// dance to keep concurrent tests from racing each other's restore. NOTE:
+/// this lock only serializes *cooperating* callers that go through
+/// `bind_socket`. Any other code path that calls `umask(2)` directly
+/// bypasses the lock and can still race with the swap-and-restore here —
+/// so don't treat this as a process-global umask guard.
 static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
 /// Bind a Unix listener at `path` with the socket inode created at 0o600
