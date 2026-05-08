@@ -45,7 +45,7 @@ Context handoff (CRITICAL): every worker cold-starts with NO memory of prior con
 
 [[orchestrations.roles]]
 name = "coder"
-command = "devbox run agent-plan"
+command = "devbox run agent-big"
 # command = "devbox run oc-coder"
 description = "Implements features, fixes bugs, refactors code"
 prompt_template = "Implement the requested change. If the task references a PRD path under prds/, read it first. Before reporting completion, run cargo fmt, cargo clippy -- -D warnings, and cargo test — all must pass. If critical context is missing from the task description, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."

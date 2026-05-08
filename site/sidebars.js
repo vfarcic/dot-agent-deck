@@ -7,6 +7,7 @@ const sidebars = {
     'keyboard-shortcuts',
     'workspace-modes',
     'configuration',
+    'remote-requirements',
     'troubleshooting',
     'license',
   ],

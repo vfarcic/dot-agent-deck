@@ -1,6 +1,6 @@
 # PRD #76: Remote Agent Environments
 
-**Status**: Not started
+**Status**: In progress
 **Priority**: High
 **Created**: 2026-05-08
 **GitHub Issue**: [#76](https://github.com/vfarcic/dot-agent-deck/issues/76)
@@ -209,7 +209,7 @@ The TUI (`src/ui.rs`, `src/state.rs`) gains a remote-deck mode where panes are n
 
 ### Phase 0: Test environment and requirements doc
 
-- [ ] **M0.1** — Draft `docs/remote-requirements.md` from scratch based on what the daemon will need (best guess; will be refined as M1+ exposes real requirements).
+- [x] **M0.1** — Draft `docs/remote-requirements.md` from scratch based on what the daemon will need (best guess; will be refined as M1+ exposes real requirements).
 - [ ] **M0.2** — Maintainer provisions a personal dev/test VM by following the draft requirements doc end-to-end. **Not** committed to the repo. Anything that had to be done out-of-band is a docs gap to fix.
 - [ ] **M0.3** — Refine the requirements doc until a clean re-provision works without consulting any other source.
 
@@ -295,6 +295,7 @@ To be resolved during implementation, not blocking PRD acceptance:
 - **Transport order in v1**: ship ssh first (smaller surface, no cluster dependency for testing), then Kubernetes; or both at once. Likely answer: ssh first (Phase 2), Kubernetes follows (Phase 3).
 - **Project filesystem on Kubernetes**: PVC per environment with git as the sync layer (recommended) vs. ephemeral with init-container clone vs. mounted ConfigMap-style. Likely answer: PVC + git.
 - **Picker UX in `connect`**: TUI list inside `dot-agent-deck` (consistent with rest of app) vs. shell-out to `fzf` (zero-effort, requires fzf installed). Likely answer: in-app TUI, fzf as fallback if not interactive.
+- **Daemon-side socket file permissions**: `src/daemon.rs` currently binds the Unix socket without an explicit `set_permissions` / `chmod`, so the socket file mode follows the process umask (typically world-readable/connectable). M0.1 docs work around this with a recommended `umask 077` instruction for shared hosts; daemon-side enforcement (set umask before bind, or chmod immediately after) should land in Phase 1 alongside the daemon-owns-PTYs work.
 
 ## Risks & Mitigations
 
