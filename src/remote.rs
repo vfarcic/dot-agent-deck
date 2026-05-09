@@ -243,6 +243,11 @@ pub struct RemoteEntry {
     pub key: Option<String>,
     pub version: String,
     pub added_at: String,
+    /// Timestamp of the most recent `remote upgrade`. `None` until the entry
+    /// has been upgraded at least once. `added_at` stays at the original
+    /// registration timestamp so users can see both moments separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgraded_at: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -486,6 +491,68 @@ fn parse_version_output(stdout: &str) -> Option<String> {
     stdout.split_whitespace().nth(1).map(|s| s.to_string())
 }
 
+/// Install (or version-check, with `no_install`) the remote binary and assert
+/// it reports the expected version. Shared between `add` and `upgrade` — the
+/// only piece that's identical between the two flows. Caller is responsible
+/// for arch detect (passes `platform`), pre-validating `version` (caller has
+/// already run `validate_version_string`), and any post-install hooks work.
+fn install_and_verify(
+    executor: &dyn SshExecutor,
+    target: &SshTarget,
+    platform: &str,
+    version: &str,
+    release_base: &str,
+    no_install: bool,
+) -> Result<(), RemoteAddError> {
+    if no_install {
+        let v = executor.run(target, "dot-agent-deck --version")?;
+        if v.status != 0 {
+            return Err(RemoteAddError::VersionMismatch {
+                actual: format!("(exit {}) {}", v.status, v.stderr.trim()),
+                expected: version.to_string(),
+            });
+        }
+        let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
+        if actual != version {
+            return Err(RemoteAddError::VersionMismatch {
+                actual,
+                expected: version.to_string(),
+            });
+        }
+        return Ok(());
+    }
+
+    // Single shell command: any step's failure aborts the rest, and we get
+    // one stderr+exit pair instead of three round-trips' worth to
+    // disentangle. `build_install_command` re-validates the version (defense
+    // in depth) so even an internal misuse can't shell-inject.
+    let (url, install_cmd) = build_install_command(release_base, version, platform)?;
+    let install = executor.run(target, &install_cmd)?;
+    if install.status != 0 {
+        return Err(RemoteAddError::DownloadFailed {
+            version: version.to_string(),
+            platform: platform.to_string(),
+            url,
+            detail: format!("exit {}: {}", install.status, install.stderr.trim()),
+        });
+    }
+    let v = executor.run(target, "~/.local/bin/dot-agent-deck --version")?;
+    if v.status != 0 {
+        return Err(RemoteAddError::VersionMismatch {
+            actual: format!("(exit {}) {}", v.status, v.stderr.trim()),
+            expected: version.to_string(),
+        });
+    }
+    let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
+    if actual != version {
+        return Err(RemoteAddError::VersionMismatch {
+            actual,
+            expected: version.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Run the `add` flow. Returns the registry entry that was written, so
 /// callers (and tests) can assert on it.
 pub fn add(
@@ -540,52 +607,15 @@ pub fn add(
             arch: uname.stdout.trim().to_string(),
         })?;
 
-    // 4. Install or version-check.
-    if opts.no_install {
-        let v = executor.run(&target, "dot-agent-deck --version")?;
-        if v.status != 0 {
-            return Err(RemoteAddError::VersionMismatch {
-                actual: format!("(exit {}) {}", v.status, v.stderr.trim()),
-                expected: version.clone(),
-            });
-        }
-        let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
-        if actual != version {
-            return Err(RemoteAddError::VersionMismatch {
-                actual,
-                expected: version.clone(),
-            });
-        }
-    } else {
-        // Single shell command: any step's failure aborts the rest, and
-        // we get one stderr+exit pair instead of three round-trips' worth
-        // to disentangle. `build_install_command` re-validates the version
-        // (defense in depth) so even an internal misuse can't shell-inject.
-        let (url, install_cmd) = build_install_command(&opts.release_base, &version, platform)?;
-        let install = executor.run(&target, &install_cmd)?;
-        if install.status != 0 {
-            return Err(RemoteAddError::DownloadFailed {
-                version: version.clone(),
-                platform: platform.to_string(),
-                url,
-                detail: format!("exit {}: {}", install.status, install.stderr.trim()),
-            });
-        }
-        let v = executor.run(&target, "~/.local/bin/dot-agent-deck --version")?;
-        if v.status != 0 {
-            return Err(RemoteAddError::VersionMismatch {
-                actual: format!("(exit {}) {}", v.status, v.stderr.trim()),
-                expected: version.clone(),
-            });
-        }
-        let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
-        if actual != version {
-            return Err(RemoteAddError::VersionMismatch {
-                actual,
-                expected: version.clone(),
-            });
-        }
-    }
+    // 4. Install or version-check (shared between `add` and `upgrade`).
+    install_and_verify(
+        executor,
+        &target,
+        platform,
+        &version,
+        &opts.release_base,
+        opts.no_install,
+    )?;
 
     // 5. Hook install on the remote.
     let hooks_bin = if opts.no_install {
@@ -621,6 +651,7 @@ pub fn add(
             .or_else(|| opts.key.as_ref().map(|p| p.to_string_lossy().into_owned())),
         version: version.clone(),
         added_at: chrono::Utc::now().to_rfc3339(),
+        upgraded_at: None,
     };
     registry.remotes.push(entry.clone());
     registry.save(remotes_path)?;
@@ -632,6 +663,261 @@ pub fn add(
     );
 
     Ok(entry)
+}
+
+// ---------------------------------------------------------------------------
+// `remote list` — purely offline metadata read (no ssh, no probing). Live
+// status comes in M2.6.
+// ---------------------------------------------------------------------------
+
+/// Render a registry entry's `added_at` (RFC3339) as a human-friendly relative
+/// form ("2d ago"). Falls back to the raw string if parsing fails — better to
+/// surface the registry's exact contents than to silently swallow malformed
+/// data. Goes up to days; `format_elapsed` in `ui.rs` is for short-lived
+/// pane sessions and tops out at hours, so it's not the right shape here.
+fn format_relative_time_rfc3339(rfc3339: &str) -> String {
+    let parsed = match chrono::DateTime::parse_from_rfc3339(rfc3339) {
+        Ok(t) => t.with_timezone(&chrono::Utc),
+        Err(_) => return rfc3339.to_string(),
+    };
+    let secs = chrono::Utc::now()
+        .signed_duration_since(parsed)
+        .num_seconds()
+        .max(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+/// Format a registry entry's host column: `[user@]host[:port]`. The default
+/// ssh port (22) is omitted to keep the table tidy; any non-default port is
+/// suffixed.
+fn format_host_column(entry: &RemoteEntry) -> String {
+    if entry.port == DEFAULT_SSH_PORT {
+        entry.host.clone()
+    } else {
+        format!("{}:{}", entry.host, entry.port)
+    }
+}
+
+/// Render the registry as a column-aligned table. Empty registry produces
+/// the "No remotes configured" hint instead of a header-only table.
+pub fn list(remotes_path: &Path, out: &mut dyn std::io::Write) -> Result<(), RemoteConfigError> {
+    let registry = RemotesFile::load(remotes_path)?;
+    if registry.remotes.is_empty() {
+        writeln!(
+            out,
+            "No remotes configured. Use `dot-agent-deck remote add <name> --type=ssh <host>` to add one."
+        )
+        .map_err(|source| RemoteConfigError::Io {
+            path: remotes_path.display().to_string(),
+            source,
+        })?;
+        return Ok(());
+    }
+
+    let headers = ["NAME", "TYPE", "HOST", "VERSION", "ADDED_AT"];
+    let rows: Vec<[String; 5]> = registry
+        .remotes
+        .iter()
+        .map(|e| {
+            [
+                e.name.clone(),
+                e.kind.clone(),
+                format_host_column(e),
+                e.version.clone(),
+                format_relative_time_rfc3339(&e.added_at),
+            ]
+        })
+        .collect();
+
+    let mut widths = headers.map(|h| h.len());
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            if cell.len() > widths[i] {
+                widths[i] = cell.len();
+            }
+        }
+    }
+
+    let write_io = |result: std::io::Result<()>| -> Result<(), RemoteConfigError> {
+        result.map_err(|source| RemoteConfigError::Io {
+            path: remotes_path.display().to_string(),
+            source,
+        })
+    };
+
+    write_io(write_table_row(out, &headers, &widths))?;
+    for row in &rows {
+        let cells: [&str; 5] = [&row[0], &row[1], &row[2], &row[3], &row[4]];
+        write_io(write_table_row(out, &cells, &widths))?;
+    }
+    Ok(())
+}
+
+/// Write one table row, two-space gap between columns, last column is not
+/// padded (avoids trailing whitespace).
+fn write_table_row(
+    out: &mut dyn std::io::Write,
+    cells: &[&str; 5],
+    widths: &[usize; 5],
+) -> std::io::Result<()> {
+    for i in 0..4 {
+        write!(out, "{:<width$}  ", cells[i], width = widths[i])?;
+    }
+    writeln!(out, "{}", cells[4])
+}
+
+// ---------------------------------------------------------------------------
+// `remote remove` — registry-only. Does not touch the remote host.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum RemoteRemoveError {
+    #[error(
+        "No remote named '{name}'. Run `dot-agent-deck remote list` to see configured remotes."
+    )]
+    UnknownName { name: String },
+    #[error(transparent)]
+    Registry(#[from] RemoteConfigError),
+}
+
+/// Remove the registry entry for `name`. Returns the removed entry so callers
+/// can confirm what was deleted. **Does not** touch the remote host — no
+/// hooks uninstall, no binary cleanup, no ssh call.
+pub fn remove(name: &str, remotes_path: &Path) -> Result<RemoteEntry, RemoteRemoveError> {
+    let mut registry = RemotesFile::load(remotes_path)?;
+    let idx = registry
+        .remotes
+        .iter()
+        .position(|r| r.name == name)
+        .ok_or_else(|| RemoteRemoveError::UnknownName {
+            name: name.to_string(),
+        })?;
+    let removed = registry.remotes.remove(idx);
+    // If this was the last entry, `registry.remotes` is now an empty Vec —
+    // serde will emit `remotes = []` so the file remains valid TOML for
+    // future loads.
+    registry.save(remotes_path)?;
+    Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
+// `remote upgrade` — re-run the install pipeline against an existing entry.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct UpgradeOptions {
+    pub name: String,
+    pub version: String,
+    pub no_install: bool,
+    pub release_base: String,
+}
+
+#[derive(Debug, Error)]
+pub enum RemoteUpgradeError {
+    #[error(
+        "No remote named '{name}'. Run `dot-agent-deck remote list` to see configured remotes."
+    )]
+    UnknownName { name: String },
+    /// The install + version-check pipeline shared with `add` already covers
+    /// version validation, ssh transport errors, arch detection, install
+    /// failure, version mismatch, and registry I/O — wrap that error type
+    /// rather than duplicating the variants. Two manual `From` impls below
+    /// keep the `?` ergonomics for `SshError` and `RemoteConfigError`.
+    #[error(transparent)]
+    Inner(#[from] RemoteAddError),
+}
+
+impl From<SshError> for RemoteUpgradeError {
+    fn from(e: SshError) -> Self {
+        RemoteUpgradeError::Inner(e.into())
+    }
+}
+
+impl From<RemoteConfigError> for RemoteUpgradeError {
+    fn from(e: RemoteConfigError) -> Self {
+        RemoteUpgradeError::Inner(e.into())
+    }
+}
+
+/// Run the `upgrade` flow. Validates `version`, looks up the existing entry,
+/// re-runs install + version-check, then updates the registry's `version`
+/// and `upgraded_at` fields. `added_at` stays at the original registration
+/// timestamp.
+pub fn upgrade(
+    opts: &UpgradeOptions,
+    executor: &dyn SshExecutor,
+    remotes_path: &Path,
+) -> Result<RemoteEntry, RemoteUpgradeError> {
+    // 1. Version validation BEFORE any ssh call (mirrors `add`).
+    let version = validate_version_string(&opts.version)?;
+
+    // 2. Lookup. Unknown name short-circuits before any ssh work.
+    let mut registry = RemotesFile::load(remotes_path)?;
+    let idx = registry
+        .remotes
+        .iter()
+        .position(|r| r.name == opts.name)
+        .ok_or_else(|| RemoteUpgradeError::UnknownName {
+            name: opts.name.clone(),
+        })?;
+
+    let target = {
+        let entry = &registry.remotes[idx];
+        SshTarget::parse(
+            &entry.host,
+            entry.port,
+            entry.key.as_ref().map(PathBuf::from),
+        )
+    };
+
+    // 3. Reachability + arch detect.
+    let uname = executor.run(&target, "uname -s -m")?;
+    if uname.status != 0 {
+        return Err(RemoteAddError::UnameFailed {
+            status: uname.status,
+            stderr: uname.stderr,
+        }
+        .into());
+    }
+    let platform =
+        detect_platform(&uname.stdout).ok_or_else(|| RemoteAddError::UnsupportedArch {
+            arch: uname.stdout.trim().to_string(),
+        })?;
+
+    // 4. Install + version-check (shared with `add`).
+    install_and_verify(
+        executor,
+        &target,
+        platform,
+        &version,
+        &opts.release_base,
+        opts.no_install,
+    )?;
+
+    // 5. Update registry. `added_at` stays at the original registration
+    //    timestamp; `upgraded_at` records the most recent upgrade so users
+    //    can see both moments without losing the registration history.
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = &mut registry.remotes[idx];
+    entry.version = version.clone();
+    entry.upgraded_at = Some(now);
+    let updated = entry.clone();
+    registry.save(remotes_path)?;
+
+    println!(
+        "Upgraded remote '{}' to version {}.",
+        opts.name, updated.version,
+    );
+
+    Ok(updated)
 }
 
 // ---------------------------------------------------------------------------
@@ -937,6 +1223,7 @@ mod tests {
                     key: Some("~/.ssh/id_ed25519".to_string()),
                     version: "0.24.5".to_string(),
                     added_at: "2026-05-09T01:23:45+00:00".to_string(),
+                    upgraded_at: None,
                 },
                 RemoteEntry {
                     name: "lab".to_string(),
@@ -946,6 +1233,7 @@ mod tests {
                     key: None,
                     version: "0.24.5".to_string(),
                     added_at: "2026-05-09T02:00:00+00:00".to_string(),
+                    upgraded_at: None,
                 },
             ],
         };

@@ -226,6 +226,7 @@ fn remote_add_duplicate_name_rejected() {
             key: None,
             version: "0.24.5".to_string(),
             added_at: "2026-05-09T01:00:00+00:00".to_string(),
+            upgraded_at: None,
         }],
     };
     pre.save(&path).unwrap();
@@ -393,6 +394,7 @@ fn remotes_toml_round_trip() {
                 key: Some("~/.ssh/id_ed25519".to_string()),
                 version: "0.24.5".to_string(),
                 added_at: "2026-05-09T01:23:45+00:00".to_string(),
+                upgraded_at: None,
             },
             RemoteEntry {
                 name: "b".to_string(),
@@ -402,6 +404,7 @@ fn remotes_toml_round_trip() {
                 key: None,
                 version: "0.24.5".to_string(),
                 added_at: "2026-05-09T02:00:00+00:00".to_string(),
+                upgraded_at: None,
             },
         ],
     };

@@ -162,6 +162,30 @@ enum RemoteCmd {
         #[arg(long = "no-install")]
         no_install: bool,
     },
+    /// Print the configured remotes from the local registry. Offline metadata
+    /// only — does not probe remote hosts.
+    List,
+    /// Remove a remote from the local registry. Does not touch the remote
+    /// host (the binary and hooks remain installed there until you ssh in
+    /// and clean them up explicitly).
+    Remove {
+        /// Friendly name of the registry entry to remove.
+        name: String,
+    },
+    /// Re-run the binary install flow against an existing entry, then bump
+    /// the registry's version field.
+    Upgrade {
+        /// Friendly name of the registry entry to upgrade.
+        name: String,
+        /// Target version. Defaults to the local client's version.
+        #[arg(long, default_value = env!("DAD_VERSION"))]
+        version: String,
+        /// Skip binary install. Useful when the user has already swapped the
+        /// binary on the remote and just wants the registry's version field
+        /// updated.
+        #[arg(long = "no-install")]
+        no_install: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -390,6 +414,53 @@ fn main() -> ExitCode {
                 let path = dot_agent_deck::remote::default_remotes_path();
                 let executor = dot_agent_deck::remote::SystemSshExecutor::new();
                 match dot_agent_deck::remote::add(&opts, &executor, &path) {
+                    Ok(_) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            RemoteCmd::List => {
+                let path = dot_agent_deck::remote::default_remotes_path();
+                let mut stdout = std::io::stdout().lock();
+                match dot_agent_deck::remote::list(&path, &mut stdout) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            RemoteCmd::Remove { name } => {
+                let path = dot_agent_deck::remote::default_remotes_path();
+                match dot_agent_deck::remote::remove(&name, &path) {
+                    Ok(_) => {
+                        println!(
+                            "Removed remote '{name}' from local registry. The dot-agent-deck binary on the remote and its hooks are unaffected; if you want to clean those up, ssh in and run `dot-agent-deck hooks uninstall` and `rm ~/.local/bin/dot-agent-deck`."
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            RemoteCmd::Upgrade {
+                name,
+                version,
+                no_install,
+            } => {
+                let opts = dot_agent_deck::remote::UpgradeOptions {
+                    name,
+                    version,
+                    no_install,
+                    release_base: dot_agent_deck::remote::RELEASE_BASE.to_string(),
+                };
+                let path = dot_agent_deck::remote::default_remotes_path();
+                let executor = dot_agent_deck::remote::SystemSshExecutor::new();
+                match dot_agent_deck::remote::upgrade(&opts, &executor, &path) {
                     Ok(_) => ExitCode::SUCCESS,
                     Err(e) => {
                         eprintln!("{e}");
