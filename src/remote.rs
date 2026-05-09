@@ -280,8 +280,18 @@ impl SshExecutor for SystemSshExecutor {
 /// deadline around the spawned child.
 ///
 /// Behavior:
-/// - Pipes stdout/stderr so the captured `Output` mirrors what `cmd.output()`
-///   would have returned on a clean exit.
+/// - Nulls stdin so the child can't read from the user's terminal — mirrors
+///   `Command::output()`'s implicit stdin nulling. Important because the
+///   probe is meant to be non-interactive (`BatchMode=yes`); without this,
+///   a tampered remote binary or wrapping shell could observe local input
+///   for up to the deadline.
+/// - Pipes stdout/stderr and drains them concurrently in two helper threads
+///   while the main loop polls `child.try_wait()`. This is what
+///   `Command::output()` does internally, and it's required for any child
+///   producing more output than a single pipe buffer (~64 KiB on Linux):
+///   without concurrent draining, the child blocks in `write(2)` before it
+///   can exit, `try_wait` keeps returning `None`, and the wallclock fires
+///   even though the child wasn't actually stalled.
 /// - Polls `child.try_wait()` every 50ms until the deadline. Polling cadence
 ///   is a wallclock-vs-CPU tradeoff; 50ms keeps the worst-case overshoot
 ///   under a tick while costing ~20 syscalls/sec.
@@ -289,40 +299,91 @@ impl SshExecutor for SystemSshExecutor {
 ///   return [`SshError::Other`] so the connect-layer mapper folds it into
 ///   `HostUnreachable` (the right user-visible classification — the user's
 ///   recourse is the same as transport-unreachable).
+/// - Computes the deadline with `Instant::checked_add` so an absurd `secs`
+///   (e.g. `u64::MAX`) can never panic between `spawn` and the polling
+///   loop and leak the child — the caller in `connect.rs` already clamps
+///   to a sane upper bound, this is belt-and-suspenders.
 fn run_with_wallclock_kill(
     cmd: &mut Command,
     target: &SshTarget,
     secs: u64,
 ) -> Result<std::process::Output, SshError> {
+    use std::io::Read;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|source| SshError::Io {
         target: target.user_host(),
         source,
     })?;
 
-    let deadline = Instant::now() + Duration::from_secs(secs);
+    // Drain stdout/stderr in dedicated threads so children that produce more
+    // than a pipe buffer don't deadlock waiting for us to read. The threads
+    // own the pipe handles via `take()`; on every exit path below we join
+    // them to recover the captured bytes (and to avoid leaking handles).
+    let stdout_handle = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    // `checked_add` keeps an absurd `secs` from panicking after spawn (the
+    // unwinding `Child` drop wouldn't reap the live ssh process). On
+    // overflow we fall back to a far-future deadline; the clamp in
+    // `connect::probe_timeout_secs` already prevents this in practice.
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(secs))
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
     let poll_interval = Duration::from_millis(50);
+
+    let join_pipes = |stdout_handle: Option<std::thread::JoinHandle<Vec<u8>>>,
+                      stderr_handle: Option<std::thread::JoinHandle<Vec<u8>>>|
+     -> (Vec<u8>, Vec<u8>) {
+        let stdout = stdout_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        (stdout, stderr)
+    };
 
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                // Child reaped already; wait_with_output reads the piped
-                // stdout/stderr to EOF and returns the cached status.
-                return child.wait_with_output().map_err(|source| SshError::Io {
-                    target: target.user_host(),
-                    source,
+            Ok(Some(status)) => {
+                // Child already exited; close the pipes by joining the
+                // drain threads (they will see EOF once the kernel reaps
+                // the writers) and assemble an Output mirroring what
+                // `Command::output()` would have returned.
+                let (stdout, stderr) = join_pipes(stdout_handle, stderr_handle);
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
                 });
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     // Best-effort cleanup: ignore secondary errors. SIGKILL
                     // is unblockable so the child is guaranteed to be
-                    // reaped, and `wait` collects the zombie.
+                    // reaped, and `wait` collects the zombie. Joining the
+                    // drain threads after kill ensures their pipe handles
+                    // don't outlive this function.
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = join_pipes(stdout_handle, stderr_handle);
                     return Err(SshError::Other {
                         target: target.user_host(),
                         detail: format!(
@@ -335,6 +396,7 @@ fn run_with_wallclock_kill(
             Err(source) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = join_pipes(stdout_handle, stderr_handle);
                 return Err(SshError::Io {
                     target: target.user_host(),
                     source,
@@ -1255,6 +1317,78 @@ mod tests {
         assert!(
             stdout.contains("dot-agent-deck 0.24.5"),
             "captured stdout must contain echoed line: {stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_wallclock_kill_nulls_stdin() {
+        // Regression: prior to the stdin(Stdio::null()) fix, the helper
+        // inherited the user's terminal stdin for up to the deadline. A
+        // command that reads stdin (e.g. `/bin/cat` with no args) would
+        // have wedged on inherited input until the wallclock fired. With
+        // stdin nulled, the child sees EOF and exits cleanly well before
+        // the 1s budget. The exact exit status doesn't matter — what we
+        // assert is that we did NOT take the wallclock-kill path (no
+        // SshError::Other "wallclock" detail, and elapsed << budget).
+        use std::time::Instant;
+        let target = SshTarget::parse("u@h", 22, None);
+        let mut cmd = Command::new("/bin/cat");
+        let start = Instant::now();
+        let result = run_with_wallclock_kill(&mut cmd, &target, 1);
+        let elapsed = start.elapsed();
+        match result {
+            Ok(_) => {}
+            Err(SshError::Other { detail, .. }) if detail.contains("wallclock") => {
+                panic!(
+                    "stdin was inherited — `cat` blocked on stdin and hit the wallclock kill (detail: {detail})"
+                );
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "elapsed {elapsed:?} suggests stdin was not nulled (cat blocked until near-deadline)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_wallclock_kill_drains_large_output_without_deadlocking() {
+        // Regression: a child that writes more than a single pipe buffer
+        // (~64 KiB on Linux, ~16 KiB on macOS) used to deadlock here —
+        // without concurrent draining, the child blocks in `write(2)` before
+        // `try_wait` ever returns Some, the wallclock fires, and the helper
+        // misclassifies a healthy chatty command as a stalled remote.
+        //
+        // We use `head -c 1048576 /dev/zero` to emit exactly 1 MiB of NUL
+        // bytes — well above any platform's pipe-buffer capacity — and
+        // assert all 1 MiB landed in `output.stdout` within a generous 5s
+        // budget. The child must finish well under that; if it hits the
+        // wallclock, the regression has reappeared.
+        use std::time::Instant;
+        const SIZE: usize = 1024 * 1024;
+        let target = SshTarget::parse("u@h", 22, None);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("head -c {SIZE} /dev/zero"));
+        let start = Instant::now();
+        let output = run_with_wallclock_kill(&mut cmd, &target, 5)
+            .expect("chatty child must round-trip its full stdout, not hit the wallclock");
+        let elapsed = start.elapsed();
+        assert!(
+            output.status.success(),
+            "head must exit cleanly, got {:?}",
+            output.status
+        );
+        assert_eq!(
+            output.stdout.len(),
+            SIZE,
+            "captured stdout must contain all {SIZE} bytes; got {}",
+            output.stdout.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "elapsed {elapsed:?} suggests pipes were not being drained concurrently"
         );
     }
 

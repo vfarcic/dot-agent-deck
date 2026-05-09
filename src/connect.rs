@@ -52,8 +52,16 @@ const REMOTE_INSTALL_PATH: &str = "~/.local/bin/dot-agent-deck";
 /// `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS` — useful when a remote is reachable
 /// but slow (cold-start VMs, congested networks). The probe is intentionally
 /// short: an unresponsive remote should fail-fast rather than wedge `connect`
-/// for a TCP timeout.
+/// for a TCP timeout. The override is clamped to
+/// `[1, PROBE_TIMEOUT_SECS_MAX]` — see [`probe_timeout_secs`].
 const PROBE_TIMEOUT_SECS_DEFAULT: u64 = 10;
+/// Upper bound on the parsed env var. One hour is well above any realistic
+/// cold-start / VPN delay and prevents `Instant::now() + Duration::from_secs(secs)`
+/// from panicking on extreme values (e.g. `u64::MAX`). Without this clamp,
+/// the panic would unwind between `Command::spawn()` and the polling loop in
+/// `remote::run_with_wallclock_kill`, leaking a live ssh child because
+/// Rust's `Child` drop does not reap.
+const PROBE_TIMEOUT_SECS_MAX: u64 = 3600;
 const PROBE_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS";
 
 /// Env var the remote TUI reads to choose the M2.8 external-daemon mode.
@@ -248,19 +256,25 @@ pub enum ProbeOutcome {
 /// Invalid values fall back silently — a malformed env var should not block
 /// `connect` outright.
 ///
-/// A parsed value of `0` is clamped to `1`. Two reasons converge here:
-/// OpenSSH treats `ConnectTimeout=0` as "no explicit timeout" and
-/// `ServerAliveInterval=0` as "keepalives disabled" (so a literal 0 disables
-/// the ssh-side guard entirely), AND the laptop-side wallclock kill in
-/// `remote::run_with_wallclock_kill` would fire instantly on
-/// `Duration::from_secs(0)`. A 1-second floor avoids both fail-open modes;
-/// LAN round-trips are well under a second so it's a defensible minimum.
+/// Result is clamped to `[1, PROBE_TIMEOUT_SECS_MAX]`:
+/// - Lower bound `1`: OpenSSH treats `ConnectTimeout=0` as "no explicit
+///   timeout" and `ServerAliveInterval=0` as "keepalives disabled" (so a
+///   literal 0 disables the ssh-side guard entirely), AND the laptop-side
+///   wallclock kill in `remote::run_with_wallclock_kill` would fire instantly
+///   on `Duration::from_secs(0)`. A 1-second floor avoids both fail-open
+///   modes; LAN round-trips are well under a second so it's a defensible
+///   minimum.
+/// - Upper bound `PROBE_TIMEOUT_SECS_MAX` (one hour): prevents
+///   `Instant::now() + Duration::from_secs(secs)` from panicking on absurd
+///   values (e.g. `u64::MAX`). The clamp closes a self-DoS / ssh-child-leak
+///   path: without it, an extreme env var would panic *after* the ssh child
+///   was spawned, and `Child::drop` does not reap.
 fn probe_timeout_secs() -> u64 {
     std::env::var(PROBE_TIMEOUT_ENV)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(PROBE_TIMEOUT_SECS_DEFAULT)
-        .max(1)
+        .clamp(1, PROBE_TIMEOUT_SECS_MAX)
 }
 
 /// Pull the version number out of `dot-agent-deck --version` output.
@@ -1269,6 +1283,35 @@ mod tests {
             1,
             "explicit 0 must clamp to 1 to avoid disabling the timeout guard"
         );
+    }
+
+    #[test]
+    fn probe_timeout_secs_clamps_upper_bound() {
+        // u64::MAX would overflow `Instant::now() + Duration::from_secs(secs)`
+        // on most platforms, panicking after `Command::spawn()` and leaking
+        // a live ssh child (Child::drop does not reap). Clamping to
+        // PROBE_TIMEOUT_SECS_MAX both bounds wallclock waits at a sane
+        // ceiling and removes the panic vector entirely.
+        let _guard = ProbeTimeoutEnvGuard::new();
+        unsafe {
+            std::env::set_var(PROBE_TIMEOUT_ENV, u64::MAX.to_string());
+        }
+        assert_eq!(
+            probe_timeout_secs(),
+            PROBE_TIMEOUT_SECS_MAX,
+            "u64::MAX must clamp to PROBE_TIMEOUT_SECS_MAX to avoid Instant overflow"
+        );
+
+        // A value just above the cap also clamps; a value at the cap is
+        // kept exactly (clamp is inclusive).
+        unsafe {
+            std::env::set_var(PROBE_TIMEOUT_ENV, "3601");
+        }
+        assert_eq!(probe_timeout_secs(), PROBE_TIMEOUT_SECS_MAX);
+        unsafe {
+            std::env::set_var(PROBE_TIMEOUT_ENV, "3600");
+        }
+        assert_eq!(probe_timeout_secs(), PROBE_TIMEOUT_SECS_MAX);
     }
 
     // ----- parse_version_output edge cases -----
