@@ -344,6 +344,42 @@ fn version_string_with_shell_metacharacters_rejected() {
 }
 
 #[test]
+fn remote_add_normalizes_v_prefixed_version_end_to_end() {
+    // Regression: `--version v0.24.5` previously built `/vv0.24.5/` URLs that
+    // 404'd on GitHub, and the post-install version comparison ("0.24.5" vs
+    // "v0.24.5") failed. Both must succeed once the input is normalized.
+    let dir = tempfile::tempdir().unwrap();
+    let path = registry_path(&dir);
+
+    let executor = FakeSshExecutor::new(vec![
+        ok("Linux x86_64\n"),
+        ok(""),
+        ok("dot-agent-deck 0.24.5\n"),
+        ok("Installed hooks\n"),
+    ]);
+
+    let mut o = opts("hetzner-1", "viktor@hetzner-1.example.com", false);
+    o.version = "v0.24.5".to_string();
+    let entry = add(&o, &executor, &path).expect("v-prefixed version must succeed");
+
+    let cmds = executor.commands();
+    assert!(
+        cmds[1].contains("/v0.24.5/dot-agent-deck-linux-amd64"),
+        "URL must have exactly one `v` before the version: {}",
+        cmds[1]
+    );
+    assert!(
+        !cmds[1].contains("vv0.24.5"),
+        "URL must not contain `vv`: {}",
+        cmds[1]
+    );
+
+    // Registry stores the canonical unprefixed form.
+    assert_eq!(entry.version, "0.24.5");
+    assert_eq!(load_registry(&path).remotes[0].version, "0.24.5");
+}
+
+#[test]
 fn remotes_toml_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("remotes.toml");

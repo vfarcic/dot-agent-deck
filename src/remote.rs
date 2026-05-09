@@ -428,13 +428,18 @@ fn version_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(VERSION_PATTERN).expect("static version regex compiles"))
 }
 
-/// Validate a user-supplied version string before it is interpolated into a
-/// URL or a remote shell command. Anything that doesn't look like a SemVer
-/// version is rejected — this is the primary defense against shell injection
-/// via `--version` (e.g. `0.24.5; rm -rf ~`).
-pub fn validate_version_string(version: &str) -> Result<(), RemoteAddError> {
+/// Validate a user-supplied version string and return its canonical
+/// unprefixed form. Anything that doesn't look like a SemVer version is
+/// rejected — this is the primary defense against shell injection via
+/// `--version` (e.g. `0.24.5; rm -rf ~`).
+///
+/// Convention: internally we always carry the *unprefixed* form (`0.24.5`).
+/// The URL builder and any other consumer that needs the `v`-prefixed form
+/// (GitHub release tag) prepends `v` themselves. The user may type either
+/// `0.24.5` or `v0.24.5`; both normalize to `0.24.5`.
+pub fn validate_version_string(version: &str) -> Result<String, RemoteAddError> {
     if version_regex().is_match(version) {
-        Ok(())
+        Ok(version.strip_prefix('v').unwrap_or(version).to_string())
     } else {
         Err(RemoteAddError::InvalidVersion {
             input: version.to_string(),
@@ -445,13 +450,14 @@ pub fn validate_version_string(version: &str) -> Result<(), RemoteAddError> {
 /// Build the install URL and the remote shell command. Validates `version`
 /// internally as a defense-in-depth so that even an internal misuse (a code
 /// path that bypassed the entry-point check in `add()`) cannot slip a shell
-/// metacharacter into the remote command.
+/// metacharacter into the remote command. Accepts both `0.24.5` and `v0.24.5`
+/// — see `validate_version_string` for the normalization convention.
 fn build_install_command(
     release_base: &str,
     version: &str,
     platform: &str,
 ) -> Result<(String, String), RemoteAddError> {
-    validate_version_string(version)?;
+    let version = validate_version_string(version)?;
     let url = format!("{release_base}/v{version}/dot-agent-deck-{platform}");
     let install_cmd = format!(
         "mkdir -p ~/.local/bin && curl -fsSL {url} -o ~/.local/bin/dot-agent-deck && chmod 0755 ~/.local/bin/dot-agent-deck"
@@ -501,8 +507,12 @@ pub fn add(
     // 2. Version validation — runs BEFORE any ssh call or URL construction so
     //    a malicious `--version` (e.g. `0.24.5; rm -rf ~`) can't reach the
     //    remote shell. Asserted by the `version_string_with_shell_metacharacters_rejected`
-    //    test, which checks zero ssh calls were attempted.
-    validate_version_string(&opts.version)?;
+    //    test, which checks zero ssh calls were attempted. We use the
+    //    normalized (unprefixed) form everywhere downstream so that whether
+    //    the user typed `0.24.5` or `v0.24.5`, the URL gets exactly one `v`
+    //    and the post-install version comparison matches the binary's
+    //    unprefixed `--version` output.
+    let version = validate_version_string(&opts.version)?;
 
     // 3. Uniqueness check — done *before* any ssh call so a duplicate name
     //    short-circuits without bothering the remote (and lets the
@@ -536,14 +546,14 @@ pub fn add(
         if v.status != 0 {
             return Err(RemoteAddError::VersionMismatch {
                 actual: format!("(exit {}) {}", v.status, v.stderr.trim()),
-                expected: opts.version.clone(),
+                expected: version.clone(),
             });
         }
         let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
-        if actual != opts.version {
+        if actual != version {
             return Err(RemoteAddError::VersionMismatch {
                 actual,
-                expected: opts.version.clone(),
+                expected: version.clone(),
             });
         }
     } else {
@@ -551,12 +561,11 @@ pub fn add(
         // we get one stderr+exit pair instead of three round-trips' worth
         // to disentangle. `build_install_command` re-validates the version
         // (defense in depth) so even an internal misuse can't shell-inject.
-        let (url, install_cmd) =
-            build_install_command(&opts.release_base, &opts.version, platform)?;
+        let (url, install_cmd) = build_install_command(&opts.release_base, &version, platform)?;
         let install = executor.run(&target, &install_cmd)?;
         if install.status != 0 {
             return Err(RemoteAddError::DownloadFailed {
-                version: opts.version.clone(),
+                version: version.clone(),
                 platform: platform.to_string(),
                 url,
                 detail: format!("exit {}: {}", install.status, install.stderr.trim()),
@@ -566,14 +575,14 @@ pub fn add(
         if v.status != 0 {
             return Err(RemoteAddError::VersionMismatch {
                 actual: format!("(exit {}) {}", v.status, v.stderr.trim()),
-                expected: opts.version.clone(),
+                expected: version.clone(),
             });
         }
         let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
-        if actual != opts.version {
+        if actual != version {
             return Err(RemoteAddError::VersionMismatch {
                 actual,
-                expected: opts.version.clone(),
+                expected: version.clone(),
             });
         }
     }
@@ -610,7 +619,7 @@ pub fn add(
             .and_then(|p| p.as_os_str().to_str())
             .map(|s| s.to_string())
             .or_else(|| opts.key.as_ref().map(|p| p.to_string_lossy().into_owned())),
-        version: opts.version.clone(),
+        version: version.clone(),
         added_at: chrono::Utc::now().to_rfc3339(),
     };
     registry.remotes.push(entry.clone());
@@ -619,7 +628,7 @@ pub fn add(
     // 7. Final success line.
     println!(
         "Added remote '{}' (ssh: {}, version {}). Run `dot-agent-deck connect {}` to attach.",
-        opts.name, opts.target, opts.version, opts.name,
+        opts.name, opts.target, version, opts.name,
     );
 
     Ok(entry)
@@ -754,6 +763,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_version_string_strips_optional_v_prefix() {
+        // The canonical internal form is unprefixed — both inputs normalize
+        // to `0.24.5`. Without this, `--version v0.24.5` would build a URL
+        // with `vv` in the release-tag segment and 404 on GitHub.
+        assert_eq!(
+            validate_version_string("v0.24.5").unwrap(),
+            "0.24.5".to_string()
+        );
+        assert_eq!(
+            validate_version_string("0.24.5").unwrap(),
+            "0.24.5".to_string()
+        );
+        // Pre-release suffixes are preserved; only the leading `v` is stripped.
+        assert_eq!(
+            validate_version_string("v1.0.0-rc.1").unwrap(),
+            "1.0.0-rc.1".to_string()
+        );
+    }
+
+    #[test]
     fn validate_version_string_rejects_malformed() {
         for v in [
             "",
@@ -779,6 +808,43 @@ mod tests {
         let err = build_install_command("https://example.test", "0.24.5; rm -rf ~", "linux-amd64")
             .expect_err("malicious version must be rejected by the builder too");
         assert!(matches!(err, RemoteAddError::InvalidVersion { .. }));
+    }
+
+    #[test]
+    fn build_install_command_url_unprefixed_version() {
+        let (url, install_cmd) =
+            build_install_command("https://example.test/releases", "0.24.5", "linux-amd64")
+                .expect("valid version must build an install command");
+        assert_eq!(
+            url,
+            "https://example.test/releases/v0.24.5/dot-agent-deck-linux-amd64"
+        );
+        assert!(install_cmd.contains(&url));
+    }
+
+    #[test]
+    fn build_install_command_url_normalizes_v_prefixed_version() {
+        // Regression: prior to normalization, `v0.24.5` produced a URL with
+        // `vv0.24.5/` and 404'd on GitHub. The builder must strip the leading
+        // `v` so exactly one `v` precedes the version segment.
+        let (url_v, _) =
+            build_install_command("https://example.test/releases", "v0.24.5", "linux-amd64")
+                .expect("v-prefixed version must be accepted");
+        let (url_plain, _) =
+            build_install_command("https://example.test/releases", "0.24.5", "linux-amd64")
+                .expect("plain version must be accepted");
+        assert_eq!(
+            url_v, url_plain,
+            "URL must be the same regardless of leading-`v` input"
+        );
+        assert_eq!(
+            url_v,
+            "https://example.test/releases/v0.24.5/dot-agent-deck-linux-amd64"
+        );
+        assert!(
+            !url_v.contains("vv"),
+            "URL must contain exactly one `v` before the version: {url_v}"
+        );
     }
 
     #[test]
