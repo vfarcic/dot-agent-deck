@@ -34,10 +34,14 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::task::JoinHandle;
 
+use crate::daemon_protocol::{
+    AttachRequest, AttachResponse, KIND_REQ, KIND_RESP, read_frame, write_frame,
+};
 use crate::remote::{RemoteConfigError, RemoteEntry, RemotesFile, SshTarget, SystemSshExecutor};
 
 /// Mode for the bridge socket: owner-only read/write. The bridge carries the
@@ -72,6 +76,30 @@ pub enum RemoteConnectError {
     NoRemotesConfigured,
     #[error("Invalid selection after {attempts} attempts; aborting.")]
     PickerGaveUp { attempts: usize },
+    /// Connect-blocking: ssh failed to establish a session with the remote.
+    /// Could be network (DNS, refused, timeout, route), auth (publickey,
+    /// password denied), or host-key trust. The captured `detail` is ssh's
+    /// stderr verbatim — surface it to the user so they can disambiguate.
+    #[error(
+        "Cannot reach remote '{name}' ({host}): {detail}\n\
+         Check network connectivity, your ssh config, or run `ssh {host}` once manually to confirm."
+    )]
+    HostUnreachable {
+        name: String,
+        host: String,
+        detail: String,
+    },
+    /// Connect-blocking: ssh reached the host, but the daemon binary on the
+    /// other end is missing, broken, or speaks a wire format we don't
+    /// understand. Most common cause is a stale or unfinished install — the
+    /// suggested fix is `remote upgrade <name>`. Version-mismatch is rolled
+    /// into this variant intentionally: per `Out of Scope`/Phase 4, we don't
+    /// surface a separate "version skew" UX in M2.6.
+    #[error(
+        "Daemon on remote '{name}' is not responding: {detail}\n\
+         Run `dot-agent-deck remote upgrade {name}` to (re)install the daemon binary on the remote."
+    )]
+    DaemonUnavailable { name: String, detail: String },
     #[error(transparent)]
     Registry(#[from] RemoteConfigError),
     #[error("Bridge I/O error: {0}")]
@@ -235,11 +263,236 @@ fn build_tokio_ssh_command(target: &SshTarget, remote_command: &str) -> TokioCom
     TokioCommand::from(std_cmd)
 }
 
+// ---------------------------------------------------------------------------
+// M2.6 — probe-then-bridge (failure-mode-aware connect)
+// ---------------------------------------------------------------------------
+
+/// Result of running ssh + a single `list-agents` request against the remote
+/// before bringing up the persistent bridge. Captured as raw bytes/strings so
+/// the classification step can be a pure function tested without any ssh
+/// subprocess in the loop.
+#[derive(Debug, Default)]
+pub struct ProbeOutcome {
+    /// ssh process exit status. `None` if the process was killed by signal
+    /// or never spawned.
+    pub exit_status: Option<i32>,
+    /// stderr captured from the ssh subprocess. Carries both transport-side
+    /// errors (ssh's own diagnostics on exit 255) and remote-shell errors
+    /// (e.g. `bash: dot-agent-deck: command not found` when the daemon
+    /// binary is missing on the far side).
+    pub stderr: String,
+    /// Successfully parsed RESP frame, if one came back. `None` if no RESP
+    /// arrived (ssh died before answering, EOF mid-frame, malformed JSON).
+    pub response: Option<AttachResponse>,
+}
+
+/// Pure classification: turn a probe outcome into either the agent list or a
+/// typed connect-blocking error. Pulled out so unit tests can exercise every
+/// failure mode without a real ssh subprocess. The real `probe_remote`
+/// orchestrates the subprocess and then calls into here.
+fn classify_probe_outcome(
+    name: &str,
+    target: &SshTarget,
+    outcome: ProbeOutcome,
+) -> Result<Vec<String>, RemoteConnectError> {
+    // 1. The daemon answered. A successful RESP is the happy path; an
+    //    error RESP means the wire format works but the operation failed
+    //    (almost always version skew per the PRD's Out-of-Scope), so
+    //    surface `DaemonUnavailable` with the daemon's own error string.
+    if let Some(resp) = outcome.response {
+        if resp.ok {
+            return Ok(resp.agents.unwrap_or_default());
+        }
+        return Err(RemoteConnectError::DaemonUnavailable {
+            name: name.to_string(),
+            detail: resp
+                .error
+                .unwrap_or_else(|| "daemon returned an error response".to_string()),
+        });
+    }
+
+    // 2. No RESP. Inspect stderr + exit status.
+    let stderr = outcome.stderr.trim();
+    let lower = stderr.to_ascii_lowercase();
+
+    // "Daemon binary missing" — POSIX shells emit `command not found` (or
+    // `not found` on ksh/sh) and exit 127. Check this BEFORE the generic
+    // transport patterns because both branches end up routing `Permission
+    // denied`-like substrings; the binary-missing case is more specific.
+    let daemon_missing = lower.contains("command not found")
+        || lower.contains(": not found")
+        || lower.contains("no such file or directory")
+        || lower.contains("executable file not found")
+        || lower.contains("cannot execute")
+        || outcome.exit_status == Some(127);
+
+    if daemon_missing {
+        return Err(RemoteConnectError::DaemonUnavailable {
+            name: name.to_string(),
+            detail: if stderr.is_empty() {
+                format!(
+                    "ssh exited {} with no stderr — daemon binary likely missing on the remote",
+                    outcome
+                        .exit_status
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "(signalled)".into())
+                )
+            } else {
+                stderr.to_string()
+            },
+        });
+    }
+
+    // Transport / auth / host-key — anything ssh itself emits on exit 255,
+    // plus host-key trust prompts that fail under BatchMode.
+    let transport_failure = lower.contains("connection refused")
+        || lower.contains("network is unreachable")
+        || lower.contains("no route to host")
+        || lower.contains("could not resolve hostname")
+        || lower.contains("connection timed out")
+        || lower.contains("permission denied")
+        || lower.contains("publickey")
+        || lower.contains("host key verification failed")
+        || lower.contains("remote host identification has changed")
+        || outcome.exit_status == Some(255);
+
+    if transport_failure {
+        return Err(RemoteConnectError::HostUnreachable {
+            name: name.to_string(),
+            host: target.user_host(),
+            detail: if stderr.is_empty() {
+                "ssh exited 255 with no diagnostic".to_string()
+            } else {
+                stderr.to_string()
+            },
+        });
+    }
+
+    // Default: ssh exited with an unrecognized signature. Treat as
+    // DaemonUnavailable rather than HostUnreachable — if ssh had failed at
+    // the transport layer it would have said so, so the most likely cause
+    // is the daemon binary itself misbehaving.
+    Err(RemoteConnectError::DaemonUnavailable {
+        name: name.to_string(),
+        detail: if stderr.is_empty() {
+            format!(
+                "ssh exited {} with no stderr and no daemon response",
+                outcome
+                    .exit_status
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "(signalled)".into())
+            )
+        } else {
+            stderr.to_string()
+        },
+    })
+}
+
+/// Probe the remote daemon: spawn a one-shot `ssh ... dot-agent-deck daemon
+/// attach`, send a single `list-agents` request, capture the response and
+/// stderr, then classify the outcome. On success returns the agent IDs (the
+/// caller uses an empty list to print the M2.6 empty-state hint); on failure
+/// returns a typed `HostUnreachable` or `DaemonUnavailable` error.
+///
+/// Architecture B from the M2.6 plan: today's `daemon_protocol::handle_connection`
+/// reads exactly ONE request frame per connection and then closes, so a
+/// "probe + handoff" on the same ssh stdio is not viable without a protocol
+/// change. Two ssh invocations cost an extra login (~sub-second on a warm
+/// link, free with persistent control sockets) but keep the protocol
+/// semantics clean.
+pub async fn probe_remote(
+    target: &SshTarget,
+    name: &str,
+) -> Result<Vec<String>, RemoteConnectError> {
+    let outcome = run_probe_subprocess(target).await;
+    classify_probe_outcome(name, target, outcome)
+}
+
+/// Production probe: spawn ssh with stdin/stdout/stderr piped, write the
+/// list-agents REQ, read one RESP, drain stderr concurrently, wait for ssh
+/// to exit, and return the captured outcome. No classification here — that's
+/// `classify_probe_outcome`'s job.
+async fn run_probe_subprocess(target: &SshTarget) -> ProbeOutcome {
+    let mut cmd = build_tokio_ssh_command(target, "dot-agent-deck daemon attach");
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return ProbeOutcome {
+                exit_status: None,
+                stderr: format!("failed to spawn ssh: {e}"),
+                response: None,
+            };
+        }
+    };
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("Stdio::piped() guarantees stdin handle");
+    let mut stdout = child
+        .stdout
+        .take()
+        .expect("Stdio::piped() guarantees stdout handle");
+    let mut stderr = child
+        .stderr
+        .take()
+        .expect("Stdio::piped() guarantees stderr handle");
+
+    // Drain stderr concurrently so a chatty ssh can't fill the pipe buffer
+    // and deadlock our send/recv path. The task ends naturally on EOF when
+    // ssh exits and stderr closes.
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf).await;
+        buf
+    });
+
+    // Send the list-agents request. The remote `dot-agent-deck daemon attach`
+    // bridge forwards this to the local daemon's attach socket, which replies
+    // with one RESP frame and closes the connection (per
+    // `daemon_protocol::handle_connection`).
+    let payload = serde_json::to_vec(&AttachRequest::ListAgents).expect("serialize ListAgents");
+    let send_ok = write_frame(&mut stdin, KIND_REQ, &payload).await.is_ok();
+    // Drop stdin so the bridge doesn't sit waiting for more frames after the
+    // RESP closes the daemon side.
+    drop(stdin);
+
+    let response = if send_ok {
+        match read_frame(&mut stdout).await {
+            Ok(Some((KIND_RESP, payload))) => {
+                serde_json::from_slice::<AttachResponse>(&payload).ok()
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let status = child.wait().await.ok().and_then(|s| s.code());
+    let stderr_text = stderr_task.await.unwrap_or_default();
+
+    ProbeOutcome {
+        exit_status: status,
+        stderr: stderr_text,
+        response,
+    }
+}
+
 /// Start the bridge: bind the socket, spawn ssh, kick off the relay task.
 /// Returns the [`ConnectBridge`] for the caller to keep alive while the TUI
 /// runs. Caller is responsible for setting `DOT_AGENT_DECK_ATTACH_SOCKET` to
 /// `bridge.socket_path()` so the TUI dials the bridge instead of a local
 /// daemon.
+///
+/// M2.6: callers SHOULD run [`probe_remote`] before this so a connect-time
+/// failure surfaces as a typed error before the TUI launches. This function
+/// itself does not classify ssh transport failures — by the time it returns,
+/// the relay task is already alive and any ssh exit shows up async.
 pub async fn start_bridge(
     target: &SshTarget,
     socket_path: PathBuf,
@@ -489,6 +742,232 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    // ----- M2.6 probe classification -----
+
+    fn ssh_target() -> SshTarget {
+        SshTarget {
+            host: "remote.example.com".to_string(),
+            user: Some("viktor".to_string()),
+            port: 22,
+            key: None,
+        }
+    }
+
+    #[test]
+    fn classify_probe_success_returns_agent_list() {
+        // Happy path: daemon answered with ok=true and an agent list.
+        let outcome = ProbeOutcome {
+            exit_status: Some(0),
+            stderr: String::new(),
+            response: Some(AttachResponse {
+                ok: true,
+                error: None,
+                agents: Some(vec!["alpha".to_string(), "beta".to_string()]),
+                id: None,
+            }),
+        };
+        let agents =
+            classify_probe_outcome("hetzner-1", &ssh_target(), outcome).expect("happy path Ok");
+        assert_eq!(agents, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn classify_probe_success_empty_list_is_ok_for_caller_hint() {
+        // The "no running agents" case is NOT an error — the bridge launches,
+        // the TUI launches, and main.rs prints the empty-state hint based on
+        // an empty Vec. This test pins that contract.
+        let outcome = ProbeOutcome {
+            exit_status: Some(0),
+            stderr: String::new(),
+            response: Some(AttachResponse {
+                ok: true,
+                error: None,
+                agents: Some(vec![]),
+                id: None,
+            }),
+        };
+        let agents =
+            classify_probe_outcome("hetzner-1", &ssh_target(), outcome).expect("empty list is Ok");
+        assert!(
+            agents.is_empty(),
+            "empty agent list must propagate so caller can print the hint"
+        );
+    }
+
+    #[test]
+    fn classify_probe_daemon_error_response_is_daemon_unavailable() {
+        // Wire format works, but daemon returned ok=false (most often a
+        // version-skew / unsupported request). Surface as DaemonUnavailable
+        // with the daemon's own error string in the detail.
+        let outcome = ProbeOutcome {
+            exit_status: Some(0),
+            stderr: String::new(),
+            response: Some(AttachResponse {
+                ok: false,
+                error: Some("unknown request kind".to_string()),
+                agents: None,
+                id: None,
+            }),
+        };
+        let err = classify_probe_outcome("hetzner-1", &ssh_target(), outcome)
+            .expect_err("daemon error must error");
+        match &err {
+            RemoteConnectError::DaemonUnavailable { name, detail } => {
+                assert_eq!(name, "hetzner-1");
+                assert!(
+                    detail.contains("unknown request kind"),
+                    "detail should carry daemon error verbatim: {detail}"
+                );
+            }
+            other => panic!("expected DaemonUnavailable, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("remote upgrade hetzner-1"),
+            "msg should hint at `remote upgrade <name>`: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_probe_command_not_found_is_daemon_unavailable() {
+        // Daemon binary missing on the remote: posix shell prints "command
+        // not found" and exits 127. Surface as DaemonUnavailable with the
+        // shell error verbatim and the `remote upgrade` hint visible in the
+        // Display impl.
+        let outcome = ProbeOutcome {
+            exit_status: Some(127),
+            stderr: "bash: dot-agent-deck: command not found\n".to_string(),
+            response: None,
+        };
+        let err = classify_probe_outcome("hetzner-1", &ssh_target(), outcome)
+            .expect_err("command-not-found must error");
+        match &err {
+            RemoteConnectError::DaemonUnavailable { name, detail } => {
+                assert_eq!(name, "hetzner-1");
+                assert!(
+                    detail.contains("command not found"),
+                    "detail should carry shell stderr verbatim: {detail}"
+                );
+            }
+            other => panic!("expected DaemonUnavailable, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("remote upgrade hetzner-1"),
+            "msg should hint at `remote upgrade <name>`: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_probe_exit_127_no_stderr_is_daemon_unavailable() {
+        // Some shell configurations swallow stderr on `command not found`
+        // (e.g. nologin shell, restrictive sshd config). Exit 127 alone is
+        // enough to classify as daemon-missing.
+        let outcome = ProbeOutcome {
+            exit_status: Some(127),
+            stderr: String::new(),
+            response: None,
+        };
+        let err = classify_probe_outcome("hetzner-1", &ssh_target(), outcome)
+            .expect_err("exit 127 must error");
+        match err {
+            RemoteConnectError::DaemonUnavailable { detail, .. } => {
+                assert!(
+                    detail.contains("daemon binary likely missing"),
+                    "synthetic detail should explain the exit code: {detail}"
+                );
+            }
+            other => panic!("expected DaemonUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_probe_connection_refused_is_host_unreachable() {
+        // ssh's own diagnostic on a refused connection. Exit 255 + stderr
+        // with "Connection refused".
+        let outcome = ProbeOutcome {
+            exit_status: Some(255),
+            stderr: "ssh: connect to host remote.example.com port 22: Connection refused\n"
+                .to_string(),
+            response: None,
+        };
+        let err = classify_probe_outcome("hetzner-1", &ssh_target(), outcome)
+            .expect_err("connection refused must error");
+        match &err {
+            RemoteConnectError::HostUnreachable { name, host, detail } => {
+                assert_eq!(name, "hetzner-1");
+                assert_eq!(host, "viktor@remote.example.com");
+                assert!(
+                    detail.to_lowercase().contains("connection refused"),
+                    "detail should carry ssh stderr verbatim: {detail}"
+                );
+            }
+            other => panic!("expected HostUnreachable, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Check network connectivity"),
+            "msg should hint at network/ssh config: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_probe_permission_denied_is_host_unreachable() {
+        // Auth failure under BatchMode=yes — ssh exits 255 with "Permission
+        // denied (publickey)". Treat as HostUnreachable: the daemon may be
+        // perfectly fine, but we can't get there to find out.
+        let outcome = ProbeOutcome {
+            exit_status: Some(255),
+            stderr: "viktor@remote.example.com: Permission denied (publickey).\n".to_string(),
+            response: None,
+        };
+        let err = classify_probe_outcome("hetzner-1", &ssh_target(), outcome)
+            .expect_err("permission denied must error");
+        match err {
+            RemoteConnectError::HostUnreachable { detail, .. } => {
+                assert!(
+                    detail.to_lowercase().contains("permission denied"),
+                    "detail should carry ssh stderr verbatim: {detail}"
+                );
+            }
+            other => panic!("expected HostUnreachable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_probe_host_key_failure_is_host_unreachable() {
+        let outcome = ProbeOutcome {
+            exit_status: Some(255),
+            stderr: "Host key verification failed.\n".to_string(),
+            response: None,
+        };
+        let err = classify_probe_outcome("hetzner-1", &ssh_target(), outcome)
+            .expect_err("host-key failure must error");
+        assert!(
+            matches!(err, RemoteConnectError::HostUnreachable { .. }),
+            "host-key failure must classify as HostUnreachable, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_probe_unknown_failure_defaults_to_daemon_unavailable() {
+        // ssh exited cleanly (0) but we got no RESP and no recognizable
+        // diagnostic. Most likely a daemon misbehaviour (printed nothing,
+        // closed stdout). Default to DaemonUnavailable so the user gets the
+        // `remote upgrade` hint.
+        let outcome = ProbeOutcome {
+            exit_status: Some(0),
+            stderr: String::new(),
+            response: None,
+        };
+        let err = classify_probe_outcome("hetzner-1", &ssh_target(), outcome)
+            .expect_err("unrecognized failure must error");
+        assert!(
+            matches!(err, RemoteConnectError::DaemonUnavailable { .. }),
+            "default fallback must be DaemonUnavailable, got {err:?}"
+        );
     }
 
     // ----- bridge byte-relay -----

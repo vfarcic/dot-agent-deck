@@ -695,6 +695,21 @@ async fn run_connect(
     let target = entry.ssh_target();
     let socket_path = dot_agent_deck::connect::bridge_socket_path();
 
+    // 2.5. M2.6 — failure-mode-aware probe. Run a one-shot ssh + list-agents
+    //      BEFORE bringing up the persistent bridge so connect-time failures
+    //      surface as typed errors (HostUnreachable / DaemonUnavailable) with
+    //      actionable hints, instead of leaking through the TUI as garbled
+    //      output. A successful probe also returns the agent list so we can
+    //      print the "no agents running" empty-state hint after the bridge is
+    //      up and before the TUI launches.
+    let agents = match dot_agent_deck::connect::probe_remote(&target, &entry.name).await {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // 3. Set the env vars the TUI's stream-backed-pane path reads
     //    (`DOT_AGENT_DECK_VIA_DAEMON` at src/main.rs ~L567,
     //    `DOT_AGENT_DECK_ATTACH_SOCKET` at src/config.rs:71). Done BEFORE
@@ -726,6 +741,17 @@ async fn run_connect(
             return ExitCode::FAILURE;
         }
     };
+
+    // 4.5. M2.6 — empty-state hint. If the probe came back with no agents,
+    //      drop a single non-blocking line BEFORE launching the TUI so the
+    //      user knows to press Ctrl+N. The TUI's existing empty-dashboard
+    //      state handles the rest.
+    if agents.is_empty() {
+        println!(
+            "No agents running on '{}'. Press Ctrl+N inside the TUI to start one.",
+            entry.name
+        );
+    }
 
     // 5. Run the same TUI body the default subcommand uses.
     run_tui_session(cli_theme, continue_session).await;
