@@ -30,8 +30,9 @@ static UMASK_LOCK: Mutex<()> = Mutex::new(());
 /// `bind` and a post-bind `chmod`: without this, a local attacker could
 /// connect via the world-readable inode that exists between the two calls.
 ///
-/// `pub(crate)` so the M1.2 attach-protocol server (`daemon_protocol`) can
-/// reuse the same restrictive-umask bind dance for its socket.
+/// `pub(crate)` so the M1.2 attach-protocol server (`daemon_protocol`) and
+/// the M2.4 `connect` bridge (`crate::connect`) can reuse the same
+/// restrictive-umask bind dance for their sockets.
 pub(crate) fn bind_socket(path: &Path) -> io::Result<UnixListener> {
     let _guard = UMASK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // SAFETY: `umask(2)` is a thread-safe libc call that simply swaps a

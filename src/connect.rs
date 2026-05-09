@@ -29,6 +29,7 @@
 //!   to the existing TUI body.
 
 use std::io::{BufRead, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -38,6 +39,12 @@ use tokio::process::{Child, Command as TokioCommand};
 use tokio::task::JoinHandle;
 
 use crate::remote::{RemoteConfigError, RemoteEntry, RemotesFile, SshTarget, SystemSshExecutor};
+
+/// Mode for the bridge socket: owner-only read/write. The bridge carries the
+/// full streaming attach protocol for the *remote* daemon, so a
+/// world-connectable bridge socket would let any local user hijack the
+/// remote daemon's control channel. Mirrors `daemon::SOCKET_MODE`.
+const BRIDGE_SOCKET_MODE: u32 = 0o600;
 
 /// Marker `kind` for entries the user added with `--type=kubernetes`. M2.4
 /// rejects these explicitly so the message clearly says "Phase 3" instead of
@@ -241,7 +248,20 @@ pub async fn start_bridge(
     // make `bind` return EADDRINUSE. The pid suffix already minimizes the
     // chance, but cleaning up defensively costs nothing.
     let _ = std::fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path)?;
+    // Reuse the daemon's TOCTOU-safe umask-before-bind helper so the bridge
+    // socket inode is created at 0o600 directly. Without this the socket
+    // inherits the user's umask — typically world-connectable — and any
+    // local user could hijack the remote daemon's control channel through
+    // the bridge.
+    let listener = crate::daemon::bind_socket(&socket_path)?;
+    // Defense in depth: `bind_socket` already created the inode at 0o600 via
+    // umask, but restating the mode here covers any future code path that
+    // bypasses `bind_socket`. Mirrors `run_daemon_with` and
+    // `daemon_protocol::bind_attach_listener`.
+    std::fs::set_permissions(
+        &socket_path,
+        std::fs::Permissions::from_mode(BRIDGE_SOCKET_MODE),
+    )?;
 
     let mut cmd = build_tokio_ssh_command(target, "dot-agent-deck daemon attach");
     cmd.stdin(Stdio::piped())
@@ -516,6 +536,45 @@ mod tests {
         drop(fake_in);
         drop(fake_out);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_socket_inode_mode_is_0o600() {
+        // The bridge carries the FULL streaming attach protocol for the
+        // *remote* daemon (list-agents, start-agent, attach-stream). A
+        // world-connectable bridge socket would let any local user hijack
+        // that control channel, so the inode must be created at 0o600.
+        // Mirrors `daemon::tests::socket_is_0600_immediately_after_bind`.
+        //
+        // We can't bring up real ssh in a unit test, so we drive
+        // `start_bridge` with a target that ssh will spawn against and
+        // immediately tear down. `bind_socket` runs *before* the spawn —
+        // by the time `start_bridge` returns Ok, the inode mode is settled
+        // regardless of ssh's connect outcome. ssh is killed via
+        // `kill_on_drop` when the bridge is dropped at end of test.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("bridge.sock");
+        // Localhost target with no user — ssh just needs to fork
+        // successfully; BatchMode=yes makes any actual connect fail fast.
+        let target = SshTarget {
+            host: "127.0.0.1".to_string(),
+            user: None,
+            port: 22,
+            key: None,
+        };
+
+        let bridge = start_bridge(&target, socket_path.clone())
+            .await
+            .expect("start_bridge should bind the socket");
+
+        let meta = std::fs::metadata(&socket_path).expect("socket file should exist");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, BRIDGE_SOCKET_MODE,
+            "expected bridge socket at 0o600, got {mode:o}"
+        );
+
+        drop(bridge);
     }
 
     #[tokio::test]

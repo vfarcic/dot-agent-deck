@@ -690,9 +690,35 @@ async fn run_connect(
         }
     };
 
-    // 2. Bring up the bridge (binds Unix socket + spawns ssh + relay task).
+    // 2. Compute the bridge socket path up front so we can publish it via
+    //    env *before* spawning any tokio task (see step 3).
     let target = entry.ssh_target();
     let socket_path = dot_agent_deck::connect::bridge_socket_path();
+
+    // 3. Set the env vars the TUI's stream-backed-pane path reads
+    //    (`DOT_AGENT_DECK_VIA_DAEMON` at src/main.rs ~L567,
+    //    `DOT_AGENT_DECK_ATTACH_SOCKET` at src/config.rs:71). Done BEFORE
+    //    `start_bridge` so the bridge listener task isn't already alive
+    //    when set_var runs.
+    //
+    // SAFETY: `std::env::set_var` is `unsafe` since Rust 1.89 because
+    // concurrent reads on another thread race with the mutation. `#[tokio::main]`
+    // has already spun up the runtime's worker threads by this point, so the
+    // process is multi-threaded — but the relevant invariant isn't
+    // "single-threaded process", it's "no concurrent thread reads these
+    // specific env vars while we mutate them". `DOT_AGENT_DECK_VIA_DAEMON`
+    // and `DOT_AGENT_DECK_ATTACH_SOCKET` are read only at TUI launch
+    // (`run_tui_session` via `attach_socket_path()` in src/config.rs and
+    // the inline `env::var` in src/main.rs), and we control the program
+    // order: nothing has been spawned yet that touches them. The values
+    // also don't depend on anything from `start_bridge` — both are static
+    // (`"1"` and the socket path computed above).
+    unsafe {
+        std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, "1");
+        std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket_path);
+    }
+
+    // 4. Bring up the bridge (binds Unix socket + spawns ssh + relay task).
     let bridge = match dot_agent_deck::connect::start_bridge(&target, socket_path.clone()).await {
         Ok(b) => b,
         Err(e) => {
@@ -701,18 +727,7 @@ async fn run_connect(
         }
     };
 
-    // 3. Tell the TUI to dial the bridge instead of spawning a daemon. The
-    //    M1.3 stream-backed-pane path reads these envs at TUI startup.
-    //    SAFETY: only this process and its children read these vars; we
-    //    don't unset them on exit because the connect process exits when
-    //    the TUI returns.
-    // SAFETY: single-threaded mutation before the TUI starts spinning up tasks.
-    unsafe {
-        std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, "1");
-        std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", bridge.socket_path());
-    }
-
-    // 4. Run the same TUI body the default subcommand uses.
+    // 5. Run the same TUI body the default subcommand uses.
     run_tui_session(cli_theme, continue_session).await;
 
     // `bridge` drops here: socket file unlinked, ssh child killed via
