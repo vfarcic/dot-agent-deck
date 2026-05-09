@@ -200,12 +200,24 @@ mod tests {
     use crate::agent_pty::SpawnOptions;
     use crate::state::AppState;
 
+    /// `tempfile::tempdir()` calls `mkdir(2)` with mode `0o700 & ~umask`. The
+    /// `bind_socket` path above briefly flips the process-global umask to
+    /// `0o177`, so a concurrent `mkdir` in a sibling test can land during
+    /// that window and produce a directory with mode `0o600` — no execute
+    /// bit, breaking lookups for files inside. Re-apply 0o700 after creation
+    /// so these tests can run in parallel without stat'ing into a non-x dir.
+    fn race_safe_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
     #[tokio::test]
     async fn socket_is_0600_immediately_after_bind() {
         // Proves the umask-before-bind change closes the TOCTOU window: the
         // socket inode must already be 0o600 at `bind(2)` time, with no
         // reliance on a post-bind chmod.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = race_safe_tempdir();
         let sock_path = dir.path().join("immediate.sock");
 
         let _listener = bind_socket(&sock_path).expect("bind should succeed");
@@ -220,7 +232,7 @@ mod tests {
 
     #[tokio::test]
     async fn socket_is_chmod_0600_after_bind() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = race_safe_tempdir();
         let sock_path = dir.path().join("test.sock");
         let state = Arc::new(RwLock::new(AppState::default()));
 

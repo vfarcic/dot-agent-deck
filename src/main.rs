@@ -6,7 +6,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, DOT_AGENT_DECK_VIA_DAEMON};
-use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
+use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path, state_dir};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::DaemonClient;
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
@@ -136,6 +136,13 @@ enum DaemonCmd {
     /// the remote host so the local TUI can speak the streaming attach
     /// protocol over the ssh pipe (PRD #76, M2.1).
     Attach,
+    /// Run the daemon as a foreground process, binding the hook-ingestion
+    /// and streaming-attach sockets but **not** launching the TUI. Used
+    /// internally by lazy-spawn-on-attach (PRD #76, M4.3): when a remote's
+    /// `daemon attach` finds the attach socket missing, it detach-spawns
+    /// `daemon serve` so the daemon survives the ssh hangup. Not part of
+    /// the everyday user surface.
+    Serve,
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -396,6 +403,7 @@ fn main() -> ExitCode {
         }
         Some(Commands::Daemon { cmd }) => match cmd {
             DaemonCmd::Attach => run_daemon_attach_cli(),
+            DaemonCmd::Serve => run_daemon_serve_cli(),
         },
         Some(Commands::Remote { cmd }) => match cmd {
             RemoteCmd::Add {
@@ -766,6 +774,32 @@ async fn run_connect(
 #[tokio::main]
 async fn run_daemon_attach_cli() -> ExitCode {
     let path = attach_socket_path();
+
+    // M4.3 lazy-spawn: if no daemon is running on this host yet, detach-spawn
+    // `daemon serve` so it survives the ssh hangup, then poll for the socket
+    // before falling through to the bridge. Subsequent `connect`s find the
+    // socket already present and skip the spawn. The 5s/50ms timing matches
+    // the M4.3 task brief and is plenty for a Rust binary that just binds
+    // two Unix sockets.
+    //
+    // Concurrent first attaches serialize on `<state_dir>/spawn.lock` inside
+    // `ensure_daemon_running` so two simultaneous `connect`s don't both race
+    // to bind the daemon socket.
+    let state_dir = state_dir();
+    let state_dir_for_spawn = state_dir.clone();
+    if let Err(e) = dot_agent_deck::daemon_attach::ensure_daemon_running(
+        &path,
+        &state_dir,
+        move || dot_agent_deck::daemon_attach::spawn_daemon_serve_detached(&state_dir_for_spawn),
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+
     match dot_agent_deck::daemon_attach::run_daemon_attach(
         &path,
         tokio::io::stdin(),
@@ -779,6 +813,31 @@ async fn run_daemon_attach_cli() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `dot-agent-deck daemon serve` — PRD #76 M4.3. Runs the daemon (hook
+/// ingestion + streaming-attach servers) in the foreground without a TUI.
+/// The body mirrors the in-process spawn used by `run_tui_session`
+/// (Daemon::with_attach + run_daemon_with) so a remote running this
+/// subcommand binds the same two sockets a local TUI would.
+///
+/// Hook auto-install is skipped here on purpose: `remote add` already runs
+/// `hooks install` on the remote, and the on-disk hook scripts only need
+/// to be (re)installed when the binary version changes — not every time
+/// the daemon starts.
+#[tokio::main]
+async fn run_daemon_serve_cli() -> ExitCode {
+    init_logging_from_env();
+    let state = Arc::new(RwLock::new(AppState::default()));
+    let path = socket_path();
+    let attach_path = attach_socket_path();
+
+    let daemon = Daemon::with_attach(state, attach_path.clone());
+    if let Err(e) = run_daemon_with(&path, daemon).await {
+        eprintln!("Daemon error: {e}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
 
 #[tokio::main]

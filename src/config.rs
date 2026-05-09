@@ -79,6 +79,25 @@ pub fn attach_socket_path() -> PathBuf {
     PathBuf::from("/tmp/dot-agent-deck-attach.sock")
 }
 
+/// Per-user state directory. Used by lazy-spawn (PRD #76 M4.3) for the
+/// detached daemon log and the spawn mutex (`spawn.lock`). Resolution order:
+///
+/// 1. `DOT_AGENT_DECK_STATE_DIR` — explicit override (tests use this).
+/// 2. `$XDG_STATE_HOME/dot-agent-deck` — freedesktop spec default.
+/// 3. `$HOME/.local/state/dot-agent-deck` — XDG fallback when the env var is
+///    unset (per the spec).
+pub fn state_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("DOT_AGENT_DECK_STATE_DIR") {
+        return PathBuf::from(path);
+    }
+    match std::env::var("XDG_STATE_HOME") {
+        Ok(state_home) if !state_home.is_empty() => {
+            PathBuf::from(state_home).join("dot-agent-deck")
+        }
+        _ => dirs_home().join(".local/state/dot-agent-deck"),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BellConfig {
@@ -511,6 +530,13 @@ impl ConfigGenState {
     }
 }
 
+/// Serializes tests that mutate `DOT_AGENT_DECK_STATE_DIR` /
+/// `XDG_STATE_HOME` / `HOME`. Rust runs unit tests in parallel and these are
+/// process-global, so any test that wants to observe a specific value of
+/// `state_dir()` must hold this lock for the duration of its env-var fiddling.
+#[cfg(test)]
+pub static STATE_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Serializes tests that mutate `DOT_AGENT_DECK_CONFIG_GEN_STATE` or call
 /// `ConfigGenState::save()` / `load()` (directly or through handlers like
 /// `handle_config_gen_prompt_key`). Rust runs unit tests in parallel, so
@@ -924,6 +950,93 @@ timeout_secs = 600
     fn auto_config_prompt_deserialize_false() {
         let dc: DashboardConfig = toml::from_str("auto_config_prompt = false").unwrap();
         assert!(!dc.auto_config_prompt);
+    }
+
+    #[test]
+    fn state_dir_uses_explicit_override_first() {
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
+        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: env-var lock held; restored on the way out.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_STATE_DIR", "/tmp/explicit-state");
+            std::env::set_var("XDG_STATE_HOME", "/should/be/ignored");
+        }
+
+        assert_eq!(state_dir(), PathBuf::from("/tmp/explicit-state"));
+
+        // SAFETY: same lock held; restoring previous values.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn state_dir_uses_xdg_state_home_when_set() {
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
+        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: env-var lock held; restored on the way out.
+        unsafe {
+            std::env::remove_var("DOT_AGENT_DECK_STATE_DIR");
+            std::env::set_var("XDG_STATE_HOME", "/var/lib/state");
+        }
+
+        assert_eq!(state_dir(), PathBuf::from("/var/lib/state/dot-agent-deck"));
+
+        // SAFETY: same lock held; restoring previous values.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn state_dir_falls_back_to_home_when_xdg_unset() {
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
+        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
+        let prev_home = std::env::var("HOME").ok();
+        // SAFETY: env-var lock held; restored on the way out.
+        unsafe {
+            std::env::remove_var("DOT_AGENT_DECK_STATE_DIR");
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::set_var("HOME", "/home/test-user");
+        }
+
+        assert_eq!(
+            state_dir(),
+            PathBuf::from("/home/test-user/.local/state/dot-agent-deck")
+        );
+
+        // SAFETY: same lock held; restoring previous values.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     #[test]
