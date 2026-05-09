@@ -411,7 +411,7 @@ pub async fn probe_remote(
 /// to exit, and return the captured outcome. No classification here — that's
 /// `classify_probe_outcome`'s job.
 async fn run_probe_subprocess(target: &SshTarget) -> ProbeOutcome {
-    let mut cmd = build_tokio_ssh_command(target, "dot-agent-deck daemon attach");
+    let mut cmd = build_tokio_ssh_command(target, "~/.local/bin/dot-agent-deck daemon attach");
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -514,7 +514,7 @@ pub async fn start_bridge(
         std::fs::Permissions::from_mode(BRIDGE_SOCKET_MODE),
     )?;
 
-    let mut cmd = build_tokio_ssh_command(target, "dot-agent-deck daemon attach");
+    let mut cmd = build_tokio_ssh_command(target, "~/.local/bin/dot-agent-deck daemon attach");
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
