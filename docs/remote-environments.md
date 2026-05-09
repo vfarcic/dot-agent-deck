@@ -35,7 +35,7 @@ dot-agent-deck remote remove my-vm         # forget the registry entry (host unt
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--type` | `ssh` | Only `ssh` is implemented today; `kubernetes` is planned in [PRD #80](https://github.com/vfarcic/dot-agent-deck/issues/80). |
+| `--type` | `ssh` | Only `ssh` is implemented today; `kubernetes` is planned in [PRD #81](https://github.com/vfarcic/dot-agent-deck/issues/81). |
 | `--port` | `22` | ssh port. |
 | `--key` | _none_ | Path to an ssh identity file. Forwarded to ssh as `-i`. Omit to use ssh's default key search. |
 | `--version` | client version | Daemon binary version to install on the remote. Usually leave unset. |
@@ -154,7 +154,7 @@ Agents emit hook events (delegate, work-done, etc.) by piping JSON to `dot-agent
 
 ## Limitations in v1
 
-- **One transport.** v1 ships ssh only. The daemon protocol is transport-agnostic and a Kubernetes transport is being designed in [PRD #80](https://github.com/vfarcic/dot-agent-deck/issues/80).
+- **One transport.** v1 ships ssh only. The daemon protocol is transport-agnostic and a Kubernetes transport is being designed in [PRD #81](https://github.com/vfarcic/dot-agent-deck/issues/81).
 - **No multi-user host isolation.** A remote is assumed to be a single user's host. Sharing one host between multiple unrelated users (each with their own credentials) is not supported in v1.
 - **No bidirectional file sync.** Project files live on the remote; sync via git. The deck does not bundle mutagen/syncthing/sshfs.
 

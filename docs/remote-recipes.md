@@ -7,7 +7,7 @@ title: Remote Recipes
 
 Provisioning snippets that get a Linux host into a state where `dot-agent-deck remote add` will succeed. The deck itself doesn't ship a provisioner — these recipes are starting points you adapt to your environment.
 
-For prerequisites the host must satisfy see [Remote Environment Requirements](remote-requirements.md). For lifecycle and connection semantics see [Remote Environments](remote-environments.md). The Kubernetes-as-host recipe lives in [PRD #80](https://github.com/vfarcic/dot-agent-deck/issues/80) and is not yet shipped.
+For prerequisites the host must satisfy see [Remote Environment Requirements](remote-requirements.md). For lifecycle and connection semantics see [Remote Environments](remote-environments.md). The Kubernetes-as-host recipe lives in [PRD #81](https://github.com/vfarcic/dot-agent-deck/issues/81) and is not yet shipped.
 
 > **Status.** Validated on a fresh Ubuntu 24.04 LTS UpCloud VM (the M0.2 reference host). Other providers should work given the same OS and SSH posture, but have not been independently re-tested. If a provider's image needs different bootstrap steps, the differences are typically in the cloud-init / first-login section — the deck-side flow (`remote add`) is identical once SSH and a non-root user with the agent toolchain are in place.
 

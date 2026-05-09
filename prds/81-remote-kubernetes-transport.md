@@ -1,9 +1,9 @@
-# PRD #80: Remote Kubernetes Transport
+# PRD #81: Remote Kubernetes Transport
 
 **Status**: Not started
 **Priority**: Medium
 **Created**: 2026-05-09
-**GitHub Issue**: TBD (create with `gh issue create` when work begins)
+**GitHub Issue**: [#81](https://github.com/vfarcic/dot-agent-deck/issues/81)
 **Depends on**: PRD #76 (Remote Agent Environments — ssh transport, daemon protocol, registry)
 
 ## Problem Statement

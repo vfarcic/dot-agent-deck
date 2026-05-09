@@ -4,7 +4,7 @@
 **Priority**: High
 **Created**: 2026-05-08
 **Scope updated**:
-- 2026-05-09 — Kubernetes transport split out into **PRD #80**.
+- 2026-05-09 — Kubernetes transport split out into **PRD #81**.
 - 2026-05-09 (later) — **Architectural pivot**. Phase 6 (laptop-as-real-client with `ProjectIO` trait + extended protocol) was added when M2.x exposed project-parity gaps, then dropped after a cost/value review. v1 now ships the simpler **TUI-on-remote** model: `connect` is an `ssh -t` wrapper, the TUI runs server-side, the daemon owns PTYs as a separate process so they survive ssh disconnects. See the *2026-05-09 architectural pivot* entry in Design Decisions.
 **GitHub Issue**: [#76](https://github.com/vfarcic/dot-agent-deck/issues/76)
 
@@ -24,14 +24,14 @@ Introduce **remote environments** as a first-class concept in `dot-agent-deck`. 
 
 The TUI on the remote attaches to a **separate-process daemon** that owns all agent PTYs and accepts hook callbacks on a local Unix socket. Because the daemon is a separate process, it survives ssh disconnects: PTYs and agent state persist across "laptop closed the lid", and re-running `connect` re-attaches a fresh TUI to the still-running daemon.
 
-A future Kubernetes (`kubectl exec`) transport ships separately as **PRD #80**.
+A future Kubernetes (`kubectl exec`) transport ships separately as **PRD #81**.
 
 ### Core architectural choices
 
 - **Per-project long-running environment, not per-agent ephemeral pods.** The "feels local" criterion wins: shared filesystem, warm build caches, ability to stop one agent and start another against the same in-progress state. Pod-per-agent was considered and rejected — it's the right shape for ephemeral CI runners, the wrong shape for a remote dev box.
 - **TUI-on-remote, not laptop-as-real-client.** The deck TUI runs on the environment, not on the laptop. ssh forwards the terminal. This collapses an entire category of "make every UI feature work over a custom protocol" work (directory pickers, project config loading, side panes, watch rules, delegate dispatch) into "they just work, they're running locally on the same box as the daemon."
 - **Daemon as separate process, not in-TUI tokio task.** In remote mode the daemon must outlive the TUI so PTYs survive ssh disconnect. Local mode (the laptop) keeps the in-process daemon for simplicity; the separation is opt-in via the lazy-spawn path that already exists from M4.3.
-- **Transport is a config detail, not an architectural fork.** ssh-to-VM is the v1 transport. `kubectl exec`-to-pod fits the same model (the TUI runs in-pod, kubectl just forwards the terminal); PRD #80 picks that up.
+- **Transport is a config detail, not an architectural fork.** ssh-to-VM is the v1 transport. `kubectl exec`-to-pod fits the same model (the TUI runs in-pod, kubectl just forwards the terminal); PRD #81 picks that up.
 - **Provisioning is out of scope.** The product documents environment requirements (Linux distro, ssh, disk, RAM, network egress) and users provision via multipass / Hetzner / fly / whatever. No cloud-provider abstraction in the product, no terraform in-repo.
 
 ### User-facing model
@@ -76,7 +76,7 @@ last_known_version = "0.25.0"
 last_connected = "2026-05-08T14:23:00Z"
 ```
 
-(PRD #80 will extend the registry with a `type = "kubernetes"` shape; the schema is forward-compatible.)
+(PRD #81 will extend the registry with a `type = "kubernetes"` shape; the schema is forward-compatible.)
 
 No secrets. Auth delegated to ssh. The file is human-editable; nothing is injected at runtime that the user can't inspect.
 
@@ -103,7 +103,7 @@ Hooks (`src/hook.rs`) currently POST to a local Unix socket. In the remote model
 - Project files live on the environment. Agent edits happen there.
 - **Git is the sync layer** between laptop working copy and remote. No bidirectional sync (mutagen, syncthing) baked into the product.
 - For VM: project state on the VM's disk. Standard.
-- (Kubernetes filesystem model — PVC per environment — covered in PRD #80.)
+- (Kubernetes filesystem model — PVC per environment — covered in PRD #81.)
 
 ## Scope
 
@@ -125,7 +125,7 @@ Hooks (`src/hook.rs`) currently POST to a local Unix socket. In the remote model
 
 ### Out of Scope
 
-- **Kubernetes (`kubectl exec`) transport — moved to PRD #80.** This PRD ships ssh-to-VM only.
+- **Kubernetes (`kubectl exec`) transport — moved to PRD #81.** This PRD ships ssh-to-VM only.
 - **Laptop-as-real-client architecture.** The laptop's TUI does not consume a custom remote-fs/remote-exec protocol; it just forwards terminal bytes over ssh. Extending the protocol with `ListDir`, `ReadFile`, `StateSnapshot`, `SubscribeEvents`, etc. is **explicitly rejected** for v1 (see Design Decisions).
 - **Multi-client viewing** of the same session from two laptops simultaneously. Tmux already solves this if a user really needs it; we won't reimplement it.
 - VM provisioning automation (no terraform, multipass-wrapping, fly-wrapping in core).
@@ -164,7 +164,7 @@ What's new in the pivot: a TUI mode where the TUI **attaches to an existing daem
 
 ### Transport: Kubernetes
 
-Deferred to PRD #80. The same pattern applies — the TUI runs in-pod, `kubectl exec` forwards the terminal, the daemon is a separate process inside the pod.
+Deferred to PRD #81. The same pattern applies — the TUI runs in-pod, `kubectl exec` forwards the terminal, the daemon is a separate process inside the pod.
 
 ### CLI: `remote` subcommand group
 
@@ -194,7 +194,7 @@ The local-deck path (no `connect`, no remote) is unchanged: TUI spawns daemon as
 
 - `docs/remote-environments.md` (new) — what a remote environment is, the lifecycle model, Ctrl+W vs ssh-disconnect, failure modes, persistence model.
 - `docs/remote-requirements.md` (new) — exact environment requirements (Linux distro, ssh access, disk, RAM, egress, optional container runtime). This doc is what the maintainer follows to set up the dev/test VM, and what users follow to set up theirs.
-- `docs/remote-recipes.md` (new) — copy-pasteable provisioning snippets for multipass, Hetzner, fly. Maintenance burden kept low: each recipe is a few commands, no abstractions. (k3s recipe lives in PRD #80.)
+- `docs/remote-recipes.md` (new) — copy-pasteable provisioning snippets for multipass, Hetzner, fly. Maintenance burden kept low: each recipe is a few commands, no abstractions. (k3s recipe lives in PRD #81.)
 - Update `docs/getting-started.mdx` and `docs/installation.md` to mention the remote option.
 
 ## Success Criteria
@@ -237,9 +237,9 @@ The pre-pivot Phase 2 built a laptop-side bridge that forwarded the daemon socke
 - [ ] **M2.9** — **`connect` becomes ssh-t wrapper.** Rewrite `connect [name]` to `ssh -t <target> dot-agent-deck <args-that-trigger-external-daemon-mode>`. Picker, version-mismatch detection, host-unreachable error surfacing all live in this milestone. End-to-end verified on the dev/test VM.
 - [ ] **M2.10** — Lifecycle verification on the dev/test VM: `Ctrl+W` stops a remote agent (ps confirms); ssh disconnect leaves daemon + agents running; reconnect via `connect` re-attaches to the same agents with scrollback intact.
 
-### Phase 3: Kubernetes transport — moved to PRD #80
+### Phase 3: Kubernetes transport — moved to PRD #81
 
-PRD #80 picks up its own milestones (image, manifest, `remote add --type=kubernetes`, `connect` over `kubectl exec` running an in-pod TUI, PVC-preserving upgrade).
+PRD #81 picks up its own milestones (image, manifest, `remote add --type=kubernetes`, `connect` over `kubectl exec` running an in-pod TUI, PVC-preserving upgrade).
 
 ### Phase 4: Quality
 
