@@ -227,10 +227,10 @@ The daemon protocol, registry shape, and CLI surface in this PRD are designed fo
 
 ### Phase 5: Documentation and release
 
-- [ ] **M5.1** — `docs/remote-environments.md`: lifecycle model, Ctrl+W vs detach semantics, failure modes, hook-on-remote behavior.
-- [ ] **M5.2** — `docs/remote-recipes.md`: provisioning snippets for multipass / Hetzner / fly. (k3s recipe lives in PRD #80.)
-- [ ] **M5.3** — Final pass on `docs/remote-requirements.md` reflecting anything learned in M1–M4.
-- [ ] **M5.4** — Update `docs/getting-started.mdx` and `docs/installation.md` to mention the remote path.
+- [x] **M5.1** — `docs/remote-environments.md`: lifecycle model, Ctrl+W vs detach semantics, failure modes, hook-on-remote behavior.
+- [x] **M5.2** — `docs/remote-recipes.md`: provisioning snippets for multipass / Hetzner / fly. (k3s recipe lives in PRD #80.)
+- [x] **M5.3** — Final pass on `docs/remote-requirements.md` reflecting anything learned in M1–M4.
+- [x] **M5.4** — Update `docs/getting-started.mdx` and `docs/installation.md` to mention the remote path.
 - [ ] **M5.5** — Changelog fragment, release.
 
 ## Key Files

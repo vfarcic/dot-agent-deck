@@ -40,3 +40,7 @@ The binary will be at `target/release/dot-agent-deck`.
 ```bash
 dot-agent-deck --help
 ```
+
+## Installing on a Remote Host
+
+If you plan to run Agent Deck on a per-project remote Linux VM (so agents survive laptop sleep and network drops), the install on the remote is handled automatically by `dot-agent-deck remote add` from the laptop — you don't install on the remote by hand. See [Remote Environments](remote-environments.md), [Requirements](remote-requirements.md), and [Recipes](remote-recipes.md) for the full path.

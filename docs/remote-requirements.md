@@ -7,7 +7,9 @@ title: Remote Environment Requirements
 
 What a host must provide for a `dot-agent-deck` **remote environment** — a per-project, long-running Linux host that runs the deck daemon and owns the project's agents. This is not a provisioning guide and not a daily-use guide; it lists the prerequisites a Linux VM must satisfy before the deck can register it as a remote.
 
-> **Status:** v1 requirements, partially validated in M0.2. The Required section reflects what was confirmed to work on a fresh Ubuntu 24.04 LTS UpCloud VM; the Recommended section reflects best-practice hardening that has not yet been re-validated end-to-end on a clean provision.
+For lifecycle, failure modes, and how the TUI attaches see [Remote Environments](remote-environments.md). For provisioning recipes see [Remote Recipes](remote-recipes.md).
+
+> **Status:** v1 requirements. The Required section reflects what was confirmed to work on a fresh Ubuntu 24.04 LTS UpCloud VM in M0.2 and has been the reference target throughout PRD #76 implementation; the Recommended section reflects best-practice hardening that has not yet been re-validated end-to-end on a clean provision since the M1–M4 implementation completed.
 
 ## How this page is organized
 
@@ -139,7 +141,7 @@ Root has its own PATH and typically doesn't need this step.
 
 ### Daemon socket security
 
-The `/tmp/dot-agent-deck.sock` fallback is intended for hosts that do not set `XDG_RUNTIME_DIR` and is **not safe on multi-user hosts** — `/tmp` is world-writable, and another local user could pre-create the path or attach to the socket. v1 assumes a single-user host (the PRD's stated scope: "no multi-user access controls beyond Linux user separation"). If the host is shared, set `$DOT_AGENT_DECK_SOCKET` to a path inside the user's home, for example `~/.local/state/dot-agent-deck/daemon.sock`, and ensure the parent directory is mode `0700`. The socket file itself should be readable and writable only by the daemon's user (mode `0600`); the daemon currently relies on the process umask for this, so set a restrictive umask (e.g. `umask 077`) in the unit file or login profile when on a shared host.
+The `/tmp/dot-agent-deck.sock` fallback is intended for hosts that do not set `XDG_RUNTIME_DIR` and is **not safe on multi-user hosts** — `/tmp` is world-writable, and another local user could pre-create the path or attach to the socket. v1 assumes a single-user host (the PRD's stated scope: "no multi-user access controls beyond Linux user separation"). If the host is shared, set `$DOT_AGENT_DECK_SOCKET` to a path inside the user's home, for example `~/.local/state/dot-agent-deck/daemon.sock`, and ensure the parent directory is mode `0700`. The socket file itself is created at mode `0600` directly by the daemon — `bind(2)` runs with a narrowed umask of `0o177` so the socket inode is never world-readable for any window, and a defense-in-depth `chmod 0600` follows. The user's process umask does not affect the socket mode, but it still affects other files the daemon and its agents create, so a restrictive umask (e.g. `umask 077`) in the unit file or login profile remains a sound default on a shared host.
 
 ### Project filesystem layout
 
@@ -152,6 +154,11 @@ mkdir -p ~/projects
 ```
 
 Git is the sync layer. Clone the repository on the remote, run agents against it there, and push/pull through your usual git remote. There is no bidirectional file sync between your laptop and the remote — the deck does not bundle mutagen, syncthing, or sshfs.
+
+## See also
+
+- [Remote Environments](remote-environments.md) — lifecycle model, stop vs detach, failure modes, hooks behavior.
+- [Remote Recipes](remote-recipes.md) — provisioning snippets for multipass, Hetzner, UpCloud, bare metal.
 
 ## What is not required
 
