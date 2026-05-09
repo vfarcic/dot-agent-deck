@@ -213,7 +213,7 @@ The TUI (`src/ui.rs`, `src/state.rs`) gains a remote-deck mode where panes are n
 - [x] **M2.3** — `remote list`, `remote remove`, `remote upgrade` commands.
 - [x] **M2.4** — `connect [name]` command: picker, ssh exec into the daemon, viewer attaches.
 - [x] **M2.5** — Lifecycle: `Ctrl+W` stops remote agent; explicit detach keybinding leaves it running; laptop sleep = implicit detach. End-to-end verified on the dev/test VM.
-- [ ] **M2.6** — Failure-mode-aware connect: distinguishes the three error states with clear messages.
+- [x] **M2.6** — Failure-mode-aware connect: distinguishes the three error states with clear messages.
 
 ### Phase 3: Kubernetes transport — moved to PRD #80
 
