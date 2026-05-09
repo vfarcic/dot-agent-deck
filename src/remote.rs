@@ -630,13 +630,10 @@ pub fn add(
         opts.no_install,
     )?;
 
-    // 5. Hook install on the remote.
-    let hooks_bin = if opts.no_install {
-        "dot-agent-deck"
-    } else {
-        "~/.local/bin/dot-agent-deck"
-    };
-    let hooks = executor.run(&target, &format!("{hooks_bin} hooks install"))?;
+    // 5. Hook install on the remote. Use the absolute path consistently —
+    //    a bare `dot-agent-deck` lookup over a non-interactive ssh shell
+    //    fails for the standard `~/.local/bin/` install location.
+    let hooks = executor.run(&target, "~/.local/bin/dot-agent-deck hooks install")?;
     if hooks.status != 0 {
         return Err(RemoteAddError::HooksInstallFailed {
             status: hooks.status,
