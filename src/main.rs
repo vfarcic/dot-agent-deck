@@ -156,7 +156,7 @@ enum RemoteCmd {
         /// ssh target: `[user@]host`.
         target: String,
         /// Remote type. Defaults to `ssh` (the only transport implemented today);
-        /// `kubernetes` is planned in PRD #80.
+        /// `kubernetes` is planned in PRD #81.
         #[arg(long = "type", value_enum, default_value_t = CliRemoteType::Ssh)]
         kind: CliRemoteType,
         /// ssh port.

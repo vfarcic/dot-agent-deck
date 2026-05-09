@@ -267,8 +267,8 @@ fn remote_add_kubernetes_type_not_yet_implemented() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("PRD #80"),
-        "msg should mention PRD #80 timeline: {msg}"
+        msg.contains("PRD #81"),
+        "msg should mention PRD #81 timeline: {msg}"
     );
     assert!(executor.commands().is_empty());
     assert!(load_registry(&path).remotes.is_empty());
