@@ -309,6 +309,41 @@ fn remote_add_ssh_unreachable_aborts_before_install() {
 }
 
 #[test]
+fn version_string_with_shell_metacharacters_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = registry_path(&dir);
+
+    let payloads = [
+        "0.24.5; rm -rf ~",
+        "0.24.5$(whoami)",
+        "0.24.5`id`",
+        "0.24.5 || true",
+        "../../etc/passwd",
+    ];
+
+    for payload in payloads {
+        // Empty queue — if any ssh call is made the fake will panic.
+        let executor = FakeSshExecutor::new(vec![]);
+        let mut o = opts("hetzner-1", "viktor@hetzner-1.example.com", false);
+        o.version = payload.to_string();
+        let err = add(&o, &executor, &path).expect_err("malicious version must be rejected");
+        match err {
+            RemoteAddError::InvalidVersion { input } => assert_eq!(input, payload),
+            other => panic!("unexpected error for `{payload}`: {other:?}"),
+        }
+        // Crucial: zero ssh calls — short-circuit before the network.
+        assert!(
+            executor.commands().is_empty(),
+            "ssh was called for malicious payload `{payload}`: {:?}",
+            executor.commands()
+        );
+    }
+
+    // Registry untouched.
+    assert!(load_registry(&path).remotes.is_empty());
+}
+
+#[test]
 fn remotes_toml_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("remotes.toml");

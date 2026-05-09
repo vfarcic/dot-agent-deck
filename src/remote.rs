@@ -12,7 +12,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -96,8 +98,55 @@ pub enum SshError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "ssh failed: host key not yet trusted for {target}. If this is a first-time connection, run `ssh {target}` once to accept the host key, then retry `remote add`. If the key has changed unexpectedly, investigate before connecting."
+    )]
+    HostKeyVerificationFailed { target: String },
     #[error("ssh to {target} failed: {detail}")]
     Other { target: String, detail: String },
+}
+
+/// Map ssh's stderr output (when the process exited with 255) onto a typed
+/// `SshError` variant. Extracted from `SystemSshExecutor::run` so it can be
+/// unit-tested without spawning a process.
+fn classify_ssh_error(target: &SshTarget, stderr: &str) -> SshError {
+    let lower = stderr.to_ascii_lowercase();
+    let detail = stderr.trim().to_string();
+    if lower.contains("connection refused")
+        || lower.contains("network is unreachable")
+        || lower.contains("no route to host")
+        || lower.contains("could not resolve hostname")
+        || lower.contains("connection timed out")
+    {
+        return SshError::ConnectionRefused {
+            host: target.host.clone(),
+            port: target.port,
+            detail,
+        };
+    }
+    // Host-key issues are checked BEFORE the generic auth match because under
+    // BatchMode=yes the canonical message is "Host key verification failed."
+    // and the user's recourse (run `ssh <target>` once) differs from a key
+    // mismatch. We treat both first-trust and key-changed scenarios as the
+    // same variant — the Display message tells the user to investigate.
+    if lower.contains("host key verification failed")
+        || lower.contains("remote host identification has changed")
+        || lower.contains("are you sure you want to continue connecting")
+    {
+        return SshError::HostKeyVerificationFailed {
+            target: target.user_host(),
+        };
+    }
+    if lower.contains("permission denied") || lower.contains("publickey") {
+        return SshError::AuthFailed {
+            target: target.user_host(),
+            detail,
+        };
+    }
+    SshError::Other {
+        target: target.user_host(),
+        detail,
+    }
 }
 
 /// Abstraction over running shell commands on a remote ssh host. The
@@ -165,30 +214,7 @@ impl SshExecutor for SystemSshExecutor {
         // typed transport errors on 255 — otherwise return the SshOutput so
         // callers can decide based on the remote command's status.
         if status == 255 {
-            let lower = stderr.to_ascii_lowercase();
-            let detail = stderr.trim().to_string();
-            if lower.contains("connection refused")
-                || lower.contains("network is unreachable")
-                || lower.contains("no route to host")
-                || lower.contains("could not resolve hostname")
-                || lower.contains("connection timed out")
-            {
-                return Err(SshError::ConnectionRefused {
-                    host: target.host.clone(),
-                    port: target.port,
-                    detail,
-                });
-            }
-            if lower.contains("permission denied") || lower.contains("publickey") {
-                return Err(SshError::AuthFailed {
-                    target: target.user_host(),
-                    detail,
-                });
-            }
-            return Err(SshError::Other {
-                target: target.user_host(),
-                detail,
-            });
+            return Err(classify_ssh_error(target, &stderr));
         }
 
         Ok(SshOutput {
@@ -260,18 +286,71 @@ impl RemotesFile {
     }
 
     /// Atomically replace the file at `path` with the serialized form of
-    /// `self`. Creates the parent directory if missing.
+    /// `self`. Creates the parent directory if missing. Writes via a sibling
+    /// temp file with mode 0o600, then `rename(2)`s it into place — so a
+    /// partial write or a crash mid-save can never leave a half-written
+    /// `remotes.toml` for the next run to choke on, and the final file is
+    /// owner-only (0o600) regardless of the user's umask.
     pub fn save(&self, path: &Path) -> Result<(), RemoteConfigError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| RemoteConfigError::Io {
-                path: parent.display().to_string(),
-                source,
-            })?;
-        }
-        let contents = toml::to_string_pretty(self)?;
-        std::fs::write(path, contents).map_err(|source| RemoteConfigError::Io {
-            path: path.display().to_string(),
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let parent = path.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|source| RemoteConfigError::Io {
+            path: parent.display().to_string(),
             source,
+        })?;
+
+        let contents = toml::to_string_pretty(self)?;
+
+        // Sibling temp file: same directory as the final path so `rename` is
+        // atomic on POSIX filesystems. Pid suffix avoids collisions when
+        // multiple deck processes save concurrently to different registries.
+        let file_name = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "remotes.toml".to_string());
+        let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
+
+        let open_result = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path);
+        let mut tmp_file = open_result.map_err(|source| RemoteConfigError::Io {
+            path: tmp_path.display().to_string(),
+            source,
+        })?;
+
+        let write_result = tmp_file.write_all(contents.as_bytes());
+        if let Err(source) = write_result {
+            // Best-effort cleanup; ignore secondary errors.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(RemoteConfigError::Io {
+                path: tmp_path.display().to_string(),
+                source,
+            });
+        }
+        // Defense in depth: if a stale temp file from a crashed previous save
+        // existed, OpenOptions::mode() would NOT have re-applied the bits, so
+        // re-set them explicitly before the rename.
+        let perm_result = tmp_file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        if let Err(source) = perm_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(RemoteConfigError::Io {
+                path: tmp_path.display().to_string(),
+                source,
+            });
+        }
+        drop(tmp_file);
+
+        std::fs::rename(&tmp_path, path).map_err(|source| {
+            let _ = std::fs::remove_file(&tmp_path);
+            RemoteConfigError::Io {
+                path: path.display().to_string(),
+                source,
+            }
         })
     }
 }
@@ -314,6 +393,8 @@ pub enum RemoteAddError {
     KubernetesNotYetImplemented,
     #[error("Unsupported remote type '{kind}'. Supported: ssh.")]
     UnsupportedType { kind: String },
+    #[error("Invalid --version '{input}': must look like '0.24.5' or 'v0.24.5'.")]
+    InvalidVersion { input: String },
     #[error(transparent)]
     Ssh(#[from] SshError),
     #[error("Remote arch is `{arch}`; supported: linux-{{amd64,arm64}}, darwin-{{amd64,arm64}}.")]
@@ -335,6 +416,47 @@ pub enum RemoteAddError {
     HooksInstallFailed { status: i32, stderr: String },
     #[error(transparent)]
     Registry(#[from] RemoteConfigError),
+}
+
+/// SemVer-ish pattern accepted by `--version`: optional `v` prefix, three
+/// numeric components, optional pre-release suffix. Rejects anything that
+/// could carry shell metacharacters into the remote install command.
+const VERSION_PATTERN: &str = r"^v?\d+(\.\d+){2}(-[A-Za-z0-9.\-]+)?$";
+
+fn version_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(VERSION_PATTERN).expect("static version regex compiles"))
+}
+
+/// Validate a user-supplied version string before it is interpolated into a
+/// URL or a remote shell command. Anything that doesn't look like a SemVer
+/// version is rejected — this is the primary defense against shell injection
+/// via `--version` (e.g. `0.24.5; rm -rf ~`).
+pub fn validate_version_string(version: &str) -> Result<(), RemoteAddError> {
+    if version_regex().is_match(version) {
+        Ok(())
+    } else {
+        Err(RemoteAddError::InvalidVersion {
+            input: version.to_string(),
+        })
+    }
+}
+
+/// Build the install URL and the remote shell command. Validates `version`
+/// internally as a defense-in-depth so that even an internal misuse (a code
+/// path that bypassed the entry-point check in `add()`) cannot slip a shell
+/// metacharacter into the remote command.
+fn build_install_command(
+    release_base: &str,
+    version: &str,
+    platform: &str,
+) -> Result<(String, String), RemoteAddError> {
+    validate_version_string(version)?;
+    let url = format!("{release_base}/v{version}/dot-agent-deck-{platform}");
+    let install_cmd = format!(
+        "mkdir -p ~/.local/bin && curl -fsSL {url} -o ~/.local/bin/dot-agent-deck && chmod 0755 ~/.local/bin/dot-agent-deck"
+    );
+    Ok((url, install_cmd))
 }
 
 /// Convert a `uname -s -m` line to one of our four supported platform tags.
@@ -376,7 +498,13 @@ pub fn add(
         }
     }
 
-    // 2. Uniqueness check — done *before* any ssh call so a duplicate name
+    // 2. Version validation — runs BEFORE any ssh call or URL construction so
+    //    a malicious `--version` (e.g. `0.24.5; rm -rf ~`) can't reach the
+    //    remote shell. Asserted by the `version_string_with_shell_metacharacters_rejected`
+    //    test, which checks zero ssh calls were attempted.
+    validate_version_string(&opts.version)?;
+
+    // 3. Uniqueness check — done *before* any ssh call so a duplicate name
     //    short-circuits without bothering the remote (and lets the
     //    `duplicate_name_rejected` test assert the fake recorded zero
     //    commands).
@@ -419,17 +547,12 @@ pub fn add(
             });
         }
     } else {
-        let url = format!(
-            "{base}/v{version}/dot-agent-deck-{platform}",
-            base = opts.release_base,
-            version = opts.version,
-        );
         // Single shell command: any step's failure aborts the rest, and
         // we get one stderr+exit pair instead of three round-trips' worth
-        // to disentangle.
-        let install_cmd = format!(
-            "mkdir -p ~/.local/bin && curl -fsSL {url} -o ~/.local/bin/dot-agent-deck && chmod 0755 ~/.local/bin/dot-agent-deck"
-        );
+        // to disentangle. `build_install_command` re-validates the version
+        // (defense in depth) so even an internal misuse can't shell-inject.
+        let (url, install_cmd) =
+            build_install_command(&opts.release_base, &opts.version, platform)?;
         let install = executor.run(&target, &install_cmd)?;
         if install.status != 0 {
             return Err(RemoteAddError::DownloadFailed {
@@ -610,6 +733,128 @@ mod tests {
             parse_version_output("dot-agent-deck 1.2.3"),
             Some("1.2.3".to_string())
         );
+    }
+
+    #[test]
+    fn validate_version_string_accepts_semver_shapes() {
+        for v in [
+            "0.24.5",
+            "v0.24.5",
+            "1.2.3",
+            "0.0.1",
+            "10.20.30",
+            "1.0.0-rc.1",
+            "0.24.5-pre.2",
+        ] {
+            assert!(
+                validate_version_string(v).is_ok(),
+                "expected `{v}` to validate"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_version_string_rejects_malformed() {
+        for v in [
+            "",
+            "not-a-version",
+            "1.2",
+            "1.2.3.4",
+            "v1.2",
+            "1.2.3 ", // trailing whitespace
+            " 1.2.3", // leading whitespace
+            "1.2.3;", // metacharacter
+            "1.2.3$x",
+        ] {
+            let err = validate_version_string(v).expect_err(&format!("expected `{v}` to fail"));
+            match err {
+                RemoteAddError::InvalidVersion { input } => assert_eq!(input, v),
+                other => panic!("unexpected error for `{v}`: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn build_install_command_rejects_invalid_version() {
+        let err = build_install_command("https://example.test", "0.24.5; rm -rf ~", "linux-amd64")
+            .expect_err("malicious version must be rejected by the builder too");
+        assert!(matches!(err, RemoteAddError::InvalidVersion { .. }));
+    }
+
+    #[test]
+    fn classify_ssh_error_host_key_verification_failed() {
+        let target = SshTarget::parse("user@host", 22, None);
+        let err = classify_ssh_error(&target, "Host key verification failed.\r\n");
+        assert!(
+            matches!(err, SshError::HostKeyVerificationFailed { .. }),
+            "got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("user@host"),
+            "Display should name target: {msg}"
+        );
+        assert!(
+            msg.contains("first-time connection"),
+            "Display should advise the user: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_ssh_error_host_key_changed_routes_to_same_variant() {
+        let target = SshTarget::parse("h", 22, None);
+        let stderr = "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n";
+        let err = classify_ssh_error(&target, stderr);
+        assert!(matches!(err, SshError::HostKeyVerificationFailed { .. }));
+    }
+
+    #[test]
+    fn classify_ssh_error_connection_refused_still_works() {
+        let target = SshTarget::parse("h", 22, None);
+        let err = classify_ssh_error(
+            &target,
+            "ssh: connect to host h port 22: Connection refused",
+        );
+        assert!(matches!(err, SshError::ConnectionRefused { .. }));
+    }
+
+    #[test]
+    fn classify_ssh_error_auth_failed_still_works() {
+        let target = SshTarget::parse("u@h", 22, None);
+        let err = classify_ssh_error(&target, "u@h: Permission denied (publickey).");
+        assert!(matches!(err, SshError::AuthFailed { .. }));
+    }
+
+    #[test]
+    fn remotes_toml_written_at_0o600() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remotes.toml");
+        let file = RemotesFile::default();
+        file.save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "remotes.toml mode is 0o{mode:o}, expected 0o600"
+        );
+
+        // Re-saving over an existing file must keep 0o600 too.
+        file.save(&path).unwrap();
+        let mode2 = std::fs::metadata(&path).unwrap().mode() & 0o777;
+        assert_eq!(
+            mode2, 0o600,
+            "after rewrite, mode is 0o{mode2:o}, expected 0o600"
+        );
+    }
+
+    #[test]
+    fn remotes_toml_save_creates_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two missing levels — exercises create_dir_all.
+        let path = dir.path().join("a/b/remotes.toml");
+        let file = RemotesFile::default();
+        file.save(&path).unwrap();
+        assert!(path.exists());
     }
 
     #[test]
