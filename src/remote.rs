@@ -514,7 +514,11 @@ fn install_and_verify(
     no_install: bool,
 ) -> Result<(), RemoteAddError> {
     if no_install {
-        let v = executor.run(target, "dot-agent-deck --version")?;
+        // Use the absolute path the install flow targets (line 548 below).
+        // A non-interactive ssh shell typically doesn't have `~/.local/bin`
+        // on PATH, so a bare `dot-agent-deck` lookup fails for binaries
+        // placed at the standard install location.
+        let v = executor.run(target, "~/.local/bin/dot-agent-deck --version")?;
         if v.status != 0 {
             return Err(RemoteAddError::VersionMismatch {
                 actual: format!("(exit {}) {}", v.status, v.stderr.trim()),

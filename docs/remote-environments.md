@@ -39,7 +39,7 @@ dot-agent-deck remote remove my-vm         # forget the registry entry (host unt
 | `--port` | `22` | ssh port. |
 | `--key` | _none_ | Path to an ssh identity file. Forwarded to ssh as `-i`. Omit to use ssh's default key search. |
 | `--version` | client version | Daemon binary version to install on the remote. Usually leave unset. |
-| `--no-install` | `false` | Skip the binary push; pre-flight requires the remote to already have a matching `dot-agent-deck` on `PATH`. |
+| `--no-install` | `false` | Skip the binary push; pre-flight requires `~/.local/bin/dot-agent-deck` on the remote with a matching version. |
 
 Example with a non-default identity file and port:
 
