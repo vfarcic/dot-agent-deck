@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
@@ -385,6 +386,13 @@ pub struct RunningAgent {
 /// [`AgentBus`] and [`AttachHandle`].
 pub struct AgentPtyRegistry {
     inner: Mutex<RegistryInner>,
+    /// Total number of explicit `KIND_DETACH` frames the daemon has observed
+    /// across all attach-stream connections. Plain socket close (implicit
+    /// detach) does *not* increment this — only the M2.5 explicit-detach
+    /// keybinding path does. Surfaced for tests asserting "the client meant
+    /// to detach, not just disconnect," and lightweight observability if a
+    /// future status command wants it.
+    detach_count: AtomicU64,
 }
 
 struct RegistryInner {
@@ -405,7 +413,23 @@ impl AgentPtyRegistry {
                 next_id: 1,
                 agents: HashMap::new(),
             }),
+            detach_count: AtomicU64::new(0),
         }
+    }
+
+    /// Bump the global detach counter. Called by the attach protocol handler
+    /// when an explicit `KIND_DETACH` frame is received. Keeps the
+    /// distinction between voluntary detach and abrupt disconnect (which is
+    /// observed as socket EOF and intentionally not counted here).
+    pub fn record_detach(&self) {
+        self.detach_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total number of explicit detach frames seen since this registry was
+    /// created. See [`AgentPtyRegistry::record_detach`] for what does and
+    /// doesn't increment this.
+    pub fn detach_count(&self) -> u64 {
+        self.detach_count.load(Ordering::Relaxed)
     }
 
     /// Spawn a new agent and return its registry id.

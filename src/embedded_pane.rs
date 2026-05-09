@@ -3,6 +3,7 @@ use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use portable_pty::PtySize;
 
@@ -24,6 +25,16 @@ struct PtyBackend {
     master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
+/// Commands the per-pane I/O task drains from `input_rx`. `Input` carries
+/// raw keystroke bytes that get framed as `KIND_STREAM_IN`. `Detach`
+/// triggers an explicit `KIND_DETACH` frame and ends the writer half of the
+/// task — used by the M2.5 explicit-detach keybinding so the daemon can
+/// distinguish voluntary detach from abrupt disconnect (PRD #76, M2.5).
+enum StreamCmd {
+    Input(Vec<u8>),
+    Detach,
+}
+
 /// Stream-backed pane state (PRD #76, M1.3): the PTY lives in the daemon,
 /// and this side owns one [`crate::daemon_client::AttachConnection`] per
 /// pane. Bytes flow daemon → STREAM_OUT → vt100 parser; keystrokes flow
@@ -35,17 +46,22 @@ struct PtyBackend {
 struct StreamBackend {
     /// Daemon-side agent id used for `stop-agent` on close.
     agent_id: String,
-    /// Channel drained by the per-pane I/O task; each push becomes one
-    /// STREAM_IN frame on the wire. Unbounded because the TUI keystroke
-    /// rate is human-paced; backpressure here would block the input
-    /// thread for no benefit.
-    input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    /// Aborts the I/O task on Drop. Closing the socket without sending
-    /// `stop-agent` is an implicit detach — the daemon keeps the agent
-    /// alive (M1.3 survival property).
-    io_task: tokio::task::AbortHandle,
+    /// Channel drained by the per-pane I/O task. `Input` becomes one
+    /// `KIND_STREAM_IN` frame on the wire; `Detach` becomes one
+    /// `KIND_DETACH` frame and ends the writer. Unbounded because the TUI
+    /// keystroke rate is human-paced; backpressure here would block the
+    /// input thread for no benefit.
+    input_tx: tokio::sync::mpsc::UnboundedSender<StreamCmd>,
+    /// Owns the I/O task. The `Option` exists so `detach_pane` can `take()`
+    /// the handle, await the writer briefly so the `KIND_DETACH` frame
+    /// flushes, and then drop. On plain `Drop` (TUI exit / pane close) the
+    /// handle is aborted instead, which closes the attach socket and the
+    /// daemon sees EOF — implicit detach (M1.3 survival property).
+    io_task: Option<tokio::task::JoinHandle<()>>,
     /// Tokio handle so the (blocking) `close_pane` path can issue
-    /// `stop-agent` over a fresh short-lived connection.
+    /// `stop-agent` over a fresh short-lived connection. Also used by the
+    /// M2.5 detach path to await the writer briefly while the explicit
+    /// `KIND_DETACH` frame is flushed before the socket is dropped.
     runtime: tokio::runtime::Handle,
     /// Daemon attach socket path used to build the `stop-agent` connection
     /// — held here rather than referenced from the controller because the
@@ -65,7 +81,9 @@ impl Drop for StreamBackend {
     /// `stop-agent` path lives only in `close_pane` for the explicit
     /// Ctrl+W close.
     fn drop(&mut self) {
-        self.io_task.abort();
+        if let Some(h) = self.io_task.take() {
+            h.abort();
+        }
     }
 }
 
@@ -209,7 +227,7 @@ impl EmbeddedPaneController {
                     p.writer.flush().map_err(PaneError::Io)?;
                 }
                 PaneBackend::Stream(s) => {
-                    if s.input_tx.send(bytes.to_vec()).is_err() {
+                    if s.input_tx.send(StreamCmd::Input(bytes.to_vec())).is_err() {
                         return Err(PaneError::CommandFailed(format!(
                             "Pane {pane_id} stream I/O task ended"
                         )));
@@ -427,7 +445,7 @@ impl EmbeddedPaneController {
             })
             .map_err(|e| PaneError::CommandFailed(format!("daemon: {e}")))?;
 
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCmd>();
 
         let parser_for_task = Arc::clone(&parser);
         let mouse_mode_for_task = Arc::clone(&mouse_mode);
@@ -460,21 +478,40 @@ impl EmbeddedPaneController {
                 }
             };
 
-            // Input forwarder: drain the keystroke channel and emit
-            // STREAM_IN frames. A failed write or a closed channel ends
-            // the task — the daemon observes EOF and treats it as
-            // implicit detach (the agent keeps running).
+            // Input forwarder: drain the keystroke channel and emit frames.
+            // `Input` becomes one `KIND_STREAM_IN`; `Detach` (M2.5) becomes
+            // one `KIND_DETACH` and ends the writer so the daemon observes
+            // an explicit detach before the socket closes. A failed write
+            // or a closed channel also ends the task — the daemon treats
+            // the resulting EOF as implicit detach (the agent keeps
+            // running).
             let writer = async {
-                while let Some(bytes) = input_rx.recv().await {
-                    if crate::daemon_protocol::write_frame(
-                        &mut wr,
-                        crate::daemon_protocol::KIND_STREAM_IN,
-                        &bytes,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break;
+                while let Some(cmd) = input_rx.recv().await {
+                    match cmd {
+                        StreamCmd::Input(bytes) => {
+                            if crate::daemon_protocol::write_frame(
+                                &mut wr,
+                                crate::daemon_protocol::KIND_STREAM_IN,
+                                &bytes,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        StreamCmd::Detach => {
+                            // Best-effort: even if the write errors, exiting
+                            // here closes the socket and the daemon will
+                            // observe EOF — the agent still survives.
+                            let _ = crate::daemon_protocol::write_frame(
+                                &mut wr,
+                                crate::daemon_protocol::KIND_DETACH,
+                                &[],
+                            )
+                            .await;
+                            break;
+                        }
                     }
                 }
             };
@@ -497,7 +534,7 @@ impl EmbeddedPaneController {
             backend: PaneBackend::Stream(StreamBackend {
                 agent_id,
                 input_tx,
-                io_task: io_task.abort_handle(),
+                io_task: Some(io_task),
                 runtime,
                 daemon_path,
             }),
@@ -512,6 +549,98 @@ impl EmbeddedPaneController {
         self.panes.lock().unwrap().insert(pane_id.clone(), pane);
 
         Ok(pane_id)
+    }
+
+    /// Explicit M2.5 detach: tell the daemon "I'm leaving voluntarily,
+    /// keep the agent running." The pane is removed from the registry and
+    /// its writer is given a brief window to flush a `KIND_DETACH` frame
+    /// before the connection closes. After that window the I/O task is
+    /// aborted (via Drop), the socket closes, and the daemon — having
+    /// already seen the explicit detach — keeps the PTY alive.
+    ///
+    /// Differences from [`PaneController::close_pane`]:
+    /// - `close_pane` issues `stop-agent` so the daemon SIGKILLs the child.
+    /// - `detach_pane` issues `KIND_DETACH` so the daemon does *not*.
+    ///
+    /// For PTY-backed panes this is a no-op (the PTY is owned by this
+    /// process; "leaving it running" outside this process is meaningless),
+    /// and an unknown `pane_id` is a soft error so callers iterating across
+    /// all panes don't have to filter first.
+    pub fn detach_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+        let pane = {
+            let mut panes = self.panes.lock().unwrap();
+            match panes.remove(pane_id) {
+                Some(p) => p,
+                None => {
+                    return Err(PaneError::CommandFailed(format!(
+                        "Pane {pane_id} not found"
+                    )));
+                }
+            }
+        };
+        match pane.backend {
+            PaneBackend::Pty(_) => {
+                // Local PTYs can't survive process exit. Treat detach as a
+                // no-op: don't kill the child here (close_pane already
+                // covers that), but don't silently leave the pane in the
+                // registry either — the caller is detaching everything in
+                // preparation for quit, and re-inserting would break that
+                // invariant. Restoring the pane is wrong; dropping it kills
+                // the child via Drop, which matches "we're about to exit."
+                let _ = pane;
+                Ok(())
+            }
+            PaneBackend::Stream(mut s) => {
+                // Best-effort signal: if the channel is already closed
+                // (writer half exited on a transport error) just fall
+                // through to the abort below — the daemon will observe EOF
+                // and still leave the agent running. Either way the agent
+                // survives.
+                let _ = s.input_tx.send(StreamCmd::Detach);
+                if let Some(handle) = s.io_task.take() {
+                    // Hand the JoinHandle to the runtime so the writer can
+                    // drain the queued `Detach` and put the `KIND_DETACH`
+                    // frame on the wire before the socket goes away. Bound
+                    // the wait at 200ms — generous for a 5-byte frame on a
+                    // local socket; on timeout we fall through to the
+                    // abort path. The handle is *not* re-stored on `s`, so
+                    // when `s` drops below the abort path is a no-op.
+                    let _ = s.runtime.block_on(async move {
+                        tokio::time::timeout(Duration::from_millis(200), handle).await
+                    });
+                }
+                // `s` drops here → channel sender drops; if the io_task is
+                // still alive (timeout case) Drop's `take()` finds None and
+                // does nothing — but the socket halves owned by the task
+                // will be dropped on the next runtime tick once the task
+                // completes or is cancelled.
+                Ok(())
+            }
+        }
+    }
+
+    /// Detach every stream-backed pane. Used by the M2.5 "Detach (leave
+    /// agents running)" option in the quit dialog: a single keystroke
+    /// signals voluntary detach for all remote agents before the TUI
+    /// exits. Returns the list of `(pane_id, error)` pairs for any panes
+    /// that failed to detach — the caller can decide whether to surface
+    /// them; a non-empty result does not block the quit.
+    pub fn detach_all_streams(&self) -> Vec<(String, PaneError)> {
+        let stream_ids: Vec<String> = {
+            let panes = self.panes.lock().unwrap();
+            panes
+                .iter()
+                .filter(|(_, p)| matches!(p.backend, PaneBackend::Stream(_)))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut errors = Vec::new();
+        for id in stream_ids {
+            if let Err(e) = self.detach_pane(&id) {
+                errors.push((id, e));
+            }
+        }
+        errors
     }
 }
 
@@ -529,7 +658,7 @@ fn write_payload_to_backend(
             p.writer.flush().map_err(PaneError::Io)?;
         }
         PaneBackend::Stream(s) => {
-            if s.input_tx.send(payload.to_vec()).is_err() {
+            if s.input_tx.send(StreamCmd::Input(payload.to_vec())).is_err() {
                 return Err(PaneError::CommandFailed(format!(
                     "Pane {pane_id} stream I/O task ended"
                 )));

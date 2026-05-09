@@ -495,7 +495,14 @@ async fn handle_attach_stream(
                 }
                 let _ = w.flush();
             }
-            Ok(Some((KIND_DETACH, _))) => break,
+            Ok(Some((KIND_DETACH, _))) => {
+                // Explicit M2.5 detach: client signalled intent to leave the
+                // agent running. Plain socket EOF takes the `Ok(None)` arm
+                // below and is intentionally *not* counted as a detach —
+                // only voluntary detaches bump the registry counter.
+                registry.record_detach();
+                break;
+            }
             Ok(Some((kind, _))) => {
                 warn!("unexpected frame kind 0x{kind:02x} on attach stream — closing");
                 break;

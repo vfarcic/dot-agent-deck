@@ -1120,9 +1120,17 @@ struct NewPaneRequest {
 enum KeyResult {
     Continue,
     Quit,
+    /// PRD #76, M2.5: detach every stream-backed pane (sending an explicit
+    /// `KIND_DETACH` frame so the daemon distinguishes voluntary detach
+    /// from abrupt disconnect) and then exit. Local-PTY panes are torn
+    /// down by the normal quit path — they can't survive process exit.
+    DetachAndQuit,
     Focus,
     NewPane(NewPaneRequest),
-    SendConfigGenPrompt { pane_id: String, cwd: String },
+    SendConfigGenPrompt {
+        pane_id: String,
+        cwd: String,
+    },
     RequestConfigGen,
     ForwardToPane(Vec<u8>),
 }
@@ -1330,25 +1338,29 @@ fn handle_pane_input_key(key: KeyEvent) -> KeyResult {
 }
 
 fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    // 0 = Quit, 1 = Detach (M2.5: leave remote agents running), 2 = Cancel.
+    const QUIT_OPTION_COUNT: usize = 3;
     match key.code {
         // Ctrl+C again: actually quit (legacy shortcut)
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyResult::Quit,
         KeyCode::Up | KeyCode::Char('k') => {
-            ui.quit_confirm_selected = 0;
+            ui.quit_confirm_selected = ui.quit_confirm_selected.saturating_sub(1);
             KeyResult::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            ui.quit_confirm_selected = 1;
+            if ui.quit_confirm_selected + 1 < QUIT_OPTION_COUNT {
+                ui.quit_confirm_selected += 1;
+            }
             KeyResult::Continue
         }
-        KeyCode::Enter => {
-            if ui.quit_confirm_selected == 0 {
-                KeyResult::Quit
-            } else {
+        KeyCode::Enter => match ui.quit_confirm_selected {
+            0 => KeyResult::Quit,
+            1 => KeyResult::DetachAndQuit,
+            _ => {
                 ui.mode = UiMode::Normal;
                 KeyResult::Continue
             }
-        }
+        },
         KeyCode::Esc => {
             ui.mode = UiMode::Normal;
             KeyResult::Continue
@@ -3111,6 +3123,23 @@ pub fn run_tui(
 
             match result {
                 KeyResult::Quit => break 'outer,
+                KeyResult::DetachAndQuit => {
+                    // M2.5: emit explicit `KIND_DETACH` frames for every
+                    // stream-backed pane so the daemon distinguishes
+                    // voluntary detach from abrupt disconnect, then exit.
+                    // Local-PTY panes have nothing to detach from — they
+                    // die with the process either way.
+                    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                        let errs = embedded.detach_all_streams();
+                        if !errs.is_empty() {
+                            tracing::warn!(
+                                error_count = errs.len(),
+                                "detach_all_streams reported errors during quit — proceeding"
+                            );
+                        }
+                    }
+                    break 'outer;
+                }
                 KeyResult::Focus => {
                     // Dismiss idle art on the focused card
                     if let Some(ref sid) = selected_id
@@ -4314,16 +4343,20 @@ fn render_bottom_bar(
 
 fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette) {
     let area = frame.area();
-    let popup_width = 44.min(area.width.saturating_sub(4));
-    let popup_height = 9u16.min(area.height.saturating_sub(4));
+    let popup_width = 60u16.min(area.width.saturating_sub(4));
+    let popup_height = 10u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
+    // PRD #76, M2.5: "Detach" sits between Quit and Cancel so users facing
+    // the dialog with remote panes can pick the survival option without
+    // having to hunt for a separate keybind.
     let options = [
-        ("Quit", "exit the application"),
+        ("Quit", "stop agents and exit"),
+        ("Detach", "leave remote agents running"),
         ("Cancel", "return to dashboard"),
     ];
 
