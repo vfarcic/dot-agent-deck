@@ -26,10 +26,6 @@
       "agent-reviewer":     ["opencode --model openai/gpt-5.5"],
       "agent-auditor":      ["opencode --model openai/gpt-5.5"],
       "agent-release":      ["claude --model haiku"],
-      // "oc":          ["opencode --continue"],
-      // "oc-coder":    ["opencode --model openai/gpt-5.5-pro"],
-      // "oc-reviewer": ["opencode --model openai/gpt-5.5-pro"],
-      // "oc-auditor":  ["opencode --model openai/gpt-5.5-pro"],
       "oc-release":  ["opencode --model openai/gpt-5.4-mini"],
       "oc-kimi":     ["opencode --model openrouter/moonshotai/kimi-k2.6"]
     }
