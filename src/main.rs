@@ -153,7 +153,7 @@ enum RemoteCmd {
         /// ssh target: `[user@]host`.
         target: String,
         /// Remote type. Only `ssh` is implemented today; `kubernetes` is
-        /// scheduled for Phase 3.
+        /// planned in PRD #80.
         #[arg(long = "type", value_enum)]
         kind: CliRemoteType,
         /// ssh port.

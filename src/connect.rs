@@ -19,7 +19,7 @@
 //! Three pieces here, each independently testable:
 //! - **lookup / picker** — pure registry logic. `lookup_remote` resolves a
 //!   name; `pick_remote` runs the numbered prompt when `<NAME>` is omitted.
-//!   Both reject `kind = "kubernetes"` (Phase 3 not yet supported).
+//!   Both reject `kind = "kubernetes"` (planned in PRD #80, not yet supported).
 //! - **bridge** — [`ConnectBridge`] owns the listener task + the ssh `Child`
 //!   and cleans up the socket file on drop. Exposed as a struct so the TUI
 //!   loop runs *while* the bridge is alive, and dropping the bridge tears
@@ -51,8 +51,8 @@ use crate::remote::{RemoteConfigError, RemoteEntry, RemotesFile, SshTarget, Syst
 const BRIDGE_SOCKET_MODE: u32 = 0o600;
 
 /// Marker `kind` for entries the user added with `--type=kubernetes`. M2.4
-/// rejects these explicitly so the message clearly says "Phase 3" instead of
-/// surfacing a generic ssh failure deeper in the bridge.
+/// rejects these explicitly so the message clearly points the user at PRD #80
+/// instead of surfacing a generic ssh failure deeper in the bridge.
 const KIND_KUBERNETES: &str = "kubernetes";
 
 /// Maximum invalid attempts on the picker prompt before bailing. Three is the
@@ -67,7 +67,7 @@ pub enum RemoteConnectError {
     )]
     UnknownName { name: String },
     #[error(
-        "Remote '{name}' is type 'kubernetes'; kubernetes remotes are not yet supported (Phase 3)."
+        "Remote '{name}' is type 'kubernetes'; kubernetes remotes are not yet supported (planned in PRD #80)."
     )]
     KubernetesNotYetSupported { name: String },
     #[error(
@@ -129,7 +129,7 @@ pub fn lookup_remote(name: &str, path: &Path) -> Result<RemoteEntry, RemoteConne
 fn format_picker_row(idx: usize, entry: &RemoteEntry) -> String {
     if entry.kind == KIND_KUBERNETES {
         format!(
-            "  {idx}) {:<12} (kubernetes)   [Phase 3 — not yet connectable]\n",
+            "  {idx}) {:<12} (kubernetes)   [PRD #80 — not yet connectable]\n",
             entry.name
         )
     } else {
@@ -142,8 +142,8 @@ fn format_picker_row(idx: usize, entry: &RemoteEntry) -> String {
 /// - 0 entries: error with the empty-state hint (this is a hard "can't
 ///   proceed" — distinct from `remote list`'s ambient empty state).
 /// - 1 entry: auto-pick. Print "Connecting to <name>..." and return without
-///   prompting. Kubernetes-only registry still routes through the
-///   Phase-3 rejection.
+///   prompting. Kubernetes-only registry still routes through the PRD #80
+///   rejection.
 /// - 2+ entries: numbered prompt. Up to [`PICKER_MAX_RETRIES`] invalid
 ///   attempts before giving up.
 ///
@@ -631,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_lookup_kubernetes_type_phase3_error() {
+    fn connect_lookup_kubernetes_type_routes_to_prd_80() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_registry(
             &dir,
@@ -645,10 +645,7 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
         let msg = err.to_string();
-        assert!(
-            msg.to_lowercase().contains("phase 3"),
-            "msg should mention Phase 3: {msg}"
-        );
+        assert!(msg.contains("PRD #80"), "msg should mention PRD #80: {msg}");
     }
 
     // ----- picker -----

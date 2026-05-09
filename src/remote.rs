@@ -403,7 +403,7 @@ pub enum RemoteAddError {
         "A remote named '{name}' already exists. Use `dot-agent-deck remote remove {name}` first or pick a different name."
     )]
     DuplicateName { name: String },
-    #[error("Remote type 'kubernetes' is not yet implemented; coming in Phase 3.")]
+    #[error("Remote type 'kubernetes' is not yet implemented; planned in PRD #80.")]
     KubernetesNotYetImplemented,
     #[error("Unsupported remote type '{kind}'. Supported: ssh.")]
     UnsupportedType { kind: String },
