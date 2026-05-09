@@ -1,58 +1,32 @@
-//! M2.1: stdio-side bridge for the streaming attach protocol (PRD #76).
+//! Lazy-spawn machinery for the on-remote daemon (PRD #76, M4.3).
 //!
-//! `dot-agent-deck daemon attach` runs on the **remote** host. ssh execs it
-//! there, the local TUI plumbs frames through ssh's stdin/stdout, and this
-//! bridge byte-relays them to the remote's local attach socket:
+//! After the 2026-05-09 architectural pivot the laptop-side bridge that
+//! ssh-exec'd `dot-agent-deck daemon attach` on the remote was removed
+//! (M2.7). What survives in this module is the pieces that lazy-spawn the
+//! daemon on the remote when something else needs it (the on-remote TUI, a
+//! future M2.8 caller, or M2.9's `ssh -t` connect):
 //!
-//! ```text
-//! local TUI <—frames—> ssh stdin/stdout <—frames—> [remote: daemon attach <—frames—> /tmp/dot-agent-deck-attach.sock]
-//! ```
-//!
-//! The bridge does **not** parse frames — the existing wire format
-//! (length-prefixed binary, see [`crate::daemon_protocol`]) already runs
-//! over any `AsyncRead` / `AsyncWrite` pair, so a transparent byte copy in
-//! both directions is sufficient.
-//!
-//! M4.3 lazy-spawn: when the attach socket isn't there yet (no prior
-//! `connect` ran on this remote since boot), [`ensure_daemon_running`]
-//! detach-spawns `dot-agent-deck daemon serve` so the daemon survives the
-//! ssh hangup, then polls for the socket before falling through to the
-//! bridge. This avoids wiring up systemd --user (PRD #76 line 140 — that's
-//! a future milestone).
-//!
-//! M4.3 fix-up — concurrency + trust:
-//! - Concurrent first attaches serialize on a `flock(2)` over
-//!   `<state_dir>/spawn.lock` so only one races the bind. The loser
-//!   re-checks the socket after acquiring the lock and short-circuits.
-//! - Both code paths (pre-existing socket and freshly-spawned socket) verify
-//!   the socket is a Unix socket owned by the current uid at mode 0o600
-//!   before connecting, so a same-uid attacker can't pre-bind to intercept.
-//! - The detached daemon's log is opened with `O_NOFOLLOW` and mode 0o600,
-//!   so a planted symlink fails fast and sensitive output (hook payloads,
-//!   task strings) doesn't leak via default umask.
+//! - [`ensure_daemon_running`] — `flock(2)`-serialized "is the attach socket
+//!   present? if not, run `spawn_fn` and poll for it" loop. Concurrent
+//!   first-attaches serialize on `<state_dir>/spawn.lock` so only one races
+//!   the bind. The loser re-checks after acquiring the lock and short-circuits.
+//! - [`verify_socket_trusted`] — checks the path is a Unix socket owned by
+//!   the current uid at mode 0o600 before any caller connects, defending
+//!   against a same-uid attacker who pre-binds at the attach path.
+//! - [`spawn_daemon_serve_detached`] — `setsid(2)` + `O_NOFOLLOW` + 0o600
+//!   detach-spawn of `dot-agent-deck daemon serve` so the daemon survives
+//!   the parent's exit.
 
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::UnixStream;
 
-/// Errors surfaced by the bridge. The CLI handler renders these to stderr
-/// before exiting nonzero; tests match on the variant.
+/// Errors surfaced by the lazy-spawn machinery. The CLI handler renders
+/// these to stderr before exiting nonzero; tests match on the variant.
 #[derive(Debug, Error)]
 pub enum AttachError {
-    #[error(
-        "daemon attach socket not found at {path}: is the daemon running on this host? (set $DOT_AGENT_DECK_ATTACH_SOCKET to override)"
-    )]
-    SocketMissing { path: PathBuf },
-    #[error("failed to connect to daemon attach socket {path}: {source}")]
-    Connect {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("failed to spawn detached daemon: {source}")]
     DaemonSpawnFailed {
         #[source]
@@ -71,70 +45,6 @@ pub enum AttachError {
          Another user (or a hostile same-uid process) may have placed this file."
     )]
     SocketUntrusted { path: PathBuf, reason: String },
-}
-
-/// Run the stdio ↔ attach-socket bridge. Returns once either direction
-/// closes:
-///
-/// - **stdin EOF** (parent ssh hung up): the inbound copy returns; we let
-///   the outbound copy finish flushing whatever the daemon already had
-///   queued, then exit.
-/// - **socket close from daemon side** (daemon shut down or detached): the
-///   outbound copy returns; the inbound future is cancelled when `select!`
-///   completes, dropping its borrows of stdin and the socket write half.
-/// - **broken pipe on stdout** (parent ssh died): the outbound copy returns
-///   `Err`; we treat that as "exit cleanly, the parent's gone".
-///
-/// Generic over `AsyncRead` / `AsyncWrite` so tests can drive it through
-/// `tokio::io::duplex` pipes without forking a process.
-pub async fn run_daemon_attach<R, W>(
-    socket_path: &Path,
-    mut stdin: R,
-    mut stdout: W,
-) -> Result<(), AttachError>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    if !socket_path.exists() {
-        return Err(AttachError::SocketMissing {
-            path: socket_path.to_path_buf(),
-        });
-    }
-    // Same-uid attackers can pre-bind a Unix socket at this path before the
-    // real daemon. Verify ownership/type/mode before we hand the bridge our
-    // stdin: connecting blindly would let the attacker speak the streaming
-    // attach protocol to whatever's on the other end of ssh.
-    verify_socket_trusted(socket_path)?;
-    let stream = UnixStream::connect(socket_path)
-        .await
-        .map_err(|source| AttachError::Connect {
-            path: socket_path.to_path_buf(),
-            source,
-        })?;
-    let (mut sock_rd, mut sock_wr) = stream.into_split();
-
-    // Two transparent byte copies. Whichever finishes first cancels the
-    // other via `select!`, which drops the inactive future and releases its
-    // half of the socket FD deterministically — same pattern as
-    // `embedded_pane::create_stream_pane`'s reader/writer select! (PRD M1.3
-    // fix-up F2). Errors on either copy are treated as "the peer is gone";
-    // they're not propagated because there is no useful recovery from
-    // here — the caller's only job after the bridge exits is to flush and
-    // return.
-    let inbound = async {
-        let _ = tokio::io::copy(&mut stdin, &mut sock_wr).await;
-    };
-    let outbound = async {
-        let _ = tokio::io::copy(&mut sock_rd, &mut stdout).await;
-    };
-    tokio::pin!(inbound, outbound);
-    tokio::select! {
-        _ = &mut inbound => {},
-        _ = &mut outbound => {},
-    }
-
-    Ok(())
 }
 
 /// If `socket_path` doesn't exist, run `spawn_fn` to start a detached
@@ -272,7 +182,7 @@ impl Drop for SpawnLock {
 /// Open or create `path` and acquire an exclusive `flock(2)` on it. flock is
 /// blocking, so we run the syscall on `spawn_blocking` to avoid stalling
 /// other tasks scheduled on the same tokio worker when contention is real
-/// (i.e., another `daemon attach` on this host is mid-spawn).
+/// (i.e., another caller on this host is mid-spawn).
 async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -316,13 +226,13 @@ fn prepare_state_dir(state_dir: &Path) -> std::io::Result<()> {
 }
 
 /// Spawn `dot-agent-deck daemon serve` as a detached background process
-/// that survives ssh hangup. Used by lazy-spawn-on-attach (M4.3).
+/// that survives the parent's exit. Used by lazy-spawn-on-attach (M4.3).
 ///
 /// - The binary is located via [`std::env::current_exe`] rather than `$PATH`
 ///   because non-interactive ssh shells routinely skip `~/.local/bin` (we
 ///   hit this exact bug three times — commits 493248b, bbf2236, ea8c748).
 /// - `setsid(2)` runs in the child via `pre_exec` so the daemon becomes
-///   its own session leader and won't receive `SIGHUP` when the parent ssh
+///   its own session leader and won't receive `SIGHUP` when the parent
 ///   shell exits.
 /// - stdin is `/dev/null` and stdout/stderr append to `<state_dir>/daemon.log`.
 ///   The log is opened with `O_NOFOLLOW` and mode 0o600 so a same-uid
@@ -382,8 +292,8 @@ pub fn spawn_daemon_serve_detached(state_dir: &Path) -> std::io::Result<()> {
     }
 
     // Spawn and immediately drop the handle. The child is now its own
-    // session leader; when this process (the `daemon attach` bridge) exits,
-    // init reaps the child. We don't wait — the bridge is about to start.
+    // session leader; when this process exits, init reaps the child. We
+    // don't wait — the caller will poll the attach socket.
     let _child = cmd.spawn()?;
     Ok(())
 }

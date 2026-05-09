@@ -6,7 +6,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, DOT_AGENT_DECK_VIA_DAEMON};
-use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path, state_dir};
+use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::DaemonClient;
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
@@ -132,16 +132,11 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum DaemonCmd {
-    /// Bridge stdio to the local daemon's attach socket. ssh execs this on
-    /// the remote host so the local TUI can speak the streaming attach
-    /// protocol over the ssh pipe (PRD #76, M2.1).
-    Attach,
     /// Run the daemon as a foreground process, binding the hook-ingestion
     /// and streaming-attach sockets but **not** launching the TUI. Used
-    /// internally by lazy-spawn-on-attach (PRD #76, M4.3): when a remote's
-    /// `daemon attach` finds the attach socket missing, it detach-spawns
-    /// `daemon serve` so the daemon survives the ssh hangup. Not part of
-    /// the everyday user surface.
+    /// internally by lazy-spawn-on-attach (PRD #76, M4.3) and by callers
+    /// that want a long-lived daemon to outlive the spawning shell. Not
+    /// part of the everyday user surface.
     Serve,
 }
 
@@ -402,7 +397,6 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(Commands::Daemon { cmd }) => match cmd {
-            DaemonCmd::Attach => run_daemon_attach_cli(),
             DaemonCmd::Serve => run_daemon_serve_cli(),
         },
         Some(Commands::Remote { cmd }) => match cmd {
@@ -658,23 +652,27 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) {
     }
 }
 
-/// `dot-agent-deck connect [name]` — PRD #76 M2.4. Resolves the remote (by
-/// name or via the picker), spawns an ssh-exec'd `daemon attach` on the
-/// remote, plumbs it through a local Unix socket, sets the M1.3 env vars so
-/// the in-process TUI dials that socket, then runs the TUI body. Bridge
-/// teardown happens automatically via `ConnectBridge::Drop` when this
-/// function returns.
-#[tokio::main]
-async fn run_connect(
-    cli_theme: Option<Theme>,
-    continue_session: bool,
+/// `dot-agent-deck connect [name]` — PRD #76 M2.4 surface.
+///
+/// The original M2.4–M2.6 implementation spawned a laptop-side socket bridge
+/// and ran the TUI in-process against the remote daemon. The 2026-05-09
+/// architectural pivot replaced that with "TUI runs on the remote via
+/// `ssh -t`, daemon is a separate process for persistence." M2.7 deletes the
+/// bridge guts; M2.9 will reintroduce the new ssh -t implementation. Until
+/// then this stub keeps the CLI surface compiling — the lookup/picker still
+/// runs (so name resolution and the kubernetes rejection still work as
+/// expected) but the connect itself returns "not yet implemented".
+fn run_connect(
+    _cli_theme: Option<Theme>,
+    _continue_session: bool,
     name: Option<String>,
 ) -> ExitCode {
-    init_logging_from_env();
-
     let registry_path = dot_agent_deck::remote::default_remotes_path();
 
-    // 1. Resolve the remote — either by name or via the interactive picker.
+    // Run lookup/picker so user-visible name-resolution errors still fire
+    // (and so an interactive `connect` without args doesn't silently
+    // succeed when there are no remotes). The resolved entry is dropped on
+    // the floor — there's nothing to connect to yet.
     let entry = match name {
         Some(n) => match dot_agent_deck::connect::lookup_remote(&n, &registry_path) {
             Ok(e) => e,
@@ -699,120 +697,13 @@ async fn run_connect(
         }
     };
 
-    // 2. Compute the bridge socket path up front so we can publish it via
-    //    env *before* spawning any tokio task (see step 3).
-    let target = entry.ssh_target();
-    let socket_path = dot_agent_deck::connect::bridge_socket_path();
-
-    // 2.5. M2.6 — failure-mode-aware probe. Run a one-shot ssh + list-agents
-    //      BEFORE bringing up the persistent bridge so connect-time failures
-    //      surface as typed errors (HostUnreachable / DaemonUnavailable) with
-    //      actionable hints, instead of leaking through the TUI as garbled
-    //      output. A successful probe also returns the agent list so we can
-    //      print the "no agents running" empty-state hint after the bridge is
-    //      up and before the TUI launches.
-    let agents = match dot_agent_deck::connect::probe_remote(&target, &entry.name).await {
-        Ok(list) => list,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // 3. Set the env vars the TUI's stream-backed-pane path reads
-    //    (`DOT_AGENT_DECK_VIA_DAEMON` at src/main.rs ~L567,
-    //    `DOT_AGENT_DECK_ATTACH_SOCKET` at src/config.rs:71). Done BEFORE
-    //    `start_bridge` so the bridge listener task isn't already alive
-    //    when set_var runs.
-    //
-    // SAFETY: `std::env::set_var` is `unsafe` since Rust 1.89 because
-    // concurrent reads on another thread race with the mutation. `#[tokio::main]`
-    // has already spun up the runtime's worker threads by this point, so the
-    // process is multi-threaded — but the relevant invariant isn't
-    // "single-threaded process", it's "no concurrent thread reads these
-    // specific env vars while we mutate them". `DOT_AGENT_DECK_VIA_DAEMON`
-    // and `DOT_AGENT_DECK_ATTACH_SOCKET` are read only at TUI launch
-    // (`run_tui_session` via `attach_socket_path()` in src/config.rs and
-    // the inline `env::var` in src/main.rs), and we control the program
-    // order: nothing has been spawned yet that touches them. The values
-    // also don't depend on anything from `start_bridge` — both are static
-    // (`"1"` and the socket path computed above).
-    unsafe {
-        std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, "1");
-        std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket_path);
-    }
-
-    // 4. Bring up the bridge (binds Unix socket + spawns ssh + relay task).
-    let bridge = match dot_agent_deck::connect::start_bridge(&target, socket_path.clone()).await {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Failed to start connect bridge: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // 4.5. M2.6 — empty-state hint. If the probe came back with no agents,
-    //      drop a single non-blocking line BEFORE launching the TUI so the
-    //      user knows to press Ctrl+N. The TUI's existing empty-dashboard
-    //      state handles the rest.
-    if agents.is_empty() {
-        println!(
-            "No agents running on '{}'. Press Ctrl+N inside the TUI to start one.",
-            entry.name
-        );
-    }
-
-    // 5. Run the same TUI body the default subcommand uses.
-    run_tui_session(cli_theme, continue_session).await;
-
-    // `bridge` drops here: socket file unlinked, ssh child killed via
-    // kill_on_drop, listener task aborted with this tokio runtime.
-    drop(bridge);
-    ExitCode::SUCCESS
-}
-
-#[tokio::main]
-async fn run_daemon_attach_cli() -> ExitCode {
-    let path = attach_socket_path();
-
-    // M4.3 lazy-spawn: if no daemon is running on this host yet, detach-spawn
-    // `daemon serve` so it survives the ssh hangup, then poll for the socket
-    // before falling through to the bridge. Subsequent `connect`s find the
-    // socket already present and skip the spawn. The 5s/50ms timing matches
-    // the M4.3 task brief and is plenty for a Rust binary that just binds
-    // two Unix sockets.
-    //
-    // Concurrent first attaches serialize on `<state_dir>/spawn.lock` inside
-    // `ensure_daemon_running` so two simultaneous `connect`s don't both race
-    // to bind the daemon socket.
-    let state_dir = state_dir();
-    let state_dir_for_spawn = state_dir.clone();
-    if let Err(e) = dot_agent_deck::daemon_attach::ensure_daemon_running(
-        &path,
-        &state_dir,
-        move || dot_agent_deck::daemon_attach::spawn_daemon_serve_detached(&state_dir_for_spawn),
-        std::time::Duration::from_millis(50),
-        std::time::Duration::from_secs(5),
-    )
-    .await
-    {
-        eprintln!("{e}");
-        return ExitCode::FAILURE;
-    }
-
-    match dot_agent_deck::daemon_attach::run_daemon_attach(
-        &path,
-        tokio::io::stdin(),
-        tokio::io::stdout(),
-    )
-    .await
-    {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::FAILURE
-        }
-    }
+    eprintln!(
+        "`connect {}` is not yet implemented (PRD #76 M2.9). \
+         The laptop-side bridge was removed in M2.7 as part of the architectural \
+         pivot to running the TUI on the remote via `ssh -t`.",
+        entry.name
+    );
+    ExitCode::FAILURE
 }
 
 /// `dot-agent-deck daemon serve` — PRD #76 M4.3. Runs the daemon (hook
