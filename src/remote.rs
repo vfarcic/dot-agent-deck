@@ -160,12 +160,19 @@ pub trait SshExecutor {
 /// the user's existing ssh config (`~/.ssh/config`, agent, known_hosts).
 ///
 /// `wallclock_timeout` is an optional fail-fast cap used by short-lived probe
-/// commands (e.g. M2.9's `connect` version probe). It maps to ssh's own
-/// `-o ConnectTimeout=N -o ServerAliveInterval=N -o ServerAliveCountMax=1`
-/// triple, which protects against both pre-handshake hangs (DNS, TCP, ssh
-/// handshake) AND mid-stream stalls on a quiet TCP connection. `None` keeps
-/// the original behavior — relevant for long-running invocations like
-/// `remote add`'s install pipeline where a 10s ceiling would be too tight.
+/// commands (e.g. M2.9's `connect` version probe). It applies on TWO layers:
+///
+/// 1. The ssh `-o ConnectTimeout=N -o ServerAliveInterval=N -o
+///    ServerAliveCountMax=1` triple, which catches transport-level stalls
+///    (DNS, TCP, ssh handshake, dead-TCP keepalives).
+/// 2. A laptop-side wallclock kill enforced by `run_with_wallclock_kill`
+///    inside `run()`, which catches the reachable-but-stalled-remote-command
+///    case the ssh options miss: server completes the handshake and answers
+///    keepalives, but the remote command hangs before producing output.
+///
+/// `None` keeps the original behavior on both layers — relevant for
+/// long-running invocations like `remote add`'s install pipeline where a 10s
+/// ceiling would be too tight.
 pub struct SystemSshExecutor {
     wallclock_timeout: Option<u64>,
 }
@@ -234,10 +241,13 @@ impl Default for SystemSshExecutor {
 impl SshExecutor for SystemSshExecutor {
     fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
         let mut cmd = self.build_command(target, command);
-        let output = cmd.output().map_err(|source| SshError::Io {
-            target: target.user_host(),
-            source,
-        })?;
+        let output = match self.wallclock_timeout {
+            Some(secs) => run_with_wallclock_kill(&mut cmd, target, secs)?,
+            None => cmd.output().map_err(|source| SshError::Io {
+                target: target.user_host(),
+                source,
+            })?,
+        };
         let status = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -255,6 +265,82 @@ impl SshExecutor for SystemSshExecutor {
             stdout,
             stderr,
         })
+    }
+}
+
+/// Spawn `cmd` and enforce a laptop-side wallclock kill at `secs` seconds.
+///
+/// `cmd.output()` has no timeout: a remote ssh server that completes the
+/// handshake but whose remote command hangs before producing output keeps
+/// answering `ServerAliveInterval` keepalives, so the ssh client sees a
+/// "healthy" transport and `cmd.output()` waits forever. The `-o
+/// ConnectTimeout=` / `ServerAliveInterval=` triple in `build_command` only
+/// catches transport-level stalls; *this* helper catches the
+/// reachable-but-stalled-remote-command case by enforcing a real local
+/// deadline around the spawned child.
+///
+/// Behavior:
+/// - Pipes stdout/stderr so the captured `Output` mirrors what `cmd.output()`
+///   would have returned on a clean exit.
+/// - Polls `child.try_wait()` every 50ms until the deadline. Polling cadence
+///   is a wallclock-vs-CPU tradeoff; 50ms keeps the worst-case overshoot
+///   under a tick while costing ~20 syscalls/sec.
+/// - On deadline: SIGKILL via `child.kill()`, reap with `child.wait()`, and
+///   return [`SshError::Other`] so the connect-layer mapper folds it into
+///   `HostUnreachable` (the right user-visible classification — the user's
+///   recourse is the same as transport-unreachable).
+fn run_with_wallclock_kill(
+    cmd: &mut Command,
+    target: &SshTarget,
+    secs: u64,
+) -> Result<std::process::Output, SshError> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|source| SshError::Io {
+        target: target.user_host(),
+        source,
+    })?;
+
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let poll_interval = Duration::from_millis(50);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                // Child reaped already; wait_with_output reads the piped
+                // stdout/stderr to EOF and returns the cached status.
+                return child.wait_with_output().map_err(|source| SshError::Io {
+                    target: target.user_host(),
+                    source,
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Best-effort cleanup: ignore secondary errors. SIGKILL
+                    // is unblockable so the child is guaranteed to be
+                    // reaped, and `wait` collects the zombie.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(SshError::Other {
+                        target: target.user_host(),
+                        detail: format!(
+                            "probe exceeded {secs}s wallclock deadline (laptop-side kill after ssh did not return)"
+                        ),
+                    });
+                }
+                std::thread::sleep(poll_interval);
+            }
+            Err(source) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SshError::Io {
+                    target: target.user_host(),
+                    source,
+                });
+            }
+        }
     }
 }
 
@@ -1104,6 +1190,71 @@ mod tests {
         assert!(
             args.iter().any(|a| a == "ServerAliveCountMax=1"),
             "with_wallclock_timeout must force a single missed-keepalive abort: {args:?}"
+        );
+    }
+
+    // ----- wallclock-kill helper -----
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_wallclock_kill_kills_a_hung_child_within_deadline() {
+        // The motivating case: a child that never exits on its own. The ssh
+        // options in `build_command` only catch transport-level stalls; this
+        // helper is what guarantees a wallclock cap on a reachable-but-
+        // stalled remote command. We use `sleep 30` as a stand-in for any
+        // hung process — it ignores SIGTERM only minimally and dies on
+        // SIGKILL like everything else, so we measure both correctness
+        // (returns Other with the right detail) and that the kill actually
+        // happens (elapsed wallclock < 3s tolerance for CI jitter).
+        use std::time::Instant;
+        let target = SshTarget::parse("u@h", 22, None);
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = Instant::now();
+        let result = run_with_wallclock_kill(&mut cmd, &target, 1);
+        let elapsed = start.elapsed();
+        let err = result.expect_err("hung child must error");
+        match err {
+            SshError::Other { detail, .. } => {
+                assert!(
+                    detail.contains("wallclock"),
+                    "detail must mention wallclock: {detail}"
+                );
+                assert!(
+                    detail.contains("1s"),
+                    "detail must mention the 1s budget: {detail}"
+                );
+            }
+            other => panic!("expected SshError::Other, got {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "elapsed {elapsed:?} exceeds 3s CI-jitter tolerance — the kill did not fire"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_wallclock_kill_returns_output_when_child_finishes_in_time() {
+        // The non-timeout path: a child that exits before the deadline must
+        // round-trip its captured stdout/stderr verbatim, so callers see the
+        // same `Output` they'd get from `cmd.output()`. `/bin/echo` (the
+        // binary, not the shell builtin) makes the assertion deterministic
+        // across $SHELL.
+        let target = SshTarget::parse("u@h", 22, None);
+        let mut cmd = Command::new("/bin/echo");
+        cmd.arg("dot-agent-deck 0.24.5");
+        let output = run_with_wallclock_kill(&mut cmd, &target, 5)
+            .expect("child finishing in time must Ok with Output");
+        assert!(
+            output.status.success(),
+            "echo must exit cleanly, got {:?}",
+            output.status
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("dot-agent-deck 0.24.5"),
+            "captured stdout must contain echoed line: {stdout}"
         );
     }
 

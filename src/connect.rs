@@ -247,11 +247,20 @@ pub enum ProbeOutcome {
 /// Read the probe-timeout override, falling back to [`PROBE_TIMEOUT_SECS_DEFAULT`].
 /// Invalid values fall back silently — a malformed env var should not block
 /// `connect` outright.
+///
+/// A parsed value of `0` is clamped to `1`. Two reasons converge here:
+/// OpenSSH treats `ConnectTimeout=0` as "no explicit timeout" and
+/// `ServerAliveInterval=0` as "keepalives disabled" (so a literal 0 disables
+/// the ssh-side guard entirely), AND the laptop-side wallclock kill in
+/// `remote::run_with_wallclock_kill` would fire instantly on
+/// `Duration::from_secs(0)`. A 1-second floor avoids both fail-open modes;
+/// LAN round-trips are well under a second so it's a defensible minimum.
 fn probe_timeout_secs() -> u64 {
     std::env::var(PROBE_TIMEOUT_ENV)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(PROBE_TIMEOUT_SECS_DEFAULT)
+        .max(1)
 }
 
 /// Pull the version number out of `dot-agent-deck --version` output.
@@ -1169,11 +1178,63 @@ mod tests {
         );
     }
 
+    /// Serializes tests that mutate `PROBE_TIMEOUT_ENV`. Rust runs unit
+    /// tests in a single binary on a thread pool, so two tests writing the
+    /// same env var would otherwise race — exactly the failure the auditor
+    /// flagged. Held for the lifetime of `ProbeTimeoutEnvGuard`.
+    static PROBE_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard for `PROBE_TIMEOUT_ENV`: takes the global lock, snapshots
+    /// the prior value on construction, and restores it (set if Some, remove
+    /// if None) in `Drop`. Without this, a panic mid-test would leak the
+    /// mutated env var into later tests in the same binary, and the previous
+    /// test unconditionally `remove_var`'d at the end — erasing any
+    /// pre-existing value the parent process had set. Mirrors the M2.8
+    /// `DaemonTestCleanup` pattern (PRD #76 M2.9 auditor LOW).
+    struct ProbeTimeoutEnvGuard {
+        prev: Option<String>,
+        // Held to serialize concurrent tests touching the same env var.
+        // `MutexGuard<'static, ()>` is the right shape: we don't need the
+        // unit value, only the exclusive section.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ProbeTimeoutEnvGuard {
+        fn new() -> Self {
+            // Recover from any prior test panic that poisoned the lock —
+            // we don't share data through the mutex, just exclusion.
+            let lock = PROBE_TIMEOUT_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            Self {
+                prev: std::env::var(PROBE_TIMEOUT_ENV).ok(),
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ProbeTimeoutEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: env mutation is unsafe in Rust 1.85+; the guard owns
+            // the only handle to this var for the test's lifetime (via the
+            // lock), and restoring is symmetric with the constructor's
+            // snapshot.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(PROBE_TIMEOUT_ENV, v),
+                    None => std::env::remove_var(PROBE_TIMEOUT_ENV),
+                }
+            }
+        }
+    }
+
     #[test]
     fn probe_timeout_secs_reads_env_var() {
+        let _guard = ProbeTimeoutEnvGuard::new();
         // SAFETY: Rust 1.85+ marks these unsafe to discourage non-test use;
         // the connect.rs unit tests don't run in parallel with anything
         // touching the same var, so the race window is empty in practice.
+        // RAII guard above restores the prior value on drop (incl. panic).
         unsafe {
             std::env::remove_var(PROBE_TIMEOUT_ENV);
         }
@@ -1190,9 +1251,24 @@ mod tests {
             PROBE_TIMEOUT_SECS_DEFAULT,
             "malformed env var must fall back silently"
         );
+    }
+
+    #[test]
+    fn probe_timeout_secs_clamps_zero_to_one() {
+        // 0 is fail-open in both directions: OpenSSH treats `ConnectTimeout=0`
+        // as "no timeout" and `ServerAliveInterval=0` as "keepalives off"
+        // (defeating the ssh-side guard), AND the laptop-side wallclock kill
+        // would fire instantly on Duration::from_secs(0). The clamp to 1
+        // closes both holes with the smallest defensible floor.
+        let _guard = ProbeTimeoutEnvGuard::new();
         unsafe {
-            std::env::remove_var(PROBE_TIMEOUT_ENV);
+            std::env::set_var(PROBE_TIMEOUT_ENV, "0");
         }
+        assert_eq!(
+            probe_timeout_secs(),
+            1,
+            "explicit 0 must clamp to 1 to avoid disabling the timeout guard"
+        );
     }
 
     // ----- parse_version_output edge cases -----
