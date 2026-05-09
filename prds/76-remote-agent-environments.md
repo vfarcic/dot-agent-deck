@@ -221,7 +221,7 @@ The daemon protocol, registry shape, and CLI surface in this PRD are designed fo
 
 ### Phase 4: Quality
 
-- [ ] **M4.1** — Tests for the streaming attach protocol (round-trip of all message types, disconnect/reconnect, partial frames).
+- [x] **M4.1** — Tests for the streaming attach protocol (round-trip of all message types, disconnect/reconnect, partial frames).
 - [ ] **M4.2** — Integration test: spin up the daemon locally, attach, start an agent, detach, reattach, stop. End-to-end on a single machine.
 - [ ] **M4.3** — Manual end-to-end validation on the dev/test VM (the K8s leg moves to PRD #80).
 

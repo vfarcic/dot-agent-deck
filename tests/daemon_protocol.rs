@@ -631,3 +631,132 @@ async fn slow_client_dropped_within_bounded_time() {
 
     server.registry.close_agent(&id).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// M4.1 — disconnect/reconnect and partial-frame reassembly
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn abrupt_disconnect_keeps_agent_alive() {
+    // Laptop-sleep / link-loss case: the client's socket dies without
+    // sending KIND_DETACH. The daemon must distinguish EOF from explicit
+    // detach, keep the agent alive, and serve scrollback to a fresh
+    // connection.
+    let server = start_server().await;
+    let id = start_agent(&server, "/bin/sh").await;
+
+    {
+        let mut a = connect_attach(&server, &id).await;
+        write_frame(&mut a, KIND_STREAM_IN, b"echo PRE-DROP\n").await;
+        read_until_contains(&mut a, b"PRE-DROP").await;
+        // Drop without DETACH — simulates abrupt socket loss.
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut s, &AttachRequest::ListAgents).await;
+    let resp = read_response(&mut s).await;
+    assert_eq!(
+        resp.agents,
+        Some(vec![id.clone()]),
+        "agent must survive abrupt disconnect"
+    );
+
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut s, &AttachRequest::Snapshot { id: id.clone() }).await;
+    let resp = read_response(&mut s).await;
+    assert!(resp.ok);
+
+    let mut snap: Vec<u8> = Vec::new();
+    loop {
+        match read_frame(&mut s).await {
+            Some((KIND_STREAM_OUT, b)) => snap.extend_from_slice(&b),
+            Some((KIND_STREAM_END, _)) => break,
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&snap).contains("PRE-DROP"),
+        "snapshot after abrupt disconnect must contain PRE-DROP; got: {:?}",
+        String::from_utf8_lossy(&snap)
+    );
+
+    server.registry.close_agent(&id).unwrap();
+}
+
+#[tokio::test]
+async fn reattach_after_detach_sees_scrollback() {
+    // Orchestrator-reconnect proof: scrollback survives an explicit
+    // DETACH and is replayed as the initial-snapshot prelude on a
+    // subsequent AttachStream.
+    let server = start_server().await;
+    let id = start_agent(&server, "/bin/sh").await;
+
+    {
+        let mut a = connect_attach(&server, &id).await;
+        write_frame(&mut a, KIND_STREAM_IN, b"echo SCROLL-A\n").await;
+        read_until_contains(&mut a, b"SCROLL-A").await;
+        write_frame(&mut a, KIND_DETACH, &[]).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut a = connect_attach(&server, &id).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut acc: Vec<u8> = Vec::new();
+    let mut saw = false;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, read_frame(&mut a)).await {
+            Ok(Some((KIND_STREAM_OUT, bytes))) => {
+                acc.extend_from_slice(&bytes);
+                if acc.windows(b"SCROLL-A".len()).any(|w| w == b"SCROLL-A") {
+                    saw = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw,
+        "reattach must replay SCROLL-A as snapshot prelude; got: {:?}",
+        String::from_utf8_lossy(&acc)
+    );
+
+    server.registry.close_agent(&id).unwrap();
+}
+
+#[tokio::test]
+async fn partial_frame_writes_reassemble() {
+    // The wire format is `1-byte kind + 4-byte BE len + payload`. The
+    // server must reassemble a frame whose bytes arrive split across
+    // multiple writes (read_exact, not a single read). Fragment the
+    // STREAM_IN frame into header / length / payload chunks with sleeps
+    // between, and verify the PTY still receives the input.
+    let server = start_server().await;
+    let id = start_agent(&server, "/bin/sh").await;
+    let mut a = connect_attach(&server, &id).await;
+
+    let payload = b"echo PARTIAL-FRAME\n";
+    let len_be = (payload.len() as u32).to_be_bytes();
+
+    a.write_all(&[KIND_STREAM_IN]).await.unwrap();
+    a.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    a.write_all(&len_be).await.unwrap();
+    a.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    a.write_all(payload).await.unwrap();
+    a.flush().await.unwrap();
+
+    read_until_contains(&mut a, b"PARTIAL-FRAME").await;
+
+    server.registry.close_agent(&id).unwrap();
+}
