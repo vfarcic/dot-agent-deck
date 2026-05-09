@@ -591,29 +591,41 @@ impl EmbeddedPaneController {
                 Ok(())
             }
             PaneBackend::Stream(mut s) => {
-                // Best-effort signal: if the channel is already closed
-                // (writer half exited on a transport error) just fall
-                // through to the abort below — the daemon will observe EOF
-                // and still leave the agent running. Either way the agent
-                // survives.
-                let _ = s.input_tx.send(StreamCmd::Detach);
+                // Surface a closed channel as `CommandFailed` so callers
+                // (e.g. `detach_all_streams`) can include it in their
+                // per-pane error list. Survival is preserved either way:
+                // if the writer task already exited, the socket has
+                // already closed and the daemon has already observed EOF
+                // (implicit detach). The error is purely observability —
+                // the user should know the explicit signal didn't reach
+                // the wire.
+                if s.input_tx.send(StreamCmd::Detach).is_err() {
+                    return Err(PaneError::CommandFailed(format!(
+                        "Pane {pane_id} stream I/O task ended"
+                    )));
+                }
                 if let Some(handle) = s.io_task.take() {
-                    // Hand the JoinHandle to the runtime so the writer can
-                    // drain the queued `Detach` and put the `KIND_DETACH`
-                    // frame on the wire before the socket goes away. Bound
-                    // the wait at 200ms — generous for a 5-byte frame on a
-                    // local socket; on timeout we fall through to the
-                    // abort path. The handle is *not* re-stored on `s`, so
-                    // when `s` drops below the abort path is a no-op.
+                    // Hand the runtime a brief window to drain the queued
+                    // `Detach` and put the `KIND_DETACH` frame on the wire
+                    // before the socket goes away. Bound the wait at
+                    // 200ms — generous for a 5-byte frame on a local
+                    // socket. On timeout `tokio::time::timeout` drops the
+                    // wrapped JoinHandle, which only *detaches* the task;
+                    // it does not cancel it. So we capture an
+                    // `AbortHandle` first and call `.abort()`
+                    // unconditionally afterward to terminate the writer
+                    // deterministically. `abort()` on a finished task is
+                    // a no-op, so this is safe regardless of which branch
+                    // (timeout vs. completion) fired.
+                    let abort = handle.abort_handle();
                     let _ = s.runtime.block_on(async move {
                         tokio::time::timeout(Duration::from_millis(200), handle).await
                     });
+                    abort.abort();
                 }
-                // `s` drops here → channel sender drops; if the io_task is
-                // still alive (timeout case) Drop's `take()` finds None and
-                // does nothing — but the socket halves owned by the task
-                // will be dropped on the next runtime tick once the task
-                // completes or is cancelled.
+                // `s` drops here → channel sender drops. The socket halves
+                // owned by the (now-aborted) task will be dropped on the
+                // next runtime tick.
                 Ok(())
             }
         }

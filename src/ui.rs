@@ -4353,9 +4353,13 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
 
     // PRD #76, M2.5: "Detach" sits between Quit and Cancel so users facing
     // the dialog with remote panes can pick the survival option without
-    // having to hunt for a separate keybind.
+    // having to hunt for a separate keybind. Both Quit and Detach leave
+    // remote agents running — the difference is that Detach emits an
+    // explicit KIND_DETACH frame so the daemon can distinguish voluntary
+    // detach from sleep/network drops, whereas Quit just exits and lets
+    // the daemon observe EOF (treated as implicit detach).
     let options = [
-        ("Quit", "stop agents and exit"),
+        ("Quit", "exit without signaling detach"),
         ("Detach", "leave remote agents running"),
         ("Cancel", "return to dashboard"),
     ];
