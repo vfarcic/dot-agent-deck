@@ -3,7 +3,7 @@
 **Status**: In progress
 **Priority**: High
 **Created**: 2026-05-08
-**Scope updated**: 2026-05-09 — Kubernetes transport split out into **PRD #80**.
+**Scope updated**: 2026-05-09 — Kubernetes transport split out into **PRD #80**. Phase 6 (Remote project parity) added after M2.x exposed that the laptop's TUI still ran project-aware features against the laptop's own filesystem; v1 ships with full parity, not partial.
 **GitHub Issue**: [#76](https://github.com/vfarcic/dot-agent-deck/issues/76)
 
 ## Problem Statement
@@ -223,7 +223,7 @@ The daemon protocol, registry shape, and CLI surface in this PRD are designed fo
 
 - [x] **M4.1** — Tests for the streaming attach protocol (round-trip of all message types, disconnect/reconnect, partial frames).
 - [x] **M4.2** — Integration test: spin up the daemon locally, attach, start an agent, detach, reattach, stop. End-to-end on a single machine.
-- [ ] **M4.3** — Manual end-to-end validation on the dev/test VM (the K8s leg moves to PRD #80).
+- [ ] **M4.3** — Manual end-to-end validation of the **transport** on the dev/test VM: ssh, daemon lifecycle, attach/detach/scrollback, hook events round-tripping through the remote daemon. Full-parity validation lives in **M6.8**. (The K8s leg moves to PRD #80.)
 
 ### Phase 5: Documentation and release
 
@@ -231,7 +231,21 @@ The daemon protocol, registry shape, and CLI surface in this PRD are designed fo
 - [x] **M5.2** — `docs/remote-recipes.md`: provisioning snippets for multipass / Hetzner / fly. (k3s recipe lives in PRD #80.)
 - [x] **M5.3** — Final pass on `docs/remote-requirements.md` reflecting anything learned in M1–M4.
 - [x] **M5.4** — Update `docs/getting-started.mdx` and `docs/installation.md` to mention the remote path.
-- [ ] **M5.5** — Changelog fragment, release.
+- [ ] **M5.5** — Changelog fragment, release. **Gated on Phase 6 (M6.8) being green** — v1 ships transport + project parity together.
+
+### Phase 6: Remote project parity
+
+Phase 1–2 cover PTY/agent lifecycle. The TUI's project-aware features — directory picker (`Ctrl+N`), `.dot-agent-deck.toml`-driven mode tabs and orchestrations, side panes, reactive panes, watch rules, delegate roles — still read laptop-side state, which makes `connect` a misleading half-experience: the agent streams from the remote, but the dashboard chrome around it reflects the laptop's project (or no project). Phase 6 closes this so the laptop becomes a true client of the remote daemon for every project-aware operation.
+
+- [ ] **M6.1** — Protocol extension: add `ListDir { path }`, `ReadFile { path }`, `Stat { path }` to `AttachRequest` (with size caps and clear error semantics for missing/unreadable/oversize paths). Server-side handlers in `src/daemon.rs` wired to the existing dispatcher. Round-trip tests for each op (success, missing-path, permission-denied, oversize-truncation).
+- [ ] **M6.2** — Project root on the remote: add `--project-dir <path>` to `remote add` (defaults to `~`); persist in `remotes.toml`. The daemon's project root comes from this; new ops reject paths outside the project tree (with the same trust-boundary caveats already documented for `StartAgent` — same UID, no privilege boundary, but a guard against accidental misconfiguration).
+- [ ] **M6.3** — `ProjectIO` trait abstracting filesystem and process operations: `read_dir`, `read_file`, `stat`, `start_pty(command, cwd, env, role)`. Two impls: `LocalIO` (wraps current `std::fs` / `portable-pty` calls — byte-for-byte equivalent to today's local-mode behavior) and `RemoteIO` (delegates to `DaemonClient` via the M6.1 ops). Inject at TUI bootstrap based on connect mode. Existing local-mode tests gate the refactor.
+- [ ] **M6.4** — Directory picker (`Ctrl+N`) goes through `ProjectIO`. In remote mode the picker shows the remote daemon's filesystem starting from the registered project root; the selected path becomes the `cwd` field of the subsequent `StartAgent` request, which the daemon `chdir`s into.
+- [ ] **M6.5** — Project config (`.dot-agent-deck.toml`) loads via `ProjectIO`. In remote mode this reads from the registered project root on the remote. Mode tabs, orchestration tabs, watch rules, and reactive-pane lists all populate from the remote's config.
+- [ ] **M6.6** — Side panes / reactive panes / mode-rule commands run on the remote. These are non-agent PTYs today spawned locally; in remote mode they must be daemon-owned. Implementation choice (extend `StartAgent` with a `kind` discriminator vs. add `StartSidePane` / `StartReactivePane`) lands in this milestone.
+- [ ] **M6.7** — Delegate / orchestration roles work in remote mode: `dot-agent-deck delegate` invoked from a remote agent reads role definitions from the remote config (already true since the agent runs on the remote); the laptop UI's orchestration tab reflects the same role list and dispatches `delegate` calls correctly.
+- [ ] **M6.8** — Manual end-to-end validation on the dev/test VM: every TUI feature behaves identically to local mode against a remote project. Specifically — Ctrl+N opens a remote-fs picker, mode tabs render the remote's config, side panes run on the remote, watch rules suppress correctly, delegate dispatches into the remote orchestration. No "this works in local mode but not in remote mode" carve-out remains.
+- [ ] **M6.9** — Docs: drop any "Limitations" subsection in `docs/remote-environments.md` covering project parity; document `--project-dir` in `docs/remote-environments.md` and the recipes; refresh `docs/remote-requirements.md` if Phase 6 surfaces new host requirements (e.g. project tree must be readable by the daemon's UID).
 
 ## Key Files
 
@@ -242,6 +256,9 @@ The daemon protocol, registry shape, and CLI surface in this PRD are designed fo
 - `src/main.rs` — wire new subcommands.
 - `src/remote.rs` (new) — `remote add | list | remove | upgrade | connect` implementations and the `~/.config/dot-agent-deck/remotes.toml` registry.
 - `src/protocol.rs` (new, or inside `daemon.rs`) — streaming attach protocol types and codec.
+- `src/daemon_protocol.rs` — extended in Phase 6 with `ListDir`/`ReadFile`/`Stat` ops alongside the existing PTY-lifecycle ops.
+- `src/project_io.rs` (new, Phase 6) — `ProjectIO` trait + `LocalIO` and `RemoteIO` implementations; injection point for the TUI's filesystem and process operations.
+- `src/remote.rs` — Phase 6 adds `--project-dir` parsing and registry persistence.
 - `docs/remote-environments.md` (new), `docs/remote-requirements.md` (new), `docs/remote-recipes.md` (new).
 - `docs/getting-started.mdx`, `docs/installation.md` — minor cross-references.
 
@@ -262,6 +279,17 @@ Considered building VM creation (`dot-agent-deck remote create-vm --provider=fly
 ### 2026-05-08: Ctrl+W stops the agent (local or remote); detach is a separate action
 
 Initial framing had close-deck-on-remote default to detach. Reversed after user feedback: keep the mental model uniform across local and remote. Ctrl+W means "I'm done with this agent" in both. Remote adds a *new* capability — explicit detach — that local doesn't need. This makes "keep it running while I disconnect" the opt-in path, which is the right default for safety (detach-by-default would mean a stray Ctrl+W leaves orphaned agents accumulating on the remote).
+
+### 2026-05-09: Laptop-as-real-client requires full project parity (Phase 6 added)
+
+After M2.4–M2.6 landed and the transport worked, the laptop's TUI was found to mix remote-streamed PTYs with laptop-local config and filesystem operations. Concretely: `Ctrl+N` opened a picker against the laptop's filesystem, `.dot-agent-deck.toml` was loaded from the laptop's cwd (driving mode tabs, orchestrations, side panes, reactive panes, watch rules), and side-pane processes ran locally. So `connect` could view a pre-existing remote agent and stop/detach/reattach it — but creating a new agent from the laptop, or seeing the right modes/orchestrations around an existing one, was broken.
+
+Two coherent shapes were considered:
+
+- **(a)** Ship the transport and rebrand `connect` as "remote-tail viewer for pre-existing agents", with documented limitations carved out in the docs.
+- **(b)** Commit to laptop-as-real-client and extend the protocol so every project-aware op (`ListDir`, `ReadFile`, side-pane spawn, …) flows through the daemon.
+
+(a) was rejected. The user's mental model when typing `connect` is "this is my deck, just pointed elsewhere" — half-parity violates that and degrades silently (Ctrl+N appears to work but starts the agent in a path that doesn't exist on the remote; mode tabs render the *laptop's* project's modes around a *remote* project's agent). Phase 6 was added to close the gap; v1 (M5.5 release) ships only after M6.8 validates full parity end-to-end.
 
 ### 2026-05-08: Phase 0 is the test environment, set up by the docs
 
@@ -286,6 +314,8 @@ To be resolved during implementation, not blocking PRD acceptance:
 | Daemon crash on the remote leaves orphaned agent processes | Daemon spawns agents with explicit process-group IDs and tracks them on disk; on restart, the daemon reconciles (reattach to existing PTYs where possible, mark unattachable as crashed). |
 | Docs drift from reality once dev VM is set up | M0.3 explicitly requires a clean re-provision from docs alone. Repeat any time `remote-requirements.md` changes. |
 | Local-deck users see regressions from the daemon refactor | Phase 1 is gated on existing local tests passing. Daemon-owns-PTYs change is observable only in remote mode; local-deck PTY spawning path stays.|
+| `ProjectIO` rewiring (Phase 6) is invasive across the TUI and risks regressions in local mode | M6.3 starts by wrapping current behavior in `LocalIO` — local-mode code paths must be byte-for-byte equivalent before any `RemoteIO` work begins. Existing local tests gate the refactor; M6.4–M6.7 only add `RemoteIO` branches behind the connect-mode discriminant. |
+| Phase 6 protocol extension drifts from Phase 1's PTY-lifecycle protocol and requires a wire-compat shim | New ops are additive on the existing `AttachRequest` enum — no breaking change. Version handshake (already in scope from Phase 2's risk row) covers old-daemon / new-laptop with a clear "remote upgrade" recommendation. |
 
 ## References
 
