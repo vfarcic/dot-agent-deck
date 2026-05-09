@@ -5,10 +5,10 @@ use std::sync::Arc;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
-use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, DOT_AGENT_DECK_VIA_DAEMON};
+use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
-use dot_agent_deck::daemon_client::DaemonClient;
+use dot_agent_deck::daemon_attach::{ensure_external_daemon_or_die, via_daemon_enabled};
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::hooks_manage;
@@ -245,10 +245,7 @@ fn main() -> ExitCode {
         .expect("clap arg matches should be valid for Cli struct");
 
     match cli.command {
-        None => {
-            run_dashboard(cli.theme, cli.continue_session);
-            ExitCode::SUCCESS
-        }
+        None => run_dashboard(cli.theme, cli.continue_session),
         Some(Commands::Hook { agent }) => {
             let agent_str = match agent {
                 CliAgent::ClaudeCode => "claude-code",
@@ -516,9 +513,9 @@ fn main() -> ExitCode {
 }
 
 #[tokio::main]
-async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
+async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) -> ExitCode {
     init_logging_from_env();
-    run_tui_session(cli_theme, continue_session).await;
+    run_tui_session(cli_theme, continue_session).await
 }
 
 /// Optional file-based logging from `DOT_AGENT_DECK_LOG`. Pulled out of the
@@ -555,33 +552,32 @@ fn init_logging_from_env() {
 
 /// The TUI body extracted from `run_dashboard` so `connect` can reuse it.
 /// Reads `DOT_AGENT_DECK_VIA_DAEMON` + `DOT_AGENT_DECK_ATTACH_SOCKET` to
-/// decide whether to spawn a daemon or attach to an existing one (M1.3
-/// behavior). The `connect` subcommand sets both env vars before calling
-/// this so the TUI dials the bridge socket instead of spawning a daemon.
-async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) {
+/// decide whether to spawn an in-process daemon (false) or lazy-spawn-and-
+/// attach to an external one (true, the M2.8 behavior). The `connect`
+/// subcommand will set both env vars in M2.9 so the TUI runs against the
+/// remote daemon over `ssh -t`.
+///
+/// Returns `ExitCode::FAILURE` when the external-daemon bootstrap fails
+/// (spawn error, start timeout, or trust-check rejection). Successful TUI
+/// runs return `ExitCode::SUCCESS` — including TUI-task errors, which are
+/// already surfaced to stderr (matching the pre-M2.8 behavior).
+async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> ExitCode {
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();
     let attach_path = attach_socket_path();
 
-    // PRD #76, M1.3: developer-facing flag for stream-backed panes against an
-    // already-running daemon. Env (not CLI) so it doesn't show up in --help.
-    // M2.4's `connect` subcommand sets this internally so the TUI dials the
-    // bridge socket. Truthy values: "1", "true", "yes" (case-insensitive).
-    let via_daemon = std::env::var(DOT_AGENT_DECK_VIA_DAEMON)
-        .ok()
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+    // PRD #76, M2.8: lazy-spawn-on-attach for the external-daemon code path.
+    // When DOT_AGENT_DECK_VIA_DAEMON=1, ensure_external_daemon_or_die fork-
+    // execs `dot-agent-deck daemon serve` detached if the attach socket is
+    // absent, and trust-checks any existing socket (uid + 0o600 + is-socket)
+    // before the TUI's DaemonClient touches it. No in-process fallback —
+    // failures are reported and the dashboard exits nonzero.
+    let via_daemon = via_daemon_enabled();
 
     let daemon_handle = if via_daemon {
-        // The daemon is expected to already be running; skip the spawn.
-        // Surface a clear error if its attach socket isn't present.
-        let client = DaemonClient::new(attach_path.clone());
-        if let Err(e) = client.ensure_socket_exists() {
-            eprintln!(
-                "remote-deck-local mode: {e}\n\
-                 Start the daemon separately before running with DOT_AGENT_DECK_VIA_DAEMON=1."
-            );
-            return;
+        if let Err(e) = ensure_external_daemon_or_die(&attach_path).await {
+            eprintln!("remote-deck-local mode: {e}");
+            return ExitCode::FAILURE;
         }
         None
     } else {
@@ -632,9 +628,12 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) {
     })
     .await;
 
-    // TUI exited — clean up. In remote-deck-local mode the daemon was not
-    // spawned by us, so we don't abort it and we don't unlink its sockets
-    // (PRD #76 line 199 — agents survive TUI exit).
+    // TUI exited — clean up. In via_daemon mode `daemon_handle` is `None`
+    // (the daemon was fork-execed detached by ensure_external_daemon_or_die,
+    // setsid'd into its own session, and is intentionally outside this
+    // process tree), so this branch is a no-op for that path: we do not
+    // abort the daemon and do not unlink its sockets. Agents must survive
+    // TUI exit (PRD #76 line 199).
     if let Some(handle) = daemon_handle {
         handle.abort();
         if path.exists() {
@@ -650,6 +649,7 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) {
     } else if let Ok(Err(e)) = tui_result {
         eprintln!("TUI error: {e}");
     }
+    ExitCode::SUCCESS
 }
 
 /// `dot-agent-deck connect [name]` — PRD #76 M2.4 surface.

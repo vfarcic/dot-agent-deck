@@ -1,10 +1,10 @@
-//! Lazy-spawn machinery for the on-remote daemon (PRD #76, M4.3).
+//! Lazy-spawn machinery for the on-remote daemon (PRD #76, M4.3 + M2.8).
 //!
 //! After the 2026-05-09 architectural pivot the laptop-side bridge that
 //! ssh-exec'd `dot-agent-deck daemon attach` on the remote was removed
 //! (M2.7). What survives in this module is the pieces that lazy-spawn the
-//! daemon on the remote when something else needs it (the on-remote TUI, a
-//! future M2.8 caller, or M2.9's `ssh -t` connect):
+//! daemon on the remote when something else needs it (the on-remote TUI
+//! bootstrap from M2.8, or M2.9's `ssh -t` connect):
 //!
 //! - [`ensure_daemon_running`] — `flock(2)`-serialized "is the attach socket
 //!   present? if not, run `spawn_fn` and poll for it" loop. Concurrent
@@ -16,12 +16,19 @@
 //! - [`spawn_daemon_serve_detached`] — `setsid(2)` + `O_NOFOLLOW` + 0o600
 //!   detach-spawn of `dot-agent-deck daemon serve` so the daemon survives
 //!   the parent's exit.
+//! - [`ensure_external_daemon_or_die`] — M2.8 entry point used by the TUI
+//!   when `DOT_AGENT_DECK_VIA_DAEMON=1`: glues the three primitives above
+//!   together against the production `state_dir()` and the production
+//!   `dot-agent-deck daemon serve` binary.
 
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
+
+use crate::agent_pty::DOT_AGENT_DECK_VIA_DAEMON;
+use crate::config::state_dir;
 
 /// Errors surfaced by the lazy-spawn machinery. The CLI handler renders
 /// these to stderr before exiting nonzero; tests match on the variant.
@@ -244,6 +251,18 @@ fn prepare_state_dir(state_dir: &Path) -> std::io::Result<()> {
 /// after this function returns. Callers should poll the attach socket
 /// (see [`ensure_daemon_running`]) to know when the daemon is ready.
 pub fn spawn_daemon_serve_detached(state_dir: &Path) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    spawn_daemon_serve_detached_with_exe(state_dir, &exe).map(|_| ())
+}
+
+/// Same as [`spawn_daemon_serve_detached`] but takes an explicit `exe`
+/// path and returns the spawned daemon's pid on success. Production callers
+/// should always go through [`spawn_daemon_serve_detached`] (which discards
+/// the pid); this variant exists so integration tests in `tests/` can
+/// fork-exec the cargo-built `dot-agent-deck` binary (the test runner's
+/// `current_exe()` is the test harness, not our binary) and recover the
+/// pid for `kill(2)`-based cleanup.
+pub fn spawn_daemon_serve_detached_with_exe(state_dir: &Path, exe: &Path) -> std::io::Result<u32> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::process::CommandExt;
 
@@ -271,7 +290,6 @@ pub fn spawn_daemon_serve_detached(state_dir: &Path) -> std::io::Result<()> {
     let stderr = stdout.try_clone()?;
     let stdin = std::fs::File::open("/dev/null")?;
 
-    let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon")
         .arg("serve")
@@ -293,9 +311,55 @@ pub fn spawn_daemon_serve_detached(state_dir: &Path) -> std::io::Result<()> {
 
     // Spawn and immediately drop the handle. The child is now its own
     // session leader; when this process exits, init reaps the child. We
-    // don't wait — the caller will poll the attach socket.
-    let _child = cmd.spawn()?;
-    Ok(())
+    // don't wait — the caller will poll the attach socket. The pid is
+    // returned for tests that need to clean up the spawned daemon; the
+    // production wrapper [`spawn_daemon_serve_detached`] discards it.
+    let child = cmd.spawn()?;
+    Ok(child.id())
+}
+
+/// Returns true if `DOT_AGENT_DECK_VIA_DAEMON` is set to a truthy value
+/// (`1`, `true`, `yes`, case-insensitive). The TUI bootstrap branches on this
+/// to decide between in-process daemon (false) and lazy-spawn-an-external
+/// one (true). Centralized here so the test that asserts the unset case
+/// doesn't duplicate the parsing rule that lives in production.
+pub fn via_daemon_enabled() -> bool {
+    std::env::var(DOT_AGENT_DECK_VIA_DAEMON)
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// M2.8 TUI bootstrap entry point. When the dashboard is invoked with
+/// `DOT_AGENT_DECK_VIA_DAEMON=1`, the TUI calls this before the first
+/// [`crate::daemon_client::DaemonClient`] connect:
+///
+/// - If the attach socket is missing, fork-execs `dot-agent-deck daemon
+///   serve` detached so it outlives the TUI (agents must survive TUI exit
+///   per PRD #76 line 199), under [`flock`]-serialized
+///   `<state_dir>/spawn.lock` so concurrent first-attaches don't double-spawn.
+/// - Either way, runs [`verify_socket_trusted`] on the resulting socket
+///   before returning Ok. A pre-existing regular file or wrong-mode socket
+///   at the path is rejected with [`AttachError::SocketUntrusted`] — the
+///   TUI must not silently fall back to the in-process daemon, since that
+///   would mask a same-uid attacker.
+///
+/// Errors are surfaced as-is to the caller (the dashboard renders them to
+/// stderr and exits nonzero — there is no in-process fallback). Polling
+/// timeout is 5s with 50ms intervals; that's enough headroom for the
+/// daemon's bind path on a loaded host without making error output feel
+/// hung.
+pub async fn ensure_external_daemon_or_die(attach_path: &Path) -> Result<(), AttachError> {
+    let state = state_dir();
+    let state_for_spawn = state.clone();
+    ensure_daemon_running(
+        attach_path,
+        &state,
+        move || spawn_daemon_serve_detached(&state_for_spawn),
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -628,5 +692,183 @@ mod tests {
             1,
             "spawn_fn must run exactly once — flock should serialize the two callers"
         );
+    }
+
+    /// Test-only RAII guard for `DOT_AGENT_DECK_STATE_DIR`. Callers must
+    /// hold `crate::config::STATE_DIR_ENV_LOCK` while the guard exists so
+    /// the env var observed by [`state_dir`] is stable for the test.
+    struct StateDirEnvGuard {
+        prev: Option<String>,
+    }
+
+    impl StateDirEnvGuard {
+        fn set(value: &Path) -> Self {
+            let prev = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
+            // SAFETY: caller holds STATE_DIR_ENV_LOCK; this serializes env
+            // mutations against other tests in the lock's scope.
+            unsafe {
+                std::env::set_var("DOT_AGENT_DECK_STATE_DIR", value);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for StateDirEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still under the same lock for the lifetime of the
+            // test that owns this guard; restoring previous state.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
+                    None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+                }
+            }
+        }
+    }
+
+    /// RAII guard for `DOT_AGENT_DECK_VIA_DAEMON`. Same pattern as
+    /// [`StateDirEnvGuard`]; tests exercising [`via_daemon_enabled`] hold
+    /// the state-dir lock since this env-var is also process-global.
+    struct ViaDaemonEnvGuard {
+        prev: Option<String>,
+    }
+
+    impl ViaDaemonEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let prev = std::env::var(DOT_AGENT_DECK_VIA_DAEMON).ok();
+            // SAFETY: caller holds STATE_DIR_ENV_LOCK.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, v),
+                    None => std::env::remove_var(DOT_AGENT_DECK_VIA_DAEMON),
+                }
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for ViaDaemonEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still under the same lock for the lifetime of the
+            // test that owns this guard; restoring previous state.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, v),
+                    None => std::env::remove_var(DOT_AGENT_DECK_VIA_DAEMON),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn via_daemon_enabled_recognizes_truthy_values() {
+        let _g = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for v in ["1", "true", "TRUE", "yes", "Yes"] {
+            let _env = ViaDaemonEnvGuard::set(Some(v));
+            assert!(via_daemon_enabled(), "{v:?} should be truthy");
+        }
+    }
+
+    #[test]
+    fn via_daemon_enabled_rejects_falsy_and_unset() {
+        let _g = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _env = ViaDaemonEnvGuard::set(None);
+        assert!(
+            !via_daemon_enabled(),
+            "unset DOT_AGENT_DECK_VIA_DAEMON must select the in-process daemon path"
+        );
+        for v in ["0", "false", "no", "", "maybe"] {
+            let _env = ViaDaemonEnvGuard::set(Some(v));
+            assert!(!via_daemon_enabled(), "{v:?} should be falsy");
+        }
+    }
+
+    // The three tests below hold `STATE_DIR_ENV_LOCK` across an `.await`.
+    // That trips clippy's `await_holding_lock` — but this is exactly the
+    // intended use: the env var that `state_dir()` reads is process-global,
+    // and `ensure_external_daemon_or_die` reads it during the call (which
+    // is itself an awaitable future). Releasing the lock before awaiting
+    // would let a parallel test mutate the env var mid-call. Allow the lint
+    // for the test fns and document why.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn external_daemon_or_die_short_circuits_on_trusted_socket() {
+        // Pre-existing trusted socket: no spawn happens. We verify by
+        // observing that the call returns Ok within the poll window —
+        // ensure_daemon_running's first lock-then-check sees the socket and
+        // skips spawn_fn entirely (which in production would fork-exec
+        // `dot-agent-deck daemon serve` — invoking that from inside a unit
+        // test is exactly what this short-circuit avoids).
+        let _g = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = race_safe_tempdir();
+        let _state_env = StateDirEnvGuard::set(dir.path());
+        let sock = dir.path().join("attach.sock");
+        let _listener = bind_trusted_socket(&sock);
+
+        ensure_external_daemon_or_die(&sock)
+            .await
+            .expect("trusted pre-existing socket should pass without invoking the spawn path");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn external_daemon_or_die_rejects_untrusted_regular_file() {
+        // Same setup as the previous test but the path is a regular file —
+        // the trust check must fire BEFORE any spawn is attempted (a
+        // pre-existing file at the attach path means the lock-then-check
+        // branch runs first), and there must be no in-process fallback.
+        let _g = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = race_safe_tempdir();
+        let _state_env = StateDirEnvGuard::set(dir.path());
+        let sock = dir.path().join("attach.sock");
+        std::fs::write(&sock, b"").unwrap();
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let err = ensure_external_daemon_or_die(&sock)
+            .await
+            .expect_err("regular file at attach path must be rejected");
+        match err {
+            AttachError::SocketUntrusted { path, reason } => {
+                assert_eq!(path, sock);
+                assert!(
+                    reason.contains("not a Unix domain socket"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn external_daemon_or_die_rejects_wrong_mode_socket() {
+        let _g = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = race_safe_tempdir();
+        let _state_env = StateDirEnvGuard::set(dir.path());
+        let sock = dir.path().join("attach.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // Too-permissive mode — same-uid attacker scenario.
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = ensure_external_daemon_or_die(&sock)
+            .await
+            .expect_err("0o644 socket at attach path must be rejected");
+        match err {
+            AttachError::SocketUntrusted { path, reason } => {
+                assert_eq!(path, sock);
+                assert!(reason.contains("mode"), "unexpected reason: {reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
