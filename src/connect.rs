@@ -5,7 +5,7 @@
 //! `ssh -t` exec wrapper:
 //!
 //! 1. **lookup / picker** — `lookup_remote` / `pick_remote` resolve the
-//!    registry entry. Kubernetes entries are rejected (planned in PRD #80).
+//!    registry entry. Kubernetes entries are rejected (planned in PRD #81).
 //! 2. **version probe** — one short `ssh <target> dot-agent-deck --version`
 //!    classifies host-unreachable, missing-binary, and version-mismatch
 //!    outcomes before we hand the terminal over.
@@ -30,7 +30,7 @@ use crate::remote::{
 };
 
 /// Marker `kind` for entries the user added with `--type=kubernetes`. M2.4
-/// rejects these explicitly so the message clearly points the user at PRD #80
+/// rejects these explicitly so the message clearly points the user at PRD #81
 /// instead of surfacing a generic ssh failure deeper in the connect path.
 const KIND_KUBERNETES: &str = "kubernetes";
 
@@ -69,7 +69,7 @@ pub enum RemoteConnectError {
     )]
     UnknownName { name: String },
     #[error(
-        "Remote '{name}' is type 'kubernetes'; kubernetes remotes are not yet supported (planned in PRD #80)."
+        "Remote '{name}' is type 'kubernetes'; kubernetes remotes are not yet supported (planned in PRD #81)."
     )]
     KubernetesNotYetSupported { name: String },
     #[error("No remotes configured. Run `dot-agent-deck remote add <name> <host>` to add one.")]
@@ -141,7 +141,7 @@ pub fn lookup_remote(name: &str, path: &Path) -> Result<RemoteEntry, RemoteConne
 fn format_picker_row(idx: usize, entry: &RemoteEntry) -> String {
     if entry.kind == KIND_KUBERNETES {
         format!(
-            "  {idx}) {:<12} (kubernetes)   [PRD #80 — not yet connectable]\n",
+            "  {idx}) {:<12} (kubernetes)   [PRD #81 — not yet connectable]\n",
             entry.name
         )
     } else {
@@ -154,7 +154,7 @@ fn format_picker_row(idx: usize, entry: &RemoteEntry) -> String {
 /// - 0 entries: error with the empty-state hint (this is a hard "can't
 ///   proceed" — distinct from `remote list`'s ambient empty state).
 /// - 1 entry: auto-pick. Print "Connecting to <name>..." and return without
-///   prompting. Kubernetes-only registry still routes through the PRD #80
+///   prompting. Kubernetes-only registry still routes through the PRD #81
 ///   rejection.
 /// - 2+ entries: numbered prompt. Up to [`PICKER_MAX_RETRIES`] invalid
 ///   attempts before giving up.
@@ -458,11 +458,35 @@ impl ConnectSpawner for SystemConnectSpawner {
     fn spawn(&self, target: &SshTarget, install_path: &str) -> Result<i32, std::io::Error> {
         let mut cmd = build_connect_command(target, install_path);
         let status = cmd.status()?;
-        // status.code() is None when the child was killed by a signal; map
-        // to 1 so the laptop process still exits non-zero (and shells get a
-        // single, predictable failure status to react to).
-        Ok(status.code().unwrap_or(1))
+        Ok(exit_code_from_status(&status))
     }
+}
+
+/// Map a child `ExitStatus` to the conventional shell exit code.
+///
+/// - Normal exit: pass through `status.code()` verbatim, so a remote shell
+///   that exits 17 makes the laptop process exit 17 (mirrors ssh's own
+///   contract one level up).
+/// - Killed by signal: encode as `128 + signal`. SIGINT (Ctrl-C) → 130,
+///   SIGTERM → 143, SIGKILL → 137. This is what every Unix shell does and
+///   what scripts checking `$?` already expect; mapping signal-exits to a
+///   bare `1` (the M2.9 first cut) erased that information.
+/// - Truly unknown (neither code nor signal): fall back to `1`. This branch
+///   is unreachable on Unix in practice — `ExitStatus` is always one of the
+///   two — but Rust's stdlib doesn't promise it, so we keep the fallback
+///   rather than `unreachable!()`-ing.
+fn exit_code_from_status(status: &std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return 128 + sig;
+        }
+    }
+    1
 }
 
 /// Bump `last_connected` on the registry entry whose name matches `name`.
@@ -554,7 +578,10 @@ pub fn run_connect_default(
     local_version: &str,
 ) -> Result<i32, RemoteConnectError> {
     use crate::remote::SystemSshExecutor;
-    let executor = SystemSshExecutor::new();
+    // Probe executor carries the wallclock cap; without this, a remote that
+    // accepts the TCP connection but never produces stdout would pin
+    // `connect` indefinitely (cmd.output() has no timeout of its own).
+    let executor = SystemSshExecutor::with_wallclock_timeout(probe_timeout_secs());
     let spawner = SystemConnectSpawner::new();
     run_connect(
         entry,
@@ -633,7 +660,7 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
         let msg = err.to_string();
-        assert!(msg.contains("PRD #80"), "msg should mention PRD #80: {msg}");
+        assert!(msg.contains("PRD #81"), "msg should mention PRD #81: {msg}");
     }
 
     // ----- picker -----
@@ -1166,5 +1193,166 @@ mod tests {
         unsafe {
             std::env::remove_var(PROBE_TIMEOUT_ENV);
         }
+    }
+
+    // ----- parse_version_output edge cases -----
+
+    #[test]
+    fn parse_version_output_accepts_canonical_and_v_prefixed() {
+        // Both shapes the install pipeline produces are accepted; the parser
+        // returns the version token verbatim (callers compare strings).
+        assert_eq!(
+            parse_version_output("dot-agent-deck 0.24.5\n"),
+            Some("0.24.5".to_string())
+        );
+        assert_eq!(
+            parse_version_output("dot-agent-deck v0.24.5-rc.1\n"),
+            Some("v0.24.5-rc.1".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_version_output_rejects_wrong_program_name() {
+        // A binary named something else at the install path must NOT be
+        // mistaken for dot-agent-deck — even if it prints a sensible version
+        // line. The probe upgrades this to RemoteBinaryMissing because
+        // `remote upgrade` is the right recovery path.
+        assert_eq!(parse_version_output("nano 7.0\n"), None);
+        assert_eq!(parse_version_output("ssh OpenSSH_9.0\n"), None);
+    }
+
+    #[test]
+    fn parse_version_output_rejects_garbage_and_empty() {
+        // Stub script / missing program / unparseable output all collapse to
+        // None; the probe layer turns this into RemoteBinaryMissing.
+        assert_eq!(parse_version_output(""), None);
+        assert_eq!(parse_version_output("\n\n"), None);
+        assert_eq!(parse_version_output("hello world"), None);
+        // Right program name but version doesn't start with a digit.
+        assert_eq!(parse_version_output("dot-agent-deck unknown"), None);
+        // Right program name but version has no `.` separator (a build that
+        // accidentally printed a single integer is unlikely to be ours).
+        assert_eq!(parse_version_output("dot-agent-deck 9"), None);
+    }
+
+    // ----- HostUnreachable on non-127 nonzero exit -----
+
+    #[test]
+    fn probe_nonzero_non_127_exit_returns_host_unreachable() {
+        // The remote shell ran *something* and it failed with an exit code
+        // we don't classify as "binary missing" (e.g. permission-denied 126).
+        // Surface it as HostUnreachable so the user sees the underlying ssh
+        // stderr rather than the misleading "binary missing" hint.
+        let executor = FakeSshExecutor::new(vec![Ok(SshOutput {
+            status: 126,
+            stdout: String::new(),
+            stderr: "bash: ~/.local/bin/dot-agent-deck: Permission denied".to_string(),
+        })]);
+        let target = ssh_target("u@h", 22);
+        let err = probe_remote_version(&executor, &target, "lab", REMOTE_INSTALL_PATH, "0.24.5")
+            .expect_err("non-127 nonzero must error");
+        match err {
+            RemoteConnectError::HostUnreachable { name, detail } => {
+                assert_eq!(name, "lab");
+                assert!(
+                    detail.contains("Permission denied"),
+                    "detail must surface the remote shell's stderr: {detail}"
+                );
+            }
+            other => panic!("expected HostUnreachable for status 126, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_nonzero_with_empty_stderr_falls_back_to_status_string() {
+        // If the remote shell exits non-zero with an empty stderr (rare but
+        // possible on some shells), the user still gets an actionable
+        // message — we synthesize "ssh exited with status N" rather than an
+        // empty detail field.
+        let executor = FakeSshExecutor::new(vec![Ok(SshOutput {
+            status: 42,
+            stdout: String::new(),
+            stderr: String::new(),
+        })]);
+        let target = ssh_target("u@h", 22);
+        let err = probe_remote_version(&executor, &target, "lab", REMOTE_INSTALL_PATH, "0.24.5")
+            .expect_err("nonzero without stderr must still error");
+        match err {
+            RemoteConnectError::HostUnreachable { detail, .. } => {
+                assert!(
+                    detail.contains("status 42"),
+                    "empty-stderr fallback must include the exit code: {detail}"
+                );
+            }
+            other => panic!("expected HostUnreachable, got {other:?}"),
+        }
+    }
+
+    // ----- touch_last_connected edge cases -----
+
+    #[test]
+    fn touch_last_connected_returns_none_when_entry_missing() {
+        // The post-spawn bookkeeping is best-effort: if the user concurrently
+        // removes the entry while their session is open, the bump should be
+        // a silent no-op rather than crashing the connect after-the-fact.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_registry(&dir, vec![entry("alpha", "ssh", "u@h")]);
+        let result = touch_last_connected("beta", &path).expect("absent entry must Ok(None)");
+        assert!(
+            result.is_none(),
+            "absent entry must yield None, got {result:?}"
+        );
+
+        // The existing entry must remain untouched (last_connected stays None).
+        let after = RemotesFile::load(&path).unwrap();
+        assert!(after.remotes[0].last_connected.is_none());
+    }
+
+    #[test]
+    fn touch_last_connected_writes_rfc3339_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_registry(&dir, vec![entry("lab", "ssh", "u@h")]);
+        let stamp = touch_last_connected("lab", &path)
+            .expect("touch must succeed")
+            .expect("present entry must yield Some(timestamp)");
+        // Round-trip parses as RFC3339 — no localized format slipped in.
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&stamp).is_ok(),
+            "timestamp must be RFC3339: {stamp}"
+        );
+        // And the registry on disk reflects that timestamp.
+        let after = RemotesFile::load(&path).unwrap();
+        assert_eq!(
+            after.remotes[0].last_connected.as_deref(),
+            Some(stamp.as_str())
+        );
+    }
+
+    // ----- signal exit-code mapping -----
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_from_status_passes_through_normal_exit() {
+        // A plain `exit 17` from the remote should round-trip verbatim,
+        // mirroring ssh's own contract one level up.
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(17 << 8);
+        assert_eq!(exit_code_from_status(&status), 17);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_from_status_maps_signal_to_128_plus_signal() {
+        // `from_raw` packs signals into the low 7 bits of the status word,
+        // matching how the kernel reports them. SIGINT(2) → 130, SIGTERM(15)
+        // → 143, SIGKILL(9) → 137 — the conventional shell encoding that
+        // every `$?` consumer already understands.
+        use std::os::unix::process::ExitStatusExt;
+        let sigint = std::process::ExitStatus::from_raw(2);
+        assert_eq!(exit_code_from_status(&sigint), 130);
+        let sigterm = std::process::ExitStatus::from_raw(15);
+        assert_eq!(exit_code_from_status(&sigterm), 143);
+        let sigkill = std::process::ExitStatus::from_raw(9);
+        assert_eq!(exit_code_from_status(&sigkill), 137);
     }
 }

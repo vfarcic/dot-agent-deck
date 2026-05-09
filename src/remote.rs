@@ -158,22 +158,55 @@ pub trait SshExecutor {
 /// Production implementation: shells out to the `ssh` binary on the user's
 /// machine. No new dependency on a Rust ssh client — we deliberately reuse
 /// the user's existing ssh config (`~/.ssh/config`, agent, known_hosts).
-pub struct SystemSshExecutor;
+///
+/// `wallclock_timeout` is an optional fail-fast cap used by short-lived probe
+/// commands (e.g. M2.9's `connect` version probe). It maps to ssh's own
+/// `-o ConnectTimeout=N -o ServerAliveInterval=N -o ServerAliveCountMax=1`
+/// triple, which protects against both pre-handshake hangs (DNS, TCP, ssh
+/// handshake) AND mid-stream stalls on a quiet TCP connection. `None` keeps
+/// the original behavior — relevant for long-running invocations like
+/// `remote add`'s install pipeline where a 10s ceiling would be too tight.
+pub struct SystemSshExecutor {
+    wallclock_timeout: Option<u64>,
+}
 
 impl SystemSshExecutor {
     pub fn new() -> Self {
-        Self
+        Self {
+            wallclock_timeout: None,
+        }
+    }
+
+    /// Construct an executor with a fail-fast wallclock cap (in seconds) on
+    /// each ssh invocation. Used by the M2.9 connect-probe path; without it,
+    /// `executor.run(...)` could hang indefinitely on a reachable-but-stalled
+    /// remote shell because `cmd.output()` provides no timeout of its own.
+    pub fn with_wallclock_timeout(secs: u64) -> Self {
+        Self {
+            wallclock_timeout: Some(secs),
+        }
     }
 
     /// Build the `ssh` command without spawning it. Exposed for tests so we
     /// can verify argument quoting without forking a subprocess.
-    pub fn build_command(target: &SshTarget, remote_command: &str) -> Command {
+    pub fn build_command(&self, target: &SshTarget, remote_command: &str) -> Command {
         let mut cmd = Command::new("ssh");
         // BatchMode=yes makes ssh fail fast on missing keys/known_hosts
         // instead of hanging on a TTY prompt. Users who haven't trusted the
         // host yet will see an actionable error rather than the deck CLI
         // wedging.
         cmd.arg("-o").arg("BatchMode=yes");
+        if let Some(secs) = self.wallclock_timeout {
+            // ConnectTimeout caps the pre-handshake phase (DNS, TCP, ssh
+            // handshake). ServerAliveInterval + ServerAliveCountMax=1 forces
+            // a disconnect after `secs` of post-handshake silence, so a
+            // remote shell that accepts the connection but never produces
+            // output can't pin the probe forever. Together they bound the
+            // wallclock at roughly 2*secs in the worst case.
+            cmd.arg("-o").arg(format!("ConnectTimeout={secs}"));
+            cmd.arg("-o").arg(format!("ServerAliveInterval={secs}"));
+            cmd.arg("-o").arg("ServerAliveCountMax=1");
+        }
         cmd.arg("-p").arg(target.port.to_string());
         if let Some(key) = &target.key {
             cmd.arg("-i").arg(key);
@@ -200,7 +233,7 @@ impl Default for SystemSshExecutor {
 
 impl SshExecutor for SystemSshExecutor {
     fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
-        let mut cmd = Self::build_command(target, command);
+        let mut cmd = self.build_command(target, command);
         let output = cmd.output().map_err(|source| SshError::Io {
             target: target.user_host(),
             source,
@@ -410,7 +443,7 @@ pub enum RemoteAddError {
         "A remote named '{name}' already exists. Use `dot-agent-deck remote remove {name}` first or pick a different name."
     )]
     DuplicateName { name: String },
-    #[error("Remote type 'kubernetes' is not yet implemented; planned in PRD #80.")]
+    #[error("Remote type 'kubernetes' is not yet implemented; planned in PRD #81.")]
     KubernetesNotYetImplemented,
     #[error("Unsupported remote type '{kind}'. Supported: ssh.")]
     UnsupportedType { kind: String },
@@ -984,7 +1017,7 @@ mod tests {
             port: 2222,
             key: Some(PathBuf::from("/tmp/key id_rsa")),
         };
-        let cmd = SystemSshExecutor::build_command(&target, "uname -s -m; echo $(id)");
+        let cmd = SystemSshExecutor::new().build_command(&target, "uname -s -m; echo $(id)");
         let args = args_of(&cmd);
 
         // Order matters: -o BatchMode -p PORT [-i KEY] -- user@host CMD.
@@ -1011,13 +1044,67 @@ mod tests {
             port: 22,
             key: None,
         };
-        let cmd = SystemSshExecutor::build_command(&target, "echo hi");
+        let cmd = SystemSshExecutor::new().build_command(&target, "echo hi");
         let args = args_of(&cmd);
         assert!(!args.iter().any(|a| a == "-i"));
         // -- precedes the destination
         let dash_dash_pos = args.iter().position(|a| a == "--").unwrap();
         assert_eq!(args[dash_dash_pos + 1], "h");
         assert_eq!(args[dash_dash_pos + 2], "echo hi");
+    }
+
+    #[test]
+    fn system_ssh_executor_emits_no_timeout_options_by_default() {
+        // The default constructor must not silently impose a ConnectTimeout
+        // — long-running flows like `remote add` install the binary across
+        // the network, and a 10s ceiling there would be wrong. The opt-in
+        // `with_wallclock_timeout` constructor is the only path that adds
+        // timeout flags to the argv.
+        let target = SshTarget {
+            host: "h".to_string(),
+            user: None,
+            port: 22,
+            key: None,
+        };
+        let cmd = SystemSshExecutor::new().build_command(&target, "echo hi");
+        let args = args_of(&cmd);
+        assert!(
+            !args.iter().any(|a| a.starts_with("ConnectTimeout=")),
+            "default executor must not impose ConnectTimeout: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("ServerAliveInterval=")),
+            "default executor must not impose ServerAliveInterval: {args:?}"
+        );
+    }
+
+    #[test]
+    fn system_ssh_executor_with_wallclock_timeout_sets_ssh_options() {
+        // The probe path uses `with_wallclock_timeout(N)` to bound a
+        // reachable-but-stalled remote. The fix maps to ssh's own
+        // ConnectTimeout (pre-handshake cap) AND ServerAliveInterval +
+        // ServerAliveCountMax=1 (post-handshake cap) so a remote that
+        // accepts the TCP connection but never speaks can't pin us forever.
+        let target = SshTarget {
+            host: "h".to_string(),
+            user: None,
+            port: 22,
+            key: None,
+        };
+        let cmd = SystemSshExecutor::with_wallclock_timeout(7).build_command(&target, "echo hi");
+        let args = args_of(&cmd);
+        assert!(
+            args.iter().any(|a| a == "ConnectTimeout=7"),
+            "with_wallclock_timeout must set ConnectTimeout: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "ServerAliveInterval=7"),
+            "with_wallclock_timeout must set ServerAliveInterval: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "ServerAliveCountMax=1"),
+            "with_wallclock_timeout must force a single missed-keepalive abort: {args:?}"
+        );
     }
 
     #[test]
