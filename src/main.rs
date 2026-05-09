@@ -652,16 +652,18 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
     ExitCode::SUCCESS
 }
 
-/// `dot-agent-deck connect [name]` — PRD #76 M2.4 surface.
+/// `dot-agent-deck connect [name]` — PRD #76 M2.9.
 ///
-/// The original M2.4–M2.6 implementation spawned a laptop-side socket bridge
-/// and ran the TUI in-process against the remote daemon. The 2026-05-09
-/// architectural pivot replaced that with "TUI runs on the remote via
-/// `ssh -t`, daemon is a separate process for persistence." M2.7 deletes the
-/// bridge guts; M2.9 will reintroduce the new ssh -t implementation. Until
-/// then this stub keeps the CLI surface compiling — the lookup/picker still
-/// runs (so name resolution and the kubernetes rejection still work as
-/// expected) but the connect itself returns "not yet implemented".
+/// Resolves the remote (via lookup or picker), probes the remote
+/// `dot-agent-deck` for reachability + version sanity, then exec's
+/// `ssh -t` to run the deck TUI on the remote in M2.8 external-daemon
+/// mode. The laptop process blocks until ssh exits and propagates the
+/// exit code.
+///
+/// `_cli_theme` and `_continue_session` are accepted to keep the
+/// `Commands::Connect` call shape stable but are intentionally ignored —
+/// they apply to a laptop-side TUI that no longer exists in this flow.
+/// See `connect::run_connect`'s doc comment for the rationale.
 fn run_connect(
     _cli_theme: Option<Theme>,
     _continue_session: bool,
@@ -669,10 +671,6 @@ fn run_connect(
 ) -> ExitCode {
     let registry_path = dot_agent_deck::remote::default_remotes_path();
 
-    // Run lookup/picker so user-visible name-resolution errors still fire
-    // (and so an interactive `connect` without args doesn't silently
-    // succeed when there are no remotes). The resolved entry is dropped on
-    // the floor — there's nothing to connect to yet.
     let entry = match name {
         Some(n) => match dot_agent_deck::connect::lookup_remote(&n, &registry_path) {
             Ok(e) => e,
@@ -697,13 +695,20 @@ fn run_connect(
         }
     };
 
-    eprintln!(
-        "`connect {}` is not yet implemented (PRD #76 M2.9). \
-         The laptop-side bridge was removed in M2.7 as part of the architectural \
-         pivot to running the TUI on the remote via `ssh -t`.",
-        entry.name
-    );
-    ExitCode::FAILURE
+    let local_version = env!("DAD_VERSION");
+    match dot_agent_deck::connect::run_connect_default(&entry, &registry_path, local_version) {
+        Ok(0) => ExitCode::SUCCESS,
+        // ExitCode::from(u8) is the closest we can get to "propagate ssh's
+        // exit code." Codes outside 0..=255 saturate to 255, which is also
+        // the value ssh itself uses for its own transport errors — that
+        // collision is harmless because we already classified those as
+        // typed RemoteConnectError before reaching the spawn.
+        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `dot-agent-deck daemon serve` — PRD #76 M4.3. Runs the daemon (hook

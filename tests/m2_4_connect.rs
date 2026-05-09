@@ -22,6 +22,7 @@ fn entry(name: &str, host: &str) -> RemoteEntry {
         version: "0.24.5".to_string(),
         added_at: "2026-05-09T01:00:00+00:00".to_string(),
         upgraded_at: None,
+        last_connected: None,
     }
 }
 

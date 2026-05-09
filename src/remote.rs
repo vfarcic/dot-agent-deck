@@ -248,6 +248,13 @@ pub struct RemoteEntry {
     /// registration timestamp so users can see both moments separately.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgraded_at: Option<String>,
+    /// Timestamp of the most recent successful `connect`. `None` until the
+    /// entry has been connected to at least once. Updated by `connect`'s
+    /// post-spawn bookkeeping when the remote ssh session exits cleanly
+    /// (status 0); a failed spawn or a non-zero remote exit leaves the field
+    /// untouched so the registry only records sessions that actually ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_connected: Option<String>,
 }
 
 impl RemoteEntry {
@@ -662,6 +669,7 @@ pub fn add(
         version: version.clone(),
         added_at: chrono::Utc::now().to_rfc3339(),
         upgraded_at: None,
+        last_connected: None,
     };
     registry.remotes.push(entry.clone());
     registry.save(remotes_path)?;
@@ -1234,6 +1242,7 @@ mod tests {
                     version: "0.24.5".to_string(),
                     added_at: "2026-05-09T01:23:45+00:00".to_string(),
                     upgraded_at: None,
+                    last_connected: None,
                 },
                 RemoteEntry {
                     name: "lab".to_string(),
@@ -1244,6 +1253,7 @@ mod tests {
                     version: "0.24.5".to_string(),
                     added_at: "2026-05-09T02:00:00+00:00".to_string(),
                     upgraded_at: None,
+                    last_connected: None,
                 },
             ],
         };
