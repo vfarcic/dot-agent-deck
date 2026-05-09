@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -119,6 +120,13 @@ enum Commands {
     Remote {
         #[command(subcommand)]
         cmd: RemoteCmd,
+    },
+    /// Attach a local TUI to a remote daemon (PRD #76, M2.4). With no
+    /// argument, runs an interactive picker over the configured remotes.
+    Connect {
+        /// Friendly name from `dot-agent-deck remote list`. If omitted, the
+        /// picker runs.
+        name: Option<String>,
     },
 }
 
@@ -469,6 +477,7 @@ fn main() -> ExitCode {
                 }
             }
         },
+        Some(Commands::Connect { name }) => run_connect(cli.theme, cli.continue_session, name),
         Some(Commands::Validate { path }) => {
             use dot_agent_deck::config_validation::{has_errors, validate_config};
             use dot_agent_deck::project_config::load_project_config;
@@ -505,9 +514,14 @@ fn main() -> ExitCode {
 
 #[tokio::main]
 async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
-    // Optional file-based logging when DOT_AGENT_DECK_LOG is set.
-    // Logs go to the file path specified (e.g., DOT_AGENT_DECK_LOG=/tmp/dad.log).
-    // If the value is "1" or empty, defaults to /tmp/dot-agent-deck.log.
+    init_logging_from_env();
+    run_tui_session(cli_theme, continue_session).await;
+}
+
+/// Optional file-based logging from `DOT_AGENT_DECK_LOG`. Pulled out of the
+/// dashboard entry point so the `connect` subcommand (which builds its own
+/// tokio runtime) can call it once before launching the TUI body.
+fn init_logging_from_env() {
     if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
         let log_path = if log_val.is_empty() || log_val == "1" {
             "/tmp/dot-agent-deck.log".to_string()
@@ -534,15 +548,22 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
             }
         }
     }
+}
 
+/// The TUI body extracted from `run_dashboard` so `connect` can reuse it.
+/// Reads `DOT_AGENT_DECK_VIA_DAEMON` + `DOT_AGENT_DECK_ATTACH_SOCKET` to
+/// decide whether to spawn a daemon or attach to an existing one (M1.3
+/// behavior). The `connect` subcommand sets both env vars before calling
+/// this so the TUI dials the bridge socket instead of spawning a daemon.
+async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) {
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();
     let attach_path = attach_socket_path();
 
     // PRD #76, M1.3: developer-facing flag for stream-backed panes against an
-    // already-running daemon. Env (not CLI) so it doesn't show up in --help —
-    // M2.4 introduces the public `connect` subcommand. Truthy values:
-    // "1", "true", "yes" (case-insensitive).
+    // already-running daemon. Env (not CLI) so it doesn't show up in --help.
+    // M2.4's `connect` subcommand sets this internally so the TUI dials the
+    // bridge socket. Truthy values: "1", "true", "yes" (case-insensitive).
     let via_daemon = std::env::var(DOT_AGENT_DECK_VIA_DAEMON)
         .ok()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
@@ -626,6 +647,78 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     } else if let Ok(Err(e)) = tui_result {
         eprintln!("TUI error: {e}");
     }
+}
+
+/// `dot-agent-deck connect [name]` — PRD #76 M2.4. Resolves the remote (by
+/// name or via the picker), spawns an ssh-exec'd `daemon attach` on the
+/// remote, plumbs it through a local Unix socket, sets the M1.3 env vars so
+/// the in-process TUI dials that socket, then runs the TUI body. Bridge
+/// teardown happens automatically via `ConnectBridge::Drop` when this
+/// function returns.
+#[tokio::main]
+async fn run_connect(
+    cli_theme: Option<Theme>,
+    continue_session: bool,
+    name: Option<String>,
+) -> ExitCode {
+    init_logging_from_env();
+
+    let registry_path = dot_agent_deck::remote::default_remotes_path();
+
+    // 1. Resolve the remote — either by name or via the interactive picker.
+    let entry = match name {
+        Some(n) => match dot_agent_deck::connect::lookup_remote(&n, &registry_path) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            match dot_agent_deck::connect::pick_remote(&registry_path, &mut input, &mut output) {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = output.flush();
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+
+    // 2. Bring up the bridge (binds Unix socket + spawns ssh + relay task).
+    let target = entry.ssh_target();
+    let socket_path = dot_agent_deck::connect::bridge_socket_path();
+    let bridge = match dot_agent_deck::connect::start_bridge(&target, socket_path.clone()).await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to start connect bridge: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 3. Tell the TUI to dial the bridge instead of spawning a daemon. The
+    //    M1.3 stream-backed-pane path reads these envs at TUI startup.
+    //    SAFETY: only this process and its children read these vars; we
+    //    don't unset them on exit because the connect process exits when
+    //    the TUI returns.
+    // SAFETY: single-threaded mutation before the TUI starts spinning up tasks.
+    unsafe {
+        std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, "1");
+        std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", bridge.socket_path());
+    }
+
+    // 4. Run the same TUI body the default subcommand uses.
+    run_tui_session(cli_theme, continue_session).await;
+
+    // `bridge` drops here: socket file unlinked, ssh child killed via
+    // kill_on_drop, listener task aborted with this tokio runtime.
+    drop(bridge);
+    ExitCode::SUCCESS
 }
 
 #[tokio::main]

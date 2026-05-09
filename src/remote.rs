@@ -250,6 +250,15 @@ pub struct RemoteEntry {
     pub upgraded_at: Option<String>,
 }
 
+impl RemoteEntry {
+    /// Reconstruct an [`SshTarget`] from this entry's stored host/port/key. The
+    /// `host` field carries the original `[user@]host` string the user typed
+    /// at `remote add` time; we re-parse it the same way `add` does.
+    pub fn ssh_target(&self) -> SshTarget {
+        SshTarget::parse(&self.host, self.port, self.key.as_ref().map(PathBuf::from))
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemotesFile {
     #[serde(default)]

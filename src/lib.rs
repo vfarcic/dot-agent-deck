@@ -3,6 +3,7 @@ pub mod ascii_art;
 pub mod config;
 pub mod config_gen;
 pub mod config_validation;
+pub mod connect;
 pub mod daemon;
 pub mod daemon_attach;
 pub mod daemon_client;
