@@ -722,7 +722,7 @@ pub fn list(remotes_path: &Path, out: &mut dyn std::io::Write) -> Result<(), Rem
     if registry.remotes.is_empty() {
         writeln!(
             out,
-            "No remotes configured. Use `dot-agent-deck remote add <name> --type=ssh <host>` to add one."
+            "No remotes configured. Use `dot-agent-deck remote add <name> <host>` to add one."
         )
         .map_err(|source| RemoteConfigError::Io {
             path: remotes_path.display().to_string(),

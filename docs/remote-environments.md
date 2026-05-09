@@ -15,7 +15,7 @@ For host prerequisites see [Remote Environment Requirements](remote-requirements
 
 ```bash
 # 1. Register a remote (one-time per host).
-dot-agent-deck remote add my-vm user@host --type=ssh
+dot-agent-deck remote add my-vm user@host
 
 # 2. Connect. With no name, an interactive picker opens.
 dot-agent-deck connect my-vm
@@ -35,7 +35,7 @@ dot-agent-deck remote remove my-vm         # forget the registry entry (host unt
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--type` | _required_ | `ssh` (only transport implemented today). |
+| `--type` | `ssh` | Only `ssh` is implemented today; `kubernetes` is planned in [PRD #80](https://github.com/vfarcic/dot-agent-deck/issues/80). |
 | `--port` | `22` | ssh port. |
 | `--key` | _none_ | Path to an ssh identity file. Forwarded to ssh as `-i`. Omit to use ssh's default key search. |
 | `--version` | client version | Daemon binary version to install on the remote. Usually leave unset. |
@@ -45,7 +45,6 @@ Example with a non-default identity file and port:
 
 ```bash
 dot-agent-deck remote add my-vm deck@198.51.100.10 \
-  --type=ssh \
   --key ~/.ssh/dot-agent-deck \
   --port 2222
 ```

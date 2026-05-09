@@ -21,7 +21,7 @@ Every recipe converges on the same end state:
 4. From your laptop:
 
    ```bash
-   dot-agent-deck remote add <name> <user>@<host> --type=ssh
+   dot-agent-deck remote add <name> <user>@<host>
    ```
 
 The recipes below differ only in steps 1–3.
@@ -68,7 +68,7 @@ IP=$(multipass info dad-dev | awk '/IPv4/ {print $2; exit}')
 
 # Multipass installs your laptop's authorized key by default; if not, use
 # `multipass exec dad-dev -- bash -c 'echo <pubkey> >> ~/.ssh/authorized_keys'`.
-dot-agent-deck remote add dad-dev ubuntu@$IP --type=ssh
+dot-agent-deck remote add dad-dev ubuntu@$IP
 dot-agent-deck connect dad-dev
 ```
 
@@ -125,14 +125,14 @@ exit
 Back on the laptop:
 
 ```bash
-dot-agent-deck remote add hetzner-1 deck@$IP --type=ssh
+dot-agent-deck remote add hetzner-1 deck@$IP
 dot-agent-deck connect hetzner-1
 ```
 
 If your ssh identity isn't at one of ssh's default search paths, pass it explicitly:
 
 ```bash
-dot-agent-deck remote add hetzner-1 deck@$IP --type=ssh \
+dot-agent-deck remote add hetzner-1 deck@$IP \
   --key ~/.ssh/dot-agent-deck
 ```
 
@@ -162,7 +162,7 @@ Any always-on Linux box on your network works — a homelab server, a Raspberry 
 2. Create a non-root user, add your laptop's ssh key to its `~/.ssh/authorized_keys`.
 3. Install Node.js + the agent CLI; set the agent's API key in the user's environment.
 4. `sudo loginctl enable-linger $USER`.
-5. From the laptop: `dot-agent-deck remote add desk-pi user@hostname.local --type=ssh`.
+5. From the laptop: `dot-agent-deck remote add desk-pi user@hostname.local`.
 
 mDNS (`hostname.local`) is convenient on a home LAN. For routed access from outside the LAN, set up a tunnel (Tailscale, ZeroTier, or a port-forwarded ssh) before running `remote add`.
 

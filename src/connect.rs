@@ -70,9 +70,7 @@ pub enum RemoteConnectError {
         "Remote '{name}' is type 'kubernetes'; kubernetes remotes are not yet supported (planned in PRD #80)."
     )]
     KubernetesNotYetSupported { name: String },
-    #[error(
-        "No remotes configured. Run `dot-agent-deck remote add <name> --type=ssh <host>` to add one."
-    )]
+    #[error("No remotes configured. Run `dot-agent-deck remote add <name> <host>` to add one.")]
     NoRemotesConfigured,
     #[error("Invalid selection after {attempts} attempts; aborting.")]
     PickerGaveUp { attempts: usize },

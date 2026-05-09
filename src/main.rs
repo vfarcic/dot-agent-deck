@@ -138,8 +138,9 @@ enum DaemonCmd {
     Attach,
 }
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 enum CliRemoteType {
+    #[default]
     Ssh,
     Kubernetes,
 }
@@ -152,9 +153,9 @@ enum RemoteCmd {
         name: String,
         /// ssh target: `[user@]host`.
         target: String,
-        /// Remote type. Only `ssh` is implemented today; `kubernetes` is
-        /// planned in PRD #80.
-        #[arg(long = "type", value_enum)]
+        /// Remote type. Defaults to `ssh` (the only transport implemented today);
+        /// `kubernetes` is planned in PRD #80.
+        #[arg(long = "type", value_enum, default_value_t = CliRemoteType::Ssh)]
         kind: CliRemoteType,
         /// ssh port.
         #[arg(long, default_value_t = dot_agent_deck::remote::DEFAULT_SSH_PORT)]
