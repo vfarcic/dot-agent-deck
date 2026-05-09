@@ -53,6 +53,44 @@ fn kill_daemon(pid: u32) {
     }
 }
 
+/// Drop guard: kills the spawned daemon (if any) and restores the test
+/// process's `DOT_AGENT_DECK_*` env vars even if an assertion panics
+/// mid-test. Without this, a panic between spawn and the explicit
+/// cleanup at end-of-test would leak a detached daemon (port-blocking
+/// subsequent runs that share state) and leave env vars trampled for
+/// the next test in this binary. (PRD #76 M2.8 reviewer/auditor LOW.)
+struct DaemonTestCleanup {
+    pid: Option<u32>,
+    prev_attach: Option<String>,
+    prev_hook: Option<String>,
+    prev_state: Option<String>,
+}
+
+impl Drop for DaemonTestCleanup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            kill_daemon(pid);
+        }
+        // SAFETY: env vars were set by this same test; restoring previous
+        // values is symmetric. The HARNESS_BIND_LOCK serializes any other
+        // test in this binary that touches these vars at startup.
+        unsafe {
+            match &self.prev_attach {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_ATTACH_SOCKET"),
+            }
+            match &self.prev_hook {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
+            }
+            match &self.prev_state {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn lazy_spawn_binds_trusted_socket_and_serves_list_agents() {
     let dir = {
@@ -70,12 +108,18 @@ async fn lazy_spawn_binds_trusted_socket_and_serves_list_agents() {
     // accept env, so we set them on the test process before invoking it.
     // Tests in this binary share env across cases; we scope the mutation
     // by restoring afterwards.
-    let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
-    let prev_hook = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
-    let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
+    // RAII guard: cleanup runs even if any assertion below panics.
+    // Constructed BEFORE we mutate env so the captured `prev_*` values are
+    // the pre-test values, not what we're about to write.
+    let mut cleanup = DaemonTestCleanup {
+        pid: None,
+        prev_attach: std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok(),
+        prev_hook: std::env::var("DOT_AGENT_DECK_SOCKET").ok(),
+        prev_state: std::env::var("DOT_AGENT_DECK_STATE_DIR").ok(),
+    };
     // SAFETY: tests in a single test binary share env; this whole test
     // binary serializes via the lock above for the bind-mode-sensitive
-    // setup, and we restore the previous values before returning.
+    // setup. The Drop impl on `cleanup` restores prior values.
     unsafe {
         std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &attach_path);
         std::env::set_var("DOT_AGENT_DECK_SOCKET", &hook_path);
@@ -100,35 +144,15 @@ async fn lazy_spawn_binds_trusted_socket_and_serves_list_agents() {
     )
     .await;
 
-    // Whatever happens next, restore env before any panic so subsequent
-    // tests don't observe our state.
-    let restore_env = || {
-        // SAFETY: same scope as the set_var above; restoring previous values.
-        unsafe {
-            match &prev_attach {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_ATTACH_SOCKET"),
-            }
-            match &prev_hook {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
-            }
-            match &prev_state {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
-            }
-        }
-    };
-
-    let pid = captured_pid.lock().unwrap().take();
-    if let Err(e) = result {
-        restore_env();
-        if let Some(pid) = pid {
-            kill_daemon(pid);
-        }
-        panic!("ensure_daemon_running failed: {e}");
-    }
-    let pid = pid.expect("spawn closure must have recorded a pid on success");
+    // Hand the pid to the cleanup guard the moment we have one — any panic
+    // from this point on must SIGTERM/SIGKILL the spawned daemon to avoid
+    // leaking a detached process across test runs.
+    cleanup.pid = captured_pid.lock().unwrap().take();
+    result.expect("ensure_daemon_running failed");
+    assert!(
+        cleanup.pid.is_some(),
+        "spawn closure must have recorded a pid on success"
+    );
 
     // Trust check: file is a Unix socket, mode 0o600, owned by us.
     let meta = std::fs::metadata(&attach_path).expect("attach socket should exist");
@@ -147,14 +171,10 @@ async fn lazy_spawn_binds_trusted_socket_and_serves_list_agents() {
     // Daemon is reachable via DaemonClient: list_agents on a fresh daemon
     // returns an empty list and demonstrates the protocol round-trips.
     let client = DaemonClient::new(attach_path.clone());
-    let agents = match client.list_agents().await {
-        Ok(a) => a,
-        Err(e) => {
-            restore_env();
-            kill_daemon(pid);
-            panic!("DaemonClient::list_agents failed: {e}");
-        }
-    };
+    let agents = client
+        .list_agents()
+        .await
+        .expect("DaemonClient::list_agents must succeed against a freshly-spawned daemon");
     assert!(
         agents.is_empty(),
         "fresh daemon should have no agents; got {agents:?}"
@@ -165,16 +185,11 @@ async fn lazy_spawn_binds_trusted_socket_and_serves_list_agents() {
     // A second list_agents after a short sleep proves the daemon hasn't
     // exited just because the spawning closure finished.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let agents_after = match client.list_agents().await {
-        Ok(a) => a,
-        Err(e) => {
-            restore_env();
-            kill_daemon(pid);
-            panic!("daemon must survive the spawn closure exiting: {e}");
-        }
-    };
+    let agents_after = client
+        .list_agents()
+        .await
+        .expect("daemon must survive the spawn closure exiting");
     assert!(agents_after.is_empty());
 
-    restore_env();
-    kill_daemon(pid);
+    // Cleanup runs via Drop on `cleanup` going out of scope.
 }
