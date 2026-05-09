@@ -129,6 +129,13 @@ dot-agent-deck remote add hetzner-1 deck@$IP --type=ssh
 dot-agent-deck connect hetzner-1
 ```
 
+If your ssh identity isn't at one of ssh's default search paths, pass it explicitly:
+
+```bash
+dot-agent-deck remote add hetzner-1 deck@$IP --type=ssh \
+  --key ~/.ssh/dot-agent-deck
+```
+
 ## UpCloud
 
 UpCloud is the M0.2 reference host. The flow is identical to Hetzner once the VM exists; the differences are at the IaaS layer.

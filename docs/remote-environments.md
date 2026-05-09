@@ -31,6 +31,25 @@ dot-agent-deck remote upgrade my-vm        # reinstall the binary at the local c
 dot-agent-deck remote remove my-vm         # forget the registry entry (host untouched)
 ```
 
+### `remote add` flags
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--type` | _required_ | `ssh` (only transport implemented today). |
+| `--port` | `22` | ssh port. |
+| `--key` | _none_ | Path to an ssh identity file. Forwarded to ssh as `-i`. Omit to use ssh's default key search. |
+| `--version` | client version | Daemon binary version to install on the remote. Usually leave unset. |
+| `--no-install` | `false` | Skip the binary push; pre-flight requires the remote to already have a matching `dot-agent-deck` on `PATH`. |
+
+Example with a non-default identity file and port:
+
+```bash
+dot-agent-deck remote add my-vm deck@198.51.100.10 \
+  --type=ssh \
+  --key ~/.ssh/dot-agent-deck \
+  --port 2222
+```
+
 ## Lifecycle model
 
 The daemon lives on the remote and owns every agent process. Your laptop runs a viewer that attaches to the daemon, streams output back, and forwards keystrokes forward.
