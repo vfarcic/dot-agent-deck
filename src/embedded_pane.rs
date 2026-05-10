@@ -10,9 +10,24 @@ use portable_pty::PtySize;
 use std::any::Any;
 
 use crate::agent_pty::{self, AgentPty, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
-use crate::daemon_client::{DaemonClient, StartAgentOptions};
+use crate::daemon_client::{AttachConnection, DaemonClient, StartAgentOptions};
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
 use crate::pane::{PaneController, PaneDirection, PaneError, PaneInfo};
+
+/// Result of [`EmbeddedPaneController::hydrate_from_daemon`]. One entry per
+/// daemon-side agent that was successfully reconnected on TUI bootstrap; the
+/// caller uses the pair to register the pane with [`crate::state::AppState`]
+/// and seed the UI's display-name maps. Agents that fail to attach (e.g.
+/// terminated between list and attach) are not represented here.
+#[derive(Debug, Clone)]
+pub struct HydratedPane {
+    /// Local pane id assigned by the controller.
+    pub pane_id: String,
+    /// Daemon-side agent id this pane is attached to. The TUI uses this as
+    /// the default display name on rehydration since the daemon does not
+    /// track per-agent display metadata (PRD #76 M2.x).
+    pub agent_id: String,
+}
 
 /// PTY-backed pane state: this process owns the PTY master and child. The
 /// historical (and only) backend before M1.3.
@@ -448,10 +463,6 @@ impl EmbeddedPaneController {
         client: DaemonClient,
         runtime: tokio::runtime::Handle,
     ) -> Result<String, PaneError> {
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
-        let mouse_mode = Arc::new(AtomicBool::new(false));
-        let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
-
         // Same hook-tagging as the local path so daemon-spawned agents
         // see DOT_AGENT_DECK_PANE_ID and can emit hook events back to
         // this UI's pane.
@@ -477,6 +488,45 @@ impl EmbeddedPaneController {
                 Ok::<_, crate::daemon_client::ClientError>((id, conn))
             })
             .map_err(|e| PaneError::CommandFailed(format!("daemon: {e}")))?;
+
+        let name = command.unwrap_or("shell").to_string();
+        let command = command.map(|c| c.to_string());
+        self.wire_stream_pane(
+            pane_id.clone(),
+            agent_id,
+            conn,
+            name,
+            command,
+            runtime,
+            daemon_path,
+        );
+        Ok(pane_id)
+    }
+
+    /// Internal helper that takes an already-resolved `agent_id` plus an
+    /// active [`AttachConnection`] and stitches together the local-side
+    /// pane state: vt100 parser, mouse-mode flag, hyperlink map, the input
+    /// channel + writer task, and the per-pane resize worker. Pulled out
+    /// of `create_stream_pane` so the M2.x rehydration path
+    /// (`hydrate_from_daemon`) can reuse the exact same wiring without
+    /// re-issuing `start-agent`. Behavior on the wire is identical: the
+    /// daemon replays its scrollback snapshot via STREAM_OUT before live
+    /// bytes (see `daemon_protocol::handle_attach_stream`), so a hydrated
+    /// pane renders the agent's current screen on first paint.
+    #[allow(clippy::too_many_arguments)]
+    fn wire_stream_pane(
+        &self,
+        pane_id: String,
+        agent_id: String,
+        conn: AttachConnection,
+        name: String,
+        command: Option<String>,
+        runtime: tokio::runtime::Handle,
+        daemon_path: PathBuf,
+    ) {
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
+        let mouse_mode = Arc::new(AtomicBool::new(false));
+        let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
 
         let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCmd>();
         let (resize_tx, resize_rx) = tokio::sync::watch::channel::<Option<(u16, u16)>>(None);
@@ -586,16 +636,100 @@ impl EmbeddedPaneController {
                 resize_task: Some(resize_task),
             }),
             screen: parser,
-            name: command.unwrap_or("shell").to_string(),
+            name,
             is_focused: false,
-            command: command.map(|c| c.to_string()),
+            command,
             mouse_mode,
             hyperlinks,
         };
 
-        self.panes.lock().unwrap().insert(pane_id.clone(), pane);
+        self.panes.lock().unwrap().insert(pane_id, pane);
+    }
 
-        Ok(pane_id)
+    /// Reconnect to every daemon-side agent on TUI bootstrap (PRD #76
+    /// M2.x). In external-daemon mode the agents the user spawned in a
+    /// previous session are still alive in the daemon; without this step
+    /// the dashboard would show "No active sessions" even though the
+    /// daemon owns live PTYs.
+    ///
+    /// For each id returned by `list_agents`, builds a fresh
+    /// `PaneBackend::Stream` and opens an `AttachStream` (no
+    /// `start-agent` — the agent already exists). The daemon replays its
+    /// scrollback snapshot before live bytes, so hydrated panes render
+    /// the agent's current screen on first paint.
+    ///
+    /// Errors are absorbed rather than propagated:
+    /// - `list_agents` failure (transient daemon hiccup): logged at debug,
+    ///   treated as empty. The user can retry by reconnecting.
+    /// - Per-agent `attach` failure (race: the agent terminated between
+    ///   list and attach): logged at debug, that agent is skipped, others
+    ///   continue.
+    /// - In `LocalDeck` mode this is a no-op: the in-process daemon either
+    ///   has no agents yet or shares the same registry as the TUI, so
+    ///   re-discovery is meaningless.
+    ///
+    /// Returns one [`HydratedPane`] per successfully attached agent, in
+    /// the order returned by the daemon. Callers are expected to register
+    /// each pane id with [`crate::state::AppState`] and seed the UI's
+    /// display-name maps with `agent_id` (the daemon does not track
+    /// display metadata yet — out of scope for M2.x).
+    pub fn hydrate_from_daemon(&self) -> Vec<HydratedPane> {
+        let (client, runtime) = match &self.mode {
+            ControllerMode::LocalDeck => return Vec::new(),
+            ControllerMode::RemoteDeckLocal { client, runtime } => {
+                (client.clone(), runtime.clone())
+            }
+        };
+
+        let agents = match runtime.block_on(client.list_agents()) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "hydrate_from_daemon: list_agents failed, treating as empty"
+                );
+                return Vec::new();
+            }
+        };
+
+        let daemon_path = client.socket_path().to_path_buf();
+        let mut hydrated = Vec::new();
+        for agent_id in agents {
+            let client_for_attach = client.clone();
+            let id_for_attach = agent_id.clone();
+            let conn = match runtime
+                .block_on(async move { client_for_attach.attach(&id_for_attach).await })
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    // Race: agent terminated between list_agents and
+                    // attach, or transient daemon error. Skip this id
+                    // and keep going so a single missing agent doesn't
+                    // sink the rest of the rehydration.
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "hydrate_from_daemon: attach failed, skipping"
+                    );
+                    continue;
+                }
+            };
+            let pane_id = self.allocate_id();
+            // Use agent_id as the pane name. Daemon-side metadata (display
+            // name, cwd, modes) is not persisted yet — the user can rename
+            // via the existing rename flow.
+            self.wire_stream_pane(
+                pane_id.clone(),
+                agent_id.clone(),
+                conn,
+                agent_id.clone(),
+                None,
+                runtime.clone(),
+                daemon_path.clone(),
+            );
+            hydrated.push(HydratedPane { pane_id, agent_id });
+        }
+        hydrated
     }
 
     /// Explicit M2.5 detach: tell the daemon "I'm leaving voluntarily,

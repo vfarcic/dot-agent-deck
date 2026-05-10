@@ -1898,6 +1898,32 @@ pub fn run_tui(
         ui.mode = UiMode::StarPrompt;
     }
 
+    // PRD #76 M2.x: in external-daemon mode the daemon may already own live
+    // agents from a previous TUI session (the user ssh-disconnected and
+    // reconnected via `dot-agent-deck connect`). Ask the daemon for its
+    // agent list and rebuild stream-backed panes for each one before the
+    // event loop starts so the dashboard shows the live sessions instead of
+    // "No active sessions". `hydrate_from_daemon` is a no-op for the
+    // in-process (`LocalDeck`) controller — the in-process daemon shares
+    // the TUI's registry directly. Errors during list_agents/attach are
+    // absorbed so a transient daemon hiccup doesn't block startup.
+    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+        let hydrated = embedded.hydrate_from_daemon();
+        for h in &hydrated {
+            let mut st = state.blocking_write();
+            st.register_pane(h.pane_id.clone());
+            st.insert_placeholder_session(h.pane_id.clone(), None);
+            drop(st);
+            // The daemon does not track per-agent display names, cwd, or
+            // modes yet (out of scope for M2.x). Use the agent id as the
+            // initial display name; the user can rename later via the
+            // existing pane-rename flow.
+            ui.pane_display_names
+                .insert(h.pane_id.clone(), h.agent_id.clone());
+            ui.pane_names.insert(h.pane_id.clone(), h.agent_id.clone());
+        }
+    }
+
     if continue_session {
         // Ensure the terminal has up-to-date dimensions before we resize
         // any PTYs — without this, get_frame().area() may return stale or
