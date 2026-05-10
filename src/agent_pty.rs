@@ -28,6 +28,15 @@ pub const DOT_AGENT_DECK_VIA_DAEMON: &str = "DOT_AGENT_DECK_VIA_DAEMON";
 /// scrub site below can reference it by name.
 pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
 
+/// Hard upper bound on PTY rows/cols accepted by the daemon. Larger values
+/// are clamped down before reaching `MasterPty::resize`. The cap defends
+/// against a same-uid attach-socket peer perturbing an existing agent's
+/// geometry to extreme values: applications inside the PTY may trust
+/// `TIOCGWINSZ` and allocate or redraw based on the reported dimensions, so
+/// `65535x65535` is a cheap local DoS vector. 4096 is far above any real
+/// terminal size while still keeping downstream allocations bounded.
+pub const PTY_RESIZE_DIM_MAX: u16 = 4096;
+
 #[derive(Debug, Error)]
 pub enum AgentPtyError {
     #[error("Failed to open PTY: {0}")]
@@ -506,13 +515,16 @@ impl AgentPtyRegistry {
     /// shape (`PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }`).
     /// Zero rows or cols are rejected up front so a buggy caller can't
     /// quietly produce a 0×0 PTY (which would deadlock any agent that
-    /// reads `TIOCGWINSZ`).
+    /// reads `TIOCGWINSZ`). Non-zero values are silently clamped down to
+    /// [`PTY_RESIZE_DIM_MAX`] — see the constant docs for the rationale.
     pub fn resize(&self, id: &str, rows: u16, cols: u16) -> Result<(), AgentPtyError> {
         if rows == 0 || cols == 0 {
             return Err(AgentPtyError::Resize(format!(
                 "rows and cols must be > 0 (got {rows}x{cols})"
             )));
         }
+        let rows = rows.min(PTY_RESIZE_DIM_MAX);
+        let cols = cols.min(PTY_RESIZE_DIM_MAX);
         let inner = self.inner.lock().unwrap();
         let agent = inner
             .agents

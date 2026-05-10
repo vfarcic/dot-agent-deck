@@ -847,3 +847,56 @@ async fn resize_zero_rows_or_cols_returns_err() {
 
     server.registry.close_agent(&id).unwrap();
 }
+
+/// Send an oversized resize and assert the kernel-visible size is clamped to
+/// `PTY_RESIZE_DIM_MAX` rather than the requested value. Mirrors the
+/// `resize_propagates_to_pty` shell-output proof — `stty size` reports the
+/// slave-side TIOCGWINSZ, which is what `MasterPty::resize` updates.
+async fn assert_resize_clamps(rows: u16, cols: u16, expected_rows: u16, expected_cols: u16) {
+    let server = start_server().await;
+    let id = start_agent(&server, "/bin/sh").await;
+
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut s,
+        &AttachRequest::Resize {
+            id: id.clone(),
+            rows,
+            cols,
+        },
+    )
+    .await;
+    let resp = read_response(&mut s).await;
+    assert!(
+        resp.ok,
+        "oversized resize {rows}x{cols} must succeed (clamped); got error: {:?}",
+        resp.error
+    );
+
+    let mut a = connect_attach(&server, &id).await;
+    write_frame(&mut a, KIND_STREAM_IN, b"echo \"DIM=$(stty size)\"\n").await;
+    let marker = format!("DIM={expected_rows} {expected_cols}");
+    let acc = read_until_contains(&mut a, marker.as_bytes()).await;
+    let out = String::from_utf8_lossy(&acc);
+    assert!(
+        out.contains(&marker),
+        "expected clamp '{marker}' from `stty size` after resize {rows}x{cols}; got: {out:?}"
+    );
+
+    server.registry.close_agent(&id).unwrap();
+}
+
+#[tokio::test]
+async fn registry_resize_clamps_oversized_rows() {
+    assert_resize_clamps(10_000, 80, 4096, 80).await;
+}
+
+#[tokio::test]
+async fn registry_resize_clamps_oversized_cols() {
+    assert_resize_clamps(80, 10_000, 80, 4096).await;
+}
+
+#[tokio::test]
+async fn registry_resize_clamps_both() {
+    assert_resize_clamps(u16::MAX, u16::MAX, 4096, 4096).await;
+}

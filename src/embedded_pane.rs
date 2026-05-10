@@ -67,6 +67,19 @@ struct StreamBackend {
     /// — held here rather than referenced from the controller because the
     /// pane outlives any borrow of the controller's path.
     daemon_path: PathBuf,
+    /// Single-slot coalescing channel for resize requests. Each
+    /// `resize_pane_pty` overwrites the latest `(rows, cols)` here; the
+    /// per-pane `resize_task` reads the most recent value and dispatches
+    /// it to the daemon. Intermediate values during rapid layout churn
+    /// are dropped on the floor — only the latest size is sent on the
+    /// wire (PRD #76 M2.10 audit follow-up).
+    resize_tx: tokio::sync::watch::Sender<Option<(u16, u16)>>,
+    /// Per-pane resize worker. Aborted on `Drop` so a pane removal can't
+    /// leak a task or an in-flight daemon connection past the pane's
+    /// lifetime. The worker would also exit on its own when `resize_tx`
+    /// drops (the receiver's `changed()` returns `Err`), but explicitly
+    /// aborting bounds the cleanup window.
+    resize_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 enum PaneBackend {
@@ -82,6 +95,14 @@ impl Drop for StreamBackend {
     /// Ctrl+W close.
     fn drop(&mut self) {
         if let Some(h) = self.io_task.take() {
+            h.abort();
+        }
+        // The resize worker would exit on its own once `resize_tx` drops
+        // (its receiver's `changed()` returns `Err`), but it might be mid
+        // I/O against the daemon when that happens. Aborting here bounds
+        // the cleanup window so a slow daemon can't keep the worker (and
+        // its open socket FD) alive past pane removal.
+        if let Some(h) = self.resize_task.take() {
             h.abort();
         }
     }
@@ -271,9 +292,12 @@ impl EmbeddedPaneController {
 
     /// Resize a pane's PTY and VT100 parser to the given dimensions. For
     /// stream-backed panes, the local vt100 parser is resized synchronously
-    /// and a `Resize` op (PRD #76, M2.10) is dispatched to the daemon over
-    /// a fresh short-lived connection — fire-and-forget so a transient
-    /// daemon hiccup can't kill the TUI; the next resize will reconcile.
+    /// and the new dimensions are written to a per-pane single-slot
+    /// coalescing channel (PRD #76, M2.10): the per-pane `resize_task`
+    /// drains the latest value and forwards a `Resize` op to the daemon
+    /// with a bounded timeout. Intermediate values during rapid layout
+    /// churn are dropped on the floor — only the latest size reaches the
+    /// wire, with at most one in-flight daemon connection per pane.
     pub fn resize_pane_pty(&self, pane_id: &str, rows: u16, cols: u16) -> Result<(), PaneError> {
         let panes = self.panes.lock().unwrap();
         let pane = panes
@@ -291,18 +315,13 @@ impl EmbeddedPaneController {
                     .map_err(|e| PaneError::CommandFailed(format!("PTY resize failed: {e}")))?;
             }
             PaneBackend::Stream(s) => {
-                let client = DaemonClient::new(s.daemon_path.clone());
-                let agent_id = s.agent_id.clone();
-                s.runtime.spawn(async move {
-                    if let Err(e) = client.resize_agent(&agent_id, rows, cols).await {
-                        tracing::debug!(
-                            agent_id = %agent_id,
-                            rows, cols,
-                            error = %e,
-                            "resize-agent failed (transient — next resize will reconcile)"
-                        );
-                    }
-                });
+                // `send_replace` overwrites whatever value was pending and
+                // ignores the no-receivers case (the worker would only be
+                // gone if the pane was being torn down — losing the resize
+                // is the right outcome there). The watch channel cannot
+                // block, so this returns immediately and never holds the
+                // pane lock across daemon I/O.
+                let _ = s.resize_tx.send_replace(Some((rows, cols)));
             }
         }
         if let Ok(mut parser) = pane.screen.lock() {
@@ -460,6 +479,18 @@ impl EmbeddedPaneController {
             .map_err(|e| PaneError::CommandFailed(format!("daemon: {e}")))?;
 
         let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCmd>();
+        let (resize_tx, resize_rx) = tokio::sync::watch::channel::<Option<(u16, u16)>>(None);
+
+        // Per-pane resize worker: at-most-one in-flight daemon Resize per
+        // pane, with intermediate values coalesced via the watch channel.
+        // Survives until either `resize_tx` drops (pane removed) or the
+        // worker is aborted by `StreamBackend::drop`. See the comment on
+        // `resize_pane_pty` for the full rationale.
+        let resize_task = runtime.spawn(resize_worker(
+            resize_rx,
+            daemon_path.clone(),
+            agent_id.clone(),
+        ));
 
         let parser_for_task = Arc::clone(&parser);
         let mouse_mode_for_task = Arc::clone(&mouse_mode);
@@ -551,6 +582,8 @@ impl EmbeddedPaneController {
                 io_task: Some(io_task),
                 runtime,
                 daemon_path,
+                resize_tx,
+                resize_task: Some(resize_task),
             }),
             screen: parser,
             name: command.unwrap_or("shell").to_string(),
@@ -667,6 +700,61 @@ impl EmbeddedPaneController {
             }
         }
         errors
+    }
+}
+
+/// Bounded wait for an in-flight daemon resize call. Two seconds is far
+/// longer than a healthy local Unix-socket round-trip for a single Resize op
+/// but short enough that a wedged daemon can't park the worker indefinitely.
+/// On timeout the underlying `DaemonClient` connection drops, releasing the
+/// FD and any per-connection daemon-side task.
+const RESIZE_DAEMON_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Per-pane resize worker (PRD #76 M2.10 audit follow-up). Reads the most
+/// recent `(rows, cols)` from the watch receiver and dispatches it to the
+/// daemon with [`RESIZE_DAEMON_TIMEOUT`]. While a dispatch is in flight,
+/// `resize_pane_pty` calls keep overwriting the watch value; the worker
+/// re-reads via `borrow_and_update` after each dispatch so only the latest
+/// size reaches the wire. Exits when `resize_tx` drops (`changed()` returns
+/// `Err`) — the watch sender is owned by `StreamBackend`, so this happens
+/// exactly when the pane is dropped.
+async fn resize_worker(
+    mut rx: tokio::sync::watch::Receiver<Option<(u16, u16)>>,
+    daemon_path: PathBuf,
+    agent_id: String,
+) {
+    // Mark the initial `None` value as seen so the first `changed()` call
+    // waits for an actual resize, not the channel's seed value.
+    let _ = rx.borrow_and_update();
+    while rx.changed().await.is_ok() {
+        let dims = *rx.borrow_and_update();
+        let Some((rows, cols)) = dims else { continue };
+
+        let client = DaemonClient::new(daemon_path.clone());
+        match tokio::time::timeout(
+            RESIZE_DAEMON_TIMEOUT,
+            client.resize_agent(&agent_id, rows, cols),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    agent_id = %agent_id,
+                    rows, cols,
+                    error = %e,
+                    "resize-agent failed (transient — next resize will reconcile)"
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    agent_id = %agent_id,
+                    rows, cols,
+                    timeout_ms = RESIZE_DAEMON_TIMEOUT.as_millis() as u64,
+                    "resize-agent timed out (transient — next resize will reconcile)"
+                );
+            }
+        }
     }
 }
 
