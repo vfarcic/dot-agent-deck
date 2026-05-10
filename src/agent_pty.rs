@@ -37,6 +37,32 @@ pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
 /// terminal size while still keeping downstream allocations bounded.
 pub const PTY_RESIZE_DIM_MAX: u16 = 4096;
 
+/// Maximum byte length the daemon will *retain* for a caller-supplied
+/// `DOT_AGENT_DECK_PANE_ID` value (and the TUI will *reuse* on rehydration).
+/// The agent's child process still receives whatever the caller sent — we
+/// only scrub the daemon's stored copy that gets echoed in `agent_records`.
+/// 64 bytes is well above the numeric ids the TUI itself emits while
+/// keeping the cumulative `list_agents` response small enough that a buggy
+/// peer can't push it past `MAX_FRAME_LEN` and lock the reconnecting TUI
+/// out of hydration entirely. See [`is_valid_pane_id_env`].
+pub const PANE_ID_ENV_MAX_LEN: usize = 64;
+
+/// Returns `true` if `value` is a well-formed pane-id env value worth
+/// retaining: non-empty, ≤ [`PANE_ID_ENV_MAX_LEN`] bytes, and made entirely
+/// of `[a-zA-Z0-9_-]`. Rejects oversize, empty, ANSI/control-char, and
+/// otherwise weird payloads from a buggy or hostile same-user peer that
+/// reaches the attach socket. Used at two layers (daemon-side capture in
+/// [`AgentPtyRegistry::spawn_agent`] and client-side hydration in
+/// `embedded_pane::hydrate_from_daemon`) so a stale daemon predating the
+/// daemon-side check still has the client-side filter as backstop.
+pub fn is_valid_pane_id_env(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= PANE_ID_ENV_MAX_LEN
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 #[derive(Debug, Error)]
 pub enum AgentPtyError {
     #[error("Failed to open PTY: {0}")]
@@ -472,11 +498,31 @@ impl AgentPtyRegistry {
         // and the TUI uses the captured value on reconnect to rebind its
         // local pane id to whatever the running child already carries —
         // see `RunningAgent::pane_id_env`.
+        //
+        // Defense in depth (PRD #76 M2.x audit follow-up): scrub the
+        // *stored* copy via [`is_valid_pane_id_env`] before retaining it.
+        // A hostile or buggy same-user peer reaching the attach socket
+        // could otherwise have us echo back oversize / control-char /
+        // ANSI-laden values via `agent_records`, growing the cumulative
+        // `list_agents` response past `MAX_FRAME_LEN` and breaking
+        // hydration for *every* agent. The child process still sees the
+        // caller's verbatim value — only the registry's mirror is scrubbed.
         let pane_id_env = opts
             .env
             .iter()
             .find(|(k, _)| k == DOT_AGENT_DECK_PANE_ID)
-            .map(|(_, v)| v.clone());
+            .map(|(_, v)| v.clone())
+            .and_then(|v| {
+                if is_valid_pane_id_env(&v) {
+                    Some(v)
+                } else {
+                    tracing::debug!(
+                        len = v.len(),
+                        "spawn_agent: dropping caller-supplied DOT_AGENT_DECK_PANE_ID — fails validation, child still sees it but registry won't echo it"
+                    );
+                    None
+                }
+            });
 
         // Defense in depth: `spawn` already protects the child internally
         // via its own `ChildGuard`, so any failure or panic *inside* spawn

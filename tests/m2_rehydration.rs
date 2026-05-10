@@ -563,3 +563,222 @@ async fn hydrate_skips_agent_that_disappears_between_list_and_attach() {
     server_handle.abort();
     drop(dir);
 }
+
+// ---------------------------------------------------------------------------
+// PRD #76 M2.x rehydration FIXUP-2: pane_id_env capture/hydrate validation.
+// ---------------------------------------------------------------------------
+// These three tests pin the defense-in-depth scrub for caller-supplied
+// DOT_AGENT_DECK_PANE_ID values. Without it a buggy/hostile same-user peer
+// reaching the attach socket can poison the daemon's stored copy (echoed
+// via `agent_records`) or, in the duplicate case, get one rehydrated pane
+// to silently overwrite another in `wire_stream_pane`'s HashMap.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydrate_drops_oversize_pane_id_env_at_capture() {
+    // 200-char pane id: comfortably above PANE_ID_ENV_MAX_LEN (64). The
+    // daemon must store None for this agent's record, and the TUI must
+    // hydrate with a freshly-allocated numeric id rather than the poison
+    // value — otherwise a near-MAX_FRAME_LEN value could push the
+    // cumulative `list_agents` response past the frame cap and break
+    // hydration for *every* agent on reconnect.
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    let oversize: String = "a".repeat(200);
+    let agent_id = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            env: vec![("DOT_AGENT_DECK_PANE_ID".to_string(), oversize.clone())],
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent should succeed");
+
+    // Daemon-side: list_agents must report pane_id_env = None for this id.
+    let records = client
+        .list_agents()
+        .await
+        .expect("list_agents should succeed");
+    let record = records
+        .iter()
+        .find(|r| r.id == agent_id)
+        .expect("just-spawned agent should be in list");
+    assert!(
+        record.pane_id_env.is_none(),
+        "daemon must scrub oversize pane_id_env; got {:?}",
+        record.pane_id_env
+    );
+
+    // Client-side: hydrate must produce a numeric (allocate_id) pane id.
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+    assert_eq!(hydrated.len(), 1);
+    assert_eq!(hydrated[0].agent_id, agent_id);
+    assert!(
+        hydrated[0].pane_id.parse::<u64>().is_ok(),
+        "oversize pane_id_env must fall back to allocate_id() — got {:?}",
+        hydrated[0].pane_id
+    );
+    assert_ne!(
+        hydrated[0].pane_id, oversize,
+        "the poison value must not surface as a pane id"
+    );
+
+    drop(ctrl);
+    let _ = server.registry.close_agent(&agent_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydrate_drops_control_char_pane_id_env_at_capture() {
+    // ANSI escape embedded in the pane id: anything outside [a-zA-Z0-9_-]
+    // is rejected by `is_valid_pane_id_env`. The daemon stores None and
+    // the client hydrates with a fresh numeric id — keeps debug-log output
+    // free of injected color codes if anything ever prints a stored value.
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    let poison = "pane\x1b[31mctl";
+    let agent_id = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            env: vec![("DOT_AGENT_DECK_PANE_ID".to_string(), poison.to_string())],
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent should succeed");
+
+    let records = client
+        .list_agents()
+        .await
+        .expect("list_agents should succeed");
+    let record = records
+        .iter()
+        .find(|r| r.id == agent_id)
+        .expect("just-spawned agent should be in list");
+    assert!(
+        record.pane_id_env.is_none(),
+        "daemon must scrub control-char pane_id_env; got {:?}",
+        record.pane_id_env
+    );
+
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+    assert_eq!(hydrated.len(), 1);
+    assert!(
+        hydrated[0].pane_id.parse::<u64>().is_ok(),
+        "control-char pane_id_env must fall back to allocate_id() — got {:?}",
+        hydrated[0].pane_id
+    );
+    assert_ne!(
+        hydrated[0].pane_id, poison,
+        "the poison value must not surface as a pane id"
+    );
+
+    drop(ctrl);
+    let _ = server.registry.close_agent(&agent_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydrate_dedups_duplicate_pane_id_env() {
+    // Two agents spawned with the *same* DOT_AGENT_DECK_PANE_ID. Both pass
+    // the daemon's grammar check (so both records carry the value), but
+    // the client's hydration dedup must keep the first reuse and fall back
+    // to allocate_id() for the second — otherwise the second pane would
+    // HashMap::insert-overwrite the first in `wire_stream_pane`, silently
+    // hiding it after reconnect.
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    let shared_pane_env = "shared-pane-id";
+    let agent_a = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            env: vec![(
+                "DOT_AGENT_DECK_PANE_ID".to_string(),
+                shared_pane_env.to_string(),
+            )],
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent A should succeed");
+    let agent_b = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            env: vec![(
+                "DOT_AGENT_DECK_PANE_ID".to_string(),
+                shared_pane_env.to_string(),
+            )],
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent B should succeed");
+
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(
+        hydrated.len(),
+        2,
+        "both agents must hydrate as distinct panes — dedup must not drop one entirely"
+    );
+
+    let pane_ids: Vec<&str> = hydrated.iter().map(|h| h.pane_id.as_str()).collect();
+    assert_ne!(
+        pane_ids[0], pane_ids[1],
+        "duplicate pane_id_env must produce distinct pane ids — got {pane_ids:?}"
+    );
+
+    // Exactly one of the two panes should reuse the shared value; the
+    // other must fall back to a numeric allocate_id().
+    let reused = pane_ids.iter().filter(|id| **id == shared_pane_env).count();
+    assert_eq!(
+        reused, 1,
+        "exactly one pane should reuse the shared pane_id_env — got {pane_ids:?}"
+    );
+    let allocated = pane_ids
+        .iter()
+        .filter(|id| id.parse::<u64>().is_ok())
+        .count();
+    assert_eq!(
+        allocated, 1,
+        "exactly one pane should fall back to allocate_id() — got {pane_ids:?}"
+    );
+
+    // Both panes must end up registered in the controller's pane registry —
+    // i.e. neither one was silently overwritten by a HashMap::insert
+    // collision in `wire_stream_pane`.
+    let registered = ctrl.pane_ids();
+    assert_eq!(
+        registered.len(),
+        2,
+        "both panes must be registered after dedup; got {registered:?}"
+    );
+
+    drop(ctrl);
+    let _ = server.registry.close_agent(&agent_a);
+    let _ = server.registry.close_agent(&agent_b);
+}

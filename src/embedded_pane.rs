@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -722,6 +722,13 @@ impl EmbeddedPaneController {
 
         let daemon_path = client.socket_path().to_path_buf();
         let mut hydrated = Vec::new();
+        // Dedup pane ids within this batch (PRD #76 M2.x audit follow-up).
+        // Tracks both reused-from-`pane_id_env` *and* fresh `allocate_id`
+        // outputs so a duplicate `DOT_AGENT_DECK_PANE_ID` from a stale or
+        // hostile daemon (or a value that happens to collide with an id
+        // we already allocated this pass) cannot HashMap::insert-overwrite
+        // an earlier pane in `wire_stream_pane`.
+        let mut used_ids: HashSet<String> = HashSet::new();
         for record in records {
             let agent_id = record.id.clone();
             let client_for_attach = client.clone();
@@ -770,8 +777,13 @@ impl EmbeddedPaneController {
             // pane visible and the byte stream rendered, but hook
             // routing won't survive reconnect — same behavior as before
             // this fix.
+            //
+            // Defense in depth (audit follow-up): re-validate the
+            // daemon-supplied value here too, so an older daemon that
+            // doesn't yet scrub at capture can't poison this client's
+            // pane registry. Same grammar as the daemon-side check.
             let pane_id = match record.pane_id_env.clone() {
-                Some(id) => {
+                Some(id) if agent_pty::is_valid_pane_id_env(&id) && !used_ids.contains(&id) => {
                     // Bump `next_id` past any reused pane id so a later
                     // `allocate_id` for a freshly-created pane can't
                     // collide with one we just rehydrated. Without this,
@@ -785,8 +797,17 @@ impl EmbeddedPaneController {
                     }
                     id
                 }
+                Some(id) => {
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        pane_id_env_len = id.len(),
+                        "hydrate_from_daemon: pane_id_env invalid or duplicate, falling back to allocate_id"
+                    );
+                    self.allocate_id()
+                }
                 None => self.allocate_id(),
             };
+            used_ids.insert(pane_id.clone());
             // Use agent_id as the pane name. Daemon-side metadata (display
             // name, cwd, modes) is not persisted yet — the user can rename
             // via the existing rename flow.
