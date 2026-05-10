@@ -502,6 +502,33 @@ impl AgentPtyRegistry {
         })
     }
 
+    /// Resize an agent's PTY. Mirrors the local-mode `MasterPty::resize`
+    /// shape (`PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }`).
+    /// Zero rows or cols are rejected up front so a buggy caller can't
+    /// quietly produce a 0×0 PTY (which would deadlock any agent that
+    /// reads `TIOCGWINSZ`).
+    pub fn resize(&self, id: &str, rows: u16, cols: u16) -> Result<(), AgentPtyError> {
+        if rows == 0 || cols == 0 {
+            return Err(AgentPtyError::Resize(format!(
+                "rows and cols must be > 0 (got {rows}x{cols})"
+            )));
+        }
+        let inner = self.inner.lock().unwrap();
+        let agent = inner
+            .agents
+            .get(id)
+            .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+        agent
+            .master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| AgentPtyError::Resize(e.to_string()))
+    }
+
     /// Take just the current scrollback snapshot for an agent.
     pub fn snapshot(&self, id: &str) -> Result<Vec<u8>, AgentPtyError> {
         let inner = self.inner.lock().unwrap();
@@ -593,6 +620,39 @@ mod tests {
 
         registry.close_agent(&id).expect("close should succeed");
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn registry_resize_rejects_zero_dims() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry.spawn_agent(SpawnOptions::default()).unwrap();
+        for (rows, cols) in [(0u16, 80u16), (24u16, 0u16), (0u16, 0u16)] {
+            let err = registry.resize(&id, rows, cols).unwrap_err();
+            assert!(matches!(err, AgentPtyError::Resize(_)));
+        }
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn registry_resize_unknown_errors() {
+        let registry = AgentPtyRegistry::new();
+        let err = registry.resize("nope", 50, 200).unwrap_err();
+        assert!(matches!(err, AgentPtyError::NotFound(_)));
+    }
+
+    #[test]
+    fn registry_resize_succeeds_on_known_agent() {
+        // Verifying the resulting kernel-level size requires a child that
+        // reads TIOCGWINSZ — the integration test in tests/daemon_protocol.rs
+        // covers that. Here we just confirm the method returns Ok for a
+        // valid id and non-zero dims, i.e. the portable_pty resize ioctl
+        // didn't error.
+        let registry = AgentPtyRegistry::new();
+        let id = registry.spawn_agent(SpawnOptions::default()).unwrap();
+        registry
+            .resize(&id, 50, 200)
+            .expect("resize should succeed");
+        registry.shutdown_all();
     }
 
     #[test]

@@ -206,6 +206,16 @@ pub enum AttachRequest {
     Snapshot {
         id: String,
     },
+    /// Propagate a TUI-side pane resize to the daemon's PTY. The daemon
+    /// ioctls `TIOCSWINSZ` on the master, which the kernel mirrors to the
+    /// slave and SIGWINCH's the foreground process. Without this op,
+    /// stream-backed panes show width/height mismatches versus the local
+    /// vt100 view (see PRD #76, M2.10).
+    Resize {
+        id: String,
+        rows: u16,
+        cols: u16,
+    },
 }
 
 fn default_rows() -> u16 {
@@ -396,6 +406,10 @@ async fn handle_connection(
         AttachRequest::AttachStream { id } => {
             handle_attach_stream(stream, registry, id).await?;
         }
+        AttachRequest::Resize { id, rows, cols } => match registry.resize(&id, rows, cols) {
+            Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
+            Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+        },
     }
     Ok(())
 }
@@ -612,6 +626,33 @@ mod tests {
             AttachRequest::StartAgent { command, env, .. } => {
                 assert_eq!(command.as_deref(), Some("/bin/sh"));
                 assert_eq!(env, vec![("FOO".to_string(), "BAR".to_string())]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn resize_request_serde_round_trip() {
+        // Wire shape must be `op = "resize"` (kebab-case) so existing
+        // dispatcher matches the same way as start-agent / stop-agent.
+        let req = AttachRequest::Resize {
+            id: "agent-7".into(),
+            rows: 50,
+            cols: 200,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["op"], "resize");
+        assert_eq!(v["id"], "agent-7");
+        assert_eq!(v["rows"], 50);
+        assert_eq!(v["cols"], 200);
+
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            AttachRequest::Resize { id, rows, cols } => {
+                assert_eq!(id, "agent-7");
+                assert_eq!(rows, 50);
+                assert_eq!(cols, 200);
             }
             _ => panic!("wrong variant"),
         }

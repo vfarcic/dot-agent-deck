@@ -270,26 +270,40 @@ impl EmbeddedPaneController {
     }
 
     /// Resize a pane's PTY and VT100 parser to the given dimensions. For
-    /// stream-backed panes, the local vt100 parser is resized but the
-    /// daemon-side PTY is *not* — the M1.2 protocol has no resize op yet
-    /// (slated for a later milestone), so the daemon keeps its initial
-    /// rows/cols. The visual mismatch is bounded: vt100 wraps lines to the
-    /// local size and the daemon's PTY-side line wrapping shows through
-    /// only when the agent does width-aware drawing.
+    /// stream-backed panes, the local vt100 parser is resized synchronously
+    /// and a `Resize` op (PRD #76, M2.10) is dispatched to the daemon over
+    /// a fresh short-lived connection — fire-and-forget so a transient
+    /// daemon hiccup can't kill the TUI; the next resize will reconcile.
     pub fn resize_pane_pty(&self, pane_id: &str, rows: u16, cols: u16) -> Result<(), PaneError> {
         let panes = self.panes.lock().unwrap();
         let pane = panes
             .get(pane_id)
             .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
-        if let PaneBackend::Pty(p) = &pane.backend {
-            p.master
-                .resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .map_err(|e| PaneError::CommandFailed(format!("PTY resize failed: {e}")))?;
+        match &pane.backend {
+            PaneBackend::Pty(p) => {
+                p.master
+                    .resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .map_err(|e| PaneError::CommandFailed(format!("PTY resize failed: {e}")))?;
+            }
+            PaneBackend::Stream(s) => {
+                let client = DaemonClient::new(s.daemon_path.clone());
+                let agent_id = s.agent_id.clone();
+                s.runtime.spawn(async move {
+                    if let Err(e) = client.resize_agent(&agent_id, rows, cols).await {
+                        tracing::debug!(
+                            agent_id = %agent_id,
+                            rows, cols,
+                            error = %e,
+                            "resize-agent failed (transient — next resize will reconcile)"
+                        );
+                    }
+                });
+            }
         }
         if let Ok(mut parser) = pane.screen.lock() {
             parser.screen_mut().set_size(rows, cols);

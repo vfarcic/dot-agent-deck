@@ -760,3 +760,90 @@ async fn partial_frame_writes_reassemble() {
 
     server.registry.close_agent(&id).unwrap();
 }
+
+#[tokio::test]
+async fn resize_propagates_to_pty() {
+    // Spawn at 24x80 (the harness default), resize to 50x200, then ask the
+    // shell for its terminal size via `stty size`. The kernel sets that via
+    // TIOCGWINSZ on the slave side, which is exactly what `MasterPty::resize`
+    // updates on the master side — so a passing assertion proves the
+    // protocol op reached the daemon's PTY.
+    let server = start_server().await;
+    let id = start_agent(&server, "/bin/sh").await;
+
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut s,
+        &AttachRequest::Resize {
+            id: id.clone(),
+            rows: 50,
+            cols: 200,
+        },
+    )
+    .await;
+    let resp = read_response(&mut s).await;
+    assert!(resp.ok, "resize failed: {:?}", resp.error);
+
+    // Use a command-substitution marker so the value `50 200` only appears
+    // in the shell's *output*, not in the line echoed back from the input
+    // (which contains the literal `$(stty size)` text). Reading until we
+    // see `DIM=50 200` therefore proves the resize ioctl actually
+    // propagated to the slave side of the PTY.
+    let mut a = connect_attach(&server, &id).await;
+    write_frame(&mut a, KIND_STREAM_IN, b"echo \"DIM=$(stty size)\"\n").await;
+    let acc = read_until_contains(&mut a, b"DIM=50 200").await;
+    let out = String::from_utf8_lossy(&acc);
+    assert!(
+        out.contains("DIM=50 200"),
+        "expected 'DIM=50 200' from `stty size` after resize; got: {out:?}"
+    );
+
+    server.registry.close_agent(&id).unwrap();
+}
+
+#[tokio::test]
+async fn resize_unknown_agent_returns_err() {
+    let server = start_server().await;
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut s,
+        &AttachRequest::Resize {
+            id: "does-not-exist".into(),
+            rows: 50,
+            cols: 200,
+        },
+    )
+    .await;
+    let resp = read_response(&mut s).await;
+    assert!(!resp.ok);
+    assert!(resp.error.is_some());
+}
+
+#[tokio::test]
+async fn resize_zero_rows_or_cols_returns_err() {
+    // Guard against a buggy caller producing a 0x0 PTY: the daemon must
+    // refuse zero rows/cols up front rather than silently passing them to
+    // TIOCSWINSZ.
+    let server = start_server().await;
+    let id = start_agent(&server, "/bin/sh").await;
+
+    for (rows, cols) in [(0u16, 80u16), (24u16, 0u16), (0u16, 0u16)] {
+        let mut s = UnixStream::connect(&server.path).await.unwrap();
+        write_request(
+            &mut s,
+            &AttachRequest::Resize {
+                id: id.clone(),
+                rows,
+                cols,
+            },
+        )
+        .await;
+        let resp = read_response(&mut s).await;
+        assert!(
+            !resp.ok,
+            "resize {rows}x{cols} should be rejected; got ok response"
+        );
+    }
+
+    server.registry.close_agent(&id).unwrap();
+}

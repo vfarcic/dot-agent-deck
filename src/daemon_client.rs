@@ -173,6 +173,32 @@ impl DaemonClient {
             .ok_or_else(|| ClientError::Malformed("start-agent ok but no id in response".into()))
     }
 
+    /// Push a TUI pane resize through to the daemon's PTY. Idempotent on the
+    /// wire: each call opens a fresh short-lived connection (matching the
+    /// pattern used for `stop_agent` / `list_agents`). Callers that fire
+    /// resize on every layout pass should treat transient errors as
+    /// best-effort — the next resize will reconcile.
+    pub async fn resize_agent(&self, id: &str, rows: u16, cols: u16) -> Result<(), ClientError> {
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::Resize {
+                id: id.to_string(),
+                rows,
+                cols,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "resize failed".into()),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn stop_agent(&self, id: &str) -> Result<(), ClientError> {
         let stream = self.connect().await?;
         let (mut rd, mut wr) = stream.into_split();
