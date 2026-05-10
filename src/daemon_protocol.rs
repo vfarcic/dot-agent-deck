@@ -66,7 +66,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
-use crate::agent_pty::{AgentPtyRegistry, SpawnOptions};
+use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
 
 // ---------------------------------------------------------------------------
 // Frame kinds
@@ -233,8 +233,20 @@ pub struct AttachResponse {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Legacy listing field: just the ids. Always populated by current
+    /// daemons so older clients (which only know about `agents`) keep
+    /// working. New clients prefer `agent_records` when present so they
+    /// also get the captured `DOT_AGENT_DECK_PANE_ID` per agent — see the
+    /// M2.x rehydration path in `embedded_pane::hydrate_from_daemon`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<Vec<String>>,
+    /// Additive companion to `agents`, carrying each agent's spawn-time
+    /// `DOT_AGENT_DECK_PANE_ID`. Older daemons omit this field; newer
+    /// clients fall back to `agents` when it's `None` so a stale daemon
+    /// is forward-compatible (panes hydrate with freshly-allocated ids
+    /// instead of preserved ones).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_records: Option<Vec<AgentRecord>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 }
@@ -257,6 +269,20 @@ impl AttachResponse {
         Self {
             ok: true,
             agents: Some(ids),
+            ..Default::default()
+        }
+    }
+    /// Build a list-agents response that populates *both* the legacy
+    /// `agents` field (just ids) and the new `agent_records` field (ids
+    /// plus captured pane env). The dual shape is what keeps older
+    /// clients reading just `agents` working alongside newer clients
+    /// preferring `agent_records`.
+    pub fn agent_records(records: Vec<AgentRecord>) -> Self {
+        let ids = records.iter().map(|r| r.id.clone()).collect();
+        Self {
+            ok: true,
+            agents: Some(ids),
+            agent_records: Some(records),
             ..Default::default()
         }
     }
@@ -349,8 +375,8 @@ async fn handle_connection(
 
     match req {
         AttachRequest::ListAgents => {
-            let ids = registry.agent_ids();
-            write_resp(&mut stream, &AttachResponse::agents(ids)).await?;
+            let records = registry.agent_records();
+            write_resp(&mut stream, &AttachResponse::agent_records(records)).await?;
         }
         AttachRequest::StartAgent {
             command,

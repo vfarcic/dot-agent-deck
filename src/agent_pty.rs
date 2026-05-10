@@ -388,6 +388,28 @@ pub struct RunningAgent {
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     pub writer: Arc<AsyncMutex<Box<dyn std::io::Write + Send>>>,
     pub bus: Arc<AgentBus>,
+    /// Value of [`DOT_AGENT_DECK_PANE_ID`] captured from the spawn-time env,
+    /// if the caller supplied one. Echoed back to clients via the M2.x
+    /// rehydration path so the TUI can re-bind a freshly-attached pane to
+    /// the *same* local pane id the agent's child env was tagged with —
+    /// otherwise hook events emitted by the agent (which carry the original
+    /// pane id) would be rejected by `AppState::apply_event` after a
+    /// reconnect, silently dropping delegate / work-done signals.
+    pub pane_id_env: Option<String>,
+}
+
+/// Snapshot of one daemon-side agent that the M2.x rehydration path needs.
+/// Carries the registry id plus the spawn-time `DOT_AGENT_DECK_PANE_ID`
+/// captured in [`RunningAgent::pane_id_env`], so the TUI can rebuild its
+/// pane→agent mapping using the *same* pane id the agent's child process
+/// already carries in its environment. Also doubles as the wire-format
+/// element for `AttachResponse::agent_records` — serde derives live here
+/// so the in-memory and over-the-wire shapes can't drift apart.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentRecord {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id_env: Option<String>,
 }
 
 /// In-process registry of agent PTYs owned by the daemon. M1.1 only exposed
@@ -443,6 +465,19 @@ impl AgentPtyRegistry {
 
     /// Spawn a new agent and return its registry id.
     pub fn spawn_agent(&self, opts: SpawnOptions<'_>) -> Result<String, AgentPtyError> {
+        // Capture the caller-supplied `DOT_AGENT_DECK_PANE_ID` *before*
+        // moving `opts` into `spawn`, so the registry retains a copy for
+        // M2.x rehydration. The agent's child process gets tagged with
+        // this same value via the env scrub-then-apply path in `spawn`,
+        // and the TUI uses the captured value on reconnect to rebind its
+        // local pane id to whatever the running child already carries —
+        // see `RunningAgent::pane_id_env`.
+        let pane_id_env = opts
+            .env
+            .iter()
+            .find(|(k, _)| k == DOT_AGENT_DECK_PANE_ID)
+            .map(|(_, v)| v.clone());
+
         // Defense in depth: `spawn` already protects the child internally
         // via its own `ChildGuard`, so any failure or panic *inside* spawn
         // cannot orphan the child. This outer `PtyGuard` covers the
@@ -471,6 +506,7 @@ impl AgentPtyRegistry {
             master,
             writer: Arc::new(AsyncMutex::new(writer)),
             bus,
+            pane_id_env,
         };
 
         let id = inner.next_id.to_string();
@@ -570,10 +606,27 @@ impl AgentPtyRegistry {
 
     /// All currently-owned agent ids, sorted ascending.
     pub fn agent_ids(&self) -> Vec<String> {
+        self.agent_records().into_iter().map(|r| r.id).collect()
+    }
+
+    /// All currently-owned agents as `(id, pane_id_env)` records, sorted
+    /// ascending by id. M2.x rehydration relies on the captured
+    /// `pane_id_env` to rebind the TUI's local pane id to whatever value
+    /// the agent's child process already carries in its environment —
+    /// without this, hook events emitted by the agent would be silently
+    /// dropped after a reconnect (see `RunningAgent::pane_id_env`).
+    pub fn agent_records(&self) -> Vec<AgentRecord> {
         let inner = self.inner.lock().unwrap();
-        let mut ids: Vec<String> = inner.agents.keys().cloned().collect();
-        ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
-        ids
+        let mut records: Vec<AgentRecord> = inner
+            .agents
+            .iter()
+            .map(|(id, agent)| AgentRecord {
+                id: id.clone(),
+                pane_id_env: agent.pane_id_env.clone(),
+            })
+            .collect();
+        records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
+        records
     }
 
     /// Number of agents currently owned by the registry.

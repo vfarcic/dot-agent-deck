@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
+pub use crate::agent_pty::AgentRecord;
 use crate::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
     KIND_STREAM_OUT, read_frame, write_frame,
@@ -141,7 +142,13 @@ impl DaemonClient {
         UnixStream::connect(&self.socket_path).await
     }
 
-    pub async fn list_agents(&self) -> Result<Vec<String>, ClientError> {
+    /// List daemon-side agents. Returns one [`AgentRecord`] per agent,
+    /// preferring the daemon's new `agent_records` field (which carries
+    /// each agent's spawn-time `DOT_AGENT_DECK_PANE_ID`). Falls back to
+    /// the legacy `agents`-only field with `pane_id_env: None` so a
+    /// newer TUI keeps working against an older daemon — at the cost of
+    /// not being able to preserve pane ids on rehydration there.
+    pub async fn list_agents(&self) -> Result<Vec<AgentRecord>, ClientError> {
         let stream = self.connect().await?;
         let (mut rd, mut wr) = stream.into_split();
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgents).await?;
@@ -150,7 +157,18 @@ impl DaemonClient {
                 resp.error.unwrap_or_else(|| "list-agents failed".into()),
             ));
         }
-        Ok(resp.agents.unwrap_or_default())
+        if let Some(records) = resp.agent_records {
+            return Ok(records);
+        }
+        Ok(resp
+            .agents
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| AgentRecord {
+                id,
+                pane_id_env: None,
+            })
+            .collect())
     }
 
     pub async fn start_agent(&self, opts: StartAgentOptions) -> Result<String, ClientError> {
@@ -338,7 +356,8 @@ mod tests {
             .expect("start should succeed");
 
         let agents = client.list_agents().await.unwrap();
-        assert_eq!(agents, vec![id.clone()]);
+        let ids: Vec<String> = agents.iter().map(|a| a.id.clone()).collect();
+        assert_eq!(ids, vec![id.clone()]);
 
         client.stop_agent(&id).await.expect("stop should succeed");
         assert!(registry.is_empty());

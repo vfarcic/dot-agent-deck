@@ -681,27 +681,64 @@ impl EmbeddedPaneController {
             }
         };
 
-        let agents = match runtime.block_on(client.list_agents()) {
-            Ok(a) => a,
-            Err(e) => {
+        // Bounded list_agents call: a parked or hostile same-user daemon
+        // could otherwise hang TUI startup on the blocking `block_on`. On
+        // timeout we treat the result as empty (the user can reconnect)
+        // and emit a debug line so the cause is observable.
+        let list_client = client.clone();
+        let records = match runtime.block_on(async move {
+            tokio::time::timeout(HYDRATE_LIST_TIMEOUT, list_client.list_agents()).await
+        }) {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => {
                 tracing::debug!(
                     error = %e,
                     "hydrate_from_daemon: list_agents failed, treating as empty"
                 );
                 return Vec::new();
             }
+            Err(_) => {
+                tracing::debug!(
+                    timeout_ms = HYDRATE_LIST_TIMEOUT.as_millis() as u64,
+                    "hydrate_from_daemon: list_agents timed out, treating as empty"
+                );
+                return Vec::new();
+            }
         };
+
+        // Cap fan-out so a misbehaving daemon advertising thousands of ids
+        // can't make us open thousands of attach sockets in series. Normal
+        // interactive workloads stay well under this — hitting the cap is
+        // itself a signal worth logging.
+        let mut records = records;
+        if records.len() > HYDRATE_MAX_PANES {
+            tracing::debug!(
+                received = records.len(),
+                cap = HYDRATE_MAX_PANES,
+                "hydrate_from_daemon: agent list exceeded cap, truncating"
+            );
+            records.truncate(HYDRATE_MAX_PANES);
+        }
 
         let daemon_path = client.socket_path().to_path_buf();
         let mut hydrated = Vec::new();
-        for agent_id in agents {
+        for record in records {
+            let agent_id = record.id.clone();
             let client_for_attach = client.clone();
             let id_for_attach = agent_id.clone();
-            let conn = match runtime
-                .block_on(async move { client_for_attach.attach(&id_for_attach).await })
-            {
-                Ok(c) => c,
-                Err(e) => {
+            // Bounded per-agent attach: same rationale as the list-agents
+            // timeout above, scaled down because there can be up to
+            // HYDRATE_MAX_PANES of these in series.
+            let attach_result = runtime.block_on(async move {
+                tokio::time::timeout(
+                    HYDRATE_ATTACH_TIMEOUT,
+                    client_for_attach.attach(&id_for_attach),
+                )
+                .await
+            });
+            let conn = match attach_result {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
                     // Race: agent terminated between list_agents and
                     // attach, or transient daemon error. Skip this id
                     // and keep going so a single missing agent doesn't
@@ -713,8 +750,43 @@ impl EmbeddedPaneController {
                     );
                     continue;
                 }
+                Err(_) => {
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        timeout_ms = HYDRATE_ATTACH_TIMEOUT.as_millis() as u64,
+                        "hydrate_from_daemon: attach timed out, skipping"
+                    );
+                    continue;
+                }
             };
-            let pane_id = self.allocate_id();
+            // Reuse the daemon-captured `DOT_AGENT_DECK_PANE_ID` when
+            // present so the TUI's local pane id matches whatever the
+            // agent's child process already carries in its env. This is
+            // what lets hook events (delegate / work-done / status)
+            // emitted by the agent route correctly after a reconnect —
+            // see `state::AppState::apply_event`'s managed-pane check.
+            // Older daemons omit this field (`pane_id_env: None`), so we
+            // fall back to allocating a fresh id; that path keeps the
+            // pane visible and the byte stream rendered, but hook
+            // routing won't survive reconnect — same behavior as before
+            // this fix.
+            let pane_id = match record.pane_id_env.clone() {
+                Some(id) => {
+                    // Bump `next_id` past any reused pane id so a later
+                    // `allocate_id` for a freshly-created pane can't
+                    // collide with one we just rehydrated. Without this,
+                    // the new pane's `insert` would silently replace the
+                    // hydrated one in the HashMap.
+                    if let Ok(parsed) = id.parse::<u64>() {
+                        let mut nxt = self.next_id.lock().unwrap();
+                        if parsed >= *nxt {
+                            *nxt = parsed + 1;
+                        }
+                    }
+                    id
+                }
+                None => self.allocate_id(),
+            };
             // Use agent_id as the pane name. Daemon-side metadata (display
             // name, cwd, modes) is not persisted yet — the user can rename
             // via the existing rename flow.
@@ -843,6 +915,30 @@ impl EmbeddedPaneController {
 /// On timeout the underlying `DaemonClient` connection drops, releasing the
 /// FD and any per-connection daemon-side task.
 const RESIZE_DAEMON_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Hard cap on the number of agents the TUI will hydrate from the daemon
+/// on bootstrap. Far above any realistic interactive workload (the TUI
+/// only renders a handful of panes at once); the cap exists so a buggy or
+/// hostile same-user daemon advertising thousands of fake ids can't fan
+/// out unbounded sockets and tasks at startup. Hits in normal use should
+/// never happen — if they do, the truncation log line is a signal that
+/// something on the daemon side is misbehaving.
+const HYDRATE_MAX_PANES: usize = 256;
+
+/// Bounded wait for the `list_agents` round-trip during rehydration. A
+/// healthy daemon answers in well under a millisecond; a daemon that
+/// fails to respond within five seconds is treated as if it had no
+/// agents (the user can reconnect). Without this bound, a parked daemon
+/// would hang TUI startup indefinitely on the blocking `block_on` call
+/// in `hydrate_from_daemon`.
+const HYDRATE_LIST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded wait for each per-agent `attach` during rehydration. Tighter
+/// than the list timeout because there are up to [`HYDRATE_MAX_PANES`] of
+/// these in series — the TUI shouldn't take HYDRATE_MAX_PANES × 5s on a
+/// pathological daemon. On timeout the agent is skipped (logged at debug)
+/// and rehydration continues with the rest.
+const HYDRATE_ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Per-pane resize worker (PRD #76 M2.10 audit follow-up). Reads the most
 /// recent `(rows, cols)` from the watch receiver and dispatches it to the

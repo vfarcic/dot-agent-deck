@@ -308,6 +308,218 @@ async fn write_resp(s: &mut UnixStream, resp: &AttachResponse) -> std::io::Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydrate_preserves_pane_id_from_agent_env() {
+    // Regression for the hook-routing bug: before this fix the hydrator
+    // allocated a *fresh* local pane id, so hook events emitted by the
+    // rehydrated agent (which still carry the original DOT_AGENT_DECK_PANE_ID
+    // in its env) were silently dropped by `AppState::apply_event`. The fix
+    // captures the spawn-time env on the daemon side and threads it through
+    // `AttachResponse::agent_records`; rehydration must reuse that exact id.
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    let pane_env = "pane-from-env-7";
+    let agent_id = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            env: vec![("DOT_AGENT_DECK_PANE_ID".to_string(), pane_env.to_string())],
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent should succeed");
+
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(hydrated.len(), 1, "single agent should hydrate as one pane");
+    assert_eq!(
+        hydrated[0].pane_id, pane_env,
+        "hydrated pane must reuse the spawn-time DOT_AGENT_DECK_PANE_ID, not allocate_id()"
+    );
+    assert_eq!(hydrated[0].agent_id, agent_id);
+
+    drop(ctrl);
+    let _ = server.registry.close_agent(&agent_id);
+}
+
+// ---------------------------------------------------------------------------
+// Mock daemon for the "older daemon (no agent_records)" test.
+// ---------------------------------------------------------------------------
+
+/// Mock that mimics an older daemon: replies to ListAgents with the legacy
+/// `agents` field only (no `agent_records`). Verifies that a newer client
+/// stays forward-compatible — pane hydrates with an allocated id, no panic.
+async fn run_legacy_list_server(listener: UnixListener) {
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        tokio::spawn(async move {
+            let req = match read_frame(&mut stream).await {
+                Ok(Some((KIND_REQ, payload))) => {
+                    match serde_json::from_slice::<AttachRequest>(&payload) {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    }
+                }
+                _ => return,
+            };
+            match req {
+                AttachRequest::ListAgents => {
+                    // Older daemons only knew about `agents`. The newer
+                    // `agent_records` field must be left at None to model
+                    // the legacy wire shape exactly.
+                    let resp = AttachResponse {
+                        ok: true,
+                        agents: Some(vec!["legacy-agent".to_string()]),
+                        agent_records: None,
+                        ..Default::default()
+                    };
+                    let _ = write_resp(&mut stream, &resp).await;
+                }
+                AttachRequest::AttachStream { .. } => {
+                    let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
+                    loop {
+                        match read_frame(&mut stream).await {
+                            Ok(None) | Err(_) => break,
+                            Ok(Some(_)) => continue,
+                        }
+                    }
+                }
+                _ => {
+                    let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
+                }
+            }
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydrate_falls_back_to_allocated_id_for_legacy_daemon() {
+    // Backward-compat: a daemon predating this fix returns `agents: Some(..)`
+    // with `agent_records: None`. The hydrator must still produce a pane
+    // (with a freshly-allocated id, since the daemon doesn't know the
+    // original env) without panicking — losing hook routing on reconnect
+    // matches the pre-fix behavior, but startup must not regress.
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = UnixListener::bind(&path).expect("bind mock attach socket");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, path, listener)
+    };
+    let server_handle = tokio::spawn(async move {
+        run_legacy_list_server(listener).await;
+    });
+
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        path,
+        tokio::runtime::Handle::current(),
+    ));
+
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(
+        hydrated.len(),
+        1,
+        "legacy daemon listing must still hydrate one pane; got {hydrated:?}"
+    );
+    assert_eq!(hydrated[0].agent_id, "legacy-agent");
+    // pane_id must be a parseable u64 (allocate_id output), not the agent id.
+    assert!(
+        hydrated[0].pane_id.parse::<u64>().is_ok(),
+        "legacy fallback should use allocate_id() — got {:?}",
+        hydrated[0].pane_id
+    );
+
+    drop(ctrl);
+    server_handle.abort();
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// Mock daemon for the "list_agents hangs past timeout" test.
+// ---------------------------------------------------------------------------
+
+/// Mock that accepts the ListAgents REQ and never replies. Used to verify
+/// the hydration list-call timeout path: the controller must give up and
+/// return an empty hydration rather than blocking TUI startup forever.
+async fn run_silent_list_server(listener: UnixListener) {
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        tokio::spawn(async move {
+            // Read the REQ but never write a RESP. Hold the stream so the
+            // client doesn't see an EOF either — purely a hang.
+            let _ = read_frame(&mut stream).await;
+            std::future::pending::<()>().await;
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydrate_treats_list_agents_timeout_as_empty() {
+    // A daemon that accepts the connection but never answers must not pin
+    // TUI startup. The HYDRATE_LIST_TIMEOUT bound in `hydrate_from_daemon`
+    // gives up and the controller proceeds with an empty pane set so the
+    // user can see the dashboard and reconnect.
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = UnixListener::bind(&path).expect("bind mock attach socket");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, path, listener)
+    };
+    let server_handle = tokio::spawn(async move {
+        run_silent_list_server(listener).await;
+    });
+
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        path,
+        tokio::runtime::Handle::current(),
+    ));
+
+    // Outer guard: even if the timeout regressed, this catches the regression
+    // before the test runner's global timeout. HYDRATE_LIST_TIMEOUT is 5s; we
+    // give 10s headroom for slow CI.
+    let hydrated_result = tokio::time::timeout(Duration::from_secs(10), {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+    })
+    .await
+    .expect("hydrate_from_daemon must not hang past HYDRATE_LIST_TIMEOUT")
+    .expect("blocking task should not panic");
+
+    assert!(
+        hydrated_result.is_empty(),
+        "list_agents timeout must surface as empty hydration; got {hydrated_result:?}"
+    );
+
+    drop(ctrl);
+    server_handle.abort();
+    drop(dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hydrate_skips_agent_that_disappears_between_list_and_attach() {
     // Race coverage: ListAgents reports two ids; AttachStream succeeds for
     // one and fails for the other. The hydrator must skip the failing one
