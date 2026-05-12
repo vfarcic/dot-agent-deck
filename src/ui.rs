@@ -2801,6 +2801,7 @@ pub fn run_tui(
                             );
                         }
                         ui.mode = UiMode::Normal;
+                        ui.status_message = None;
                         shortcut_handled = true;
                     }
                     // Ctrl+t: toggle layout
