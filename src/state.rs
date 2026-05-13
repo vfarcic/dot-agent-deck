@@ -286,7 +286,9 @@ impl AppState {
                 session.active_tool = None;
             }
             EventType::ToolStart => {
-                session.status = SessionStatus::Working;
+                if session.status != SessionStatus::WaitingForInput {
+                    session.status = SessionStatus::Working;
+                }
                 session.active_tool = Some(ActiveTool {
                     name: event.tool_name.clone().unwrap_or_default(),
                     detail: event.tool_detail.clone(),
@@ -513,6 +515,48 @@ mod tests {
     }
 
     #[test]
+    fn toolstart_does_not_override_waiting_for_input() {
+        // Regression: a concurrent subagent firing PreToolUse while a permission
+        // prompt is active must not knock the status back to Working.
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+
+        state.apply_event(make_event("s1", EventType::PermissionRequest));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
+
+        let mut subagent_tool = make_event("s1", EventType::ToolStart);
+        subagent_tool.tool_name = Some("Explore".to_string());
+        state.apply_event(subagent_tool);
+        assert_eq!(
+            state.sessions["s1"].status,
+            SessionStatus::WaitingForInput,
+            "ToolStart must not override WaitingForInput"
+        );
+        assert_eq!(
+            state.sessions["s1"].active_tool.as_ref().map(|t| t.name.as_str()),
+            Some("Explore"),
+            "active_tool must still be updated even when status is preserved"
+        );
+    }
+
+    #[test]
+    fn toolstart_sets_working_when_not_waiting() {
+        // Normal flow: ToolStart should still set Working when no permission prompt.
+        let mut state = AppState::default();
+        state.apply_event(make_event("s1", EventType::SessionStart));
+
+        let mut tool_start = make_event("s1", EventType::ToolStart);
+        tool_start.tool_name = Some("Bash".to_string());
+        state.apply_event(tool_start);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+        assert_eq!(
+            state.sessions["s1"].active_tool.as_ref().map(|t| t.name.as_str()),
+            Some("Bash"),
+            "active_tool must be set on normal ToolStart"
+        );
+    }
+
+    #[test]
     fn tool_end_preserves_working_status() {
         let mut state = AppState::default();
         state.apply_event(make_event("s1", EventType::SessionStart));
@@ -714,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_start_clears_waiting_for_input() {
+    fn tool_start_preserves_waiting_for_input() {
         let mut state = AppState::default();
         state.apply_event(make_event("s1", EventType::SessionStart));
         state.apply_event(make_event("s1", EventType::WaitingForInput));
@@ -723,7 +767,7 @@ mod tests {
         let mut tool_start = make_event("s1", EventType::ToolStart);
         tool_start.tool_name = Some("Bash".into());
         state.apply_event(tool_start);
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
     }
 
     #[test]
