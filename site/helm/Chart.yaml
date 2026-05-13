@@ -2,5 +2,5 @@ apiVersion: v2
 name: dot-agent-deck-docs
 description: Documentation site for dot-agent-deck
 type: application
-version: 0.24.5
-appVersion: "v0.24.5"
+version: 0.24.7
+appVersion: "v0.24.7"
