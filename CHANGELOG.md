@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.24.6] - 2026-05-13
+
+### Fixed
+
+- **Permission Prompt Status No Longer Flickers During Concurrent Subagent Tools**
+  Session cards now keep their "Needs Input" status when a concurrent subagent fires a tool event. Previously, a subagent's `PreToolUse` would flip the card back to "Working" while the user was looking at an active permission prompt — making the prompt easy to miss when several agents were running in parallel.
+  The dashboard now preserves `WaitingForInput` across `ToolStart` events from concurrent subagents while still updating the active-tool display, so the prompt card stays visible until the user responds.
+
+
+
 ## [0.24.5] - 2026-05-06
 
 ### Fixed
