@@ -532,6 +532,11 @@ mod tests {
             SessionStatus::WaitingForInput,
             "ToolStart must not override WaitingForInput"
         );
+        assert_eq!(
+            state.sessions["s1"].active_tool.as_ref().map(|t| t.name.as_str()),
+            Some("Explore"),
+            "active_tool must still be updated even when status is preserved"
+        );
     }
 
     #[test]
@@ -544,6 +549,11 @@ mod tests {
         tool_start.tool_name = Some("Bash".to_string());
         state.apply_event(tool_start);
         assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+        assert_eq!(
+            state.sessions["s1"].active_tool.as_ref().map(|t| t.name.as_str()),
+            Some("Bash"),
+            "active_tool must be set on normal ToolStart"
+        );
     }
 
     #[test]
