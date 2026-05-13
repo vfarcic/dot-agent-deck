@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.24.7] - 2026-05-13
+
+### Fixed
+
+- **Normal-Mode Hints Reappear Immediately After Exiting PaneInput**
+  Pressing `Ctrl+d` to leave PaneInput mode now restores the Normal-mode navigation hints right away. Previously, the "PaneInput mode — type to interact, Ctrl+d for dashboard" status message lingered for up to 15 seconds and hid the hint bar, leaving users with no visual confirmation they were back in command mode.
+  The mode-transition handler now clears the status message in addition to switching `ui.mode`, so the hint bar (`?: help`, `j/k`, `Ctrl+n`, `Ctrl+d: dashboard`, etc.) is visible immediately.
+
+
+
 ## [0.24.6] - 2026-05-13
 
 ### Fixed
