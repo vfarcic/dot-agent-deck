@@ -562,7 +562,7 @@ async fn rename_pane_with_empty_text_clears_daemon_display_name() {
     // Stream backend (PaneBackend::Pty would skip the daemon path).
     // create_pane_with_display_name internally `block_on`s the daemon
     // client, so run it on a blocking thread.
-    let pane_id = {
+    let (pane_id, resolved) = {
         let ctrl = ctrl.clone();
         tokio::task::spawn_blocking(move || {
             ctrl.create_pane_with_display_name(
@@ -575,6 +575,7 @@ async fn rename_pane_with_empty_text_clears_daemon_display_name() {
         .unwrap()
         .expect("create_pane_with_display_name")
     };
+    assert_eq!(resolved, "initial");
 
     // Find the agent id (assigned by the daemon).
     let records = client.list_agents().await.unwrap();
@@ -621,7 +622,7 @@ async fn rename_pane_with_whitespace_clears_daemon_display_name() {
         tokio::runtime::Handle::current(),
     ));
 
-    let pane_id = {
+    let (pane_id, _resolved) = {
         let ctrl = ctrl.clone();
         tokio::task::spawn_blocking(move || {
             ctrl.create_pane_with_display_name(
@@ -678,7 +679,7 @@ async fn create_pane_with_whitespace_name_falls_back_via_stream_path() {
     // controller filter strips it to None at the call site, and
     // `create_stream_pane` falls back to the command string for the
     // daemon-side label.
-    let _pane_id = {
+    let (_pane_id, resolved) = {
         let ctrl = ctrl.clone();
         tokio::task::spawn_blocking(move || {
             ctrl.create_pane_with_display_name(Some("sh -c 'sleep 30'"), Some("/tmp"), Some("   "))
@@ -687,6 +688,7 @@ async fn create_pane_with_whitespace_name_falls_back_via_stream_path() {
         .unwrap()
         .expect("create_pane_with_display_name")
     };
+    assert_eq!(resolved, "sh -c 'sleep 30'");
 
     let records = client.list_agents().await.unwrap();
     assert_eq!(records.len(), 1);
@@ -696,6 +698,217 @@ async fn create_pane_with_whitespace_name_falls_back_via_stream_path() {
         "whitespace-only Name must fall back to command, not be stored as '   '"
     );
     assert_ne!(records[0].display_name.as_deref(), Some("   "));
+
+    server.registry.shutdown_all();
+    drop(ctrl);
+}
+
+// ---------------------------------------------------------------------------
+// PRD #76 M2.11 fixup 4 — single source of truth for display_name
+// normalization. These tests pin the daemon round-trip behavior for the
+// four cases that previously diverged between the UI helper and the
+// controller paths.
+// ---------------------------------------------------------------------------
+
+/// Reviewer P2: form Name `"  foo  "` must reach the daemon as `"foo"`,
+/// not the raw whitespace-padded string. Before fixup 4, the controller
+/// stored the raw value while the UI helper trimmed it, so a reconnect
+/// would flip the dashboard label back to the raw form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_pane_with_surround_whitespace_name_stores_trimmed_on_daemon() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let (pane_id, resolved) = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane_with_display_name(
+                Some("sh -c 'sleep 30'"),
+                Some("/tmp"),
+                Some("  foo  "),
+            )
+        })
+        .await
+        .unwrap()
+        .expect("create_pane_with_display_name")
+    };
+    assert_eq!(
+        resolved, "foo",
+        "controller must return the trimmed canonical name"
+    );
+
+    let records = client.list_agents().await.unwrap();
+    let rec = records
+        .iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(&pane_id))
+        .expect("agent record for new pane");
+    assert_eq!(
+        rec.display_name.as_deref(),
+        Some("foo"),
+        "daemon must store the trimmed name, never the raw '  foo  '"
+    );
+
+    server.registry.shutdown_all();
+    drop(ctrl);
+}
+
+/// Auditor LOW: empty form Name + command containing an ASCII control
+/// byte (real ESC, e.g. `"echo \x1b[31m"`) must fall through to
+/// `"shell"` on BOTH the daemon record and the local Pane.name. Before
+/// fixup 4, the daemon dropped the invalid command (-> None), but the
+/// UI helper inserted the raw bytes into `pane_display_names`, briefly
+/// emitting terminal control sequences into the render path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_pane_with_control_char_command_stores_shell_on_daemon() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let evil_cmd = "echo \x1b[31m"; // real ESC byte after `echo `
+    let (_pane_id, resolved) = {
+        let ctrl = ctrl.clone();
+        let cmd = evil_cmd.to_string();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane_with_display_name(Some(&cmd), Some("/tmp"), Some(""))
+        })
+        .await
+        .unwrap()
+        .expect("create_pane_with_display_name")
+    };
+    assert_eq!(resolved, "shell");
+
+    let records = client.list_agents().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].display_name.as_deref(),
+        Some("shell"),
+        "control-char command must fall through to 'shell' on the daemon, \
+         not silently land as None (which would diverge from the local label)"
+    );
+
+    server.registry.shutdown_all();
+    drop(ctrl);
+}
+
+/// Fixup 4 rename path: surround whitespace is trimmed before reaching
+/// the daemon, exactly like the new-pane path. Without trimming, the
+/// daemon would accept `"  newname  "` verbatim (passes
+/// `is_valid_display_name`) and the dashboard would render the padded
+/// label.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_pane_trims_surround_whitespace_on_daemon() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let (pane_id, _) = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane_with_display_name(
+                Some("sh -c 'sleep 30'"),
+                Some("/tmp"),
+                Some("initial"),
+            )
+        })
+        .await
+        .unwrap()
+        .expect("create_pane_with_display_name")
+    };
+    let agent_id = client
+        .list_agents()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(&pane_id))
+        .expect("record")
+        .id;
+
+    let id_for_call = pane_id.clone();
+    let ctrl_clone = ctrl.clone();
+    tokio::task::spawn_blocking(move || ctrl_clone.rename_pane(&id_for_call, "  newname  "))
+        .await
+        .unwrap()
+        .expect("rename_pane with surround whitespace");
+
+    let rec = poll_record(&client, &agent_id, |r| {
+        r.display_name.as_deref() == Some("newname")
+    })
+    .await
+    .expect("daemon must observe the trimmed rename");
+    assert_eq!(rec.display_name.as_deref(), Some("newname"));
+
+    server.registry.shutdown_all();
+    drop(ctrl);
+}
+
+/// Fixup 4 rename path: a rename whose trimmed form fails
+/// `is_valid_display_name` (control bytes, etc.) is REJECTED — the
+/// existing daemon-side label stays put. Silently falling back to
+/// command/"shell" would replace the user's intent with an unrelated
+/// string, which the task explicitly forbids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_pane_with_control_chars_is_rejected_on_daemon() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let (pane_id, _) = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane_with_display_name(
+                Some("sh -c 'sleep 30'"),
+                Some("/tmp"),
+                Some("baseline"),
+            )
+        })
+        .await
+        .unwrap()
+        .expect("create_pane_with_display_name")
+    };
+    let agent_id = client
+        .list_agents()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(&pane_id))
+        .expect("record")
+        .id;
+
+    // Sanity-check the baseline before attempting the rejected rename.
+    let before = find_record(&client.list_agents().await.unwrap(), &agent_id);
+    assert_eq!(before.display_name.as_deref(), Some("baseline"));
+
+    let id_for_call = pane_id.clone();
+    let ctrl_clone = ctrl.clone();
+    tokio::task::spawn_blocking(move || ctrl_clone.rename_pane(&id_for_call, "  \x1b[31m  "))
+        .await
+        .unwrap()
+        .expect("rejected rename still returns Ok");
+
+    // Allow the (would-be) daemon RPC time to land. The rename is
+    // rejected client-side so no RPC fires, but a sleep here keeps the
+    // assertion honest if a future regression spawns the RPC anyway.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let after = find_record(&client.list_agents().await.unwrap(), &agent_id);
+    assert_eq!(
+        after.display_name.as_deref(),
+        Some("baseline"),
+        "rejected rename must NOT mutate AgentRecord.display_name"
+    );
 
     server.registry.shutdown_all();
     drop(ctrl);

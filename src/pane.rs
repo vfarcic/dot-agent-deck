@@ -42,19 +42,24 @@ pub trait PaneController: Send + Sync {
     /// `rename_pane` would persist the command-based fallback name on the
     /// daemon and lose the user's chosen Name on the next reconnect
     /// (PRD #76 M2.11 reviewer P2).
+    ///
+    /// Returns `(pane_id, resolved_display_name)` so the caller can mirror
+    /// the EXACT label the controller (and the daemon, for stream panes)
+    /// stored. The resolved name is computed via
+    /// [`crate::agent_pty::resolve_display_name`] — the single source of
+    /// truth shared with the UI maps, preventing the divergence between
+    /// `ui.pane_display_names` and `AgentRecord.display_name` that fixup-3
+    /// reviewer P2 / auditor LOW called out.
     fn create_pane_with_display_name(
         &self,
         command: Option<&str>,
         cwd: Option<&str>,
         display_name: Option<&str>,
-    ) -> Result<String, PaneError> {
+    ) -> Result<(String, String), PaneError> {
+        let resolved = crate::agent_pty::resolve_display_name(display_name, command);
         let id = self.create_pane(command, cwd)?;
-        if let Some(name) = display_name
-            && !name.trim().is_empty()
-        {
-            self.rename_pane(&id, name)?;
-        }
-        Ok(id)
+        self.rename_pane(&id, &resolved)?;
+        Ok((id, resolved))
     }
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError>;
     fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError>;

@@ -398,7 +398,7 @@ impl EmbeddedPaneController {
         pane_id: String,
         command: Option<&str>,
         cwd: Option<&str>,
-        display_name: Option<&str>,
+        display_name: &str,
     ) -> Result<String, PaneError> {
         // Tag the spawned process so hooks can identify which pane it belongs to.
         let env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
@@ -453,16 +453,12 @@ impl EmbeddedPaneController {
                 master,
             }),
             screen: parser,
-            // Prefer the form-supplied Name so the local-PTY pane shows
-            // the same label remote panes get baked into StartAgent.
-            // Whitespace-only Names fall back to command/"shell" for
-            // the same reason as the stream-backed path — a bare
-            // `"   "` would render as a blank label otherwise (PRD #76
-            // M2.11 reviewer P2.3).
-            name: display_name
-                .filter(|n| !n.trim().is_empty())
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| command.unwrap_or("shell").to_string()),
+            // The caller already resolved this value via
+            // `resolve_display_name`, so the local-PTY pane stores the
+            // SAME string the stream path sends to the daemon and the
+            // SAME string the UI mirrors into `ui.pane_display_names`.
+            // No second normalization pass here (PRD #76 M2.11 fixup 4).
+            name: display_name.to_string(),
             is_focused: false,
             command: command.map(|c| c.to_string()),
             cwd: cwd.map(|c| c.to_string()),
@@ -484,7 +480,7 @@ impl EmbeddedPaneController {
         pane_id: String,
         command: Option<&str>,
         cwd: Option<&str>,
-        display_name: Option<&str>,
+        display_name: &str,
         client: DaemonClient,
         runtime: tokio::runtime::Handle,
     ) -> Result<String, PaneError> {
@@ -493,20 +489,12 @@ impl EmbeddedPaneController {
         // this UI's pane.
         let env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
 
-        // Prefer the caller-supplied Name (from the new-pane form) so the
-        // user's chosen label reaches the daemon in the same `StartAgent`
-        // RPC that spawns the agent. Without this, a disconnect or crash
-        // between `start-agent` and the follow-up `SetAgentLabel` would
-        // persist the command-based fallback name on the daemon and lose
-        // the user's choice on the next reconnect (PRD #76 M2.11
-        // reviewer P2). Fall back to command (or "shell") when the form
-        // Name is empty or whitespace-only — the latter would otherwise
-        // pass the daemon's `is_valid_display_name` filter (which
-        // accepts spaces) and render as a blank label (P2.3).
-        let label = display_name
-            .filter(|n| !n.trim().is_empty())
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| command.unwrap_or("shell").to_string());
+        // Already resolved by `create_pane_with_display_name`
+        // (single source of truth via `resolve_display_name`).
+        // Sending it as-is keeps the StartAgent payload identical to the
+        // local Pane.name and the UI maps — fixing the divergence M2.11
+        // fixup-3 reviewer P2 and auditor LOW called out.
+        let label = display_name.to_string();
 
         let opts = StartAgentOptions {
             command: command.map(|c| c.to_string()),
@@ -1199,6 +1187,7 @@ impl PaneController for EmbeddedPaneController {
 
     fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError> {
         self.create_pane_with_display_name(command, cwd, None)
+            .map(|(id, _)| id)
     }
 
     fn create_pane_with_display_name(
@@ -1206,35 +1195,34 @@ impl PaneController for EmbeddedPaneController {
         command: Option<&str>,
         cwd: Option<&str>,
         display_name: Option<&str>,
-    ) -> Result<String, PaneError> {
+    ) -> Result<(String, String), PaneError> {
         // The pane ID is allocated up front because it has to be injected into
         // the child's environment as DOT_AGENT_DECK_PANE_ID. If the spawn
         // below fails, the ID is intentionally consumed (a gap in the
         // sequence is harmless and avoids racing concurrent `create_pane`
         // calls to revert the counter).
         let pane_id = self.allocate_id();
-        // Treat empty *or* whitespace-only as absent so callers can pass
-        // form fields verbatim without an extra trim check at every call
-        // site. A bare `"   "` would otherwise land in
-        // `StartAgentOptions.display_name` (and `Pane.name` for the
-        // local backend) and render as a visually blank label —
-        // `is_valid_display_name` accepts spaces, so the daemon would
-        // happily store it (PRD #76 M2.11 reviewer P2.3).
-        let display_name = display_name.filter(|n| !n.trim().is_empty());
+        // Single source of truth for the in-session label, local Pane.name,
+        // and the daemon's StartAgent.display_name. `resolve_display_name`
+        // applies trim + `is_valid_display_name` + shell fallback, so all
+        // downstream sites store the SAME string by construction — fixing
+        // the divergence M2.11 fixup-3 reviewer P2 / auditor LOW called
+        // out (bare `"   "`, surround whitespace, and control-byte
+        // commands all converge here).
+        let resolved = agent_pty::resolve_display_name(display_name, command);
 
-        match &self.mode {
-            ControllerMode::LocalDeck => {
-                self.create_local_pane(pane_id, command, cwd, display_name)
-            }
+        let result = match &self.mode {
+            ControllerMode::LocalDeck => self.create_local_pane(pane_id, command, cwd, &resolved),
             ControllerMode::RemoteDeckLocal { client, runtime } => self.create_stream_pane(
                 pane_id,
                 command,
                 cwd,
-                display_name,
+                &resolved,
                 client.clone(),
                 runtime.clone(),
             ),
-        }
+        };
+        result.map(|id| (id, resolved))
     }
 
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
@@ -1347,6 +1335,32 @@ impl PaneController for EmbeddedPaneController {
     }
 
     fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError> {
+        // M2.11 fixup 4 — single normalization rule shared with
+        // `create_pane_with_display_name`: trim, then either
+        //   * empty after trim → clear (None on daemon, "" locally)
+        //   * trimmed value passes `is_valid_display_name` → apply that
+        //     EXACT string to both local pane.name and daemon record
+        //   * non-empty but fails validation (control bytes, oversized,
+        //     etc.) → reject the rename, don't touch local or daemon,
+        //     debug-log so the user can see why the label didn't update
+        //
+        // Rejecting on invalid input (rather than silently falling back
+        // to command/"shell") matches the user's intent: they typed
+        // garbage, so the existing label stays put instead of being
+        // replaced with an unrelated string they didn't ask for.
+        let trimmed = name.trim();
+        let new_label: Option<String> = if trimmed.is_empty() {
+            None
+        } else if agent_pty::is_valid_display_name(trimmed) {
+            Some(trimmed.to_string())
+        } else {
+            tracing::debug!(
+                pane_id = %pane_id,
+                "rename_pane: rejected — name contains invalid bytes after trim"
+            );
+            return Ok(());
+        };
+
         // M2.11: snapshot the stream-backed agent id + cached cwd under
         // the pane lock, then release the lock before the daemon RPC.
         // The cwd echo matters because `set_agent_label` uses "None to
@@ -1359,12 +1373,13 @@ impl PaneController for EmbeddedPaneController {
         // hydrate_from_daemon then falls back to the agent_id rather
         // than restoring a stale pre-clear name (PRD #76 M2.11 reviewer
         // P1 clear-rename case).
+        let local_name = new_label.clone().unwrap_or_default();
         let stream_update: Option<(String, Option<String>, tokio::runtime::Handle, PathBuf)> = {
             let mut panes = self.panes.lock().unwrap();
             let pane = panes
                 .get_mut(pane_id)
                 .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
-            pane.name = name.to_string();
+            pane.name = local_name;
             match &pane.backend {
                 PaneBackend::Stream(s) => Some((
                     s.agent_id.clone(),
@@ -1386,11 +1401,6 @@ impl PaneController for EmbeddedPaneController {
             // effect; a transient daemon failure resyncs on the next
             // reconnect.
             let client = DaemonClient::new(daemon_path);
-            let new_label = if name.trim().is_empty() {
-                None
-            } else {
-                Some(name.to_string())
-            };
             let agent_id_for_log = agent_id.clone();
             runtime.spawn(async move {
                 if let Err(e) = client.set_agent_label(&agent_id, new_label, cwd).await {
@@ -1514,9 +1524,10 @@ mod tests {
     #[test]
     fn create_pane_with_whitespace_display_name_falls_back_to_command() {
         let ctrl = EmbeddedPaneController::new();
-        let id = ctrl
+        let (id, resolved) = ctrl
             .create_pane_with_display_name(Some("/bin/sh"), None, Some("   "))
             .unwrap();
+        assert_eq!(resolved, "/bin/sh");
         let panes = ctrl.list_panes().unwrap();
         let info = panes
             .iter()
@@ -1532,9 +1543,10 @@ mod tests {
     #[test]
     fn create_pane_with_empty_display_name_falls_back_to_command() {
         let ctrl = EmbeddedPaneController::new();
-        let id = ctrl
+        let (id, resolved) = ctrl
             .create_pane_with_display_name(Some("/bin/sh"), None, Some(""))
             .unwrap();
+        assert_eq!(resolved, "/bin/sh");
         let panes = ctrl.list_panes().unwrap();
         let info = panes.iter().find(|p| p.pane_id == id).unwrap();
         assert_eq!(info.title, "/bin/sh");
@@ -1547,12 +1559,105 @@ mod tests {
         // and the controller defaults to "shell". Without the
         // whitespace filter the pane would be titled "   ".
         let ctrl = EmbeddedPaneController::new();
-        let id = ctrl
+        let (id, resolved) = ctrl
             .create_pane_with_display_name(None, None, Some("  \t "))
             .unwrap();
+        assert_eq!(resolved, "shell");
         let panes = ctrl.list_panes().unwrap();
         let info = panes.iter().find(|p| p.pane_id == id).unwrap();
         assert_eq!(info.title, "shell");
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    // PRD #76 M2.11 fixup 4 — surround whitespace is stripped from a
+    // form Name before it reaches `Pane.name` and (for stream panes) the
+    // daemon. Returning the raw `"  foo  "` here was the reviewer P2
+    // bug: UI maps showed `"foo"` while the daemon/local pane stored
+    // `"  foo  "`, so hydrate would flip the label back on reconnect.
+    #[test]
+    fn create_pane_with_surround_whitespace_trims_local_name() {
+        let ctrl = EmbeddedPaneController::new();
+        let (id, resolved) = ctrl
+            .create_pane_with_display_name(Some("/bin/sh"), None, Some("  foo  "))
+            .unwrap();
+        assert_eq!(resolved, "foo");
+        let panes = ctrl.list_panes().unwrap();
+        let info = panes.iter().find(|p| p.pane_id == id).unwrap();
+        assert_eq!(
+            info.title, "foo",
+            "surround whitespace must be trimmed from the local Pane.name"
+        );
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    // PRD #76 M2.11 fixup 4 (auditor LOW): if the form Name is empty and
+    // the command contains an ASCII control byte, the resolver must fall
+    // through to "shell" rather than stuffing the raw command into the
+    // local Pane.name (which `terminal_widget` then writes verbatim into
+    // the TUI title). The daemon already drops such names on the wire;
+    // this pins the same behavior for the LocalDeck path so there is no
+    // window where in-session render disagrees with daemon storage.
+    #[test]
+    fn create_pane_with_control_char_command_falls_back_to_shell() {
+        let ctrl = EmbeddedPaneController::new();
+        let evil_cmd = "echo \x1b[31m"; // real ESC byte
+        let (id, resolved) = ctrl
+            .create_pane_with_display_name(Some(evil_cmd), None, Some(""))
+            .unwrap();
+        assert_eq!(
+            resolved, "shell",
+            "control-byte command must fall through to \"shell\""
+        );
+        let panes = ctrl.list_panes().unwrap();
+        let info = panes.iter().find(|p| p.pane_id == id).unwrap();
+        assert_eq!(info.title, "shell");
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    // PRD #76 M2.11 fixup 4: rename with surround whitespace must store
+    // the trimmed value, not the raw string. Without this, the local
+    // pane.name would carry `"  newname  "` while the daemon (which
+    // applies `is_valid_display_name` and would accept it) stored the
+    // same — but the UI maps would not — perpetuating divergence.
+    #[test]
+    fn rename_pane_trims_surround_whitespace_on_local_backend() {
+        let ctrl = EmbeddedPaneController::new();
+        let id = ctrl.create_pane(None, None).unwrap();
+        ctrl.rename_pane(&id, "  newname  ").unwrap();
+        let panes = ctrl.list_panes().unwrap();
+        let info = panes.iter().find(|p| p.pane_id == id).unwrap();
+        assert_eq!(info.title, "newname");
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    // PRD #76 M2.11 fixup 4: rename text that trims to a string failing
+    // `is_valid_display_name` is REJECTED — neither the local pane.name
+    // nor (for stream panes) the daemon record changes. The previous
+    // label stays put rather than silently fall back to command/"shell"
+    // because the user typed garbage; we don't substitute a different
+    // string they didn't ask for. Debug log captures the rejection.
+    #[test]
+    fn rename_pane_rejects_control_char_input() {
+        let ctrl = EmbeddedPaneController::new();
+        let (id, _) = ctrl
+            .create_pane_with_display_name(Some("/bin/sh"), None, Some("good-name"))
+            .unwrap();
+        // Verify baseline label first.
+        assert_eq!(
+            ctrl.list_panes().unwrap()[0].title,
+            "good-name",
+            "baseline label before rejected rename"
+        );
+        // Rename with control bytes in the trimmed portion — must be a
+        // no-op (returns Ok, but pane.name is unchanged).
+        ctrl.rename_pane(&id, "  \x1b[31m  ")
+            .expect("rejected rename still returns Ok");
+        let panes = ctrl.list_panes().unwrap();
+        let info = panes.iter().find(|p| p.pane_id == id).unwrap();
+        assert_eq!(
+            info.title, "good-name",
+            "control-byte rename must NOT update pane.name"
+        );
         ctrl.close_pane(&id).unwrap();
     }
 

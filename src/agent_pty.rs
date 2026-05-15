@@ -90,6 +90,40 @@ pub fn is_valid_display_name(value: &str) -> bool {
         && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
 }
 
+/// Canonical resolver for the human-readable display name shown on a pane
+/// and stored on the daemon-side `AgentRecord.display_name`. This is the
+/// single source of truth shared by the UI's new-pane handler and the
+/// controller's local/stream pane creation paths so all four sites apply
+/// the same trim + validation + fallback rules (PRD #76 M2.11 fixup 4).
+///
+/// Resolution order:
+/// 1. `str::trim()` the form-supplied `form_name`. If non-empty and
+///    [`is_valid_display_name`] accepts the trimmed value, return it.
+/// 2. Otherwise `str::trim()` the `command`. If non-empty and
+///    [`is_valid_display_name`] accepts the trimmed value, return it.
+/// 3. Otherwise return `"shell"` — the ultimate fallback, assumed valid.
+///
+/// A whitespace-only form_name falls through to command. A command with
+/// ASCII control bytes (e.g. `"echo \x1b[31m"` with a real ESC) fails
+/// validation and falls through to `"shell"`, matching the daemon-side
+/// drop behavior so the in-session UI maps can't diverge from the daemon
+/// record (M2.11 fixup-3 AUDITOR LOW).
+pub fn resolve_display_name(form_name: Option<&str>, command: Option<&str>) -> String {
+    if let Some(name) = form_name {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() && is_valid_display_name(trimmed) {
+            return trimmed.to_string();
+        }
+    }
+    if let Some(cmd) = command {
+        let trimmed = cmd.trim();
+        if !trimmed.is_empty() && is_valid_display_name(trimmed) {
+            return trimmed.to_string();
+        }
+    }
+    "shell".to_string()
+}
+
 /// Returns `true` if `value` is acceptable to retain as a cwd: non-empty,
 /// ≤ [`CWD_MAX_LEN`] bytes, and free of ASCII control characters (bytes
 /// < 0x20 plus 0x7F DEL). Mirrors the [`is_valid_display_name`] filter so
@@ -851,6 +885,65 @@ impl Drop for AgentPtyRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PRD #76 M2.11 fixup 4 — pin the canonical name resolver so the UI
+    // helper, the controller's new-pane path, and the rename path all
+    // converge on the same rules. Regressions here would resurrect the
+    // fixup-3 reviewer P2 / auditor LOW divergence between
+    // `ui.pane_display_names` and `AgentRecord.display_name`.
+
+    #[test]
+    fn resolve_display_name_prefers_trimmed_form_name() {
+        assert_eq!(
+            resolve_display_name(Some("  foo  "), Some("vim")),
+            "foo",
+            "surrounding whitespace must be stripped from a valid form name"
+        );
+        assert_eq!(
+            resolve_display_name(Some("agent-1"), Some("vim")),
+            "agent-1"
+        );
+    }
+
+    #[test]
+    fn resolve_display_name_whitespace_only_form_falls_through_to_command() {
+        assert_eq!(resolve_display_name(Some("   "), Some("vim")), "vim");
+        assert_eq!(resolve_display_name(Some(""), Some("htop")), "htop");
+        assert_eq!(resolve_display_name(Some("\t  \n"), Some("ls")), "ls");
+    }
+
+    #[test]
+    fn resolve_display_name_no_inputs_falls_back_to_shell() {
+        assert_eq!(resolve_display_name(None, None), "shell");
+        assert_eq!(resolve_display_name(Some("   "), None), "shell");
+        assert_eq!(resolve_display_name(None, Some("   ")), "shell");
+    }
+
+    #[test]
+    fn resolve_display_name_rejects_control_char_form_name() {
+        // Form Name with ANSI ESC must fail `is_valid_display_name` and
+        // fall through to the command — the daemon would drop the same
+        // string, so the UI map must never store it.
+        assert_eq!(
+            resolve_display_name(Some("\x1b[31mevil"), Some("vim")),
+            "vim",
+            "control-byte form name must fall through to command"
+        );
+    }
+
+    #[test]
+    fn resolve_display_name_rejects_control_char_command_falls_to_shell() {
+        // Command with real ESC byte (the auditor LOW case): form Name
+        // empty so we fall through to command, which fails validation,
+        // so the final fallback "shell" wins.
+        let evil_cmd = "echo \x1b[31m";
+        assert_eq!(
+            resolve_display_name(Some(""), Some(evil_cmd)),
+            "shell",
+            "control-byte command must fall through to shell, not be stored verbatim"
+        );
+        assert_eq!(resolve_display_name(None, Some(evil_cmd)), "shell");
+    }
 
     #[test]
     fn spawn_default_shell_works() {
