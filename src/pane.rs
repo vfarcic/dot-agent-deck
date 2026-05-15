@@ -50,7 +50,7 @@ pub trait PaneController: Send + Sync {
     ) -> Result<String, PaneError> {
         let id = self.create_pane(command, cwd)?;
         if let Some(name) = display_name
-            && !name.is_empty()
+            && !name.trim().is_empty()
         {
             self.rename_pane(&id, name)?;
         }

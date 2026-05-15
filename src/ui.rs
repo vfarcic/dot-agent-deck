@@ -1617,6 +1617,21 @@ fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     KeyResult::Continue
 }
 
+/// Decide what value to push to the daemon on a Rename-mode keypress.
+/// Returns `Some(text)` only on Enter; the caller then forwards `text` to
+/// `PaneController::rename_pane`. An empty/whitespace-only `text` means
+/// "clear" — `rename_pane` maps it to a daemon-side `None` so hydrate
+/// falls back to the agent_id on reconnect rather than restoring a stale
+/// label. Returns `None` for any non-Enter key (typing, Esc, backspace),
+/// so the daemon isn't pinged on every keystroke.
+///
+/// Pulled out of the inline match arm in `run_app` so the empty-Enter
+/// clear path stays unit-testable without a full TUI harness (PRD #76
+/// M2.11 reviewer P1 & P2.4).
+fn rename_commit_value(key: KeyEvent, rename_text: &str) -> Option<String> {
+    matches!(key.code, KeyCode::Enter).then(|| rename_text.to_string())
+}
+
 fn handle_rename_key(
     key: KeyEvent,
     ui: &mut UiState,
@@ -3162,13 +3177,12 @@ pub fn run_tui(
                         // `rename_text`. handle_rename_key only mutates
                         // ui.display_names; we still need to call
                         // `pane.rename_pane` so the daemon updates its
-                        // AgentRecord.display_name. Without this the rename
-                        // is lost on reconnect, since hydrate_from_daemon
-                        // reads the daemon's stored label
-                        // (PRD #76 M2.11 reviewer P1).
-                        let commit = matches!(key.code, KeyCode::Enter)
-                            .then(|| ui.rename_text.clone())
-                            .filter(|t| !t.is_empty());
+                        // AgentRecord.display_name. Empty/whitespace-only
+                        // text is a "clear" — rename_pane treats that as
+                        // a daemon-side `None`, so hydrate falls back to
+                        // the agent_id on reconnect rather than restoring
+                        // a stale label (PRD #76 M2.11 reviewer P1).
+                        let commit = rename_commit_value(key, &ui.rename_text);
                         let r = handle_rename_key(key, &mut ui, selected_id.as_deref());
                         if let Some(new_name) = commit
                             && let Some(ref sid) = selected_id
@@ -3177,8 +3191,9 @@ pub fn run_tui(
                         {
                             // Best-effort daemon update — rename_pane's
                             // own error path already logs and swallows
-                            // transient daemon failures so the local UI
-                            // never freezes on a slow RPC.
+                            // transient daemon failures, and the daemon
+                            // RPC is spawned off the UI thread so a
+                            // wedged daemon can't freeze the renderer.
                             let _ = pane.rename_pane(pane_id, &new_name);
                         }
                         r
@@ -3374,7 +3389,10 @@ pub fn run_tui(
                             // call that previously sat at this site is now redundant —
                             // the daemon already has the right label, and
                             // `create_pane_with_display_name` set the local pane.name.
-                            let form_name = if req.name.is_empty() {
+                            // Whitespace-only Names also count as "no name" so the
+                            // controller falls back to command/"shell" instead of
+                            // recording a blank label (P2.3).
+                            let form_name = if req.name.trim().is_empty() {
                                 None
                             } else {
                                 Some(req.name.as_str())
@@ -7883,6 +7901,58 @@ mod tests {
 
         fn as_any(&self) -> &dyn std::any::Any {
             self
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #76 M2.11 — rename commit-intent helper.
+    //
+    // These tests exercise the helper the dashboard Enter handler now
+    // calls (`rename_commit_value`), not the daemon RPC. Together with
+    // the integration test in `tests/m2_agent_metadata.rs` they pin the
+    // full path: handler decides what to commit → forwards to
+    // `PaneController::rename_pane` → controller maps empty/whitespace
+    // to a daemon-side `None` clear (reviewer P1 clear-rename case,
+    // P2.4 handler coverage).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rename_commit_value_returns_empty_string_on_enter_with_empty_text() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        // Empty text is still a commit: the controller will see "" and
+        // translate it to a daemon-side `None` clear. Returning `None`
+        // here would skip the daemon update entirely and leave the
+        // stale label on the daemon (the original P1 clear-rename bug).
+        assert_eq!(rename_commit_value(key, ""), Some(String::new()));
+    }
+
+    #[test]
+    fn rename_commit_value_returns_whitespace_on_enter_with_whitespace_text() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        // Whitespace passes through verbatim; the controller applies
+        // the trim. This keeps the helper purely about commit intent
+        // (Enter vs not Enter) and the trim policy in one place.
+        assert_eq!(rename_commit_value(key, "   "), Some("   ".to_string()));
+    }
+
+    #[test]
+    fn rename_commit_value_returns_text_on_enter() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            rename_commit_value(key, "new-label"),
+            Some("new-label".to_string())
+        );
+    }
+
+    #[test]
+    fn rename_commit_value_returns_none_on_non_enter_keys() {
+        // Typing, navigation, backspace, escape — none of these are a
+        // commit. The handler must not ping the daemon on every
+        // keystroke (would amount to a per-keystroke `SetAgentLabel`
+        // RPC storm and break the "only commit on Enter" contract).
+        for code in [KeyCode::Char('a'), KeyCode::Esc, KeyCode::Backspace] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            assert_eq!(rename_commit_value(key, "anything"), None);
         }
     }
 

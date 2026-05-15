@@ -16,6 +16,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio::net::UnixStream;
@@ -27,6 +28,8 @@ use dot_agent_deck::daemon_protocol::{
     AttachResponse, KIND_REQ, KIND_RESP, bind_attach_listener, read_frame, serve_attach,
     write_frame,
 };
+use dot_agent_deck::embedded_pane::EmbeddedPaneController;
+use dot_agent_deck::pane::PaneController;
 
 /// `bind_attach_listener` flips the process-global umask while binding;
 /// share a lock with the rest of the M-series tests so concurrent tempdir
@@ -508,6 +511,194 @@ async fn older_daemon_record_shape_still_hydrates_with_none_metadata() {
     drop(client);
     handle.abort();
     drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// PRD #76 M2.11 reviewer P2.4 — pin the controller-level rename and
+// create-pane paths against a real daemon. These cover what the direct
+// `set_agent_label` and `start_agent` tests above can't: they would
+// pass even if `EmbeddedPaneController::rename_pane` or
+// `create_pane_with_display_name` never forwarded to the daemon. The
+// tests below drive the controller (the same object `ui.rs` calls) so
+// a regression in the controller wiring fails the suite, not just the
+// RPC.
+// ---------------------------------------------------------------------------
+
+async fn poll_record<F>(client: &DaemonClient, agent_id: &str, mut pred: F) -> Option<AgentRecord>
+where
+    F: FnMut(&AgentRecord) -> bool,
+{
+    // `rename_pane` is fire-and-forget on the controller's runtime, so
+    // the daemon update is observed via polling rather than awaiting
+    // the spawn handle. 2s is generous — in practice the in-process
+    // server replies in single-digit milliseconds.
+    let start = tokio::time::Instant::now();
+    while tokio::time::Instant::now() - start < Duration::from_secs(2) {
+        if let Ok(records) = client.list_agents().await
+            && let Some(rec) = records.into_iter().find(|r| r.id == agent_id)
+            && pred(&rec)
+        {
+            return Some(rec);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_pane_with_empty_text_clears_daemon_display_name() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    // Build a controller against the same in-process daemon — this is
+    // the same construction the production `main` path uses for
+    // RemoteDeckLocal mode.
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    // Spawn an agent through the controller so rename_pane has a real
+    // Stream backend (PaneBackend::Pty would skip the daemon path).
+    // create_pane_with_display_name internally `block_on`s the daemon
+    // client, so run it on a blocking thread.
+    let pane_id = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane_with_display_name(
+                Some("sh -c 'sleep 30'"),
+                Some("/tmp"),
+                Some("initial"),
+            )
+        })
+        .await
+        .unwrap()
+        .expect("create_pane_with_display_name")
+    };
+
+    // Find the agent id (assigned by the daemon).
+    let records = client.list_agents().await.unwrap();
+    let rec = records
+        .iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(&pane_id))
+        .expect("agent record for new pane");
+    let agent_id = rec.id.clone();
+    assert_eq!(rec.display_name.as_deref(), Some("initial"));
+
+    // Empty-string rename — this is exactly what the Enter handler
+    // produces when the user clears the rename buffer and presses
+    // Enter (`rename_commit_value` returns `Some(String::new())`).
+    let id_for_call = pane_id.clone();
+    let ctrl_clone = ctrl.clone();
+    tokio::task::spawn_blocking(move || ctrl_clone.rename_pane(&id_for_call, ""))
+        .await
+        .unwrap()
+        .expect("rename_pane with empty text");
+
+    // The daemon must observe a `display_name: None` clear. Without
+    // the trim-to-None logic in `rename_pane` it would store `Some("")`
+    // (a blank label) or — under the original P1 bug — keep the stale
+    // pre-clear value ("initial").
+    let rec = poll_record(&client, &agent_id, |r| r.display_name.is_none())
+        .await
+        .expect("display_name must clear within timeout");
+    assert!(rec.display_name.is_none());
+    // cwd must survive the clear — the controller echoes the cached
+    // cwd back to `set_agent_label` so "None to clear" semantics don't
+    // erase the spawn-time cwd as a side effect of the rename.
+    assert_eq!(rec.cwd.as_deref(), Some("/tmp"));
+
+    server.registry.shutdown_all();
+    drop(ctrl);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_pane_with_whitespace_clears_daemon_display_name() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let pane_id = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane_with_display_name(
+                Some("sh -c 'sleep 30'"),
+                Some("/tmp"),
+                Some("initial"),
+            )
+        })
+        .await
+        .unwrap()
+        .expect("create_pane_with_display_name")
+    };
+
+    let agent_id = client
+        .list_agents()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(&pane_id))
+        .expect("record")
+        .id;
+
+    // Whitespace-only rename — also a "clear". Without the trim check
+    // in `rename_pane`, the daemon would happily store "   " (it
+    // passes `is_valid_display_name`) and the dashboard would render
+    // a blank label after reconnect.
+    let id_for_call = pane_id.clone();
+    let ctrl_clone = ctrl.clone();
+    tokio::task::spawn_blocking(move || ctrl_clone.rename_pane(&id_for_call, "   "))
+        .await
+        .unwrap()
+        .expect("rename_pane with whitespace");
+
+    let rec = poll_record(&client, &agent_id, |r| r.display_name.is_none())
+        .await
+        .expect("whitespace rename must clear display_name");
+    assert!(rec.display_name.is_none());
+
+    server.registry.shutdown_all();
+    drop(ctrl);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_pane_with_whitespace_name_falls_back_via_stream_path() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    // Whitespace-only Name flowing through the controller into
+    // StartAgent must NOT land in AgentRecord.display_name. The
+    // controller filter strips it to None at the call site, and
+    // `create_stream_pane` falls back to the command string for the
+    // daemon-side label.
+    let _pane_id = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane_with_display_name(Some("sh -c 'sleep 30'"), Some("/tmp"), Some("   "))
+        })
+        .await
+        .unwrap()
+        .expect("create_pane_with_display_name")
+    };
+
+    let records = client.list_agents().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].display_name.as_deref(),
+        Some("sh -c 'sleep 30'"),
+        "whitespace-only Name must fall back to command, not be stored as '   '"
+    );
+    assert_ne!(records[0].display_name.as_deref(), Some("   "));
+
+    server.registry.shutdown_all();
+    drop(ctrl);
 }
 
 // Silence "unused" warnings: `AttachResponse` and `UnixStream` are
