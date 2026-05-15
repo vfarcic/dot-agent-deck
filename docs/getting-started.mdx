@@ -136,21 +136,3 @@ To tear down a mode tab entirely, press `Ctrl+w` while its agent's card is selec
 See [Keyboard Shortcuts](keyboard-shortcuts.md) for all tab navigation keybindings.
 
 For the full configuration reference and more examples, see [Workspace Modes](workspace-modes.md).
-
-## Running on a Remote Host
-
-Agent Deck can run agents on a per-project Linux VM and stream the terminals back to the laptop over ssh. Agents survive laptop sleep, network drops, and TUI restarts.
-
-```bash
-# 1. Register a remote (one-time per host).
-dot-agent-deck remote add my-vm user@host
-
-# 2. Connect; an interactive picker opens if you omit the name.
-dot-agent-deck connect my-vm
-```
-
-For host prerequisites, lifecycle semantics, failure modes, and provisioning recipes:
-
-- [Remote Environments](remote-environments.md) — how the daemon, viewer, and stop/detach lifecycle work.
-- [Remote Environment Requirements](remote-requirements.md) — what a host must provide before `remote add` will succeed.
-- [Remote Recipes](remote-recipes.md) — copy-paste provisioning snippets for multipass, Hetzner, UpCloud, and bare metal.

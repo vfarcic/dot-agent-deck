@@ -192,18 +192,14 @@ The local-deck path (no `connect`, no remote) is unchanged: TUI spawns daemon as
 
 ### Documentation deliverables
 
-- `docs/remote-environments.md` (new) — what a remote environment is, the lifecycle model, Ctrl+W vs ssh-disconnect, failure modes, persistence model.
-- `docs/remote-requirements.md` (new) — exact environment requirements (Linux distro, ssh access, disk, RAM, egress, optional container runtime). This doc is what the maintainer follows to set up the dev/test VM, and what users follow to set up theirs.
-- `docs/remote-recipes.md` (new) — copy-pasteable provisioning snippets for multipass, Hetzner, fly. Maintenance burden kept low: each recipe is a few commands, no abstractions. (k3s recipe lives in PRD #81.)
-- Update `docs/getting-started.mdx` and `docs/installation.md` to mention the remote option.
+Documentation work for this feature is owned by [PRD #85](85-remote-environments-docs.md) so it can ship on its own release schedule once the code path here is validated end-to-end. The three drafted pages (`docs/remote-environments.md`, `docs/remote-recipes.md`, `docs/remote-requirements.md`) live on disk as the working draft but are intentionally **not** in `site/sidebars.js` — the published docs site is unchanged by this PRD.
 
 ## Success Criteria
 
-- A user with an empty laptop and a fresh remote box (provisioned via the recipes doc) can run `dot-agent-deck remote add hetzner-1`, `dot-agent-deck connect hetzner-1`, start an agent, and have that agent survive `Ctrl+Z`-ing the laptop, closing the lid, and reconnecting from a different network — within 24 hours, the agent is still there with full scrollback, and re-running `connect` shows it.
+- A user with an empty laptop and a fresh remote box can run `dot-agent-deck remote add hetzner-1`, `dot-agent-deck connect hetzner-1`, start an agent, and have that agent survive `Ctrl+Z`-ing the laptop, closing the lid, and reconnecting from a different network — within 24 hours, the agent is still there with full scrollback, and re-running `connect` shows it.
 - `Ctrl+W` on a remote agent pane stops the agent process on the remote (verified via `ps` on the remote: the process is gone). It does **not** also kill the daemon.
 - ssh disconnect leaves the daemon and agents running. Reconnect picks up the existing state.
 - `remote list` shows last-known status; `connect` distinguishes the "host unreachable" vs "binary missing" failure modes with actionable messages.
-- The maintainer's own dev/test VM is provisioned by following `docs/remote-requirements.md` from a clean box, with no out-of-band steps. Anything missing from the docs is a docs bug, fixed before merge.
 - Hook callbacks fired during a viewer disconnect are reflected in the TUI state on reattach.
 - Existing local-deck flow is unchanged. Users who never run `remote add` see no behavioral difference.
 - Every TUI feature behaves identically in remote mode and local mode (because in remote mode it *is* local mode, just running on the remote box). No "this works locally but not remotely" carve-outs.
@@ -251,11 +247,7 @@ PRD #81 picks up its own milestones (image, manifest, `remote add --type=kuberne
 
 ### Phase 5: Documentation and release
 
-- [x] **M5.1** — `docs/remote-environments.md`: lifecycle model, Ctrl+W semantics, ssh-disconnect-as-detach, failure modes, hook-on-remote behavior.
-- [x] **M5.2** — `docs/remote-recipes.md`: provisioning snippets for multipass / Hetzner / fly.
-- [x] **M5.3** — Final pass on `docs/remote-requirements.md` reflecting anything learned in M1–M4.
-- [x] **M5.4** — Update `docs/getting-started.mdx` and `docs/installation.md` to mention the remote path.
-- [ ] **M5.5** — Post-pivot doc refresh: revise `docs/remote-environments.md` to describe TUI-on-remote (drop any mentions of laptop-side bridge / streaming protocol over ssh / explicit detach keybinding). Revise the ssh-disconnect-as-detach lifecycle. Changelog fragment, release.
+Moved to [PRD #85](85-remote-environments-docs.md). The earlier M5.1–M5.5 work on this branch wrote three new pages (`docs/remote-environments.md`, `docs/remote-recipes.md`, `docs/remote-requirements.md`) but they are intentionally **not added to `site/sidebars.js`** so the published docs site is unchanged. The pages remain on disk as the starting draft for PRD #85 to take to release. Cross-references in `docs/getting-started.mdx` and `docs/installation.md` were reverted to the pre-PRD-76 state for the same reason. Changelog fragment + release are owned by PRD #85.
 
 ## Key Files
 
@@ -268,8 +260,7 @@ PRD #81 picks up its own milestones (image, manifest, `remote add --type=kuberne
 - `src/connect.rs` — substantially shrinks in M2.7; the new `connect` is an `ssh -t` wrapper plus picker.
 - `src/daemon_attach.rs` — the bridge entrypoint is removed in M2.7. Hardening helpers (`state_dir`, `verify_socket_trusted`, `ensure_daemon_running`) survive and are reused by M2.8.
 - `src/daemon_protocol.rs` — unchanged from Phase 1. **No `ListDir` / `ReadFile` / `StateSnapshot` / `SubscribeEvents` ops** (those were Phase 6, dropped).
-- `docs/remote-environments.md`, `docs/remote-requirements.md`, `docs/remote-recipes.md`.
-- `docs/getting-started.mdx`, `docs/installation.md` — minor cross-references.
+- Doc pages — handed off to the docs PRD (this PRD does not publish docs).
 
 ## Design Decisions
 
