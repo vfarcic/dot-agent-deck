@@ -25,6 +25,7 @@ use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, Shared
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
 use crate::terminal_widget::TerminalWidget;
 use crate::theme::ColorPalette;
+use crate::tui_state_persist;
 
 impl fmt::Display for crate::event::AgentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1857,6 +1858,37 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
 // Reactive pane routing — extract new Bash commands from session events
 // ---------------------------------------------------------------------------
 
+/// Build the persistable snapshot of TUI organizational state (PRD #76
+/// M2.11). Only stream-backed panes are included — those are the panes
+/// the daemon owns and that will be visible after a reconnect; local
+/// PTY-backed panes die with the TUI process and so have nothing to
+/// persist. The display name falls back to the daemon agent_id when no
+/// override has been set; cwd comes from `pane_metadata` when the pane
+/// was created via the new-pane form (rehydrated panes inherit it from
+/// the previous TUI session's file).
+fn build_persisted_state(
+    embedded: &EmbeddedPaneController,
+    pane_display_names: &HashMap<String, String>,
+    pane_metadata: &HashMap<String, config::SavedPane>,
+) -> tui_state_persist::TuiPersistedState {
+    let mut panes = HashMap::new();
+    for (pane_id, agent_id) in embedded.stream_agent_ids() {
+        let display_name = pane_display_names
+            .get(&pane_id)
+            .cloned()
+            .unwrap_or_else(|| agent_id.clone());
+        let cwd = pane_metadata.get(&pane_id).map(|m| m.dir.clone());
+        panes.insert(
+            agent_id,
+            tui_state_persist::TuiPaneState { display_name, cwd },
+        );
+    }
+    tui_state_persist::TuiPersistedState {
+        version: tui_state_persist::SCHEMA_VERSION,
+        panes,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TUI entry point
 // ---------------------------------------------------------------------------
@@ -1907,20 +1939,83 @@ pub fn run_tui(
     // in-process (`LocalDeck`) controller — the in-process daemon shares
     // the TUI's registry directly. Errors during list_agents/attach are
     // absorbed so a transient daemon hiccup doesn't block startup.
+    //
+    // PRD #76 M2.11: alongside the daemon-side agent list, read back the
+    // TUI's own persisted organizational state (display names, cwd) from
+    // `<state_dir>/tui-state.json`. The daemon stays a narrow PTY
+    // supervisor; everything UI-side (names, future mode/orchestration
+    // structure) lives in this file so a reconnect — possibly from a
+    // different laptop — reproduces the same organized view.
+    let mut persist_writer: Option<tui_state_persist::PersistWriter> = None;
+    let mut last_submitted_state: Option<tui_state_persist::TuiPersistedState> = None;
     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+        let persist_path = tui_state_persist::state_file_path();
+        let use_persist = embedded.is_remote();
+        let mut persisted = if use_persist {
+            tui_state_persist::load(&persist_path)
+        } else {
+            tui_state_persist::TuiPersistedState::default()
+        };
+
         let hydrated = embedded.hydrate_from_daemon();
         for h in &hydrated {
             let mut st = state.blocking_write();
             st.register_pane(h.pane_id.clone());
-            st.insert_placeholder_session(h.pane_id.clone(), None);
+            // Carry the persisted cwd through to the placeholder session
+            // so the session card shows the right directory until the
+            // agent emits its first SessionStart event.
+            let persisted_cwd = persisted.panes.get(&h.agent_id).and_then(|p| p.cwd.clone());
+            st.insert_placeholder_session(h.pane_id.clone(), persisted_cwd.clone());
             drop(st);
-            // The daemon does not track per-agent display names, cwd, or
-            // modes yet (out of scope for M2.x). Use the agent id as the
-            // initial display name; the user can rename later via the
-            // existing pane-rename flow.
+            // If the persisted file has an entry for this agent_id, use
+            // its display_name (and cwd metadata). Otherwise fall back
+            // to using the agent_id as the display name — same behavior
+            // as M2.x before persistence existed.
+            let display_name = persisted
+                .panes
+                .get(&h.agent_id)
+                .map(|p| p.display_name.clone())
+                .unwrap_or_else(|| h.agent_id.clone());
             ui.pane_display_names
-                .insert(h.pane_id.clone(), h.agent_id.clone());
-            ui.pane_names.insert(h.pane_id.clone(), h.agent_id.clone());
+                .insert(h.pane_id.clone(), display_name.clone());
+            ui.pane_names.insert(h.pane_id.clone(), display_name);
+            if let Some(dir) = persisted_cwd {
+                ui.pane_metadata.insert(
+                    h.pane_id.clone(),
+                    config::SavedPane {
+                        dir,
+                        name: ui
+                            .pane_display_names
+                            .get(&h.pane_id)
+                            .cloned()
+                            .unwrap_or_else(|| h.agent_id.clone()),
+                        command: String::new(),
+                        mode: None,
+                    },
+                );
+            }
+        }
+
+        // Garbage-collect persisted entries whose agent_id is no longer
+        // alive in the daemon (the previous TUI closed them, or the
+        // daemon restarted). Rewriting the file here clears the stale
+        // names so they can't accidentally re-attach to a future
+        // unrelated agent that happens to reuse the id.
+        if use_persist {
+            let live_ids: Vec<String> = hydrated.iter().map(|h| h.agent_id.clone()).collect();
+            let _changed = persisted.reconcile_with_live(&live_ids);
+            // Spawn the debounced writer regardless of whether we
+            // dropped anything: the event loop will submit on every
+            // organizational mutation.
+            if let Some(handle) = embedded.runtime_handle() {
+                let writer = tui_state_persist::PersistWriter::spawn(persist_path.clone(), handle);
+                // Submit the post-reconcile state once so any GC'd
+                // entries land on disk even if the user never makes
+                // another change.
+                writer.submit(persisted.clone());
+                last_submitted_state = Some(persisted);
+                persist_writer = Some(writer);
+            }
         }
     }
 
@@ -3518,6 +3613,25 @@ pub fn run_tui(
                     } else {
                         ui.pane_display_names.remove(pane_id);
                     }
+                }
+            }
+
+            // PRD #76 M2.11: sample the persistable organizational state
+            // once per inner-event iteration. Submitting on every event
+            // is fine because the `PersistWriter` coalesces submits
+            // within its debounce window — typing into a pane never
+            // touches the disk because every keystroke produces the same
+            // sampled state. Only an actual organizational mutation
+            // (rename / pane add / pane close / cwd change) advances
+            // `last_submitted_state` and reaches `write_atomic`.
+            if let Some(writer) = persist_writer.as_ref()
+                && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+            {
+                let sampled =
+                    build_persisted_state(embedded, &ui.pane_display_names, &ui.pane_metadata);
+                if last_submitted_state.as_ref() != Some(&sampled) && writer.submit(sampled.clone())
+                {
+                    last_submitted_state = Some(sampled);
                 }
             }
 

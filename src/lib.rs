@@ -25,6 +25,7 @@ pub mod state;
 pub mod tab;
 pub mod terminal_widget;
 pub mod theme;
+pub mod tui_state_persist;
 pub mod ui;
 pub mod version;
 pub mod watch;

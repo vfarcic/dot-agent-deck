@@ -241,6 +241,44 @@ impl EmbeddedPaneController {
         ids
     }
 
+    /// True when this controller delegates to a daemon (PRD #76
+    /// `RemoteDeckLocal` mode). The TUI uses this to decide whether the
+    /// M2.11 organizational-state persistence path applies — in
+    /// `LocalDeck` the in-process daemon dies with the TUI, so the file
+    /// would never be read back.
+    pub fn is_remote(&self) -> bool {
+        matches!(self.mode, ControllerMode::RemoteDeckLocal { .. })
+    }
+
+    /// Tokio runtime handle this controller was built against, when
+    /// running in `RemoteDeckLocal` mode. The TUI passes it to the
+    /// M2.11 debounced state-persistence writer so the writer can spawn
+    /// on the same runtime as the daemon I/O tasks (avoiding a second
+    /// runtime just for a single fsync task).
+    pub fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
+        match &self.mode {
+            ControllerMode::RemoteDeckLocal { runtime, .. } => Some(runtime.clone()),
+            ControllerMode::LocalDeck => None,
+        }
+    }
+
+    /// Return `(pane_id, agent_id)` pairs for every stream-backed pane
+    /// in insertion order. PTY-backed panes have no daemon agent id and
+    /// are skipped. Used by the M2.11 state-persistence sampler to map
+    /// in-memory display names back to daemon-stable keys.
+    pub fn stream_agent_ids(&self) -> Vec<(String, String)> {
+        let panes = self.panes.lock().unwrap();
+        let mut pairs: Vec<(String, String)> = panes
+            .iter()
+            .filter_map(|(pane_id, pane)| match &pane.backend {
+                PaneBackend::Stream(s) => Some((pane_id.clone(), s.agent_id.clone())),
+                PaneBackend::Pty(_) => None,
+            })
+            .collect();
+        pairs.sort_by_key(|(id, _)| id.parse::<u64>().unwrap_or(0));
+        pairs
+    }
+
     /// Get the currently focused pane ID, if any.
     pub fn focused_pane_id(&self) -> Option<String> {
         let panes = self.panes.lock().unwrap();
