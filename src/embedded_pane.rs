@@ -12,7 +12,7 @@ use std::any::Any;
 use crate::agent_pty::{self, AgentPty, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use crate::daemon_client::{AttachConnection, DaemonClient, StartAgentOptions};
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
-use crate::pane::{PaneController, PaneDirection, PaneError, PaneInfo};
+use crate::pane::{PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome};
 
 /// Result of [`EmbeddedPaneController::hydrate_from_daemon`]. One entry per
 /// daemon-side agent that was successfully reconnected on TUI bootstrap; the
@@ -1334,15 +1334,24 @@ impl PaneController for EmbeddedPaneController {
         Ok(())
     }
 
-    fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError> {
+    fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
         // M2.11 fixup 4 — single normalization rule shared with
         // `create_pane_with_display_name`: trim, then either
-        //   * empty after trim → clear (None on daemon, "" locally)
-        //   * trimmed value passes `is_valid_display_name` → apply that
-        //     EXACT string to both local pane.name and daemon record
+        //   * empty after trim → Cleared (None on daemon, "" locally)
+        //   * trimmed value passes `is_valid_display_name` → Applied
+        //     with that EXACT string on both local pane.name and the
+        //     daemon record
         //   * non-empty but fails validation (control bytes, oversized,
-        //     etc.) → reject the rename, don't touch local or daemon,
+        //     etc.) → Rejected — don't touch local or daemon,
         //     debug-log so the user can see why the label didn't update
+        //
+        // M2.11 fixup 5 — return the outcome so the dashboard rename
+        // handler can mirror the controller-resolved label into the UI
+        // display-name maps. Before this the UI inserted the raw
+        // rename text verbatim and diverged from the controller (a
+        // `"  newname  "` rename left the UI map padded; a
+        // control-byte rename slipped escapes into the dashboard
+        // title even though the controller rejected the change).
         //
         // Rejecting on invalid input (rather than silently falling back
         // to command/"shell") matches the user's intent: they typed
@@ -1358,7 +1367,7 @@ impl PaneController for EmbeddedPaneController {
                 pane_id = %pane_id,
                 "rename_pane: rejected — name contains invalid bytes after trim"
             );
-            return Ok(());
+            return Ok(RenameOutcome::Rejected);
         };
 
         // M2.11: snapshot the stream-backed agent id + cached cwd under
@@ -1402,8 +1411,9 @@ impl PaneController for EmbeddedPaneController {
             // reconnect.
             let client = DaemonClient::new(daemon_path);
             let agent_id_for_log = agent_id.clone();
+            let daemon_label = new_label.clone();
             runtime.spawn(async move {
-                if let Err(e) = client.set_agent_label(&agent_id, new_label, cwd).await {
+                if let Err(e) = client.set_agent_label(&agent_id, daemon_label, cwd).await {
                     tracing::debug!(
                         agent_id = %agent_id_for_log,
                         error = %e,
@@ -1412,7 +1422,10 @@ impl PaneController for EmbeddedPaneController {
                 }
             });
         }
-        Ok(())
+        Ok(match new_label {
+            Some(label) => RenameOutcome::Applied(label),
+            None => RenameOutcome::Cleared,
+        })
     }
 
     fn toggle_layout(&self) -> Result<(), PaneError> {
@@ -1510,7 +1523,8 @@ mod tests {
         let ctrl = EmbeddedPaneController::new();
         let id = ctrl.create_pane(None, None).unwrap();
 
-        ctrl.rename_pane(&id, "my-agent").unwrap();
+        let outcome = ctrl.rename_pane(&id, "my-agent").unwrap();
+        assert_eq!(outcome, RenameOutcome::Applied("my-agent".to_string()));
         let panes = ctrl.list_panes().unwrap();
         assert_eq!(panes[0].title, "my-agent");
 
@@ -1623,7 +1637,11 @@ mod tests {
     fn rename_pane_trims_surround_whitespace_on_local_backend() {
         let ctrl = EmbeddedPaneController::new();
         let id = ctrl.create_pane(None, None).unwrap();
-        ctrl.rename_pane(&id, "  newname  ").unwrap();
+        let outcome = ctrl.rename_pane(&id, "  newname  ").unwrap();
+        // Fixup 5: the controller now returns the trimmed canonical
+        // label so callers (the dashboard rename handler) can mirror
+        // it into the UI display-name maps without re-trimming.
+        assert_eq!(outcome, RenameOutcome::Applied("newname".to_string()));
         let panes = ctrl.list_panes().unwrap();
         let info = panes.iter().find(|p| p.pane_id == id).unwrap();
         assert_eq!(info.title, "newname");
@@ -1649,9 +1667,15 @@ mod tests {
             "baseline label before rejected rename"
         );
         // Rename with control bytes in the trimmed portion — must be a
-        // no-op (returns Ok, but pane.name is unchanged).
-        ctrl.rename_pane(&id, "  \x1b[31m  ")
+        // no-op (returns Ok(Rejected); pane.name unchanged).
+        let outcome = ctrl
+            .rename_pane(&id, "  \x1b[31m  ")
             .expect("rejected rename still returns Ok");
+        assert_eq!(
+            outcome,
+            RenameOutcome::Rejected,
+            "control-byte rename must report Rejected so the UI keeps the prior label"
+        );
         let panes = ctrl.list_panes().unwrap();
         let info = panes.iter().find(|p| p.pane_id == id).unwrap();
         assert_eq!(
@@ -1672,8 +1696,27 @@ mod tests {
     fn rename_pane_with_empty_string_succeeds_on_local_backend() {
         let ctrl = EmbeddedPaneController::new();
         let id = ctrl.create_pane(None, None).unwrap();
-        ctrl.rename_pane(&id, "")
+        let outcome = ctrl
+            .rename_pane(&id, "")
             .expect("empty rename must succeed");
+        // Fixup 5: empty input is a "clear" — callers must remove the
+        // corresponding entry from their UI display-name maps so the
+        // dashboard card falls back to the agent_id label.
+        assert_eq!(outcome, RenameOutcome::Cleared);
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    // PRD #76 M2.11 fixup 5 — whitespace-only input is also a "clear"
+    // (trim yields empty). Pins the outcome shape the dashboard
+    // handler now relies on to remove UI display-name entries.
+    #[test]
+    fn rename_pane_with_whitespace_only_returns_cleared() {
+        let ctrl = EmbeddedPaneController::new();
+        let id = ctrl.create_pane(None, None).unwrap();
+        let outcome = ctrl
+            .rename_pane(&id, "   ")
+            .expect("whitespace rename must succeed");
+        assert_eq!(outcome, RenameOutcome::Cleared);
         ctrl.close_pane(&id).unwrap();
     }
 

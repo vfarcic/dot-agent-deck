@@ -404,7 +404,7 @@ impl ModeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pane::{PaneDirection, PaneInfo};
+    use crate::pane::{PaneDirection, PaneInfo, RenameOutcome};
     use crate::project_config::{ModePersistentPane, ModeRule};
     use std::any::Any;
     use std::sync::Mutex;
@@ -448,12 +448,12 @@ mod tests {
             Ok(())
         }
 
-        fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError> {
+        fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
             self.renamed
                 .lock()
                 .unwrap()
                 .push((pane_id.to_string(), name.to_string()));
-            Ok(())
+            Ok(RenameOutcome::Applied(name.to_string()))
         }
 
         fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {

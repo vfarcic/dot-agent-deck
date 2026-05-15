@@ -31,6 +31,43 @@ pub struct PaneInfo {
     pub command: Option<String>,
 }
 
+/// Outcome of a [`PaneController::rename_pane`] call.
+///
+/// M2.11 fixup 5 — the rename path now returns what the controller
+/// actually did with the user-supplied text, so callers (the dashboard
+/// rename handler in particular) can mirror the EXACT label the
+/// controller stored on `Pane.name` (and queued for the daemon) into
+/// `ui.display_names` / `ui.pane_display_names`. Before this, the UI
+/// inserted the raw `ui.rename_text` verbatim, which diverged from
+/// the controller's trim + `is_valid_display_name` normalization (a
+/// `"  newname  "` rename left the dashboard map padded while the
+/// daemon stored `"newname"`, and a control-byte rename slipped
+/// terminal escapes into the dashboard card title even though the
+/// controller refused the change). This extends fixup 4's "single
+/// source of truth" pattern from create to rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameOutcome {
+    /// Controller accepted the rename; the included string is the
+    /// canonical label now stored on local `Pane.name` (and, for
+    /// stream-backed panes, queued for the daemon via
+    /// `set_agent_label`). Callers must mirror this exact string
+    /// into their UI display-name maps.
+    Applied(String),
+    /// Controller treated the rename as a "clear" — empty or
+    /// whitespace-only input. Local `Pane.name` is now empty and the
+    /// daemon (if any) will be sent `display_name: None` so hydrate
+    /// falls back to the agent_id on reconnect rather than restoring
+    /// a stale label. Callers should remove the corresponding entry
+    /// from their UI display-name maps.
+    Cleared,
+    /// Controller refused the rename because the trimmed value
+    /// failed `is_valid_display_name` (control bytes, oversized,
+    /// etc.). Neither local `Pane.name` nor the daemon was mutated;
+    /// callers must leave their UI display-name maps unchanged so
+    /// the previous label stays visible.
+    Rejected,
+}
+
 pub trait PaneController: Send + Sync {
     fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError>;
     fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError>;
@@ -58,6 +95,11 @@ pub trait PaneController: Send + Sync {
     ) -> Result<(String, String), PaneError> {
         let resolved = crate::agent_pty::resolve_display_name(display_name, command);
         let id = self.create_pane(command, cwd)?;
+        // Discard the RenameOutcome here: `resolved` is already the
+        // canonical resolved value (computed via the shared resolver),
+        // so the controller's outcome adds no new information for the
+        // create-then-rename path. The new outcome shape matters at
+        // the dashboard rename call site, not here.
         self.rename_pane(&id, &resolved)?;
         Ok((id, resolved))
     }
@@ -69,7 +111,13 @@ pub trait PaneController: Send + Sync {
         direction: PaneDirection,
         amount: u16,
     ) -> Result<(), PaneError>;
-    fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError>;
+    /// Rename a pane. Returns a [`RenameOutcome`] describing what the
+    /// controller actually did so callers (the dashboard rename
+    /// handler in particular) can mirror the controller-resolved
+    /// label into their UI display-name maps instead of inserting
+    /// the raw user input verbatim. See [`RenameOutcome`] for the
+    /// three states.
+    fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError>;
     fn toggle_layout(&self) -> Result<(), PaneError>;
     fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError>;
     fn name(&self) -> &str;

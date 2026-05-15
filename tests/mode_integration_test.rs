@@ -2,7 +2,7 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use dot_agent_deck::mode_manager::ModeManager;
-use dot_agent_deck::pane::{PaneController, PaneDirection, PaneError, PaneInfo};
+use dot_agent_deck::pane::{PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome};
 use dot_agent_deck::project_config::{
     CONFIG_FILE_NAME, ModeConfig, ModePersistentPane, ModeRule, load_project_config,
 };
@@ -53,12 +53,12 @@ impl PaneController for MockPaneController {
         Ok(())
     }
 
-    fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError> {
+    fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
         self.renamed
             .lock()
             .unwrap()
             .push((pane_id.to_string(), name.to_string()));
-        Ok(())
+        Ok(RenameOutcome::Applied(name.to_string()))
     }
 
     fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {

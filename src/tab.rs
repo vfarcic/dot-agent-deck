@@ -449,7 +449,7 @@ pub(crate) fn extract_new_bash_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pane::{PaneDirection, PaneError, PaneInfo};
+    use crate::pane::{PaneDirection, PaneError, PaneInfo, RenameOutcome};
     use crate::project_config::{
         ModePersistentPane, ModeRule, OrchestrationConfig, OrchestrationRoleConfig,
     };
@@ -493,8 +493,8 @@ mod tests {
             Ok(())
         }
 
-        fn rename_pane(&self, _pane_id: &str, _name: &str) -> Result<(), PaneError> {
-            Ok(())
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::Applied(name.to_string()))
         }
 
         fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {

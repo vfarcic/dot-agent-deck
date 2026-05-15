@@ -29,7 +29,7 @@ use dot_agent_deck::daemon_protocol::{
     write_frame,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
-use dot_agent_deck::pane::PaneController;
+use dot_agent_deck::pane::{PaneController, RenameOutcome};
 
 /// `bind_attach_listener` flips the process-global umask while binding;
 /// share a lock with the rest of the M-series tests so concurrent tempdir
@@ -909,6 +909,154 @@ async fn rename_pane_with_control_chars_is_rejected_on_daemon() {
         Some("baseline"),
         "rejected rename must NOT mutate AgentRecord.display_name"
     );
+
+    server.registry.shutdown_all();
+    drop(ctrl);
+}
+
+// ---------------------------------------------------------------------------
+// PRD #76 M2.11 fixup 5 — controller-returned RenameOutcome shape.
+// These pin the wire-level promise the dashboard now relies on: the
+// controller-resolved label that lands in `Pane.name` (and on the
+// daemon-side `AgentRecord.display_name`) is the SAME string returned
+// to the caller as `RenameOutcome::Applied(...)`, so the UI maps can
+// be mirrored from a single source of truth instead of being filled
+// from the raw rename_text. Together with the in-crate unit tests
+// (`src/ui.rs::apply_rename_outcome_*` and
+// `src/embedded_pane.rs::rename_pane_*`) they cover the full path.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_outcome_applied_carries_trimmed_label_for_surround_whitespace() {
+    let server = start_real_server().await;
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let (pane_id, _) = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane_with_display_name(
+                Some("sh -c 'sleep 30'"),
+                Some("/tmp"),
+                Some("initial"),
+            )
+        })
+        .await
+        .unwrap()
+        .expect("create_pane_with_display_name")
+    };
+
+    let outcome = {
+        let id_for_call = pane_id.clone();
+        let ctrl_clone = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl_clone.rename_pane(&id_for_call, "  newname  "))
+            .await
+            .unwrap()
+            .expect("rename_pane")
+    };
+
+    // The dashboard mirrors this exact string into both display-name
+    // maps. Without fixup 5 the UI inserted the raw `"  newname  "`
+    // while the daemon stored `"newname"` — diverging by design.
+    assert_eq!(
+        outcome,
+        RenameOutcome::Applied("newname".to_string()),
+        "Applied outcome must carry the trimmed canonical label"
+    );
+
+    server.registry.shutdown_all();
+    drop(ctrl);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_outcome_rejected_for_control_bytes() {
+    let server = start_real_server().await;
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let (pane_id, _) = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane_with_display_name(
+                Some("sh -c 'sleep 30'"),
+                Some("/tmp"),
+                Some("baseline"),
+            )
+        })
+        .await
+        .unwrap()
+        .expect("create_pane_with_display_name")
+    };
+
+    let outcome = {
+        let id_for_call = pane_id.clone();
+        let ctrl_clone = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl_clone.rename_pane(&id_for_call, "  \x1b[31m  "))
+            .await
+            .unwrap()
+            .expect("rejected rename still returns Ok")
+    };
+
+    // The dashboard now keys off this outcome to leave its display
+    // maps unchanged. Before fixup 5 the raw ESC bytes landed in
+    // `ui.pane_display_names` and `ui.display_names`, so the card
+    // title rendered the control sequence even though the daemon
+    // (and local Pane.name) were never mutated.
+    assert_eq!(
+        outcome,
+        RenameOutcome::Rejected,
+        "Rejected outcome is the signal the dashboard needs to keep the prior label"
+    );
+
+    server.registry.shutdown_all();
+    drop(ctrl);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_outcome_cleared_for_empty_and_whitespace() {
+    let server = start_real_server().await;
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let (pane_id, _) = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane_with_display_name(
+                Some("sh -c 'sleep 30'"),
+                Some("/tmp"),
+                Some("initial"),
+            )
+        })
+        .await
+        .unwrap()
+        .expect("create_pane_with_display_name")
+    };
+
+    let outcome_empty = {
+        let id_for_call = pane_id.clone();
+        let ctrl_clone = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl_clone.rename_pane(&id_for_call, ""))
+            .await
+            .unwrap()
+            .expect("rename_pane empty")
+    };
+    assert_eq!(outcome_empty, RenameOutcome::Cleared);
+
+    let outcome_ws = {
+        let id_for_call = pane_id.clone();
+        let ctrl_clone = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl_clone.rename_pane(&id_for_call, "   "))
+            .await
+            .unwrap()
+            .expect("rename_pane whitespace")
+    };
+    assert_eq!(outcome_ws, RenameOutcome::Cleared);
 
     server.registry.shutdown_all();
     drop(ctrl);

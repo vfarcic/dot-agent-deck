@@ -19,7 +19,7 @@ use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::config_validation::sanitize_role_name;
 use crate::embedded_pane::EmbeddedPaneController;
 use crate::event::{AgentType, EventType};
-use crate::pane::{PaneController, PaneError};
+use crate::pane::{PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
@@ -1632,10 +1632,53 @@ fn rename_commit_value(key: KeyEvent, rename_text: &str) -> Option<String> {
     matches!(key.code, KeyCode::Enter).then(|| rename_text.to_string())
 }
 
+/// Apply a [`RenameOutcome`] returned by `PaneController::rename_pane`
+/// to the dashboard's two display-name maps (`display_names` keyed
+/// by session_id, `pane_display_names` keyed by pane_id). Pulled out
+/// of the inline match in `run_app` so the mirroring rules are
+/// directly unit-testable without a full TUI harness — the
+/// dashboard rename path's correctness is now `controller-outcome
+/// → these maps`, with no separate UI-side normalization that could
+/// drift from the controller (PRD #76 M2.11 fixup 5).
+///
+/// Semantics:
+/// * `Applied(name)` — insert the trimmed canonical label into
+///   both maps so the dashboard card title and any later
+///   session-restart restore reflect EXACTLY what the controller
+///   stored on `Pane.name` (and queued for the daemon).
+/// * `Cleared` — remove the entry from both maps so the card
+///   falls back to the agent_id-based default; matches the
+///   controller's `display_name: None` clear on the daemon side.
+/// * `Rejected` — leave both maps untouched; the prior label
+///   stays visible because the controller refused to mutate
+///   anything.
+fn apply_rename_outcome(
+    display_names: &mut HashMap<String, String>,
+    pane_display_names: &mut HashMap<String, String>,
+    session_id: &str,
+    pane_id: &str,
+    outcome: RenameOutcome,
+) {
+    match outcome {
+        RenameOutcome::Applied(name) => {
+            display_names.insert(session_id.to_string(), name.clone());
+            pane_display_names.insert(pane_id.to_string(), name);
+        }
+        RenameOutcome::Cleared => {
+            display_names.remove(session_id);
+            pane_display_names.remove(pane_id);
+        }
+        RenameOutcome::Rejected => {
+            // No-op by design. Re-asserting the prior label would
+            // require a redundant clone; the maps already hold it.
+        }
+    }
+}
+
 fn handle_rename_key(
     key: KeyEvent,
     ui: &mut UiState,
-    selected_session_id: Option<&str>,
+    _selected_session_id: Option<&str>,
 ) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
@@ -1647,15 +1690,16 @@ fn handle_rename_key(
             ui.rename_text.clear();
             ui.mode = UiMode::Normal;
         }
+        // M2.11 fixup 5 — handler no longer writes to ui.display_names.
+        // The dashboard dispatch loop calls `pane.rename_pane` and
+        // mirrors the controller-returned RenameOutcome into both
+        // display-name maps so the UI reflects EXACTLY what the
+        // controller stored (a `"  newname  "` rename lands as
+        // `"newname"`; a control-byte rename leaves the existing
+        // label intact). Writing the raw rename_text here would
+        // re-introduce the divergence reviewer P2 / auditor LOW
+        // flagged in fixup 4.
         KeyCode::Enter => {
-            if let Some(id) = selected_session_id {
-                if ui.rename_text.is_empty() {
-                    ui.display_names.remove(id);
-                } else {
-                    ui.display_names
-                        .insert(id.to_string(), ui.rename_text.clone());
-                }
-            }
             ui.rename_text.clear();
             ui.mode = UiMode::Normal;
         }
@@ -3174,14 +3218,17 @@ pub fn run_tui(
                     UiMode::Help => handle_help_key(key, &mut ui),
                     UiMode::Rename => {
                         // Capture commit intent before the handler clears
-                        // `rename_text`. handle_rename_key only mutates
-                        // ui.display_names; we still need to call
-                        // `pane.rename_pane` so the daemon updates its
-                        // AgentRecord.display_name. Empty/whitespace-only
-                        // text is a "clear" — rename_pane treats that as
-                        // a daemon-side `None`, so hydrate falls back to
-                        // the agent_id on reconnect rather than restoring
-                        // a stale label (PRD #76 M2.11 reviewer P1).
+                        // `rename_text`. M2.11 fixup 5 — the dispatch
+                        // loop drives both the controller call AND the
+                        // UI display-name maps so the dashboard mirrors
+                        // EXACTLY the controller-resolved label
+                        // (Applied → trimmed canonical; Cleared → remove
+                        // entries; Rejected → leave existing label
+                        // intact). Empty/whitespace-only text reaches
+                        // the controller as a "clear" → daemon-side
+                        // `None`, so hydrate falls back to the agent_id
+                        // on reconnect rather than restoring a stale
+                        // label (PRD #76 M2.11 reviewer P1).
                         let commit = rename_commit_value(key, &ui.rename_text);
                         let r = handle_rename_key(key, &mut ui, selected_id.as_deref());
                         if let Some(new_name) = commit
@@ -3194,7 +3241,22 @@ pub fn run_tui(
                             // transient daemon failures, and the daemon
                             // RPC is spawned off the UI thread so a
                             // wedged daemon can't freeze the renderer.
-                            let _ = pane.rename_pane(pane_id, &new_name);
+                            match pane.rename_pane(pane_id, &new_name) {
+                                Ok(outcome) => apply_rename_outcome(
+                                    &mut ui.display_names,
+                                    &mut ui.pane_display_names,
+                                    sid,
+                                    pane_id,
+                                    outcome,
+                                ),
+                                Err(e) => {
+                                    tracing::debug!(
+                                        pane_id = %pane_id,
+                                        error = %e,
+                                        "rename_pane returned an error; UI maps unchanged"
+                                    );
+                                }
+                            }
                         }
                         r
                     }
@@ -3577,17 +3639,19 @@ pub fn run_tui(
                 KeyResult::Continue => {}
             }
 
-            // Keep pane_display_names in sync with display_names
-            // so renames persist across session restarts.
-            for (sid, session) in &snapshot.sessions {
-                if let Some(ref pane_id) = session.pane_id {
-                    if let Some(name) = ui.display_names.get(sid) {
-                        ui.pane_display_names.insert(pane_id.clone(), name.clone());
-                    } else {
-                        ui.pane_display_names.remove(pane_id);
-                    }
-                }
-            }
+            // M2.11 fixup 5 — the deferred display_names ↔
+            // pane_display_names mirror that used to live here was
+            // the path that copied raw rename_text into
+            // pane_display_names (so a `"  newname  "` rename
+            // landed as `"  newname  "` in the dashboard while the
+            // controller stored `"newname"`). Both maps are now
+            // updated inline by the Rename dispatch arm above
+            // using the controller-returned RenameOutcome, and
+            // every other write path already touches both maps
+            // (the new-pane handler, the apply-pending-names
+            // block, and the restore paths). Reintroducing the
+            // deferred mirror would re-open the divergence
+            // reviewer P2 / auditor LOW flagged.
 
             // In PaneInput mode, drain remaining events to reduce typing latency.
             // In all other modes, break immediately to re-render so UI state
@@ -6412,8 +6476,17 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
     }
 
+    // M2.11 fixup 5 — handle_rename_key no longer writes to
+    // ui.display_names on Enter; the dispatch loop now calls
+    // `pane.rename_pane` first and mirrors the controller-returned
+    // RenameOutcome into both display-name maps. These tests pin
+    // the residual handler responsibilities: clearing rename_text
+    // and returning to Normal mode. The full commit pathway (handler
+    // → controller → UI maps) is covered by
+    // `tests/m2_agent_metadata.rs::rename_outcome_*` and
+    // `rename_pane_*_on_local_backend` in this crate.
     #[test]
-    fn test_rename_commits_on_enter() {
+    fn test_rename_handler_clears_buffer_and_exits_on_enter() {
         let mut ui = default_ui();
         ui.mode = UiMode::Rename;
         ui.rename_text = "my-agent".to_string();
@@ -6425,14 +6498,24 @@ mod tests {
         );
 
         assert_eq!(ui.mode, UiMode::Normal);
-        assert_eq!(
-            ui.display_names.get("session-123"),
-            Some(&"my-agent".to_string())
+        assert!(
+            ui.rename_text.is_empty(),
+            "rename_text must be cleared after Enter"
+        );
+        // Crucially: handler does NOT touch display_names. The
+        // dispatch loop mirrors the controller's RenameOutcome
+        // into the maps so the raw input never reaches them.
+        assert!(
+            !ui.display_names.contains_key("session-123"),
+            "handler must not insert raw rename_text into display_names"
         );
     }
 
     #[test]
-    fn test_rename_empty_removes_name() {
+    fn test_rename_handler_preserves_existing_label_on_enter() {
+        // Even when the handler runs with non-empty rename_text, it
+        // must not mutate display_names — the dispatch loop owns
+        // both maps now, gated by the RenameOutcome.
         let mut ui = default_ui();
         ui.display_names
             .insert("s1".to_string(), "old-name".to_string());
@@ -6446,7 +6529,12 @@ mod tests {
         );
 
         assert_eq!(ui.mode, UiMode::Normal);
-        assert!(!ui.display_names.contains_key("s1"));
+        assert_eq!(
+            ui.display_names.get("s1"),
+            Some(&"old-name".to_string()),
+            "handler must NOT remove existing display_names entry — \
+             the dispatch loop owns that based on RenameOutcome::Cleared"
+        );
     }
 
     #[test]
@@ -7855,12 +7943,12 @@ mod tests {
             Ok(())
         }
 
-        fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError> {
+        fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
             self.renamed
                 .lock()
                 .unwrap()
                 .push((pane_id.to_string(), name.to_string()));
-            Ok(())
+            Ok(RenameOutcome::Applied(name.to_string()))
         }
 
         fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
@@ -7947,6 +8035,108 @@ mod tests {
             let key = KeyEvent::new(code, KeyModifiers::NONE);
             assert_eq!(rename_commit_value(key, "anything"), None);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #76 M2.11 fixup 5 — `apply_rename_outcome` is the single
+    // place that mutates the dashboard's two display-name maps in
+    // response to a `PaneController::rename_pane` result. These
+    // tests pin the three outcome branches the dispatch loop now
+    // relies on. Together with the controller-side outcome tests
+    // in `src/embedded_pane.rs::rename_pane_*` and the daemon
+    // round-trip tests in `tests/m2_agent_metadata.rs`, they cover
+    // the full path: raw rename text → controller-resolved label
+    // → UI map mirror.
+    // -----------------------------------------------------------------------
+
+    fn make_rename_maps(
+        sid: &str,
+        pane_id: &str,
+        label: &str,
+    ) -> (HashMap<String, String>, HashMap<String, String>) {
+        let mut display = HashMap::new();
+        let mut pane = HashMap::new();
+        display.insert(sid.to_string(), label.to_string());
+        pane.insert(pane_id.to_string(), label.to_string());
+        (display, pane)
+    }
+
+    /// Reviewer P2 / Auditor LOW: surround-whitespace input must
+    /// mirror the controller's trimmed label, not the raw text.
+    /// Before fixup 5 the dashboard mirror stored `"  newname  "`
+    /// while the controller (and the daemon) stored `"newname"`.
+    #[test]
+    fn apply_rename_outcome_applied_overwrites_both_maps_with_trimmed_name() {
+        let (mut display, mut pane) = make_rename_maps("s1", "p1", "old");
+        apply_rename_outcome(
+            &mut display,
+            &mut pane,
+            "s1",
+            "p1",
+            RenameOutcome::Applied("newname".to_string()),
+        );
+        assert_eq!(display.get("s1"), Some(&"newname".to_string()));
+        assert_eq!(pane.get("p1"), Some(&"newname".to_string()));
+    }
+
+    /// Reviewer P2 / Auditor LOW: a rename rejected by the
+    /// controller (control bytes after trim) must NOT touch the UI
+    /// maps. Before fixup 5 the raw `\x1b[31m` text landed in the
+    /// dashboard mirror and emitted terminal escapes into the card
+    /// title even though the controller correctly refused the
+    /// mutation locally and on the daemon.
+    #[test]
+    fn apply_rename_outcome_rejected_leaves_both_maps_unchanged() {
+        let (mut display, mut pane) = make_rename_maps("s1", "p1", "good-name");
+        apply_rename_outcome(&mut display, &mut pane, "s1", "p1", RenameOutcome::Rejected);
+        assert_eq!(
+            display.get("s1"),
+            Some(&"good-name".to_string()),
+            "Rejected outcome must NOT mutate display_names"
+        );
+        assert_eq!(
+            pane.get("p1"),
+            Some(&"good-name".to_string()),
+            "Rejected outcome must NOT mutate pane_display_names"
+        );
+    }
+
+    /// Reviewer P1 (extended): empty/whitespace rename text reaches
+    /// the controller as a "clear" → `RenameOutcome::Cleared`. The
+    /// UI mirror must remove the entries from BOTH maps so the
+    /// card falls back to the agent_id-based default label,
+    /// matching what hydrate would produce against the daemon's
+    /// `display_name: None`.
+    #[test]
+    fn apply_rename_outcome_cleared_removes_entries_from_both_maps() {
+        let (mut display, mut pane) = make_rename_maps("s1", "p1", "old");
+        apply_rename_outcome(&mut display, &mut pane, "s1", "p1", RenameOutcome::Cleared);
+        assert!(
+            !display.contains_key("s1"),
+            "Cleared must remove display_names entry"
+        );
+        assert!(
+            !pane.contains_key("p1"),
+            "Cleared must remove pane_display_names entry"
+        );
+    }
+
+    /// First-time rename (no prior label): Applied must still
+    /// populate both maps. Guards against a regression where the
+    /// helper only updates existing entries.
+    #[test]
+    fn apply_rename_outcome_applied_inserts_when_no_prior_label() {
+        let mut display: HashMap<String, String> = HashMap::new();
+        let mut pane: HashMap<String, String> = HashMap::new();
+        apply_rename_outcome(
+            &mut display,
+            &mut pane,
+            "s1",
+            "p1",
+            RenameOutcome::Applied("foo".to_string()),
+        );
+        assert_eq!(display.get("s1"), Some(&"foo".to_string()));
+        assert_eq!(pane.get("p1"), Some(&"foo".to_string()));
     }
 
     // -----------------------------------------------------------------------

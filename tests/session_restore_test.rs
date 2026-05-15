@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use dot_agent_deck::config::{SavedPane, SavedSession};
-use dot_agent_deck::pane::{PaneController, PaneDirection, PaneError, PaneInfo};
+use dot_agent_deck::pane::{PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome};
 use dot_agent_deck::project_config::{CONFIG_FILE_NAME, load_project_config};
 use dot_agent_deck::tab::TabManager;
 
@@ -91,8 +91,8 @@ impl PaneController for MockPaneController {
         Ok(())
     }
 
-    fn rename_pane(&self, _pane_id: &str, _name: &str) -> Result<(), PaneError> {
-        Ok(())
+    fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+        Ok(RenameOutcome::Applied(name.to_string()))
     }
 
     fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
