@@ -1103,6 +1103,24 @@ fn compute_bell_needed(
     (need_bell, new_status_map)
 }
 
+/// Compute the effective in-session display name for a newly created pane,
+/// mirroring the fallback that `EmbeddedPaneController::create_pane_with_display_name`
+/// (and its `create_stream_pane` / `create_local_pane` callees) apply: a trimmed
+/// non-empty `req.name` wins; otherwise fall back to the command string, or
+/// `"shell"` when no command was supplied. This keeps `ui.pane_display_names`
+/// in sync with the controller- and daemon-side label for the brand-new pane,
+/// so a whitespace-only form Name (e.g. `"   "`) doesn't render as a blank label
+/// in the current session even though hydrate-from-daemon would self-heal it on
+/// reconnect (PRD #76 M2.11 reviewer P2).
+fn effective_new_pane_display_name(req_name: &str, command: Option<&str>) -> String {
+    let trimmed = req_name.trim();
+    if trimmed.is_empty() {
+        command.unwrap_or("shell").to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Key handling
 // ---------------------------------------------------------------------------
@@ -3410,11 +3428,21 @@ pub fn run_tui(
                                             Some(dir_str.clone()),
                                         );
                                     }
-                                    if !req.name.is_empty() {
-                                        ui.pane_display_names
-                                            .insert(new_id.clone(), req.name.clone());
-                                        ui.pane_names.insert(new_id.clone(), req.name.clone());
-                                    }
+                                    // Mirror the controller's fallback so a whitespace-only
+                                    // form Name (which `create_pane_with_display_name`
+                                    // turned into the command-or-"shell" fallback for both
+                                    // the local Pane.name and the daemon's StartAgent
+                                    // label) doesn't get overwritten here with the raw
+                                    // whitespace. Without this, `"   "` would render as a
+                                    // blank label in the current TUI session even though
+                                    // the daemon record is correct and reconnect would
+                                    // self-heal it via `hydrate_from_daemon`
+                                    // (PRD #76 M2.11 reviewer P2).
+                                    let effective_name =
+                                        effective_new_pane_display_name(&req.name, cmd);
+                                    ui.pane_display_names
+                                        .insert(new_id.clone(), effective_name.clone());
+                                    ui.pane_names.insert(new_id.clone(), effective_name);
                                     let mode_name_for_save =
                                         req.mode_config.as_ref().map(|m| m.name.clone());
                                     ui.pane_metadata.insert(
@@ -5514,6 +5542,51 @@ mod tests {
         assert_eq!(format_elapsed(now - Duration::seconds(60)), "1m ago");
         assert_eq!(format_elapsed(now - Duration::seconds(3900)), "1h 5m ago");
         assert_eq!(format_elapsed(now - Duration::seconds(3600)), "1h ago");
+    }
+
+    // PRD #76 M2.11 reviewer P2: in-session pane label must not show as
+    // whitespace when the form Name is whitespace-only. The controller and
+    // daemon already fall back to command-or-"shell", and this helper
+    // mirrors that fallback so `ui.pane_display_names` stays in sync with
+    // the controller-side label even before any hydrate-from-daemon round
+    // trip.
+
+    #[test]
+    fn effective_display_name_whitespace_falls_back_to_command() {
+        assert_eq!(
+            effective_new_pane_display_name("   ", Some("vim")),
+            "vim",
+            "whitespace-only Name with a command must fall back to the command"
+        );
+    }
+
+    #[test]
+    fn effective_display_name_whitespace_with_no_command_falls_back_to_shell() {
+        assert_eq!(
+            effective_new_pane_display_name("\t  \n", None),
+            "shell",
+            "whitespace-only Name with no command must fall back to \"shell\""
+        );
+    }
+
+    #[test]
+    fn effective_display_name_empty_falls_back_to_command_or_shell() {
+        assert_eq!(effective_new_pane_display_name("", Some("htop")), "htop");
+        assert_eq!(effective_new_pane_display_name("", None), "shell");
+    }
+
+    #[test]
+    fn effective_display_name_uses_trimmed_value_when_non_empty() {
+        assert_eq!(
+            effective_new_pane_display_name("valid", Some("vim")),
+            "valid",
+            "non-empty Name beats the command fallback"
+        );
+        assert_eq!(
+            effective_new_pane_display_name("  trimmed  ", Some("vim")),
+            "trimmed",
+            "surrounding whitespace is stripped from the stored label"
+        );
     }
 
     #[test]
