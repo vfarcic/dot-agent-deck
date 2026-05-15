@@ -1,8 +1,9 @@
-# PRD #85: Remote Environments Documentation
+# PRD #87: Remote Environments Documentation
 
 **Status**: Planning
 **Priority**: Medium
 **Created**: 2026-05-16
+**GitHub Issue**: [#87](https://github.com/vfarcic/dot-agent-deck/issues/87)
 **Depends on**: PRD #76 (Remote Agent Environments) being shipped first.
 
 ## Problem Statement

@@ -192,7 +192,7 @@ The local-deck path (no `connect`, no remote) is unchanged: TUI spawns daemon as
 
 ### Documentation deliverables
 
-Documentation work for this feature is owned by [PRD #85](85-remote-environments-docs.md) so it can ship on its own release schedule once the code path here is validated end-to-end. The three drafted pages (`docs/remote-environments.md`, `docs/remote-recipes.md`, `docs/remote-requirements.md`) live on disk as the working draft but are intentionally **not** in `site/sidebars.js` — the published docs site is unchanged by this PRD.
+Documentation work for this feature is owned by [PRD #87](87-remote-environments-docs.md) so it can ship on its own release schedule once the code path here is validated end-to-end. The three drafted pages (`docs/remote-environments.md`, `docs/remote-recipes.md`, `docs/remote-requirements.md`) live on disk as the working draft but are intentionally **not** in `site/sidebars.js` — the published docs site is unchanged by this PRD.
 
 ## Success Criteria
 
@@ -247,7 +247,7 @@ PRD #81 picks up its own milestones (image, manifest, `remote add --type=kuberne
 
 ### Phase 5: Documentation and release
 
-Moved to [PRD #85](85-remote-environments-docs.md). The earlier M5.1–M5.5 work on this branch wrote three new pages (`docs/remote-environments.md`, `docs/remote-recipes.md`, `docs/remote-requirements.md`) but they are intentionally **not added to `site/sidebars.js`** so the published docs site is unchanged. The pages remain on disk as the starting draft for PRD #85 to take to release. Cross-references in `docs/getting-started.mdx` and `docs/installation.md` were reverted to the pre-PRD-76 state for the same reason. Changelog fragment + release are owned by PRD #85.
+Moved to [PRD #87](87-remote-environments-docs.md). The earlier M5.1–M5.5 work on this branch wrote three new pages (`docs/remote-environments.md`, `docs/remote-recipes.md`, `docs/remote-requirements.md`) but they are intentionally **not added to `site/sidebars.js`** so the published docs site is unchanged. The pages remain on disk as the starting draft for PRD #85 to take to release. Cross-references in `docs/getting-started.mdx` and `docs/installation.md` were reverted to the pre-PRD-76 state for the same reason. Changelog fragment + release are owned by PRD #87.
 
 ## Key Files
 
