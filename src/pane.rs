@@ -243,4 +243,28 @@ mod tests {
         assert_eq!(RenameOutcome::applied("   "), RenameOutcome::Cleared);
         assert_eq!(RenameOutcome::applied("\t \n"), RenameOutcome::Cleared);
     }
+
+    #[test]
+    fn rename_outcome_applied_rejects_oversized_label() {
+        // Mirror the daemon-side cap (`is_valid_display_name` rejects
+        // > DISPLAY_NAME_MAX_LEN = 128 bytes after trim). A 129-byte
+        // payload must surface as Rejected so the UI never mirrors a
+        // label the daemon would refuse to store — otherwise the
+        // dashboard map and `AgentRecord.display_name` would diverge.
+        let oversized = "a".repeat(crate::agent_pty::DISPLAY_NAME_MAX_LEN + 1);
+        assert_eq!(RenameOutcome::applied(&oversized), RenameOutcome::Rejected);
+    }
+
+    #[test]
+    fn rename_outcome_applied_accepts_unicode_label() {
+        // `is_valid_display_name` allows bytes ≥ 0x20 (control bytes
+        // and DEL are the only thing filtered), so legitimate UTF-8
+        // labels — kanji, emoji, accented Latin — must round-trip as
+        // Applied with the trimmed bytes preserved. Pads with
+        // surrounding whitespace to exercise the trim step too.
+        assert_eq!(
+            RenameOutcome::applied("  café-агент-日本語  "),
+            RenameOutcome::Applied("café-агент-日本語".to_string())
+        );
+    }
 }

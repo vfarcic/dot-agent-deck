@@ -7948,7 +7948,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((pane_id.to_string(), name.to_string()));
-            Ok(RenameOutcome::Applied(name.to_string()))
+            Ok(RenameOutcome::applied(name))
         }
 
         fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
