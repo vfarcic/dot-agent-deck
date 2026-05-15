@@ -23,10 +23,16 @@ use crate::pane::{PaneController, PaneDirection, PaneError, PaneInfo};
 pub struct HydratedPane {
     /// Local pane id assigned by the controller.
     pub pane_id: String,
-    /// Daemon-side agent id this pane is attached to. The TUI uses this as
-    /// the default display name on rehydration since the daemon does not
-    /// track per-agent display metadata (PRD #76 M2.x).
+    /// Daemon-side agent id this pane is attached to.
     pub agent_id: String,
+    /// Display name as last stored on the daemon (M2.11). `None` means
+    /// either the agent was started without a name or the daemon ran an
+    /// older binary that didn't persist it. Callers fall back to
+    /// `agent_id` in that case.
+    pub display_name: Option<String>,
+    /// Working directory captured at spawn time on the daemon (M2.11).
+    /// `None` mirrors the same forward-compat reasoning as `display_name`.
+    pub cwd: Option<String>,
 }
 
 /// PTY-backed pane state: this process owns the PTY master and child. The
@@ -137,6 +143,12 @@ struct Pane {
     is_focused: bool,
     /// The command that was used to create this pane.
     command: Option<String>,
+    /// Working directory recorded at spawn time (M2.11). Cached here so the
+    /// rename flow can re-send it alongside the new display_name in
+    /// `set_agent_label` — the daemon-side API uses `None to clear`
+    /// semantics, so callers that want to update one field must echo
+    /// the other.
+    cwd: Option<String>,
     /// Whether the child app has enabled mouse reporting (e.g., TUI apps like opencode).
     mouse_mode: Arc<AtomicBool>,
     /// Hyperlink URLs extracted from OSC 8 escape sequences, keyed by screen row.
@@ -239,44 +251,6 @@ impl EmbeddedPaneController {
         let mut ids: Vec<String> = panes.keys().cloned().collect();
         ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
         ids
-    }
-
-    /// True when this controller delegates to a daemon (PRD #76
-    /// `RemoteDeckLocal` mode). The TUI uses this to decide whether the
-    /// M2.11 organizational-state persistence path applies — in
-    /// `LocalDeck` the in-process daemon dies with the TUI, so the file
-    /// would never be read back.
-    pub fn is_remote(&self) -> bool {
-        matches!(self.mode, ControllerMode::RemoteDeckLocal { .. })
-    }
-
-    /// Tokio runtime handle this controller was built against, when
-    /// running in `RemoteDeckLocal` mode. The TUI passes it to the
-    /// M2.11 debounced state-persistence writer so the writer can spawn
-    /// on the same runtime as the daemon I/O tasks (avoiding a second
-    /// runtime just for a single fsync task).
-    pub fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
-        match &self.mode {
-            ControllerMode::RemoteDeckLocal { runtime, .. } => Some(runtime.clone()),
-            ControllerMode::LocalDeck => None,
-        }
-    }
-
-    /// Return `(pane_id, agent_id)` pairs for every stream-backed pane
-    /// in insertion order. PTY-backed panes have no daemon agent id and
-    /// are skipped. Used by the M2.11 state-persistence sampler to map
-    /// in-memory display names back to daemon-stable keys.
-    pub fn stream_agent_ids(&self) -> Vec<(String, String)> {
-        let panes = self.panes.lock().unwrap();
-        let mut pairs: Vec<(String, String)> = panes
-            .iter()
-            .filter_map(|(pane_id, pane)| match &pane.backend {
-                PaneBackend::Stream(s) => Some((pane_id.clone(), s.agent_id.clone())),
-                PaneBackend::Pty(_) => None,
-            })
-            .collect();
-        pairs.sort_by_key(|(id, _)| id.parse::<u64>().unwrap_or(0));
-        pairs
     }
 
     /// Get the currently focused pane ID, if any.
@@ -436,6 +410,7 @@ impl EmbeddedPaneController {
         } = agent_pty::spawn(SpawnOptions {
             command,
             cwd,
+            display_name: None,
             rows: 24,
             cols: 80,
             env,
@@ -480,6 +455,7 @@ impl EmbeddedPaneController {
             name: command.unwrap_or("shell").to_string(),
             is_focused: false,
             command: command.map(|c| c.to_string()),
+            cwd: cwd.map(|c| c.to_string()),
             mouse_mode,
             hyperlinks,
         };
@@ -506,9 +482,18 @@ impl EmbeddedPaneController {
         // this UI's pane.
         let env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
 
+        // Default display_name mirrors the pane-name fallback below: the
+        // command if supplied, else "shell". Lets the daemon stash a
+        // reasonable label even when the user creates a pane without a
+        // custom name, so reconnects don't lose the agent's identity to
+        // the bare numeric agent_id. The TUI overwrites this via
+        // `set_pane_label` whenever the user types a real name.
+        let default_label = command.unwrap_or("shell").to_string();
+
         let opts = StartAgentOptions {
             command: command.map(|c| c.to_string()),
             cwd: cwd.map(|c| c.to_string()),
+            display_name: Some(default_label.clone()),
             rows: 24,
             cols: 80,
             env,
@@ -527,14 +512,16 @@ impl EmbeddedPaneController {
             })
             .map_err(|e| PaneError::CommandFailed(format!("daemon: {e}")))?;
 
-        let name = command.unwrap_or("shell").to_string();
+        let name = default_label;
         let command = command.map(|c| c.to_string());
+        let cwd_stored = cwd.map(|c| c.to_string());
         self.wire_stream_pane(
             pane_id.clone(),
             agent_id,
             conn,
             name,
             command,
+            cwd_stored,
             runtime,
             daemon_path,
         );
@@ -559,6 +546,7 @@ impl EmbeddedPaneController {
         conn: AttachConnection,
         name: String,
         command: Option<String>,
+        cwd: Option<String>,
         runtime: tokio::runtime::Handle,
         daemon_path: PathBuf,
     ) {
@@ -677,6 +665,7 @@ impl EmbeddedPaneController {
             name,
             is_focused: false,
             command,
+            cwd,
             mouse_mode,
             hyperlinks,
         };
@@ -846,19 +835,29 @@ impl EmbeddedPaneController {
                 None => self.allocate_id(),
             };
             used_ids.insert(pane_id.clone());
-            // Use agent_id as the pane name. Daemon-side metadata (display
-            // name, cwd, modes) is not persisted yet — the user can rename
-            // via the existing rename flow.
+            // M2.11: prefer the daemon-stored display_name when present,
+            // falling back to agent_id when older daemons omit it. Pane
+            // metadata (cwd) is also lifted from the record so the
+            // dashboard's cwd column survives a reconnect.
+            let display_name = record.display_name.clone();
+            let cwd_record = record.cwd.clone();
+            let pane_name = display_name.clone().unwrap_or_else(|| agent_id.clone());
             self.wire_stream_pane(
                 pane_id.clone(),
                 agent_id.clone(),
                 conn,
-                agent_id.clone(),
+                pane_name,
                 None,
+                cwd_record.clone(),
                 runtime.clone(),
                 daemon_path.clone(),
             );
-            hydrated.push(HydratedPane { pane_id, agent_id });
+            hydrated.push(HydratedPane {
+                pane_id,
+                agent_id,
+                display_name,
+                cwd: cwd_record,
+            });
         }
         hydrated
     }
@@ -1257,6 +1256,7 @@ impl PaneController for EmbeddedPaneController {
                             name: pane.name,
                             is_focused: pane.is_focused,
                             command: pane.command,
+                            cwd: pane.cwd,
                             mouse_mode: pane.mouse_mode,
                             hyperlinks: pane.hyperlinks,
                         };
@@ -1305,15 +1305,50 @@ impl PaneController for EmbeddedPaneController {
     }
 
     fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError> {
-        let mut panes = self.panes.lock().unwrap();
-        if let Some(pane) = panes.get_mut(pane_id) {
+        // M2.11: snapshot the stream-backed agent id + cached cwd under
+        // the pane lock, then release the lock before the blocking
+        // daemon call. Keeps the rename path lock-light — a stalled
+        // daemon can't freeze the renderer. The cwd echo matters
+        // because `set_agent_label` uses "None to clear" semantics; if
+        // we passed `cwd: None` here every rename would erase the
+        // daemon-stored cwd captured at spawn time.
+        let stream_update: Option<(String, Option<String>, tokio::runtime::Handle, PathBuf)> = {
+            let mut panes = self.panes.lock().unwrap();
+            let pane = panes
+                .get_mut(pane_id)
+                .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
             pane.name = name.to_string();
-            Ok(())
-        } else {
-            Err(PaneError::CommandFailed(format!(
-                "Pane {pane_id} not found"
-            )))
+            match &pane.backend {
+                PaneBackend::Stream(s) => Some((
+                    s.agent_id.clone(),
+                    pane.cwd.clone(),
+                    s.runtime.clone(),
+                    s.daemon_path.clone(),
+                )),
+                PaneBackend::Pty(_) => None,
+            }
+        };
+        if let Some((agent_id, cwd, runtime, daemon_path)) = stream_update {
+            // Best-effort daemon update — if the daemon is slow or
+            // gone, the local rename has already taken effect and a
+            // subsequent reconnect will sync from whatever state the
+            // daemon does have. We deliberately don't propagate the
+            // error so a transient daemon hiccup can't make the rename
+            // look broken to the user.
+            let client = DaemonClient::new(daemon_path);
+            let agent_id_for_log = agent_id.clone();
+            let new_label = name.to_string();
+            if let Err(e) =
+                runtime.block_on(client.set_agent_label(&agent_id, Some(new_label), cwd))
+            {
+                tracing::debug!(
+                    agent_id = %agent_id_for_log,
+                    error = %e,
+                    "rename_pane: set_agent_label failed — local rename kept, daemon will resync on next reconnect"
+                );
+            }
         }
+        Ok(())
     }
 
     fn toggle_layout(&self) -> Result<(), PaneError> {

@@ -47,6 +47,12 @@ pub enum ClientError {
 pub struct StartAgentOptions {
     pub command: Option<String>,
     pub cwd: Option<String>,
+    /// Human-readable label captured into the daemon's per-agent registry
+    /// (M2.11). Forwarded as `AttachRequest::StartAgent.display_name`; the
+    /// daemon validates it via `is_valid_display_name` and stores `None`
+    /// on failure. `None` here omits the field from the wire payload so
+    /// older daemons keep accepting the request.
+    pub display_name: Option<String>,
     pub rows: u16,
     pub cols: u16,
     pub env: Vec<(String, String)>,
@@ -57,6 +63,7 @@ impl Default for StartAgentOptions {
         Self {
             command: None,
             cwd: None,
+            display_name: None,
             rows: 24,
             cols: 80,
             env: Vec::new(),
@@ -167,6 +174,8 @@ impl DaemonClient {
             .map(|id| AgentRecord {
                 id,
                 pane_id_env: None,
+                display_name: None,
+                cwd: None,
             })
             .collect())
     }
@@ -177,6 +186,7 @@ impl DaemonClient {
         let req = AttachRequest::StartAgent {
             command: opts.command,
             cwd: opts.cwd,
+            display_name: opts.display_name,
             rows: opts.rows,
             cols: opts.cols,
             env: opts.env,
@@ -212,6 +222,40 @@ impl DaemonClient {
         if !resp.ok {
             return Err(ClientError::Server(
                 resp.error.unwrap_or_else(|| "resize failed".into()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Update the daemon-side display_name and/or cwd for an agent (M2.11).
+    /// Passing `None` for either field clears it. The daemon validates both
+    /// values independently and silently drops anything that fails — see
+    /// `AgentPtyRegistry::set_agent_label` for the rules. Best-effort: the
+    /// TUI calls this from the rename flow on every keystroke commit, so a
+    /// transient daemon error here is logged at the call site, not
+    /// propagated.
+    pub async fn set_agent_label(
+        &self,
+        id: &str,
+        display_name: Option<String>,
+        cwd: Option<String>,
+    ) -> Result<(), ClientError> {
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::SetAgentLabel {
+                id: id.to_string(),
+                display_name,
+                cwd,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "set-agent-label failed".into()),
             ));
         }
         Ok(())

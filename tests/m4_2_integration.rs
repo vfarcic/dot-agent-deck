@@ -166,6 +166,7 @@ async fn end_to_end_lifecycle_start_attach_detach_reattach_stop() {
             &AttachRequest::StartAgent {
                 command: Some("/bin/sh".into()),
                 cwd: None,
+                display_name: None,
                 rows: 24,
                 cols: 80,
                 env: vec![],

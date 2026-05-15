@@ -63,6 +63,41 @@ pub fn is_valid_pane_id_env(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// Maximum byte length the daemon will accept for a per-agent display name
+/// (M2.11). Anything longer is rejected and the agent's display_name is
+/// recorded as `None`. 128 bytes is roughly four times the visible width
+/// of a typical tab label; well past that and we're paying for storage we
+/// can never render anyway.
+pub const DISPLAY_NAME_MAX_LEN: usize = 128;
+
+/// Maximum byte length the daemon will accept for a per-agent cwd (M2.11),
+/// matching the conventional PATH_MAX on Linux/macOS. The daemon stores the
+/// value verbatim — paths legitimately contain a wide range of bytes — but
+/// caps the length so a buggy or hostile same-user peer can't push
+/// `list_agents` past [`crate::daemon_protocol::MAX_FRAME_LEN`] with one
+/// pathological cwd.
+pub const CWD_MAX_LEN: usize = 4096;
+
+/// Returns `true` if `value` is a well-formed display name: non-empty,
+/// ≤ [`DISPLAY_NAME_MAX_LEN`] bytes, and free of ASCII control characters
+/// (bytes < 0x20 plus 0x7F DEL). Unicode beyond 0x7F is allowed so the
+/// user can type UTF-8 names. Rejects values containing ANSI escapes,
+/// NUL, newlines, carriage returns, etc. — anything that could perturb
+/// the TUI render path when echoed back via `list_agents`.
+pub fn is_valid_display_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= DISPLAY_NAME_MAX_LEN
+        && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
+}
+
+/// Returns `true` if `value` is acceptable to retain as a cwd: non-empty
+/// and ≤ [`CWD_MAX_LEN`] bytes. Path content is otherwise allowed verbatim
+/// — paths legitimately contain spaces, dots, and any byte except NUL,
+/// and the daemon does not interpret the value beyond stashing it.
+pub fn is_valid_cwd(value: &str) -> bool {
+    !value.is_empty() && value.len() <= CWD_MAX_LEN
+}
+
 #[derive(Debug, Error)]
 pub enum AgentPtyError {
     #[error("Failed to open PTY: {0}")]
@@ -87,6 +122,11 @@ pub struct SpawnOptions<'a> {
     pub command: Option<&'a str>,
     /// Working directory for the spawned process.
     pub cwd: Option<&'a str>,
+    /// Optional human-readable label for the agent (M2.11). Captured into
+    /// `RunningAgent::display_name` and echoed back to clients via
+    /// `list_agents` so renamed panes survive a reconnect. The PTY child
+    /// itself does not see this value; it lives only in the registry.
+    pub display_name: Option<&'a str>,
     /// Initial PTY size.
     pub rows: u16,
     pub cols: u16,
@@ -99,6 +139,7 @@ impl Default for SpawnOptions<'_> {
         Self {
             command: None,
             cwd: None,
+            display_name: None,
             rows: 24,
             cols: 80,
             env: Vec::new(),
@@ -422,6 +463,20 @@ pub struct RunningAgent {
     /// pane id) would be rejected by `AppState::apply_event` after a
     /// reconnect, silently dropping delegate / work-done signals.
     pub pane_id_env: Option<String>,
+    /// Human-readable label assigned by the user (M2.11). Captured from
+    /// [`SpawnOptions::display_name`] at spawn time and updated via
+    /// [`AgentPtyRegistry::set_agent_label`] whenever the TUI renames the
+    /// pane. Replayed via `list_agents` on reconnect so renamed panes keep
+    /// their names across ssh drops. Values are filtered through
+    /// [`is_valid_display_name`]; failing strings are stored as `None`.
+    pub display_name: Option<String>,
+    /// Working directory the agent was launched in (M2.11). Mirrors
+    /// [`SpawnOptions::cwd`] when supplied and validated by [`is_valid_cwd`];
+    /// updateable via [`AgentPtyRegistry::set_agent_label`] so a TUI that
+    /// learns the cwd after spawn (e.g. via a hook event) can persist it
+    /// alongside the display name. Echoed back to clients via `list_agents`
+    /// so the dashboard cwd column survives a reconnect.
+    pub cwd: Option<String>,
 }
 
 /// Snapshot of one daemon-side agent that the M2.x rehydration path needs.
@@ -436,6 +491,18 @@ pub struct AgentRecord {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_id_env: Option<String>,
+    /// Display name as last set on the daemon (M2.11). `None` means either
+    /// the agent was spawned without a label or the value failed
+    /// [`is_valid_display_name`] validation. `skip_serializing_if` keeps
+    /// the wire shape backwards-compatible with older clients that don't
+    /// know about this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Working directory the agent was launched in, if recorded (M2.11).
+    /// `None` when neither the original spawn nor a later `SetAgentLabel`
+    /// supplied a value, or when the supplied value failed [`is_valid_cwd`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// In-process registry of agent PTYs owned by the daemon. M1.1 only exposed
@@ -524,6 +591,35 @@ impl AgentPtyRegistry {
                 }
             });
 
+        // M2.11: capture display_name and cwd into the registry so renamed
+        // panes survive a reconnect. Both go through the same validation
+        // helpers used by [`set_agent_label`] so the wire-format invariants
+        // (no control chars in display_name, bounded length) hold the same
+        // way whether the value arrived via the initial StartAgent or via a
+        // later SetAgentLabel.
+        let display_name = opts.display_name.and_then(|v| {
+            if is_valid_display_name(v) {
+                Some(v.to_string())
+            } else {
+                tracing::debug!(
+                    len = v.len(),
+                    "spawn_agent: dropping caller-supplied display_name — fails validation"
+                );
+                None
+            }
+        });
+        let cwd_stored = opts.cwd.and_then(|v| {
+            if is_valid_cwd(v) {
+                Some(v.to_string())
+            } else {
+                tracing::debug!(
+                    len = v.len(),
+                    "spawn_agent: dropping caller-supplied cwd from registry — fails validation (child still sees it)"
+                );
+                None
+            }
+        });
+
         // Defense in depth: `spawn` already protects the child internally
         // via its own `ChildGuard`, so any failure or panic *inside* spawn
         // cannot orphan the child. This outer `PtyGuard` covers the
@@ -553,6 +649,8 @@ impl AgentPtyRegistry {
             writer: Arc::new(AsyncMutex::new(writer)),
             bus,
             pane_id_env,
+            display_name,
+            cwd: cwd_stored,
         };
 
         let id = inner.next_id.to_string();
@@ -669,10 +767,55 @@ impl AgentPtyRegistry {
             .map(|(id, agent)| AgentRecord {
                 id: id.clone(),
                 pane_id_env: agent.pane_id_env.clone(),
+                display_name: agent.display_name.clone(),
+                cwd: agent.cwd.clone(),
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
         records
+    }
+
+    /// Update the per-agent display name and cwd captured in the registry
+    /// (M2.11). Each value is validated independently — invalid display
+    /// names are rejected and stored as `None`, invalid cwds likewise.
+    /// Passing `None` clears the corresponding field. Returns
+    /// [`AgentPtyError::NotFound`] if the agent id is unknown.
+    pub fn set_agent_label(
+        &self,
+        id: &str,
+        display_name: Option<String>,
+        cwd: Option<String>,
+    ) -> Result<(), AgentPtyError> {
+        let display_name = display_name.and_then(|v| {
+            if is_valid_display_name(&v) {
+                Some(v)
+            } else {
+                tracing::debug!(
+                    len = v.len(),
+                    "set_agent_label: dropping display_name — fails validation"
+                );
+                None
+            }
+        });
+        let cwd = cwd.and_then(|v| {
+            if is_valid_cwd(&v) {
+                Some(v)
+            } else {
+                tracing::debug!(
+                    len = v.len(),
+                    "set_agent_label: dropping cwd — fails validation"
+                );
+                None
+            }
+        });
+        let mut inner = self.inner.lock().unwrap();
+        let agent = inner
+            .agents
+            .get_mut(id)
+            .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+        agent.display_name = display_name;
+        agent.cwd = cwd;
+        Ok(())
     }
 
     /// Number of agents currently owned by the registry.

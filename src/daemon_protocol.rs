@@ -196,6 +196,11 @@ pub enum AttachRequest {
         cols: u16,
         #[serde(default)]
         env: Vec<(String, String)>,
+        /// M2.11: human-readable label captured into the daemon's per-agent
+        /// state. `skip_serializing_if` keeps the on-the-wire shape
+        /// backwards-compatible with daemons predating this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
     },
     StopAgent {
         id: String,
@@ -215,6 +220,17 @@ pub enum AttachRequest {
         id: String,
         rows: u16,
         cols: u16,
+    },
+    /// M2.11: update the daemon-side display_name and cwd for an agent.
+    /// Either field may be `None` to clear it. Used by the TUI's rename
+    /// flow so renamed panes survive an ssh drop without a separate file
+    /// on disk — the daemon's per-agent state is the source of truth.
+    SetAgentLabel {
+        id: String,
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
 }
 
@@ -384,6 +400,7 @@ async fn handle_connection(
             rows,
             cols,
             env,
+            display_name,
         } => {
             // Trust boundary: same OS user, same exec capability — see the
             // `AttachRequest::StartAgent` docs. We forward `command`/`cwd`/
@@ -406,6 +423,7 @@ async fn handle_connection(
             let opts = SpawnOptions {
                 command: command.as_deref(),
                 cwd: cwd.as_deref(),
+                display_name: display_name.as_deref(),
                 rows,
                 cols,
                 env,
@@ -416,6 +434,14 @@ async fn handle_connection(
             }
         }
         AttachRequest::StopAgent { id } => match registry.close_agent(&id) {
+            Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
+            Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+        },
+        AttachRequest::SetAgentLabel {
+            id,
+            display_name,
+            cwd,
+        } => match registry.set_agent_label(&id, display_name, cwd) {
             Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
@@ -645,13 +671,69 @@ mod tests {
             rows: 24,
             cols: 80,
             env: vec![("FOO".into(), "BAR".into())],
+            display_name: Some("auditor".into()),
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
         match back {
-            AttachRequest::StartAgent { command, env, .. } => {
+            AttachRequest::StartAgent {
+                command,
+                env,
+                display_name,
+                ..
+            } => {
                 assert_eq!(command.as_deref(), Some("/bin/sh"));
                 assert_eq!(env, vec![("FOO".to_string(), "BAR".to_string())]);
+                assert_eq!(display_name.as_deref(), Some("auditor"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn start_agent_omits_display_name_when_none() {
+        // Forward compat: older daemons must accept a StartAgent payload
+        // that doesn't carry `display_name`, and the field must not be
+        // present in JSON when it's None.
+        let req = AttachRequest::StartAgent {
+            command: Some("/bin/sh".into()),
+            cwd: None,
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            display_name: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("display_name"),
+            "display_name=None should be omitted from the wire payload"
+        );
+    }
+
+    #[test]
+    fn set_agent_label_serde_round_trip() {
+        let req = AttachRequest::SetAgentLabel {
+            id: "7".into(),
+            display_name: Some("coder".into()),
+            cwd: Some("/tmp/work".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["op"], "set-agent-label");
+        assert_eq!(v["id"], "7");
+        assert_eq!(v["display_name"], "coder");
+        assert_eq!(v["cwd"], "/tmp/work");
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            AttachRequest::SetAgentLabel {
+                id,
+                display_name,
+                cwd,
+            } => {
+                assert_eq!(id, "7");
+                assert_eq!(display_name.as_deref(), Some("coder"));
+                assert_eq!(cwd.as_deref(), Some("/tmp/work"));
             }
             _ => panic!("wrong variant"),
         }

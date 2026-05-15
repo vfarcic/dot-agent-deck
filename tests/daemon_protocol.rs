@@ -107,6 +107,7 @@ async fn start_agent(server: &Server, command: &str) -> String {
         &AttachRequest::StartAgent {
             command: Some(command.into()),
             cwd: None,
+            display_name: None,
             rows: 24,
             cols: 80,
             env: vec![],
@@ -412,6 +413,7 @@ async fn start_agent_rejects_blank_command() {
         &AttachRequest::StartAgent {
             command: Some("   ".into()),
             cwd: None,
+            display_name: None,
             rows: 24,
             cols: 80,
             env: vec![],
