@@ -3157,7 +3157,32 @@ pub fn run_tui(
                     UiMode::Normal => handle_normal_key(key, &mut ui, total),
                     UiMode::Filter => handle_filter_key(key, &mut ui),
                     UiMode::Help => handle_help_key(key, &mut ui),
-                    UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
+                    UiMode::Rename => {
+                        // Capture commit intent before the handler clears
+                        // `rename_text`. handle_rename_key only mutates
+                        // ui.display_names; we still need to call
+                        // `pane.rename_pane` so the daemon updates its
+                        // AgentRecord.display_name. Without this the rename
+                        // is lost on reconnect, since hydrate_from_daemon
+                        // reads the daemon's stored label
+                        // (PRD #76 M2.11 reviewer P1).
+                        let commit = matches!(key.code, KeyCode::Enter)
+                            .then(|| ui.rename_text.clone())
+                            .filter(|t| !t.is_empty());
+                        let r = handle_rename_key(key, &mut ui, selected_id.as_deref());
+                        if let Some(new_name) = commit
+                            && let Some(ref sid) = selected_id
+                            && let Some(session) = snapshot.sessions.get(sid)
+                            && let Some(ref pane_id) = session.pane_id
+                        {
+                            // Best-effort daemon update — rename_pane's
+                            // own error path already logs and swallows
+                            // transient daemon failures so the local UI
+                            // never freezes on a slow RPC.
+                            let _ = pane.rename_pane(pane_id, &new_name);
+                        }
+                        r
+                    }
                     UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
                     UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
                     UiMode::PaneInput => handle_pane_input_key(key),
@@ -3342,7 +3367,20 @@ pub fn run_tui(
                             } else {
                                 Some(req.command.as_str())
                             };
-                            match pane.create_pane(cmd, Some(&dir_str)) {
+                            // Thread the form's Name through to `StartAgent.display_name`
+                            // so a disconnect or crash between create and rename can't
+                            // persist the command-based fallback label on the daemon
+                            // (PRD #76 M2.11 reviewer P2). The post-start `rename_pane`
+                            // call that previously sat at this site is now redundant —
+                            // the daemon already has the right label, and
+                            // `create_pane_with_display_name` set the local pane.name.
+                            let form_name = if req.name.is_empty() {
+                                None
+                            } else {
+                                Some(req.name.as_str())
+                            };
+                            match pane.create_pane_with_display_name(cmd, Some(&dir_str), form_name)
+                            {
                                 Ok(new_id) => {
                                     // Register so only events from our panes are accepted,
                                     // and create a placeholder session for an immediate dashboard card.
@@ -3355,7 +3393,6 @@ pub fn run_tui(
                                         );
                                     }
                                     if !req.name.is_empty() {
-                                        let _ = pane.rename_pane(&new_id, &req.name);
                                         ui.pane_display_names
                                             .insert(new_id.clone(), req.name.clone());
                                         ui.pane_names.insert(new_id.clone(), req.name.clone());

@@ -229,6 +229,188 @@ async fn display_name_with_control_chars_is_dropped_to_none() {
     server.registry.shutdown_all();
 }
 
+// Reviewer P1: a dashboard rename must reach the daemon through
+// `SetAgentLabel` and show up in `list_agents`. The dashboard handler is
+// awkward to drive at the TUI level (it depends on terminal state and
+// the live `PaneController`), so we cover the wire pathway it now uses:
+// `pane.rename_pane` ultimately invokes `DaemonClient::set_agent_label`,
+// and the daemon must reflect the new name. A separate per-PaneController
+// test (`rename_pane_propagates_display_name_change_for_stream_panes` in
+// `src/embedded_pane.rs`) would require a live daemon socket harness;
+// this integration test pins the wire shape end-to-end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dashboard_rename_propagates_through_set_agent_label() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    let id = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            display_name: Some("old-name".into()),
+            cwd: Some("/tmp".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent");
+
+    // This is the exact call the rename-Enter handler now makes via
+    // `pane.rename_pane`: new label, cwd echoed so "None means clear"
+    // doesn't erase the spawn-time cwd.
+    client
+        .set_agent_label(
+            &id,
+            Some("renamed-in-dashboard".into()),
+            Some("/tmp".into()),
+        )
+        .await
+        .expect("set_agent_label");
+
+    let rec = find_record(&client.list_agents().await.unwrap(), &id);
+    assert_eq!(rec.display_name.as_deref(), Some("renamed-in-dashboard"));
+    assert_eq!(
+        rec.cwd.as_deref(),
+        Some("/tmp"),
+        "cwd must survive the rename — set_agent_label clears with None"
+    );
+
+    server.registry.shutdown_all();
+}
+
+// Reviewer P2: the new-pane form's Name must reach the daemon in the
+// initial `StartAgent` RPC, not via a follow-up rename. We exercise the
+// wire path the form now uses: `StartAgent.display_name = form_name`
+// lands in `AgentRecord.display_name` directly, no command-based
+// fallback window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_pane_form_name_lands_in_start_agent_display_name() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    // Form-name differs from command so a regression that fell back to
+    // `command.unwrap_or("shell")` would be visible.
+    let form_name = "my-orchestrator";
+    let id = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            display_name: Some(form_name.into()),
+            cwd: Some("/tmp".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent");
+
+    let rec = find_record(&client.list_agents().await.unwrap(), &id);
+    assert_eq!(
+        rec.display_name.as_deref(),
+        Some(form_name),
+        "form Name must reach AgentRecord.display_name, not the command fallback"
+    );
+    // Negative side of the assertion — the previous code would have set
+    // `display_name = Some("sh -c 'sleep 30'")` until a follow-up
+    // SetAgentLabel landed.
+    assert_ne!(rec.display_name.as_deref(), Some("sh -c 'sleep 30'"));
+
+    server.registry.shutdown_all();
+}
+
+// Auditor MED: cwd must reject ASCII control characters so a hostile
+// `SetAgentLabel` can't smuggle terminal escape sequences into the
+// dashboard's basename render at `src/ui.rs:5069-5105`. Mirrors the
+// existing `display_name_with_control_chars_is_dropped_to_none` test —
+// cwd now uses the same filter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cwd_with_control_chars_is_dropped_to_none() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    let id = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            display_name: Some("ok".into()),
+            // Don't pass a control-char cwd through StartAgent — that
+            // would also be the child's CWD and spawn would fail. We
+            // exercise the registry filter via SetAgentLabel, which
+            // doesn't touch the child.
+            cwd: Some("/tmp".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent");
+
+    // ESC (0x1b) — the exact byte the auditor flagged, in the canonical
+    // payload `/tmp/\x1b[31mpwn`.
+    client
+        .set_agent_label(&id, Some("ok".into()), Some("/tmp/\x1b[31mpwn".into()))
+        .await
+        .expect("set_agent_label call itself should succeed");
+    let rec = find_record(&client.list_agents().await.unwrap(), &id);
+    assert!(
+        rec.cwd.is_none(),
+        "ESC in cwd must be rejected, got {:?}",
+        rec.cwd
+    );
+
+    // NUL (0x00).
+    client
+        .set_agent_label(&id, Some("ok".into()), Some("/tmp/\x00pwn".into()))
+        .await
+        .expect("set_agent_label call itself should succeed");
+    let rec = find_record(&client.list_agents().await.unwrap(), &id);
+    assert!(
+        rec.cwd.is_none(),
+        "NUL in cwd must be rejected, got {:?}",
+        rec.cwd
+    );
+
+    // DEL (0x7f) — the upper bound the display-name filter rejects.
+    client
+        .set_agent_label(&id, Some("ok".into()), Some("/tmp/\x7fpwn".into()))
+        .await
+        .expect("set_agent_label call itself should succeed");
+    let rec = find_record(&client.list_agents().await.unwrap(), &id);
+    assert!(
+        rec.cwd.is_none(),
+        "DEL (0x7f) in cwd must be rejected, got {:?}",
+        rec.cwd
+    );
+
+    server.registry.shutdown_all();
+}
+
+// Auditor MED (positive case): the control-char filter must NOT reject
+// legitimate UTF-8 paths. Accented characters encode as bytes > 0x7F
+// (e.g. 'é' → 0xc3 0xa9), which the filter explicitly allows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cwd_with_unicode_path_is_accepted() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    let id = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            display_name: Some("ok".into()),
+            cwd: Some("/tmp".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent");
+
+    let unicode_cwd = "/home/usér/projet";
+    client
+        .set_agent_label(&id, Some("ok".into()), Some(unicode_cwd.into()))
+        .await
+        .expect("set_agent_label");
+
+    let rec = find_record(&client.list_agents().await.unwrap(), &id);
+    assert_eq!(
+        rec.cwd.as_deref(),
+        Some(unicode_cwd),
+        "UTF-8 cwd must round-trip unchanged"
+    );
+
+    server.registry.shutdown_all();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cwd_oversize_is_dropped_to_none() {
     let server = start_real_server().await;

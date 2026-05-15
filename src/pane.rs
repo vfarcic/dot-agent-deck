@@ -34,6 +34,28 @@ pub struct PaneInfo {
 pub trait PaneController: Send + Sync {
     fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError>;
     fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError>;
+    /// Create a pane and apply a display name in one step. The default impl
+    /// composes `create_pane` + `rename_pane`, which is fine for local-PTY
+    /// backends. The stream-backed `EmbeddedPaneController` overrides this
+    /// so the name reaches the daemon via `StartAgent.display_name` —
+    /// otherwise a disconnect or crash between `create_pane` and
+    /// `rename_pane` would persist the command-based fallback name on the
+    /// daemon and lose the user's chosen Name on the next reconnect
+    /// (PRD #76 M2.11 reviewer P2).
+    fn create_pane_with_display_name(
+        &self,
+        command: Option<&str>,
+        cwd: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Result<String, PaneError> {
+        let id = self.create_pane(command, cwd)?;
+        if let Some(name) = display_name
+            && !name.is_empty()
+        {
+            self.rename_pane(&id, name)?;
+        }
+        Ok(id)
+    }
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError>;
     fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError>;
     fn resize_pane(

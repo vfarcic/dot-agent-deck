@@ -398,6 +398,7 @@ impl EmbeddedPaneController {
         pane_id: String,
         command: Option<&str>,
         cwd: Option<&str>,
+        display_name: Option<&str>,
     ) -> Result<String, PaneError> {
         // Tag the spawned process so hooks can identify which pane it belongs to.
         let env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
@@ -452,7 +453,11 @@ impl EmbeddedPaneController {
                 master,
             }),
             screen: parser,
-            name: command.unwrap_or("shell").to_string(),
+            // Prefer the form-supplied Name so the local-PTY pane shows
+            // the same label remote panes get baked into StartAgent.
+            name: display_name
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| command.unwrap_or("shell").to_string()),
             is_focused: false,
             command: command.map(|c| c.to_string()),
             cwd: cwd.map(|c| c.to_string()),
@@ -474,6 +479,7 @@ impl EmbeddedPaneController {
         pane_id: String,
         command: Option<&str>,
         cwd: Option<&str>,
+        display_name: Option<&str>,
         client: DaemonClient,
         runtime: tokio::runtime::Handle,
     ) -> Result<String, PaneError> {
@@ -482,18 +488,22 @@ impl EmbeddedPaneController {
         // this UI's pane.
         let env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
 
-        // Default display_name mirrors the pane-name fallback below: the
-        // command if supplied, else "shell". Lets the daemon stash a
-        // reasonable label even when the user creates a pane without a
-        // custom name, so reconnects don't lose the agent's identity to
-        // the bare numeric agent_id. The TUI overwrites this via
-        // `set_pane_label` whenever the user types a real name.
-        let default_label = command.unwrap_or("shell").to_string();
+        // Prefer the caller-supplied Name (from the new-pane form) so the
+        // user's chosen label reaches the daemon in the same `StartAgent`
+        // RPC that spawns the agent. Without this, a disconnect or crash
+        // between `start-agent` and the follow-up `SetAgentLabel` would
+        // persist the command-based fallback name on the daemon and lose
+        // the user's choice on the next reconnect (PRD #76 M2.11
+        // reviewer P2). Fall back to command (or "shell") when the form
+        // Name is empty.
+        let label = display_name
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| command.unwrap_or("shell").to_string());
 
         let opts = StartAgentOptions {
             command: command.map(|c| c.to_string()),
             cwd: cwd.map(|c| c.to_string()),
-            display_name: Some(default_label.clone()),
+            display_name: Some(label.clone()),
             rows: 24,
             cols: 80,
             env,
@@ -512,7 +522,7 @@ impl EmbeddedPaneController {
             })
             .map_err(|e| PaneError::CommandFailed(format!("daemon: {e}")))?;
 
-        let name = default_label;
+        let name = label;
         let command = command.map(|c| c.to_string());
         let cwd_stored = cwd.map(|c| c.to_string());
         self.wire_stream_pane(
@@ -1180,18 +1190,37 @@ impl PaneController for EmbeddedPaneController {
     }
 
     fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError> {
+        self.create_pane_with_display_name(command, cwd, None)
+    }
+
+    fn create_pane_with_display_name(
+        &self,
+        command: Option<&str>,
+        cwd: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Result<String, PaneError> {
         // The pane ID is allocated up front because it has to be injected into
         // the child's environment as DOT_AGENT_DECK_PANE_ID. If the spawn
         // below fails, the ID is intentionally consumed (a gap in the
         // sequence is harmless and avoids racing concurrent `create_pane`
         // calls to revert the counter).
         let pane_id = self.allocate_id();
+        // Treat empty as absent so callers can pass form fields verbatim
+        // without an extra is_empty check at every call site.
+        let display_name = display_name.filter(|n| !n.is_empty());
 
         match &self.mode {
-            ControllerMode::LocalDeck => self.create_local_pane(pane_id, command, cwd),
-            ControllerMode::RemoteDeckLocal { client, runtime } => {
-                self.create_stream_pane(pane_id, command, cwd, client.clone(), runtime.clone())
+            ControllerMode::LocalDeck => {
+                self.create_local_pane(pane_id, command, cwd, display_name)
             }
+            ControllerMode::RemoteDeckLocal { client, runtime } => self.create_stream_pane(
+                pane_id,
+                command,
+                cwd,
+                display_name,
+                client.clone(),
+                runtime.clone(),
+            ),
         }
     }
 

@@ -90,12 +90,15 @@ pub fn is_valid_display_name(value: &str) -> bool {
         && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
 }
 
-/// Returns `true` if `value` is acceptable to retain as a cwd: non-empty
-/// and ≤ [`CWD_MAX_LEN`] bytes. Path content is otherwise allowed verbatim
-/// — paths legitimately contain spaces, dots, and any byte except NUL,
-/// and the daemon does not interpret the value beyond stashing it.
+/// Returns `true` if `value` is acceptable to retain as a cwd: non-empty,
+/// ≤ [`CWD_MAX_LEN`] bytes, and free of ASCII control characters (bytes
+/// < 0x20 plus 0x7F DEL). Mirrors the [`is_valid_display_name`] filter so
+/// the dashboard, which renders `cwd`'s basename through `Span::raw`,
+/// can't be tricked into emitting terminal control sequences via a
+/// hostile `SetAgentLabel` like `/tmp/\x1b[31mpwn`. Unicode beyond 0x7F
+/// stays valid (paths are UTF-8 and legitimately contain accented bytes).
 pub fn is_valid_cwd(value: &str) -> bool {
-    !value.is_empty() && value.len() <= CWD_MAX_LEN
+    !value.is_empty() && value.len() <= CWD_MAX_LEN && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
 }
 
 #[derive(Debug, Error)]
