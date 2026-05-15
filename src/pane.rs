@@ -52,6 +52,19 @@ pub enum RenameOutcome {
     /// stream-backed panes, queued for the daemon via
     /// `set_agent_label`). Callers must mirror this exact string
     /// into their UI display-name maps.
+    ///
+    /// **Invariant**: the inner `String` must be the trimmed value of
+    /// the user's input and must satisfy
+    /// [`crate::agent_pty::is_valid_display_name`]. The only correct
+    /// way to construct this variant outside a context that has just
+    /// validated the label itself (the production controller, or a
+    /// test using a statically known-valid literal) is via
+    /// [`RenameOutcome::applied`] — which trims, validates, and falls
+    /// back to [`RenameOutcome::Cleared`] / [`RenameOutcome::Rejected`]
+    /// for invalid input. Bypassing the constructor with raw user
+    /// input would allow padded or control-byte labels into UI
+    /// display-name maps and break the fixup-5 normalization
+    /// guarantee (PRD #76 M2.11 fixup-5 auditor LOW).
     Applied(String),
     /// Controller treated the rename as a "clear" — empty or
     /// whitespace-only input. Local `Pane.name` is now empty and the
@@ -66,6 +79,40 @@ pub enum RenameOutcome {
     /// callers must leave their UI display-name maps unchanged so
     /// the previous label stays visible.
     Rejected,
+}
+
+impl RenameOutcome {
+    /// Construct a [`RenameOutcome`] from raw user-supplied rename text,
+    /// applying the same trim + validation rules the production
+    /// controller (`EmbeddedPaneController::rename_pane`) uses. This is
+    /// the single canonical way to derive a `RenameOutcome` from
+    /// untrusted input: it guarantees the [`Applied`](Self::Applied)
+    /// invariant by routing invalid bytes to [`Rejected`](Self::Rejected)
+    /// and empty/whitespace-only input to [`Cleared`](Self::Cleared).
+    ///
+    /// Mock `PaneController::rename_pane` implementations should call
+    /// this instead of constructing `Applied(name.to_string())` directly
+    /// — otherwise a test driving invalid input through a mock would
+    /// produce an `Applied` value that violates the documented variant
+    /// invariant and could falsely prove the UI accepts unvalidated
+    /// labels (PRD #76 M2.11 fixup-5 auditor LOW).
+    ///
+    /// Semantics, matching the production controller:
+    /// - Trim the input.
+    /// - Empty after trim → [`Cleared`](Self::Cleared).
+    /// - Non-empty + [`crate::agent_pty::is_valid_display_name`] →
+    ///   [`Applied`](Self::Applied) with the trimmed label.
+    /// - Non-empty + invalid → [`Rejected`](Self::Rejected).
+    pub fn applied(name: impl AsRef<str>) -> Self {
+        let trimmed = name.as_ref().trim();
+        if trimmed.is_empty() {
+            Self::Cleared
+        } else if crate::agent_pty::is_valid_display_name(trimmed) {
+            Self::Applied(trimmed.to_string())
+        } else {
+            Self::Rejected
+        }
+    }
 }
 
 pub trait PaneController: Send + Sync {
@@ -142,5 +189,58 @@ mod tests {
         let ctrl = detect_multiplexer();
         assert_eq!(ctrl.name(), "embedded");
         assert!(ctrl.is_available());
+    }
+
+    // M2.11 fixup 6 — pin the typed `RenameOutcome::applied` constructor
+    // semantics. These tests are what makes the constructor a meaningful
+    // type-level guarantee: callers (production controller + mocks) can
+    // route raw user input through one function and trust the three
+    // documented outcomes, instead of repeating the trim + validation
+    // dance and risking divergence (PRD #76 M2.11 fixup-5 auditor LOW).
+
+    #[test]
+    fn rename_outcome_applied_returns_applied_for_valid_input() {
+        assert_eq!(
+            RenameOutcome::applied("foo"),
+            RenameOutcome::Applied("foo".to_string())
+        );
+    }
+
+    #[test]
+    fn rename_outcome_applied_trims_surrounding_whitespace() {
+        // Matches the production controller's trim semantics so the
+        // dashboard map can't end up storing a padded label.
+        assert_eq!(
+            RenameOutcome::applied("  foo  "),
+            RenameOutcome::Applied("foo".to_string())
+        );
+        assert_eq!(
+            RenameOutcome::applied("\tbar\n"),
+            RenameOutcome::Applied("bar".to_string())
+        );
+    }
+
+    #[test]
+    fn rename_outcome_applied_rejects_control_bytes() {
+        // ANSI ESC after trim — the canonical "garbage that would slip
+        // into the dashboard title" case. Must NOT become Applied.
+        assert_eq!(RenameOutcome::applied("\x1b[31m"), RenameOutcome::Rejected);
+        assert_eq!(
+            RenameOutcome::applied("  \x1b[31mevil  "),
+            RenameOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn rename_outcome_applied_treats_empty_as_cleared() {
+        assert_eq!(RenameOutcome::applied(""), RenameOutcome::Cleared);
+    }
+
+    #[test]
+    fn rename_outcome_applied_treats_whitespace_only_as_cleared() {
+        // User's "clear" intent — must map to Cleared so the daemon-side
+        // field is cleared rather than stored as a blank label.
+        assert_eq!(RenameOutcome::applied("   "), RenameOutcome::Cleared);
+        assert_eq!(RenameOutcome::applied("\t \n"), RenameOutcome::Cleared);
     }
 }

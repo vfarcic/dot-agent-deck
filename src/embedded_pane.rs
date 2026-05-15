@@ -1357,17 +1357,24 @@ impl PaneController for EmbeddedPaneController {
         // to command/"shell") matches the user's intent: they typed
         // garbage, so the existing label stays put instead of being
         // replaced with an unrelated string they didn't ask for.
-        let trimmed = name.trim();
-        let new_label: Option<String> = if trimmed.is_empty() {
-            None
-        } else if agent_pty::is_valid_display_name(trimmed) {
-            Some(trimmed.to_string())
-        } else {
-            tracing::debug!(
-                pane_id = %pane_id,
-                "rename_pane: rejected — name contains invalid bytes after trim"
-            );
-            return Ok(RenameOutcome::Rejected);
+        //
+        // M2.11 fixup 6 — route through `RenameOutcome::applied` so the
+        // trim + `is_valid_display_name` invariant is enforced by a
+        // single typed constructor instead of repeated inline in every
+        // controller / mock. The constructor returns the same three
+        // outcomes the production controller already maps to: empty
+        // → Cleared, valid → Applied(trimmed), invalid → Rejected.
+        let outcome = RenameOutcome::applied(name);
+        let new_label: Option<String> = match &outcome {
+            RenameOutcome::Applied(label) => Some(label.clone()),
+            RenameOutcome::Cleared => None,
+            RenameOutcome::Rejected => {
+                tracing::debug!(
+                    pane_id = %pane_id,
+                    "rename_pane: rejected — name contains invalid bytes after trim"
+                );
+                return Ok(outcome);
+            }
         };
 
         // M2.11: snapshot the stream-backed agent id + cached cwd under
@@ -1422,10 +1429,7 @@ impl PaneController for EmbeddedPaneController {
                 }
             });
         }
-        Ok(match new_label {
-            Some(label) => RenameOutcome::Applied(label),
-            None => RenameOutcome::Cleared,
-        })
+        Ok(outcome)
     }
 
     fn toggle_layout(&self) -> Result<(), PaneError> {

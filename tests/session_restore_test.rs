@@ -92,7 +92,7 @@ impl PaneController for MockPaneController {
     }
 
     fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
-        Ok(RenameOutcome::Applied(name.to_string()))
+        Ok(RenameOutcome::applied(name))
     }
 
     fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
