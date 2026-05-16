@@ -98,7 +98,19 @@ where
     // the socket the winner created and skips the spawn.
     if socket_path.exists() {
         verify_socket_trusted(socket_path)?;
-        return Ok(());
+        // Trust check only validates the inode (type, owner, mode) — it
+        // doesn't know whether anyone is listening. A daemon that died
+        // without unlinking (crash, SIGKILL, host reboot mid-write) leaves
+        // a stale socket on disk that would otherwise short-circuit lazy-
+        // spawn forever, with every subsequent client connect failing
+        // `ECONNREFUSED`. Probe-connect here so we can distinguish a live
+        // daemon from a leftover file; on failure, the inode is ours
+        // (trust check just validated uid + mode) so unlinking and
+        // falling through to the spawn branch is safe.
+        if probe_socket_alive(socket_path).await {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(socket_path);
     }
 
     spawn_fn().map_err(|source| AttachError::DaemonSpawnFailed { source })?;
@@ -165,6 +177,19 @@ pub(crate) fn verify_socket_trusted(path: &Path) -> Result<(), AttachError> {
     }
 
     Ok(())
+}
+
+/// Best-effort liveness probe for a Unix domain socket. Returns true iff
+/// `connect(2)` succeeds; any error (typically `ECONNREFUSED` from a stale
+/// inode whose binder is dead) returns false. The connection is dropped
+/// immediately — this is only a "is anything listening" signal.
+///
+/// Used inside [`ensure_daemon_running`] to differentiate a live daemon
+/// from a leftover socket file: file existence is not sufficient evidence
+/// that the daemon is up, since `bind(2)` doesn't auto-unlink on the
+/// binder's death.
+async fn probe_socket_alive(path: &Path) -> bool {
+    tokio::net::UnixStream::connect(path).await.is_ok()
 }
 
 /// RAII guard for the `spawn.lock` flock. Drop releases the lock by
@@ -416,6 +441,58 @@ mod tests {
             calls.load(Ordering::SeqCst),
             0,
             "spawn_fn must not run when socket is already present"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_recovers_from_stale_socket() {
+        // Regression: a daemon that died without unlinking its socket leaves
+        // a file at the attach path that passes `verify_socket_trusted`
+        // (type/owner/mode are intact — the inode is just unbound). Before
+        // the probe-connect was added, `ensure_daemon_running` would
+        // short-circuit on file existence and every subsequent client
+        // connect would fail with `ECONNREFUSED`, forcing users to manually
+        // unlink the socket to recover. The lazy-spawn must instead detect
+        // the dead inode, unlink it, and run `spawn_fn`.
+        let dir = race_safe_tempdir();
+        let sock = dir.path().join("attach.sock");
+
+        // Bind then drop the listener — the inode survives on disk but no
+        // one is listening, so connect attempts return ECONNREFUSED.
+        {
+            let _stale = bind_trusted_socket(&sock);
+        }
+        assert!(
+            sock.exists(),
+            "precondition: stale socket file must remain after listener drop"
+        );
+
+        let sock_for_spawn = sock.clone();
+        let listener_slot: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixListener>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot = listener_slot.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = calls.clone();
+
+        ensure_daemon_running(
+            &sock,
+            dir.path(),
+            move || {
+                calls_inner.fetch_add(1, Ordering::SeqCst);
+                let l = bind_trusted_socket(&sock_for_spawn);
+                *slot.lock().unwrap() = Some(l);
+                Ok(())
+            },
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("stale-socket path must recover by unlinking + respawning");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "spawn_fn must run exactly once after the stale socket was unlinked"
         );
     }
 
