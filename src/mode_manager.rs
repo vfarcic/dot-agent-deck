@@ -3,7 +3,7 @@ use std::sync::Arc;
 use regex::Regex;
 use thiserror::Error;
 
-use crate::pane::{PaneController, PaneError};
+use crate::pane::{AgentSpawnOptions, PaneController, PaneError};
 use crate::project_config::ModeConfig;
 
 // ---------------------------------------------------------------------------
@@ -102,6 +102,17 @@ pub struct ModeManager {
     pane_controller: Arc<dyn PaneController>,
     active_mode: Option<ActiveMode>,
     cwd: Option<String>,
+    /// PRD #76 M2.15 fixup pass 2 G1 — latest known side-pane PTY dims
+    /// (rows, cols). Used by the reactive-replacement spawn inside
+    /// [`Self::handle_command`] so the new pane opens at the eventual
+    /// layout size instead of the legacy 24×80 default. Refreshed from
+    /// the caller's `mode_side_pane_dims(frame_area, side_count)` value
+    /// on [`Self::activate_mode`] and on every
+    /// [`Self::set_side_pane_dims`] call (the UI invokes the setter from
+    /// the resize-mode-tab sweep just before routing reactive commands).
+    /// Defaults to the conservative `(24, 80)` so tests that never call
+    /// the setter still produce valid spawn options.
+    side_pane_dims: (u16, u16),
 }
 
 impl ModeManager {
@@ -110,14 +121,34 @@ impl ModeManager {
             pane_controller,
             active_mode: None,
             cwd: None,
+            side_pane_dims: (24, 80),
         }
+    }
+
+    /// PRD #76 M2.15 fixup pass 2 G1 — refresh the cached side-pane
+    /// dims used by the reactive-replacement spawn in
+    /// [`Self::handle_command`]. The caller is expected to compute
+    /// `dims` via `mode_side_pane_dims(frame_area, side_count)` (the
+    /// single layout-math SSOT in `ui.rs`), so the cached value tracks
+    /// the same geometry the resize-mode-tab sweep applies.
+    pub fn set_side_pane_dims(&mut self, dims: (u16, u16)) {
+        self.side_pane_dims = dims;
     }
 
     pub fn activate_mode(
         &mut self,
         config: &ModeConfig,
         cwd: Option<&str>,
+        // PRD #76 M2.15 fixup pass 2 G1 — initial side-pane PTY dims
+        // for every persistent + reactive pane created in this mode.
+        // The caller computes this via
+        // `mode_side_pane_dims(frame_area, total_side_count)` so the
+        // daemon-side PTY opens at the eventual viewport size, not the
+        // legacy 24×80 default. Stored on `self.side_pane_dims` for
+        // reactive-replacement spawns inside `handle_command`.
+        side_pane_dims: (u16, u16),
     ) -> Result<(), ModeManagerError> {
+        self.side_pane_dims = side_pane_dims;
         // Deactivate any existing mode first
         if self.active_mode.is_some() {
             self.deactivate_mode()?;
@@ -168,10 +199,24 @@ impl ModeManager {
                         pane_cfg.command.clone()
                     };
 
-                    let pane_id = self.pane_controller.create_pane(None, cwd)?;
-                    created_pane_ids.push(pane_id.clone());
+                    // PRD #76 M2.15 fixup pass 2 G1 — route through
+                    // `create_pane_with_options` with real side-pane dims so
+                    // the daemon-side PTY opens at the viewport-derived size,
+                    // not the legacy 24×80 default that the bare
+                    // `create_pane` wrapper used to fall through to.
+                    let (rows, cols) = side_pane_dims;
                     let display_name = pane_cfg.name.as_deref().unwrap_or(&pane_cfg.command);
-                    self.pane_controller.rename_pane(&pane_id, display_name)?;
+                    let (pane_id, _) = self.pane_controller.create_pane_with_options(
+                        None,
+                        cwd,
+                        AgentSpawnOptions {
+                            display_name: Some(display_name),
+                            tab_membership: None,
+                            rows,
+                            cols,
+                        },
+                    )?;
+                    created_pane_ids.push(pane_id.clone());
 
                     pending.push(PendingCommand {
                         pane_id: pane_id.clone(),
@@ -183,11 +228,20 @@ impl ModeManager {
                 }
 
                 let mut pool = ReactivePool::new();
+                let (rows, cols) = side_pane_dims;
                 for i in 0..config.reactive_panes {
-                    let pane_id = self.pane_controller.create_pane(None, cwd)?;
+                    let reactive_name = format!("reactive-{i}");
+                    let (pane_id, _) = self.pane_controller.create_pane_with_options(
+                        None,
+                        cwd,
+                        AgentSpawnOptions {
+                            display_name: Some(&reactive_name),
+                            tab_membership: None,
+                            rows,
+                            cols,
+                        },
+                    )?;
                     created_pane_ids.push(pane_id.clone());
-                    self.pane_controller
-                        .rename_pane(&pane_id, &format!("reactive-{i}"))?;
 
                     // Reactive panes only need init_command (no command until a rule matches)
                     if config.init_command.is_some() {
@@ -360,10 +414,27 @@ impl ModeManager {
         } else {
             // No init_command — create replacement before closing old pane so the
             // pool never contains a dead slot if creation fails.
-            let new_pane_id = self
-                .pane_controller
-                .create_pane(Some(&pane_cmd), self.cwd.as_deref())?;
-            let _ = self.pane_controller.rename_pane(&new_pane_id, command);
+            // PRD #76 M2.15 fixup pass 2 G1 — spawn the replacement at the
+            // cached side-pane dims (refreshed by the UI from
+            // `mode_side_pane_dims(frame_area, ...)` just before reactive
+            // routing) so the daemon-side PTY opens at the viewport-derived
+            // size, not the legacy 24×80 default.
+            let (rows, cols) = self.side_pane_dims;
+            // Passing `display_name: Some(command)` lets the production
+            // controller forward the label to the daemon via
+            // `StartAgent.display_name` (and the trait-default
+            // `create_pane_with_options` calls `rename_pane` internally
+            // for mocks), so no follow-up rename call is required.
+            let (new_pane_id, _) = self.pane_controller.create_pane_with_options(
+                Some(&pane_cmd),
+                self.cwd.as_deref(),
+                AgentSpawnOptions {
+                    display_name: Some(command),
+                    tab_membership: None,
+                    rows,
+                    cols,
+                },
+            )?;
             mode.reactive_pool
                 .replace(&old_pane_id, new_pane_id.clone());
             let _ = self.pane_controller.close_pane(&old_pane_id);
@@ -519,7 +590,7 @@ mod tests {
     fn activate_creates_persistent_and_reactive_panes() {
         let mock = Arc::new(MockPaneController::new());
         let mut mgr = ModeManager::new(mock.clone());
-        mgr.activate_mode(&test_config(), None).unwrap();
+        mgr.activate_mode(&test_config(), None, (24, 80)).unwrap();
 
         // 1 persistent + 2 reactive (from config) = 3 panes
         let ids = mgr.managed_pane_ids();
@@ -531,7 +602,7 @@ mod tests {
     fn handle_command_matches_first_rule() {
         let mock = Arc::new(MockPaneController::new());
         let mut mgr = ModeManager::new(mock.clone());
-        mgr.activate_mode(&test_config(), None).unwrap();
+        mgr.activate_mode(&test_config(), None, (24, 80)).unwrap();
 
         let change = mgr
             .handle_command("kubectl describe pod nginx")
@@ -563,7 +634,7 @@ mod tests {
             }],
             reactive_panes: 2,
         };
-        mgr.activate_mode(&config, None).unwrap();
+        mgr.activate_mode(&config, None, (24, 80)).unwrap();
 
         let p1 = mgr.handle_command("cmd1").unwrap().unwrap();
         let p2 = mgr.handle_command("cmd2").unwrap().unwrap();
@@ -583,7 +654,7 @@ mod tests {
     fn deactivate_closes_all_panes() {
         let mock = Arc::new(MockPaneController::new());
         let mut mgr = ModeManager::new(mock.clone());
-        mgr.activate_mode(&test_config(), None).unwrap();
+        mgr.activate_mode(&test_config(), None, (24, 80)).unwrap();
 
         mgr.deactivate_mode().unwrap();
 
@@ -611,7 +682,7 @@ mod tests {
             reactive_panes: 1,
         };
 
-        let err = mgr.activate_mode(&config, None).unwrap_err();
+        let err = mgr.activate_mode(&config, None, (24, 80)).unwrap_err();
         assert!(matches!(err, ModeManagerError::InvalidPattern { .. }));
     }
 
@@ -628,7 +699,7 @@ mod tests {
     fn no_match_returns_none() {
         let mock = Arc::new(MockPaneController::new());
         let mut mgr = ModeManager::new(mock);
-        mgr.activate_mode(&test_config(), None).unwrap();
+        mgr.activate_mode(&test_config(), None, (24, 80)).unwrap();
 
         let result = mgr.handle_command("echo hello").unwrap();
         assert!(result.is_none());

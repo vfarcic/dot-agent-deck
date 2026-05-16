@@ -261,6 +261,110 @@ async fn start_agent_with_orchestration_membership_round_trip() {
     server.registry.shutdown_all();
 }
 
+// PRD #76 M2.15: spawn-time rows/cols are no longer the hardcoded 24/80
+// VT100 default — the TUI computes the value from its real viewport.
+// Pin the wire-format round-trip for explicit non-default values so a
+// regression that re-hardcodes the field, or quietly substitutes the
+// `default_rows`/`default_cols` defaults on the encode path, fails the
+// build. The fields are old (M2.12 already used them implicitly via the
+// 24/80 defaults), so the only thing changing in M2.15 is that callers
+// finally pass real values — and those real values must survive
+// `serde_json` round-trip on the daemon side.
+#[tokio::test]
+async fn start_agent_round_trips_explicit_rows_cols() {
+    let server = start_server().await;
+
+    let req = AttachRequest::StartAgent {
+        command: Some("sh -c 'sleep 30'".into()),
+        cwd: None,
+        display_name: None,
+        // Pick values that are obviously NOT the 24/80 defaults so a regression
+        // that silently substitutes defaults shows up immediately. Choosing
+        // 50/200 also exercises a cols value > 127 (catches accidental
+        // narrowing to `i8` / `u7` on the wire).
+        rows: 50,
+        cols: 200,
+        env: vec![],
+        tab_membership: None,
+    };
+
+    // Wire round-trip: encode + decode via the same serde path the daemon
+    // uses, and verify the values come back identical. This is the spec's
+    // primary assertion — the daemon's handler reads these fields off the
+    // decoded value, so if the round-trip is lossy the daemon would see
+    // 24/80 (the serde defaults) and open the PTY at the wrong size.
+    let json = serde_json::to_string(&req).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["rows"], 50);
+    assert_eq!(v["cols"], 200);
+    let back: AttachRequest = serde_json::from_str(&json).unwrap();
+    match back {
+        AttachRequest::StartAgent { rows, cols, .. } => {
+            assert_eq!(rows, 50);
+            assert_eq!(cols, 200);
+        }
+        _ => panic!("wrong variant"),
+    }
+
+    // End-to-end sanity: the daemon accepts the non-default values
+    // without error and the agent appears in `list_agents`. This catches
+    // a regression where the server-side handler validates rows/cols
+    // against a narrower range than the wire schema allows.
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut s, &req).await;
+    let resp = read_response(&mut s).await;
+    assert!(resp.ok, "start-agent failed: {:?}", resp.error);
+    let id = resp.id.expect("start-agent response missing id");
+    assert!(server.registry.agent_ids().contains(&id));
+    server.registry.shutdown_all();
+}
+
+// PRD #76 M2.15 fixup F4 — forward-compat coverage for the older-client
+// wire shape. The fields `rows` / `cols` carry `#[serde(default = ...)]`
+// so an older client that omits them deserializes to the 24/80 VT100
+// defaults rather than failing the decode. Without this test, an
+// accidental removal of those serde attributes (or a rename of the
+// `default_rows` / `default_cols` functions) would silently break the
+// older-client → newer-daemon path: every reconnect from a stale binary
+// would crash with a `missing field` decode error, even though the
+// daemon's intent is to gracefully accept the legacy shape.
+#[test]
+fn start_agent_deserializes_old_client_shape_without_rows_cols() {
+    // Hand-crafted JSON literal that mirrors what an older client (one
+    // built before M2.15 added the rows/cols TUI plumbing) would have
+    // serialized: the type tag, the legacy fields, no rows / no cols.
+    // The literal is deliberately not built from a Rust struct so a
+    // regression that drops `#[serde(default = ...)]` from the type
+    // shows up here even if the encoding side is updated in lockstep.
+    let json = r#"{
+        "op": "start-agent",
+        "command": "sh -c 'sleep 30'",
+        "cwd": null,
+        "display_name": null,
+        "env": []
+    }"#;
+
+    let decoded: AttachRequest = serde_json::from_str(json).expect(
+        "older client shape must deserialize via #[serde(default)] on rows/cols/tab_membership",
+    );
+    match decoded {
+        AttachRequest::StartAgent {
+            rows,
+            cols,
+            tab_membership,
+            ..
+        } => {
+            assert_eq!(rows, 24, "missing `rows` must default to the VT100 24");
+            assert_eq!(cols, 80, "missing `cols` must default to the VT100 80");
+            assert!(
+                tab_membership.is_none(),
+                "missing `tab_membership` must default to None (dashboard pane)"
+            );
+        }
+        other => panic!("expected StartAgent variant, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn start_agent_with_invalid_membership_name_is_rejected() {
     // M2.12 fixup reviewer #2: an invalid `tab_membership.name` (empty,

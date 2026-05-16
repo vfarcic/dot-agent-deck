@@ -333,7 +333,7 @@ fn save_then_restore_recreates_side_panes() {
     let mut tab_manager = TabManager::new(mock.clone());
     let agent_pane_id = mock.create_pane(None, Some(&restored.dir)).unwrap();
     let (_idx, side_ids) = tab_manager
-        .open_mode_tab(&mode_cfg, &restored.dir, agent_pane_id.clone())
+        .open_mode_tab(&mode_cfg, &restored.dir, agent_pane_id.clone(), (24, 80))
         .expect("open_mode_tab must succeed on restore");
 
     // Two persistent + default reactive panes (matches the existing

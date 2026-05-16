@@ -130,15 +130,65 @@ impl RenameOutcome {
 /// - `tab_membership`: which tab this pane belonged to. `None` means
 ///   dashboard pane — same default as the legacy
 ///   `create_pane_with_display_name` path.
-#[derive(Debug, Default, Clone)]
+/// - `rows` / `cols`: initial PTY dimensions (PRD #76 M2.15). Required —
+///   the TUI always knows its viewport, and an `Option` that's never `None`
+///   in practice would invite drift. Callers compute the value at the spawn
+///   site using the same layout-math helpers the resize-time path calls
+///   (`agent_pane_dims_*` in `ui.rs`), so the agent's first frame draws at
+///   the eventual size instead of the legacy 24×80 default + immediate
+///   resize hiccup. `Default` returns the conservative 24/80 fallback so
+///   test fixtures using `..Default::default()` continue to compile.
+#[derive(Debug, Clone)]
 pub struct AgentSpawnOptions<'a> {
     pub display_name: Option<&'a str>,
     pub tab_membership: Option<TabMembership>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl Default for AgentSpawnOptions<'_> {
+    fn default() -> Self {
+        Self {
+            display_name: None,
+            tab_membership: None,
+            // Conservative VT100 fallback — production callers in
+            // `src/ui.rs` always set both explicitly via the layout
+            // helpers; defaults exist only for test fixtures.
+            rows: 24,
+            cols: 80,
+        }
+    }
 }
 
 pub trait PaneController: Send + Sync {
     fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError>;
-    fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError>;
+    /// PRD #76 M2.15 fixup pass 2 G1 — legacy single-call entry point.
+    /// The default impl routes through `create_pane_with_options` with
+    /// `AgentSpawnOptions::default()`, which opens the PTY at the
+    /// conservative 24×80 fallback. **Production callers must NOT use
+    /// this method**: every production spawn now goes through
+    /// `create_pane_with_options` with real dims computed via the
+    /// `*_pane_dims` SSOT helpers in `ui.rs` (`dashboard_pane_dims`,
+    /// `mode_agent_pane_dims`, `mode_side_pane_dims`,
+    /// `orchestration_role_pane_dims`). After the M2.15 fixup pass 2,
+    /// the legacy `EmbeddedPaneController::create_pane` override was
+    /// deleted so no production controller can hit the 24×80 fallback —
+    /// only test mocks (which intentionally override `create_pane` to
+    /// avoid wiring the full `create_pane_with_options` shape) and test
+    /// fixtures that call `.create_pane(...)` directly still route
+    /// through this method.
+    ///
+    /// **Recursion note:** both `create_pane` and `create_pane_with_options`
+    /// have default impls that call into each other. Every concrete
+    /// `PaneController` impl must override at least one to break the
+    /// cycle: `EmbeddedPaneController` overrides `create_pane_with_options`;
+    /// test mocks override `create_pane`. A new impl that overrides
+    /// neither will infinitely recurse at runtime on the first
+    /// `create_pane*` call.
+    fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError> {
+        self.create_pane_with_options(command, cwd, AgentSpawnOptions::default())
+            .map(|(id, _)| id)
+    }
     /// Create a pane and apply a display name in one step. The default impl
     /// composes `create_pane` + `rename_pane`, which is fine for local-PTY
     /// backends. The stream-backed `EmbeddedPaneController` overrides this
@@ -166,7 +216,7 @@ pub trait PaneController: Send + Sync {
             cwd,
             AgentSpawnOptions {
                 display_name,
-                tab_membership: None,
+                ..Default::default()
             },
         )
     }

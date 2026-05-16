@@ -174,14 +174,23 @@ impl TabManager {
     }
 
     /// Open a new mode tab. Returns `(tab_index, managed_pane_ids)`.
+    ///
+    /// PRD #76 M2.15 fixup pass 2 G1 — `side_pane_dims` is the
+    /// initial PTY size for every persistent + reactive side pane the
+    /// mode creates. Callers compute this from
+    /// `terminal.get_frame().area()` via the `mode_side_pane_dims`
+    /// SSOT helper in `ui.rs`, so the daemon-side PTYs open at the
+    /// viewport-derived size instead of the legacy 24×80. Tests that
+    /// don't care about geometry pass `(24, 80)`.
     pub fn open_mode_tab(
         &mut self,
         config: &ModeConfig,
         cwd: &str,
         agent_pane_id: String,
+        side_pane_dims: (u16, u16),
     ) -> Result<(usize, Vec<String>), TabError> {
         let mut mode_manager = ModeManager::new(Arc::clone(&self.pane_controller));
-        mode_manager.activate_mode(config, Some(cwd))?;
+        mode_manager.activate_mode(config, Some(cwd), side_pane_dims)?;
         let pane_ids = mode_manager.managed_pane_ids();
 
         let id = self.next_id;
@@ -222,8 +231,17 @@ impl TabManager {
         config: &OrchestrationConfig,
         cwd: &str,
         orchestrator_prompt: Option<String>,
+        // PRD #76 M2.15: initial PTY dims for every role pane in this
+        // orchestration. The caller computes these from
+        // `terminal.get_frame().area()` + the dashboard-layout helper, so
+        // the daemon-side PTY opens at the viewport size instead of the
+        // legacy 24×80. Callers without a real viewport (tests) pass
+        // `(24, 80)`. The post-spawn `resize_dashboard_panes` sweep
+        // reconciles per-role focus state on the first frame.
+        spawn_dims: (u16, u16),
     ) -> Result<(usize, Vec<String>), TabError> {
         let mut role_pane_ids: Vec<String> = Vec::with_capacity(config.roles.len());
+        let (spawn_rows, spawn_cols) = spawn_dims;
 
         // PRD #76 M2.12: tag each role pane with its orchestration tab
         // membership so the daemon-side registry can echo it back via
@@ -236,6 +254,8 @@ impl TabManager {
                     name: config.name.clone(),
                     role_index,
                 }),
+                rows: spawn_rows,
+                cols: spawn_cols,
             };
             let (pane_id, _resolved) = match self.pane_controller.create_pane_with_options(
                 Some(&role.command),
@@ -304,8 +324,11 @@ impl TabManager {
         config: &ModeConfig,
         cwd: &str,
         agent_pane_id: String,
+        // PRD #76 M2.15 fixup pass 2 G1 — initial side-pane PTY dims;
+        // see `open_mode_tab` for the SSOT helper to compute this.
+        side_pane_dims: (u16, u16),
     ) -> Result<(usize, Vec<String>), TabError> {
-        self.open_mode_tab(config, cwd, agent_pane_id)
+        self.open_mode_tab(config, cwd, agent_pane_id, side_pane_dims)
     }
 
     /// PRD #76 M2.12: hydration entry point for orchestration tabs.
@@ -726,7 +749,7 @@ mod tests {
     fn open_mode_tab_creates_tab() {
         let mut tm = make_manager();
         let (idx, ids) = tm
-            .open_mode_tab(&test_config("k8s-ops"), "/tmp", String::new())
+            .open_mode_tab(&test_config("k8s-ops"), "/tmp", String::new(), (24, 80))
             .unwrap();
         assert_eq!(idx, 1);
         assert!(!ids.is_empty());
@@ -741,10 +764,10 @@ mod tests {
     fn open_multiple_mode_tabs() {
         let mut tm = make_manager();
         let (_, ids1) = tm
-            .open_mode_tab(&test_config("k8s"), "/tmp/a", String::new())
+            .open_mode_tab(&test_config("k8s"), "/tmp/a", String::new(), (24, 80))
             .unwrap();
         let (_, ids2) = tm
-            .open_mode_tab(&test_config("rust-tdd"), "/tmp/b", String::new())
+            .open_mode_tab(&test_config("rust-tdd"), "/tmp/b", String::new(), (24, 80))
             .unwrap();
         assert_eq!(tm.tab_count(), 3);
         assert_eq!(tm.active_index(), 2);
@@ -761,7 +784,7 @@ mod tests {
         let mut tm = TabManager::new(mock.clone());
         let agent_id = mock.create_pane(None, None).unwrap();
         let (_, side_ids) = tm
-            .open_mode_tab(&test_config("k8s"), "/tmp", agent_id.clone())
+            .open_mode_tab(&test_config("k8s"), "/tmp", agent_id.clone(), (24, 80))
             .unwrap();
         assert_eq!(tm.tab_count(), 2);
 
@@ -784,9 +807,9 @@ mod tests {
         let mut tm = TabManager::new(mock.clone());
         let agent1 = mock.create_pane(None, None).unwrap();
         let agent2 = mock.create_pane(None, None).unwrap();
-        tm.open_mode_tab(&test_config("a"), "/tmp/a", agent1.clone())
+        tm.open_mode_tab(&test_config("a"), "/tmp/a", agent1.clone(), (24, 80))
             .unwrap();
-        tm.open_mode_tab(&test_config("b"), "/tmp/b", agent2.clone())
+        tm.open_mode_tab(&test_config("b"), "/tmp/b", agent2.clone(), (24, 80))
             .unwrap();
 
         // Simulate exit cleanup: close tabs in reverse order.
@@ -819,7 +842,7 @@ mod tests {
     fn tab_index_for_pane_lookup() {
         let mut tm = make_manager();
         let (_, ids) = tm
-            .open_mode_tab(&test_config("k8s"), "/tmp", String::new())
+            .open_mode_tab(&test_config("k8s"), "/tmp", String::new(), (24, 80))
             .unwrap();
         for id in &ids {
             assert_eq!(tm.tab_index_for_pane(id), Some(1));
@@ -832,7 +855,7 @@ mod tests {
         let mut tm = make_manager();
         assert!(tm.active_mode_name().is_none());
 
-        tm.open_mode_tab(&test_config("k8s"), "/tmp", String::new())
+        tm.open_mode_tab(&test_config("k8s"), "/tmp", String::new(), (24, 80))
             .unwrap();
         assert_eq!(tm.active_mode_name(), Some("k8s"));
 
@@ -843,11 +866,11 @@ mod tests {
     #[test]
     fn close_adjusts_active_index() {
         let mut tm = make_manager();
-        tm.open_mode_tab(&test_config("a"), "/tmp/a", String::new())
+        tm.open_mode_tab(&test_config("a"), "/tmp/a", String::new(), (24, 80))
             .unwrap();
-        tm.open_mode_tab(&test_config("b"), "/tmp/b", String::new())
+        tm.open_mode_tab(&test_config("b"), "/tmp/b", String::new(), (24, 80))
             .unwrap();
-        tm.open_mode_tab(&test_config("c"), "/tmp/c", String::new())
+        tm.open_mode_tab(&test_config("c"), "/tmp/c", String::new(), (24, 80))
             .unwrap();
         // tabs: [Dashboard, a, b, c], active = 3 (c)
 
@@ -864,7 +887,7 @@ mod tests {
     #[test]
     fn close_active_tab_falls_back_to_dashboard() {
         let mut tm = make_manager();
-        tm.open_mode_tab(&test_config("k8s"), "/tmp", String::new())
+        tm.open_mode_tab(&test_config("k8s"), "/tmp", String::new(), (24, 80))
             .unwrap();
         assert_eq!(tm.active_index(), 1);
 
@@ -877,10 +900,10 @@ mod tests {
     fn all_managed_pane_ids_across_tabs() {
         let mut tm = make_manager();
         let (_, ids1) = tm
-            .open_mode_tab(&test_config("a"), "/tmp/a", String::new())
+            .open_mode_tab(&test_config("a"), "/tmp/a", String::new(), (24, 80))
             .unwrap();
         let (_, ids2) = tm
-            .open_mode_tab(&test_config("b"), "/tmp/b", String::new())
+            .open_mode_tab(&test_config("b"), "/tmp/b", String::new(), (24, 80))
             .unwrap();
 
         let all = tm.all_managed_pane_ids();
@@ -1040,7 +1063,7 @@ mod tests {
     fn open_orchestration_tab_creates_tab() {
         let mut tm = make_manager();
         let (idx, ids) = tm
-            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None)
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None, (24, 80))
             .unwrap();
         assert_eq!(idx, 1);
         assert_eq!(ids.len(), 2);
@@ -1076,8 +1099,13 @@ mod tests {
     fn open_orchestration_tab_stores_prompt() {
         let mut tm = make_manager();
         let prompt = "You are the orchestrator.".to_string();
-        tm.open_orchestration_tab(&test_orchestration_config(), "/tmp", Some(prompt.clone()))
-            .unwrap();
+        tm.open_orchestration_tab(
+            &test_orchestration_config(),
+            "/tmp",
+            Some(prompt.clone()),
+            (24, 80),
+        )
+        .unwrap();
         if let Tab::Orchestration {
             orchestrator_prompt,
             ..
@@ -1099,7 +1127,7 @@ mod tests {
             name: String::new(),
             ..test_orchestration_config()
         };
-        tm.open_orchestration_tab(&config, "/home/user/my-project", None)
+        tm.open_orchestration_tab(&config, "/home/user/my-project", None, (24, 80))
             .unwrap();
         assert_eq!(tm.tab_labels(), vec!["Dashboard", "my-project"]);
     }
@@ -1109,7 +1137,7 @@ mod tests {
         let mock = Arc::new(MockPaneController::new());
         let mut tm = TabManager::new(mock.clone());
         let (_, ids) = tm
-            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None)
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None, (24, 80))
             .unwrap();
         assert_eq!(tm.tab_count(), 2);
 
@@ -1125,7 +1153,7 @@ mod tests {
     fn orchestration_pane_ids_in_all_managed() {
         let mut tm = make_manager();
         let (_, ids) = tm
-            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None)
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None, (24, 80))
             .unwrap();
         let all = tm.all_managed_pane_ids();
         for id in &ids {
@@ -1137,7 +1165,7 @@ mod tests {
     fn tab_index_for_orchestration_pane() {
         let mut tm = make_manager();
         let (_, ids) = tm
-            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None)
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None, (24, 80))
             .unwrap();
         for id in &ids {
             assert_eq!(tm.tab_index_for_pane(id), Some(1));

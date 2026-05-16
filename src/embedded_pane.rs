@@ -409,6 +409,8 @@ impl EmbeddedPaneController {
         command: Option<&str>,
         cwd: Option<&str>,
         display_name: &str,
+        rows: u16,
+        cols: u16,
     ) -> Result<String, PaneError> {
         // Tag the spawned process so hooks can identify which pane it belongs to.
         let env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
@@ -422,14 +424,25 @@ impl EmbeddedPaneController {
             command,
             cwd,
             display_name: None,
-            rows: 24,
-            cols: 80,
+            // PRD #76 M2.15: open the PTY at the caller-supplied viewport
+            // dimensions instead of the legacy 24×80. The TUI computes
+            // these from `terminal.get_frame().area()` + the layout the
+            // pane is about to land in, so the agent's first frame draws
+            // at the eventual size rather than at 24×80 inside a much
+            // larger viewport.
+            rows,
+            cols,
             env,
             tab_membership: None,
         })
         .map_err(|e| PaneError::CommandFailed(e.to_string()))?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
+        // Match the vt100 parser to the PTY dims (PRD #76 M2.15): a 24×80
+        // parser receiving an agent's already-correctly-sized initial frame
+        // would clip it, producing the same "tiny frame in big viewport"
+        // hiccup we just fixed at the PTY end. Resize-time keeps the parser
+        // in sync via `resize_pane_pty`; this only affects the initial frame.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
         let mouse_mode = Arc::new(AtomicBool::new(false));
         let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
 
@@ -494,6 +507,8 @@ impl EmbeddedPaneController {
         cwd: Option<&str>,
         display_name: &str,
         tab_membership: Option<TabMembership>,
+        rows: u16,
+        cols: u16,
         client: DaemonClient,
         runtime: tokio::runtime::Handle,
     ) -> Result<String, PaneError> {
@@ -513,8 +528,13 @@ impl EmbeddedPaneController {
             command: command.map(|c| c.to_string()),
             cwd: cwd.map(|c| c.to_string()),
             display_name: Some(label.clone()),
-            rows: 24,
-            cols: 80,
+            // PRD #76 M2.15: forward the TUI's real viewport-derived dims
+            // so the daemon opens its PTY at the eventual size. Older
+            // daemons fall back to the serde defaults (24/80) via
+            // `default_rows` / `default_cols`, so this is forward + backward
+            // compatible without a wire-format change.
+            rows,
+            cols,
             env,
             tab_membership,
         };
@@ -542,6 +562,8 @@ impl EmbeddedPaneController {
             name,
             command,
             cwd_stored,
+            rows,
+            cols,
             runtime,
             daemon_path,
         );
@@ -567,10 +589,17 @@ impl EmbeddedPaneController {
         name: String,
         command: Option<String>,
         cwd: Option<String>,
+        rows: u16,
+        cols: u16,
         runtime: tokio::runtime::Handle,
         daemon_path: PathBuf,
     ) {
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
+        // PRD #76 M2.15: size the local vt100 parser to match the dims the
+        // daemon's PTY was opened at (spawn) or last resized to (hydration).
+        // A 24×80 parser receiving an already-correctly-sized frame would
+        // clip it; resize-time keeps both sides in sync via the per-pane
+        // resize worker + `resize_pane_pty`.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
         let mouse_mode = Arc::new(AtomicBool::new(false));
         let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
 
@@ -862,6 +891,12 @@ impl EmbeddedPaneController {
             let display_name = record.display_name.clone();
             let cwd_record = record.cwd.clone();
             let pane_name = display_name.clone().unwrap_or_else(|| agent_id.clone());
+            // PRD #76 M2.15: at hydration time we don't know the daemon's
+            // current PTY dims (the daemon doesn't echo them via
+            // `list_agents`). Seed the local vt100 parser at 24×80 and let
+            // the post-hydration resize sweep in `ui.rs` immediately push
+            // the real viewport dims to the daemon — `resize_pane_pty`
+            // synchronises both sides on its first call.
             self.wire_stream_pane(
                 pane_id.clone(),
                 agent_id.clone(),
@@ -869,6 +904,8 @@ impl EmbeddedPaneController {
                 pane_name,
                 None,
                 cwd_record.clone(),
+                24,
+                80,
                 runtime.clone(),
                 daemon_path.clone(),
             );
@@ -1200,11 +1237,6 @@ impl PaneController for EmbeddedPaneController {
         Ok(())
     }
 
-    fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError> {
-        self.create_pane_with_options(command, cwd, AgentSpawnOptions::default())
-            .map(|(id, _)| id)
-    }
-
     fn create_pane_with_options(
         &self,
         command: Option<&str>,
@@ -1227,13 +1259,17 @@ impl PaneController for EmbeddedPaneController {
         let resolved = agent_pty::resolve_display_name(opts.display_name, command);
 
         let result = match &self.mode {
-            ControllerMode::LocalDeck => self.create_local_pane(pane_id, command, cwd, &resolved),
+            ControllerMode::LocalDeck => {
+                self.create_local_pane(pane_id, command, cwd, &resolved, opts.rows, opts.cols)
+            }
             ControllerMode::RemoteDeckLocal { client, runtime } => self.create_stream_pane(
                 pane_id,
                 command,
                 cwd,
                 &resolved,
                 opts.tab_membership,
+                opts.rows,
+                opts.cols,
                 client.clone(),
                 runtime.clone(),
             ),
