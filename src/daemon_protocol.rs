@@ -66,6 +66,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
+pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
 
 // ---------------------------------------------------------------------------
@@ -201,6 +202,14 @@ pub enum AttachRequest {
         /// backwards-compatible with daemons predating this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_name: Option<String>,
+        /// M2.12: which tab (mode / orchestration) the spawning UI placed
+        /// this agent pane in. Stored on the daemon-side registry and
+        /// echoed back via `list_agents` so the TUI can rebuild tab
+        /// structure on reconnect. `None` = dashboard pane. Same
+        /// `skip_serializing_if` pattern as `display_name` for forward
+        /// compat with daemons that don't know about this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab_membership: Option<TabMembership>,
     },
     StopAgent {
         id: String,
@@ -401,6 +410,7 @@ async fn handle_connection(
             cols,
             env,
             display_name,
+            tab_membership,
         } => {
             // Trust boundary: same OS user, same exec capability — see the
             // `AttachRequest::StartAgent` docs. We forward `command`/`cwd`/
@@ -427,6 +437,7 @@ async fn handle_connection(
                 rows,
                 cols,
                 env,
+                tab_membership,
             };
             match registry.spawn_agent(opts) {
                 Ok(id) => write_resp(&mut stream, &AttachResponse::with_id(id)).await?,
@@ -672,6 +683,7 @@ mod tests {
             cols: 80,
             env: vec![("FOO".into(), "BAR".into())],
             display_name: Some("auditor".into()),
+            tab_membership: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
@@ -680,11 +692,13 @@ mod tests {
                 command,
                 env,
                 display_name,
+                tab_membership,
                 ..
             } => {
                 assert_eq!(command.as_deref(), Some("/bin/sh"));
                 assert_eq!(env, vec![("FOO".to_string(), "BAR".to_string())]);
                 assert_eq!(display_name.as_deref(), Some("auditor"));
+                assert!(tab_membership.is_none());
             }
             _ => panic!("wrong variant"),
         }
@@ -702,12 +716,205 @@ mod tests {
             cols: 80,
             env: vec![],
             display_name: None,
+            tab_membership: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert!(
             !v.as_object().unwrap().contains_key("display_name"),
             "display_name=None should be omitted from the wire payload"
+        );
+        assert!(
+            !v.as_object().unwrap().contains_key("tab_membership"),
+            "tab_membership=None should be omitted from the wire payload"
+        );
+    }
+
+    #[test]
+    fn start_agent_with_mode_tab_membership_round_trip() {
+        // PRD #76 M2.12: tab_membership round-trips through the wire format
+        // and survives `serde_json::from_str` on a foreign client.
+        let req = AttachRequest::StartAgent {
+            command: Some("claude".into()),
+            cwd: Some("/work".into()),
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            display_name: Some("k8s-ops".into()),
+            tab_membership: Some(TabMembership::Mode {
+                name: "k8s-ops".into(),
+            }),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Wire shape sanity: tagged enum with snake_case kind.
+        assert_eq!(v["tab_membership"]["kind"], "mode");
+        assert_eq!(v["tab_membership"]["name"], "k8s-ops");
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            AttachRequest::StartAgent { tab_membership, .. } => {
+                assert_eq!(
+                    tab_membership,
+                    Some(TabMembership::Mode {
+                        name: "k8s-ops".into()
+                    })
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn start_agent_with_orchestration_tab_membership_round_trip() {
+        let req = AttachRequest::StartAgent {
+            command: Some("claude".into()),
+            cwd: Some("/work".into()),
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            display_name: Some("coder".into()),
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "tdd-cycle".into(),
+                role_index: 2,
+            }),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["tab_membership"]["kind"], "orchestration");
+        assert_eq!(v["tab_membership"]["name"], "tdd-cycle");
+        assert_eq!(v["tab_membership"]["role_index"], 2);
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            AttachRequest::StartAgent { tab_membership, .. } => {
+                assert_eq!(
+                    tab_membership,
+                    Some(TabMembership::Orchestration {
+                        name: "tdd-cycle".into(),
+                        role_index: 2,
+                    })
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn agent_record_with_tab_membership_round_trip() {
+        // PRD #76 M2.12: the daemon's echo via `list_agents` must serialize
+        // tab_membership so the TUI can rebuild tabs on reconnect. Older
+        // clients ignore the unknown field; older daemons omit it (None).
+        let rec = AgentRecord {
+            id: "7".into(),
+            pane_id_env: Some("pid-7".into()),
+            display_name: Some("coder".into()),
+            cwd: Some("/work".into()),
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "tdd-cycle".into(),
+                role_index: 1,
+            }),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tab_membership, rec.tab_membership);
+    }
+
+    #[test]
+    fn agent_record_omits_tab_membership_when_none() {
+        let rec = AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("tab_membership"),
+            "tab_membership=None should be omitted from the wire payload"
+        );
+        let back: AgentRecord =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert!(back.tab_membership.is_none());
+    }
+
+    #[test]
+    fn agent_record_without_tab_membership_field_deserializes() {
+        // Forward compat: an older daemon that doesn't know about
+        // tab_membership omits the field. A newer TUI must deserialize the
+        // payload with `tab_membership: None` and treat the agent as a
+        // dashboard pane on hydration.
+        let json = r#"{"id":"1","display_name":"foo","cwd":"/tmp"}"#;
+        let rec: AgentRecord = serde_json::from_str(json).unwrap();
+        assert!(rec.tab_membership.is_none());
+    }
+
+    #[test]
+    fn start_agent_deserializes_old_client_shape_without_tab_membership() {
+        // M2.12 fixup auditor #4: explicit compat test using a
+        // hand-crafted JSON literal in the *old* client shape — no
+        // `tab_membership` field at all. A newer daemon must accept
+        // the payload and decode `tab_membership: None`. Asserting via
+        // round-trip of the current struct doesn't catch this: it'd
+        // serialize the (`skip_serializing_if = None`) field as
+        // absent, but only because our struct produces that shape.
+        // This test pins the actual wire surface an older client
+        // would send.
+        let json = r#"{
+            "op": "start-agent",
+            "command": "/bin/sh",
+            "cwd": "/tmp",
+            "rows": 24,
+            "cols": 80,
+            "env": [],
+            "display_name": "auditor"
+        }"#;
+        let req: AttachRequest = serde_json::from_str(json).unwrap();
+        match req {
+            AttachRequest::StartAgent {
+                command,
+                cwd,
+                display_name,
+                tab_membership,
+                rows,
+                cols,
+                ..
+            } => {
+                assert_eq!(command.as_deref(), Some("/bin/sh"));
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+                assert_eq!(display_name.as_deref(), Some("auditor"));
+                assert_eq!(rows, 24);
+                assert_eq!(cols, 80);
+                assert!(
+                    tab_membership.is_none(),
+                    "old-client payload without tab_membership must decode as None"
+                );
+            }
+            _ => panic!("expected StartAgent variant, got {req:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_record_deserializes_old_daemon_shape_without_tab_membership() {
+        // M2.12 fixup auditor #4 (sibling case): hand-crafted JSON
+        // literal in the *old* daemon shape — `AgentRecord` without a
+        // `tab_membership` field. A newer TUI must accept the payload
+        // and decode `tab_membership: None`, treating the agent as a
+        // dashboard pane on hydration.
+        let json = r#"{
+            "id": "42",
+            "pane_id_env": "pid-42",
+            "display_name": "auditor",
+            "cwd": "/work"
+        }"#;
+        let rec: AgentRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.id, "42");
+        assert_eq!(rec.pane_id_env.as_deref(), Some("pid-42"));
+        assert_eq!(rec.display_name.as_deref(), Some("auditor"));
+        assert_eq!(rec.cwd.as_deref(), Some("/work"));
+        assert!(
+            rec.tab_membership.is_none(),
+            "old-daemon record without tab_membership must decode as None"
         );
     }
 

@@ -9,10 +9,12 @@ use portable_pty::PtySize;
 
 use std::any::Any;
 
-use crate::agent_pty::{self, AgentPty, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+use crate::agent_pty::{self, AgentPty, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership};
 use crate::daemon_client::{AttachConnection, DaemonClient, StartAgentOptions};
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
-use crate::pane::{PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome};
+use crate::pane::{
+    AgentSpawnOptions, PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome,
+};
 
 /// Result of [`EmbeddedPaneController::hydrate_from_daemon`]. One entry per
 /// daemon-side agent that was successfully reconnected on TUI bootstrap; the
@@ -33,6 +35,14 @@ pub struct HydratedPane {
     /// Working directory captured at spawn time on the daemon (M2.11).
     /// `None` mirrors the same forward-compat reasoning as `display_name`.
     pub cwd: Option<String>,
+    /// Which tab the agent belonged to at spawn time (PRD #76 M2.12).
+    /// Drives the hydration partition in `ui.rs`: `None` → dashboard,
+    /// `Some(Mode { ... })` → mode tab rebuild, `Some(Orchestration {
+    /// ... })` → orchestration tab rebuild. `None` is also the
+    /// older-daemon fallback (the field is omitted from the wire shape
+    /// via `skip_serializing_if`), which keeps every legacy agent on
+    /// the dashboard — same behavior as before M2.12.
+    pub tab_membership: Option<TabMembership>,
 }
 
 /// PTY-backed pane state: this process owns the PTY master and child. The
@@ -415,6 +425,7 @@ impl EmbeddedPaneController {
             rows: 24,
             cols: 80,
             env,
+            tab_membership: None,
         })
         .map_err(|e| PaneError::CommandFailed(e.to_string()))?;
 
@@ -475,12 +486,14 @@ impl EmbeddedPaneController {
     /// `RemoteDeckLocal` mode). The PTY lives in the daemon; this side
     /// holds an [`crate::daemon_client::AttachConnection`] and feeds the
     /// shared vt100 parser from STREAM_OUT bytes.
+    #[allow(clippy::too_many_arguments)]
     fn create_stream_pane(
         &self,
         pane_id: String,
         command: Option<&str>,
         cwd: Option<&str>,
         display_name: &str,
+        tab_membership: Option<TabMembership>,
         client: DaemonClient,
         runtime: tokio::runtime::Handle,
     ) -> Result<String, PaneError> {
@@ -503,6 +516,7 @@ impl EmbeddedPaneController {
             rows: 24,
             cols: 80,
             env,
+            tab_membership,
         };
 
         // Start-agent + attach happen on the daemon's runtime; we
@@ -863,6 +877,7 @@ impl EmbeddedPaneController {
                 agent_id,
                 display_name,
                 cwd: cwd_record,
+                tab_membership: record.tab_membership.clone(),
             });
         }
         hydrated
@@ -1186,15 +1201,15 @@ impl PaneController for EmbeddedPaneController {
     }
 
     fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError> {
-        self.create_pane_with_display_name(command, cwd, None)
+        self.create_pane_with_options(command, cwd, AgentSpawnOptions::default())
             .map(|(id, _)| id)
     }
 
-    fn create_pane_with_display_name(
+    fn create_pane_with_options(
         &self,
         command: Option<&str>,
         cwd: Option<&str>,
-        display_name: Option<&str>,
+        opts: AgentSpawnOptions<'_>,
     ) -> Result<(String, String), PaneError> {
         // The pane ID is allocated up front because it has to be injected into
         // the child's environment as DOT_AGENT_DECK_PANE_ID. If the spawn
@@ -1209,7 +1224,7 @@ impl PaneController for EmbeddedPaneController {
         // the divergence M2.11 fixup-3 reviewer P2 / auditor LOW called
         // out (bare `"   "`, surround whitespace, and control-byte
         // commands all converge here).
-        let resolved = agent_pty::resolve_display_name(display_name, command);
+        let resolved = agent_pty::resolve_display_name(opts.display_name, command);
 
         let result = match &self.mode {
             ControllerMode::LocalDeck => self.create_local_pane(pane_id, command, cwd, &resolved),
@@ -1218,6 +1233,7 @@ impl PaneController for EmbeddedPaneController {
                 command,
                 cwd,
                 &resolved,
+                opts.tab_membership,
                 client.clone(),
                 runtime.clone(),
             ),

@@ -170,6 +170,7 @@ async fn end_to_end_lifecycle_start_attach_detach_reattach_stop() {
                 rows: 24,
                 cols: 80,
                 env: vec![],
+                tab_membership: None,
             },
         )
         .await;

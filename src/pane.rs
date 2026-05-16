@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::agent_pty::TabMembership;
+
 #[derive(Debug, Error)]
 pub enum PaneError {
     #[error("IO error: {0}")]
@@ -115,6 +117,25 @@ impl RenameOutcome {
     }
 }
 
+/// PRD #76 M2.12 spawn-time options bundled into one struct so the
+/// [`PaneController::create_pane_with_options`] trait method doesn't grow
+/// a six-arg signature. `display_name` and `tab_membership` are forwarded
+/// to the daemon-side `StartAgent` payload so a reconnect rehydrates the
+/// pane with its label and tab home intact.
+///
+/// Field semantics:
+/// - `display_name`: user-supplied label (from the new-pane form, or a
+///   role name in an orchestration). Resolved via
+///   [`crate::agent_pty::resolve_display_name`] before reaching the daemon.
+/// - `tab_membership`: which tab this pane belonged to. `None` means
+///   dashboard pane — same default as the legacy
+///   `create_pane_with_display_name` path.
+#[derive(Debug, Default, Clone)]
+pub struct AgentSpawnOptions<'a> {
+    pub display_name: Option<&'a str>,
+    pub tab_membership: Option<TabMembership>,
+}
+
 pub trait PaneController: Send + Sync {
     fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError>;
     fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError>;
@@ -140,7 +161,34 @@ pub trait PaneController: Send + Sync {
         cwd: Option<&str>,
         display_name: Option<&str>,
     ) -> Result<(String, String), PaneError> {
-        let resolved = crate::agent_pty::resolve_display_name(display_name, command);
+        self.create_pane_with_options(
+            command,
+            cwd,
+            AgentSpawnOptions {
+                display_name,
+                tab_membership: None,
+            },
+        )
+    }
+    /// PRD #76 M2.12: superset of `create_pane_with_display_name` that
+    /// also carries `tab_membership` through to the daemon's `StartAgent`
+    /// payload. Mode and orchestration tab callers use this so a reconnect
+    /// can rebuild tab structure instead of stranding every hydrated pane
+    /// on the dashboard. Dashboard callers pass `tab_membership: None` and
+    /// see the legacy behavior.
+    ///
+    /// The default impl mirrors the create-then-rename pattern of
+    /// `create_pane_with_display_name` and ignores `tab_membership` — fine
+    /// for local-PTY mocks where there's no daemon to echo the field. The
+    /// stream-backed `EmbeddedPaneController` overrides this so the value
+    /// reaches the daemon via `StartAgent.tab_membership`.
+    fn create_pane_with_options(
+        &self,
+        command: Option<&str>,
+        cwd: Option<&str>,
+        opts: AgentSpawnOptions<'_>,
+    ) -> Result<(String, String), PaneError> {
+        let resolved = crate::agent_pty::resolve_display_name(opts.display_name, command);
         let id = self.create_pane(command, cwd)?;
         // Discard the RenameOutcome here: `resolved` is already the
         // canonical resolved value (computed via the shared resolver),

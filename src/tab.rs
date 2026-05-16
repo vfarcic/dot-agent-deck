@@ -4,9 +4,10 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
+use crate::agent_pty::TabMembership;
 use crate::event::EventType;
 use crate::mode_manager::{ModeManager, ModeManagerError};
-use crate::pane::PaneController;
+use crate::pane::{AgentSpawnOptions, PaneController};
 use crate::project_config::{ModeConfig, OrchestrationConfig};
 use crate::state::SessionState;
 
@@ -28,6 +29,15 @@ pub enum TabError {
     IndexOutOfBounds(usize),
     #[error("Mode error: {0}")]
     ModeManager(#[from] ModeManagerError),
+    /// Hydration-time API mismatch (PRD #76 M2.12 fixup auditor #3):
+    /// the caller passed a `role_pane_ids` vec whose length did not
+    /// match `config.roles.len()`. Reported as an error rather than
+    /// panicking so a malformed daemon record + a future-caller bug
+    /// can't crash the TUI from a hydration-only API.
+    #[error(
+        "open_orchestration_tab_with_existing_role_panes: role_pane_ids length {got} does not match config.roles.len() {expected}"
+    )]
+    MismatchedRoleCount { expected: usize, got: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -46,6 +56,13 @@ pub enum OrchestrationRoleStatus {
     Waiting,
     Working,
     Done,
+    /// PRD #76 M2.12: the role's agent pane was not present in the daemon
+    /// on reconnect — either the agent died before the TUI reattached or
+    /// hydration couldn't locate it. The slot is preserved on the
+    /// orchestration tab as a dead placeholder rather than silently
+    /// respawned (design decision 4), so the user can decide whether to
+    /// re-run the orchestration.
+    Failed,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,12 +225,24 @@ impl TabManager {
     ) -> Result<(usize, Vec<String>), TabError> {
         let mut role_pane_ids: Vec<String> = Vec::with_capacity(config.roles.len());
 
-        for role in &config.roles {
-            let pane_id = match self
-                .pane_controller
-                .create_pane(Some(&role.command), Some(cwd))
-            {
-                Ok(id) => id,
+        // PRD #76 M2.12: tag each role pane with its orchestration tab
+        // membership so the daemon-side registry can echo it back via
+        // `list_agents` and the TUI rebuilds the orchestration tab on
+        // reconnect instead of stranding all role panes on the dashboard.
+        for (role_index, role) in config.roles.iter().enumerate() {
+            let opts = AgentSpawnOptions {
+                display_name: Some(role.name.as_str()),
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: config.name.clone(),
+                    role_index,
+                }),
+            };
+            let (pane_id, _resolved) = match self.pane_controller.create_pane_with_options(
+                Some(&role.command),
+                Some(cwd),
+                opts,
+            ) {
+                Ok(p) => p,
                 Err(e) => {
                     // Clean up any panes already created.
                     for id in &role_pane_ids {
@@ -222,7 +251,6 @@ impl TabManager {
                     return Err(ModeManagerError::Pane(e).into());
                 }
             };
-            let _ = self.pane_controller.rename_pane(&pane_id, &role.name);
             role_pane_ids.push(pane_id);
         }
 
@@ -258,6 +286,122 @@ impl TabManager {
         Ok((index, role_pane_ids))
     }
 
+    /// PRD #76 M2.12: hydration entry point for mode tabs. Same flow as
+    /// [`open_mode_tab`], but documents the intent: the agent pane
+    /// already exists as `agent_pane_id` (a daemon pane reattached during
+    /// `hydrate_from_daemon`). Side panes still spawn fresh from
+    /// `config.panes` — they're not daemon-tracked (design decision 2),
+    /// so any in-flight side-pane state is intentionally lost on
+    /// reconnect.
+    ///
+    /// Returns `(tab_index, side_pane_ids)`, matching `open_mode_tab`.
+    /// Keeping the two as separate symbols (rather than overloading the
+    /// user-driven entry point) makes the hydration call sites in
+    /// `ui.rs` self-documenting and lets future divergence happen without
+    /// touching the user-driven path.
+    pub fn open_mode_tab_with_existing_agent_pane(
+        &mut self,
+        config: &ModeConfig,
+        cwd: &str,
+        agent_pane_id: String,
+    ) -> Result<(usize, Vec<String>), TabError> {
+        self.open_mode_tab(config, cwd, agent_pane_id)
+    }
+
+    /// PRD #76 M2.12: hydration entry point for orchestration tabs.
+    /// Unlike [`open_orchestration_tab`], does not spawn role panes —
+    /// `role_pane_ids[i]` is either `Some(existing_pane_id)` (the slot
+    /// is wired to that hydrated daemon pane and starts in the `Working`
+    /// state) or `None` (the slot is dead: the role's agent terminated
+    /// before reconnect, so it's preserved as a placeholder in
+    /// `OrchestrationRoleStatus::Failed`, never silently respawned —
+    /// design decision 4).
+    ///
+    /// `orchestrator_prompt` is always `None` because the prompt is
+    /// display polish only — the orchestrator role already received it
+    /// at start time and has the conversation in its scrollback (design
+    /// decision 3). The wire-format `role_pane_ids` length must match
+    /// `config.roles.len()`; out-of-bounds role_index entries should be
+    /// dropped to the dashboard by the caller (logged as a config-drift
+    /// bug per design decision 5).
+    ///
+    /// Returns `(tab_index, role_pane_ids_flat)` where the flat vec
+    /// substitutes empty strings for `None` slots so the existing
+    /// `Tab::Orchestration::role_pane_ids: Vec<String>` shape stays
+    /// stable. Callers can cross-reference `role_statuses` to tell live
+    /// from dead slots.
+    pub fn open_orchestration_tab_with_existing_role_panes(
+        &mut self,
+        config: &OrchestrationConfig,
+        cwd: &str,
+        role_pane_ids: Vec<Option<String>>,
+    ) -> Result<(usize, Vec<String>), TabError> {
+        // M2.12 fixup auditor #3: this is a hydration-oriented API, so
+        // mismatched lengths must surface as a `TabError` for the
+        // caller to handle (log + fallback to dashboard) rather than
+        // panic. The current caller constructs the vec correctly, but
+        // a malformed daemon record + a future-caller bug should not
+        // tear down the whole TUI.
+        if role_pane_ids.len() != config.roles.len() {
+            return Err(TabError::MismatchedRoleCount {
+                expected: config.roles.len(),
+                got: role_pane_ids.len(),
+            });
+        }
+
+        // Flatten Option<String> → String. Dead slots get the empty
+        // sentinel so the Vec<String> shape of `Tab::Orchestration`
+        // doesn't have to change. Downstream lookups (`role_pane_ids[i]`
+        // for delegation routing in `ui.rs`) will see "" and find no
+        // matching pane — same observable effect as the role being
+        // missing.
+        let role_statuses: Vec<OrchestrationRoleStatus> = role_pane_ids
+            .iter()
+            .map(|slot| match slot {
+                Some(_) => OrchestrationRoleStatus::Working,
+                None => OrchestrationRoleStatus::Failed,
+            })
+            .collect();
+        let role_pane_ids_flat: Vec<String> = role_pane_ids
+            .into_iter()
+            .map(|slot| slot.unwrap_or_default())
+            .collect();
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let start_role_index = config.roles.iter().position(|r| r.start).unwrap_or(0);
+
+        let name = if config.name.is_empty() {
+            std::path::Path::new(cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| cwd.to_string())
+        } else {
+            config.name.clone()
+        };
+
+        self.tabs.push(Tab::Orchestration {
+            id,
+            name,
+            role_pane_ids: role_pane_ids_flat.clone(),
+            role_statuses,
+            cwd: cwd.to_string(),
+            start_role_index,
+            // Design decision 3: don't replay orchestrator_prompt on
+            // reconnect. The orchestrator already received it at start
+            // time and the conversation is in its scrollback.
+            orchestrator_prompt: None,
+            config: config.clone(),
+            status: OrchestrationStatus::WaitingForOrchestrator,
+        });
+
+        let index = self.tabs.len() - 1;
+        self.active_index = index;
+
+        Ok((index, role_pane_ids_flat))
+    }
+
     /// Close a mode tab by index. Returns the pane IDs that were managed.
     pub fn close_tab(&mut self, index: usize) -> Result<Vec<String>, TabError> {
         if index == 0 {
@@ -285,6 +429,13 @@ impl TabManager {
             }
             Tab::Orchestration { role_pane_ids, .. } => {
                 for id in &role_pane_ids {
+                    // M2.12: skip the empty-string dead-slot sentinel
+                    // inserted by `open_orchestration_tab_with_existing_role_panes`
+                    // for roles that didn't survive reconnect — there's
+                    // no pane to close.
+                    if id.is_empty() {
+                        continue;
+                    }
                     let _ = self.pane_controller.close_pane(id);
                 }
                 role_pane_ids
@@ -316,7 +467,8 @@ impl TabManager {
                     ids.extend(mode_manager.managed_pane_ids());
                 }
                 Tab::Orchestration { role_pane_ids, .. } => {
-                    ids.extend(role_pane_ids.iter().cloned());
+                    // M2.12: skip the empty-string dead-slot sentinel.
+                    ids.extend(role_pane_ids.iter().filter(|id| !id.is_empty()).cloned());
                 }
                 Tab::Dashboard => {}
             }
@@ -335,8 +487,12 @@ impl TabManager {
                 {
                     return Some(i);
                 }
+                // M2.12: an empty pane_id would falsely match the
+                // dead-slot sentinel — skip the empty-string case
+                // explicitly so a caller asking about pane_id="" doesn't
+                // get a spurious orchestration tab match.
                 Tab::Orchestration { role_pane_ids, .. }
-                    if role_pane_ids.contains(&pane_id.to_string()) =>
+                    if !pane_id.is_empty() && role_pane_ids.contains(&pane_id.to_string()) =>
                 {
                     return Some(i);
                 }

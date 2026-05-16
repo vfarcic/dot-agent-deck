@@ -135,6 +135,72 @@ pub fn is_valid_cwd(value: &str) -> bool {
     !value.is_empty() && value.len() <= CWD_MAX_LEN && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
 }
 
+/// Which tab a daemon-tracked agent pane belonged to at spawn time
+/// (PRD #76 M2.12). Echoed back via `list_agents` so the TUI can rebuild
+/// the user's mode/orchestration tab structure on reconnect instead of
+/// stranding every hydrated pane on the dashboard.
+///
+/// Validation: the embedded `name` follows the same `is_valid_display_name`
+/// grammar as `display_name` — non-empty, ≤ 128 bytes, no control bytes.
+/// Anything failing that is dropped to `None` on capture so a buggy or
+/// hostile same-user peer reaching the attach socket can't smuggle ANSI
+/// escapes back via `list_agents` (the auditor-flagged echo path).
+///
+/// Wire shape (serde):
+/// ```json
+/// { "kind": "mode", "name": "k8s-ops" }
+/// { "kind": "orchestration", "name": "tdd-cycle", "role_index": 2 }
+/// ```
+///
+/// `kind` tag is `snake_case` to match the other JSON enums in this crate.
+/// `Option<TabMembership>` on `AgentRecord` / `StartAgent` is serialized with
+/// `skip_serializing_if = "Option::is_none"` so older clients/daemons keep
+/// working: a daemon predating this field sends nothing, and a TUI predating
+/// this field ignores any extra key. `None` is the dashboard pane.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TabMembership {
+    /// Agent pane of a Mode tab. Side panes (the cards on the left) are
+    /// NOT daemon-tracked — they respawn fresh from `ModeConfig.panes` on
+    /// reconnect, see PRD #76 M2.12 design decision 2.
+    Mode { name: String },
+    /// One role slot of an orchestration tab. `role_index` is the position
+    /// of this role in `OrchestrationConfig.roles`; on reconnect a dead
+    /// slot (between role-index 0 and `roles.len()` with no surviving
+    /// agent) is marked failed rather than respawned.
+    Orchestration { name: String, role_index: usize },
+}
+
+impl TabMembership {
+    /// Borrow the tab name (mode or orchestration) so callers don't have
+    /// to match on the variant for the common "extract name for validation
+    /// or lookup" case.
+    pub fn name(&self) -> &str {
+        match self {
+            TabMembership::Mode { name } => name,
+            TabMembership::Orchestration { name, .. } => name,
+        }
+    }
+}
+
+/// Validate a [`TabMembership`] in the same way display_name is validated.
+/// Returns the input on accept, `None` on reject. Mirrors the spawn-time
+/// drop semantics for display_name/cwd: invalid → stored as `None`, so
+/// `list_agents` can't echo control bytes from a hostile peer.
+///
+/// Exposed publicly so the client-side wire boundary
+/// ([`crate::daemon_client::DaemonClient::list_agents`]) can apply the
+/// same sanitization to incoming `AgentRecord.tab_membership` — defense
+/// in depth against a malformed or older daemon (M2.12 fixup auditor
+/// #1).
+pub fn validate_tab_membership(tm: TabMembership) -> Option<TabMembership> {
+    if is_valid_display_name(tm.name()) {
+        Some(tm)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AgentPtyError {
     #[error("Failed to open PTY: {0}")]
@@ -149,6 +215,13 @@ pub enum AgentPtyError {
     Resize(String),
     #[error("Agent {0} not found")]
     NotFound(String),
+    /// Caller-supplied spawn metadata failed validation. Surfaced to the
+    /// attach client via `AttachResponse::err` so a malformed spawn fails
+    /// loudly instead of silently dropping the bad field (PRD #76 M2.12
+    /// review fixup — reject invalid `tab_membership.name` rather than
+    /// reclassify the pane as dashboard).
+    #[error("Invalid spawn options: {0}")]
+    Validation(String),
 }
 
 /// How to spawn an agent.
@@ -169,6 +242,15 @@ pub struct SpawnOptions<'a> {
     pub cols: u16,
     /// Extra environment variables to inject (e.g. `DOT_AGENT_DECK_PANE_ID`).
     pub env: Vec<(String, String)>,
+    /// Which tab this agent pane belongs to (PRD #76 M2.12). `None` means
+    /// "dashboard pane". Captured into `RunningAgent::tab_membership` and
+    /// echoed back via `list_agents` so the TUI can rebuild mode and
+    /// orchestration tabs on reconnect. Invalid values (name fails
+    /// `is_valid_display_name`) cause the spawn to fail with
+    /// [`AgentPtyError::Validation`] — silent drop would hide bad spawn
+    /// metadata behind a "looks dashboard" pane on reconnect (M2.12 fixup
+    /// reviewer #2).
+    pub tab_membership: Option<TabMembership>,
 }
 
 impl Default for SpawnOptions<'_> {
@@ -180,6 +262,7 @@ impl Default for SpawnOptions<'_> {
             rows: 24,
             cols: 80,
             env: Vec::new(),
+            tab_membership: None,
         }
     }
 }
@@ -514,6 +597,15 @@ pub struct RunningAgent {
     /// alongside the display name. Echoed back to clients via `list_agents`
     /// so the dashboard cwd column survives a reconnect.
     pub cwd: Option<String>,
+    /// Which tab this pane belonged to at spawn time (PRD #76 M2.12).
+    /// Captured from [`SpawnOptions::tab_membership`] after validation;
+    /// invalid values are stored as `None` (same drop pattern as
+    /// `display_name`). The TUI uses this on reconnect to rebuild
+    /// mode/orchestration tabs instead of stranding every hydrated pane
+    /// on the dashboard. `None` means dashboard pane (or an older daemon
+    /// predating this field — wire-format `skip_serializing_if` keeps the
+    /// hydration path backwards compatible).
+    pub tab_membership: Option<TabMembership>,
 }
 
 /// Snapshot of one daemon-side agent that the M2.x rehydration path needs.
@@ -540,6 +632,15 @@ pub struct AgentRecord {
     /// supplied a value, or when the supplied value failed [`is_valid_cwd`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Which tab this pane belonged to at spawn time (PRD #76 M2.12).
+    /// `None` means either the agent was a dashboard pane, the spawn
+    /// supplied an invalid value (dropped at capture), or the daemon ran
+    /// an older binary that didn't persist this field. The TUI uses this
+    /// to rebuild mode/orchestration tabs on reconnect.
+    /// `skip_serializing_if` keeps the wire shape backwards-compatible
+    /// with daemons predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_membership: Option<TabMembership>,
 }
 
 /// In-process registry of agent PTYs owned by the daemon. M1.1 only exposed
@@ -594,7 +695,7 @@ impl AgentPtyRegistry {
     }
 
     /// Spawn a new agent and return its registry id.
-    pub fn spawn_agent(&self, opts: SpawnOptions<'_>) -> Result<String, AgentPtyError> {
+    pub fn spawn_agent(&self, mut opts: SpawnOptions<'_>) -> Result<String, AgentPtyError> {
         // Capture the caller-supplied `DOT_AGENT_DECK_PANE_ID` *before*
         // moving `opts` into `spawn`, so the registry retains a copy for
         // M2.x rehydration. The agent's child process gets tagged with
@@ -657,6 +758,31 @@ impl AgentPtyRegistry {
             }
         });
 
+        // M2.12: capture tab_membership through the same validation lens
+        // (the embedded `name` must satisfy `is_valid_display_name`) so the
+        // echo via `list_agents` can't carry control bytes from a hostile
+        // same-user peer. M2.12 fixup reviewer #2: an invalid name now
+        // *rejects* the spawn (returns `AgentPtyError::Validation`). The
+        // earlier behavior — silently dropping to `None` — let a malformed
+        // client get a successful `StartAgent` response and quietly
+        // reclassified the pane as dashboard on reconnect, hiding the bad
+        // spawn metadata. Take the value out of `opts` before `spawn` moves
+        // the struct so we don't fight the borrow checker.
+        let tab_membership = match opts.tab_membership.take() {
+            Some(tm) => {
+                let name_len = tm.name().len();
+                match validate_tab_membership(tm) {
+                    Some(v) => Some(v),
+                    None => {
+                        return Err(AgentPtyError::Validation(format!(
+                            "tab_membership.name fails is_valid_display_name (len={name_len})"
+                        )));
+                    }
+                }
+            }
+            None => None,
+        };
+
         // Defense in depth: `spawn` already protects the child internally
         // via its own `ChildGuard`, so any failure or panic *inside* spawn
         // cannot orphan the child. This outer `PtyGuard` covers the
@@ -688,6 +814,7 @@ impl AgentPtyRegistry {
             pane_id_env,
             display_name,
             cwd: cwd_stored,
+            tab_membership,
         };
 
         let id = inner.next_id.to_string();
@@ -806,6 +933,7 @@ impl AgentPtyRegistry {
                 pane_id_env: agent.pane_id_env.clone(),
                 display_name: agent.display_name.clone(),
                 cwd: agent.cwd.clone(),
+                tab_membership: agent.tab_membership.clone(),
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));

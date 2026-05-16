@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-pub use crate::agent_pty::AgentRecord;
+pub use crate::agent_pty::{AgentRecord, TabMembership, validate_tab_membership};
 use crate::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
     KIND_STREAM_OUT, read_frame, write_frame,
@@ -56,6 +56,14 @@ pub struct StartAgentOptions {
     pub rows: u16,
     pub cols: u16,
     pub env: Vec<(String, String)>,
+    /// PRD #76 M2.12: which tab the TUI placed this agent pane in
+    /// (mode / orchestration). Forwarded as
+    /// `AttachRequest::StartAgent.tab_membership` so the daemon can
+    /// echo it back via `list_agents` and the TUI can rebuild tab
+    /// structure on reconnect. `None` here means "dashboard pane" and
+    /// omits the field from the wire payload so older daemons keep
+    /// accepting the request.
+    pub tab_membership: Option<TabMembership>,
 }
 
 impl Default for StartAgentOptions {
@@ -67,6 +75,7 @@ impl Default for StartAgentOptions {
             rows: 24,
             cols: 80,
             env: Vec::new(),
+            tab_membership: None,
         }
     }
 }
@@ -114,6 +123,28 @@ pub async fn issue_command<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     read_response(rd).await
 }
 
+/// Clamp `record.tab_membership` to `None` if the embedded `name` fails
+/// [`validate_tab_membership`]. Defense in depth at the wire boundary
+/// (M2.12 fixup auditor #1): the daemon validates on `StartAgent`, but
+/// a malformed or older daemon could still echo an invalid record. A
+/// rejected membership is logged via `tracing::warn!` (the agent is
+/// real — we just don't trust the bucketing hint).
+fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
+    if let Some(tm) = rec.tab_membership.take() {
+        let name_len = tm.name().len();
+        match validate_tab_membership(tm) {
+            Some(v) => rec.tab_membership = Some(v),
+            None => {
+                tracing::warn!(
+                    agent_id = %rec.id,
+                    name_len,
+                    "list_agents: clamping invalid tab_membership.name from daemon record to None — pane lands on dashboard"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unix-socket transport
 // ---------------------------------------------------------------------------
@@ -155,6 +186,15 @@ impl DaemonClient {
     /// the legacy `agents`-only field with `pane_id_env: None` so a
     /// newer TUI keeps working against an older daemon — at the cost of
     /// not being able to preserve pane ids on rehydration there.
+    ///
+    /// M2.12 fixup auditor #1: re-validates each record's
+    /// `tab_membership` at this wire boundary. The daemon validates
+    /// `StartAgent.tab_membership` before storing it, but a malformed
+    /// or older daemon could still echo back an invalid `name` here. An
+    /// invalid membership is cleared to `None` (the agent is real, it
+    /// just lands on the dashboard) and a `tracing::warn!` surfaces the
+    /// drift — we never propagate a control-byte name into
+    /// bucketing/logging/tab lookup.
     pub async fn list_agents(&self) -> Result<Vec<AgentRecord>, ClientError> {
         let stream = self.connect().await?;
         let (mut rd, mut wr) = stream.into_split();
@@ -164,7 +204,10 @@ impl DaemonClient {
                 resp.error.unwrap_or_else(|| "list-agents failed".into()),
             ));
         }
-        if let Some(records) = resp.agent_records {
+        if let Some(mut records) = resp.agent_records {
+            for rec in &mut records {
+                sanitize_record_tab_membership(rec);
+            }
             return Ok(records);
         }
         Ok(resp
@@ -176,6 +219,7 @@ impl DaemonClient {
                 pane_id_env: None,
                 display_name: None,
                 cwd: None,
+                tab_membership: None,
             })
             .collect())
     }
@@ -190,6 +234,7 @@ impl DaemonClient {
             rows: opts.rows,
             cols: opts.cols,
             env: opts.env,
+            tab_membership: opts.tab_membership,
         };
         let resp = issue_command(&mut rd, &mut wr, &req).await?;
         if !resp.ok {
@@ -464,5 +509,46 @@ mod tests {
         );
 
         registry.close_agent(&id).unwrap();
+    }
+
+    #[test]
+    fn sanitize_record_tab_membership_strips_invalid_name() {
+        // M2.12 fixup auditor #1: the daemon validates `tab_membership`
+        // on `StartAgent`, but a malformed or older daemon could echo
+        // back a record carrying an invalid `name`. The client-side
+        // boundary sanitizer must clamp the membership to `None` so the
+        // TUI's bucketing / tracing never sees control bytes — the
+        // agent is still real and lands on the dashboard.
+        let mut rec = AgentRecord {
+            id: "7".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Mode {
+                name: "\x1b[31mevil".into(),
+            }),
+        };
+        sanitize_record_tab_membership(&mut rec);
+        assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
+
+        // And a valid record round-trips untouched.
+        let mut ok = AgentRecord {
+            id: "8".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "tdd-cycle".into(),
+                role_index: 2,
+            }),
+        };
+        sanitize_record_tab_membership(&mut ok);
+        assert_eq!(
+            ok.tab_membership,
+            Some(TabMembership::Orchestration {
+                name: "tdd-cycle".into(),
+                role_index: 2,
+            }),
+        );
     }
 }

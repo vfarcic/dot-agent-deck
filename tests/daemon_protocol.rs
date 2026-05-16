@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use dot_agent_deck::agent_pty::AgentPtyRegistry;
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
-    KIND_STREAM_IN, KIND_STREAM_OUT, bind_attach_listener, serve_attach,
+    KIND_STREAM_IN, KIND_STREAM_OUT, TabMembership, bind_attach_listener, serve_attach,
 };
 
 // ---------------------------------------------------------------------------
@@ -111,6 +111,7 @@ async fn start_agent(server: &Server, command: &str) -> String {
             rows: 24,
             cols: 80,
             env: vec![],
+            tab_membership: None,
         },
     )
     .await;
@@ -179,6 +180,145 @@ async fn list_agents_returns_empty_initially() {
     let resp = read_response(&mut s).await;
     assert!(resp.ok);
     assert_eq!(resp.agents.as_deref(), Some(&[][..] as &[String]));
+}
+
+// PRD #76 M2.12: `tab_membership` round-trips through the StartAgent →
+// list_agents wire path so the TUI can rebuild mode/orchestration tabs
+// on reconnect instead of stranding every hydrated pane on the
+// dashboard. Two end-to-end paths: Mode tab and Orchestration tab.
+
+async fn start_agent_with_membership(server: &Server, membership: TabMembership) -> String {
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut s,
+        &AttachRequest::StartAgent {
+            command: Some("sh -c 'sleep 30'".into()),
+            cwd: Some("/tmp".into()),
+            display_name: Some("auditor".into()),
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            tab_membership: Some(membership),
+        },
+    )
+    .await;
+    let resp = read_response(&mut s).await;
+    assert!(resp.ok, "start-agent failed: {:?}", resp.error);
+    resp.id.expect("start-agent response missing id")
+}
+
+#[tokio::test]
+async fn start_agent_with_mode_membership_round_trip() {
+    let server = start_server().await;
+
+    let id = start_agent_with_membership(
+        &server,
+        TabMembership::Mode {
+            name: "k8s-ops".into(),
+        },
+    )
+    .await;
+
+    let records = server.registry.agent_records();
+    let rec = records
+        .iter()
+        .find(|r| r.id == id)
+        .expect("agent missing from list_agents");
+    assert_eq!(
+        rec.tab_membership,
+        Some(TabMembership::Mode {
+            name: "k8s-ops".into()
+        })
+    );
+    server.registry.shutdown_all();
+}
+
+#[tokio::test]
+async fn start_agent_with_orchestration_membership_round_trip() {
+    let server = start_server().await;
+
+    let id = start_agent_with_membership(
+        &server,
+        TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 2,
+        },
+    )
+    .await;
+
+    let records = server.registry.agent_records();
+    let rec = records
+        .iter()
+        .find(|r| r.id == id)
+        .expect("agent missing from list_agents");
+    assert_eq!(
+        rec.tab_membership,
+        Some(TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 2,
+        })
+    );
+    server.registry.shutdown_all();
+}
+
+#[tokio::test]
+async fn start_agent_with_invalid_membership_name_is_rejected() {
+    // M2.12 fixup reviewer #2: an invalid `tab_membership.name` (empty,
+    // over-128-byte, or any of the control bytes the dashboard render
+    // path renders as a span) must *reject* the spawn rather than
+    // silently dropping the membership to `None`. Silent drop hid bad
+    // spawn metadata behind a pane that looked dashboard-resident on
+    // reconnect. Covers all five edge cases from `is_valid_display_name`.
+    let server = start_server().await;
+
+    let cases: &[(&str, String)] = &[
+        ("empty", String::new()),
+        ("129-byte", "a".repeat(129)),
+        ("embedded \\n", "ok\nname".into()),
+        ("embedded \\r", "ok\rname".into()),
+        ("embedded \\0", "ok\0name".into()),
+    ];
+
+    for (label, name) in cases {
+        let mut s = UnixStream::connect(&server.path).await.unwrap();
+        write_request(
+            &mut s,
+            &AttachRequest::StartAgent {
+                command: Some("sh -c 'sleep 30'".into()),
+                cwd: Some("/tmp".into()),
+                display_name: Some("auditor".into()),
+                rows: 24,
+                cols: 80,
+                env: vec![],
+                tab_membership: Some(TabMembership::Mode { name: name.clone() }),
+            },
+        )
+        .await;
+        let resp = read_response(&mut s).await;
+        assert!(
+            !resp.ok,
+            "case {label}: spawn must fail for invalid tab_membership name, got ok response"
+        );
+        assert!(
+            resp.id.is_none(),
+            "case {label}: rejected spawn must not return an id"
+        );
+        assert!(
+            resp.error
+                .as_deref()
+                .is_some_and(|e| e.contains("tab_membership")),
+            "case {label}: error must mention tab_membership, got {:?}",
+            resp.error
+        );
+    }
+
+    // And the daemon must not have spawned anything across all five
+    // cases — invalid metadata, no agent.
+    assert!(
+        server.registry.is_empty(),
+        "no agents should be spawned when tab_membership validation rejects"
+    );
+    server.registry.shutdown_all();
 }
 
 #[tokio::test]
@@ -417,6 +557,7 @@ async fn start_agent_rejects_blank_command() {
             rows: 24,
             cols: 80,
             env: vec![],
+            tab_membership: None,
         },
     )
     .await;

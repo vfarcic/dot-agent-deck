@@ -13,13 +13,14 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Tabs},
 };
 
+use crate::agent_pty::TabMembership;
 use crate::ascii_art::{AsciiArtResult, generate_ascii_art};
 use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::config_validation::sanitize_role_name;
-use crate::embedded_pane::EmbeddedPaneController;
+use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
 use crate::event::{AgentType, EventType};
-use crate::pane::{PaneController, PaneError, RenameOutcome};
+use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
@@ -794,6 +795,166 @@ fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Optio
 }
 
 // ---------------------------------------------------------------------------
+// PRD #76 M2.12: hydration partition
+// ---------------------------------------------------------------------------
+
+/// One mode bucket from [`partition_hydrated_panes`]: the agent pane id
+/// captured from a single hydrated daemon record claiming
+/// `TabMembership::Mode { name }` for the given `cwd`. Multiple records
+/// matching the same `(cwd, mode_name)` are flagged as drift by the
+/// partition (only the first survives; the rest are dropped to dashboard).
+#[derive(Debug, Clone)]
+pub(crate) struct ModeHydrationBucket {
+    pub cwd: String,
+    pub mode_name: String,
+    pub agent_pane_id: String,
+}
+
+/// One orchestration bucket from [`partition_hydrated_panes`]:
+/// the role slots for a single `(cwd, orchestration_name)` pairing. Each
+/// entry is `(role_index, pane_id)`. The hydration glue then expands this
+/// to a `Vec<Option<String>>` of length `config.roles.len()`, treating
+/// any missing index as a dead slot (design decision 4) and any
+/// out-of-range index as config drift (design decision 5).
+#[derive(Debug, Clone)]
+pub(crate) struct OrchestrationHydrationBucket {
+    pub cwd: String,
+    pub orchestration_name: String,
+    pub role_slots: Vec<(usize, String)>,
+}
+
+/// Diagnostic info for a hydrated pane the partition couldn't bucket
+/// cleanly. Surfaced via `HydrationPartition.rejections` so the caller
+/// can emit `tracing::error!` at the hydration site and the partition
+/// helper itself stays pure (no I/O, no tracing) — M2.12 fixup reviewer
+/// #3.
+///
+/// Rejected panes are still routed to `dashboard_pane_ids`, so the
+/// rejection record is purely informational: the user sees the pane on
+/// the dashboard regardless. Today the only rejection reason is a
+/// duplicate `(cwd, mode_name)` claim, but the variant shape leaves
+/// room for future reasons without breaking call sites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HydrationRejection {
+    /// More than one hydrated pane claimed `Mode { name }` for the same
+    /// `cwd`. The first claimant won the bucket; this is the i-th
+    /// duplicate that got dropped to the dashboard instead.
+    DuplicateMode {
+        cwd: String,
+        mode_name: String,
+        agent_id: String,
+        pane_id: String,
+    },
+}
+
+/// Output of [`partition_hydrated_panes`]: separates hydrated panes into
+/// "stays on dashboard" (`dashboard_pane_ids`) and "needs a tab rebuilt"
+/// (`mode_buckets`, `orchestration_buckets`). Panes that name a mode or
+/// orchestration that doesn't exist in the cwd's project config end up
+/// here only via the dispatcher's fallback path — the partition itself
+/// is config-agnostic so it stays a pure function and can be unit-tested
+/// without spinning up a full TUI.
+///
+/// `rejections` carries deferred diagnostics for panes that couldn't be
+/// bucketed cleanly (e.g. duplicate mode claims). The partition helper
+/// stays pure — no I/O, no `tracing` — so the caller is responsible for
+/// logging each rejection at the hydration site (M2.12 fixup reviewer
+/// #3).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HydrationPartition {
+    pub dashboard_pane_ids: Vec<String>,
+    pub mode_buckets: Vec<ModeHydrationBucket>,
+    pub orchestration_buckets: Vec<OrchestrationHydrationBucket>,
+    pub rejections: Vec<HydrationRejection>,
+}
+
+/// PRD #76 M2.12: partition hydrated daemon panes into dashboard / mode
+/// / orchestration buckets based on each agent's recorded
+/// `tab_membership`. Pure function for testability.
+///
+/// Rules:
+/// - `tab_membership == None` → dashboard.
+/// - `Some(Mode { name })` → mode bucket keyed by `(cwd, mode_name)`.
+///   Cwd defaults to `""` when the daemon record omits it (older daemon
+///   shape). The first record claiming a `(cwd, mode_name)` wins; later
+///   duplicates from the same pairing are logged and dropped to the
+///   dashboard so a buggy daemon can't double-build a single mode tab.
+/// - `Some(Orchestration { name, role_index })` → orchestration bucket
+///   keyed by `(cwd, orch_name)`, collecting `(role_index, pane_id)`.
+///   The bucket may be sparse (a role can be missing if its agent died
+///   before the TUI reattached); the dispatcher expands this to a
+///   `Vec<Option<String>>` of full role-count length.
+///
+/// Ordering is stable: dashboard panes preserve input order, mode and
+/// orchestration buckets preserve the order in which their (cwd, name)
+/// pairing was first seen so the user's mental "which tab opened first"
+/// model survives reconnect (TabManager appends in iteration order).
+pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition {
+    use std::collections::HashSet;
+
+    let mut out = HydrationPartition::default();
+    // Bucket lookup tables are local: in-memory only, only used during
+    // this partition pass. Index into `out.mode_buckets` /
+    // `out.orchestration_buckets` keyed by `(cwd, name)`.
+    let mut mode_keys: HashSet<(String, String)> = HashSet::new();
+    let mut orch_index: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+
+    for h in hydrated {
+        let cwd = h.cwd.clone().unwrap_or_default();
+        match &h.tab_membership {
+            None => {
+                out.dashboard_pane_ids.push(h.pane_id.clone());
+            }
+            Some(TabMembership::Mode { name }) => {
+                let key = (cwd.clone(), name.clone());
+                if !mode_keys.insert(key) {
+                    // Duplicate `(cwd, mode_name)` claim. Pure helper:
+                    // record the rejection for the caller to log via
+                    // `tracing::error!`, then route the pane to the
+                    // dashboard. M2.12 fixup reviewer #3.
+                    out.rejections.push(HydrationRejection::DuplicateMode {
+                        cwd: cwd.clone(),
+                        mode_name: name.clone(),
+                        agent_id: h.agent_id.clone(),
+                        pane_id: h.pane_id.clone(),
+                    });
+                    out.dashboard_pane_ids.push(h.pane_id.clone());
+                    continue;
+                }
+                out.mode_buckets.push(ModeHydrationBucket {
+                    cwd,
+                    mode_name: name.clone(),
+                    agent_pane_id: h.pane_id.clone(),
+                });
+            }
+            Some(TabMembership::Orchestration { name, role_index }) => {
+                let key = (cwd.clone(), name.clone());
+                let idx = match orch_index.get(&key) {
+                    Some(i) => *i,
+                    None => {
+                        let i = out.orchestration_buckets.len();
+                        orch_index.insert(key, i);
+                        out.orchestration_buckets
+                            .push(OrchestrationHydrationBucket {
+                                cwd,
+                                orchestration_name: name.clone(),
+                                role_slots: Vec::new(),
+                            });
+                        i
+                    }
+                };
+                out.orchestration_buckets[idx]
+                    .role_slots
+                    .push((*role_index, h.pane_id.clone()));
+            }
+        }
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // M5: Delegation dispatch
 // ---------------------------------------------------------------------------
 
@@ -905,14 +1066,32 @@ fn dispatch_delegate_events(
 
                 let _ = pane.close_pane(&old_pane_id);
 
-                let new_pane_id = match pane.create_pane(None, Some(&cwd)) {
-                    Ok(id) => id,
+                // M2.12 fixup reviewer #1: thread `tab_membership`
+                // through to `StartAgent` here, mirroring the
+                // orchestration-spawn site in
+                // `TabManager::open_orchestration_tab`. Without this,
+                // the daemon stores the restarted role with
+                // `tab_membership = None`, and a later remote
+                // reconnect would strand the role on the dashboard
+                // instead of rebuilding it into its orchestration
+                // tab.
+                let (new_pane_id, _resolved) = match pane.create_pane_with_options(
+                    None,
+                    Some(&cwd),
+                    AgentSpawnOptions {
+                        display_name: Some(role.name.as_str()),
+                        tab_membership: Some(TabMembership::Orchestration {
+                            name: config.name.clone(),
+                            role_index: role_idx,
+                        }),
+                    },
+                ) {
+                    Ok(p) => p,
                     Err(e) => {
                         tracing::error!(role = %role.name, error = %e, "dispatch: failed to create pane");
                         continue;
                     }
                 };
-                let _ = pane.rename_pane(&new_pane_id, &role.name);
 
                 // Update Tab::Orchestration role_pane_ids.
                 if let Tab::Orchestration { role_pane_ids, .. } =
@@ -1986,6 +2165,15 @@ pub fn run_tui(
                 .insert(h.pane_id.clone(), display_name.clone());
             ui.pane_names.insert(h.pane_id.clone(), display_name);
             if let Some(dir) = h.cwd.clone() {
+                // Mode buckets need a `SavedPane.mode` hint for the
+                // existing tab-restore path elsewhere in the UI; the
+                // hydration dispatcher below also reads this map for
+                // mode tab rebuild, so populate `.mode` from
+                // tab_membership rather than leaving it None.
+                let mode_hint = match &h.tab_membership {
+                    Some(TabMembership::Mode { name }) => Some(name.clone()),
+                    _ => None,
+                };
                 ui.pane_metadata.insert(
                     h.pane_id.clone(),
                     config::SavedPane {
@@ -1996,11 +2184,208 @@ pub fn run_tui(
                             .cloned()
                             .unwrap_or_else(|| h.agent_id.clone()),
                         command: String::new(),
-                        mode: None,
+                        mode: mode_hint,
                     },
                 );
             }
         }
+
+        // PRD #76 M2.12: partition hydrated panes by tab_membership and
+        // rebuild mode/orchestration tabs from the project config. Panes
+        // claiming a mode/orchestration that the cwd's project config
+        // doesn't know about (config-drift case from design decision 5)
+        // get logged loudly and left on the dashboard rather than getting
+        // a limbo tab.
+        let partition = partition_hydrated_panes(&hydrated);
+        // Emit deferred diagnostics from the pure partition helper
+        // (M2.12 fixup reviewer #3: partition stays I/O-free; logging
+        // lives at the hydration call site).
+        for rejection in &partition.rejections {
+            match rejection {
+                HydrationRejection::DuplicateMode {
+                    cwd,
+                    mode_name,
+                    agent_id,
+                    pane_id,
+                } => {
+                    tracing::error!(
+                        cwd = %cwd,
+                        mode = %mode_name,
+                        agent_id = %agent_id,
+                        pane_id = %pane_id,
+                        "hydration: duplicate Mode tab_membership for (cwd, name); dropping to dashboard"
+                    );
+                }
+            }
+        }
+        // Cache cwd → project config so the lookup happens once per
+        // distinct cwd regardless of how many buckets share it.
+        let mut config_cache: std::collections::HashMap<
+            String,
+            Option<crate::project_config::ProjectConfig>,
+        > = std::collections::HashMap::new();
+        let lookup_config = |cache: &mut std::collections::HashMap<
+            String,
+            Option<crate::project_config::ProjectConfig>,
+        >,
+                             cwd: &str|
+         -> Option<crate::project_config::ProjectConfig> {
+            if let Some(cached) = cache.get(cwd) {
+                return cached.clone();
+            }
+            let loaded = match load_project_config(std::path::Path::new(cwd)) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::error!(
+                        cwd = %cwd,
+                        error = %e,
+                        "hydration: failed to load project config; dropping mode/orchestration tabs to dashboard"
+                    );
+                    None
+                }
+            };
+            cache.insert(cwd.to_string(), loaded.clone());
+            loaded
+        };
+
+        for bucket in &partition.mode_buckets {
+            let cfg = lookup_config(&mut config_cache, &bucket.cwd);
+            let mode_config = cfg
+                .as_ref()
+                .and_then(|c| c.modes.iter().find(|m| m.name == bucket.mode_name).cloned());
+            let Some(mode_config) = mode_config else {
+                tracing::error!(
+                    cwd = %bucket.cwd,
+                    mode = %bucket.mode_name,
+                    agent_pane_id = %bucket.agent_pane_id,
+                    "hydration: hydrated agent claims mode that is not in project config; dropping to dashboard"
+                );
+                continue;
+            };
+            match tab_manager.open_mode_tab_with_existing_agent_pane(
+                &mode_config,
+                &bucket.cwd,
+                bucket.agent_pane_id.clone(),
+            ) {
+                Ok((_idx, side_ids)) => {
+                    for id in &side_ids {
+                        state.blocking_write().register_pane(id.clone());
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        cwd = %bucket.cwd,
+                        mode = %bucket.mode_name,
+                        error = %e,
+                        "hydration: failed to rebuild mode tab; agent pane stays on dashboard"
+                    );
+                }
+            }
+        }
+
+        for bucket in &partition.orchestration_buckets {
+            let cfg = lookup_config(&mut config_cache, &bucket.cwd);
+            let orch_config = cfg.as_ref().and_then(|c| {
+                c.orchestrations
+                    .iter()
+                    .find(|o| o.name == bucket.orchestration_name)
+                    .cloned()
+            });
+            let Some(orch_config) = orch_config else {
+                tracing::error!(
+                    cwd = %bucket.cwd,
+                    orchestration = %bucket.orchestration_name,
+                    role_count = bucket.role_slots.len(),
+                    "hydration: hydrated agents claim orchestration that is not in project config; dropping to dashboard"
+                );
+                continue;
+            };
+            // Build a Vec<Option<String>> of length config.roles.len()
+            // from the (role_index, pane_id) entries. Out-of-range
+            // indices are config drift (design decision 5): log loudly
+            // and leave the pane on the dashboard.
+            let mut role_pane_ids: Vec<Option<String>> = vec![None; orch_config.roles.len()];
+            for (role_index, pane_id) in &bucket.role_slots {
+                if *role_index >= orch_config.roles.len() {
+                    tracing::error!(
+                        cwd = %bucket.cwd,
+                        orchestration = %bucket.orchestration_name,
+                        role_index = role_index,
+                        role_count = orch_config.roles.len(),
+                        pane_id = %pane_id,
+                        "hydration: orchestration role_index out of range; dropping pane to dashboard"
+                    );
+                    continue;
+                }
+                if role_pane_ids[*role_index].is_some() {
+                    tracing::error!(
+                        cwd = %bucket.cwd,
+                        orchestration = %bucket.orchestration_name,
+                        role_index = role_index,
+                        pane_id = %pane_id,
+                        "hydration: duplicate role_index in orchestration bucket; keeping first, dropping rest to dashboard"
+                    );
+                    continue;
+                }
+                role_pane_ids[*role_index] = Some(pane_id.clone());
+            }
+            // M2.12 fixup auditor #2: if every claimed role slot was
+            // rejected above (out-of-range / duplicate), don't rebuild
+            // an empty orchestration tab — the user didn't ask for one,
+            // and it would only show dead frames. Drop the whole
+            // bucket; the rejected panes already routed themselves to
+            // the dashboard via the logs above.
+            if role_pane_ids.iter().all(Option::is_none) {
+                tracing::warn!(
+                    cwd = %bucket.cwd,
+                    orchestration = %bucket.orchestration_name,
+                    role_count = orch_config.roles.len(),
+                    "hydration: skipping orchestration tab rebuild — no role slots survived filtering"
+                );
+                continue;
+            }
+            // Now register the orchestrator pane mapping for any live
+            // start role so M5 dispatch keeps routing work-done events
+            // back to the right place.
+            let start_role_index = orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+            let orchestrator_pane = role_pane_ids.get(start_role_index).and_then(|s| s.clone());
+            match tab_manager.open_orchestration_tab_with_existing_role_panes(
+                &orch_config,
+                &bucket.cwd,
+                role_pane_ids.clone(),
+            ) {
+                Ok(_) => {
+                    let mut st = state.blocking_write();
+                    for (i, role) in orch_config.roles.iter().enumerate() {
+                        if let Some(Some(pane_id)) = role_pane_ids.get(i) {
+                            st.pane_role_map.insert(pane_id.clone(), role.name.clone());
+                            st.pane_cwd_map.insert(pane_id.clone(), bucket.cwd.clone());
+                            if role.start {
+                                st.orchestrator_pane_ids.insert(pane_id.clone());
+                            }
+                        }
+                    }
+                    drop(st);
+                    if let Some(pane_id) = orchestrator_pane {
+                        let _ = pane_id; // silence "unused" if no further uses below
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        cwd = %bucket.cwd,
+                        orchestration = %bucket.orchestration_name,
+                        error = %e,
+                        "hydration: failed to rebuild orchestration tab; role panes stay on dashboard"
+                    );
+                }
+            }
+        }
+        // After hydration, snap back to the dashboard so the user gets
+        // the overview first. open_mode_tab / open_orchestration_tab
+        // change active_index to the new tab; without this reset, a
+        // multi-tab reconnect would land on whichever tab was built
+        // last.
+        tab_manager.switch_to(0);
     }
 
     if continue_session {
@@ -2089,8 +2474,23 @@ pub fn run_tui(
         // Restore mode tabs — create agent pane (empty shell), open mode tab,
         // resize PTYs, then send init + agent commands at the right size.
         for (saved_pane, mode_config) in deferred_mode_panes {
-            match pane.create_pane(None, Some(&saved_pane.dir)) {
-                Ok(new_id) => {
+            // M2.12: tag the daemon-side agent with this mode tab's
+            // membership so the next reconnect can rebuild this tab
+            // from `list_agents` rather than dropping the agent to the
+            // dashboard. `create_pane_with_options` is the only path
+            // that reaches `StartAgent.tab_membership` on the wire.
+            let mode_tab_membership = Some(TabMembership::Mode {
+                name: mode_config.name.clone(),
+            });
+            match pane.create_pane_with_options(
+                None,
+                Some(&saved_pane.dir),
+                AgentSpawnOptions {
+                    display_name: None,
+                    tab_membership: mode_tab_membership,
+                },
+            ) {
+                Ok((new_id, _resolved)) => {
                     state.blocking_write().register_pane(new_id.clone());
                     if !saved_pane.name.is_empty() {
                         let _ = pane.rename_pane(&new_id, &saved_pane.name);
@@ -3454,8 +3854,25 @@ pub fn run_tui(
                             // so the UI maps below mirror EXACTLY what the daemon has —
                             // no separate normalization helper to drift (M2.11 fixup 4).
                             let form_name = Some(req.name.as_str());
-                            match pane.create_pane_with_display_name(cmd, Some(&dir_str), form_name)
-                            {
+                            // PRD #76 M2.12: tag the agent pane with its
+                            // mode-tab membership so the daemon-side
+                            // registry can echo it back via `list_agents`
+                            // on the next reconnect, letting the
+                            // hydration partition rebuild this mode tab
+                            // instead of stranding the agent on the
+                            // dashboard.
+                            let tab_membership =
+                                req.mode_config.as_ref().map(|m| TabMembership::Mode {
+                                    name: m.name.clone(),
+                                });
+                            match pane.create_pane_with_options(
+                                cmd,
+                                Some(&dir_str),
+                                AgentSpawnOptions {
+                                    display_name: form_name,
+                                    tab_membership,
+                                },
+                            ) {
                                 Ok((new_id, resolved_name)) => {
                                     // Register so only events from our panes are accepted,
                                     // and create a placeholder session for an immediate dashboard card.
@@ -5560,6 +5977,195 @@ mod tests {
 
     fn default_ui() -> UiState {
         UiState::default()
+    }
+
+    // PRD #76 M2.12: pin the hydration partition's bucket semantics so
+    // a future tweak to `partition_hydrated_panes` can't silently strand
+    // mode/orchestration panes on the dashboard or double-build a tab.
+
+    fn hydrated(
+        pane_id: &str,
+        agent_id: &str,
+        cwd: Option<&str>,
+        membership: Option<TabMembership>,
+    ) -> HydratedPane {
+        HydratedPane {
+            pane_id: pane_id.to_string(),
+            agent_id: agent_id.to_string(),
+            display_name: None,
+            cwd: cwd.map(|s| s.to_string()),
+            tab_membership: membership,
+        }
+    }
+
+    #[test]
+    fn partition_routes_dashboard_panes_unchanged() {
+        let panes = vec![
+            hydrated("1", "a-1", Some("/work"), None),
+            hydrated("2", "a-2", None, None),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.dashboard_pane_ids, vec!["1".to_string(), "2".to_string()]);
+        assert!(p.mode_buckets.is_empty());
+        assert!(p.orchestration_buckets.is_empty());
+    }
+
+    #[test]
+    fn partition_groups_mode_membership_by_cwd_and_name() {
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/work"),
+                Some(TabMembership::Mode {
+                    name: "k8s-ops".into(),
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/work2"),
+                Some(TabMembership::Mode {
+                    name: "k8s-ops".into(),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert!(p.dashboard_pane_ids.is_empty());
+        assert_eq!(p.mode_buckets.len(), 2);
+        assert_eq!(p.mode_buckets[0].cwd, "/work");
+        assert_eq!(p.mode_buckets[0].mode_name, "k8s-ops");
+        assert_eq!(p.mode_buckets[0].agent_pane_id, "1");
+        assert_eq!(p.mode_buckets[1].cwd, "/work2");
+        assert_eq!(p.mode_buckets[1].agent_pane_id, "2");
+    }
+
+    #[test]
+    fn partition_duplicate_mode_bucket_drops_extras_to_dashboard() {
+        // Two agents claim the same (cwd, mode_name) — that's a logic
+        // error (mode tabs have one agent each), so the first wins and
+        // the rest end up on the dashboard rather than getting a doubled
+        // mode tab. M2.12 fixup reviewer #3: the helper is pure, so the
+        // duplicate is surfaced via `rejections` for the caller to log.
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/work"),
+                Some(TabMembership::Mode {
+                    name: "k8s-ops".into(),
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/work"),
+                Some(TabMembership::Mode {
+                    name: "k8s-ops".into(),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.mode_buckets.len(), 1);
+        assert_eq!(p.mode_buckets[0].agent_pane_id, "1");
+        assert_eq!(p.dashboard_pane_ids, vec!["2".to_string()]);
+        assert_eq!(
+            p.rejections,
+            vec![HydrationRejection::DuplicateMode {
+                cwd: "/work".into(),
+                mode_name: "k8s-ops".into(),
+                agent_id: "a-2".into(),
+                pane_id: "2".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn partition_collects_orchestration_role_slots() {
+        let panes = vec![
+            hydrated(
+                "10",
+                "a-10",
+                Some("/work"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                }),
+            ),
+            hydrated(
+                "11",
+                "a-11",
+                Some("/work"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 2,
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.orchestration_buckets.len(), 1);
+        let bucket = &p.orchestration_buckets[0];
+        assert_eq!(bucket.cwd, "/work");
+        assert_eq!(bucket.orchestration_name, "tdd-cycle");
+        assert_eq!(bucket.role_slots.len(), 2);
+        assert!(bucket.role_slots.contains(&(0, "10".to_string())));
+        assert!(bucket.role_slots.contains(&(2, "11".to_string())));
+    }
+
+    #[test]
+    fn partition_separates_orchestrations_by_cwd() {
+        // Same orchestration name, different cwds — two separate tabs.
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/work-a"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/work-b"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.orchestration_buckets.len(), 2);
+    }
+
+    #[test]
+    fn partition_mixed_input_preserves_order() {
+        // dashboard pane, then mode, then orchestration in input order.
+        let panes = vec![
+            hydrated("1", "a-1", Some("/w"), None),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/w"),
+                Some(TabMembership::Mode { name: "m".into() }),
+            ),
+            hydrated(
+                "3",
+                "a-3",
+                Some("/w"),
+                Some(TabMembership::Orchestration {
+                    name: "o".into(),
+                    role_index: 0,
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.dashboard_pane_ids, vec!["1".to_string()]);
+        assert_eq!(p.mode_buckets.len(), 1);
+        assert_eq!(p.mode_buckets[0].agent_pane_id, "2");
+        assert_eq!(p.orchestration_buckets.len(), 1);
+        assert_eq!(p.orchestration_buckets[0].role_slots, vec![(0, "3".into())]);
     }
 
     #[test]
