@@ -7483,6 +7483,143 @@ mod tests {
             .unwrap();
     }
 
+    /// Concatenate every cell symbol on a row into a single string and join
+    /// rows with newlines. Used by the render-decision tests below to grep
+    /// the rendered buffer for the placeholder lines.
+    fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut out = String::with_capacity((area.width as usize + 1) * area.height as usize);
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #76 M2.13: dashboard placeholder render-decision tests.
+    //
+    // `render_session_card` flips a single gate on `session.agent_type ==
+    // AgentType::None`: when set, the card shows the "Launch an agent to
+    // get started" empty state and the "No agent" status badge; when
+    // populated (e.g. by the hydration path threading
+    // `AgentRecord.agent_type` through `insert_placeholder_session`), the
+    // card renders as a real session.
+    //
+    // Wire-format and AppState-side coverage live in `tests/m2_rehydration.rs`
+    // (`hydrate_preserves_agent_type_end_to_end` + its OpenCode counterpart).
+    // These two tests pin the render side specifically so a future change to
+    // the gate, the placeholder copy, or the agent-type field can't silently
+    // re-introduce the "reconnect shows Launch an agent" bug.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dashboard_placeholder_with_agent_type_does_not_show_launch_an_agent() {
+        // Simulate the post-hydration state: a placeholder session whose
+        // `agent_type` was populated from the daemon's registry via
+        // `insert_placeholder_session(.., Some(ClaudeCode))`. The dashboard
+        // card must render the agent (no "Launch an agent" empty state,
+        // no "No agent" status badge).
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            Some(AgentType::ClaudeCode),
+        );
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
+                )
+            })
+            .unwrap();
+
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            !rendered.contains("Launch an agent to get started"),
+            "hydrated placeholder (agent_type=ClaudeCode) must not render the \
+             empty-state line; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("No agent"),
+            "hydrated placeholder (agent_type=ClaudeCode) must not show the \
+             'No agent' status badge; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn dashboard_placeholder_without_agent_type_shows_launch_an_agent() {
+        // Negative case: a placeholder created without an `agent_type` (the
+        // legacy local-mode path, or hydration from a pre-M2.13 daemon that
+        // doesn't echo the field) still renders the empty state. This pins
+        // the gate in the other direction so a refactor that drops the
+        // distinction can't silently change the empty-state UX either.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session("1".to_string(), Some("/tmp".to_string()), None);
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
+                )
+            })
+            .unwrap();
+
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            rendered.contains("Launch an agent to get started"),
+            "unhydrated placeholder (agent_type=None) must render the \
+             empty-state line; got:\n{rendered}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------

@@ -858,3 +858,64 @@ async fn hydrate_preserves_agent_type_end_to_end() {
     drop(ctrl);
     let _ = server.registry.close_agent(&agent_id);
 }
+
+// PRD #76 M2.13: the wire field is an enum; a serde rename or variant
+// addition that breaks `OpenCode` round-trip would slip past the
+// ClaudeCode-only end-to-end test above. Re-run the same hydration chain
+// with `OpenCode` so any single-variant regression in `AgentRecord.agent_type`
+// (or downstream plumbing) fails loudly on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydrate_preserves_agent_type_end_to_end_opencode() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    let agent_id = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            agent_type: Some(AgentType::OpenCode),
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent should succeed");
+
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(hydrated.len(), 1);
+    let h = &hydrated[0];
+    assert_eq!(h.agent_id, agent_id);
+    assert_eq!(
+        h.agent_type,
+        Some(AgentType::OpenCode),
+        "hydrated pane must carry the OpenCode agent_type, not None — got {:?}",
+        h.agent_type
+    );
+
+    let mut state = AppState::default();
+    state.register_pane(h.pane_id.clone());
+    state.insert_placeholder_session(h.pane_id.clone(), h.cwd.clone(), h.agent_type.clone());
+
+    let session = state
+        .sessions
+        .values()
+        .find(|s| s.pane_id.as_deref() == Some(h.pane_id.as_str()))
+        .expect("placeholder session must exist for the hydrated pane");
+    assert_eq!(
+        session.agent_type,
+        AgentType::OpenCode,
+        "placeholder session must inherit the daemon-recorded OpenCode \
+         agent_type — got {:?}",
+        session.agent_type
+    );
+
+    drop(ctrl);
+    let _ = server.registry.close_agent(&agent_id);
+}
