@@ -505,8 +505,11 @@ struct UiState {
     config_gen_target: Option<(String, String)>,
     /// Selected option index in the config-gen modal (0=Yes, 1=No, 2=Never).
     config_gen_selected: usize,
-    /// Selected option in quit confirm modal (0=Quit, 1=Cancel).
+    /// Selected option in quit confirm modal (0=action, 1=Cancel).
     quit_confirm_selected: usize,
+    /// PRD #76 M2.18: true when the TUI is attached to an external daemon,
+    /// so the quit dialog shows "Detach" instead of "Quit".
+    via_daemon: bool,
     /// Orchestration tab IDs whose start-role prompt has already been injected.
     orchestration_prompted: HashSet<TabId>,
     /// Tracks when orchestration tabs were created (for delayed prompt injection).
@@ -563,6 +566,7 @@ impl UiState {
             config_gen_target: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
+            via_daemon: false,
             orchestration_prompted: HashSet::new(),
             orchestration_created_at: HashMap::new(),
             pending_dispatches: Vec::new(),
@@ -1845,10 +1849,13 @@ fn handle_pane_input_key(key: KeyEvent) -> KeyResult {
 }
 
 fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
-    // 0 = Quit, 1 = Detach (M2.5: leave remote agents running), 2 = Cancel.
-    const QUIT_OPTION_COUNT: usize = 3;
+    // PRD #76 M2.18: index 0 is the mode-dependent action (Quit locally,
+    // Detach in external-daemon mode); index 1 is Cancel.
+    const QUIT_OPTION_COUNT: usize = 2;
     match key.code {
-        // Ctrl+C again: actually quit (legacy shortcut)
+        // Ctrl+C again: legacy escape-hatch that always exits without
+        // KIND_DETACH. In external mode the daemon treats EOF as implicit
+        // detach so agents still survive.
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyResult::Quit,
         KeyCode::Up | KeyCode::Char('k') => {
             ui.quit_confirm_selected = ui.quit_confirm_selected.saturating_sub(1);
@@ -1861,8 +1868,13 @@ fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             KeyResult::Continue
         }
         KeyCode::Enter => match ui.quit_confirm_selected {
-            0 => KeyResult::Quit,
-            1 => KeyResult::DetachAndQuit,
+            0 => {
+                if ui.via_daemon {
+                    KeyResult::DetachAndQuit
+                } else {
+                    KeyResult::Quit
+                }
+            }
             _ => {
                 ui.mode = UiMode::Normal;
                 KeyResult::Continue
@@ -2446,6 +2458,12 @@ pub fn run_post_loop_teardown(
         // agents on the daemon.
         return;
     }
+    // PRD #76 M2.18: skip tab 0 (Dashboard) deliberately. `TabManager::close_tab(0)`
+    // returns `Err(CannotCloseDashboard)` by design, and the `Tab::Dashboard`
+    // variant carries no pane IDs anyway — dashboard PTY children are tracked
+    // through `state`/the pane controller directly and die with the TUI
+    // process on exit. Iterating from 1 here is the only correct range; a
+    // `0..tab_count()` bound would error on tab 0 and return nothing.
     for i in (1..tab_manager.tab_count()).rev() {
         if let Ok(ids) = tab_manager.close_tab(i) {
             for id in ids {
@@ -2483,6 +2501,10 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, palette);
+    ui.via_daemon = pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .is_some_and(|c| c.is_external_daemon());
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -5093,7 +5115,7 @@ fn render_overlays(
         render_config_gen_prompt(frame, ui.config_gen_selected, palette);
     }
     if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame, ui.quit_confirm_selected, palette);
+        render_quit_confirm(frame, ui.quit_confirm_selected, ui.via_daemon, palette);
     }
 }
 
@@ -5502,33 +5524,50 @@ fn render_bottom_bar(
     }
 }
 
-fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette) {
+fn render_quit_confirm(
+    frame: &mut Frame,
+    selected: usize,
+    via_daemon: bool,
+    palette: ColorPalette,
+) {
     let area = frame.area();
     let popup_width = 60u16.min(area.width.saturating_sub(4));
-    let popup_height = 10u16.min(area.height.saturating_sub(4));
+    let popup_height = 9u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
-    // PRD #76, M2.5: "Detach" sits between Quit and Cancel so users facing
-    // the dialog with remote panes can pick the survival option without
-    // having to hunt for a separate keybind. Both Quit and Detach leave
-    // remote agents running — the difference is that Detach emits an
-    // explicit KIND_DETACH frame so the daemon can distinguish voluntary
-    // detach from sleep/network drops, whereas Quit just exits and lets
-    // the daemon observe EOF (treated as implicit detach).
+    // PRD #76 M2.18: in external-daemon mode the only meaningful exit is
+    // Detach (TUI exits, daemon-owned agents keep running, KIND_DETACH frame
+    // emitted so the daemon log distinguishes voluntary detach from EOF).
+    // In local mode there is no daemon to detach from, so the action is
+    // Quit (exit and reap local PTY children).
+    let (action_label, action_desc, title, prompt) = if via_daemon {
+        (
+            "Detach",
+            "leave agents running on the daemon",
+            " Detach ",
+            "  Detach from this TUI?",
+        )
+    } else {
+        (
+            "Quit",
+            "exit and reap local agents",
+            " Quit ",
+            "  Are you sure you want to quit?",
+        )
+    };
     let options = [
-        ("Quit", "exit without signaling detach"),
-        ("Detach", "leave remote agents running"),
+        (action_label, action_desc),
         ("Cancel", "return to dashboard"),
     ];
 
     let mut text = vec![
         Line::from(""),
         Line::styled(
-            "  Are you sure you want to quit?",
+            prompt,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -5558,7 +5597,7 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
     ));
 
     let block = Block::default()
-        .title(" Quit ")
+        .title(title)
         .title_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -10268,5 +10307,64 @@ mod tests {
         );
         assert_eq!(ui.pending_dispatches[0].pane_id, *orchestrator_pane);
         assert!(ui.pending_dispatches[0].prompt.contains("coder"));
+    }
+
+    // PRD #76 M2.18: the quit dialog collapsed from three options (Quit /
+    // Detach / Cancel) to two mode-dependent ones. Pin the dispatch so a
+    // future refactor can't silently drop the mode-awareness — local mode
+    // must yield `KeyResult::Quit` (reap local children) and external mode
+    // must yield `KeyResult::DetachAndQuit` (emit KIND_DETACH so the daemon
+    // log distinguishes voluntary detach from EOF).
+    #[test]
+    fn quit_confirm_enter_in_local_mode_returns_quit() {
+        let mut ui = default_ui();
+        ui.via_daemon = false;
+        ui.mode = UiMode::QuitConfirm;
+        ui.quit_confirm_selected = 0;
+
+        let result =
+            handle_quit_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+        assert!(matches!(result, KeyResult::Quit));
+    }
+
+    #[test]
+    fn quit_confirm_enter_in_external_daemon_mode_returns_detach() {
+        let mut ui = default_ui();
+        ui.via_daemon = true;
+        ui.mode = UiMode::QuitConfirm;
+        ui.quit_confirm_selected = 0;
+
+        let result =
+            handle_quit_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+        assert!(matches!(result, KeyResult::DetachAndQuit));
+    }
+
+    #[test]
+    fn quit_confirm_cancel_returns_to_normal_mode() {
+        for via_daemon in [false, true] {
+            let mut ui = default_ui();
+            ui.via_daemon = via_daemon;
+            ui.mode = UiMode::QuitConfirm;
+            ui.quit_confirm_selected = 1;
+
+            let result =
+                handle_quit_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+            assert!(matches!(result, KeyResult::Continue));
+            assert_eq!(ui.mode, UiMode::Normal);
+        }
+    }
+
+    #[test]
+    fn quit_confirm_down_clamps_to_two_options() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::QuitConfirm;
+        ui.quit_confirm_selected = 0;
+
+        // Two presses on Down — selection must stop at index 1 (Cancel),
+        // proving QUIT_OPTION_COUNT == 2.
+        handle_quit_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui);
+        assert_eq!(ui.quit_confirm_selected, 1);
+        handle_quit_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui);
+        assert_eq!(ui.quit_confirm_selected, 1);
     }
 }
