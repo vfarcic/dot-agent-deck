@@ -54,8 +54,9 @@ async fn start_server() -> Server {
     };
 
     let registry_for_task = registry.clone();
+    let (event_tx, _) = tokio::sync::broadcast::channel(16);
     let handle = tokio::spawn(async move {
-        let _ = serve_attach(listener, registry_for_task).await;
+        let _ = serve_attach(listener, registry_for_task, event_tx).await;
     });
 
     Server {

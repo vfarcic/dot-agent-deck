@@ -21,10 +21,10 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 pub use crate::agent_pty::{AgentRecord, TabMembership, validate_tab_membership};
 use crate::daemon_protocol::{
-    AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
+    AttachRequest, AttachResponse, KIND_DETACH, KIND_EVENT, KIND_REQ, KIND_RESP, KIND_STREAM_END,
     KIND_STREAM_OUT, read_frame, write_frame,
 };
-use crate::event::AgentType;
+use crate::event::{AgentEvent, AgentType};
 
 /// Errors returned by the client. Server-side error responses are surfaced
 /// as [`ClientError::Server`] with the daemon's message; transport problems
@@ -337,6 +337,32 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// PRD #76 M2.17: open a long-lived `SubscribeEvents` connection.
+    /// Returns once the daemon has confirmed the subscription with a
+    /// successful RESP — subsequent frames on the wire are `KIND_EVENT`
+    /// (one per hook event broadcast by the daemon) until the daemon
+    /// closes the stream (`KIND_STREAM_END` carrying the reason) or
+    /// either side drops the socket.
+    pub async fn subscribe_events(&self) -> Result<EventSubscription, ClientError> {
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::SubscribeEvents).await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "subscribe-events failed".into()),
+            ));
+        }
+        // Keep the write half alive for the lifetime of the subscription.
+        // The daemon races a one-byte read on its side against rx.recv() to
+        // detect client disconnect — dropping wr here would shut down our
+        // side via SHUT_WR and trip that detector immediately, tearing the
+        // subscription down before any events flow. Letting wr live until
+        // EventSubscription drops means the daemon sees EOF exactly when
+        // the client actually goes away.
+        Ok(EventSubscription { rd, _wr: wr })
+    }
+
     /// Open an attach-stream connection. Returns once the daemon has
     /// confirmed the attach with a successful RESP — i.e. the next frame on
     /// the wire is the consistent scrollback snapshot, followed by live
@@ -357,6 +383,56 @@ impl DaemonClient {
             ));
         }
         Ok(AttachConnection { rd, wr })
+    }
+}
+
+/// Long-lived `SubscribeEvents` connection (PRD #76 M2.17). Yields one
+/// [`AgentEvent`] per `next_event` call until the daemon ends the stream
+/// (`KIND_STREAM_END` — typically `"lagged"` when the broadcast receiver
+/// fell behind) or the socket drops. Callers reconnect via
+/// [`DaemonClient::subscribe_events`].
+pub struct EventSubscription {
+    rd: OwnedReadHalf,
+    /// Held purely as a lifetime signal: dropping the subscription drops
+    /// `_wr`, which half-closes the socket via `SHUT_WR`, which trips the
+    /// daemon's read-side disconnect detector and tears the per-connection
+    /// receiver down promptly. Never written to after the request.
+    _wr: OwnedWriteHalf,
+}
+
+impl EventSubscription {
+    /// Read the next `AgentEvent` from the subscription. Returns
+    /// `Ok(None)` on `KIND_STREAM_END`, peer EOF, or an unexpected frame
+    /// kind (logged via `tracing::warn!`) — the caller should drop and
+    /// reconnect. A malformed JSON payload is returned as
+    /// `Err(io::Error)` so the caller can decide whether to reconnect or
+    /// surface the bug.
+    pub async fn next_event(&mut self) -> io::Result<Option<AgentEvent>> {
+        match read_frame(&mut self.rd).await? {
+            None => Ok(None),
+            Some((KIND_EVENT, payload)) => match serde_json::from_slice::<AgentEvent>(&payload) {
+                Ok(event) => Ok(Some(event)),
+                Err(e) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("malformed KIND_EVENT payload: {e}"),
+                )),
+            },
+            Some((KIND_STREAM_END, reason)) => {
+                if !reason.is_empty() {
+                    tracing::warn!(
+                        reason = %String::from_utf8_lossy(&reason),
+                        "subscribe_events: daemon ended stream"
+                    );
+                }
+                Ok(None)
+            }
+            Some((kind, _)) => {
+                tracing::warn!(
+                    "unexpected frame kind 0x{kind:02x} on subscribe-events stream — ending"
+                );
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -413,6 +489,7 @@ mod tests {
 
     use crate::agent_pty::AgentPtyRegistry;
     use crate::daemon_protocol::{bind_attach_listener, serve_attach};
+    use tokio::sync::broadcast;
 
     /// Mirror the harness lock from `tests/daemon_protocol.rs`: `bind_socket`
     /// flips the process-global umask while binding, and a tempdir created
@@ -430,8 +507,9 @@ mod tests {
             (dir, path, listener)
         };
         let reg = registry.clone();
+        let (event_tx, _) = broadcast::channel(16);
         tokio::spawn(async move {
-            let _ = serve_attach(listener, reg).await;
+            let _ = serve_attach(listener, reg, event_tx).await;
         });
         (dir, path, registry)
     }

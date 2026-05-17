@@ -5,12 +5,20 @@ use std::sync::{Arc, Mutex};
 
 use tokio::io::AsyncBufReadExt;
 use tokio::net::UnixListener;
+use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use crate::agent_pty::AgentPtyRegistry;
 use crate::error::DaemonError;
 use crate::event::{AgentEvent, DaemonMessage};
 use crate::state::SharedState;
+
+/// Daemon-wide broadcast capacity for `AgentEvent`s forwarded to attached
+/// TUIs (PRD #76 M2.17). Generous so a slow client doesn't drop events
+/// during a normal burst; a subscriber that falls further behind than this
+/// is signalled via `RecvError::Lagged` and the per-connection forwarder
+/// drops the connection (the TUI reconnects).
+const EVENT_BROADCAST_CAPACITY: usize = 1024;
 
 /// Mode for the daemon's Unix socket: owner-only read/write. Without this the
 /// socket file inherits the process umask, which on most systems leaves it
@@ -64,16 +72,25 @@ pub struct Daemon {
     /// tests that only exercise hook ingestion. Production callers
     /// (`main.rs`) populate this from `config::attach_socket_path()`.
     pub attach_socket_path: Option<PathBuf>,
+    /// Daemon-wide broadcast of hook events (PRD #76 M2.17). The hook loop
+    /// publishes every successfully-parsed `AgentEvent` here after applying
+    /// it to `state`; the attach server hands each `SubscribeEvents`
+    /// connection its own `Receiver` so attached TUIs in remote mode see
+    /// live agent activity. In the in-process daemon path the receiver is
+    /// unused — the TUI shares `state` directly.
+    pub event_tx: broadcast::Sender<AgentEvent>,
 }
 
 impl Daemon {
     /// Hook-only daemon, no streaming attach server. Preserves the M1.1
     /// behavior for callers that don't need the M1.2 protocol.
     pub fn new(state: SharedState) -> Self {
+        let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         Self {
             state,
             pty_registry: Arc::new(AgentPtyRegistry::new()),
             attach_socket_path: None,
+            event_tx,
         }
     }
 
@@ -81,10 +98,12 @@ impl Daemon {
     /// on `attach_path`. Hook ingestion still uses the path passed to
     /// `run_daemon_with`.
     pub fn with_attach(state: SharedState, attach_path: PathBuf) -> Self {
+        let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         Self {
             state,
             pty_registry: Arc::new(AgentPtyRegistry::new()),
             attach_socket_path: Some(attach_path),
+            event_tx,
         }
     }
 }
@@ -115,19 +134,23 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // (killing any owned agents) when this future is dropped/aborted.
     let pty_registry = daemon.pty_registry;
     let state = daemon.state;
+    let event_tx = daemon.event_tx;
 
     // Optionally spawn the M1.2 streaming attach server. We hold its
     // JoinHandle and abort it on exit so it doesn't outlive the daemon.
     let attach_handle = daemon.attach_socket_path.map(|path| {
         let registry = pty_registry.clone();
+        let attach_event_tx = event_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::daemon_protocol::run_attach_server(&path, registry).await {
+            if let Err(e) =
+                crate::daemon_protocol::run_attach_server(&path, registry, attach_event_tx).await
+            {
                 error!("attach protocol server error: {e}");
             }
         })
     });
 
-    let result = run_hook_loop(listener, state).await;
+    let result = run_hook_loop(listener, state, event_tx).await;
 
     if let Some(h) = attach_handle {
         h.abort();
@@ -137,11 +160,16 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     result
 }
 
-async fn run_hook_loop(listener: UnixListener, state: SharedState) -> Result<(), DaemonError> {
+async fn run_hook_loop(
+    listener: UnixListener,
+    state: SharedState,
+    event_tx: broadcast::Sender<AgentEvent>,
+) -> Result<(), DaemonError> {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let state = state.clone();
+                let event_tx = event_tx.clone();
                 tokio::spawn(async move {
                     let reader = tokio::io::BufReader::new(stream);
                     let mut lines = reader.lines();
@@ -174,6 +202,13 @@ async fn run_hook_loop(listener: UnixListener, state: SharedState) -> Result<(),
                                 agent_type = ?event.agent_type,
                                 "Received event"
                             );
+                            // Fan out to subscribed attach connections
+                            // *before* mutating local state, so the broadcast
+                            // happens whether or not the local `apply_event`
+                            // accepts the event (e.g. an unmanaged pane id).
+                            // `send` returns Err only when there are no
+                            // subscribers — that's expected and ignored.
+                            let _ = event_tx.send(event.clone());
                             state.write().await.apply_event(event);
                         } else {
                             warn!("Malformed event: {line}");

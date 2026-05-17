@@ -9,6 +9,7 @@ use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_attach::{ensure_external_daemon_or_die, via_daemon_enabled};
+use dot_agent_deck::daemon_client::DaemonClient;
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::hooks_manage;
@@ -579,6 +580,11 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
             eprintln!("remote-deck-local mode: {e}");
             return ExitCode::FAILURE;
         }
+        // PRD #76 M2.17: subscribe to the daemon's `AgentEvent` broadcast
+        // so the remote-mode TUI's `AppState` mirrors live agent activity.
+        // In the in-process daemon path the TUI and daemon already share
+        // `state`, so this branch is the only one that needs the bridge.
+        spawn_event_subscriber(attach_path.clone(), state.clone());
         None
     } else {
         let daemon_state = state.clone();
@@ -650,6 +656,58 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
         eprintln!("TUI error: {e}");
     }
     ExitCode::SUCCESS
+}
+
+/// PRD #76 M2.17: open a long-lived `SubscribeEvents` connection against the
+/// daemon and forward every `AgentEvent` into the TUI's `AppState` via
+/// `apply_event`. Reconnects with a small backoff on transport errors so a
+/// daemon restart or a `KIND_STREAM_END "lagged"` tear-down recovers
+/// automatically — the TUI in remote mode would otherwise stay frozen at
+/// placeholder defaults (the symptom this milestone fixes).
+fn spawn_event_subscriber(
+    attach_path: std::path::PathBuf,
+    state: dot_agent_deck::state::SharedState,
+) {
+    tokio::spawn(async move {
+        // Backoff parameters tuned for "daemon briefly unavailable" rather
+        // than long outages: a fresh-daemon ready window is sub-second, so
+        // a 500ms initial delay catches most transient cases, and we cap
+        // at 5s so a stuck daemon doesn't burn CPU on reconnect attempts.
+        let mut delay = std::time::Duration::from_millis(500);
+        let max_delay = std::time::Duration::from_secs(5);
+        let client = DaemonClient::new(attach_path);
+        loop {
+            match client.subscribe_events().await {
+                Ok(mut sub) => {
+                    // Reset backoff on a successful subscribe.
+                    delay = std::time::Duration::from_millis(500);
+                    loop {
+                        match sub.next_event().await {
+                            Ok(Some(event)) => {
+                                state.write().await.apply_event(event);
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "subscribe_events: stream error, reconnecting"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "subscribe_events: subscribe failed, retrying"
+                    );
+                }
+            }
+            tokio::time::sleep(delay).await;
+            delay = std::cmp::min(delay * 2, max_delay);
+        }
+    });
 }
 
 /// `dot-agent-deck connect [name]` — PRD #76 M2.9.

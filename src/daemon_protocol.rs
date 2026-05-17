@@ -27,6 +27,7 @@
 //! | `KIND_STREAM_IN`  | client → server | raw bytes for PTY stdin       |
 //! | `KIND_DETACH`     | client → server | empty — detach, leave agent   |
 //! | `KIND_STREAM_END` | server → client | optional reason (e.g. lagged) |
+//! | `KIND_EVENT`      | server → client | JSON [`crate::event::AgentEvent`] (M2.17, after a `SubscribeEvents` request) |
 //!
 //! # Per-connection state machine
 //!
@@ -68,7 +69,7 @@ use tracing::{error, info, warn};
 
 pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
-use crate::event::AgentType;
+use crate::event::{AgentEvent, AgentType};
 
 // ---------------------------------------------------------------------------
 // Frame kinds
@@ -80,6 +81,11 @@ pub const KIND_STREAM_OUT: u8 = 0x10;
 pub const KIND_STREAM_IN: u8 = 0x11;
 pub const KIND_STREAM_END: u8 = 0x12;
 pub const KIND_DETACH: u8 = 0x13;
+/// PRD #76 M2.17: server → client JSON-encoded `AgentEvent` forwarded over
+/// a long-lived `SubscribeEvents` connection. The TUI's remote-mode
+/// `AppState` is otherwise disconnected from the daemon's hook ingestion
+/// loop; this frame is the bridge.
+pub const KIND_EVENT: u8 = 0x14;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -251,6 +257,14 @@ pub enum AttachRequest {
         #[serde(default)]
         cwd: Option<String>,
     },
+    /// PRD #76 M2.17: long-lived subscription to the daemon's
+    /// `AgentEvent` broadcast. Server replies with an OK `RESP` then
+    /// streams `KIND_EVENT` frames (one per hook event) until either side
+    /// closes the connection or the broadcast receiver lags. The TUI in
+    /// remote mode opens exactly one of these on startup so its
+    /// `AppState` mirrors the daemon's view of live agent activity (agent
+    /// type, tool counts, prompts, last-activity timestamps).
+    SubscribeEvents,
 }
 
 fn default_rows() -> u16 {
@@ -355,16 +369,24 @@ pub fn bind_attach_listener(path: &Path) -> io::Result<UnixListener> {
 
 /// Accept-loop half of the attach server. Runs until the listener errors out
 /// or the future is dropped. Pairs with `bind_attach_listener`.
+///
+/// `event_tx` is the daemon-wide `AgentEvent` broadcast (PRD #76 M2.17). It
+/// is held here so each accepted connection can call `subscribe()` if the
+/// client opens a `SubscribeEvents` stream. The cost of holding a `Sender`
+/// with zero subscribers is negligible — `send` only succeeds when at
+/// least one `Receiver` exists.
 pub async fn serve_attach(
     listener: UnixListener,
     registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<AgentEvent>,
 ) -> io::Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let registry = registry.clone();
+                let event_tx = event_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, registry).await {
+                    if let Err(e) = handle_connection(stream, registry, event_tx).await {
                         warn!("attach protocol connection error: {e}");
                     }
                 });
@@ -380,15 +402,20 @@ pub async fn serve_attach(
 /// Bind the attach socket and serve protocol connections forever. Cleans up
 /// any stale socket file before binding. Runs until the listener errors out
 /// or the future is dropped.
-pub async fn run_attach_server(path: &Path, registry: Arc<AgentPtyRegistry>) -> io::Result<()> {
+pub async fn run_attach_server(
+    path: &Path,
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<AgentEvent>,
+) -> io::Result<()> {
     let listener = bind_attach_listener(path)?;
     info!("Attach protocol listening on {}", path.display());
-    serve_attach(listener, registry).await
+    serve_attach(listener, registry, event_tx).await
 }
 
 async fn handle_connection(
     mut stream: UnixStream,
     registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<AgentEvent>,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -485,6 +512,9 @@ async fn handle_connection(
             Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
+        AttachRequest::SubscribeEvents => {
+            handle_subscribe_events(stream, event_tx).await?;
+        }
     }
     Ok(())
 }
@@ -492,6 +522,70 @@ async fn handle_connection(
 async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse) -> io::Result<()> {
     let payload = serde_json::to_vec(resp).expect("AttachResponse must serialize");
     write_frame(w, KIND_RESP, &payload).await
+}
+
+/// Long-lived `SubscribeEvents` handler (PRD #76 M2.17). Confirms the
+/// subscription with an OK `RESP`, then forwards every event from the
+/// daemon-wide broadcast as a `KIND_EVENT` frame. Each write is bounded by
+/// `CLIENT_WRITE_TIMEOUT` so a wedged client can't pin this task forever.
+/// A lagged receiver — the client fell further behind than the broadcast
+/// capacity — closes the connection with `KIND_STREAM_END` carrying
+/// `"lagged"`; the TUI's reconnect path drains a `list_agents` snapshot
+/// to recover. Client disconnect is detected by racing a one-byte read
+/// against `rx.recv()` so the broadcast `Receiver` is dropped promptly
+/// when the client goes away between events — otherwise the per-connection
+/// task and its receiver would leak for the lifetime of the daemon.
+async fn handle_subscribe_events(
+    stream: UnixStream,
+    event_tx: broadcast::Sender<AgentEvent>,
+) -> io::Result<()> {
+    let mut rx = event_tx.subscribe();
+    let (mut rd, mut wr) = stream.into_split();
+    write_resp(&mut wr, &AttachResponse::ok()).await?;
+    loop {
+        tokio::select! {
+            recv = rx.recv() => {
+                match recv {
+                    Ok(event) => {
+                        let payload = match serde_json::to_vec(&event) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                // An AgentEvent that can't serialize is a daemon
+                                // bug — log and skip rather than tear the
+                                // subscription down for every other client.
+                                warn!("subscribe-events: skipping unserializable event: {e}");
+                                continue;
+                            }
+                        };
+                        if !write_or_timeout(&mut wr, KIND_EVENT, &payload).await {
+                            let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Daemon's event_tx dropped — daemon is shutting down.
+                        let _ = write_or_timeout(&mut wr, KIND_STREAM_END, &[]).await;
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Client fell behind beyond EVENT_BROADCAST_CAPACITY.
+                        // Tear the subscription down with a typed reason so the
+                        // client can drop and reconnect.
+                        let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"lagged").await;
+                        break;
+                    }
+                }
+            }
+            // Disconnect detector: the client never writes after the
+            // SubscribeEvents request, so any read result here means the
+            // socket is gone (EOF / error) or the client is misbehaving.
+            // Either way, exit so the receiver drops.
+            _ = rd.read_u8() => {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn handle_attach_stream(
@@ -993,6 +1087,54 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn subscribe_events_request_serde_round_trip() {
+        // PRD #76 M2.17: SubscribeEvents has no payload fields, so the
+        // wire shape is just `{"op": "subscribe-events"}`. Older daemons
+        // would respond with `expected REQ frame, got kind 0x...` —
+        // adding the variant doesn't break the existing dispatch.
+        let req = AttachRequest::SubscribeEvents;
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["op"], "subscribe-events");
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, AttachRequest::SubscribeEvents));
+    }
+
+    #[tokio::test]
+    async fn kind_event_frame_round_trip() {
+        // The KIND_EVENT payload is a JSON-encoded AgentEvent. Pin the
+        // round-trip here so a future structural change to AgentEvent
+        // doesn't silently break wire compatibility for remote-mode TUIs.
+        use crate::event::{AgentEvent, AgentType, EventType};
+        use chrono::Utc;
+        use std::collections::HashMap;
+
+        let event = AgentEvent {
+            session_id: "sess-1".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::ToolStart,
+            tool_name: Some("Read".into()),
+            tool_detail: Some("src/main.rs".into()),
+            cwd: Some("/work".into()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some("7".into()),
+        };
+        let payload = serde_json::to_vec(&event).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        write_frame(&mut buf, KIND_EVENT, &payload).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let (kind, body) = read_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(kind, KIND_EVENT);
+        let back: AgentEvent = serde_json::from_slice(&body).unwrap();
+        assert_eq!(back.session_id, "sess-1");
+        assert_eq!(back.event_type, EventType::ToolStart);
+        assert_eq!(back.tool_name.as_deref(), Some("Read"));
+        assert_eq!(back.pane_id.as_deref(), Some("7"));
     }
 
     #[test]
