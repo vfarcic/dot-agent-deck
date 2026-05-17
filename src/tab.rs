@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 use crate::agent_pty::TabMembership;
-use crate::event::EventType;
+use crate::event::{AgentType, EventType};
 use crate::mode_manager::{ModeManager, ModeManagerError};
 use crate::pane::{AgentSpawnOptions, PaneController};
 use crate::project_config::{ModeConfig, OrchestrationConfig};
@@ -256,6 +256,13 @@ impl TabManager {
                 }),
                 rows: spawn_rows,
                 cols: spawn_cols,
+                // PRD #76 M2.13: tag each role's daemon-side registry
+                // entry with the agent type inferred from its command
+                // (e.g. `claude` → `ClaudeCode`). The daemon echoes this
+                // back via `list_agents` on reconnect so the hydration
+                // path can build the placeholder session with the right
+                // type instead of "No agent".
+                agent_type: AgentType::from_command(Some(&role.command)),
             };
             let (pane_id, _resolved) = match self.pane_controller.create_pane_with_options(
                 Some(&role.command),

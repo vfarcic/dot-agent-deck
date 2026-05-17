@@ -4,6 +4,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::agent_pty::TabMembership;
+use crate::event::AgentType;
 
 #[derive(Debug, Error)]
 pub enum PaneError {
@@ -144,6 +145,13 @@ pub struct AgentSpawnOptions<'a> {
     pub tab_membership: Option<TabMembership>,
     pub rows: u16,
     pub cols: u16,
+    /// PRD #76 M2.13: which AI agent this spawn command runs (typically
+    /// inferred at the call site via [`AgentType::from_command`]).
+    /// Forwarded to the daemon via `StartAgentOptions.agent_type` so the
+    /// registry's `agent_type` echo on `list_agents` can seed hydrated
+    /// placeholder sessions with the correct type. `None` means
+    /// "unknown / not an agent" — same default as the legacy path.
+    pub agent_type: Option<AgentType>,
 }
 
 impl Default for AgentSpawnOptions<'_> {
@@ -156,6 +164,7 @@ impl Default for AgentSpawnOptions<'_> {
             // helpers; defaults exist only for test fixtures.
             rows: 24,
             cols: 80,
+            agent_type: None,
         }
     }
 }

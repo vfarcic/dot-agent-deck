@@ -104,8 +104,24 @@ impl AppState {
         self.managed_pane_ids.insert(pane_id);
     }
 
-    /// Create a placeholder session for a newly created pane so it always has a dashboard card.
-    pub fn insert_placeholder_session(&mut self, pane_id: String, cwd: Option<String>) {
+    /// Create a placeholder session for a newly created pane so it always
+    /// has a dashboard card.
+    ///
+    /// PRD #76 M2.13: `agent_type` lets the hydration path on remote
+    /// reconnect seed the placeholder with the daemon's known agent type
+    /// (carried via `AgentRecord.agent_type`) instead of defaulting to
+    /// `AgentType::None` — which the dashboard renderer labels as
+    /// "No agent" until a real `SessionStart` hook fires (and on
+    /// reconnect, no hook fires because the agent was already running).
+    /// Local-mode callers and session-end restorers pass `None`; their
+    /// `agent_type` gets filled in later from the next hook event via
+    /// [`AppState::apply_event`].
+    pub fn insert_placeholder_session(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+    ) {
         let session_id = format!("pane-{}", pane_id);
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
@@ -113,7 +129,7 @@ impl AppState {
             session_id.clone(),
             SessionState {
                 session_id,
-                agent_type: AgentType::None,
+                agent_type: agent_type.unwrap_or(AgentType::None),
                 cwd,
                 status: SessionStatus::Idle,
                 active_tool: None,
@@ -226,7 +242,11 @@ impl AppState {
             if let Some((pane_id, cwd)) = pane_id_and_cwd
                 && self.managed_pane_ids.contains(&pane_id)
             {
-                self.insert_placeholder_session(pane_id, cwd);
+                // M2.13: a SessionEnd restoration creates a fresh
+                // placeholder; `agent_type` is unknown post-end and gets
+                // re-populated when the next `SessionStart` hook arrives
+                // for this pane. Same default behavior as before M2.13.
+                self.insert_placeholder_session(pane_id, cwd, None);
             }
             return;
         }
@@ -730,7 +750,7 @@ mod tests {
     fn placeholder_session_created() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None);
 
         assert!(state.sessions.contains_key("pane-42"));
         let session = &state.sessions["pane-42"];
@@ -741,11 +761,51 @@ mod tests {
         assert_eq!(session.tool_count, 0);
     }
 
+    // PRD #76 M2.13: hydration must seed the placeholder session with
+    // the daemon-known agent_type so the dashboard renders the real
+    // agent label on reconnect instead of "No agent" until a hook
+    // fires (no hook fires on reconnect — the agent was already
+    // running). Pin both the "type known" and "type unknown" forks.
+    #[test]
+    fn placeholder_session_carries_supplied_agent_type() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+        state.insert_placeholder_session(
+            "42".to_string(),
+            Some("/tmp".to_string()),
+            Some(AgentType::ClaudeCode),
+        );
+        let session = &state.sessions["pane-42"];
+        assert_eq!(
+            session.agent_type,
+            AgentType::ClaudeCode,
+            "hydration-supplied agent_type must reach the session, not get overridden to None"
+        );
+        assert_eq!(
+            session.status,
+            SessionStatus::Idle,
+            "agent_type plumbing must not perturb other placeholder fields"
+        );
+    }
+
+    #[test]
+    fn placeholder_session_defaults_to_none_when_agent_type_unknown() {
+        let mut state = AppState::default();
+        state.register_pane("99".to_string());
+        state.insert_placeholder_session("99".to_string(), Some("/tmp".to_string()), None);
+        let session = &state.sessions["pane-99"];
+        assert_eq!(
+            session.agent_type,
+            AgentType::None,
+            "local-mode (None) callers preserve the pre-M2.13 default"
+        );
+    }
+
     #[test]
     fn placeholder_transitions_to_real_session() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None);
 
         let mut start = make_event("real-uuid-123", EventType::SessionStart);
         start.pane_id = Some("42".to_string());
@@ -765,7 +825,7 @@ mod tests {
     fn placeholder_restored_after_session_end() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None);
 
         // Transition to real session
         let mut start = make_event("real-uuid", EventType::SessionStart);
@@ -787,7 +847,7 @@ mod tests {
     fn placeholder_not_restored_after_close() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None);
 
         // Transition to real session
         let mut start = make_event("real-uuid", EventType::SessionStart);
@@ -806,7 +866,7 @@ mod tests {
     fn placeholder_excluded_from_stats() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None);
 
         // Add a real session on a different registered pane
         state.register_pane("99".to_string());
@@ -823,7 +883,7 @@ mod tests {
     fn close_placeholder_session() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None);
 
         // Simulate Ctrl+w on the placeholder
         state.sessions.remove("pane-42");

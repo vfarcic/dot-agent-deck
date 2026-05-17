@@ -11,6 +11,7 @@ use std::any::Any;
 
 use crate::agent_pty::{self, AgentPty, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership};
 use crate::daemon_client::{AttachConnection, DaemonClient, StartAgentOptions};
+use crate::event::AgentType;
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
 use crate::pane::{
     AgentSpawnOptions, PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome,
@@ -43,6 +44,14 @@ pub struct HydratedPane {
     /// via `skip_serializing_if`), which keeps every legacy agent on
     /// the dashboard — same behavior as before M2.12.
     pub tab_membership: Option<TabMembership>,
+    /// Which AI agent the daemon recorded for this pane at spawn time
+    /// (PRD #76 M2.13). Threaded into `insert_placeholder_session` so
+    /// the hydrated session's `agent_type` reflects the daemon's known
+    /// value instead of defaulting to `AgentType::None` (which the
+    /// dashboard renders as "No agent"). `None` means either the daemon
+    /// is older / didn't persist the field, or the spawn command wasn't
+    /// recognized as an agent by [`AgentType::from_command`].
+    pub agent_type: Option<AgentType>,
 }
 
 /// PTY-backed pane state: this process owns the PTY master and child. The
@@ -434,6 +443,12 @@ impl EmbeddedPaneController {
             cols,
             env,
             tab_membership: None,
+            // PRD #76 M2.13: local panes don't need to round-trip
+            // agent_type through a daemon registry (the TUI's own
+            // `AppState::apply_event` populates `agent_type` directly
+            // from hook events). Pass `None` so behavior stays
+            // byte-identical to pre-M2.13 for the local-deck path.
+            agent_type: None,
         })
         .map_err(|e| PaneError::CommandFailed(e.to_string()))?;
 
@@ -507,6 +522,7 @@ impl EmbeddedPaneController {
         cwd: Option<&str>,
         display_name: &str,
         tab_membership: Option<TabMembership>,
+        agent_type: Option<AgentType>,
         rows: u16,
         cols: u16,
         client: DaemonClient,
@@ -537,6 +553,7 @@ impl EmbeddedPaneController {
             cols,
             env,
             tab_membership,
+            agent_type,
         };
 
         // Start-agent + attach happen on the daemon's runtime; we
@@ -915,6 +932,7 @@ impl EmbeddedPaneController {
                 display_name,
                 cwd: cwd_record,
                 tab_membership: record.tab_membership.clone(),
+                agent_type: record.agent_type.clone(),
             });
         }
         hydrated
@@ -1268,6 +1286,7 @@ impl PaneController for EmbeddedPaneController {
                 cwd,
                 &resolved,
                 opts.tab_membership,
+                opts.agent_type,
                 opts.rows,
                 opts.cols,
                 client.clone(),

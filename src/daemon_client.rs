@@ -24,6 +24,7 @@ use crate::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
     KIND_STREAM_OUT, read_frame, write_frame,
 };
+use crate::event::AgentType;
 
 /// Errors returned by the client. Server-side error responses are surfaced
 /// as [`ClientError::Server`] with the daemon's message; transport problems
@@ -64,6 +65,16 @@ pub struct StartAgentOptions {
     /// omits the field from the wire payload so older daemons keep
     /// accepting the request.
     pub tab_membership: Option<TabMembership>,
+    /// PRD #76 M2.13: which AI agent this spawn command runs (inferred
+    /// from the command via [`AgentType::from_command`] at the TUI spawn
+    /// site). Forwarded as `AttachRequest::StartAgent.agent_type` so the
+    /// daemon captures it from the outset and `list_agents` can echo it
+    /// back on reconnect — the hydration path uses the value to seed
+    /// placeholder sessions with the correct `agent_type` instead of
+    /// `AgentType::None` (which the dashboard renders as "No agent").
+    /// `None` here omits the field from the wire payload so older
+    /// daemons keep accepting the request.
+    pub agent_type: Option<AgentType>,
 }
 
 impl Default for StartAgentOptions {
@@ -76,6 +87,7 @@ impl Default for StartAgentOptions {
             cols: 80,
             env: Vec::new(),
             tab_membership: None,
+            agent_type: None,
         }
     }
 }
@@ -220,6 +232,7 @@ impl DaemonClient {
                 display_name: None,
                 cwd: None,
                 tab_membership: None,
+                agent_type: None,
             })
             .collect())
     }
@@ -235,6 +248,7 @@ impl DaemonClient {
             cols: opts.cols,
             env: opts.env,
             tab_membership: opts.tab_membership,
+            agent_type: opts.agent_type,
         };
         let resp = issue_command(&mut rd, &mut wr, &req).await?;
         if !resp.ok {
@@ -527,6 +541,7 @@ mod tests {
             tab_membership: Some(TabMembership::Mode {
                 name: "\x1b[31mevil".into(),
             }),
+            agent_type: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -541,6 +556,7 @@ mod tests {
                 name: "tdd-cycle".into(),
                 role_index: 2,
             }),
+            agent_type: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(

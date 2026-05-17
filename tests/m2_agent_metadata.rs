@@ -29,6 +29,7 @@ use dot_agent_deck::daemon_protocol::{
     write_frame,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
+use dot_agent_deck::event::AgentType;
 use dot_agent_deck::pane::{PaneController, RenameOutcome};
 
 /// `bind_attach_listener` flips the process-global umask while binding;
@@ -101,6 +102,54 @@ async fn start_agent_with_display_name_and_cwd_round_trips_through_list_agents()
     let rec = find_record(&records, &id);
     assert_eq!(rec.display_name.as_deref(), Some("auditor"));
     assert_eq!(rec.cwd.as_deref(), Some("/tmp"));
+
+    server.registry.shutdown_all();
+}
+
+// PRD #76 M2.13 — end-to-end: `agent_type` supplied at spawn time
+// round-trips through the registry and `list_agents`. This is the
+// piece that lets a remote reconnect hydrate placeholder sessions
+// with the daemon's known type instead of "No agent". Without this
+// round trip the M2.13 plumbing is dead-on-arrival.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_agent_with_agent_type_round_trips_through_list_agents() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    let id = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            cwd: Some("/tmp".into()),
+            display_name: Some("coder".into()),
+            agent_type: Some(AgentType::ClaudeCode),
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent should succeed");
+
+    let records = client.list_agents().await.expect("list_agents");
+    let rec = find_record(&records, &id);
+    assert_eq!(
+        rec.agent_type,
+        Some(AgentType::ClaudeCode),
+        "agent_type must round-trip through StartAgent → registry → list_agents"
+    );
+
+    // And the absent-on-spawn shape stays absent on the echo so older
+    // clients keep decoding records cleanly.
+    let id2 = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            agent_type: None,
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent (no agent_type) should succeed");
+    let rec2 = find_record(&client.list_agents().await.unwrap(), &id2);
+    assert!(
+        rec2.agent_type.is_none(),
+        "agent_type=None at spawn must echo back as None"
+    );
 
     server.registry.shutdown_all();
 }

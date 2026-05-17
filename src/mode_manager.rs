@@ -214,6 +214,10 @@ impl ModeManager {
                             tab_membership: None,
                             rows,
                             cols,
+                            // Mode side panes run regular commands
+                            // (htop, npm, etc.) not AI agents, so M2.13
+                            // agent_type stays `None`.
+                            agent_type: None,
                         },
                     )?;
                     created_pane_ids.push(pane_id.clone());
@@ -239,6 +243,9 @@ impl ModeManager {
                             tab_membership: None,
                             rows,
                             cols,
+                            // Reactive panes are mode side panes, not
+                            // agents — same M2.13 rationale.
+                            agent_type: None,
                         },
                     )?;
                     created_pane_ids.push(pane_id.clone());
@@ -433,6 +440,10 @@ impl ModeManager {
                     tab_membership: None,
                     rows,
                     cols,
+                    // Reactive pane replacement: not an AI agent pane —
+                    // same M2.13 rationale as the initial reactive
+                    // spawn above.
+                    agent_type: None,
                 },
             )?;
             mode.reactive_pool

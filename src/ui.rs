@@ -1397,6 +1397,12 @@ fn dispatch_delegate_events(
                         }),
                         rows,
                         cols,
+                        // PRD #76 M2.13: tag the role's daemon-side
+                        // registry entry with the agent type inferred
+                        // from the role command so a reconnect can
+                        // hydrate the placeholder with the right type
+                        // instead of "No agent".
+                        agent_type: AgentType::from_command(Some(&role.command)),
                     },
                 ) {
                     Ok(p) => p,
@@ -1427,7 +1433,16 @@ fn dispatch_delegate_events(
                     if role.start {
                         st.orchestrator_pane_ids.insert(new_pane_id.clone());
                     }
-                    st.insert_placeholder_session(new_pane_id.clone(), Some(cwd.clone()));
+                    // PRD #76 M2.13: the daemon-bound spawn above tags the
+                    // registry entry via `AgentType::from_command(...)` so a
+                    // remote reconnect's hydration carries the right type.
+                    // The local placeholder, however, starts at `None`: the
+                    // next `SessionStart` hook fills `agent_type` in (per the
+                    // pre-M2.13 contract). Seeding the placeholder with the
+                    // inferred type here would trip the orchestration
+                    // readiness gate at `dispatch_orchestrator` and bypass
+                    // the 10-second fallback.
+                    st.insert_placeholder_session(new_pane_id.clone(), Some(cwd.clone()), None);
                 }
 
                 // Update UI display names.
@@ -2456,7 +2471,17 @@ pub fn run_tui(
             // Carry the daemon-recorded cwd through to the placeholder session
             // so the session card shows the right directory until the agent
             // emits its first SessionStart event.
-            st.insert_placeholder_session(h.pane_id.clone(), h.cwd.clone());
+            //
+            // PRD #76 M2.13: also carry the daemon-recorded `agent_type`
+            // through so the dashboard card renders the real agent label
+            // (ClaudeCode / OpenCode) on reconnect instead of "No agent".
+            // The daemon captured the value at spawn time from
+            // `StartAgent.agent_type` (inferred from the command via
+            // `AgentType::from_command`); a `None` here means either the
+            // command wasn't recognized or an older daemon predated the
+            // field, in which case the placeholder shows "No agent" until
+            // the next `SessionStart` event — same legacy behavior.
+            st.insert_placeholder_session(h.pane_id.clone(), h.cwd.clone(), h.agent_type.clone());
             drop(st);
             let display_name = h.display_name.clone().unwrap_or_else(|| h.agent_id.clone());
             ui.pane_display_names
@@ -2807,6 +2832,10 @@ pub fn run_tui(
             // reconcile any rounding once every restored pane is in place.
             let (rows, cols) =
                 dashboard_restore_pane_dims(&*pane, &tab_manager, terminal.get_frame().area());
+            // PRD #76 M2.13: infer agent_type from the restored command so
+            // the daemon's registry echo on reconnect carries the right
+            // type. Local-mode session card pick-up still happens via the
+            // next `SessionStart` hook.
             match pane.create_pane_with_options(
                 cmd,
                 Some(&saved_pane.dir),
@@ -2815,13 +2844,23 @@ pub fn run_tui(
                     tab_membership: None,
                     rows,
                     cols,
+                    agent_type: AgentType::from_command(cmd),
                 },
             ) {
                 Ok((new_id, _resolved)) => {
                     {
                         let mut st = state.blocking_write();
                         st.register_pane(new_id.clone());
-                        st.insert_placeholder_session(new_id.clone(), Some(saved_pane.dir.clone()));
+                        // PRD #76 M2.13: the daemon-bound spawn above tags
+                        // the registry entry with the inferred agent type so
+                        // a later reconnect's hydration knows it; the local
+                        // placeholder stays at `None` until the next
+                        // `SessionStart` hook fires (pre-M2.13 contract).
+                        st.insert_placeholder_session(
+                            new_id.clone(),
+                            Some(saved_pane.dir.clone()),
+                            None,
+                        );
                     }
                     if !saved_pane.name.is_empty() {
                         if let Err(e) = pane.rename_pane(&new_id, &saved_pane.name) {
@@ -2863,6 +2902,15 @@ pub fn run_tui(
             // this just removes the visible 24×80 hiccup.
             let frame_area = terminal.get_frame().area();
             let (rows, cols) = mode_agent_pane_dims(frame_area);
+            // PRD #76 M2.13: mode-tab agent panes spawn as empty shells
+            // (the agent command is sent later via `write_to_pane`), so
+            // infer agent_type from the saved command rather than from
+            // the spawn command (which is `None` here).
+            let mode_agent_type = if saved_pane.command.is_empty() {
+                None
+            } else {
+                AgentType::from_command(Some(saved_pane.command.as_str()))
+            };
             match pane.create_pane_with_options(
                 None,
                 Some(&saved_pane.dir),
@@ -2871,6 +2919,7 @@ pub fn run_tui(
                     tab_membership: mode_tab_membership,
                     rows,
                     cols,
+                    agent_type: mode_agent_type,
                 },
             ) {
                 Ok((new_id, _resolved)) => {
@@ -2937,6 +2986,9 @@ pub fn run_tui(
                                 &tab_manager,
                                 terminal.get_frame().area(),
                             );
+                            // PRD #76 M2.13: infer agent_type from the
+                            // saved command for the fallback path too.
+                            let fb_agent_type = AgentType::from_command(cmd);
                             match pane.create_pane_with_options(
                                 cmd,
                                 Some(&saved_pane.dir),
@@ -2945,6 +2997,7 @@ pub fn run_tui(
                                     tab_membership: None,
                                     rows: fb_rows,
                                     cols: fb_cols,
+                                    agent_type: fb_agent_type.clone(),
                                 },
                             ) {
                                 Ok((fb_id, _resolved)) => {
@@ -2954,6 +3007,7 @@ pub fn run_tui(
                                         st.insert_placeholder_session(
                                             fb_id.clone(),
                                             Some(saved_pane.dir.clone()),
+                                            None,
                                         );
                                     }
                                     if !saved_pane.name.is_empty() {
@@ -2993,6 +3047,9 @@ pub fn run_tui(
                         &tab_manager,
                         terminal.get_frame().area(),
                     );
+                    // PRD #76 M2.13: infer agent_type from saved command
+                    // for this outer-error fallback as well.
+                    let fb_agent_type = AgentType::from_command(cmd);
                     match pane.create_pane_with_options(
                         cmd,
                         Some(&saved_pane.dir),
@@ -3001,6 +3058,7 @@ pub fn run_tui(
                             tab_membership: None,
                             rows: fb_rows,
                             cols: fb_cols,
+                            agent_type: fb_agent_type.clone(),
                         },
                     ) {
                         Ok((fb_id, _resolved)) => {
@@ -3010,6 +3068,7 @@ pub fn run_tui(
                                 st.insert_placeholder_session(
                                     fb_id.clone(),
                                     Some(saved_pane.dir.clone()),
+                                    None,
                                 );
                             }
                             if !saved_pane.name.is_empty() {
@@ -4216,11 +4275,21 @@ pub fn run_tui(
                                 Ok((_tab_idx, role_pane_ids)) => {
                                     {
                                         let mut st = state.blocking_write();
+                                        // PRD #76 M2.13: `open_orchestration_tab`
+                                        // already tags each role's daemon-bound
+                                        // spawn with `AgentType::from_command(...)`,
+                                        // so a reconnect's hydration carries the
+                                        // right type. The local placeholder stays
+                                        // at `None` until each role's first
+                                        // `SessionStart` hook fires — preserving
+                                        // the orchestration readiness gate's
+                                        // 10-second fallback (pre-M2.13 contract).
                                         for id in &role_pane_ids {
                                             st.register_pane(id.clone());
                                             st.insert_placeholder_session(
                                                 id.clone(),
                                                 Some(dir_str.clone()),
+                                                None,
                                             );
                                         }
                                         // Register pane-to-role and pane-to-cwd mappings for work-done resolution.
@@ -4340,6 +4409,22 @@ pub fn run_tui(
                                     tab_manager.show_tab_bar(),
                                 )
                             };
+                            // PRD #76 M2.13: infer agent_type from the
+                            // form's command (the canonical "what runs in
+                            // this pane" hint) — `cmd` is `None` for mode
+                            // panes (which spawn empty and run the
+                            // command later via `write_to_pane`), so use
+                            // `req.command` directly to cover both flows.
+                            // The inferred type goes ONLY into the daemon-
+                            // bound spawn options so a remote reconnect's
+                            // hydration carries it; the local placeholder
+                            // stays at `None` until the first `SessionStart`
+                            // hook fires (pre-M2.13 contract).
+                            let spawn_agent_type = if req.command.is_empty() {
+                                None
+                            } else {
+                                AgentType::from_command(Some(req.command.as_str()))
+                            };
                             match pane.create_pane_with_options(
                                 cmd,
                                 Some(&dir_str),
@@ -4348,6 +4433,7 @@ pub fn run_tui(
                                     tab_membership,
                                     rows: spawn_rows,
                                     cols: spawn_cols,
+                                    agent_type: spawn_agent_type,
                                 },
                             ) {
                                 Ok((new_id, resolved_name)) => {
@@ -4359,6 +4445,7 @@ pub fn run_tui(
                                         st.insert_placeholder_session(
                                             new_id.clone(),
                                             Some(dir_str.clone()),
+                                            None,
                                         );
                                     }
                                     ui.pane_display_names
@@ -6723,6 +6810,7 @@ mod tests {
             display_name: None,
             cwd: cwd.map(|s| s.to_string()),
             tab_membership: membership,
+            agent_type: None,
         }
     }
 

@@ -27,6 +27,30 @@ pub enum AgentType {
     None,
 }
 
+impl AgentType {
+    /// PRD #76 M2.13: best-effort inference of agent type from the binary
+    /// name in a spawn command. Used by TUI spawn sites to populate
+    /// `StartAgentOptions.agent_type` so the daemon's registry can echo it
+    /// back via `list_agents` and a remote reconnect can build placeholder
+    /// sessions with the correct type instead of "No agent".
+    ///
+    /// Returns `Some(AgentType)` only for recognized agent binaries
+    /// (`claude` → `ClaudeCode`, `opencode` → `OpenCode`); unknown
+    /// commands and `None` input return `None` so the daemon stores
+    /// "type not known yet" rather than misclassifying. Whitespace
+    /// before the binary name is ignored to match shell-style invocations.
+    pub fn from_command(cmd: Option<&str>) -> Option<Self> {
+        let cmd = cmd?;
+        let bin = cmd.split_whitespace().next()?;
+        let basename = std::path::Path::new(bin).file_name()?.to_str()?;
+        match basename {
+            "claude" => Some(AgentType::ClaudeCode),
+            "opencode" => Some(AgentType::OpenCode),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub session_id: String,
@@ -157,6 +181,57 @@ mod tests {
             "timestamp": "2026-03-22T10:00:00Z"
         }"#;
         assert!(serde_json::from_str::<AgentEvent>(json).is_err());
+    }
+
+    // PRD #76 M2.13: pin the AgentType::from_command inference rules.
+    // Spawn-site callers (orchestration roles, new-pane form, session
+    // restore) feed the daemon's `StartAgent.agent_type` through this
+    // helper so the hydrated dashboard card on reconnect has the right
+    // type. The mapping must be stable: a regression that flips the
+    // `claude` → ClaudeCode arm would silently strand every reconnected
+    // pane back at "No agent".
+    #[test]
+    fn agent_type_from_command_recognizes_claude() {
+        assert_eq!(
+            AgentType::from_command(Some("claude")),
+            Some(AgentType::ClaudeCode)
+        );
+        // Full path also resolves via file_name().
+        assert_eq!(
+            AgentType::from_command(Some("/usr/local/bin/claude")),
+            Some(AgentType::ClaudeCode)
+        );
+        // Args after the binary are ignored.
+        assert_eq!(
+            AgentType::from_command(Some("claude --dangerously-skip-permissions")),
+            Some(AgentType::ClaudeCode)
+        );
+    }
+
+    #[test]
+    fn agent_type_from_command_recognizes_opencode() {
+        assert_eq!(
+            AgentType::from_command(Some("opencode")),
+            Some(AgentType::OpenCode)
+        );
+        assert_eq!(
+            AgentType::from_command(Some("/opt/bin/opencode --foo")),
+            Some(AgentType::OpenCode)
+        );
+    }
+
+    #[test]
+    fn agent_type_from_command_returns_none_for_unknown_or_empty() {
+        // Non-agent commands must NOT misclassify — the daemon would
+        // otherwise echo a wrong type via list_agents and the dashboard
+        // would mislabel non-agent panes on reconnect.
+        assert!(AgentType::from_command(Some("sh")).is_none());
+        assert!(AgentType::from_command(Some("/bin/bash")).is_none());
+        assert!(AgentType::from_command(Some("vim")).is_none());
+        assert!(AgentType::from_command(None).is_none());
+        // Whitespace-only / empty input also stays None.
+        assert!(AgentType::from_command(Some("")).is_none());
+        assert!(AgentType::from_command(Some("   ")).is_none());
     }
 
     #[test]

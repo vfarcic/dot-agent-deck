@@ -15,6 +15,8 @@ use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
+use crate::event::AgentType;
+
 /// Trigger flag the deck client honors to mean "the daemon is already
 /// running; attach over its stream socket instead of spawning one." The
 /// read site (in `main.rs`) and the scrub site (in [`spawn`] below) share
@@ -251,6 +253,15 @@ pub struct SpawnOptions<'a> {
     /// metadata behind a "looks dashboard" pane on reconnect (M2.12 fixup
     /// reviewer #2).
     pub tab_membership: Option<TabMembership>,
+    /// Which AI agent the spawn command runs (PRD #76 M2.13). Captured
+    /// into `RunningAgent::agent_type` and echoed back via `list_agents`
+    /// so a remote reconnect can build placeholder sessions with the
+    /// correct type instead of "No agent". `None` means "unknown / not an
+    /// agent" — same wire shape as older daemons that predate this field
+    /// (`skip_serializing_if` on the `AgentRecord` mirror keeps it
+    /// backwards-compatible). The TUI computes the value at the spawn site
+    /// via [`AgentType::from_command`].
+    pub agent_type: Option<AgentType>,
 }
 
 impl Default for SpawnOptions<'_> {
@@ -263,6 +274,7 @@ impl Default for SpawnOptions<'_> {
             cols: 80,
             env: Vec::new(),
             tab_membership: None,
+            agent_type: None,
         }
     }
 }
@@ -606,6 +618,16 @@ pub struct RunningAgent {
     /// predating this field — wire-format `skip_serializing_if` keeps the
     /// hydration path backwards compatible).
     pub tab_membership: Option<TabMembership>,
+    /// Which AI agent this pane was spawned to run (PRD #76 M2.13).
+    /// Captured from [`SpawnOptions::agent_type`] at spawn time and echoed
+    /// back via `list_agents` so a TUI reconnect can populate the
+    /// hydrated session's `agent_type` instead of defaulting to
+    /// `AgentType::None` (which the dashboard renders as "No agent"). The
+    /// TUI computes the field via [`AgentType::from_command`]; unknown
+    /// commands and non-agent panes stay `None`. Same forward-compat
+    /// rationale as `display_name` / `tab_membership` — older clients
+    /// that omit the field round-trip as `None`.
+    pub agent_type: Option<AgentType>,
 }
 
 /// Snapshot of one daemon-side agent that the M2.x rehydration path needs.
@@ -641,6 +663,16 @@ pub struct AgentRecord {
     /// with daemons predating this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_membership: Option<TabMembership>,
+    /// Which AI agent this pane was spawned to run (PRD #76 M2.13).
+    /// `None` means either the spawn didn't supply a recognized agent
+    /// command, the pane is non-agent, or the daemon ran an older binary
+    /// that didn't persist this field. The TUI uses this on reconnect to
+    /// populate the placeholder session's `agent_type` (otherwise the
+    /// dashboard renders "No agent" until a `SessionStart` hook fires).
+    /// `skip_serializing_if` keeps the wire shape backwards-compatible
+    /// with daemons predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<AgentType>,
 }
 
 /// In-process registry of agent PTYs owned by the daemon. M1.1 only exposed
@@ -783,6 +815,12 @@ impl AgentPtyRegistry {
             None => None,
         };
 
+        // M2.13: capture agent_type as-is; the enum is closed (ClaudeCode /
+        // OpenCode / None) so there's no equivalent of the display_name /
+        // tab_membership validation gate — serde already rejected anything
+        // outside the variant set at deserialization.
+        let agent_type = opts.agent_type.take();
+
         // Defense in depth: `spawn` already protects the child internally
         // via its own `ChildGuard`, so any failure or panic *inside* spawn
         // cannot orphan the child. This outer `PtyGuard` covers the
@@ -815,6 +853,7 @@ impl AgentPtyRegistry {
             display_name,
             cwd: cwd_stored,
             tab_membership,
+            agent_type,
         };
 
         let id = inner.next_id.to_string();
@@ -934,6 +973,7 @@ impl AgentPtyRegistry {
                 display_name: agent.display_name.clone(),
                 cwd: agent.cwd.clone(),
                 tab_membership: agent.tab_membership.clone(),
+                agent_type: agent.agent_type.clone(),
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));

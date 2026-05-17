@@ -35,6 +35,8 @@ use dot_agent_deck::daemon_protocol::{
     serve_attach, write_frame,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
+use dot_agent_deck::event::AgentType;
+use dot_agent_deck::state::AppState;
 
 // `bind_attach_listener` flips the process-global umask while binding; share
 // the lock with the other M-series tests so concurrent tempdir creation
@@ -781,4 +783,77 @@ async fn hydrate_dedups_duplicate_pane_id_env() {
     drop(ctrl);
     let _ = server.registry.close_agent(&agent_a);
     let _ = server.registry.close_agent(&agent_b);
+}
+
+// ---------------------------------------------------------------------------
+// PRD #76 M2.13 fixup F2 — full hydration-path agent_type plumbing.
+// ---------------------------------------------------------------------------
+// Wire-format tests pin `StartAgent.agent_type` and `AgentRecord.agent_type`
+// round-trips in isolation; the placeholder-seeding unit tests pin the
+// `AppState` side. This test exercises the *full* path end-to-end so a future
+// refactor that breaks any single link (StartAgent → daemon registry →
+// AgentRecord → hydrate_from_daemon → HydratedPane → insert_placeholder_session)
+// is caught before the dashboard goes back to rendering "No agent" on reconnect.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydrate_preserves_agent_type_end_to_end() {
+    // Spawn with an explicit `StartAgentOptions.agent_type = Some(ClaudeCode)`,
+    // hydrate, then thread the hydrated value through `insert_placeholder_session`
+    // exactly the way `ui.rs` does. The placeholder must end up with
+    // `agent_type == ClaudeCode`, not `AgentType::None`.
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    let agent_id = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            agent_type: Some(AgentType::ClaudeCode),
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent should succeed");
+
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(hydrated.len(), 1, "single agent should hydrate as one pane");
+    let h = &hydrated[0];
+    assert_eq!(h.agent_id, agent_id);
+    assert_eq!(
+        h.agent_type,
+        Some(AgentType::ClaudeCode),
+        "hydrated pane must carry the StartAgent-supplied agent_type, \
+         not None — got {:?}",
+        h.agent_type
+    );
+
+    // Mirror `ui.rs` hydration: register the pane and seed the placeholder
+    // with `h.agent_type`. Without M2.13 wiring this collapses to None.
+    let mut state = AppState::default();
+    state.register_pane(h.pane_id.clone());
+    state.insert_placeholder_session(h.pane_id.clone(), h.cwd.clone(), h.agent_type.clone());
+
+    let session = state
+        .sessions
+        .values()
+        .find(|s| s.pane_id.as_deref() == Some(h.pane_id.as_str()))
+        .expect("placeholder session must exist for the hydrated pane");
+    assert_eq!(
+        session.agent_type,
+        AgentType::ClaudeCode,
+        "placeholder session must inherit the daemon-recorded agent_type — \
+         got {:?}",
+        session.agent_type
+    );
+
+    drop(ctrl);
+    let _ = server.registry.close_agent(&agent_id);
 }

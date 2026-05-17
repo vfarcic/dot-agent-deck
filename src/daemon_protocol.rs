@@ -68,6 +68,7 @@ use tracing::{error, info, warn};
 
 pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
+use crate::event::AgentType;
 
 // ---------------------------------------------------------------------------
 // Frame kinds
@@ -210,6 +211,15 @@ pub enum AttachRequest {
         /// compat with daemons that don't know about this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tab_membership: Option<TabMembership>,
+        /// M2.13: which AI agent the spawn command runs (inferred at the
+        /// TUI spawn site via `AgentType::from_command`). Stored on the
+        /// daemon-side registry and echoed back via `list_agents` so a
+        /// remote reconnect can build placeholder sessions with the
+        /// correct agent_type instead of "No agent". Same
+        /// `skip_serializing_if` pattern as the other M2.x fields for
+        /// forward compat with daemons that don't know about it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type: Option<AgentType>,
     },
     StopAgent {
         id: String,
@@ -411,6 +421,7 @@ async fn handle_connection(
             env,
             display_name,
             tab_membership,
+            agent_type,
         } => {
             // Trust boundary: same OS user, same exec capability — see the
             // `AttachRequest::StartAgent` docs. We forward `command`/`cwd`/
@@ -438,6 +449,7 @@ async fn handle_connection(
                 cols,
                 env,
                 tab_membership,
+                agent_type,
             };
             match registry.spawn_agent(opts) {
                 Ok(id) => write_resp(&mut stream, &AttachResponse::with_id(id)).await?,
@@ -684,6 +696,7 @@ mod tests {
             env: vec![("FOO".into(), "BAR".into())],
             display_name: Some("auditor".into()),
             tab_membership: None,
+            agent_type: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
@@ -717,6 +730,7 @@ mod tests {
             env: vec![],
             display_name: None,
             tab_membership: None,
+            agent_type: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
@@ -727,6 +741,10 @@ mod tests {
         assert!(
             !v.as_object().unwrap().contains_key("tab_membership"),
             "tab_membership=None should be omitted from the wire payload"
+        );
+        assert!(
+            !v.as_object().unwrap().contains_key("agent_type"),
+            "agent_type=None should be omitted from the wire payload"
         );
     }
 
@@ -744,6 +762,7 @@ mod tests {
             tab_membership: Some(TabMembership::Mode {
                 name: "k8s-ops".into(),
             }),
+            agent_type: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -777,6 +796,7 @@ mod tests {
                 name: "tdd-cycle".into(),
                 role_index: 2,
             }),
+            agent_type: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -812,6 +832,7 @@ mod tests {
                 name: "tdd-cycle".into(),
                 role_index: 1,
             }),
+            agent_type: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -826,6 +847,7 @@ mod tests {
             display_name: None,
             cwd: None,
             tab_membership: None,
+            agent_type: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();

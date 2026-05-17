@@ -12,11 +12,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
-use dot_agent_deck::agent_pty::AgentPtyRegistry;
+use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
     KIND_STREAM_IN, KIND_STREAM_OUT, TabMembership, bind_attach_listener, serve_attach,
 };
+use dot_agent_deck::event::AgentType;
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -112,6 +113,7 @@ async fn start_agent(server: &Server, command: &str) -> String {
             cols: 80,
             env: vec![],
             tab_membership: None,
+            agent_type: None,
         },
     )
     .await;
@@ -199,6 +201,7 @@ async fn start_agent_with_membership(server: &Server, membership: TabMembership)
             cols: 80,
             env: vec![],
             tab_membership: Some(membership),
+            agent_type: None,
         },
     )
     .await;
@@ -286,6 +289,7 @@ async fn start_agent_round_trips_explicit_rows_cols() {
         cols: 200,
         env: vec![],
         tab_membership: None,
+        agent_type: None,
     };
 
     // Wire round-trip: encode + decode via the same serde path the daemon
@@ -352,6 +356,7 @@ fn start_agent_deserializes_old_client_shape_without_rows_cols() {
             rows,
             cols,
             tab_membership,
+            agent_type,
             ..
         } => {
             assert_eq!(rows, 24, "missing `rows` must default to the VT100 24");
@@ -360,9 +365,133 @@ fn start_agent_deserializes_old_client_shape_without_rows_cols() {
                 tab_membership.is_none(),
                 "missing `tab_membership` must default to None (dashboard pane)"
             );
+            // PRD #76 M2.13: same forward-compat shape — an older client
+            // that doesn't know about `agent_type` must still deserialize
+            // and the field defaults to `None`. Without
+            // `#[serde(default)]` on the variant field, an older client
+            // pointing at a newer daemon would fail to encode requests
+            // that omit `agent_type` — defeating the same backwards-compat
+            // contract M2.11/M2.12 established for the earlier fields.
+            assert!(
+                agent_type.is_none(),
+                "missing `agent_type` must default to None (unknown agent / not echoed back)"
+            );
         }
         other => panic!("expected StartAgent variant, got {other:?}"),
     }
+}
+
+// PRD #76 M2.13: round-trip an explicit `agent_type` through the wire
+// format. Mirrors `start_agent_round_trips_explicit_rows_cols` so a
+// regression that drops the field from `AttachRequest::StartAgent` (or
+// from the serde derive) lights up here, not silently at a stalled
+// hydration on reconnect. The wire shape also has to be
+// `"agent_type": "claude_code"` (snake_case via the enum's
+// `rename_all = "snake_case"`), so this also pins the snake-case wire
+// label that the daemon's apply_event already uses for AgentEvent JSON.
+#[test]
+fn start_agent_round_trips_explicit_agent_type() {
+    let req = AttachRequest::StartAgent {
+        command: Some("claude".into()),
+        cwd: None,
+        display_name: None,
+        rows: 24,
+        cols: 80,
+        env: vec![],
+        tab_membership: None,
+        agent_type: Some(AgentType::ClaudeCode),
+    };
+
+    let json = serde_json::to_string(&req).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        v["agent_type"], "claude_code",
+        "agent_type must serialize as snake_case to match the AgentEvent wire shape"
+    );
+
+    let back: AttachRequest = serde_json::from_str(&json).unwrap();
+    match back {
+        AttachRequest::StartAgent { agent_type, .. } => {
+            assert_eq!(agent_type, Some(AgentType::ClaudeCode));
+        }
+        other => panic!("expected StartAgent variant, got {other:?}"),
+    }
+
+    // OpenCode round-trip too, so a regression that only added the
+    // ClaudeCode variant to the serde mapping shows up.
+    let req_oc = AttachRequest::StartAgent {
+        command: Some("opencode".into()),
+        cwd: None,
+        display_name: None,
+        rows: 24,
+        cols: 80,
+        env: vec![],
+        tab_membership: None,
+        agent_type: Some(AgentType::OpenCode),
+    };
+    let json_oc = serde_json::to_string(&req_oc).unwrap();
+    let back_oc: AttachRequest = serde_json::from_str(&json_oc).unwrap();
+    match back_oc {
+        AttachRequest::StartAgent { agent_type, .. } => {
+            assert_eq!(agent_type, Some(AgentType::OpenCode));
+        }
+        other => panic!("expected StartAgent variant, got {other:?}"),
+    }
+}
+
+// PRD #76 M2.13: the daemon's echo via `list_agents` must round-trip
+// `agent_type` so the TUI's hydration path can seed the placeholder
+// session with the daemon-known type. Old clients that don't know about
+// the field must still decode the record cleanly (forward compat),
+// and a daemon-side `None` must be omitted from the wire payload so
+// pre-M2.13 clients keep accepting the record.
+#[test]
+fn agent_record_round_trips_explicit_agent_type() {
+    let rec = AgentRecord {
+        id: "11".into(),
+        pane_id_env: Some("pid-11".into()),
+        display_name: Some("coder".into()),
+        cwd: Some("/work".into()),
+        tab_membership: None,
+        agent_type: Some(AgentType::ClaudeCode),
+    };
+    let json = serde_json::to_string(&rec).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["agent_type"], "claude_code");
+
+    let back: AgentRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.agent_type, Some(AgentType::ClaudeCode));
+}
+
+#[test]
+fn agent_record_omits_agent_type_when_none() {
+    let rec = AgentRecord {
+        id: "12".into(),
+        pane_id_env: None,
+        display_name: None,
+        cwd: None,
+        tab_membership: None,
+        agent_type: None,
+    };
+    let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+    assert!(
+        !v.as_object().unwrap().contains_key("agent_type"),
+        "agent_type=None should be omitted from the wire payload so older clients keep decoding"
+    );
+    // Forward compat: a record without `agent_type` in the JSON must
+    // still decode (the older daemon shape from before M2.13).
+    let legacy_json = r#"{
+        "id": "13",
+        "pane_id_env": null,
+        "display_name": null,
+        "cwd": null
+    }"#;
+    let back: AgentRecord = serde_json::from_str(legacy_json)
+        .expect("older daemon shape must decode via #[serde(default)] on agent_type");
+    assert!(
+        back.agent_type.is_none(),
+        "missing `agent_type` in older daemon record must default to None"
+    );
 }
 
 #[tokio::test]
@@ -395,6 +524,7 @@ async fn start_agent_with_invalid_membership_name_is_rejected() {
                 cols: 80,
                 env: vec![],
                 tab_membership: Some(TabMembership::Mode { name: name.clone() }),
+                agent_type: None,
             },
         )
         .await;
@@ -662,6 +792,7 @@ async fn start_agent_rejects_blank_command() {
             cols: 80,
             env: vec![],
             tab_membership: None,
+            agent_type: None,
         },
     )
     .await;
