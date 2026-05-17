@@ -24,7 +24,7 @@ use crate::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_EVENT, KIND_REQ, KIND_RESP, KIND_STREAM_END,
     KIND_STREAM_OUT, read_frame, write_frame,
 };
-use crate::event::{AgentEvent, AgentType};
+use crate::event::{AgentType, BroadcastMsg};
 
 /// Errors returned by the client. Server-side error responses are surfaced
 /// as [`ClientError::Server`] with the daemon's message; transport problems
@@ -386,10 +386,11 @@ impl DaemonClient {
     }
 }
 
-/// Long-lived `SubscribeEvents` connection (PRD #76 M2.17). Yields one
-/// [`AgentEvent`] per `next_event` call until the daemon ends the stream
-/// (`KIND_STREAM_END` — typically `"lagged"` when the broadcast receiver
-/// fell behind) or the socket drops. Callers reconnect via
+/// Long-lived `SubscribeEvents` connection (PRD #76 M2.17, extended in
+/// M2.19 to also carry delegate signals). Yields one [`BroadcastMsg`]
+/// per `next_event` call until the daemon ends the stream
+/// (`KIND_STREAM_END` — typically `"lagged"` when the broadcast
+/// receiver fell behind) or the socket drops. Callers reconnect via
 /// [`DaemonClient::subscribe_events`].
 pub struct EventSubscription {
     rd: OwnedReadHalf,
@@ -401,17 +402,17 @@ pub struct EventSubscription {
 }
 
 impl EventSubscription {
-    /// Read the next `AgentEvent` from the subscription. Returns
-    /// `Ok(None)` on `KIND_STREAM_END`, peer EOF, or an unexpected frame
-    /// kind (logged via `tracing::warn!`) — the caller should drop and
-    /// reconnect. A malformed JSON payload is returned as
-    /// `Err(io::Error)` so the caller can decide whether to reconnect or
-    /// surface the bug.
-    pub async fn next_event(&mut self) -> io::Result<Option<AgentEvent>> {
+    /// Read the next [`BroadcastMsg`] from the subscription. Returns
+    /// `Ok(None)` on `KIND_STREAM_END`, peer EOF, or an unexpected
+    /// frame kind (logged via `tracing::warn!`) — the caller should
+    /// drop and reconnect. A malformed JSON payload is returned as
+    /// `Err(io::Error)` so the caller can decide whether to reconnect
+    /// or surface the bug.
+    pub async fn next_event(&mut self) -> io::Result<Option<BroadcastMsg>> {
         match read_frame(&mut self.rd).await? {
             None => Ok(None),
-            Some((KIND_EVENT, payload)) => match serde_json::from_slice::<AgentEvent>(&payload) {
-                Ok(event) => Ok(Some(event)),
+            Some((KIND_EVENT, payload)) => match serde_json::from_slice::<BroadcastMsg>(&payload) {
+                Ok(msg) => Ok(Some(msg)),
                 Err(e) => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("malformed KIND_EVENT payload: {e}"),

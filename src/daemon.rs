@@ -10,14 +10,14 @@ use tracing::{error, info, warn};
 
 use crate::agent_pty::AgentPtyRegistry;
 use crate::error::DaemonError;
-use crate::event::{AgentEvent, DaemonMessage};
+use crate::event::{AgentEvent, BroadcastMsg, DaemonMessage};
 use crate::state::SharedState;
 
-/// Daemon-wide broadcast capacity for `AgentEvent`s forwarded to attached
-/// TUIs (PRD #76 M2.17). Generous so a slow client doesn't drop events
-/// during a normal burst; a subscriber that falls further behind than this
-/// is signalled via `RecvError::Lagged` and the per-connection forwarder
-/// drops the connection (the TUI reconnects).
+/// Daemon-wide broadcast capacity for `BroadcastMsg`s forwarded to attached
+/// TUIs (PRD #76 M2.17 / M2.19). Generous so a slow client doesn't drop
+/// events during a normal burst; a subscriber that falls further behind
+/// than this is signalled via `RecvError::Lagged` and the per-connection
+/// forwarder drops the connection (the TUI reconnects).
 const EVENT_BROADCAST_CAPACITY: usize = 1024;
 
 /// Mode for the daemon's Unix socket: owner-only read/write. Without this the
@@ -72,13 +72,17 @@ pub struct Daemon {
     /// tests that only exercise hook ingestion. Production callers
     /// (`main.rs`) populate this from `config::attach_socket_path()`.
     pub attach_socket_path: Option<PathBuf>,
-    /// Daemon-wide broadcast of hook events (PRD #76 M2.17). The hook loop
-    /// publishes every successfully-parsed `AgentEvent` here after applying
-    /// it to `state`; the attach server hands each `SubscribeEvents`
-    /// connection its own `Receiver` so attached TUIs in remote mode see
-    /// live agent activity. In the in-process daemon path the receiver is
-    /// unused — the TUI shares `state` directly.
-    pub event_tx: broadcast::Sender<AgentEvent>,
+    /// Daemon-wide broadcast of hook messages (PRD #76 M2.17 for events,
+    /// extended in M2.19 to carry delegate signals). The hook loop wraps
+    /// every successfully-parsed payload in a `BroadcastMsg` variant and
+    /// publishes it here; the attach server hands each
+    /// `SubscribeEvents` connection its own `Receiver`. Delegate signals
+    /// in external-daemon mode rely on this bridge because the daemon's
+    /// own `AppState` has no role map to validate against — see
+    /// `BroadcastMsg::Delegate` and `state::handle_delegate`. In the
+    /// in-process daemon path the receiver is unused — the TUI shares
+    /// `state` directly.
+    pub event_tx: broadcast::Sender<BroadcastMsg>,
 }
 
 impl Daemon {
@@ -136,6 +140,12 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let state = daemon.state;
     let event_tx = daemon.event_tx;
 
+    // Capture mode before consuming `attach_socket_path` below — used by
+    // `run_hook_loop` to deterministically route delegates without
+    // depending on broadcast subscriber count (which has transient
+    // zero-subscriber windows during TUI reconnect).
+    let is_external_mode = daemon.attach_socket_path.is_some();
+
     // Optionally spawn the M1.2 streaming attach server. We hold its
     // JoinHandle and abort it on exit so it doesn't outlive the daemon.
     let attach_handle = daemon.attach_socket_path.map(|path| {
@@ -150,7 +160,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     });
 
-    let result = run_hook_loop(listener, state, event_tx).await;
+    let result = run_hook_loop(listener, state, event_tx, is_external_mode).await;
 
     if let Some(h) = attach_handle {
         h.abort();
@@ -163,7 +173,8 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
 async fn run_hook_loop(
     listener: UnixListener,
     state: SharedState,
-    event_tx: broadcast::Sender<AgentEvent>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    is_external_mode: bool,
 ) -> Result<(), DaemonError> {
     loop {
         match listener.accept().await {
@@ -183,7 +194,44 @@ async fn run_hook_loop(
                                         targets = ?signal.to,
                                         "Received delegate signal"
                                     );
-                                    state.write().await.handle_delegate(signal);
+                                    // PRD #76 M2.19: route delegates by
+                                    // mode using the deterministic
+                                    // attach-socket flag (not the
+                                    // broadcast's delivery count, which
+                                    // briefly reports zero subscribers
+                                    // during TUI startup, reconnect, and
+                                    // lagged-stream teardown).
+                                    if is_external_mode {
+                                        // External-daemon mode: the TUI-side
+                                        // AppState owns the role map and
+                                        // validates the delegate. Daemon is
+                                        // a dumb pipe. If `send` returns
+                                        // Err right now there are zero
+                                        // attached subscribers — typically
+                                        // a brief reconnect window — and
+                                        // the delegate is lost (no replay
+                                        // buffer; a recent-delegates buffer
+                                        // is the follow-up if this race
+                                        // ever bites a user in practice).
+                                        // Log so an operator can correlate.
+                                        if event_tx
+                                            .send(BroadcastMsg::Delegate(signal.clone()))
+                                            .is_err()
+                                        {
+                                            warn!(
+                                                pane_id = %signal.pane_id,
+                                                "delegate dropped: no attached TUI subscribers (reconnect race?)"
+                                            );
+                                        }
+                                    } else {
+                                        // In-process daemon mode: TUI
+                                        // shares `state` directly, so the
+                                        // daemon-local call is the real
+                                        // enqueue path. The broadcast has
+                                        // no subscribers in this mode and
+                                        // would be a no-op.
+                                        state.write().await.handle_delegate(signal);
+                                    }
                                 }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
@@ -208,7 +256,7 @@ async fn run_hook_loop(
                             // accepts the event (e.g. an unmanaged pane id).
                             // `send` returns Err only when there are no
                             // subscribers — that's expected and ignored.
-                            let _ = event_tx.send(event.clone());
+                            let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
                             state.write().await.apply_event(event);
                         } else {
                             warn!("Malformed event: {line}");

@@ -24,7 +24,7 @@ use dot_agent_deck::agent_pty::AgentPtyRegistry;
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::DaemonClient;
 use dot_agent_deck::daemon_protocol::{bind_attach_listener, serve_attach};
-use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
 use dot_agent_deck::state::AppState;
 
 // Same umask-narrowing serialization as the other integration test binaries.
@@ -132,8 +132,10 @@ async fn hook_event_round_trips_to_attached_appstate() {
     // `spawn_event_subscriber` in main.rs does.
     let state_for_task = tui_state.clone();
     let forwarder = tokio::spawn(async move {
-        while let Ok(Some(event)) = sub.next_event().await {
-            state_for_task.write().await.apply_event(event);
+        while let Ok(Some(msg)) = sub.next_event().await {
+            if let BroadcastMsg::Event(event) = msg {
+                state_for_task.write().await.apply_event(event);
+            }
         }
     });
 
@@ -226,7 +228,7 @@ async fn lagged_subscriber_receives_stream_end() {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("attach.sock");
 
-    let (event_tx, _) = broadcast::channel::<AgentEvent>(2);
+    let (event_tx, _) = broadcast::channel::<BroadcastMsg>(2);
     let registry = Arc::new(AgentPtyRegistry::new());
 
     let listener = {
@@ -248,7 +250,7 @@ async fn lagged_subscriber_receives_stream_end() {
     // first recv() returns RecvError::Lagged.
     for i in 0..5000 {
         let event = make_tool_start_event(&format!("sess-lag-{i}"), "p-lag");
-        let _ = event_tx.send(event);
+        let _ = event_tx.send(BroadcastMsg::Event(event));
     }
 
     // Pull events until the daemon ends the stream. Some events may have

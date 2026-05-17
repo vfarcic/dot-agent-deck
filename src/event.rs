@@ -98,6 +98,28 @@ pub struct DelegateSignal {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Daemon → attached-TUI broadcast (PRD #76 M2.17/M2.19). The daemon
+/// publishes one of these per ingested hook message; subscribers receive
+/// them as `KIND_EVENT` frames on the attach socket.
+///
+/// In external-daemon mode the daemon's own `AppState` doesn't carry the
+/// role map (the TUI does), so the daemon can't validate delegate
+/// signals locally. The broadcast is what lets the TUI's `AppState`
+/// receive the signal and run role-validation against its own
+/// `pane_role_map` / `orchestrator_pane_ids`. In the in-process daemon
+/// path the TUI and daemon share state directly and no subscriber is
+/// attached — `send` returns Err(no receivers) and is ignored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum BroadcastMsg {
+    /// A hook event (existing M2.17 wire shape, now wrapped).
+    #[serde(rename = "event")]
+    Event(AgentEvent),
+    /// An orchestrator's delegate signal (M2.19).
+    #[serde(rename = "delegate")]
+    Delegate(DelegateSignal),
+}
+
 /// Signal sent by a worker via `dot-agent-deck work-done`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkDoneSignal {

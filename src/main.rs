@@ -658,16 +658,25 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
     ExitCode::SUCCESS
 }
 
-/// PRD #76 M2.17: open a long-lived `SubscribeEvents` connection against the
-/// daemon and forward every `AgentEvent` into the TUI's `AppState` via
-/// `apply_event`. Reconnects with a small backoff on transport errors so a
-/// daemon restart or a `KIND_STREAM_END "lagged"` tear-down recovers
-/// automatically — the TUI in remote mode would otherwise stay frozen at
-/// placeholder defaults (the symptom this milestone fixes).
+/// PRD #76 M2.17 (hook events) / M2.19 (delegate signals): open a
+/// long-lived `SubscribeEvents` connection against the daemon and
+/// route each `BroadcastMsg` into the TUI's `AppState`:
+///
+/// - [`BroadcastMsg::Event`] → `apply_event`.
+/// - [`BroadcastMsg::Delegate`] → `handle_delegate`. The daemon can't
+///   validate delegate signals in external-daemon mode (its own
+///   `pane_role_map` is empty); the TUI re-runs the orchestrator-role
+///   guard against its own role map before enqueueing.
+///
+/// Reconnects with a small backoff on transport errors so a daemon
+/// restart or a `KIND_STREAM_END "lagged"` tear-down recovers
+/// automatically.
 fn spawn_event_subscriber(
     attach_path: std::path::PathBuf,
     state: dot_agent_deck::state::SharedState,
 ) {
+    use dot_agent_deck::event::BroadcastMsg;
+
     tokio::spawn(async move {
         // Backoff parameters tuned for "daemon briefly unavailable" rather
         // than long outages: a fresh-daemon ready window is sub-second, so
@@ -683,8 +692,11 @@ fn spawn_event_subscriber(
                     delay = std::time::Duration::from_millis(500);
                     loop {
                         match sub.next_event().await {
-                            Ok(Some(event)) => {
+                            Ok(Some(BroadcastMsg::Event(event))) => {
                                 state.write().await.apply_event(event);
+                            }
+                            Ok(Some(BroadcastMsg::Delegate(signal))) => {
+                                state.write().await.handle_delegate(signal);
                             }
                             Ok(None) => break,
                             Err(e) => {

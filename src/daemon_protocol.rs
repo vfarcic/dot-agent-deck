@@ -27,7 +27,7 @@
 //! | `KIND_STREAM_IN`  | client → server | raw bytes for PTY stdin       |
 //! | `KIND_DETACH`     | client → server | empty — detach, leave agent   |
 //! | `KIND_STREAM_END` | server → client | optional reason (e.g. lagged) |
-//! | `KIND_EVENT`      | server → client | JSON [`crate::event::AgentEvent`] (M2.17, after a `SubscribeEvents` request) |
+//! | `KIND_EVENT`      | server → client | JSON [`crate::event::BroadcastMsg`] (M2.17/M2.19, after a `SubscribeEvents` request) |
 //!
 //! # Per-connection state machine
 //!
@@ -69,7 +69,7 @@ use tracing::{error, info, warn};
 
 pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
-use crate::event::{AgentEvent, AgentType};
+use crate::event::{AgentType, BroadcastMsg};
 
 // ---------------------------------------------------------------------------
 // Frame kinds
@@ -370,15 +370,16 @@ pub fn bind_attach_listener(path: &Path) -> io::Result<UnixListener> {
 /// Accept-loop half of the attach server. Runs until the listener errors out
 /// or the future is dropped. Pairs with `bind_attach_listener`.
 ///
-/// `event_tx` is the daemon-wide `AgentEvent` broadcast (PRD #76 M2.17). It
-/// is held here so each accepted connection can call `subscribe()` if the
-/// client opens a `SubscribeEvents` stream. The cost of holding a `Sender`
-/// with zero subscribers is negligible — `send` only succeeds when at
-/// least one `Receiver` exists.
+/// `event_tx` is the daemon-wide `BroadcastMsg` broadcast (PRD #76
+/// M2.17 for hook events; extended in M2.19 to also carry delegate
+/// signals). It is held here so each accepted connection can call
+/// `subscribe()` if the client opens a `SubscribeEvents` stream. The
+/// cost of holding a `Sender` with zero subscribers is negligible —
+/// `send` only succeeds when at least one `Receiver` exists.
 pub async fn serve_attach(
     listener: UnixListener,
     registry: Arc<AgentPtyRegistry>,
-    event_tx: broadcast::Sender<AgentEvent>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> io::Result<()> {
     loop {
         match listener.accept().await {
@@ -405,7 +406,7 @@ pub async fn serve_attach(
 pub async fn run_attach_server(
     path: &Path,
     registry: Arc<AgentPtyRegistry>,
-    event_tx: broadcast::Sender<AgentEvent>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> io::Result<()> {
     let listener = bind_attach_listener(path)?;
     info!("Attach protocol listening on {}", path.display());
@@ -415,7 +416,7 @@ pub async fn run_attach_server(
 async fn handle_connection(
     mut stream: UnixStream,
     registry: Arc<AgentPtyRegistry>,
-    event_tx: broadcast::Sender<AgentEvent>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -524,20 +525,23 @@ async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse) -> 
     write_frame(w, KIND_RESP, &payload).await
 }
 
-/// Long-lived `SubscribeEvents` handler (PRD #76 M2.17). Confirms the
-/// subscription with an OK `RESP`, then forwards every event from the
-/// daemon-wide broadcast as a `KIND_EVENT` frame. Each write is bounded by
-/// `CLIENT_WRITE_TIMEOUT` so a wedged client can't pin this task forever.
-/// A lagged receiver — the client fell further behind than the broadcast
-/// capacity — closes the connection with `KIND_STREAM_END` carrying
-/// `"lagged"`; the TUI's reconnect path drains a `list_agents` snapshot
-/// to recover. Client disconnect is detected by racing a one-byte read
-/// against `rx.recv()` so the broadcast `Receiver` is dropped promptly
-/// when the client goes away between events — otherwise the per-connection
-/// task and its receiver would leak for the lifetime of the daemon.
+/// Long-lived `SubscribeEvents` handler (PRD #76 M2.17, extended for
+/// delegate signals in M2.19). Confirms the subscription with an OK
+/// `RESP`, then forwards every `BroadcastMsg` from the daemon-wide
+/// broadcast as a `KIND_EVENT` frame (JSON-tagged variant — see
+/// [`BroadcastMsg`]). Each write is bounded by `CLIENT_WRITE_TIMEOUT`
+/// so a wedged client can't pin this task forever. A lagged receiver —
+/// the client fell further behind than the broadcast capacity — closes
+/// the connection with `KIND_STREAM_END` carrying `"lagged"`; the
+/// TUI's reconnect path drains a `list_agents` snapshot to recover.
+/// Client disconnect is detected by racing a one-byte read against
+/// `rx.recv()` so the broadcast `Receiver` is dropped promptly when
+/// the client goes away between messages — otherwise the
+/// per-connection task and its receiver would leak for the lifetime
+/// of the daemon.
 async fn handle_subscribe_events(
     stream: UnixStream,
-    event_tx: broadcast::Sender<AgentEvent>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> io::Result<()> {
     let mut rx = event_tx.subscribe();
     let (mut rd, mut wr) = stream.into_split();
@@ -546,14 +550,14 @@ async fn handle_subscribe_events(
         tokio::select! {
             recv = rx.recv() => {
                 match recv {
-                    Ok(event) => {
-                        let payload = match serde_json::to_vec(&event) {
+                    Ok(msg) => {
+                        let payload = match serde_json::to_vec(&msg) {
                             Ok(b) => b,
                             Err(e) => {
-                                // An AgentEvent that can't serialize is a daemon
+                                // A BroadcastMsg that can't serialize is a daemon
                                 // bug — log and skip rather than tear the
                                 // subscription down for every other client.
-                                warn!("subscribe-events: skipping unserializable event: {e}");
+                                warn!("subscribe-events: skipping unserializable broadcast: {e}");
                                 continue;
                             }
                         };
@@ -1105,10 +1109,14 @@ mod tests {
 
     #[tokio::test]
     async fn kind_event_frame_round_trip() {
-        // The KIND_EVENT payload is a JSON-encoded AgentEvent. Pin the
-        // round-trip here so a future structural change to AgentEvent
-        // doesn't silently break wire compatibility for remote-mode TUIs.
-        use crate::event::{AgentEvent, AgentType, EventType};
+        // The KIND_EVENT payload is a JSON-encoded BroadcastMsg
+        // (PRD #76 M2.17 / M2.19 — the Event variant wraps the
+        // legacy AgentEvent shape; the Delegate variant carries
+        // orchestrator delegate signals across the external-daemon
+        // hop). Pin the round-trip for both variants here so a future
+        // structural change doesn't silently break wire compatibility
+        // for remote-mode TUIs.
+        use crate::event::{AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType};
         use chrono::Utc;
         use std::collections::HashMap;
 
@@ -1120,21 +1128,82 @@ mod tests {
             tool_detail: Some("src/main.rs".into()),
             cwd: Some("/work".into()),
             timestamp: Utc::now(),
-            user_prompt: None,
+            user_prompt: Some("fix the login bug".into()),
             metadata: HashMap::new(),
             pane_id: Some("7".into()),
         };
-        let payload = serde_json::to_vec(&event).unwrap();
+        let payload = serde_json::to_vec(&BroadcastMsg::Event(event)).unwrap();
+
+        // Pin the on-wire JSON shape. A self-symmetric round-trip
+        // would pass even if someone renamed `#[serde(tag = "kind")]`
+        // to `tag = "type"` or renamed the `Event` variant rename
+        // from `"event"`. Spell the contract out so a future
+        // structural rename trips the test.
+        //
+        // The TUI's `apply_event` reads `tool_detail`, `cwd`,
+        // `timestamp`, and `user_prompt` in addition to the discriminator
+        // fields, so pin those too — a self-symmetric round-trip would
+        // otherwise hide a rename or omission that breaks the remote UI.
+        let wire: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(wire["kind"], "event");
+        assert_eq!(wire["session_id"], "sess-1");
+        assert_eq!(wire["agent_type"], "claude_code");
+        assert_eq!(wire["event_type"], "tool_start");
+        assert_eq!(wire["tool_name"], "Read");
+        assert_eq!(wire["tool_detail"], "src/main.rs");
+        assert_eq!(wire["cwd"], "/work");
+        assert!(wire["timestamp"].is_string());
+        assert_eq!(wire["user_prompt"], "fix the login bug");
+        assert_eq!(wire["pane_id"], "7");
+
         let mut buf: Vec<u8> = Vec::new();
         write_frame(&mut buf, KIND_EVENT, &payload).await.unwrap();
         let mut cursor = std::io::Cursor::new(buf);
         let (kind, body) = read_frame(&mut cursor).await.unwrap().unwrap();
         assert_eq!(kind, KIND_EVENT);
-        let back: AgentEvent = serde_json::from_slice(&body).unwrap();
-        assert_eq!(back.session_id, "sess-1");
-        assert_eq!(back.event_type, EventType::ToolStart);
-        assert_eq!(back.tool_name.as_deref(), Some("Read"));
-        assert_eq!(back.pane_id.as_deref(), Some("7"));
+        let back: BroadcastMsg = serde_json::from_slice(&body).unwrap();
+        match back {
+            BroadcastMsg::Event(e) => {
+                assert_eq!(e.session_id, "sess-1");
+                assert_eq!(e.event_type, EventType::ToolStart);
+                assert_eq!(e.tool_name.as_deref(), Some("Read"));
+                assert_eq!(e.pane_id.as_deref(), Some("7"));
+            }
+            BroadcastMsg::Delegate(_) => panic!("expected Event variant"),
+        }
+
+        let signal = DelegateSignal {
+            pane_id: "orch-7".into(),
+            task: "implement X".into(),
+            to: vec!["coder".into(), "reviewer".into()],
+            timestamp: Utc::now(),
+        };
+        let payload = serde_json::to_vec(&BroadcastMsg::Delegate(signal)).unwrap();
+
+        // Same wire-shape pin for the Delegate variant.
+        let wire: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(wire["kind"], "delegate");
+        assert_eq!(wire["pane_id"], "orch-7");
+        assert_eq!(wire["task"], "implement X");
+        assert_eq!(
+            wire["to"],
+            serde_json::json!(["coder".to_string(), "reviewer".to_string()])
+        );
+        assert!(wire["timestamp"].is_string());
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_frame(&mut buf, KIND_EVENT, &payload).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let (_, body) = read_frame(&mut cursor).await.unwrap().unwrap();
+        let back: BroadcastMsg = serde_json::from_slice(&body).unwrap();
+        match back {
+            BroadcastMsg::Delegate(s) => {
+                assert_eq!(s.pane_id, "orch-7");
+                assert_eq!(s.task, "implement X");
+                assert_eq!(s.to, vec!["coder".to_string(), "reviewer".to_string()]);
+            }
+            BroadcastMsg::Event(_) => panic!("expected Delegate variant"),
+        }
     }
 
     #[test]
