@@ -2412,6 +2412,49 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
 // TUI entry point
 // ---------------------------------------------------------------------------
 
+/// Tear down every non-dashboard tab (mode + orchestration) and unregister
+/// their pane IDs from `state`.
+///
+/// PRD #76: gated on local-deck mode. In external-daemon mode the daemon
+/// owns the agent children and Quit/Detach must both leave them running.
+/// The Detach path explicitly calls `detach_all_streams` first (which
+/// removes the panes from the controller's local registry), so by the
+/// time this teardown ran on Detach the close_pane lookups missed and
+/// became no-ops — the daemon agents survived. The Quit path has no such
+/// pre-step, so the unconditional teardown was issuing `stop-agent`
+/// against the daemon for every orchestration role pane and killing the
+/// agents. Skipping the loop in external-daemon mode is correct: pane
+/// Drop closes the attach sockets, the daemon observes EOF, and the
+/// agents survive as the spec requires. In local-deck mode the loop
+/// stays — those panes are real PTY children that would leak past TUI
+/// exit otherwise.
+pub fn run_post_loop_teardown(
+    pane: &Arc<dyn PaneController>,
+    state: &SharedState,
+    tab_manager: &mut TabManager,
+) {
+    let external_daemon = pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .is_some_and(|c| c.is_external_daemon());
+    if external_daemon {
+        // Quit in external-daemon mode must leave daemon agents running (spec).
+        // Detach removes stream panes from the controller's local registry
+        // before this helper runs, so `close_pane` would no-op for them
+        // anyway. Quit has no such pre-step, so without this gate
+        // `close_pane` → `client.stop_agent` would SIGKILL orchestration
+        // agents on the daemon.
+        return;
+    }
+    for i in (1..tab_manager.tab_count()).rev() {
+        if let Ok(ids) = tab_manager.close_tab(i) {
+            for id in ids {
+                state.blocking_write().unregister_pane(&id);
+            }
+        }
+    }
+}
+
 pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
@@ -4650,14 +4693,9 @@ pub fn run_tui(
         }
     }
 
-    // Tear down all mode/orchestration tabs (clean up their panes).
-    for i in (1..tab_manager.tab_count()).rev() {
-        if let Ok(ids) = tab_manager.close_tab(i) {
-            for id in ids {
-                state.blocking_write().unregister_pane(&id);
-            }
-        }
-    }
+    // Tear down all mode/orchestration tabs (clean up their panes),
+    // gated on external-daemon mode — see `run_post_loop_teardown`.
+    run_post_loop_teardown(&pane, &state, &mut tab_manager);
 
     let _ = crossterm::execute!(
         std::io::stdout(),

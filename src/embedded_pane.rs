@@ -252,6 +252,19 @@ impl EmbeddedPaneController {
         }
     }
 
+    /// Returns true when this controller is backed by an external daemon
+    /// (i.e. agent children live in the daemon process, not this TUI).
+    ///
+    /// The TUI exit / Quit teardown path uses this to skip closing
+    /// orchestration panes: in external-daemon mode the daemon owns the
+    /// agent children and pane Drop closes the attach sockets cleanly,
+    /// which the daemon treats as implicit detach — agents survive.
+    /// In `LocalDeck` mode the panes are local PTYs that would leak past
+    /// TUI exit if not torn down.
+    pub fn is_external_daemon(&self) -> bool {
+        matches!(self.mode, ControllerMode::RemoteDeckLocal { .. })
+    }
+
     /// Access the vt100 screen for a pane (used by the terminal widget for rendering).
     pub fn get_screen(&self, pane_id: &str) -> Option<Arc<Mutex<vt100::Parser>>> {
         let panes = self.panes.lock().unwrap();
@@ -1556,6 +1569,32 @@ impl PaneController for EmbeddedPaneController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PRD #76 — the post-loop teardown in `ui.rs` gates `close_tab` on
+    // this method. Inverting the flag would silently re-introduce the
+    // "Quit kills orchestration agents in external-daemon mode" bug
+    // (the daemon-side child would be SIGKILL'd by `stop-agent` instead
+    // of surviving an implicit-detach EOF).
+    #[test]
+    fn is_external_daemon_distinguishes_modes() {
+        let local = EmbeddedPaneController::new();
+        assert!(
+            !local.is_external_daemon(),
+            "LocalDeck mode must report false — panes are in-process PTYs that the TUI exit needs to clean up"
+        );
+
+        // Build a `with_remote_deck` controller without exercising the
+        // daemon: the constructor only stores the socket path + runtime
+        // handle, it does not connect. A tempdir path is sufficient.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("attach.sock");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let remote = EmbeddedPaneController::with_remote_deck(socket, rt.handle().clone());
+        assert!(
+            remote.is_external_daemon(),
+            "RemoteDeckLocal mode must report true — agents live in the daemon and must survive TUI exit"
+        );
+    }
 
     #[test]
     fn create_and_list_panes() {
