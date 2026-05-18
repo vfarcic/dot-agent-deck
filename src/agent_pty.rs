@@ -382,12 +382,27 @@ impl Drop for PtyGuard {
 
 /// Spawn a new PTY-attached child process.
 pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
+    // Mirror the `resize` bounds at spawn time: reject 0 rows/cols and clamp
+    // oversized values down to [`PTY_RESIZE_DIM_MAX`]. Without this, a same-uid
+    // attach-socket peer issuing `StartAgent { rows: 0, cols: 0 }` (or
+    // `u16::MAX × u16::MAX`) skips the post-spawn `resize` gate entirely and
+    // hands `openpty` either a deadlock-prone 0×0 PTY or a giant geometry that
+    // apps inside the PTY trust via TIOCGWINSZ.
+    if opts.rows == 0 || opts.cols == 0 {
+        return Err(AgentPtyError::Validation(format!(
+            "rows and cols must be > 0 (got {}x{})",
+            opts.rows, opts.cols
+        )));
+    }
+    let rows = opts.rows.min(PTY_RESIZE_DIM_MAX);
+    let cols = opts.cols.min(PTY_RESIZE_DIM_MAX);
+
     let pty_system = NativePtySystem::default();
 
     let pair = pty_system
         .openpty(PtySize {
-            rows: opts.rows,
-            cols: opts.cols,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -1116,6 +1131,72 @@ mod tests {
     #[test]
     fn spawn_default_shell_works() {
         let pty = spawn(SpawnOptions::default()).expect("spawn should succeed");
+        let mut child = pty.child;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn spawn_rejects_zero_rows() {
+        let Err(err) = spawn(SpawnOptions {
+            rows: 0,
+            cols: 80,
+            ..SpawnOptions::default()
+        }) else {
+            panic!("spawn must reject rows=0");
+        };
+        assert!(
+            matches!(err, AgentPtyError::Validation(_)),
+            "expected Validation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_rejects_zero_cols() {
+        let Err(err) = spawn(SpawnOptions {
+            rows: 24,
+            cols: 0,
+            ..SpawnOptions::default()
+        }) else {
+            panic!("spawn must reject cols=0");
+        };
+        assert!(
+            matches!(err, AgentPtyError::Validation(_)),
+            "expected Validation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_clamps_oversized_rows() {
+        let pty = spawn(SpawnOptions {
+            rows: u16::MAX,
+            cols: 80,
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed when rows are oversized — they must clamp");
+        let size = pty.master.get_size().expect("get_size should succeed");
+        assert_eq!(
+            size.rows, PTY_RESIZE_DIM_MAX,
+            "rows must be clamped to PTY_RESIZE_DIM_MAX, not u16::MAX"
+        );
+        let mut child = pty.child;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn spawn_clamps_oversized_cols() {
+        let pty = spawn(SpawnOptions {
+            rows: 24,
+            cols: u16::MAX,
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed when cols are oversized — they must clamp");
+        let size = pty.master.get_size().expect("get_size should succeed");
+        assert_eq!(
+            size.cols, PTY_RESIZE_DIM_MAX,
+            "cols must be clamped to PTY_RESIZE_DIM_MAX, not u16::MAX"
+        );
         let mut child = pty.child;
         let _ = child.kill();
         let _ = child.wait();
