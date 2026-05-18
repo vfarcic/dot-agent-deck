@@ -25,6 +25,7 @@ use std::process::Command;
 
 use thiserror::Error;
 
+use crate::daemon_protocol::{AttachResponse, PROTOCOL_VERSION};
 use crate::remote::{
     RemoteConfigError, RemoteEntry, RemotesFile, SshError, SshExecutor, SshTarget,
 };
@@ -120,6 +121,30 @@ pub enum RemoteConnectError {
         #[source]
         source: std::io::Error,
     },
+    /// PRD #76 M2.21: the laptop and the remote speak incompatible
+    /// attach-protocol versions. Unlike `VersionMismatch` (which only warns),
+    /// a protocol-version mismatch is fatal: the wire format isn't
+    /// backward-compatible and live updates would silently fail. `remote`
+    /// is `None` when the remote binary is too old to know about the
+    /// handshake at all (pre-M2.21 — no `daemon hello` subcommand).
+    #[error("Remote '{name}' speaks attach protocol v{remote_str}; laptop speaks v{local}. {upgrade_hint}",
+            remote_str = remote.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string()))]
+    ProtocolMismatch {
+        name: String,
+        remote: Option<u32>,
+        local: u32,
+        upgrade_hint: String,
+    },
+    /// PRD #76 M2.21: the remote daemon answered the handshake but flagged
+    /// `ok: false` in its response. The wire format isn't skewed (a legacy
+    /// remote wouldn't reach this branch), so the right user action is to
+    /// investigate the remote daemon rather than to upgrade either binary.
+    /// `message` carries any `error` string the remote included, when present.
+    #[error(
+        "Remote '{name}' rejected the protocol handshake{message_suffix}.\nInvestigate the remote daemon (logs, recent restarts, disk space) before retrying.",
+        message_suffix = if message.is_empty() { String::new() } else { format!(": {message}") }
+    )]
+    RemoteHandshakeError { name: String, message: String },
     #[error(transparent)]
     Registry(#[from] RemoteConfigError),
     #[error("I/O error: {0}")]
@@ -391,6 +416,130 @@ pub fn probe_remote_version(
     }
 }
 
+/// Maximum bytes of stdout the protocol probe accepts before declaring the
+/// remote response unparseable. A legitimate `AttachResponse` from `daemon
+/// hello` is well under 100 bytes; the cap leaves ~1000x headroom for any
+/// future fields and still bounds the in-memory capture so a hostile or
+/// broken remote binary that streams unbounded stdout (PRD #76 M2.21 audit
+/// P2) can't push the laptop into memory pressure before the probe parses.
+/// 64 KiB also matches the typical Linux pipe buffer, so the cap is reached
+/// in one buffer's worth of reads.
+const PROBE_PROTOCOL_STDOUT_CAP: usize = 64 * 1024;
+
+/// PRD #76 M2.21: run the protocol-version handshake over ssh and decide
+/// whether the wire format is compatible.
+///
+/// The remote runs `<install_path> daemon hello`, which prints a JSON
+/// `AttachResponse` carrying `server_version` (the remote binary's
+/// compiled-in [`PROTOCOL_VERSION`]). The protocol version is a property of
+/// the binary, not of a running daemon, so the static print is equivalent to
+/// a Hello round-trip against a running daemon — and avoids spawning the
+/// daemon just to answer a version probe.
+///
+/// Failure modes:
+///
+/// - Remote answered with `{"ok":false,...}` →
+///   [`RemoteConnectError::RemoteHandshakeError`]. The wire shape is
+///   compatible; the daemon is signaling an error. User's recovery is to
+///   investigate the remote, not to upgrade.
+/// - Remote prints a `server_version` that differs from the laptop's
+///   [`PROTOCOL_VERSION`] →
+///   [`RemoteConnectError::ProtocolMismatch`] with `upgrade_hint` naming
+///   which side is older.
+/// - Remote exits non-zero (e.g. pre-M2.21 binary that doesn't recognize
+///   `daemon hello`) → `ProtocolMismatch { remote: None, .. }`.
+/// - Remote exits 0 but stdout doesn't parse as a JSON response with a
+///   `server_version` field → same treatment as "remote too old".
+///
+/// Transport failures (`SshError`) fold into `HostUnreachable` via the same
+/// `map_probe_ssh_error` the binary-version probe uses — the user's
+/// recovery hint (check ssh config) is identical.
+///
+/// Stdout is capped at [`PROBE_PROTOCOL_STDOUT_CAP`] bytes; see that
+/// constant for the threat model.
+pub fn probe_remote_protocol(
+    executor: &dyn SshExecutor,
+    target: &SshTarget,
+    name: &str,
+    install_path: &str,
+) -> Result<(), RemoteConnectError> {
+    // SAFETY (audit P3b): `install_path` is currently a module-level
+    // constant (`REMOTE_INSTALL_PATH`) with no shell metacharacters. If it
+    // ever becomes user- or registry-configurable, this interpolation needs
+    // a shell-quoting / validation pass before that change ships — the
+    // command is handed to the remote shell via `ssh <target> "<cmd>"`, so
+    // an attacker-controlled `install_path` could inject arbitrary remote
+    // commands. A regression test feeding spaces/quotes/metacharacters in
+    // `install_path` would catch this.
+    let cmd = format!("{install_path} daemon hello");
+    let result = executor.run_capped(target, &cmd, PROBE_PROTOCOL_STDOUT_CAP);
+    match result {
+        Err(ssh_err) => Err(map_probe_ssh_error(name, ssh_err)),
+        Ok(output) => {
+            if output.status != 0 {
+                // A pre-M2.21 binary doesn't know `daemon hello`. clap exits
+                // with status 2 and a "unrecognized subcommand" message; some
+                // shells fold the message into stdout, others stderr —
+                // either way, the right reading is "remote is older than the
+                // handshake landed". The non-zero exit also covers any other
+                // unexpected runtime failure on the remote (broken install,
+                // dependency missing, etc.) which the user resolves the same
+                // way: re-run `remote upgrade`.
+                return Err(RemoteConnectError::ProtocolMismatch {
+                    name: name.to_string(),
+                    remote: None,
+                    local: PROTOCOL_VERSION,
+                    upgrade_hint: format!("Run `dot-agent-deck remote upgrade {name}`"),
+                });
+            }
+            let resp: AttachResponse = match serde_json::from_str(output.stdout.trim()) {
+                Ok(r) => r,
+                Err(_) => {
+                    return Err(RemoteConnectError::ProtocolMismatch {
+                        name: name.to_string(),
+                        remote: None,
+                        local: PROTOCOL_VERSION,
+                        upgrade_hint: format!("Run `dot-agent-deck remote upgrade {name}`"),
+                    });
+                }
+            };
+            // Check `ok` before `server_version`: a daemon that responds
+            // with `{"ok":false,"error":"..."}` is healthy enough to speak
+            // the wire format but is signaling a runtime error. Collapsing
+            // it into the legacy-remote hint would point users at the wrong
+            // recovery action (audit P3).
+            if !resp.ok {
+                return Err(RemoteConnectError::RemoteHandshakeError {
+                    name: name.to_string(),
+                    message: resp.error.unwrap_or_default(),
+                });
+            }
+            match resp.server_version {
+                Some(v) if v == PROTOCOL_VERSION => Ok(()),
+                Some(v) => {
+                    let upgrade_hint = if v < PROTOCOL_VERSION {
+                        format!("Run `dot-agent-deck remote upgrade {name}`")
+                    } else {
+                        "Upgrade your laptop binary".to_string()
+                    };
+                    Err(RemoteConnectError::ProtocolMismatch {
+                        name: name.to_string(),
+                        remote: Some(v),
+                        local: PROTOCOL_VERSION,
+                        upgrade_hint,
+                    })
+                }
+                None => Err(RemoteConnectError::ProtocolMismatch {
+                    name: name.to_string(),
+                    remote: None,
+                    local: PROTOCOL_VERSION,
+                    upgrade_hint: format!("Run `dot-agent-deck remote upgrade {name}`"),
+                }),
+            }
+        }
+    }
+}
+
 /// Translate an `SshError` from the version probe into the connect-side
 /// error. Auth + host-key failures fold into `HostUnreachable` because the
 /// recovery hint (check ssh config / known_hosts) is the same for the user.
@@ -555,8 +704,8 @@ pub fn run_connect(
 ) -> Result<i32, RemoteConnectError> {
     let target = entry.ssh_target();
 
-    // Stage 1: version probe. Errors short-circuit; warnings (mismatch) get
-    // surfaced on stderr and we proceed.
+    // Stage 1: binary-version probe. Errors short-circuit; warnings (mismatch)
+    // get surfaced on stderr and we proceed.
     match probe_remote_version(executor, &target, &entry.name, install_path, local_version)? {
         ProbeOutcome::Match => {}
         ProbeOutcome::Mismatch { remote, local } => {
@@ -566,6 +715,15 @@ pub fn run_connect(
             );
         }
     }
+
+    // Stage 1b: protocol-version handshake. A binary-version match doesn't
+    // guarantee wire-format compatibility (the protocol is bumped
+    // independently of the binary semver, see PRD #76 M2.21), and a
+    // binary-version mismatch can still be safe if the protocol versions
+    // agree. Fail the connect with a clear error on any protocol disagreement
+    // — the wire format isn't backward-compatible and the silent failure
+    // mode (frozen dashboard, no error) is worse than a hard-stop here.
+    probe_remote_protocol(executor, &target, &entry.name, install_path)?;
 
     // Stage 2: hand the terminal over. This blocks until the user exits.
     let exit_code =
@@ -853,6 +1011,15 @@ mod tests {
         })
     }
 
+    /// Canned response for the M2.21 protocol-version probe: a JSON
+    /// `AttachResponse` with `server_version = `[`PROTOCOL_VERSION`]. Used by
+    /// `run_connect_*` happy-path tests that need to satisfy both the binary
+    /// probe and the protocol probe.
+    fn ok_protocol_match() -> Result<SshOutput, SshError> {
+        let resp = AttachResponse::hello(PROTOCOL_VERSION);
+        ok_stdout(&format!("{}\n", serde_json::to_string(&resp).unwrap()))
+    }
+
     fn args_of(cmd: &Command) -> Vec<String> {
         cmd.get_args()
             .map(OsStr::to_string_lossy)
@@ -1068,7 +1235,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_registry(&dir, vec![entry("lab", "ssh", "u@h")]);
 
-        let executor = FakeSshExecutor::new(vec![ok_stdout("dot-agent-deck 0.24.5\n")]);
+        let executor = FakeSshExecutor::new(vec![
+            ok_stdout("dot-agent-deck 0.24.5\n"),
+            ok_protocol_match(),
+        ]);
         let spawner = FakeConnectSpawner::new(0);
         let entry = lookup_remote("lab", &path).unwrap();
 
@@ -1106,7 +1276,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_registry(&dir, vec![entry("lab", "ssh", "u@h")]);
 
-        let executor = FakeSshExecutor::new(vec![ok_stdout("dot-agent-deck 0.24.5\n")]);
+        let executor = FakeSshExecutor::new(vec![
+            ok_stdout("dot-agent-deck 0.24.5\n"),
+            ok_protocol_match(),
+        ]);
         // ssh exits 130 (Ctrl-C inside remote shell) — the user bailed,
         // so we should NOT mark the session as a "successful connect".
         let spawner = FakeConnectSpawner::new(130);
@@ -1171,7 +1344,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_registry(&dir, vec![entry("lab", "ssh", "u@h")]);
 
-        let executor = FakeSshExecutor::new(vec![ok_stdout("dot-agent-deck 0.30.0\n")]);
+        let executor = FakeSshExecutor::new(vec![
+            ok_stdout("dot-agent-deck 0.30.0\n"),
+            ok_protocol_match(),
+        ]);
         let spawner = FakeConnectSpawner::new(0);
         let entry = lookup_remote("lab", &path).unwrap();
 
@@ -1473,5 +1649,325 @@ mod tests {
         assert_eq!(exit_code_from_status(&sigterm), 143);
         let sigkill = std::process::ExitStatus::from_raw(9);
         assert_eq!(exit_code_from_status(&sigkill), 137);
+    }
+
+    // ----- M2.21: protocol-version handshake -----
+
+    #[test]
+    fn probe_protocol_match_returns_ok() {
+        // Happy path: remote prints a JSON AttachResponse whose
+        // server_version equals our PROTOCOL_VERSION.
+        let executor = FakeSshExecutor::new(vec![ok_protocol_match()]);
+        let target = ssh_target("u@h", 22);
+        probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
+            .expect("matching protocol version is Ok");
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].1.contains("daemon hello"),
+            "probe must invoke `daemon hello`: {}",
+            calls[0].1
+        );
+    }
+
+    #[test]
+    fn probe_protocol_mismatch_remote_newer_returns_error_upgrade_laptop() {
+        // Remote reports a higher PROTOCOL_VERSION than the laptop.
+        let resp = AttachResponse {
+            ok: true,
+            server_version: Some(PROTOCOL_VERSION + 1),
+            ..Default::default()
+        };
+        let executor =
+            FakeSshExecutor::new(vec![ok_stdout(&serde_json::to_string(&resp).unwrap())]);
+        let target = ssh_target("u@h", 22);
+        let err = probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
+            .expect_err("higher remote protocol must error");
+        match err {
+            RemoteConnectError::ProtocolMismatch {
+                name,
+                remote,
+                local,
+                upgrade_hint,
+            } => {
+                assert_eq!(name, "lab");
+                assert_eq!(remote, Some(PROTOCOL_VERSION + 1));
+                assert_eq!(local, PROTOCOL_VERSION);
+                assert!(
+                    upgrade_hint.to_lowercase().contains("laptop"),
+                    "hint should point at laptop upgrade: {upgrade_hint}"
+                );
+            }
+            other => panic!("expected ProtocolMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_protocol_mismatch_remote_older_returns_error_upgrade_remote() {
+        // Remote reports a lower PROTOCOL_VERSION than the laptop. Pre-M2.21
+        // remotes go through the missing-field path instead (covered by a
+        // separate test); this case covers a future skew where both sides
+        // know the field but the numbers diverge.
+        if PROTOCOL_VERSION == 0 {
+            // Can't construct a strictly-lower version when the laptop is at
+            // 0. Skip; the missing-field test covers the pre-handshake case.
+            return;
+        }
+        let older = PROTOCOL_VERSION - 1;
+        let resp = AttachResponse {
+            ok: true,
+            server_version: Some(older),
+            ..Default::default()
+        };
+        let executor =
+            FakeSshExecutor::new(vec![ok_stdout(&serde_json::to_string(&resp).unwrap())]);
+        let target = ssh_target("u@h", 22);
+        let err = probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
+            .expect_err("lower remote protocol must error");
+        match err {
+            RemoteConnectError::ProtocolMismatch {
+                remote,
+                upgrade_hint,
+                ..
+            } => {
+                assert_eq!(remote, Some(older));
+                assert!(
+                    upgrade_hint.contains("remote upgrade lab"),
+                    "hint should point at `remote upgrade <name>`: {upgrade_hint}"
+                );
+            }
+            other => panic!("expected ProtocolMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_protocol_legacy_remote_without_server_version_returns_error() {
+        // A pre-M2.21 daemon binary doesn't recognize `daemon hello` — clap
+        // exits non-zero. The probe collapses any non-zero exit into
+        // ProtocolMismatch with `remote = None`, pointing at `remote
+        // upgrade` as the recovery path.
+        let executor = FakeSshExecutor::new(vec![Ok(SshOutput {
+            status: 2,
+            stdout: String::new(),
+            stderr: "error: unrecognized subcommand 'hello'".to_string(),
+        })]);
+        let target = ssh_target("u@h", 22);
+        let err = probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
+            .expect_err("legacy remote must error");
+        match err {
+            RemoteConnectError::ProtocolMismatch {
+                remote,
+                upgrade_hint,
+                ..
+            } => {
+                assert_eq!(remote, None);
+                assert!(
+                    upgrade_hint.contains("remote upgrade lab"),
+                    "hint should point at `remote upgrade <name>`: {upgrade_hint}"
+                );
+            }
+            other => panic!("expected ProtocolMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_protocol_legacy_remote_with_missing_field_returns_error() {
+        // A hypothetical remote that ran `daemon hello`, exited 0, but
+        // emitted an `AttachResponse` without `server_version` (e.g. a
+        // hand-rolled stub). The deserialization succeeds, but the missing
+        // field signals "remote too old" — same recovery hint.
+        let executor = FakeSshExecutor::new(vec![ok_stdout(r#"{"ok":true}"#)]);
+        let target = ssh_target("u@h", 22);
+        let err = probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
+            .expect_err("missing server_version must error");
+        match err {
+            RemoteConnectError::ProtocolMismatch {
+                remote,
+                upgrade_hint,
+                ..
+            } => {
+                assert_eq!(remote, None);
+                assert!(
+                    upgrade_hint.contains("remote upgrade lab"),
+                    "hint should point at `remote upgrade <name>`: {upgrade_hint}"
+                );
+            }
+            other => panic!("expected ProtocolMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_protocol_garbage_stdout_returns_error() {
+        // Status 0 but stdout doesn't parse as a JSON response — e.g. the
+        // remote shell injected a banner. Same treatment as a legacy remote.
+        let executor = FakeSshExecutor::new(vec![ok_stdout("Welcome to ssh\n")]);
+        let target = ssh_target("u@h", 22);
+        let err = probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
+            .expect_err("garbage stdout must error");
+        assert!(matches!(err, RemoteConnectError::ProtocolMismatch { .. }));
+    }
+
+    #[test]
+    fn probe_protocol_transport_failure_folds_into_host_unreachable() {
+        let executor = FakeSshExecutor::new(vec![Err(SshError::ConnectionRefused {
+            host: "h".to_string(),
+            port: 22,
+            detail: "Connection refused".to_string(),
+        })]);
+        let target = ssh_target("u@h", 22);
+        let err = probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
+            .expect_err("transport failure must error");
+        assert!(matches!(err, RemoteConnectError::HostUnreachable { .. }));
+    }
+
+    #[test]
+    fn run_connect_fails_on_protocol_mismatch_without_spawning() {
+        // Binary versions match, but the protocol probe fails. The connect
+        // must NOT spawn ssh -t — otherwise the user would see a frozen
+        // remote TUI with no error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_registry(&dir, vec![entry("lab", "ssh", "u@h")]);
+
+        let bad_resp = AttachResponse {
+            ok: true,
+            server_version: Some(PROTOCOL_VERSION + 1),
+            ..Default::default()
+        };
+        let executor = FakeSshExecutor::new(vec![
+            ok_stdout("dot-agent-deck 0.24.5\n"),
+            ok_stdout(&serde_json::to_string(&bad_resp).unwrap()),
+        ]);
+        let spawner = FakeConnectSpawner::new(0);
+        let entry = lookup_remote("lab", &path).unwrap();
+
+        let err = run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &path,
+            "0.24.5",
+            REMOTE_INSTALL_PATH,
+        )
+        .expect_err("protocol mismatch must short-circuit");
+        assert!(matches!(err, RemoteConnectError::ProtocolMismatch { .. }));
+        assert_eq!(
+            spawner.calls.lock().unwrap().len(),
+            0,
+            "must not spawn ssh -t on protocol mismatch"
+        );
+
+        let updated = RemotesFile::load(&path).unwrap();
+        assert!(updated.remotes[0].last_connected.is_none());
+    }
+
+    #[test]
+    fn run_connect_fails_on_legacy_remote_without_hello_subcommand() {
+        // Pre-M2.21 remote: binary probe succeeds (the binary exists and
+        // reports a version) but `daemon hello` is unrecognized. Must fail
+        // the connect with a `remote upgrade` hint.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_registry(&dir, vec![entry("lab", "ssh", "u@h")]);
+
+        let executor = FakeSshExecutor::new(vec![
+            ok_stdout("dot-agent-deck 0.24.5\n"),
+            Ok(SshOutput {
+                status: 2,
+                stdout: String::new(),
+                stderr: "error: unrecognized subcommand 'hello'".to_string(),
+            }),
+        ]);
+        let spawner = FakeConnectSpawner::new(0);
+        let entry = lookup_remote("lab", &path).unwrap();
+
+        let err = run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &path,
+            "0.24.5",
+            REMOTE_INSTALL_PATH,
+        )
+        .expect_err("legacy remote must short-circuit");
+        match err {
+            RemoteConnectError::ProtocolMismatch {
+                name,
+                remote,
+                upgrade_hint,
+                ..
+            } => {
+                assert_eq!(name, "lab");
+                assert_eq!(remote, None);
+                assert!(upgrade_hint.contains("remote upgrade lab"));
+            }
+            other => panic!("expected ProtocolMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            spawner.calls.lock().unwrap().len(),
+            0,
+            "must not spawn ssh -t when handshake fails"
+        );
+    }
+
+    #[test]
+    fn probe_protocol_oversized_stdout_returns_error() {
+        // Audit P2: a hostile/broken remote that prints unbounded stdout
+        // must not push the laptop into memory pressure before the probe
+        // parses. The cap is enforced via `run_capped`; here we use a
+        // larger-than-cap stdout to confirm the probe rejects it (either
+        // because the truncated bytes don't parse as JSON, or because the
+        // parser handles the truncation cleanly) and returns the
+        // legacy-remote `ProtocolMismatch`.
+        //
+        // The fake executor's default `run_capped` truncates after `run`
+        // returns, which is enough to exercise the parse path; the
+        // production executor enforces the cap at the pipe-drain layer
+        // (covered by behavioral inspection — a real-process test would
+        // need a hostile child binary).
+        let huge: String = "A".repeat(PROBE_PROTOCOL_STDOUT_CAP * 4);
+        let executor = FakeSshExecutor::new(vec![ok_stdout(&huge)]);
+        let target = ssh_target("u@h", 22);
+        let err = probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
+            .expect_err("oversized stdout must error");
+        assert!(matches!(err, RemoteConnectError::ProtocolMismatch { .. }));
+    }
+
+    #[test]
+    fn probe_protocol_remote_ok_false_returns_remote_handshake_error() {
+        // Audit P3: a remote that exits 0 with `{"ok":false,"error":"..."}`
+        // is signaling a daemon-side error, not a wire-format skew. The
+        // probe must surface `RemoteHandshakeError` so the user
+        // investigates the remote daemon instead of running `remote
+        // upgrade`.
+        let executor = FakeSshExecutor::new(vec![ok_stdout(
+            r#"{"ok":false,"error":"daemon socket unreachable"}"#,
+        )]);
+        let target = ssh_target("u@h", 22);
+        let err = probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
+            .expect_err("ok:false must error");
+        match err {
+            RemoteConnectError::RemoteHandshakeError { name, message } => {
+                assert_eq!(name, "lab");
+                assert!(
+                    message.contains("daemon socket unreachable"),
+                    "must surface remote-side error message: {message}"
+                );
+            }
+            other => panic!("expected RemoteHandshakeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_protocol_remote_ok_false_without_message_still_errors() {
+        // The remote may omit the `error` field — the variant carries an
+        // empty `message` in that case but is still distinct from the
+        // legacy-remote `ProtocolMismatch` path.
+        let executor = FakeSshExecutor::new(vec![ok_stdout(r#"{"ok":false}"#)]);
+        let target = ssh_target("u@h", 22);
+        let err = probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
+            .expect_err("ok:false must error");
+        assert!(matches!(
+            err,
+            RemoteConnectError::RemoteHandshakeError { .. }
+        ));
     }
 }

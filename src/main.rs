@@ -139,6 +139,14 @@ enum DaemonCmd {
     /// that want a long-lived daemon to outlive the spawning shell. Not
     /// part of the everyday user surface.
     Serve,
+    /// Print the binary's attach-protocol version as JSON. Used by the
+    /// laptop-side `connect` flow (PRD #76 M2.21) to detect wire-format skew
+    /// across an ssh hop without spawning the remote daemon: the protocol
+    /// version is compiled into the binary, so a static print is equivalent
+    /// to a Hello round-trip against a running daemon. Output is a JSON
+    /// `AttachResponse` carrying `server_version` so the client side can
+    /// reuse its existing deserializer.
+    Hello,
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -396,6 +404,7 @@ fn main() -> ExitCode {
         }
         Some(Commands::Daemon { cmd }) => match cmd {
             DaemonCmd::Serve => run_daemon_serve_cli(),
+            DaemonCmd::Hello => run_daemon_hello_cli(),
         },
         Some(Commands::Remote { cmd }) => match cmd {
             RemoteCmd::Add {
@@ -779,6 +788,36 @@ fn run_connect(
             ExitCode::FAILURE
         }
     }
+}
+
+/// `dot-agent-deck daemon hello` — PRD #76 M2.21 protocol-version handshake.
+/// Prints a JSON-encoded [`dot_agent_deck::daemon_protocol::AttachResponse`]
+/// carrying `server_version = PROTOCOL_VERSION` and exits.
+///
+/// Used by the laptop-side `connect` flow over ssh: the remote binary's
+/// compiled-in `PROTOCOL_VERSION` is what its daemon would speak, so a static
+/// print here is equivalent to a Hello round-trip against a running daemon —
+/// and avoids lazy-spawning the daemon just to answer a version probe.
+///
+/// The wire shape mirrors what the daemon dispatcher returns for an
+/// [`dot_agent_deck::daemon_protocol::AttachRequest::Hello`] in the
+/// in-process attach path, so the client-side deserializer is the same in
+/// both flows. Keep this helper in lockstep with that dispatcher arm and
+/// with `AttachResponse::hello` — any divergence silently breaks the
+/// handshake.
+fn run_daemon_hello_cli() -> ExitCode {
+    let resp = dot_agent_deck::daemon_protocol::AttachResponse::hello(
+        dot_agent_deck::daemon_protocol::PROTOCOL_VERSION,
+    );
+    let json = match serde_json::to_string(&resp) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("Failed to serialize hello response: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("{json}");
+    ExitCode::SUCCESS
 }
 
 /// `dot-agent-deck daemon serve` — PRD #76 M4.3. Runs the daemon (hook

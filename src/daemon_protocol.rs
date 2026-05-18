@@ -1,5 +1,22 @@
 //! Streaming attach protocol for the daemon (PRD #76, M1.2).
 //!
+//! # Protocol versioning
+//!
+//! [`PROTOCOL_VERSION`] is the on-the-wire shape of this module. Bump it when
+//! a change would cause an older or newer peer to mis-parse a frame:
+//!
+//! - **Bump:** new `KIND_*` codes, payload-schema changes that aren't
+//!   forward-compatible (renames, type changes, removed fields without a
+//!   `#[serde(default)]` shim), new [`AttachRequest`] variants.
+//! - **Do NOT bump:** additive optional fields tagged
+//!   `#[serde(default, skip_serializing_if = "Option::is_none")]` — those are
+//!   forward-compatible by design (older peer ignores the field, newer peer
+//!   tolerates its absence).
+//!
+//! The handshake itself ([`AttachRequest::Hello`]) is enforced only by the
+//! laptop-side `connect` flow — single-binary in-process call sites already
+//! match versions by construction and don't need the check.
+//!
 //! # Wire format
 //!
 //! Length-prefixed binary frames:
@@ -86,6 +103,20 @@ pub const KIND_DETACH: u8 = 0x13;
 /// `AppState` is otherwise disconnected from the daemon's hook ingestion
 /// loop; this frame is the bridge.
 pub const KIND_EVENT: u8 = 0x14;
+
+/// PRD #76 M2.21: wire-format version for the attach socket. Bump every time
+/// the on-the-wire shape changes in a way an older client/daemon would
+/// mis-parse — new `KIND_*` codes, payload schema changes, new request
+/// variants. PRD #76 has accumulated several silent bumps (M2.17 added
+/// `KIND_EVENT`, M2.19 changed its payload to `BroadcastMsg`, earlier
+/// milestones added `Resize` / `SetAgentLabel` / `SubscribeEvents`); this
+/// constant starts at the first post-M2.19 version so older daemons fail the
+/// handshake instead of silently dropping live updates.
+///
+/// Additive `#[serde(default, skip_serializing_if = "Option::is_none")]`
+/// fields do NOT require a bump — they're forward-compatible by design. See
+/// the module-level "Protocol versioning" section for the full bump policy.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -265,6 +296,15 @@ pub enum AttachRequest {
     /// `AppState` mirrors the daemon's view of live agent activity (agent
     /// type, tool counts, prompts, last-activity timestamps).
     SubscribeEvents,
+    /// PRD #76 M2.21: protocol-version handshake. Client sends its
+    /// [`PROTOCOL_VERSION`]; server replies with its own in
+    /// [`AttachResponse::server_version`]. The daemon never rejects on
+    /// `client_version` — only the client decides whether to fail (the
+    /// `connect` strict path) or continue (call sites that have no version
+    /// dependency).
+    Hello {
+        client_version: u32,
+    },
 }
 
 fn default_rows() -> u16 {
@@ -298,6 +338,12 @@ pub struct AttachResponse {
     pub agent_records: Option<Vec<AgentRecord>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// PRD #76 M2.21: server's [`PROTOCOL_VERSION`], populated in response to
+    /// a [`AttachRequest::Hello`] request. Optional so the field is omitted
+    /// on unrelated responses and absent on the wire from pre-M2.21 daemons
+    /// (in which case the client treats `None` as "incompatible").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<u32>,
 }
 
 impl AttachResponse {
@@ -339,6 +385,15 @@ impl AttachResponse {
         Self {
             ok: true,
             id: Some(id),
+            ..Default::default()
+        }
+    }
+    /// PRD #76 M2.21: protocol-version handshake reply. `version` is the
+    /// daemon's [`PROTOCOL_VERSION`]; the client compares it against its own.
+    pub fn hello(version: u32) -> Self {
+        Self {
+            ok: true,
+            server_version: Some(version),
             ..Default::default()
         }
     }
@@ -515,6 +570,16 @@ async fn handle_connection(
         },
         AttachRequest::SubscribeEvents => {
             handle_subscribe_events(stream, event_tx).await?;
+        }
+        AttachRequest::Hello { client_version: _ } => {
+            // PRD #76 M2.21: the daemon never enforces or rejects on
+            // `client_version` — we always reply with our own
+            // `PROTOCOL_VERSION` and let the caller decide. Centralizing the
+            // policy on the client side means a newer client talking to an
+            // older daemon (the upgrade-skew direction the daemon can't
+            // detect anyway) still gets a sensible mismatch error instead of
+            // the daemon rejecting what *would* be its own future shape.
+            write_resp(&mut stream, &AttachResponse::hello(PROTOCOL_VERSION)).await?;
         }
     }
     Ok(())
@@ -1226,5 +1291,147 @@ mod tests {
         let r = AttachResponse::with_id("42".into());
         assert!(r.ok);
         assert_eq!(r.id.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn hello_request_serde_round_trip() {
+        // PRD #76 M2.21: pin the on-wire JSON shape so a future structural
+        // change to the AttachRequest enum trips the test rather than
+        // silently breaking the handshake. Mirrors the
+        // `kind_event_frame_round_trip` precedent.
+        let req = AttachRequest::Hello {
+            client_version: PROTOCOL_VERSION,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["op"], "hello");
+        assert_eq!(v["client_version"], PROTOCOL_VERSION);
+
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            AttachRequest::Hello { client_version } => {
+                assert_eq!(client_version, PROTOCOL_VERSION);
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_response_serde_round_trip() {
+        let resp = AttachResponse::hello(PROTOCOL_VERSION);
+        let json = serde_json::to_string(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["server_version"], PROTOCOL_VERSION);
+
+        let back: AttachResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.server_version, Some(PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn response_omits_server_version_when_none() {
+        // Forward compat: an unrelated response (e.g. list-agents) must NOT
+        // carry `server_version` on the wire. Pre-M2.21 clients/daemons
+        // ignore the field; newer clients use its absence as the signal to
+        // treat the peer as protocol-too-old.
+        let resp = AttachResponse::ok();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("server_version"),
+            "server_version=None should be omitted from the wire payload"
+        );
+    }
+
+    #[test]
+    fn response_deserializes_legacy_shape_without_server_version() {
+        // A pre-M2.21 daemon never emits `server_version`. A newer client
+        // must accept the payload and decode the field as None — which is
+        // what the protocol-mismatch logic looks for to detect "remote too
+        // old to know about the handshake".
+        let json = r#"{"ok":true}"#;
+        let resp: AttachResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert!(resp.server_version.is_none());
+    }
+
+    #[tokio::test]
+    async fn daemon_hello_dispatch_returns_protocol_version_regardless_of_client_version() {
+        // PRD #76 M2.21: the daemon never rejects on client_version — it
+        // always echoes its own PROTOCOL_VERSION. Probe the dispatcher
+        // end-to-end via a connected pair of UnixStreams, sending a
+        // deliberately bogus client_version to confirm the daemon ignores it.
+        use crate::agent_pty::AgentPtyRegistry;
+        use std::sync::Arc;
+        use tokio::net::UnixStream;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+
+        let server_task = tokio::spawn(async move {
+            handle_connection(server, registry, event_tx).await.unwrap();
+        });
+
+        let (mut rd, mut wr) = client.into_split();
+        let req = AttachRequest::Hello {
+            client_version: 99, // deliberately not PROTOCOL_VERSION
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        write_frame(&mut wr, KIND_REQ, &payload).await.unwrap();
+
+        let (kind, body) = read_frame(&mut rd).await.unwrap().unwrap();
+        assert_eq!(kind, KIND_RESP);
+        let resp: AttachResponse = serde_json::from_slice(&body).unwrap();
+        assert!(resp.ok);
+        assert_eq!(
+            resp.server_version,
+            Some(PROTOCOL_VERSION),
+            "daemon must echo its own PROTOCOL_VERSION, not the client's value"
+        );
+
+        drop(wr);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn daemon_hello_dispatch_handles_u32_max_client_version() {
+        // Audit P3: explicit coverage of the serde boundary. `u32::MAX` is
+        // the largest value `client_version` can hold; the daemon must
+        // accept it and still echo its own `PROTOCOL_VERSION` (the
+        // dispatcher ignores `client_version` by design — only the client
+        // side decides on version compatibility).
+        use crate::agent_pty::AgentPtyRegistry;
+        use std::sync::Arc;
+        use tokio::net::UnixStream;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+
+        let server_task = tokio::spawn(async move {
+            handle_connection(server, registry, event_tx).await.unwrap();
+        });
+
+        let (mut rd, mut wr) = client.into_split();
+        let req = AttachRequest::Hello {
+            client_version: u32::MAX,
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        write_frame(&mut wr, KIND_REQ, &payload).await.unwrap();
+
+        let (kind, body) = read_frame(&mut rd).await.unwrap().unwrap();
+        assert_eq!(kind, KIND_RESP);
+        let resp: AttachResponse = serde_json::from_slice(&body).unwrap();
+        assert!(resp.ok);
+        assert_eq!(
+            resp.server_version,
+            Some(PROTOCOL_VERSION),
+            "daemon must echo its own PROTOCOL_VERSION even at the u32::MAX boundary"
+        );
+
+        drop(wr);
+        let _ = server_task.await;
     }
 }

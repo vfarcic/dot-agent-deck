@@ -153,6 +153,42 @@ fn classify_ssh_error(target: &SshTarget, stderr: &str) -> SshError {
 /// production impl shells out to the `ssh` binary; tests use a fake.
 pub trait SshExecutor {
     fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError>;
+
+    /// Variant of [`run`](Self::run) that caps the captured output at
+    /// `max_capture_bytes` per stream. The default implementation calls `run`
+    /// and truncates the resulting stdout `String` afterward — adequate for
+    /// tests and any executor whose underlying transport already bounds
+    /// memory. The production [`SystemSshExecutor`] overrides this to bound
+    /// the in-memory capture for BOTH stdout and stderr at the pipe-drain
+    /// layer (each pipe is a separate DoS vector), so a hostile remote that
+    /// streams unbounded output on either stream can't push the laptop into
+    /// memory pressure before the cap is observed.
+    ///
+    /// The default impl only caps stdout because the test-grade fallback
+    /// doesn't have a pipe-drain layer to extend; production callers that
+    /// care about the symmetric cap go through `SystemSshExecutor`.
+    fn run_capped(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        max_capture_bytes: usize,
+    ) -> Result<SshOutput, SshError> {
+        let mut output = self.run(target, command)?;
+        if output.stdout.len() > max_capture_bytes {
+            // Truncate on a UTF-8 char boundary at or before the cap so the
+            // returned `String` stays a valid `String` (callers JSON-parse
+            // it). `floor_char_boundary` is unstable, so do the search by
+            // hand: walk backward at most 3 bytes to land on a char boundary
+            // (UTF-8 chars are at most 4 bytes, so the boundary is within 3
+            // bytes of any cap position).
+            let mut cap = max_capture_bytes;
+            while cap > 0 && !output.stdout.is_char_boundary(cap) {
+                cap -= 1;
+            }
+            output.stdout.truncate(cap);
+        }
+        Ok(output)
+    }
 }
 
 /// Production implementation: shells out to the `ssh` binary on the user's
@@ -242,7 +278,7 @@ impl SshExecutor for SystemSshExecutor {
     fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
         let mut cmd = self.build_command(target, command);
         let output = match self.wallclock_timeout {
-            Some(secs) => run_with_wallclock_kill(&mut cmd, target, secs)?,
+            Some(secs) => run_with_wallclock_kill(&mut cmd, target, secs, None)?,
             None => cmd.output().map_err(|source| SshError::Io {
                 target: target.user_host(),
                 source,
@@ -256,6 +292,55 @@ impl SshExecutor for SystemSshExecutor {
         // anything else is the remote command's exit code. Only translate to
         // typed transport errors on 255 — otherwise return the SshOutput so
         // callers can decide based on the remote command's status.
+        if status == 255 {
+            return Err(classify_ssh_error(target, &stderr));
+        }
+
+        Ok(SshOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Override the default trait impl so the byte cap is enforced at the
+    /// pipe-drain layer, not after the full payload lands in memory. A
+    /// hostile remote binary that streams unbounded output on *either*
+    /// stdout or stderr would otherwise push the laptop into memory pressure
+    /// long before the trait default's post-hoc `truncate` ran. The
+    /// wallclock-kill path threads `max_capture_bytes` through to the
+    /// per-stream drainer and applies it symmetrically to stdout and stderr
+    /// (each pipe is a separate attack vector); the no-timeout path is only
+    /// used by long-running install commands (not probes), so it falls back
+    /// to the default capture-then-truncate behavior.
+    fn run_capped(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        max_capture_bytes: usize,
+    ) -> Result<SshOutput, SshError> {
+        let Some(secs) = self.wallclock_timeout else {
+            // No wallclock: use the post-hoc truncation from the default impl.
+            // This branch is only reached by callers that have opted out of
+            // the timeout (e.g. `remote add`'s install pipeline), which today
+            // do not need a byte cap.
+            let mut output = SshExecutor::run(self, target, command)?;
+            if output.stdout.len() > max_capture_bytes {
+                let mut cap = max_capture_bytes;
+                while cap > 0 && !output.stdout.is_char_boundary(cap) {
+                    cap -= 1;
+                }
+                output.stdout.truncate(cap);
+            }
+            return Ok(output);
+        };
+
+        let mut cmd = self.build_command(target, command);
+        let output = run_with_wallclock_kill(&mut cmd, target, secs, Some(max_capture_bytes))?;
+        let status = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
         if status == 255 {
             return Err(classify_ssh_error(target, &stderr));
         }
@@ -307,8 +392,8 @@ fn run_with_wallclock_kill(
     cmd: &mut Command,
     target: &SshTarget,
     secs: u64,
+    max_capture_bytes: Option<usize>,
 ) -> Result<std::process::Output, SshError> {
-    use std::io::Read;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
@@ -324,20 +409,22 @@ fn run_with_wallclock_kill(
     // than a pipe buffer don't deadlock waiting for us to read. The threads
     // own the pipe handles via `take()`; on every exit path below we join
     // them to recover the captured bytes (and to avoid leaking handles).
-    let stdout_handle = child.stdout.take().map(|mut s| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = s.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let stderr_handle = child.stderr.take().map(|mut s| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = s.read_to_end(&mut buf);
-            buf
-        })
-    });
+    //
+    // When `max_capture_bytes` is set the same cap is applied to *each*
+    // stream independently — stdout and stderr are separate attack vectors,
+    // and a hostile remote that floods stderr can drive laptop memory
+    // growth just as easily as one that floods stdout. Each drainer stops
+    // reading altogether once its cap is reached: if the child keeps
+    // writing it will fill the kernel pipe buffer and block in `write(2)`,
+    // and the wallclock kill below reaps the still-running process.
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|s| std::thread::spawn(move || drain_pipe(s, max_capture_bytes)));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|s| std::thread::spawn(move || drain_pipe(s, max_capture_bytes)));
 
     // `checked_add` keeps an absurd `secs` from panicking after spawn (the
     // unwinding `Child` drop wouldn't reap the live ssh process). On
@@ -402,6 +489,42 @@ fn run_with_wallclock_kill(
                     source,
                 });
             }
+        }
+    }
+}
+
+/// Drain a child-process pipe into a `Vec<u8>`, optionally capping how much
+/// is retained. When `cap` is `Some(n)`, at most `n` bytes are buffered and
+/// the helper returns immediately once that bound is hit — no further `read`
+/// syscalls are issued. If the child keeps writing it will fill the kernel
+/// pipe buffer and then block in `write(2)`; the surrounding wallclock kill
+/// is the documented fallback that reaps such children. Errors are
+/// swallowed: a half-read pipe still returns the bytes that did land,
+/// matching the behavior `Command::output()` exhibits when the kernel closes
+/// the writer.
+fn drain_pipe<R: std::io::Read>(mut reader: R, cap: Option<usize>) -> Vec<u8> {
+    match cap {
+        None => {
+            let mut buf = Vec::new();
+            let _ = reader.read_to_end(&mut buf);
+            buf
+        }
+        Some(cap) => {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                if buf.len() >= cap {
+                    break;
+                }
+                let needed = cap - buf.len();
+                let take = chunk.len().min(needed);
+                match reader.read(&mut chunk[..take]) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            buf
         }
     }
 }
@@ -1273,7 +1396,7 @@ mod tests {
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
         let start = Instant::now();
-        let result = run_with_wallclock_kill(&mut cmd, &target, 1);
+        let result = run_with_wallclock_kill(&mut cmd, &target, 1, None);
         let elapsed = start.elapsed();
         let err = result.expect_err("hung child must error");
         match err {
@@ -1306,7 +1429,7 @@ mod tests {
         let target = SshTarget::parse("u@h", 22, None);
         let mut cmd = Command::new("/bin/echo");
         cmd.arg("dot-agent-deck 0.24.5");
-        let output = run_with_wallclock_kill(&mut cmd, &target, 5)
+        let output = run_with_wallclock_kill(&mut cmd, &target, 5, None)
             .expect("child finishing in time must Ok with Output");
         assert!(
             output.status.success(),
@@ -1335,7 +1458,7 @@ mod tests {
         let target = SshTarget::parse("u@h", 22, None);
         let mut cmd = Command::new("/bin/cat");
         let start = Instant::now();
-        let result = run_with_wallclock_kill(&mut cmd, &target, 1);
+        let result = run_with_wallclock_kill(&mut cmd, &target, 1, None);
         let elapsed = start.elapsed();
         match result {
             Ok(_) => {}
@@ -1349,6 +1472,97 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(800),
             "elapsed {elapsed:?} suggests stdin was not nulled (cat blocked until near-deadline)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_wallclock_kill_caps_stdout_at_the_drain_layer() {
+        // Audit P3 (M2.21 refixup pass 3): exercise the production
+        // bounded-read path with a real child, not the fake executor's
+        // post-hoc truncation. A hostile remote binary that streams
+        // unbounded stdout must not allocate beyond `cap` bytes: the
+        // drainer stops reading once `cap` bytes land, and if the child
+        // keeps writing it blocks on a full pipe and is reaped by the
+        // wallclock kill. Either outcome — clean child exit (when the
+        // child finishes before the pipe fills) or wallclock kill (when
+        // the child blocks) — is acceptable; the property under test is
+        // that capture is bounded and the helper terminates promptly.
+        use std::time::Instant;
+        const CAP: usize = 4 * 1024;
+        const SIZE: usize = 256 * 1024;
+        const WALLCLOCK_SECS: u64 = 2;
+        let target = SshTarget::parse("u@h", 22, None);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("head -c {SIZE} /dev/zero"));
+        let start = Instant::now();
+        let result = run_with_wallclock_kill(&mut cmd, &target, WALLCLOCK_SECS, Some(CAP));
+        let elapsed = start.elapsed();
+        match result {
+            Ok(output) => assert_eq!(
+                output.stdout.len(),
+                CAP,
+                "captured stdout must be exactly CAP={CAP} on clean-exit path; got {}",
+                output.stdout.len()
+            ),
+            Err(SshError::Other { detail, .. }) if detail.contains("wallclock") => {
+                // Child blocked on a full pipe and was reaped — also
+                // acceptable. The cap stopped the drainer from reading,
+                // which is the property under audit.
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(WALLCLOCK_SECS + 2),
+            "elapsed {elapsed:?} exceeds wallclock+slack — helper failed to terminate promptly"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_wallclock_kill_caps_stderr_at_the_drain_layer() {
+        // Audit P2 (M2.21 refixup pass 3): mirror of the stdout cap test
+        // for stderr. A hostile remote that floods stderr (e.g., a
+        // wrapped `daemon hello` that prints `BAD` on stderr in a tight
+        // loop) used to be drained with unbounded `read_to_end`. The
+        // bounded-read drainer now applies to both streams; the cap
+        // stops the drainer from reading further, and if the child
+        // blocks on a full pipe the wallclock kill reaps it. Either
+        // termination path is acceptable.
+        use std::time::Instant;
+        const CAP: usize = 4 * 1024;
+        const SIZE: usize = 256 * 1024;
+        const WALLCLOCK_SECS: u64 = 2;
+        let target = SshTarget::parse("u@h", 22, None);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("head -c {SIZE} /dev/zero >&2"));
+        let start = Instant::now();
+        let result = run_with_wallclock_kill(&mut cmd, &target, WALLCLOCK_SECS, Some(CAP));
+        let elapsed = start.elapsed();
+        match result {
+            Ok(output) => {
+                assert_eq!(
+                    output.stderr.len(),
+                    CAP,
+                    "captured stderr must be exactly CAP={CAP} on clean-exit path; got {}",
+                    output.stderr.len()
+                );
+                assert!(
+                    output.stdout.is_empty(),
+                    "stdout must be empty (everything was redirected to stderr); got {} bytes",
+                    output.stdout.len()
+                );
+            }
+            Err(SshError::Other { detail, .. }) if detail.contains("wallclock") => {
+                // Child blocked on a full stderr pipe and was reaped —
+                // also acceptable. The cap stopped the drainer from
+                // reading, which is the property under audit.
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(WALLCLOCK_SECS + 2),
+            "elapsed {elapsed:?} exceeds wallclock+slack — helper failed to terminate promptly"
         );
     }
 
@@ -1372,7 +1586,7 @@ mod tests {
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(format!("head -c {SIZE} /dev/zero"));
         let start = Instant::now();
-        let output = run_with_wallclock_kill(&mut cmd, &target, 5)
+        let output = run_with_wallclock_kill(&mut cmd, &target, 5, None)
             .expect("chatty child must round-trip its full stdout, not hit the wallclock");
         let elapsed = start.elapsed();
         assert!(
