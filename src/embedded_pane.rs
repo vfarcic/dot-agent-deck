@@ -572,13 +572,31 @@ impl EmbeddedPaneController {
         // Start-agent + attach happen on the daemon's runtime; we
         // `block_on` here because `create_pane` is called from the TUI's
         // blocking thread.
+        //
+        // CodeRabbit Fix D: if `start_agent` succeeds the daemon has
+        // already spawned a live PTY + session. A subsequent `attach`
+        // failure would otherwise leak that session — the user never gets
+        // a pane to close it through. Capture the agent id immediately
+        // after start, and on attach error issue a best-effort
+        // `stop_agent` before propagating the original attach failure.
         let daemon_path = client.socket_path().to_path_buf();
         let client_for_calls = client.clone();
         let (agent_id, conn) = runtime
             .block_on(async move {
                 let id = client_for_calls.start_agent(opts).await?;
-                let conn = client_for_calls.attach(&id).await?;
-                Ok::<_, crate::daemon_client::ClientError>((id, conn))
+                match client_for_calls.attach(&id).await {
+                    Ok(conn) => Ok::<_, crate::daemon_client::ClientError>((id, conn)),
+                    Err(attach_err) => {
+                        if let Err(stop_err) = client_for_calls.stop_agent(&id).await {
+                            tracing::warn!(
+                                agent_id = %id,
+                                error = %stop_err,
+                                "create_stream_pane: stop_agent during attach-failure cleanup failed; daemon-side agent may be leaked"
+                            );
+                        }
+                        Err(attach_err)
+                    }
+                }
             })
             .map_err(|e| PaneError::CommandFailed(format!("daemon: {e}")))?;
 
