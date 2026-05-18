@@ -600,7 +600,10 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
         let daemon_path = path.clone();
         let daemon_attach_path = attach_path.clone();
         Some(tokio::spawn(async move {
-            let daemon = Daemon::with_attach(daemon_state, daemon_attach_path);
+            // In-process daemon shares its state with the TUI, so delegate
+            // signals must take the direct-call path (no broadcast — the
+            // TUI doesn't subscribe to its own daemon in local mode).
+            let daemon = Daemon::with_attach_in_process(daemon_state, daemon_attach_path);
             if let Err(e) = run_daemon_with(&daemon_path, daemon).await {
                 eprintln!("Daemon error: {e}");
             }

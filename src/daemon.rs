@@ -72,6 +72,18 @@ pub struct Daemon {
     /// tests that only exercise hook ingestion. Production callers
     /// (`main.rs`) populate this from `config::attach_socket_path()`.
     pub attach_socket_path: Option<PathBuf>,
+    /// `true` when this daemon shares its `state` Arc with a TUI in the
+    /// same process (the local-mode in-TUI-process daemon). The delegate
+    /// router uses this to decide between a direct `state.handle_delegate`
+    /// call (fast path, no socket round-trip, role-validation runs against
+    /// the TUI's own role map) and a `BroadcastMsg::Delegate` over the
+    /// attach socket (external-daemon mode, where the daemon's own state
+    /// has no role map and a subscribing TUI runs the guard instead).
+    ///
+    /// Defaults to `false`; the in-process constructor `with_attach_in_process`
+    /// flips it explicitly. Standalone `daemon serve` and tests use the
+    /// default so the broadcast path is exercised end-to-end.
+    pub in_process: bool,
     /// Daemon-wide broadcast of hook messages (PRD #76 M2.17 for events,
     /// extended in M2.19 to carry delegate signals). The hook loop wraps
     /// every successfully-parsed payload in a `BroadcastMsg` variant and
@@ -94,21 +106,37 @@ impl Daemon {
             state,
             pty_registry: Arc::new(AgentPtyRegistry::new()),
             attach_socket_path: None,
+            in_process: false,
             event_tx,
         }
     }
 
     /// Daemon configured to also serve the M1.2 streaming attach protocol
     /// on `attach_path`. Hook ingestion still uses the path passed to
-    /// `run_daemon_with`.
+    /// `run_daemon_with`. Used by `daemon serve` and tests — the daemon's
+    /// `state` is not shared with any TUI, so delegate signals are routed
+    /// via the broadcast for a subscribing TUI to handle.
     pub fn with_attach(state: SharedState, attach_path: PathBuf) -> Self {
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         Self {
             state,
             pty_registry: Arc::new(AgentPtyRegistry::new()),
             attach_socket_path: Some(attach_path),
+            in_process: false,
             event_tx,
         }
+    }
+
+    /// Same as [`with_attach`](Self::with_attach) but flags the daemon as
+    /// sharing `state` with a TUI in the same process. Delegate signals
+    /// take the direct `state.handle_delegate` path so the local TUI sees
+    /// them without needing to subscribe to its own daemon's broadcast.
+    /// Used by the local-mode TUI's in-process daemon (`run_tui_session`
+    /// when `via_daemon` is false).
+    pub fn with_attach_in_process(state: SharedState, attach_path: PathBuf) -> Self {
+        let mut daemon = Self::with_attach(state, attach_path);
+        daemon.in_process = true;
+        daemon
     }
 }
 
@@ -140,11 +168,15 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let state = daemon.state;
     let event_tx = daemon.event_tx;
 
-    // Capture mode before consuming `attach_socket_path` below — used by
-    // `run_hook_loop` to deterministically route delegates without
-    // depending on broadcast subscriber count (which has transient
-    // zero-subscriber windows during TUI reconnect).
-    let is_external_mode = daemon.attach_socket_path.is_some();
+    // Route delegates by daemon mode, not by attach-socket presence: the
+    // in-process TUI daemon ALSO binds an attach socket (so a future
+    // `connect` from another laptop could reach it), but its `state`
+    // is shared with the TUI, so a direct call is correct and the
+    // broadcast would have no subscriber. Standalone `daemon serve`
+    // and tests construct via the default `with_attach` (in_process=false)
+    // so the broadcast path runs and any attached TUI's subscriber
+    // re-runs role validation against its own state.
+    let is_external_mode = !daemon.in_process;
 
     // Optionally spawn the M1.2 streaming attach server. We hold its
     // JoinHandle and abort it on exit so it doesn't outlive the daemon.
@@ -332,6 +364,81 @@ mod tests {
         assert_eq!(mode, SOCKET_MODE, "expected 0600, got {mode:o}");
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn delegate_routes_direct_in_in_process_mode() {
+        // Regression for "delegate silently no-op in local-mode TUI":
+        // `with_attach_in_process` must route delegates via the shared
+        // state's `handle_delegate`, not via a broadcast that has no
+        // subscriber in this mode.
+        use crate::event::{DaemonMessage, DelegateSignal};
+        use chrono::Utc;
+        use tokio::io::AsyncWriteExt;
+
+        let dir = race_safe_tempdir();
+        let hook_path = dir.path().join("hook.sock");
+        let attach_path = dir.path().join("attach.sock");
+
+        let state = Arc::new(RwLock::new(AppState::default()));
+        // Mimic the TUI's pane registration so handle_delegate accepts the signal.
+        {
+            let mut st = state.write().await;
+            st.register_pane("orch".into());
+            st.pane_role_map
+                .insert("orch".into(), "orchestrator".into());
+            st.orchestrator_pane_ids.insert("orch".into());
+        }
+
+        let daemon_state = state.clone();
+        let attach_for_daemon = attach_path.clone();
+        let hook_for_daemon = hook_path.clone();
+        let handle = tokio::spawn(async move {
+            let daemon = Daemon::with_attach_in_process(daemon_state, attach_for_daemon);
+            let _ = run_daemon_with(&hook_for_daemon, daemon).await;
+        });
+
+        // Wait for the hook socket to bind.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if hook_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(hook_path.exists(), "hook socket did not appear");
+
+        // Send a delegate signal. No subscriber on the broadcast — this
+        // must still land in `state.delegate_events` via the direct path.
+        let signal = DelegateSignal {
+            pane_id: "orch".into(),
+            task: "test".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        };
+        let msg = DaemonMessage::Delegate(signal);
+        let mut json = serde_json::to_vec(&msg).unwrap();
+        json.push(b'\n');
+        let mut stream = tokio::net::UnixStream::connect(&hook_path).await.unwrap();
+        stream.write_all(&json).await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        // Wait briefly for the hook loop to enqueue.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut saw = false;
+        while tokio::time::Instant::now() < deadline {
+            if !state.read().await.delegate_events.is_empty() {
+                saw = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        handle.abort();
+        assert!(
+            saw,
+            "in-process daemon must enqueue delegate via direct handle_delegate; \
+             a broadcast-only path would silently drop it (no subscriber in local mode)"
+        );
     }
 
     #[test]
