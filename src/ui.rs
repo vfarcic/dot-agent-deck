@@ -451,6 +451,34 @@ impl NewPaneFormState {
 /// transient info messages don't linger past their usefulness.
 const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// PRD #76 M2.20 — minimum gap between the last forwarded keystroke and an
+/// Enter keystroke that follows it on the human-typing path. Agent TUIs like
+/// claude treat a CR fused to preceding bytes as newline-in-input, not submit;
+/// only a CR separated by a brief pause is honored as Enter. Mirrors the
+/// programmatic submit guard in `src/embedded_pane.rs:199` (`SUBMIT_DELAY`),
+/// which was tuned empirically — keep the two values in sync.
+const SUBMIT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Returns how long the human-typing dispatch should sleep before forwarding
+/// `bytes` to the pane, to ensure an Enter keystroke arrives as a standalone
+/// event rather than fused to recent typing. Returns `Duration::ZERO` unless
+/// `bytes` contains `\r` and the elapsed time since the previous forward is
+/// below `SUBMIT_DEBOUNCE`. Extracted as a helper so the policy is unit-testable.
+fn submit_debounce_duration(
+    now: std::time::Instant,
+    last: Option<std::time::Instant>,
+    bytes: &[u8],
+) -> std::time::Duration {
+    if !bytes.contains(&b'\r') {
+        return std::time::Duration::ZERO;
+    }
+    let Some(prev) = last else {
+        return std::time::Duration::ZERO;
+    };
+    let elapsed = now.saturating_duration_since(prev);
+    SUBMIT_DEBOUNCE.checked_sub(elapsed).unwrap_or_default()
+}
+
 /// A prompt queued for injection into a pane once its agent is ready.
 /// Used by M5 delegation dispatch when `clear = true` restarts a pane.
 struct PendingDispatch {
@@ -516,6 +544,13 @@ struct UiState {
     orchestration_created_at: HashMap<TabId, std::time::Instant>,
     /// Prompts waiting to be injected into panes once their agent is ready (M5 dispatch).
     pending_dispatches: Vec<PendingDispatch>,
+    /// PRD #76 M2.20: timestamp of the most recent keystroke forwarded to a
+    /// pane via `ForwardToPane`. Drives the submit-debounce in `PaneInput` mode
+    /// so an Enter keystroke arriving fused to preceding typed bytes is
+    /// delayed just enough that the agent TUI treats it as a standalone submit
+    /// (matches `write_to_pane`'s SUBMIT_DELAY rationale at
+    /// src/embedded_pane.rs:199).
+    last_pane_keystroke_at: Option<std::time::Instant>,
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -570,6 +605,7 @@ impl UiState {
             orchestration_prompted: HashSet::new(),
             orchestration_created_at: HashMap::new(),
             pending_dispatches: Vec::new(),
+            last_pane_keystroke_at: None,
         }
     }
 }
@@ -3819,6 +3855,12 @@ pub fn run_tui(
                         payload.extend_from_slice(b"\x1b[201~");
                     }
                     let _ = embedded.write_raw_bytes(&pane_id, &payload);
+                    // PRD #76 M2.20: a paste is a forwarded keystroke event
+                    // too — mark the timestamp so a following Enter
+                    // (`KeyResult::ForwardToPane(b"\r")`) is debounced and
+                    // arrives at the agent as a standalone submit, not fused
+                    // with the paste tail.
+                    ui.last_pane_keystroke_at = Some(std::time::Instant::now());
                 }
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     break;
@@ -4656,10 +4698,22 @@ pub fn run_tui(
                     {
                         // Reset scrollback to live output on any keystroke.
                         embedded.reset_scrollback(&pane_id);
+                        // PRD #76 M2.20: separate a CR-bearing keystroke from
+                        // the preceding typed bytes so the agent TUI treats it
+                        // as a standalone submit, not newline-in-input.
+                        let sleep = submit_debounce_duration(
+                            std::time::Instant::now(),
+                            ui.last_pane_keystroke_at,
+                            &bytes,
+                        );
+                        if !sleep.is_zero() {
+                            std::thread::sleep(sleep);
+                        }
                         if let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes) {
                             ui.status_message =
                                 Some((format!("PTY write failed: {e}"), std::time::Instant::now()));
                         }
+                        ui.last_pane_keystroke_at = Some(std::time::Instant::now());
                     }
                 }
                 KeyResult::Continue => {}
@@ -8619,6 +8673,46 @@ mod tests {
             KeyResult::ForwardToPane(bytes) => assert_eq!(bytes, vec![b'l']),
             other => panic!("Expected ForwardToPane, got {:?}", other),
         }
+    }
+
+    // PRD #76 M2.20 — submit-debounce policy tests.
+
+    #[test]
+    fn enter_following_recent_keystroke_sleeps_at_least_debounce_minus_elapsed() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_millis(30);
+        let sleep = submit_debounce_duration(now, Some(last), b"\r");
+        // Expected ~120ms (150 - 30). Allow a few ms tolerance for arithmetic.
+        let expected = std::time::Duration::from_millis(120);
+        let lower = expected.saturating_sub(std::time::Duration::from_millis(5));
+        let upper = expected + std::time::Duration::from_millis(5);
+        assert!(
+            sleep >= lower && sleep <= upper,
+            "expected ~{expected:?}, got {sleep:?}"
+        );
+    }
+
+    #[test]
+    fn enter_with_stale_last_keystroke_does_not_sleep() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_millis(500);
+        let sleep = submit_debounce_duration(now, Some(last), b"\r");
+        assert_eq!(sleep, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn enter_with_no_prior_keystroke_does_not_sleep() {
+        let now = std::time::Instant::now();
+        let sleep = submit_debounce_duration(now, None, b"\r");
+        assert_eq!(sleep, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn non_enter_bytes_never_sleep_even_when_recent() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_millis(10);
+        let sleep = submit_debounce_duration(now, Some(last), b"hello");
+        assert_eq!(sleep, std::time::Duration::ZERO);
     }
 
     // -----------------------------------------------------------------------
