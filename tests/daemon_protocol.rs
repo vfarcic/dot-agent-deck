@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
-    KIND_STREAM_IN, KIND_STREAM_OUT, TabMembership, bind_attach_listener, serve_attach,
+    KIND_STREAM_IN, KIND_STREAM_OUT, TabMembership, bind_attach_listener, serve_attach, write_resp,
 };
 use dot_agent_deck::event::AgentType;
 
@@ -1009,6 +1009,174 @@ async fn slow_client_dropped_within_bounded_time() {
     .await;
 
     server.registry.close_agent(&id).unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_drops_wedged_client_within_bounded_time() {
+    // CodeRabbit Fix C (PRD #76): the dispatcher's `AttachRequest::Snapshot`
+    // arm must bound its body + STREAM_END writes with `CLIENT_WRITE_TIMEOUT`,
+    // mirroring `attach-stream` and `subscribe-events`. A client that opened
+    // a Snapshot connection and stopped reading after the OK response used to
+    // park the dispatcher task forever on `write_all` (kernel send buffer
+    // fills, the write never completes). The Snapshot path doesn't subscribe
+    // to the bus so the `receiver_count` observation used by
+    // `slow_client_dropped_within_bounded_time` doesn't apply here; the
+    // discriminator we use instead is *bytes drained on the client side*. With
+    // the timeout, the daemon writes at most one kernel-send-buffer worth of
+    // bytes before giving up and closing the socket; without it, the daemon
+    // resumes once we drain and emits the full scrollback plus STREAM_END.
+
+    let server = start_server().await;
+    let id = start_agent(&server, "yes AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").await;
+
+    // Wait until scrollback fills to the 1 MiB cap. This is well above the
+    // largest plausible Unix-socket send buffer (~208 KiB on Linux default,
+    // smaller on macOS) so the dispatcher's body write definitely
+    // back-pressures rather than fitting entirely in the kernel buffer.
+    let fill_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let snapshot_size = loop {
+        let size = server.registry.snapshot(&id).map(|b| b.len()).unwrap_or(0);
+        if size >= 1024 * 1024 {
+            break size;
+        }
+        if tokio::time::Instant::now() >= fill_deadline {
+            panic!("scrollback never reached 1 MiB cap; got {size}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    // Open a `Snapshot` connection, read the OK response, then stop reading.
+    let mut wedged = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut wedged, &AttachRequest::Snapshot { id: id.clone() }).await;
+    let resp = read_response(&mut wedged).await;
+    assert!(resp.ok, "snapshot request failed: {:?}", resp.error);
+
+    // Wait past `CLIENT_WRITE_TIMEOUT` (5s) + slack. After this, the
+    // dispatcher must have given up on the wedged body write and dropped its
+    // writer, leaving at most `SO_SNDBUF` body bytes plus the frame header in
+    // the kernel buffer.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // Drain everything that's still queued. With the fix, we read at most one
+    // kernel-send-buffer worth of bytes before EOF. Without the fix, the
+    // daemon would have resumed writing once we started draining and we'd
+    // pull the full ~1 MiB plus a STREAM_END frame.
+    let mut total: usize = 0;
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "drain did not hit EOF within 5s after CLIENT_WRITE_TIMEOUT; \
+                 read {total} bytes — daemon must close socket within bounded time"
+            );
+        }
+        match tokio::time::timeout(remaining, wedged.read(&mut buf)).await {
+            Ok(Ok(0)) => break, // EOF — daemon closed its end.
+            Ok(Ok(n)) => total += n,
+            Ok(Err(e)) => panic!("unexpected drain error: {e}"),
+            Err(_) => {
+                panic!(
+                    "drain did not hit EOF within 5s after CLIENT_WRITE_TIMEOUT; \
+                     read {total} bytes — daemon must close socket within bounded time"
+                );
+            }
+        }
+    }
+
+    // With the fix in place, `total` is bounded by `SO_SNDBUF`. Picking a
+    // threshold well above the largest plausible default (~208 KiB on Linux)
+    // but well below the scrollback size keeps the assertion both portable
+    // and a sharp discriminator: without the fix, `total` would be roughly
+    // `snapshot_size` plus framing overhead.
+    assert!(
+        total < snapshot_size / 2,
+        "snapshot body should have been truncated by CLIENT_WRITE_TIMEOUT; \
+         drained {total} bytes (snapshot size {snapshot_size}) — \
+         implies dispatcher resumed writing instead of giving up"
+    );
+
+    server.registry.close_agent(&id).unwrap();
+}
+
+#[tokio::test]
+async fn write_resp_times_out_on_wedged_client() {
+    // CodeRabbit Fix C fixup (PRD #76): the *initial* OK/Err response write at
+    // the head of every dispatch arm goes through `write_resp` → `write_frame`.
+    // Before this fix `write_resp` had no bound, so a same-UID client that
+    // connected and then stopped reading could pin the dispatcher task on the
+    // RESP write (kernel send buffer fills, `write_all` never completes). All
+    // dispatch arms share `write_resp`, so the regression assertion targets the
+    // helper directly via `UnixStream::pair()` rather than threading a wedged
+    // client through every variant. With the fix, `write_resp` returns
+    // `io::ErrorKind::TimedOut` within `CLIENT_WRITE_TIMEOUT (5s)` + slack.
+    use std::io;
+
+    let (mut server_side, _client_side) = UnixStream::pair().unwrap();
+
+    // Pre-fill the kernel send buffer in `server_side → _client_side` direction
+    // so that any subsequent write — even the tiny RESP frame — back-pressures.
+    // Strategy: `writable().await` blocks once the kernel buffer is full (no
+    // FD readiness signal until the peer drains, and the peer never reads), so
+    // a `tokio::time::timeout` around it detects buffer-full. `try_write` on
+    // each readiness ping commits another chunk. This is more reliable than a
+    // tight `try_write` spin: tokio's readiness cache can return `WouldBlock`
+    // before the kernel buffer is actually full, especially on a freshly
+    // created `UnixStream::pair()` where mio hasn't observed write readiness.
+    let fill_chunk = vec![0u8; 64 * 1024];
+    let fill_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if tokio::time::Instant::now() >= fill_deadline {
+            panic!("failed to fill UnixStream send buffer within 10s");
+        }
+        match tokio::time::timeout(Duration::from_millis(200), server_side.writable()).await {
+            Ok(Ok(())) => match server_side.try_write(&fill_chunk) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Spurious readiness notification — loop and re-arm.
+                }
+                Err(e) => panic!("unexpected fill-phase write error: {e}"),
+            },
+            Ok(Err(e)) => panic!("writable() failed during fill: {e}"),
+            // `writable()` did not resolve within 200ms — kernel buffer is full
+            // and the peer (held in `_client_side`) is not draining.
+            Err(_) => break,
+        }
+    }
+
+    // Now `write_resp` must time out — the kernel buffer is full and the peer
+    // is parked (we never read `_client_side`). Drive it through a wall-clock
+    // bound a bit larger than `CLIENT_WRITE_TIMEOUT (5s)` so an actual hang
+    // surfaces as a test failure rather than blocking the suite.
+    let start = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        write_resp(&mut server_side, &AttachResponse::err("agent not found")),
+    )
+    .await
+    .expect("write_resp must return within CLIENT_WRITE_TIMEOUT + slack (8s)");
+    let elapsed = start.elapsed();
+
+    let err = result.expect_err("write_resp must report an error on a wedged client");
+    assert_eq!(
+        err.kind(),
+        io::ErrorKind::TimedOut,
+        "expected TimedOut, got {err:?}"
+    );
+
+    // The bound is `CLIENT_WRITE_TIMEOUT (5s)`. Allow generous slack on both
+    // sides so the assertion stays sharp without flaking on slow CI: it must
+    // not give up too early (< 3s would point at a missing timeout), and must
+    // not exceed the wall-clock bound we already enforce above.
+    assert!(
+        elapsed >= Duration::from_secs(3),
+        "write_resp returned too early ({elapsed:?}); CLIENT_WRITE_TIMEOUT not honored"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "write_resp ran past CLIENT_WRITE_TIMEOUT + slack: {elapsed:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

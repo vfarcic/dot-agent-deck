@@ -554,10 +554,23 @@ async fn handle_connection(
         AttachRequest::Snapshot { id } => match registry.snapshot(&id) {
             Ok(bytes) => {
                 write_resp(&mut stream, &AttachResponse::ok()).await?;
-                if !bytes.is_empty() {
-                    write_frame(&mut stream, KIND_STREAM_OUT, &bytes).await?;
+                // Mirror the attach-stream / subscribe-events policy: bound the
+                // body and STREAM_END writes with `CLIENT_WRITE_TIMEOUT`. A
+                // client that opened a `Snapshot` connection and stopped
+                // reading after the OK response could otherwise park this task
+                // forever on `write_all` (kernel send buffer fills, the write
+                // never completes). On timeout, best-effort STREAM_END with a
+                // typed reason and return Ok(()) — a stuck client doesn't
+                // justify failing the dispatcher task.
+                if !bytes.is_empty()
+                    && !write_or_timeout(&mut stream, KIND_STREAM_OUT, &bytes).await
+                {
+                    let _ = write_or_timeout(&mut stream, KIND_STREAM_END, b"timeout").await;
+                    return Ok(());
                 }
-                write_frame(&mut stream, KIND_STREAM_END, &[]).await?;
+                if !write_or_timeout(&mut stream, KIND_STREAM_END, &[]).await {
+                    return Ok(());
+                }
             }
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
@@ -585,9 +598,22 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse) -> io::Result<()> {
+// CodeRabbit Fix C fixup: bound the response write with `CLIENT_WRITE_TIMEOUT`.
+// Every dispatch arm calls `write_resp` first; without a timeout, a same-UID
+// client that connected and then stopped reading could pin the dispatcher task
+// on this initial OK/Err write (kernel send buffer fills, `write_all` never
+// completes). On timeout, surface `io::ErrorKind::TimedOut` so existing `?`
+// callers propagate up and let the connection drop.
+#[doc(hidden)]
+pub async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse) -> io::Result<()> {
     let payload = serde_json::to_vec(resp).expect("AttachResponse must serialize");
-    write_frame(w, KIND_RESP, &payload).await
+    match tokio::time::timeout(CLIENT_WRITE_TIMEOUT, write_frame(w, KIND_RESP, &payload)).await {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "write_resp: client did not drain RESP within CLIENT_WRITE_TIMEOUT",
+        )),
+    }
 }
 
 /// Long-lived `SubscribeEvents` handler (PRD #76 M2.17, extended for
