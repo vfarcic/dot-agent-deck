@@ -579,24 +579,88 @@ impl EmbeddedPaneController {
         // a pane to close it through. Capture the agent id immediately
         // after start, and on attach error issue a best-effort
         // `stop_agent` before propagating the original attach failure.
+        //
+        // Fix D fixup (reviewer + auditor P3): each RPC inside the
+        // `block_on` is wrapped in `tokio::time::timeout`. Without these
+        // a wedged same-UID daemon could:
+        //   * hang `start_agent` (no agent created, no cleanup needed —
+        //     surface a TimedOut error),
+        //   * answer `attach` with Err promptly then *never* respond to
+        //     the cleanup `stop_agent`, pinning `create_stream_pane`
+        //     forever on the cleanup await (auditor's specific concern),
+        //   * hang `attach` itself, never reaching the cleanup branch.
+        // Cleanup on `attach` error OR `attach` timeout is best-effort
+        // and bounded by `CREATE_PANE_STOP_TIMEOUT`; the original attach
+        // error (or synthesized timeout error) is what propagates.
         let daemon_path = client.socket_path().to_path_buf();
         let client_for_calls = client.clone();
         let (agent_id, conn) = runtime
             .block_on(async move {
-                let id = client_for_calls.start_agent(opts).await?;
-                match client_for_calls.attach(&id).await {
-                    Ok(conn) => Ok::<_, crate::daemon_client::ClientError>((id, conn)),
-                    Err(attach_err) => {
-                        if let Err(stop_err) = client_for_calls.stop_agent(&id).await {
-                            tracing::warn!(
-                                agent_id = %id,
-                                error = %stop_err,
-                                "create_stream_pane: stop_agent during attach-failure cleanup failed; daemon-side agent may be leaked"
-                            );
-                        }
-                        Err(attach_err)
+                use crate::daemon_client::ClientError;
+
+                let id = match tokio::time::timeout(
+                    CREATE_PANE_START_TIMEOUT,
+                    client_for_calls.start_agent(opts),
+                )
+                .await
+                {
+                    Ok(Ok(id)) => id,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(ClientError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "start_agent timed out after {}ms",
+                                CREATE_PANE_START_TIMEOUT.as_millis()
+                            ),
+                        )));
                     }
+                };
+
+                // Run attach with a timeout. On Ok(conn) we're done. On
+                // Err OR timeout we fall through to the bounded cleanup
+                // path below.
+                let attach_err: ClientError = match tokio::time::timeout(
+                    CREATE_PANE_ATTACH_TIMEOUT,
+                    client_for_calls.attach(&id),
+                )
+                .await
+                {
+                    Ok(Ok(conn)) => return Ok::<_, ClientError>((id, conn)),
+                    Ok(Err(e)) => e,
+                    Err(_) => ClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "attach timed out after {}ms",
+                            CREATE_PANE_ATTACH_TIMEOUT.as_millis()
+                        ),
+                    )),
+                };
+
+                // Best-effort, bounded cleanup. On failure OR timeout we
+                // log at warn (the daemon-side agent may be leaked) but
+                // always propagate the ORIGINAL attach error so callers
+                // see the real cause, not a cleanup-stage symptom.
+                match tokio::time::timeout(
+                    CREATE_PANE_STOP_TIMEOUT,
+                    client_for_calls.stop_agent(&id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(stop_err)) => tracing::warn!(
+                        agent_id = %id,
+                        error = %stop_err,
+                        "create_stream_pane: stop_agent during attach-failure cleanup failed; daemon-side agent may be leaked"
+                    ),
+                    Err(_) => tracing::warn!(
+                        agent_id = %id,
+                        timeout_ms = CREATE_PANE_STOP_TIMEOUT.as_millis() as u64,
+                        "create_stream_pane: stop_agent during attach-failure cleanup timed out; daemon-side agent may be leaked"
+                    ),
                 }
+
+                Err(attach_err)
             })
             .map_err(|e| PaneError::CommandFailed(format!("daemon: {e}")))?;
 
@@ -1105,6 +1169,31 @@ const HYDRATE_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// pathological daemon. On timeout the agent is skipped (logged at debug)
 /// and rehydration continues with the rest.
 const HYDRATE_ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bounded wait for the `start_agent` RPC inside `create_stream_pane`. The
+/// daemon allocates a PTY and spawns the child process before replying,
+/// which is heavier than `list_agents` but should still complete within a
+/// few seconds on a healthy host. Without this bound a wedged same-UID
+/// daemon would pin the TUI's blocking `block_on` indefinitely.
+const CREATE_PANE_START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded wait for the `attach` RPC inside `create_stream_pane`. Same
+/// rationale as [`HYDRATE_ATTACH_TIMEOUT`]: a single attach round-trip is
+/// well under a millisecond on a healthy daemon; capping at three seconds
+/// keeps a wedged daemon from blocking pane creation forever. On timeout
+/// the cleanup [`CREATE_PANE_STOP_TIMEOUT`] path runs and the timeout is
+/// surfaced as the propagated error.
+const CREATE_PANE_ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bounded wait for the best-effort `stop_agent` cleanup inside
+/// `create_stream_pane` when `attach` fails or times out. Auditor P3 on
+/// Fix D: a wedged daemon could answer `attach` with Err promptly then
+/// never respond to the cleanup `stop_agent`, leaving the function pinned
+/// on the cleanup await. Tight because cleanup is best-effort — on
+/// timeout we log a warning and still propagate the original attach
+/// error (the daemon-side agent may be leaked, same outcome as a stop_agent
+/// that errored).
+const CREATE_PANE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Per-pane resize worker (PRD #76 M2.10 audit follow-up). Reads the most
 /// recent `(rows, cols)` from the watch receiver and dispatches it to the
