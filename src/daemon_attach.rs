@@ -82,9 +82,9 @@ where
     F: FnOnce() -> std::io::Result<()>,
 {
     // Lock file lives inside the state dir, so we have to make sure the dir
-    // exists first. Mode 0o700 on freshly-created dirs only — we deliberately
-    // leave pre-existing dirs alone (the user may have looser perms there for
-    // other tooling).
+    // exists first. `prepare_state_dir` creates idempotently AND enforces
+    // mode 0o700 unconditionally — including repairing a pre-existing dir
+    // that was left at looser permissions by a stale install.
     prepare_state_dir(state_dir).map_err(|source| AttachError::DaemonSpawnFailed { source })?;
 
     // Acquire the spawn mutex. flock(2) blocks until granted, so this also
@@ -240,21 +240,28 @@ async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
     .map_err(std::io::Error::other)?
 }
 
-/// Create `state_dir` with mode 0o700 if missing. Pre-existing dirs are
-/// left untouched (the user may have looser perms there from other tooling
-/// — chmod'ing them down without consent could break things). The 0o700 on
-/// fresh creation matches the auditor's "freshly-created dirs should be
-/// 0o700" requirement so per-uid state isn't world-readable on a clean
-/// remote.
+/// Create `state_dir` with mode 0o700, repairing the mode on pre-existing
+/// directories. `DirBuilder::mode(0o700)` only applies to a directory
+/// freshly created by the call — an existing `state_dir` at 0o755 (stale
+/// install, prior misconfigured run) would slip through and leave the
+/// per-uid socket dir world-readable. We follow up with an unconditional
+/// `set_permissions(0o700)`, matching the chmod-after-bind pattern used
+/// for the daemon socket in `src/daemon.rs`.
+///
+/// Race-safety: `prepare_state_dir` runs before `spawn.lock` is acquired,
+/// so two first-time callers (twin TUI launches, or TUI + `daemon serve`)
+/// can both observe "missing" and try to create. `DirBuilder::recursive(true)`
+/// makes the mkdir idempotent — the stdlib internally converts
+/// `AlreadyExists` to `Ok(())` when the existing path is a directory — so
+/// the loser's create call succeeds against whatever the winner left behind.
+/// Real I/O errors (permission denied, ENOSPC) still surface unchanged.
 fn prepare_state_dir(state_dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
-    if state_dir.exists() {
-        return Ok(());
-    }
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
-    builder.create(state_dir)
+    builder.create(state_dir)?;
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))
 }
 
 /// Spawn `dot-agent-deck daemon serve` as a detached background process
@@ -947,5 +954,79 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn prepare_state_dir_is_race_safe() {
+        // CodeRabbit P2 on PR #95: `prepare_state_dir` runs before
+        // `spawn.lock` is acquired, so concurrent first-time callers can
+        // race on `create_dir`. With `DirBuilder::recursive(true)` the
+        // stdlib treats `AlreadyExists` as success when the existing path
+        // is a directory, so every racer should observe `Ok(())`.
+        //
+        // The Barrier forces all eight threads to arrive at the call site
+        // together — without it the threads can serialize on `spawn` /
+        // OS scheduling latency and the test passes by luck rather than
+        // demonstrating concurrent contention.
+        let dir = race_safe_tempdir();
+        let target = Arc::new(dir.path().join("state"));
+        assert!(
+            !target.exists(),
+            "precondition: state_dir must not exist before the race"
+        );
+
+        const RACERS: usize = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(RACERS));
+        let mut handles = Vec::new();
+        for _ in 0..RACERS {
+            let target = target.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                prepare_state_dir(&target)
+            }));
+        }
+        for h in handles {
+            h.join()
+                .expect("worker thread panicked")
+                .expect("prepare_state_dir must return Ok for every concurrent caller");
+        }
+
+        assert!(
+            target.is_dir(),
+            "state_dir must exist as a directory after the race"
+        );
+        let mode = std::fs::metadata(&*target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "freshly-created state_dir must be 0o700, got {mode:o}"
+        );
+    }
+
+    #[test]
+    fn prepare_state_dir_repairs_loose_mode() {
+        // `DirBuilder::mode(0o700)` only applies when the call actually
+        // creates the directory. A pre-existing state_dir at 0o755 (stale
+        // install, prior misconfigured run) would otherwise slip through
+        // the idempotent create with its loose mode intact. Verify the
+        // unconditional `set_permissions(0o700)` on the success path
+        // tightens it back down.
+        let dir = race_safe_tempdir();
+        let target = dir.path().join("state");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pre_mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            pre_mode, 0o755,
+            "precondition: pre-existing state_dir must be at 0o755"
+        );
+
+        prepare_state_dir(&target).expect("prepare_state_dir must succeed against existing dir");
+
+        let post_mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            post_mode, 0o700,
+            "prepare_state_dir must repair a loose-mode pre-existing state_dir to 0o700, got {post_mode:o}"
+        );
     }
 }
