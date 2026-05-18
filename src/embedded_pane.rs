@@ -775,10 +775,11 @@ impl EmbeddedPaneController {
     ///   re-discovery is meaningless.
     ///
     /// Returns one [`HydratedPane`] per successfully attached agent, in
-    /// the order returned by the daemon. Callers are expected to register
-    /// each pane id with [`crate::state::AppState`] and seed the UI's
-    /// display-name maps with `agent_id` (the daemon does not track
-    /// display metadata yet — out of scope for M2.x).
+    /// the order returned by the daemon. Callers register each pane id
+    /// with [`crate::state::AppState`] and seed the UI's display-name
+    /// maps from `HydratedPane::display_name` (falling back to `agent_id`
+    /// when the daemon has no recorded label — M2.11 added persistence,
+    /// older daemons or unlabelled agents still come back as `None`).
     pub fn hydrate_from_daemon(&self) -> Vec<HydratedPane> {
         let (client, runtime) = match &self.mode {
             ControllerMode::LocalDeck => return Vec::new(),
