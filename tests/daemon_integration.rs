@@ -70,19 +70,21 @@ async fn spawn_daemon() -> DaemonHandle {
     // socket first, then spawns the attach server. We poll the attach
     // socket since that's the one this test connects to.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut attach_ready = false;
     while tokio::time::Instant::now() < deadline {
         if attach_path.exists() {
             // Inode exists, but the listener may not be accepting yet.
             // A trial connect is the cheapest way to confirm readiness.
             if UnixStream::connect(&attach_path).await.is_ok() {
+                attach_ready = true;
                 break;
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
-        attach_path.exists(),
-        "attach socket did not appear within 5s"
+        attach_ready,
+        "attach socket did not become connectable within 5s"
     );
 
     DaemonHandle {
