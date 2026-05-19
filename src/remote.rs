@@ -784,8 +784,18 @@ fn build_install_command(
 ) -> Result<(String, String), RemoteAddError> {
     let version = validate_version_string(version)?;
     let url = format!("{release_base}/v{version}/dot-agent-deck-{platform}");
+    // Atomic install: download to a PID-suffixed sibling temp file, chmod the
+    // temp, then `mv` it into place. Same-filesystem `mv` is POSIX-atomic, so
+    // an interrupted curl leaves the existing binary untouched instead of
+    // overwriting it with a truncated download. A per-process temp leak on a
+    // failed install is acceptable — a wildcard sweep would race with a
+    // concurrent upgrade's in-flight download.
     let install_cmd = format!(
-        "mkdir -p ~/.local/bin && curl -fsSL {url} -o ~/.local/bin/dot-agent-deck && chmod 0755 ~/.local/bin/dot-agent-deck"
+        "mkdir -p ~/.local/bin \
+         && tmp=~/.local/bin/.dot-agent-deck.$$ \
+         && curl -fsSL {url} -o \"$tmp\" \
+         && chmod 0755 \"$tmp\" \
+         && mv \"$tmp\" ~/.local/bin/dot-agent-deck"
     );
     Ok((url, install_cmd))
 }
@@ -1710,6 +1720,36 @@ mod tests {
             "https://example.test/releases/v0.24.5/dot-agent-deck-linux-amd64"
         );
         assert!(install_cmd.contains(&url));
+    }
+
+    #[test]
+    fn build_install_command_is_atomic() {
+        // Regression: previously curl wrote directly to the final path, so an
+        // interrupted download left a truncated binary at the install target
+        // with no rollback. The command must download to a sibling temp file
+        // and `mv` it into place — same-filesystem mv is POSIX-atomic.
+        let (_, install_cmd) =
+            build_install_command("https://example.test/releases", "0.24.5", "linux-amd64")
+                .expect("valid version must build an install command");
+        assert!(
+            install_cmd.contains("mv "),
+            "install command must `mv` the temp file into place: {install_cmd}"
+        );
+        assert!(
+            install_cmd.contains(".dot-agent-deck."),
+            "install command must download to a sibling temp file: {install_cmd}"
+        );
+        assert!(
+            install_cmd.contains("$tmp"),
+            "install command must reference the temp file by variable so chmod and mv target the temp: {install_cmd}"
+        );
+        // The chmod must happen on the temp file, not on the final path —
+        // otherwise an interrupted download still leaves a chmod-ed final
+        // path.
+        assert!(
+            install_cmd.contains("chmod 0755 \"$tmp\""),
+            "chmod must target the temp file, not the final path: {install_cmd}"
+        );
     }
 
     #[test]

@@ -117,19 +117,33 @@ fn remote_add_happy_path_writes_registry_and_invokes_hooks_install() {
     let cmds = executor.commands();
     assert_eq!(cmds.len(), 4);
     assert_eq!(cmds[0], "uname -s -m");
+    // Atomic install: curl writes to a sibling temp file, chmod targets the
+    // temp, then `mv` swings the temp into the final path. Same-filesystem mv
+    // is POSIX-atomic, so an interrupted curl leaves the previous binary in
+    // place rather than truncating the install target.
     assert!(
-        cmds[1].starts_with("mkdir -p ~/.local/bin && curl -fsSL "),
+        cmds[1].starts_with("mkdir -p ~/.local/bin"),
         "install command shape: {}",
         cmds[1]
     );
     assert!(
-        cmds[1].contains("/v0.24.5/dot-agent-deck-linux-amd64 -o ~/.local/bin/dot-agent-deck"),
-        "install URL/dest: {}",
+        cmds[1].contains("/v0.24.5/dot-agent-deck-linux-amd64"),
+        "install URL: {}",
         cmds[1]
     );
     assert!(
-        cmds[1].ends_with("&& chmod 0755 ~/.local/bin/dot-agent-deck"),
-        "install chmod tail: {}",
+        cmds[1].contains("curl -fsSL ") && cmds[1].contains("-o \"$tmp\""),
+        "curl must download to the temp file: {}",
+        cmds[1]
+    );
+    assert!(
+        cmds[1].contains("chmod 0755 \"$tmp\""),
+        "chmod must target the temp file, not the final path: {}",
+        cmds[1]
+    );
+    assert!(
+        cmds[1].ends_with("mv \"$tmp\" ~/.local/bin/dot-agent-deck"),
+        "install must finish with an atomic mv into place: {}",
         cmds[1]
     );
     assert_eq!(cmds[2], "~/.local/bin/dot-agent-deck --version");
