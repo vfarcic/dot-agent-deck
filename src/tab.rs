@@ -458,17 +458,20 @@ impl TabManager {
                 ids
             }
             Tab::Orchestration { role_pane_ids, .. } => {
+                let mut closed_ids = Vec::with_capacity(role_pane_ids.len());
                 for id in &role_pane_ids {
                     // M2.12: skip the empty-string dead-slot sentinel
                     // inserted by `open_orchestration_tab_with_existing_role_panes`
                     // for roles that didn't survive reconnect — there's
-                    // no pane to close.
+                    // no pane to close, and leaking "" through a pane-id
+                    // API confuses downstream callers.
                     if id.is_empty() {
                         continue;
                     }
                     let _ = self.pane_controller.close_pane(id);
+                    closed_ids.push(id.clone());
                 }
-                role_pane_ids
+                closed_ids
             }
             Tab::Dashboard => Vec::new(),
         };
@@ -1154,6 +1157,53 @@ mod tests {
         assert_eq!(tm.active_index(), 0);
         let closed = mock.closed.lock().unwrap();
         assert_eq!(closed.len(), 2);
+    }
+
+    #[test]
+    fn close_orchestration_tab_filters_dead_slot_sentinels() {
+        // PRD #76 M2.12: the hydration path inserts "" sentinels for
+        // role slots whose agent did not survive reconnect. close_tab
+        // must not leak those non-pane values through its pane-id
+        // return, nor attempt to close them via the pane controller.
+        let mock = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(mock.clone());
+
+        // Three-role config so we can place a dead slot between live ones.
+        let role = |name: &str, start: bool| OrchestrationRoleConfig {
+            name: name.to_string(),
+            command: "claude".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        };
+        let config = OrchestrationConfig {
+            name: "with-dead-slot".to_string(),
+            roles: vec![
+                role("tester", true),
+                role("coder", false),
+                role("reviewer", false),
+            ],
+        };
+
+        let (_, flat_ids) = tm
+            .open_orchestration_tab_with_existing_role_panes(
+                &config,
+                "/tmp",
+                vec![Some("real-1".to_string()), None, Some("real-2".to_string())],
+            )
+            .unwrap();
+        // Sanity-check the hydration result: middle slot is the "" sentinel.
+        assert_eq!(flat_ids, vec!["real-1", "", "real-2"]);
+
+        let closed_ids = tm.close_tab(1).unwrap();
+
+        // Only real pane IDs come back — no "" sentinels leak.
+        assert_eq!(closed_ids, vec!["real-1".to_string(), "real-2".to_string()]);
+
+        // close_pane was invoked once per real ID, never for the sentinel.
+        let closed = mock.closed.lock().unwrap();
+        assert_eq!(*closed, vec!["real-1".to_string(), "real-2".to_string()]);
     }
 
     #[test]
