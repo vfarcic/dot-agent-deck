@@ -1454,12 +1454,24 @@ impl PaneController for EmbeddedPaneController {
                 // detach and the agent would survive.
                 let client = DaemonClient::new(s.daemon_path.clone());
                 let agent_id = s.agent_id.clone();
-                match s.runtime.block_on(client.stop_agent(&agent_id)) {
-                    Ok(()) => {
+                // CodeRabbit Fix E: bound the stop-agent RPC. Without this
+                // timeout a wedged daemon would pin the TUI renderer
+                // indefinitely (Ctrl+W happens on the render thread via
+                // `block_on`) while the pane has already been removed from
+                // the registry — the UI would freeze on a phantom-closed
+                // pane. Reusing `CREATE_PANE_STOP_TIMEOUT` (2s): same
+                // semantics — "how long do we wait on a daemon stop-agent
+                // call?" — and same cap as the attach-failure cleanup.
+                let stop_result = s.runtime.block_on(async {
+                    tokio::time::timeout(CREATE_PANE_STOP_TIMEOUT, client.stop_agent(&agent_id))
+                        .await
+                });
+                match stop_result {
+                    Ok(Ok(())) => {
                         // Drop `s` → io_task aborts. No explicit abort needed.
                         Ok(())
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         // Don't silently degrade to detach: a swallowed
                         // stop-agent error would close the socket, the
                         // daemon would treat the close as implicit detach,
@@ -1488,6 +1500,36 @@ impl PaneController for EmbeddedPaneController {
                             .insert(pane_id.to_string(), restored);
                         Err(PaneError::CommandFailed(format!(
                             "stop-agent failed for pane {pane_id}: {e}"
+                        )))
+                    }
+                    Err(_) => {
+                        // Timeout: daemon never answered. Same restore
+                        // path as the RPC-error branch — the io_task is
+                        // still alive (`s` not dropped), the daemon-side
+                        // agent likely still exists, and the user needs
+                        // a visible pane to retry against rather than a
+                        // phantom-closed one.
+                        tracing::error!(
+                            agent_id = %agent_id,
+                            timeout_ms = CREATE_PANE_STOP_TIMEOUT.as_millis() as u64,
+                            "stop-agent timed out during Ctrl+W close — pane retained for retry"
+                        );
+                        let restored = Pane {
+                            backend: PaneBackend::Stream(s),
+                            screen: pane.screen,
+                            name: pane.name,
+                            is_focused: pane.is_focused,
+                            command: pane.command,
+                            cwd: pane.cwd,
+                            mouse_mode: pane.mouse_mode,
+                            hyperlinks: pane.hyperlinks,
+                        };
+                        self.panes
+                            .lock()
+                            .unwrap()
+                            .insert(pane_id.to_string(), restored);
+                        Err(PaneError::CommandFailed(format!(
+                            "stop-agent timed out for pane {pane_id}"
                         )))
                     }
                 }

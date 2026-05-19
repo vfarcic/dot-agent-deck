@@ -71,6 +71,11 @@ enum AttachBehavior {
     /// Accept the request but never write a response (the await on the
     /// client side has to be bounded by a timeout to make progress).
     Hang,
+    /// Reply promptly with `ok=true` and hold the connection open
+    /// without sending any subsequent frames. The client's I/O task
+    /// blocks on reads that never arrive — fine for tests that only
+    /// need pane creation to succeed (e.g. exercising close_pane).
+    Accept,
 }
 
 /// How the mock daemon should respond to `StopAgent`.
@@ -153,6 +158,16 @@ async fn start_mock_server(start_id: &str, config: MockConfig) -> MockServer {
                             // Hold the connection open without writing a
                             // response. The client's read await blocks
                             // until its `tokio::time::timeout` fires.
+                            std::future::pending::<()>().await;
+                        }
+                        AttachBehavior::Accept => {
+                            // Attach succeeds → pane creation completes
+                            // and the pane lands in the registry. Hold
+                            // the connection open afterward so the
+                            // client-side I/O task doesn't see EOF (it
+                            // just blocks on reads that never arrive,
+                            // which is fine for close-path tests).
+                            let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
                             std::future::pending::<()>().await;
                         }
                     },
@@ -413,5 +428,98 @@ async fn attach_hang_does_not_pin_create_stream_pane() {
     assert!(
         ctrl.pane_ids().is_empty(),
         "no pane should be registered when attach times out"
+    );
+}
+
+/// CodeRabbit Fix E: the Ctrl+W close path (`EmbeddedPaneController::close_pane`)
+/// used to `block_on(client.stop_agent(...))` unbounded. A wedged daemon
+/// would freeze the TUI renderer indefinitely while the pane had already
+/// been removed from the registry — phantom-closed-pane bug.
+///
+/// Pin the fix: mock daemon accepts attach so the pane lands in the
+/// registry, then *never* responds to stop_agent. close_pane must:
+/// - return within `CREATE_PANE_STOP_TIMEOUT` (2s) + slack,
+/// - surface a `PaneError::CommandFailed` whose message contains "timed out",
+/// - restore the pane to the registry so the user can retry (same
+///   restore-on-failure semantics as the RPC-error branch).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_w_stop_agent_timeout_restores_pane_and_returns_error() {
+    let server = start_mock_server(
+        "ctrl-w-stop-hang",
+        MockConfig {
+            attach: AttachBehavior::Accept,
+            stop: StopBehavior::Hang,
+        },
+    )
+    .await;
+    let socket = server.path.clone();
+
+    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+        socket,
+        tokio::runtime::Handle::current(),
+    ));
+
+    // First create a pane successfully so close_pane has something to
+    // operate on. AttachBehavior::Accept replies OK to AttachStream and
+    // holds the stream open; the client's I/O task then just waits on
+    // reads — fine for our purposes.
+    let pane_id = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane_with_options(Some("/bin/sh"), None, AgentSpawnOptions::default())
+        })
+        .await
+        .unwrap()
+        .expect("create_pane must succeed when attach is accepted")
+        .0
+    };
+    assert!(
+        ctrl.pane_ids().contains(&pane_id),
+        "pane must be registered after successful create"
+    );
+
+    // Now call close_pane. The mock daemon will never answer stop_agent.
+    // Without the timeout this future would block_on forever; the outer
+    // deadline catches that regression by panicking.
+    let outer_deadline = Duration::from_secs(4);
+    let started = tokio::time::Instant::now();
+
+    let result = {
+        let ctrl = ctrl.clone();
+        let pane_id = pane_id.clone();
+        let join = tokio::task::spawn_blocking(move || ctrl.close_pane(&pane_id));
+        match tokio::time::timeout(outer_deadline, join).await {
+            Ok(j) => j.unwrap(),
+            Err(_) => panic!(
+                "close_pane must not hang when stop_agent never responds; \
+                 wedged for > {outer_deadline:?}"
+            ),
+        }
+    };
+
+    let elapsed = started.elapsed();
+    let err = result.expect_err("stop_agent timeout must surface as Err");
+    match err {
+        PaneError::CommandFailed(msg) => assert!(
+            msg.contains("timed out"),
+            "stop_agent timeout must surface a 'timed out' message; got: {msg}"
+        ),
+        other => panic!("expected PaneError::CommandFailed, got {other:?}"),
+    }
+
+    // Bound: should complete within CREATE_PANE_STOP_TIMEOUT (2s) plus
+    // generous slack for the blocking-thread + runtime hop. If this
+    // fails the timeout is probably missing or too loose.
+    assert!(
+        elapsed < outer_deadline,
+        "close_pane took {elapsed:?} — expected < {outer_deadline:?}"
+    );
+
+    // Pane must be restored so the user can retry Ctrl+W rather than
+    // see a phantom-closed pane.
+    assert!(
+        ctrl.pane_ids().contains(&pane_id),
+        "pane must be restored to the registry after stop_agent timeout (got: {:?})",
+        ctrl.pane_ids()
     );
 }
