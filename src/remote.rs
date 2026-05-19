@@ -1234,7 +1234,28 @@ pub fn upgrade(
         opts.no_install,
     )?;
 
-    // 5. Update registry. `added_at` stays at the original registration
+    // 5. Reinstall hooks on the remote. A release may change hook behavior,
+    //    so the upgraded binary must be paired with refreshed hook scripts —
+    //    otherwise `remote upgrade` reports success while leaving the remote
+    //    on stale hooks. Mirrors the same step in `add()` so both paths stay
+    //    in lockstep. Runs BEFORE `registry.save` so a hook-install failure
+    //    fails loud rather than persisting half-finished state.
+    let hooks = executor.run(&target, "~/.local/bin/dot-agent-deck hooks install")?;
+    if hooks.status != 0 {
+        return Err(RemoteAddError::HooksInstallFailed {
+            status: hooks.status,
+            stderr: hooks.stderr,
+        }
+        .into());
+    }
+    if !hooks.stdout.is_empty() {
+        print!("{}", hooks.stdout);
+        if !hooks.stdout.ends_with('\n') {
+            println!();
+        }
+    }
+
+    // 6. Update registry. `added_at` stays at the original registration
     //    timestamp; `upgraded_at` records the most recent upgrade so users
     //    can see both moments without losing the registration history.
     let now = chrono::Utc::now().to_rfc3339();

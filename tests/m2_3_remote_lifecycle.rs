@@ -16,6 +16,14 @@ use dot_agent_deck::remote::{
     SshExecutor, SshOutput, SshTarget, UpgradeOptions, list, remove, upgrade,
 };
 
+fn err_status(status: i32, stderr: &str) -> Result<SshOutput, SshError> {
+    Ok(SshOutput {
+        status,
+        stdout: String::new(),
+        stderr: stderr.to_string(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // FakeSshExecutor — pops responses in FIFO order, records every call.
 // (Duplicated from `m2_2_remote_add.rs` — `tests/*.rs` are independent
@@ -271,11 +279,12 @@ fn remote_upgrade_runs_install_flow_with_new_version() {
     pre.save(&path).unwrap();
     let original_added_at = pre.remotes[0].added_at.clone();
 
-    // 3 ssh calls in install mode: uname, install, version-check.
+    // 4 ssh calls in install mode: uname, install, version-check, hooks install.
     let executor = FakeSshExecutor::new(vec![
         ok("Linux x86_64\n"),
         ok(""), // install: success
         ok("dot-agent-deck 0.24.5\n"),
+        ok(""), // hooks install: success
     ]);
 
     let updated = upgrade(
@@ -296,7 +305,7 @@ fn remote_upgrade_runs_install_flow_with_new_version() {
     );
 
     let cmds = executor.commands();
-    assert_eq!(cmds.len(), 3);
+    assert_eq!(cmds.len(), 4);
     assert_eq!(cmds[0], "uname -s -m");
     assert!(
         cmds[1].contains("/v0.24.5/dot-agent-deck-linux-amd64"),
@@ -304,6 +313,7 @@ fn remote_upgrade_runs_install_flow_with_new_version() {
         cmds[1]
     );
     assert_eq!(cmds[2], "~/.local/bin/dot-agent-deck --version");
+    assert_eq!(cmds[3], "~/.local/bin/dot-agent-deck hooks install");
 
     // Registry persisted: version updated, name unchanged, single row.
     let reg = load_registry(&path);
@@ -449,6 +459,7 @@ fn remote_upgrade_normalizes_v_prefix() {
         ok("Linux x86_64\n"),
         ok(""),
         ok("dot-agent-deck 0.24.5\n"),
+        ok(""), // hooks install: success
     ]);
 
     let updated = upgrade(
@@ -473,4 +484,117 @@ fn remote_upgrade_normalizes_v_prefix() {
     // Registry stores the canonical unprefixed form.
     assert_eq!(updated.version, "0.24.5");
     assert_eq!(load_registry(&path).remotes[0].version, "0.24.5");
+}
+
+#[test]
+fn upgrade_runs_hooks_install_after_successful_binary_swap() {
+    // The binary swap and hook scripts must move together: a release that
+    // changes hook behavior would otherwise leave the upgraded remote on
+    // stale scripts. Assert the exact ssh call sequence and that the
+    // registry is persisted only after hooks install succeeds.
+    let dir = tempfile::tempdir().unwrap();
+    let path = registry_path(&dir);
+    let pre = RemotesFile {
+        remotes: vec![entry(
+            "hetzner-1",
+            "viktor@hetzner-1.example.com",
+            22,
+            "0.24.4",
+        )],
+    };
+    pre.save(&path).unwrap();
+
+    let executor = FakeSshExecutor::new(vec![
+        ok("Linux x86_64\n"),
+        ok(""), // install
+        ok("dot-agent-deck 0.24.5\n"),
+        ok("hooks installed\n"), // hooks install: success
+    ]);
+
+    let updated = upgrade(
+        &upgrade_opts("hetzner-1", "0.24.5", false),
+        &executor,
+        &path,
+    )
+    .expect("upgrade succeeds");
+
+    let cmds = executor.commands();
+    assert_eq!(
+        cmds,
+        vec![
+            "uname -s -m".to_string(),
+            cmds[1].clone(), // install URL — checked separately
+            "~/.local/bin/dot-agent-deck --version".to_string(),
+            "~/.local/bin/dot-agent-deck hooks install".to_string(),
+        ],
+        "ssh calls must run in order: uname, install, version-check, hooks install"
+    );
+    assert!(
+        cmds[1].contains("/v0.24.5/dot-agent-deck-linux-amd64"),
+        "install URL should target v0.24.5: {}",
+        cmds[1]
+    );
+
+    // Registry persisted with new version and upgraded_at populated.
+    assert_eq!(updated.version, "0.24.5");
+    let reg = load_registry(&path);
+    assert_eq!(reg.remotes.len(), 1);
+    assert_eq!(reg.remotes[0].version, "0.24.5");
+    assert!(reg.remotes[0].upgraded_at.is_some());
+}
+
+#[test]
+fn upgrade_fails_if_hooks_install_fails() {
+    // Defensive contract: registry must NOT record the new version when the
+    // hooks install step fails on the remote. Otherwise a follow-up `version`
+    // check would report success even though hooks are stale.
+    let dir = tempfile::tempdir().unwrap();
+    let path = registry_path(&dir);
+    let pre = RemotesFile {
+        remotes: vec![entry(
+            "hetzner-1",
+            "viktor@hetzner-1.example.com",
+            22,
+            "0.24.4",
+        )],
+    };
+    pre.save(&path).unwrap();
+    let original_added_at = pre.remotes[0].added_at.clone();
+
+    let executor = FakeSshExecutor::new(vec![
+        ok("Linux x86_64\n"),
+        ok(""), // install
+        ok("dot-agent-deck 0.24.5\n"),
+        err_status(2, "permission denied creating ~/.dot-agent-deck/hooks\n"),
+    ]);
+
+    let err = upgrade(
+        &upgrade_opts("hetzner-1", "0.24.5", false),
+        &executor,
+        &path,
+    )
+    .expect_err("hooks install failure must propagate as a typed error");
+    match err {
+        RemoteUpgradeError::Inner(RemoteAddError::HooksInstallFailed { status, stderr }) => {
+            assert_eq!(status, 2);
+            assert!(
+                stderr.contains("permission denied"),
+                "stderr should be surfaced verbatim: {stderr}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    // Registry untouched: still at 0.24.4, no upgraded_at, original added_at.
+    let reg = load_registry(&path);
+    assert_eq!(reg.remotes.len(), 1);
+    assert_eq!(
+        reg.remotes[0].version, "0.24.4",
+        "version must not be persisted when hooks install fails"
+    );
+    assert!(
+        reg.remotes[0].upgraded_at.is_none(),
+        "upgraded_at must not be set when hooks install fails"
+    );
+    assert_eq!(reg.remotes[0].added_at, original_added_at);
 }
