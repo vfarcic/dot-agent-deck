@@ -1,13 +1,19 @@
+use std::io::Write as _;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
-use dot_agent_deck::config::{DashboardConfig, socket_path};
-use dot_agent_deck::daemon::run_daemon;
+use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
+use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
+use dot_agent_deck::daemon::{Daemon, run_daemon_with};
+use dot_agent_deck::daemon_attach::{ensure_external_daemon_or_die, via_daemon_enabled};
+use dot_agent_deck::daemon_client::DaemonClient;
+use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::hooks_manage;
+use dot_agent_deck::pane::PaneController;
 use dot_agent_deck::state::AppState;
 use dot_agent_deck::theme::Theme;
 use dot_agent_deck::ui::run_tui;
@@ -105,6 +111,101 @@ enum Commands {
         #[arg(long)]
         done: bool,
     },
+    /// Daemon-side subcommands. Used internally by remote transports — not
+    /// part of the everyday user surface.
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
+    /// Manage registered remote agent environments (PRD #76).
+    Remote {
+        #[command(subcommand)]
+        cmd: RemoteCmd,
+    },
+    /// Attach a local TUI to a remote daemon (PRD #76, M2.4). With no
+    /// argument, runs an interactive picker over the configured remotes.
+    Connect {
+        /// Friendly name from `dot-agent-deck remote list`. If omitted, the
+        /// picker runs.
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Run the daemon as a foreground process, binding the hook-ingestion
+    /// and streaming-attach sockets but **not** launching the TUI. Used
+    /// internally by lazy-spawn-on-attach (PRD #76, M4.3) and by callers
+    /// that want a long-lived daemon to outlive the spawning shell. Not
+    /// part of the everyday user surface.
+    Serve,
+    /// Print the binary's attach-protocol version as JSON. Used by the
+    /// laptop-side `connect` flow (PRD #76 M2.21) to detect wire-format skew
+    /// across an ssh hop without spawning the remote daemon: the protocol
+    /// version is compiled into the binary, so a static print is equivalent
+    /// to a Hello round-trip against a running daemon. Output is a JSON
+    /// `AttachResponse` carrying `server_version` so the client side can
+    /// reuse its existing deserializer.
+    Hello,
+}
+
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum CliRemoteType {
+    #[default]
+    Ssh,
+    Kubernetes,
+}
+
+#[derive(Subcommand)]
+enum RemoteCmd {
+    /// Register a remote ssh-reachable host as a deck environment.
+    Add {
+        /// Friendly name for the registry (e.g. hetzner-1). Must be unique.
+        name: String,
+        /// ssh target: `[user@]host`.
+        target: String,
+        /// Remote type. Defaults to `ssh` (the only transport implemented today);
+        /// `kubernetes` is planned in PRD #81.
+        #[arg(long = "type", value_enum, default_value_t = CliRemoteType::Ssh)]
+        kind: CliRemoteType,
+        /// ssh port.
+        #[arg(long, default_value_t = dot_agent_deck::remote::DEFAULT_SSH_PORT)]
+        port: u16,
+        /// ssh identity file. Optional; if omitted, ssh's default key search applies.
+        #[arg(long)]
+        key: Option<std::path::PathBuf>,
+        /// Daemon binary version to install on the remote.
+        #[arg(long, default_value = env!("DAD_VERSION"))]
+        version: String,
+        /// Skip binary install. Pre-flight will run `dot-agent-deck --version`
+        /// on the remote and require version match.
+        #[arg(long = "no-install")]
+        no_install: bool,
+    },
+    /// Print the configured remotes from the local registry. Offline metadata
+    /// only — does not probe remote hosts.
+    List,
+    /// Remove a remote from the local registry. Does not touch the remote
+    /// host (the binary and hooks remain installed there until you ssh in
+    /// and clean them up explicitly).
+    Remove {
+        /// Friendly name of the registry entry to remove.
+        name: String,
+    },
+    /// Re-run the binary install flow against an existing entry, then bump
+    /// the registry's version field.
+    Upgrade {
+        /// Friendly name of the registry entry to upgrade.
+        name: String,
+        /// Target version. Defaults to the local client's version.
+        #[arg(long, default_value = env!("DAD_VERSION"))]
+        version: String,
+        /// Skip binary install. Useful when the user has already swapped the
+        /// binary on the remote and just wants the registry's version field
+        /// updated.
+        #[arg(long = "no-install")]
+        no_install: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -153,10 +254,7 @@ fn main() -> ExitCode {
         .expect("clap arg matches should be valid for Cli struct");
 
     match cli.command {
-        None => {
-            run_dashboard(cli.theme, cli.continue_session);
-            ExitCode::SUCCESS
-        }
+        None => run_dashboard(cli.theme, cli.continue_session),
         Some(Commands::Hook { agent }) => {
             let agent_str = match agent {
                 CliAgent::ClaudeCode => "claude-code",
@@ -241,7 +339,7 @@ fn main() -> ExitCode {
             dot_agent_deck::watch::run_watch(interval, &command)
         }
         Some(Commands::Delegate { task, to }) => {
-            let pane_id = match std::env::var("DOT_AGENT_DECK_PANE_ID") {
+            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
                 Err(_) => {
                     eprintln!(
@@ -275,7 +373,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(Commands::WorkDone { task, done }) => {
-            let pane_id = match std::env::var("DOT_AGENT_DECK_PANE_ID") {
+            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
                 Err(_) => {
                     eprintln!(
@@ -304,6 +402,92 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Some(Commands::Daemon { cmd }) => match cmd {
+            DaemonCmd::Serve => run_daemon_serve_cli(),
+            DaemonCmd::Hello => run_daemon_hello_cli(),
+        },
+        Some(Commands::Remote { cmd }) => match cmd {
+            RemoteCmd::Add {
+                name,
+                target,
+                kind,
+                port,
+                key,
+                version,
+                no_install,
+            } => {
+                let opts = dot_agent_deck::remote::AddOptions {
+                    name,
+                    remote_type: match kind {
+                        CliRemoteType::Ssh => "ssh".to_string(),
+                        CliRemoteType::Kubernetes => "kubernetes".to_string(),
+                    },
+                    target,
+                    port,
+                    key,
+                    version,
+                    no_install,
+                    release_base: dot_agent_deck::remote::RELEASE_BASE.to_string(),
+                };
+                let path = dot_agent_deck::remote::default_remotes_path();
+                let executor = dot_agent_deck::remote::SystemSshExecutor::new();
+                match dot_agent_deck::remote::add(&opts, &executor, &path) {
+                    Ok(_) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            RemoteCmd::List => {
+                let path = dot_agent_deck::remote::default_remotes_path();
+                let mut stdout = std::io::stdout().lock();
+                match dot_agent_deck::remote::list(&path, &mut stdout) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            RemoteCmd::Remove { name } => {
+                let path = dot_agent_deck::remote::default_remotes_path();
+                match dot_agent_deck::remote::remove(&name, &path) {
+                    Ok(_) => {
+                        println!(
+                            "Removed remote '{name}' from local registry. The dot-agent-deck binary on the remote and its hooks are unaffected; if you want to clean those up, ssh in and run `dot-agent-deck hooks uninstall` and `rm ~/.local/bin/dot-agent-deck`."
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            RemoteCmd::Upgrade {
+                name,
+                version,
+                no_install,
+            } => {
+                let opts = dot_agent_deck::remote::UpgradeOptions {
+                    name,
+                    version,
+                    no_install,
+                    release_base: dot_agent_deck::remote::RELEASE_BASE.to_string(),
+                };
+                let path = dot_agent_deck::remote::default_remotes_path();
+                let executor = dot_agent_deck::remote::SystemSshExecutor::new();
+                match dot_agent_deck::remote::upgrade(&opts, &executor, &path) {
+                    Ok(_) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        },
+        Some(Commands::Connect { name }) => run_connect(cli.theme, cli.continue_session, name),
         Some(Commands::Validate { path }) => {
             use dot_agent_deck::config_validation::{has_errors, validate_config};
             use dot_agent_deck::project_config::load_project_config;
@@ -339,10 +523,15 @@ fn main() -> ExitCode {
 }
 
 #[tokio::main]
-async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
-    // Optional file-based logging when DOT_AGENT_DECK_LOG is set.
-    // Logs go to the file path specified (e.g., DOT_AGENT_DECK_LOG=/tmp/dad.log).
-    // If the value is "1" or empty, defaults to /tmp/dot-agent-deck.log.
+async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) -> ExitCode {
+    init_logging_from_env();
+    run_tui_session(cli_theme, continue_session).await
+}
+
+/// Optional file-based logging from `DOT_AGENT_DECK_LOG`. Pulled out of the
+/// dashboard entry point so the `connect` subcommand (which builds its own
+/// tokio runtime) can call it once before launching the TUI body.
+fn init_logging_from_env() {
     if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
         let log_path = if log_val.is_empty() || log_val == "1" {
             "/tmp/dot-agent-deck.log".to_string()
@@ -369,17 +558,57 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
             }
         }
     }
+}
 
+/// The TUI body extracted from `run_dashboard` so `connect` can reuse it.
+/// Reads `DOT_AGENT_DECK_VIA_DAEMON` + `DOT_AGENT_DECK_ATTACH_SOCKET` to
+/// decide whether to spawn an in-process daemon (false) or lazy-spawn-and-
+/// attach to an external one (true, the M2.8 behavior). The `connect`
+/// subcommand will set both env vars in M2.9 so the TUI runs against the
+/// remote daemon over `ssh -t`.
+///
+/// Returns `ExitCode::FAILURE` when the external-daemon bootstrap fails
+/// (spawn error, start timeout, or trust-check rejection). Successful TUI
+/// runs return `ExitCode::SUCCESS` — including TUI-task errors, which are
+/// already surfaced to stderr (matching the pre-M2.8 behavior).
+async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> ExitCode {
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();
+    let attach_path = attach_socket_path();
 
-    let daemon_state = state.clone();
-    let daemon_path = path.clone();
-    let daemon_handle = tokio::spawn(async move {
-        if let Err(e) = run_daemon(&daemon_path, daemon_state).await {
-            eprintln!("Daemon error: {e}");
+    // PRD #76, M2.8: lazy-spawn-on-attach for the external-daemon code path.
+    // When DOT_AGENT_DECK_VIA_DAEMON=1, ensure_external_daemon_or_die fork-
+    // execs `dot-agent-deck daemon serve` detached if the attach socket is
+    // absent, and trust-checks any existing socket (uid + 0o600 + is-socket)
+    // before the TUI's DaemonClient touches it. No in-process fallback —
+    // failures are reported and the dashboard exits nonzero.
+    let via_daemon = via_daemon_enabled();
+
+    let daemon_handle = if via_daemon {
+        if let Err(e) = ensure_external_daemon_or_die(&attach_path).await {
+            eprintln!("remote-deck-local mode: {e}");
+            return ExitCode::FAILURE;
         }
-    });
+        // PRD #76 M2.17: subscribe to the daemon's `AgentEvent` broadcast
+        // so the remote-mode TUI's `AppState` mirrors live agent activity.
+        // In the in-process daemon path the TUI and daemon already share
+        // `state`, so this branch is the only one that needs the bridge.
+        spawn_event_subscriber(attach_path.clone(), state.clone());
+        None
+    } else {
+        let daemon_state = state.clone();
+        let daemon_path = path.clone();
+        let daemon_attach_path = attach_path.clone();
+        Some(tokio::spawn(async move {
+            // In-process daemon shares its state with the TUI, so delegate
+            // signals must take the direct-call path (no broadcast — the
+            // TUI doesn't subscribe to its own daemon in local mode).
+            let daemon = Daemon::with_attach_in_process(daemon_state, daemon_attach_path);
+            if let Err(e) = run_daemon_with(&daemon_path, daemon).await {
+                eprintln!("Daemon error: {e}");
+            }
+        }))
+    };
 
     let version_state = state.clone();
     tokio::spawn(async move {
@@ -397,7 +626,14 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     let effective_theme = cli_theme.unwrap_or(config.theme);
     // Detect terminal theme *before* raw mode / alternate screen takes over.
     let palette = dot_agent_deck::theme::resolve_palette(effective_theme);
-    let pane_controller = dot_agent_deck::pane::detect_multiplexer();
+    let pane_controller: Arc<dyn PaneController> = if via_daemon {
+        Arc::new(EmbeddedPaneController::with_remote_deck(
+            attach_path.clone(),
+            tokio::runtime::Handle::current(),
+        ))
+    } else {
+        dot_agent_deck::pane::detect_multiplexer()
+    };
     let tui_state = state.clone();
     let tui_result = tokio::task::spawn_blocking(move || {
         run_tui(
@@ -410,11 +646,20 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     })
     .await;
 
-    // TUI exited — clean up
-    daemon_handle.abort();
-
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
+    // TUI exited — clean up. In via_daemon mode `daemon_handle` is `None`
+    // (the daemon was fork-execed detached by ensure_external_daemon_or_die,
+    // setsid'd into its own session, and is intentionally outside this
+    // process tree), so this branch is a no-op for that path: we do not
+    // abort the daemon and do not unlink its sockets. Agents must survive
+    // TUI exit (PRD #76 line 199).
+    if let Some(handle) = daemon_handle {
+        handle.abort();
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        if attach_path.exists() {
+            let _ = std::fs::remove_file(&attach_path);
+        }
     }
 
     if let Err(e) = tui_result {
@@ -422,6 +667,185 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     } else if let Ok(Err(e)) = tui_result {
         eprintln!("TUI error: {e}");
     }
+    ExitCode::SUCCESS
+}
+
+/// PRD #76 M2.17 (hook events) / M2.19 (delegate signals): open a
+/// long-lived `SubscribeEvents` connection against the daemon and
+/// route each `BroadcastMsg` into the TUI's `AppState`:
+///
+/// - [`BroadcastMsg::Event`] → `apply_event`.
+/// - [`BroadcastMsg::Delegate`] → `handle_delegate`. The daemon can't
+///   validate delegate signals in external-daemon mode (its own
+///   `pane_role_map` is empty); the TUI re-runs the orchestrator-role
+///   guard against its own role map before enqueueing.
+///
+/// Reconnects with a small backoff on transport errors so a daemon
+/// restart or a `KIND_STREAM_END "lagged"` tear-down recovers
+/// automatically.
+fn spawn_event_subscriber(
+    attach_path: std::path::PathBuf,
+    state: dot_agent_deck::state::SharedState,
+) {
+    use dot_agent_deck::event::BroadcastMsg;
+
+    tokio::spawn(async move {
+        // Backoff parameters tuned for "daemon briefly unavailable" rather
+        // than long outages: a fresh-daemon ready window is sub-second, so
+        // a 500ms initial delay catches most transient cases, and we cap
+        // at 5s so a stuck daemon doesn't burn CPU on reconnect attempts.
+        let mut delay = std::time::Duration::from_millis(500);
+        let max_delay = std::time::Duration::from_secs(5);
+        let client = DaemonClient::new(attach_path);
+        loop {
+            match client.subscribe_events().await {
+                Ok(mut sub) => {
+                    // Reset backoff on a successful subscribe.
+                    delay = std::time::Duration::from_millis(500);
+                    loop {
+                        match sub.next_event().await {
+                            Ok(Some(BroadcastMsg::Event(event))) => {
+                                state.write().await.apply_event(event);
+                            }
+                            Ok(Some(BroadcastMsg::Delegate(signal))) => {
+                                state.write().await.handle_delegate(signal);
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "subscribe_events: stream error, reconnecting"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "subscribe_events: subscribe failed, retrying"
+                    );
+                }
+            }
+            tokio::time::sleep(delay).await;
+            delay = std::cmp::min(delay * 2, max_delay);
+        }
+    });
+}
+
+/// `dot-agent-deck connect [name]` — PRD #76 M2.9.
+///
+/// Resolves the remote (via lookup or picker), probes the remote
+/// `dot-agent-deck` for reachability + version sanity, then exec's
+/// `ssh -t` to run the deck TUI on the remote in M2.8 external-daemon
+/// mode. The laptop process blocks until ssh exits and propagates the
+/// exit code.
+///
+/// `_cli_theme` and `_continue_session` are accepted to keep the
+/// `Commands::Connect` call shape stable but are intentionally ignored —
+/// they apply to a laptop-side TUI that no longer exists in this flow.
+/// See `connect::run_connect`'s doc comment for the rationale.
+fn run_connect(
+    _cli_theme: Option<Theme>,
+    _continue_session: bool,
+    name: Option<String>,
+) -> ExitCode {
+    let registry_path = dot_agent_deck::remote::default_remotes_path();
+
+    let entry = match name {
+        Some(n) => match dot_agent_deck::connect::lookup_remote(&n, &registry_path) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            match dot_agent_deck::connect::pick_remote(&registry_path, &mut input, &mut output) {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = output.flush();
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+
+    let local_version = env!("DAD_VERSION");
+    match dot_agent_deck::connect::run_connect_default(&entry, &registry_path, local_version) {
+        Ok(0) => ExitCode::SUCCESS,
+        // ExitCode::from(u8) is the closest we can get to "propagate ssh's
+        // exit code." Codes outside 0..=255 saturate to 255, which is also
+        // the value ssh itself uses for its own transport errors — that
+        // collision is harmless because we already classified those as
+        // typed RemoteConnectError before reaching the spawn.
+        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `dot-agent-deck daemon hello` — PRD #76 M2.21 protocol-version handshake.
+/// Prints a JSON-encoded [`dot_agent_deck::daemon_protocol::AttachResponse`]
+/// carrying `server_version = PROTOCOL_VERSION` and exits.
+///
+/// Used by the laptop-side `connect` flow over ssh: the remote binary's
+/// compiled-in `PROTOCOL_VERSION` is what its daemon would speak, so a static
+/// print here is equivalent to a Hello round-trip against a running daemon —
+/// and avoids lazy-spawning the daemon just to answer a version probe.
+///
+/// The wire shape mirrors what the daemon dispatcher returns for an
+/// [`dot_agent_deck::daemon_protocol::AttachRequest::Hello`] in the
+/// in-process attach path, so the client-side deserializer is the same in
+/// both flows. Keep this helper in lockstep with that dispatcher arm and
+/// with `AttachResponse::hello` — any divergence silently breaks the
+/// handshake.
+fn run_daemon_hello_cli() -> ExitCode {
+    let resp = dot_agent_deck::daemon_protocol::AttachResponse::hello(
+        dot_agent_deck::daemon_protocol::PROTOCOL_VERSION,
+    );
+    let json = match serde_json::to_string(&resp) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("Failed to serialize hello response: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("{json}");
+    ExitCode::SUCCESS
+}
+
+/// `dot-agent-deck daemon serve` — PRD #76 M4.3. Runs the daemon (hook
+/// ingestion + streaming-attach servers) in the foreground without a TUI.
+/// The body mirrors the in-process spawn used by `run_tui_session`
+/// (Daemon::with_attach + run_daemon_with) so a remote running this
+/// subcommand binds the same two sockets a local TUI would.
+///
+/// Hook auto-install is skipped here on purpose: `remote add` already runs
+/// `hooks install` on the remote, and the on-disk hook scripts only need
+/// to be (re)installed when the binary version changes — not every time
+/// the daemon starts.
+#[tokio::main]
+async fn run_daemon_serve_cli() -> ExitCode {
+    init_logging_from_env();
+    let state = Arc::new(RwLock::new(AppState::default()));
+    let path = socket_path();
+    let attach_path = attach_socket_path();
+
+    let daemon = Daemon::with_attach(state, attach_path.clone());
+    if let Err(e) = run_daemon_with(&path, daemon).await {
+        eprintln!("Daemon error: {e}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
 
 #[tokio::main]

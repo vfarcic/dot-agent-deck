@@ -4,9 +4,10 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
-use crate::event::EventType;
+use crate::agent_pty::TabMembership;
+use crate::event::{AgentType, EventType};
 use crate::mode_manager::{ModeManager, ModeManagerError};
-use crate::pane::PaneController;
+use crate::pane::{AgentSpawnOptions, PaneController};
 use crate::project_config::{ModeConfig, OrchestrationConfig};
 use crate::state::SessionState;
 
@@ -28,6 +29,15 @@ pub enum TabError {
     IndexOutOfBounds(usize),
     #[error("Mode error: {0}")]
     ModeManager(#[from] ModeManagerError),
+    /// Hydration-time API mismatch (PRD #76 M2.12 fixup auditor #3):
+    /// the caller passed a `role_pane_ids` vec whose length did not
+    /// match `config.roles.len()`. Reported as an error rather than
+    /// panicking so a malformed daemon record + a future-caller bug
+    /// can't crash the TUI from a hydration-only API.
+    #[error(
+        "open_orchestration_tab_with_existing_role_panes: role_pane_ids length {got} does not match config.roles.len() {expected}"
+    )]
+    MismatchedRoleCount { expected: usize, got: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -46,6 +56,13 @@ pub enum OrchestrationRoleStatus {
     Waiting,
     Working,
     Done,
+    /// PRD #76 M2.12: the role's agent pane was not present in the daemon
+    /// on reconnect — either the agent died before the TUI reattached or
+    /// hydration couldn't locate it. The slot is preserved on the
+    /// orchestration tab as a dead placeholder rather than silently
+    /// respawned (design decision 4), so the user can decide whether to
+    /// re-run the orchestration.
+    Failed,
 }
 
 // ---------------------------------------------------------------------------
@@ -157,14 +174,23 @@ impl TabManager {
     }
 
     /// Open a new mode tab. Returns `(tab_index, managed_pane_ids)`.
+    ///
+    /// PRD #76 M2.15 fixup pass 2 G1 — `side_pane_dims` is the
+    /// initial PTY size for every persistent + reactive side pane the
+    /// mode creates. Callers compute this from
+    /// `terminal.get_frame().area()` via the `mode_side_pane_dims`
+    /// SSOT helper in `ui.rs`, so the daemon-side PTYs open at the
+    /// viewport-derived size instead of the legacy 24×80. Tests that
+    /// don't care about geometry pass `(24, 80)`.
     pub fn open_mode_tab(
         &mut self,
         config: &ModeConfig,
         cwd: &str,
         agent_pane_id: String,
+        side_pane_dims: (u16, u16),
     ) -> Result<(usize, Vec<String>), TabError> {
         let mut mode_manager = ModeManager::new(Arc::clone(&self.pane_controller));
-        mode_manager.activate_mode(config, Some(cwd))?;
+        mode_manager.activate_mode(config, Some(cwd), side_pane_dims)?;
         let pane_ids = mode_manager.managed_pane_ids();
 
         let id = self.next_id;
@@ -205,15 +231,45 @@ impl TabManager {
         config: &OrchestrationConfig,
         cwd: &str,
         orchestrator_prompt: Option<String>,
+        // PRD #76 M2.15: initial PTY dims for every role pane in this
+        // orchestration. The caller computes these from
+        // `terminal.get_frame().area()` + the dashboard-layout helper, so
+        // the daemon-side PTY opens at the viewport size instead of the
+        // legacy 24×80. Callers without a real viewport (tests) pass
+        // `(24, 80)`. The post-spawn `resize_dashboard_panes` sweep
+        // reconciles per-role focus state on the first frame.
+        spawn_dims: (u16, u16),
     ) -> Result<(usize, Vec<String>), TabError> {
         let mut role_pane_ids: Vec<String> = Vec::with_capacity(config.roles.len());
+        let (spawn_rows, spawn_cols) = spawn_dims;
 
-        for role in &config.roles {
-            let pane_id = match self
-                .pane_controller
-                .create_pane(Some(&role.command), Some(cwd))
-            {
-                Ok(id) => id,
+        // PRD #76 M2.12: tag each role pane with its orchestration tab
+        // membership so the daemon-side registry can echo it back via
+        // `list_agents` and the TUI rebuilds the orchestration tab on
+        // reconnect instead of stranding all role panes on the dashboard.
+        for (role_index, role) in config.roles.iter().enumerate() {
+            let opts = AgentSpawnOptions {
+                display_name: Some(role.name.as_str()),
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: config.name.clone(),
+                    role_index,
+                }),
+                rows: spawn_rows,
+                cols: spawn_cols,
+                // PRD #76 M2.13: tag each role's daemon-side registry
+                // entry with the agent type inferred from its command
+                // (e.g. `claude` → `ClaudeCode`). The daemon echoes this
+                // back via `list_agents` on reconnect so the hydration
+                // path can build the placeholder session with the right
+                // type instead of "No agent".
+                agent_type: AgentType::from_command(Some(&role.command)),
+            };
+            let (pane_id, _resolved) = match self.pane_controller.create_pane_with_options(
+                Some(&role.command),
+                Some(cwd),
+                opts,
+            ) {
+                Ok(p) => p,
                 Err(e) => {
                     // Clean up any panes already created.
                     for id in &role_pane_ids {
@@ -222,7 +278,6 @@ impl TabManager {
                     return Err(ModeManagerError::Pane(e).into());
                 }
             };
-            let _ = self.pane_controller.rename_pane(&pane_id, &role.name);
             role_pane_ids.push(pane_id);
         }
 
@@ -258,6 +313,125 @@ impl TabManager {
         Ok((index, role_pane_ids))
     }
 
+    /// PRD #76 M2.12: hydration entry point for mode tabs. Same flow as
+    /// [`open_mode_tab`], but documents the intent: the agent pane
+    /// already exists as `agent_pane_id` (a daemon pane reattached during
+    /// `hydrate_from_daemon`). Side panes still spawn fresh from
+    /// `config.panes` — they're not daemon-tracked (design decision 2),
+    /// so any in-flight side-pane state is intentionally lost on
+    /// reconnect.
+    ///
+    /// Returns `(tab_index, side_pane_ids)`, matching `open_mode_tab`.
+    /// Keeping the two as separate symbols (rather than overloading the
+    /// user-driven entry point) makes the hydration call sites in
+    /// `ui.rs` self-documenting and lets future divergence happen without
+    /// touching the user-driven path.
+    pub fn open_mode_tab_with_existing_agent_pane(
+        &mut self,
+        config: &ModeConfig,
+        cwd: &str,
+        agent_pane_id: String,
+        // PRD #76 M2.15 fixup pass 2 G1 — initial side-pane PTY dims;
+        // see `open_mode_tab` for the SSOT helper to compute this.
+        side_pane_dims: (u16, u16),
+    ) -> Result<(usize, Vec<String>), TabError> {
+        self.open_mode_tab(config, cwd, agent_pane_id, side_pane_dims)
+    }
+
+    /// PRD #76 M2.12: hydration entry point for orchestration tabs.
+    /// Unlike [`open_orchestration_tab`], does not spawn role panes —
+    /// `role_pane_ids[i]` is either `Some(existing_pane_id)` (the slot
+    /// is wired to that hydrated daemon pane and starts in the `Working`
+    /// state) or `None` (the slot is dead: the role's agent terminated
+    /// before reconnect, so it's preserved as a placeholder in
+    /// `OrchestrationRoleStatus::Failed`, never silently respawned —
+    /// design decision 4).
+    ///
+    /// `orchestrator_prompt` is always `None` because the prompt is
+    /// display polish only — the orchestrator role already received it
+    /// at start time and has the conversation in its scrollback (design
+    /// decision 3). The wire-format `role_pane_ids` length must match
+    /// `config.roles.len()`; out-of-bounds role_index entries should be
+    /// dropped to the dashboard by the caller (logged as a config-drift
+    /// bug per design decision 5).
+    ///
+    /// Returns `(tab_index, role_pane_ids_flat)` where the flat vec
+    /// substitutes empty strings for `None` slots so the existing
+    /// `Tab::Orchestration::role_pane_ids: Vec<String>` shape stays
+    /// stable. Callers can cross-reference `role_statuses` to tell live
+    /// from dead slots.
+    pub fn open_orchestration_tab_with_existing_role_panes(
+        &mut self,
+        config: &OrchestrationConfig,
+        cwd: &str,
+        role_pane_ids: Vec<Option<String>>,
+    ) -> Result<(usize, Vec<String>), TabError> {
+        // M2.12 fixup auditor #3: this is a hydration-oriented API, so
+        // mismatched lengths must surface as a `TabError` for the
+        // caller to handle (log + fallback to dashboard) rather than
+        // panic. The current caller constructs the vec correctly, but
+        // a malformed daemon record + a future-caller bug should not
+        // tear down the whole TUI.
+        if role_pane_ids.len() != config.roles.len() {
+            return Err(TabError::MismatchedRoleCount {
+                expected: config.roles.len(),
+                got: role_pane_ids.len(),
+            });
+        }
+
+        // Flatten Option<String> → String. Dead slots get the empty
+        // sentinel so the Vec<String> shape of `Tab::Orchestration`
+        // doesn't have to change. Downstream lookups (`role_pane_ids[i]`
+        // for delegation routing in `ui.rs`) will see "" and find no
+        // matching pane — same observable effect as the role being
+        // missing.
+        let role_statuses: Vec<OrchestrationRoleStatus> = role_pane_ids
+            .iter()
+            .map(|slot| match slot {
+                Some(_) => OrchestrationRoleStatus::Working,
+                None => OrchestrationRoleStatus::Failed,
+            })
+            .collect();
+        let role_pane_ids_flat: Vec<String> = role_pane_ids
+            .into_iter()
+            .map(|slot| slot.unwrap_or_default())
+            .collect();
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let start_role_index = config.roles.iter().position(|r| r.start).unwrap_or(0);
+
+        let name = if config.name.is_empty() {
+            std::path::Path::new(cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| cwd.to_string())
+        } else {
+            config.name.clone()
+        };
+
+        self.tabs.push(Tab::Orchestration {
+            id,
+            name,
+            role_pane_ids: role_pane_ids_flat.clone(),
+            role_statuses,
+            cwd: cwd.to_string(),
+            start_role_index,
+            // Design decision 3: don't replay orchestrator_prompt on
+            // reconnect. The orchestrator already received it at start
+            // time and the conversation is in its scrollback.
+            orchestrator_prompt: None,
+            config: config.clone(),
+            status: OrchestrationStatus::WaitingForOrchestrator,
+        });
+
+        let index = self.tabs.len() - 1;
+        self.active_index = index;
+
+        Ok((index, role_pane_ids_flat))
+    }
+
     /// Close a mode tab by index. Returns the pane IDs that were managed.
     pub fn close_tab(&mut self, index: usize) -> Result<Vec<String>, TabError> {
         if index == 0 {
@@ -284,10 +458,20 @@ impl TabManager {
                 ids
             }
             Tab::Orchestration { role_pane_ids, .. } => {
+                let mut closed_ids = Vec::with_capacity(role_pane_ids.len());
                 for id in &role_pane_ids {
+                    // M2.12: skip the empty-string dead-slot sentinel
+                    // inserted by `open_orchestration_tab_with_existing_role_panes`
+                    // for roles that didn't survive reconnect — there's
+                    // no pane to close, and leaking "" through a pane-id
+                    // API confuses downstream callers.
+                    if id.is_empty() {
+                        continue;
+                    }
                     let _ = self.pane_controller.close_pane(id);
+                    closed_ids.push(id.clone());
                 }
-                role_pane_ids
+                closed_ids
             }
             Tab::Dashboard => Vec::new(),
         };
@@ -316,7 +500,8 @@ impl TabManager {
                     ids.extend(mode_manager.managed_pane_ids());
                 }
                 Tab::Orchestration { role_pane_ids, .. } => {
-                    ids.extend(role_pane_ids.iter().cloned());
+                    // M2.12: skip the empty-string dead-slot sentinel.
+                    ids.extend(role_pane_ids.iter().filter(|id| !id.is_empty()).cloned());
                 }
                 Tab::Dashboard => {}
             }
@@ -335,8 +520,12 @@ impl TabManager {
                 {
                     return Some(i);
                 }
+                // M2.12: an empty pane_id would falsely match the
+                // dead-slot sentinel — skip the empty-string case
+                // explicitly so a caller asking about pane_id="" doesn't
+                // get a spurious orchestration tab match.
                 Tab::Orchestration { role_pane_ids, .. }
-                    if role_pane_ids.contains(&pane_id.to_string()) =>
+                    if !pane_id.is_empty() && role_pane_ids.contains(&pane_id.to_string()) =>
                 {
                     return Some(i);
                 }
@@ -449,7 +638,7 @@ pub(crate) fn extract_new_bash_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pane::{PaneDirection, PaneError, PaneInfo};
+    use crate::pane::{PaneDirection, PaneError, PaneInfo, RenameOutcome};
     use crate::project_config::{
         ModePersistentPane, ModeRule, OrchestrationConfig, OrchestrationRoleConfig,
     };
@@ -493,8 +682,8 @@ mod tests {
             Ok(())
         }
 
-        fn rename_pane(&self, _pane_id: &str, _name: &str) -> Result<(), PaneError> {
-            Ok(())
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
         }
 
         fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
@@ -570,7 +759,7 @@ mod tests {
     fn open_mode_tab_creates_tab() {
         let mut tm = make_manager();
         let (idx, ids) = tm
-            .open_mode_tab(&test_config("k8s-ops"), "/tmp", String::new())
+            .open_mode_tab(&test_config("k8s-ops"), "/tmp", String::new(), (24, 80))
             .unwrap();
         assert_eq!(idx, 1);
         assert!(!ids.is_empty());
@@ -585,10 +774,10 @@ mod tests {
     fn open_multiple_mode_tabs() {
         let mut tm = make_manager();
         let (_, ids1) = tm
-            .open_mode_tab(&test_config("k8s"), "/tmp/a", String::new())
+            .open_mode_tab(&test_config("k8s"), "/tmp/a", String::new(), (24, 80))
             .unwrap();
         let (_, ids2) = tm
-            .open_mode_tab(&test_config("rust-tdd"), "/tmp/b", String::new())
+            .open_mode_tab(&test_config("rust-tdd"), "/tmp/b", String::new(), (24, 80))
             .unwrap();
         assert_eq!(tm.tab_count(), 3);
         assert_eq!(tm.active_index(), 2);
@@ -605,7 +794,7 @@ mod tests {
         let mut tm = TabManager::new(mock.clone());
         let agent_id = mock.create_pane(None, None).unwrap();
         let (_, side_ids) = tm
-            .open_mode_tab(&test_config("k8s"), "/tmp", agent_id.clone())
+            .open_mode_tab(&test_config("k8s"), "/tmp", agent_id.clone(), (24, 80))
             .unwrap();
         assert_eq!(tm.tab_count(), 2);
 
@@ -628,9 +817,9 @@ mod tests {
         let mut tm = TabManager::new(mock.clone());
         let agent1 = mock.create_pane(None, None).unwrap();
         let agent2 = mock.create_pane(None, None).unwrap();
-        tm.open_mode_tab(&test_config("a"), "/tmp/a", agent1.clone())
+        tm.open_mode_tab(&test_config("a"), "/tmp/a", agent1.clone(), (24, 80))
             .unwrap();
-        tm.open_mode_tab(&test_config("b"), "/tmp/b", agent2.clone())
+        tm.open_mode_tab(&test_config("b"), "/tmp/b", agent2.clone(), (24, 80))
             .unwrap();
 
         // Simulate exit cleanup: close tabs in reverse order.
@@ -663,7 +852,7 @@ mod tests {
     fn tab_index_for_pane_lookup() {
         let mut tm = make_manager();
         let (_, ids) = tm
-            .open_mode_tab(&test_config("k8s"), "/tmp", String::new())
+            .open_mode_tab(&test_config("k8s"), "/tmp", String::new(), (24, 80))
             .unwrap();
         for id in &ids {
             assert_eq!(tm.tab_index_for_pane(id), Some(1));
@@ -676,7 +865,7 @@ mod tests {
         let mut tm = make_manager();
         assert!(tm.active_mode_name().is_none());
 
-        tm.open_mode_tab(&test_config("k8s"), "/tmp", String::new())
+        tm.open_mode_tab(&test_config("k8s"), "/tmp", String::new(), (24, 80))
             .unwrap();
         assert_eq!(tm.active_mode_name(), Some("k8s"));
 
@@ -687,11 +876,11 @@ mod tests {
     #[test]
     fn close_adjusts_active_index() {
         let mut tm = make_manager();
-        tm.open_mode_tab(&test_config("a"), "/tmp/a", String::new())
+        tm.open_mode_tab(&test_config("a"), "/tmp/a", String::new(), (24, 80))
             .unwrap();
-        tm.open_mode_tab(&test_config("b"), "/tmp/b", String::new())
+        tm.open_mode_tab(&test_config("b"), "/tmp/b", String::new(), (24, 80))
             .unwrap();
-        tm.open_mode_tab(&test_config("c"), "/tmp/c", String::new())
+        tm.open_mode_tab(&test_config("c"), "/tmp/c", String::new(), (24, 80))
             .unwrap();
         // tabs: [Dashboard, a, b, c], active = 3 (c)
 
@@ -708,7 +897,7 @@ mod tests {
     #[test]
     fn close_active_tab_falls_back_to_dashboard() {
         let mut tm = make_manager();
-        tm.open_mode_tab(&test_config("k8s"), "/tmp", String::new())
+        tm.open_mode_tab(&test_config("k8s"), "/tmp", String::new(), (24, 80))
             .unwrap();
         assert_eq!(tm.active_index(), 1);
 
@@ -721,10 +910,10 @@ mod tests {
     fn all_managed_pane_ids_across_tabs() {
         let mut tm = make_manager();
         let (_, ids1) = tm
-            .open_mode_tab(&test_config("a"), "/tmp/a", String::new())
+            .open_mode_tab(&test_config("a"), "/tmp/a", String::new(), (24, 80))
             .unwrap();
         let (_, ids2) = tm
-            .open_mode_tab(&test_config("b"), "/tmp/b", String::new())
+            .open_mode_tab(&test_config("b"), "/tmp/b", String::new(), (24, 80))
             .unwrap();
 
         let all = tm.all_managed_pane_ids();
@@ -884,7 +1073,7 @@ mod tests {
     fn open_orchestration_tab_creates_tab() {
         let mut tm = make_manager();
         let (idx, ids) = tm
-            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None)
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None, (24, 80))
             .unwrap();
         assert_eq!(idx, 1);
         assert_eq!(ids.len(), 2);
@@ -920,8 +1109,13 @@ mod tests {
     fn open_orchestration_tab_stores_prompt() {
         let mut tm = make_manager();
         let prompt = "You are the orchestrator.".to_string();
-        tm.open_orchestration_tab(&test_orchestration_config(), "/tmp", Some(prompt.clone()))
-            .unwrap();
+        tm.open_orchestration_tab(
+            &test_orchestration_config(),
+            "/tmp",
+            Some(prompt.clone()),
+            (24, 80),
+        )
+        .unwrap();
         if let Tab::Orchestration {
             orchestrator_prompt,
             ..
@@ -943,7 +1137,7 @@ mod tests {
             name: String::new(),
             ..test_orchestration_config()
         };
-        tm.open_orchestration_tab(&config, "/home/user/my-project", None)
+        tm.open_orchestration_tab(&config, "/home/user/my-project", None, (24, 80))
             .unwrap();
         assert_eq!(tm.tab_labels(), vec!["Dashboard", "my-project"]);
     }
@@ -953,7 +1147,7 @@ mod tests {
         let mock = Arc::new(MockPaneController::new());
         let mut tm = TabManager::new(mock.clone());
         let (_, ids) = tm
-            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None)
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None, (24, 80))
             .unwrap();
         assert_eq!(tm.tab_count(), 2);
 
@@ -966,10 +1160,57 @@ mod tests {
     }
 
     #[test]
+    fn close_orchestration_tab_filters_dead_slot_sentinels() {
+        // PRD #76 M2.12: the hydration path inserts "" sentinels for
+        // role slots whose agent did not survive reconnect. close_tab
+        // must not leak those non-pane values through its pane-id
+        // return, nor attempt to close them via the pane controller.
+        let mock = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(mock.clone());
+
+        // Three-role config so we can place a dead slot between live ones.
+        let role = |name: &str, start: bool| OrchestrationRoleConfig {
+            name: name.to_string(),
+            command: "claude".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        };
+        let config = OrchestrationConfig {
+            name: "with-dead-slot".to_string(),
+            roles: vec![
+                role("tester", true),
+                role("coder", false),
+                role("reviewer", false),
+            ],
+        };
+
+        let (_, flat_ids) = tm
+            .open_orchestration_tab_with_existing_role_panes(
+                &config,
+                "/tmp",
+                vec![Some("real-1".to_string()), None, Some("real-2".to_string())],
+            )
+            .unwrap();
+        // Sanity-check the hydration result: middle slot is the "" sentinel.
+        assert_eq!(flat_ids, vec!["real-1", "", "real-2"]);
+
+        let closed_ids = tm.close_tab(1).unwrap();
+
+        // Only real pane IDs come back — no "" sentinels leak.
+        assert_eq!(closed_ids, vec!["real-1".to_string(), "real-2".to_string()]);
+
+        // close_pane was invoked once per real ID, never for the sentinel.
+        let closed = mock.closed.lock().unwrap();
+        assert_eq!(*closed, vec!["real-1".to_string(), "real-2".to_string()]);
+    }
+
+    #[test]
     fn orchestration_pane_ids_in_all_managed() {
         let mut tm = make_manager();
         let (_, ids) = tm
-            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None)
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None, (24, 80))
             .unwrap();
         let all = tm.all_managed_pane_ids();
         for id in &ids {
@@ -981,7 +1222,7 @@ mod tests {
     fn tab_index_for_orchestration_pane() {
         let mut tm = make_manager();
         let (_, ids) = tm
-            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None)
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None, (24, 80))
             .unwrap();
         for id in &ids {
             assert_eq!(tm.tab_index_for_pane(id), Some(1));

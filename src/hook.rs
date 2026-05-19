@@ -8,6 +8,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::agent_pty::DOT_AGENT_DECK_PANE_ID;
 use crate::config::socket_path;
 use crate::event::{AgentEvent, AgentType, EventType};
 
@@ -143,7 +144,7 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
     let tool_detail = extract_tool_detail(tool_name.as_deref(), tool_input.as_ref());
 
     let user_prompt = prompt.map(|p| truncate(&p, 200));
-    let pane_id = std::env::var("DOT_AGENT_DECK_PANE_ID").ok();
+    let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
 
     let mut metadata = HashMap::new();
     if let Some(tool_use_id) = tool_use_id {
@@ -201,7 +202,7 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     let event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
     let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
     let user_prompt = input.prompt.map(|p| truncate(&p, 200));
-    let pane_id = std::env::var("DOT_AGENT_DECK_PANE_ID").ok();
+    let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
 
     let mut metadata = HashMap::new();
     if matches!(event_type, EventType::PermissionRequest) {
@@ -684,7 +685,7 @@ mod tests {
     #[test]
     fn pane_id_propagated_from_env_claude_code() {
         let _lock = ENV_MUTEX.lock().unwrap();
-        let key = "DOT_AGENT_DECK_PANE_ID";
+        let key = DOT_AGENT_DECK_PANE_ID;
         let prev = std::env::var(key).ok();
         unsafe { std::env::set_var(key, "pane-42") };
 
@@ -712,7 +713,7 @@ mod tests {
     #[test]
     fn pane_id_propagated_from_env_opencode() {
         let _lock = ENV_MUTEX.lock().unwrap();
-        let key = "DOT_AGENT_DECK_PANE_ID";
+        let key = DOT_AGENT_DECK_PANE_ID;
         let prev = std::env::var(key).ok();
         unsafe { std::env::set_var(key, "pane-99") };
 

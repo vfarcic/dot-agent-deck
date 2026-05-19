@@ -1,0 +1,1911 @@
+//! PRD #76 M2.2 — `dot-agent-deck remote add --type=ssh ...`.
+//!
+//! Registers an ssh-reachable host as a deck environment: verifies
+//! reachability, installs the matching `dot-agent-deck` binary on the remote
+//! (downloaded from GitHub releases), runs `dot-agent-deck hooks install` on
+//! the remote, and writes a registry entry to
+//! `~/.config/dot-agent-deck/remotes.toml`.
+//!
+//! All side-effecting ssh work goes through the `SshExecutor` trait so tests
+//! can drive the flow with a `FakeSshExecutor` that records commands and
+//! returns canned outputs.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
+
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// GitHub releases base URL used to download `dot-agent-deck` binaries onto
+/// remote hosts. Hard-coded because Cargo doesn't export
+/// `[package.repository]` to the build (and our `Cargo.toml` doesn't set it).
+/// Mirrors the URL in `version.rs`.
+pub const RELEASE_BASE: &str = "https://github.com/vfarcic/dot-agent-deck/releases/download";
+
+/// Default ssh port.
+pub const DEFAULT_SSH_PORT: u16 = 22;
+
+// ---------------------------------------------------------------------------
+// SshExecutor abstraction — the seam that lets us test the add flow without
+// shelling out to a real `ssh` binary.
+// ---------------------------------------------------------------------------
+
+/// Where to ssh to, parsed from the CLI args.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTarget {
+    pub host: String,
+    pub user: Option<String>,
+    pub port: u16,
+    pub key: Option<PathBuf>,
+}
+
+impl SshTarget {
+    /// Parse `[user@]host` and combine with `--port` / `--key` flags.
+    pub fn parse(target: &str, port: u16, key: Option<PathBuf>) -> Self {
+        let (user, host) = match target.split_once('@') {
+            Some((u, h)) => (Some(u.to_string()), h.to_string()),
+            None => (None, target.to_string()),
+        };
+        Self {
+            host,
+            user,
+            port,
+            key,
+        }
+    }
+
+    /// `user@host` if a user was given, else just `host`. The form ssh wants
+    /// as its destination argument.
+    pub fn user_host(&self) -> String {
+        match &self.user {
+            Some(u) => format!("{u}@{}", self.host),
+            None => self.host.clone(),
+        }
+    }
+}
+
+/// Captured output of one ssh invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshOutput {
+    pub status: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Failure modes the executor distinguishes. Mapped from ssh's stderr/exit
+/// status by `SystemSshExecutor`; the production matcher is conservative —
+/// anything we can't classify ends up as `Other` so the caller can surface
+/// stderr verbatim.
+#[derive(Debug, Error)]
+pub enum SshError {
+    #[error(
+        "Could not reach {host}:{port}. Check the host is up and ssh is exposed on this port.\nDetails: {detail}"
+    )]
+    ConnectionRefused {
+        host: String,
+        port: u16,
+        detail: String,
+    },
+    #[error(
+        "ssh authentication to {target} failed. Check your key (`--key`) or `~/.ssh/config`.\nDetails: {detail}"
+    )]
+    AuthFailed { target: String, detail: String },
+    #[error("ssh I/O error contacting {target}: {source}")]
+    Io {
+        target: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "ssh failed: host key not yet trusted for {target}. If this is a first-time connection, run `ssh {target}` once to accept the host key, then retry `remote add`. If the key has changed unexpectedly, investigate before connecting."
+    )]
+    HostKeyVerificationFailed { target: String },
+    #[error("ssh to {target} failed: {detail}")]
+    Other { target: String, detail: String },
+}
+
+/// Map ssh's stderr output (when the process exited with 255) onto a typed
+/// `SshError` variant. Extracted from `SystemSshExecutor::run` so it can be
+/// unit-tested without spawning a process.
+fn classify_ssh_error(target: &SshTarget, stderr: &str) -> SshError {
+    let lower = stderr.to_ascii_lowercase();
+    let detail = stderr.trim().to_string();
+    if lower.contains("connection refused")
+        || lower.contains("network is unreachable")
+        || lower.contains("no route to host")
+        || lower.contains("could not resolve hostname")
+        || lower.contains("connection timed out")
+    {
+        return SshError::ConnectionRefused {
+            host: target.host.clone(),
+            port: target.port,
+            detail,
+        };
+    }
+    // Host-key issues are checked BEFORE the generic auth match because under
+    // BatchMode=yes the canonical message is "Host key verification failed."
+    // and the user's recourse (run `ssh <target>` once) differs from a key
+    // mismatch. We treat both first-trust and key-changed scenarios as the
+    // same variant — the Display message tells the user to investigate.
+    if lower.contains("host key verification failed")
+        || lower.contains("remote host identification has changed")
+        || lower.contains("are you sure you want to continue connecting")
+    {
+        return SshError::HostKeyVerificationFailed {
+            target: target.user_host(),
+        };
+    }
+    if lower.contains("permission denied") || lower.contains("publickey") {
+        return SshError::AuthFailed {
+            target: target.user_host(),
+            detail,
+        };
+    }
+    SshError::Other {
+        target: target.user_host(),
+        detail,
+    }
+}
+
+/// Abstraction over running shell commands on a remote ssh host. The
+/// production impl shells out to the `ssh` binary; tests use a fake.
+pub trait SshExecutor {
+    fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError>;
+
+    /// Variant of [`run`](Self::run) that caps the captured output at
+    /// `max_capture_bytes` per stream. The default implementation calls `run`
+    /// and truncates the resulting stdout `String` afterward — adequate for
+    /// tests and any executor whose underlying transport already bounds
+    /// memory. The production [`SystemSshExecutor`] overrides this to bound
+    /// the in-memory capture for BOTH stdout and stderr at the pipe-drain
+    /// layer (each pipe is a separate DoS vector), so a hostile remote that
+    /// streams unbounded output on either stream can't push the laptop into
+    /// memory pressure before the cap is observed.
+    ///
+    /// The default impl only caps stdout because the test-grade fallback
+    /// doesn't have a pipe-drain layer to extend; production callers that
+    /// care about the symmetric cap go through `SystemSshExecutor`.
+    fn run_capped(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        max_capture_bytes: usize,
+    ) -> Result<SshOutput, SshError> {
+        let mut output = self.run(target, command)?;
+        if output.stdout.len() > max_capture_bytes {
+            // Truncate on a UTF-8 char boundary at or before the cap so the
+            // returned `String` stays a valid `String` (callers JSON-parse
+            // it). `floor_char_boundary` is unstable, so do the search by
+            // hand: walk backward at most 3 bytes to land on a char boundary
+            // (UTF-8 chars are at most 4 bytes, so the boundary is within 3
+            // bytes of any cap position).
+            let mut cap = max_capture_bytes;
+            while cap > 0 && !output.stdout.is_char_boundary(cap) {
+                cap -= 1;
+            }
+            output.stdout.truncate(cap);
+        }
+        Ok(output)
+    }
+}
+
+/// Production implementation: shells out to the `ssh` binary on the user's
+/// machine. No new dependency on a Rust ssh client — we deliberately reuse
+/// the user's existing ssh config (`~/.ssh/config`, agent, known_hosts).
+///
+/// `wallclock_timeout` is an optional fail-fast cap used by short-lived probe
+/// commands (e.g. M2.9's `connect` version probe). It applies on TWO layers:
+///
+/// 1. The ssh `-o ConnectTimeout=N -o ServerAliveInterval=N -o
+///    ServerAliveCountMax=1` triple, which catches transport-level stalls
+///    (DNS, TCP, ssh handshake, dead-TCP keepalives).
+/// 2. A laptop-side wallclock kill enforced by `run_with_wallclock_kill`
+///    inside `run()`, which catches the reachable-but-stalled-remote-command
+///    case the ssh options miss: server completes the handshake and answers
+///    keepalives, but the remote command hangs before producing output.
+///
+/// `None` keeps the original behavior on both layers — relevant for
+/// long-running invocations like `remote add`'s install pipeline where a 10s
+/// ceiling would be too tight.
+pub struct SystemSshExecutor {
+    wallclock_timeout: Option<u64>,
+}
+
+impl SystemSshExecutor {
+    pub fn new() -> Self {
+        Self {
+            wallclock_timeout: None,
+        }
+    }
+
+    /// Construct an executor with a fail-fast wallclock cap (in seconds) on
+    /// each ssh invocation. Used by the M2.9 connect-probe path; without it,
+    /// `executor.run(...)` could hang indefinitely on a reachable-but-stalled
+    /// remote shell because `cmd.output()` provides no timeout of its own.
+    pub fn with_wallclock_timeout(secs: u64) -> Self {
+        Self {
+            wallclock_timeout: Some(secs),
+        }
+    }
+
+    /// Build the `ssh` command without spawning it. Exposed for tests so we
+    /// can verify argument quoting without forking a subprocess.
+    pub fn build_command(&self, target: &SshTarget, remote_command: &str) -> Command {
+        let mut cmd = Command::new("ssh");
+        // BatchMode=yes makes ssh fail fast on missing keys/known_hosts
+        // instead of hanging on a TTY prompt. Users who haven't trusted the
+        // host yet will see an actionable error rather than the deck CLI
+        // wedging.
+        cmd.arg("-o").arg("BatchMode=yes");
+        if let Some(secs) = self.wallclock_timeout {
+            // ConnectTimeout caps the pre-handshake phase (DNS, TCP, ssh
+            // handshake). ServerAliveInterval + ServerAliveCountMax=1 forces
+            // a disconnect after `secs` of post-handshake silence, so a
+            // remote shell that accepts the connection but never produces
+            // output can't pin the probe forever. Together they bound the
+            // wallclock at roughly 2*secs in the worst case.
+            cmd.arg("-o").arg(format!("ConnectTimeout={secs}"));
+            cmd.arg("-o").arg(format!("ServerAliveInterval={secs}"));
+            cmd.arg("-o").arg("ServerAliveCountMax=1");
+        }
+        cmd.arg("-p").arg(target.port.to_string());
+        if let Some(key) = &target.key {
+            cmd.arg("-i").arg(key);
+        }
+        cmd.arg("--");
+        cmd.arg(target.user_host());
+        // Pass the remote command as a single argv entry. ssh joins remaining
+        // args with spaces and runs them through the remote shell, so passing
+        // one arg keeps quoting predictable. NOTE: `remote_command` is a
+        // string we (the deck) construct entirely from internal templates and
+        // the resolved version/platform — no user input is interpolated into
+        // shell here. The parsed user@host arg also goes through `arg(...)`,
+        // not through a shell, so there's no local shell-injection surface.
+        cmd.arg(remote_command);
+        cmd
+    }
+}
+
+impl Default for SystemSshExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SshExecutor for SystemSshExecutor {
+    fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+        let mut cmd = self.build_command(target, command);
+        let output = match self.wallclock_timeout {
+            Some(secs) => run_with_wallclock_kill(&mut cmd, target, secs, None)?,
+            None => cmd.output().map_err(|source| SshError::Io {
+                target: target.user_host(),
+                source,
+            })?,
+        };
+        let status = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+        // ssh uses exit 255 to signal its own (i.e. transport/auth) errors;
+        // anything else is the remote command's exit code. Only translate to
+        // typed transport errors on 255 — otherwise return the SshOutput so
+        // callers can decide based on the remote command's status.
+        if status == 255 {
+            return Err(classify_ssh_error(target, &stderr));
+        }
+
+        Ok(SshOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Override the default trait impl so the byte cap is enforced at the
+    /// pipe-drain layer, not after the full payload lands in memory. A
+    /// hostile remote binary that streams unbounded output on *either*
+    /// stdout or stderr would otherwise push the laptop into memory pressure
+    /// long before the trait default's post-hoc `truncate` ran. The
+    /// wallclock-kill path threads `max_capture_bytes` through to the
+    /// per-stream drainer and applies it symmetrically to stdout and stderr
+    /// (each pipe is a separate attack vector); the no-timeout path is only
+    /// used by long-running install commands (not probes), so it falls back
+    /// to the default capture-then-truncate behavior.
+    fn run_capped(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        max_capture_bytes: usize,
+    ) -> Result<SshOutput, SshError> {
+        let Some(secs) = self.wallclock_timeout else {
+            // No wallclock: use the post-hoc truncation from the default impl.
+            // This branch is only reached by callers that have opted out of
+            // the timeout (e.g. `remote add`'s install pipeline), which today
+            // do not need a byte cap.
+            let mut output = SshExecutor::run(self, target, command)?;
+            if output.stdout.len() > max_capture_bytes {
+                let mut cap = max_capture_bytes;
+                while cap > 0 && !output.stdout.is_char_boundary(cap) {
+                    cap -= 1;
+                }
+                output.stdout.truncate(cap);
+            }
+            return Ok(output);
+        };
+
+        let mut cmd = self.build_command(target, command);
+        let output = run_with_wallclock_kill(&mut cmd, target, secs, Some(max_capture_bytes))?;
+        let status = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+        if status == 255 {
+            return Err(classify_ssh_error(target, &stderr));
+        }
+
+        Ok(SshOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+/// Spawn `cmd` and enforce a laptop-side wallclock kill at `secs` seconds.
+///
+/// `cmd.output()` has no timeout: a remote ssh server that completes the
+/// handshake but whose remote command hangs before producing output keeps
+/// answering `ServerAliveInterval` keepalives, so the ssh client sees a
+/// "healthy" transport and `cmd.output()` waits forever. The `-o
+/// ConnectTimeout=` / `ServerAliveInterval=` triple in `build_command` only
+/// catches transport-level stalls; *this* helper catches the
+/// reachable-but-stalled-remote-command case by enforcing a real local
+/// deadline around the spawned child.
+///
+/// Behavior:
+/// - Nulls stdin so the child can't read from the user's terminal — mirrors
+///   `Command::output()`'s implicit stdin nulling. Important because the
+///   probe is meant to be non-interactive (`BatchMode=yes`); without this,
+///   a tampered remote binary or wrapping shell could observe local input
+///   for up to the deadline.
+/// - Pipes stdout/stderr and drains them concurrently in two helper threads
+///   while the main loop polls `child.try_wait()`. This is what
+///   `Command::output()` does internally, and it's required for any child
+///   producing more output than a single pipe buffer (~64 KiB on Linux):
+///   without concurrent draining, the child blocks in `write(2)` before it
+///   can exit, `try_wait` keeps returning `None`, and the wallclock fires
+///   even though the child wasn't actually stalled.
+/// - Polls `child.try_wait()` every 50ms until the deadline. Polling cadence
+///   is a wallclock-vs-CPU tradeoff; 50ms keeps the worst-case overshoot
+///   under a tick while costing ~20 syscalls/sec.
+/// - On deadline: SIGKILL via `child.kill()`, reap with `child.wait()`, and
+///   return [`SshError::Other`] so the connect-layer mapper folds it into
+///   `HostUnreachable` (the right user-visible classification — the user's
+///   recourse is the same as transport-unreachable).
+/// - Computes the deadline with `Instant::checked_add` so an absurd `secs`
+///   (e.g. `u64::MAX`) can never panic between `spawn` and the polling
+///   loop and leak the child — the caller in `connect.rs` already clamps
+///   to a sane upper bound, this is belt-and-suspenders.
+fn run_with_wallclock_kill(
+    cmd: &mut Command,
+    target: &SshTarget,
+    secs: u64,
+    max_capture_bytes: Option<usize>,
+) -> Result<std::process::Output, SshError> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|source| SshError::Io {
+        target: target.user_host(),
+        source,
+    })?;
+
+    // Drain stdout/stderr in dedicated threads so children that produce more
+    // than a pipe buffer don't deadlock waiting for us to read. The threads
+    // own the pipe handles via `take()`; on every exit path below we join
+    // them to recover the captured bytes (and to avoid leaking handles).
+    //
+    // When `max_capture_bytes` is set the same cap is applied to *each*
+    // stream independently — stdout and stderr are separate attack vectors,
+    // and a hostile remote that floods stderr can drive laptop memory
+    // growth just as easily as one that floods stdout. Each drainer stops
+    // reading altogether once its cap is reached: if the child keeps
+    // writing it will fill the kernel pipe buffer and block in `write(2)`,
+    // and the wallclock kill below reaps the still-running process.
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|s| std::thread::spawn(move || drain_pipe(s, max_capture_bytes)));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|s| std::thread::spawn(move || drain_pipe(s, max_capture_bytes)));
+
+    // `checked_add` keeps an absurd `secs` from panicking after spawn (the
+    // unwinding `Child` drop wouldn't reap the live ssh process). On
+    // overflow we fall back to a far-future deadline; the clamp in
+    // `connect::probe_timeout_secs` already prevents this in practice.
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(secs))
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+    let poll_interval = Duration::from_millis(50);
+
+    let join_pipes = |stdout_handle: Option<std::thread::JoinHandle<Vec<u8>>>,
+                      stderr_handle: Option<std::thread::JoinHandle<Vec<u8>>>|
+     -> (Vec<u8>, Vec<u8>) {
+        let stdout = stdout_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        (stdout, stderr)
+    };
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Child already exited; close the pipes by joining the
+                // drain threads (they will see EOF once the kernel reaps
+                // the writers) and assemble an Output mirroring what
+                // `Command::output()` would have returned.
+                let (stdout, stderr) = join_pipes(stdout_handle, stderr_handle);
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Best-effort cleanup: ignore secondary errors. SIGKILL
+                    // is unblockable so the child is guaranteed to be
+                    // reaped, and `wait` collects the zombie. Joining the
+                    // drain threads after kill ensures their pipe handles
+                    // don't outlive this function.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = join_pipes(stdout_handle, stderr_handle);
+                    return Err(SshError::Other {
+                        target: target.user_host(),
+                        detail: format!(
+                            "probe exceeded {secs}s wallclock deadline (laptop-side kill after ssh did not return)"
+                        ),
+                    });
+                }
+                std::thread::sleep(poll_interval);
+            }
+            Err(source) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_pipes(stdout_handle, stderr_handle);
+                return Err(SshError::Io {
+                    target: target.user_host(),
+                    source,
+                });
+            }
+        }
+    }
+}
+
+/// Drain a child-process pipe into a `Vec<u8>`, optionally capping how much
+/// is retained. When `cap` is `Some(n)`, at most `n` bytes are buffered and
+/// the helper returns immediately once that bound is hit — no further `read`
+/// syscalls are issued. If the child keeps writing it will fill the kernel
+/// pipe buffer and then block in `write(2)`; the surrounding wallclock kill
+/// is the documented fallback that reaps such children. Errors are
+/// swallowed: a half-read pipe still returns the bytes that did land,
+/// matching the behavior `Command::output()` exhibits when the kernel closes
+/// the writer.
+fn drain_pipe<R: std::io::Read>(mut reader: R, cap: Option<usize>) -> Vec<u8> {
+    match cap {
+        None => {
+            let mut buf = Vec::new();
+            let _ = reader.read_to_end(&mut buf);
+            buf
+        }
+        Some(cap) => {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                if buf.len() >= cap {
+                    break;
+                }
+                let needed = cap - buf.len();
+                let take = chunk.len().min(needed);
+                match reader.read(&mut chunk[..take]) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            buf
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry: ~/.config/dot-agent-deck/remotes.toml
+// ---------------------------------------------------------------------------
+
+/// One row in `remotes.toml`. `host` carries the full `[user@]host` string
+/// the user passed on the CLI — we keep it intact so `connect` (M2.4) can
+/// re-parse it the same way the user typed it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteEntry {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub host: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    pub version: String,
+    pub added_at: String,
+    /// Timestamp of the most recent `remote upgrade`. `None` until the entry
+    /// has been upgraded at least once. `added_at` stays at the original
+    /// registration timestamp so users can see both moments separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgraded_at: Option<String>,
+    /// Timestamp of the most recent successful `connect`. `None` until the
+    /// entry has been connected to at least once. Updated by `connect`'s
+    /// post-spawn bookkeeping when the remote ssh session exits cleanly
+    /// (status 0); a failed spawn or a non-zero remote exit leaves the field
+    /// untouched so the registry only records sessions that actually ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_connected: Option<String>,
+}
+
+impl RemoteEntry {
+    /// Reconstruct an [`SshTarget`] from this entry's stored host/port/key. The
+    /// `host` field carries the original `[user@]host` string the user typed
+    /// at `remote add` time; we re-parse it the same way `add` does.
+    pub fn ssh_target(&self) -> SshTarget {
+        SshTarget::parse(&self.host, self.port, self.key.as_ref().map(PathBuf::from))
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemotesFile {
+    #[serde(default)]
+    pub remotes: Vec<RemoteEntry>,
+}
+
+#[derive(Debug, Error)]
+pub enum RemoteConfigError {
+    #[error("Failed to read remotes file at {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Failed to parse remotes file at {path}: {source}")]
+    Parse {
+        path: String,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("Failed to serialize remotes file: {0}")]
+    Serialize(#[from] toml::ser::Error),
+}
+
+impl RemotesFile {
+    /// Load the registry from `path`. Missing file → empty registry.
+    pub fn load(path: &Path) -> Result<Self, RemoteConfigError> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => toml::from_str(&contents).map_err(|source| RemoteConfigError::Parse {
+                path: path.display().to_string(),
+                source,
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(source) => Err(RemoteConfigError::Io {
+                path: path.display().to_string(),
+                source,
+            }),
+        }
+    }
+
+    /// Atomically replace the file at `path` with the serialized form of
+    /// `self`. Creates the parent directory if missing. Writes via a sibling
+    /// temp file with mode 0o600, then `rename(2)`s it into place — so a
+    /// partial write or a crash mid-save can never leave a half-written
+    /// `remotes.toml` for the next run to choke on, and the final file is
+    /// owner-only (0o600) regardless of the user's umask.
+    pub fn save(&self, path: &Path) -> Result<(), RemoteConfigError> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let parent = path.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|source| RemoteConfigError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+
+        let contents = toml::to_string_pretty(self)?;
+
+        // Sibling temp file: same directory as the final path so `rename` is
+        // atomic on POSIX filesystems. Pid suffix avoids collisions when
+        // multiple deck processes save concurrently to different registries.
+        let file_name = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "remotes.toml".to_string());
+        let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
+
+        let open_result = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path);
+        let mut tmp_file = open_result.map_err(|source| RemoteConfigError::Io {
+            path: tmp_path.display().to_string(),
+            source,
+        })?;
+
+        let write_result = tmp_file.write_all(contents.as_bytes());
+        if let Err(source) = write_result {
+            // Best-effort cleanup; ignore secondary errors.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(RemoteConfigError::Io {
+                path: tmp_path.display().to_string(),
+                source,
+            });
+        }
+        // Defense in depth: if a stale temp file from a crashed previous save
+        // existed, OpenOptions::mode() would NOT have re-applied the bits, so
+        // re-set them explicitly before the rename.
+        let perm_result = tmp_file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        if let Err(source) = perm_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(RemoteConfigError::Io {
+                path: tmp_path.display().to_string(),
+                source,
+            });
+        }
+        drop(tmp_file);
+
+        std::fs::rename(&tmp_path, path).map_err(|source| {
+            let _ = std::fs::remove_file(&tmp_path);
+            RemoteConfigError::Io {
+                path: path.display().to_string(),
+                source,
+            }
+        })
+    }
+}
+
+/// Default location for the registry: `$DOT_AGENT_DECK_REMOTES` if set,
+/// else `~/.config/dot-agent-deck/remotes.toml`. The env var override is
+/// new; tests use it (or pass an explicit path to `add`).
+pub fn default_remotes_path() -> PathBuf {
+    if let Ok(p) = std::env::var("DOT_AGENT_DECK_REMOTES") {
+        return PathBuf::from(p);
+    }
+    crate::config::dirs_home().join(".config/dot-agent-deck/remotes.toml")
+}
+
+// ---------------------------------------------------------------------------
+// `remote add` flow
+// ---------------------------------------------------------------------------
+
+/// CLI options accepted by `remote add`. `release_base` is overridable so the
+/// happy-path test can inject a stub URL without changing global state.
+#[derive(Debug, Clone)]
+pub struct AddOptions {
+    pub name: String,
+    pub remote_type: String,
+    pub target: String,
+    pub port: u16,
+    pub key: Option<PathBuf>,
+    pub version: String,
+    pub no_install: bool,
+    pub release_base: String,
+}
+
+#[derive(Debug, Error)]
+pub enum RemoteAddError {
+    #[error(
+        "A remote named '{name}' already exists. Use `dot-agent-deck remote remove {name}` first or pick a different name."
+    )]
+    DuplicateName { name: String },
+    #[error("Remote type 'kubernetes' is not yet implemented; planned in PRD #81.")]
+    KubernetesNotYetImplemented,
+    #[error("Unsupported remote type '{kind}'. Supported: ssh.")]
+    UnsupportedType { kind: String },
+    #[error("Invalid --version '{input}': must look like '0.24.5' or 'v0.24.5'.")]
+    InvalidVersion { input: String },
+    #[error(transparent)]
+    Ssh(#[from] SshError),
+    #[error("Remote arch is `{arch}`; supported: linux-{{amd64,arm64}}, darwin-{{amd64,arm64}}.")]
+    UnsupportedArch { arch: String },
+    #[error("Failed to detect remote arch (`uname -s -m` exited {status}): {stderr}")]
+    UnameFailed { status: i32, stderr: String },
+    #[error(
+        "Failed to download dot-agent-deck v{version} for {platform} from {url}.\nCheck the remote has internet egress and the version exists.\nDetails: {detail}"
+    )]
+    DownloadFailed {
+        version: String,
+        platform: String,
+        url: String,
+        detail: String,
+    },
+    #[error("Installed binary reports `{actual}` but expected `{expected}`.")]
+    VersionMismatch { actual: String, expected: String },
+    #[error("`dot-agent-deck hooks install` on remote failed (exit {status}): {stderr}")]
+    HooksInstallFailed { status: i32, stderr: String },
+    #[error(transparent)]
+    Registry(#[from] RemoteConfigError),
+}
+
+/// SemVer-ish pattern accepted by `--version`: optional `v` prefix, three
+/// numeric components, optional pre-release suffix. Rejects anything that
+/// could carry shell metacharacters into the remote install command.
+const VERSION_PATTERN: &str = r"^v?\d+(\.\d+){2}(-[A-Za-z0-9.\-]+)?$";
+
+fn version_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(VERSION_PATTERN).expect("static version regex compiles"))
+}
+
+/// Validate a user-supplied version string and return its canonical
+/// unprefixed form. Anything that doesn't look like a SemVer version is
+/// rejected — this is the primary defense against shell injection via
+/// `--version` (e.g. `0.24.5; rm -rf ~`).
+///
+/// Convention: internally we always carry the *unprefixed* form (`0.24.5`).
+/// The URL builder and any other consumer that needs the `v`-prefixed form
+/// (GitHub release tag) prepends `v` themselves. The user may type either
+/// `0.24.5` or `v0.24.5`; both normalize to `0.24.5`.
+pub fn validate_version_string(version: &str) -> Result<String, RemoteAddError> {
+    if version_regex().is_match(version) {
+        Ok(version.strip_prefix('v').unwrap_or(version).to_string())
+    } else {
+        Err(RemoteAddError::InvalidVersion {
+            input: version.to_string(),
+        })
+    }
+}
+
+/// Build the install URL and the remote shell command. Validates `version`
+/// internally as a defense-in-depth so that even an internal misuse (a code
+/// path that bypassed the entry-point check in `add()`) cannot slip a shell
+/// metacharacter into the remote command. Accepts both `0.24.5` and `v0.24.5`
+/// — see `validate_version_string` for the normalization convention.
+fn build_install_command(
+    release_base: &str,
+    version: &str,
+    platform: &str,
+) -> Result<(String, String), RemoteAddError> {
+    let version = validate_version_string(version)?;
+    let url = format!("{release_base}/v{version}/dot-agent-deck-{platform}");
+    // Atomic install: download to a PID-suffixed sibling temp file, chmod the
+    // temp, then `mv` it into place. Same-filesystem `mv` is POSIX-atomic, so
+    // an interrupted curl leaves the existing binary untouched instead of
+    // overwriting it with a truncated download. A per-process temp leak on a
+    // failed install is acceptable — a wildcard sweep would race with a
+    // concurrent upgrade's in-flight download.
+    let install_cmd = format!(
+        "mkdir -p ~/.local/bin \
+         && tmp=~/.local/bin/.dot-agent-deck.$$ \
+         && curl -fsSL {url} -o \"$tmp\" \
+         && chmod 0755 \"$tmp\" \
+         && mv \"$tmp\" ~/.local/bin/dot-agent-deck"
+    );
+    Ok((url, install_cmd))
+}
+
+/// Convert a `uname -s -m` line to one of our four supported platform tags.
+fn detect_platform(uname_stdout: &str) -> Option<&'static str> {
+    let trimmed = uname_stdout.trim();
+    let mut parts = trimmed.split_whitespace();
+    let os = parts.next()?;
+    let arch = parts.next()?;
+    match (os, arch) {
+        ("Linux", "x86_64") => Some("linux-amd64"),
+        ("Linux", "aarch64") | ("Linux", "arm64") => Some("linux-arm64"),
+        ("Darwin", "x86_64") => Some("darwin-amd64"),
+        ("Darwin", "arm64") => Some("darwin-arm64"),
+        _ => None,
+    }
+}
+
+/// Pull the version number out of `dot-agent-deck --version` output.
+/// Expected shape: `dot-agent-deck X.Y.Z` (possibly with trailing whitespace).
+fn parse_version_output(stdout: &str) -> Option<String> {
+    stdout.split_whitespace().nth(1).map(|s| s.to_string())
+}
+
+/// Install (or version-check, with `no_install`) the remote binary and assert
+/// it reports the expected version. Shared between `add` and `upgrade` — the
+/// only piece that's identical between the two flows. Caller is responsible
+/// for arch detect (passes `platform`), pre-validating `version` (caller has
+/// already run `validate_version_string`), and any post-install hooks work.
+fn install_and_verify(
+    executor: &dyn SshExecutor,
+    target: &SshTarget,
+    platform: &str,
+    version: &str,
+    release_base: &str,
+    no_install: bool,
+) -> Result<(), RemoteAddError> {
+    if no_install {
+        // Use the absolute path the install flow targets (line 548 below).
+        // A non-interactive ssh shell typically doesn't have `~/.local/bin`
+        // on PATH, so a bare `dot-agent-deck` lookup fails for binaries
+        // placed at the standard install location.
+        let v = executor.run(target, "~/.local/bin/dot-agent-deck --version")?;
+        if v.status != 0 {
+            return Err(RemoteAddError::VersionMismatch {
+                actual: format!("(exit {}) {}", v.status, v.stderr.trim()),
+                expected: version.to_string(),
+            });
+        }
+        let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
+        if actual != version {
+            return Err(RemoteAddError::VersionMismatch {
+                actual,
+                expected: version.to_string(),
+            });
+        }
+        return Ok(());
+    }
+
+    // Single shell command: any step's failure aborts the rest, and we get
+    // one stderr+exit pair instead of three round-trips' worth to
+    // disentangle. `build_install_command` re-validates the version (defense
+    // in depth) so even an internal misuse can't shell-inject.
+    let (url, install_cmd) = build_install_command(release_base, version, platform)?;
+    let install = executor.run(target, &install_cmd)?;
+    if install.status != 0 {
+        return Err(RemoteAddError::DownloadFailed {
+            version: version.to_string(),
+            platform: platform.to_string(),
+            url,
+            detail: format!("exit {}: {}", install.status, install.stderr.trim()),
+        });
+    }
+    let v = executor.run(target, "~/.local/bin/dot-agent-deck --version")?;
+    if v.status != 0 {
+        return Err(RemoteAddError::VersionMismatch {
+            actual: format!("(exit {}) {}", v.status, v.stderr.trim()),
+            expected: version.to_string(),
+        });
+    }
+    let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
+    if actual != version {
+        return Err(RemoteAddError::VersionMismatch {
+            actual,
+            expected: version.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Run the `add` flow. Returns the registry entry that was written, so
+/// callers (and tests) can assert on it.
+pub fn add(
+    opts: &AddOptions,
+    executor: &dyn SshExecutor,
+    remotes_path: &Path,
+) -> Result<RemoteEntry, RemoteAddError> {
+    // 1. Type validation.
+    match opts.remote_type.as_str() {
+        "ssh" => {}
+        "kubernetes" => return Err(RemoteAddError::KubernetesNotYetImplemented),
+        other => {
+            return Err(RemoteAddError::UnsupportedType {
+                kind: other.to_string(),
+            });
+        }
+    }
+
+    // 2. Version validation — runs BEFORE any ssh call or URL construction so
+    //    a malicious `--version` (e.g. `0.24.5; rm -rf ~`) can't reach the
+    //    remote shell. Asserted by the `version_string_with_shell_metacharacters_rejected`
+    //    test, which checks zero ssh calls were attempted. We use the
+    //    normalized (unprefixed) form everywhere downstream so that whether
+    //    the user typed `0.24.5` or `v0.24.5`, the URL gets exactly one `v`
+    //    and the post-install version comparison matches the binary's
+    //    unprefixed `--version` output.
+    let version = validate_version_string(&opts.version)?;
+
+    // 3. Uniqueness check — done *before* any ssh call so a duplicate name
+    //    short-circuits without bothering the remote (and lets the
+    //    `duplicate_name_rejected` test assert the fake recorded zero
+    //    commands).
+    let mut registry = RemotesFile::load(remotes_path)?;
+    if registry.remotes.iter().any(|r| r.name == opts.name) {
+        return Err(RemoteAddError::DuplicateName {
+            name: opts.name.clone(),
+        });
+    }
+
+    let target = SshTarget::parse(&opts.target, opts.port, opts.key.clone());
+
+    // 3. Pre-flight reachability + arch detection.
+    let uname = executor.run(&target, "uname -s -m")?;
+    if uname.status != 0 {
+        return Err(RemoteAddError::UnameFailed {
+            status: uname.status,
+            stderr: uname.stderr,
+        });
+    }
+    let platform =
+        detect_platform(&uname.stdout).ok_or_else(|| RemoteAddError::UnsupportedArch {
+            arch: uname.stdout.trim().to_string(),
+        })?;
+
+    // 4. Install or version-check (shared between `add` and `upgrade`).
+    install_and_verify(
+        executor,
+        &target,
+        platform,
+        &version,
+        &opts.release_base,
+        opts.no_install,
+    )?;
+
+    // 5. Hook install on the remote. Use the absolute path consistently —
+    //    a bare `dot-agent-deck` lookup over a non-interactive ssh shell
+    //    fails for the standard `~/.local/bin/` install location.
+    let hooks = executor.run(&target, "~/.local/bin/dot-agent-deck hooks install")?;
+    if hooks.status != 0 {
+        return Err(RemoteAddError::HooksInstallFailed {
+            status: hooks.status,
+            stderr: hooks.stderr,
+        });
+    }
+    if !hooks.stdout.is_empty() {
+        print!("{}", hooks.stdout);
+        if !hooks.stdout.ends_with('\n') {
+            println!();
+        }
+    }
+
+    // 6. Append to registry.
+    let entry = RemoteEntry {
+        name: opts.name.clone(),
+        kind: "ssh".to_string(),
+        host: opts.target.clone(),
+        port: opts.port,
+        key: opts
+            .key
+            .as_ref()
+            .and_then(|p| p.as_os_str().to_str())
+            .map(|s| s.to_string())
+            .or_else(|| opts.key.as_ref().map(|p| p.to_string_lossy().into_owned())),
+        version: version.clone(),
+        added_at: chrono::Utc::now().to_rfc3339(),
+        upgraded_at: None,
+        last_connected: None,
+    };
+    registry.remotes.push(entry.clone());
+    registry.save(remotes_path)?;
+
+    // 7. Final success line.
+    println!(
+        "Added remote '{}' (ssh: {}, version {}). Run `dot-agent-deck connect {}` to attach.",
+        opts.name, opts.target, version, opts.name,
+    );
+
+    Ok(entry)
+}
+
+// ---------------------------------------------------------------------------
+// `remote list` — purely offline metadata read (no ssh, no probing). Live
+// status comes in M2.6.
+// ---------------------------------------------------------------------------
+
+/// Render a registry entry's `added_at` (RFC3339) as a human-friendly relative
+/// form ("2d ago"). Falls back to the raw string if parsing fails — better to
+/// surface the registry's exact contents than to silently swallow malformed
+/// data. Goes up to days; `format_elapsed` in `ui.rs` is for short-lived
+/// pane sessions and tops out at hours, so it's not the right shape here.
+fn format_relative_time_rfc3339(rfc3339: &str) -> String {
+    let parsed = match chrono::DateTime::parse_from_rfc3339(rfc3339) {
+        Ok(t) => t.with_timezone(&chrono::Utc),
+        Err(_) => return rfc3339.to_string(),
+    };
+    let secs = chrono::Utc::now()
+        .signed_duration_since(parsed)
+        .num_seconds()
+        .max(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+/// Format a registry entry's host column: `[user@]host[:port]`. The default
+/// ssh port (22) is omitted to keep the table tidy; any non-default port is
+/// suffixed.
+fn format_host_column(entry: &RemoteEntry) -> String {
+    if entry.port == DEFAULT_SSH_PORT {
+        entry.host.clone()
+    } else {
+        format!("{}:{}", entry.host, entry.port)
+    }
+}
+
+/// Render the registry as a column-aligned table. Empty registry produces
+/// the "No remotes configured" hint instead of a header-only table.
+pub fn list(remotes_path: &Path, out: &mut dyn std::io::Write) -> Result<(), RemoteConfigError> {
+    let registry = RemotesFile::load(remotes_path)?;
+    if registry.remotes.is_empty() {
+        writeln!(
+            out,
+            "No remotes configured. Use `dot-agent-deck remote add <name> <host>` to add one."
+        )
+        .map_err(|source| RemoteConfigError::Io {
+            path: remotes_path.display().to_string(),
+            source,
+        })?;
+        return Ok(());
+    }
+
+    let headers = ["NAME", "TYPE", "HOST", "VERSION", "ADDED_AT"];
+    let rows: Vec<[String; 5]> = registry
+        .remotes
+        .iter()
+        .map(|e| {
+            [
+                e.name.clone(),
+                e.kind.clone(),
+                format_host_column(e),
+                e.version.clone(),
+                format_relative_time_rfc3339(&e.added_at),
+            ]
+        })
+        .collect();
+
+    let mut widths = headers.map(|h| h.len());
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            if cell.len() > widths[i] {
+                widths[i] = cell.len();
+            }
+        }
+    }
+
+    let write_io = |result: std::io::Result<()>| -> Result<(), RemoteConfigError> {
+        result.map_err(|source| RemoteConfigError::Io {
+            path: remotes_path.display().to_string(),
+            source,
+        })
+    };
+
+    write_io(write_table_row(out, &headers, &widths))?;
+    for row in &rows {
+        let cells: [&str; 5] = [&row[0], &row[1], &row[2], &row[3], &row[4]];
+        write_io(write_table_row(out, &cells, &widths))?;
+    }
+    Ok(())
+}
+
+/// Write one table row, two-space gap between columns, last column is not
+/// padded (avoids trailing whitespace).
+fn write_table_row(
+    out: &mut dyn std::io::Write,
+    cells: &[&str; 5],
+    widths: &[usize; 5],
+) -> std::io::Result<()> {
+    for i in 0..4 {
+        write!(out, "{:<width$}  ", cells[i], width = widths[i])?;
+    }
+    writeln!(out, "{}", cells[4])
+}
+
+// ---------------------------------------------------------------------------
+// `remote remove` — registry-only. Does not touch the remote host.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum RemoteRemoveError {
+    #[error(
+        "No remote named '{name}'. Run `dot-agent-deck remote list` to see configured remotes."
+    )]
+    UnknownName { name: String },
+    #[error(transparent)]
+    Registry(#[from] RemoteConfigError),
+}
+
+/// Remove the registry entry for `name`. Returns the removed entry so callers
+/// can confirm what was deleted. **Does not** touch the remote host — no
+/// hooks uninstall, no binary cleanup, no ssh call.
+pub fn remove(name: &str, remotes_path: &Path) -> Result<RemoteEntry, RemoteRemoveError> {
+    let mut registry = RemotesFile::load(remotes_path)?;
+    let idx = registry
+        .remotes
+        .iter()
+        .position(|r| r.name == name)
+        .ok_or_else(|| RemoteRemoveError::UnknownName {
+            name: name.to_string(),
+        })?;
+    let removed = registry.remotes.remove(idx);
+    // If this was the last entry, `registry.remotes` is now an empty Vec —
+    // serde will emit `remotes = []` so the file remains valid TOML for
+    // future loads.
+    registry.save(remotes_path)?;
+    Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
+// `remote upgrade` — re-run the install pipeline against an existing entry.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct UpgradeOptions {
+    pub name: String,
+    pub version: String,
+    pub no_install: bool,
+    pub release_base: String,
+}
+
+#[derive(Debug, Error)]
+pub enum RemoteUpgradeError {
+    #[error(
+        "No remote named '{name}'. Run `dot-agent-deck remote list` to see configured remotes."
+    )]
+    UnknownName { name: String },
+    /// The install + version-check pipeline shared with `add` already covers
+    /// version validation, ssh transport errors, arch detection, install
+    /// failure, version mismatch, and registry I/O — wrap that error type
+    /// rather than duplicating the variants. Two manual `From` impls below
+    /// keep the `?` ergonomics for `SshError` and `RemoteConfigError`.
+    #[error(transparent)]
+    Inner(#[from] RemoteAddError),
+}
+
+impl From<SshError> for RemoteUpgradeError {
+    fn from(e: SshError) -> Self {
+        RemoteUpgradeError::Inner(e.into())
+    }
+}
+
+impl From<RemoteConfigError> for RemoteUpgradeError {
+    fn from(e: RemoteConfigError) -> Self {
+        RemoteUpgradeError::Inner(e.into())
+    }
+}
+
+/// Run the `upgrade` flow. Validates `version`, looks up the existing entry,
+/// re-runs install + version-check, then updates the registry's `version`
+/// and `upgraded_at` fields. `added_at` stays at the original registration
+/// timestamp.
+pub fn upgrade(
+    opts: &UpgradeOptions,
+    executor: &dyn SshExecutor,
+    remotes_path: &Path,
+) -> Result<RemoteEntry, RemoteUpgradeError> {
+    // 1. Version validation BEFORE any ssh call (mirrors `add`).
+    let version = validate_version_string(&opts.version)?;
+
+    // 2. Lookup. Unknown name short-circuits before any ssh work.
+    let mut registry = RemotesFile::load(remotes_path)?;
+    let idx = registry
+        .remotes
+        .iter()
+        .position(|r| r.name == opts.name)
+        .ok_or_else(|| RemoteUpgradeError::UnknownName {
+            name: opts.name.clone(),
+        })?;
+
+    let target = {
+        let entry = &registry.remotes[idx];
+        SshTarget::parse(
+            &entry.host,
+            entry.port,
+            entry.key.as_ref().map(PathBuf::from),
+        )
+    };
+
+    // 3. Reachability + arch detect.
+    let uname = executor.run(&target, "uname -s -m")?;
+    if uname.status != 0 {
+        return Err(RemoteAddError::UnameFailed {
+            status: uname.status,
+            stderr: uname.stderr,
+        }
+        .into());
+    }
+    let platform =
+        detect_platform(&uname.stdout).ok_or_else(|| RemoteAddError::UnsupportedArch {
+            arch: uname.stdout.trim().to_string(),
+        })?;
+
+    // 4. Install + version-check (shared with `add`).
+    install_and_verify(
+        executor,
+        &target,
+        platform,
+        &version,
+        &opts.release_base,
+        opts.no_install,
+    )?;
+
+    // 5. Reinstall hooks on the remote. A release may change hook behavior,
+    //    so the upgraded binary must be paired with refreshed hook scripts —
+    //    otherwise `remote upgrade` reports success while leaving the remote
+    //    on stale hooks. Mirrors the same step in `add()` so both paths stay
+    //    in lockstep. Runs BEFORE `registry.save` so a hook-install failure
+    //    fails loud rather than persisting half-finished state.
+    let hooks = executor.run(&target, "~/.local/bin/dot-agent-deck hooks install")?;
+    if hooks.status != 0 {
+        return Err(RemoteAddError::HooksInstallFailed {
+            status: hooks.status,
+            stderr: hooks.stderr,
+        }
+        .into());
+    }
+    if !hooks.stdout.is_empty() {
+        print!("{}", hooks.stdout);
+        if !hooks.stdout.ends_with('\n') {
+            println!();
+        }
+    }
+
+    // 6. Update registry. `added_at` stays at the original registration
+    //    timestamp; `upgraded_at` records the most recent upgrade so users
+    //    can see both moments without losing the registration history.
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = &mut registry.remotes[idx];
+    entry.version = version.clone();
+    entry.upgraded_at = Some(now);
+    let updated = entry.clone();
+    registry.save(remotes_path)?;
+
+    println!(
+        "Upgraded remote '{}' to version {}.",
+        opts.name, updated.version,
+    );
+
+    Ok(updated)
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the production SshExecutor's argument construction. Crucially
+// these do NOT spawn ssh — they inspect the `Command`'s args, which is
+// enough to catch quoting regressions and shell-injection mistakes.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(OsStr::to_string_lossy)
+            .map(|s| s.into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn ssh_target_parse_with_user() {
+        let t = SshTarget::parse("viktor@hetzner-1.example.com", 2222, None);
+        assert_eq!(t.user.as_deref(), Some("viktor"));
+        assert_eq!(t.host, "hetzner-1.example.com");
+        assert_eq!(t.port, 2222);
+        assert_eq!(t.user_host(), "viktor@hetzner-1.example.com");
+    }
+
+    #[test]
+    fn ssh_target_parse_without_user() {
+        let t = SshTarget::parse("hetzner-1.example.com", 22, None);
+        assert!(t.user.is_none());
+        assert_eq!(t.user_host(), "hetzner-1.example.com");
+    }
+
+    #[test]
+    fn system_ssh_executor_quotes_arguments_safely() {
+        // Hostile-looking host string + a remote command that would be
+        // catastrophic if naively interpolated into a shell. Our impl uses
+        // `Command::arg` (no shell), so each lands as its own argv entry —
+        // the local ssh process never sees a meta-character it can interpret.
+        let target = SshTarget {
+            host: "host`whoami`".to_string(),
+            user: Some("user;rm -rf /".to_string()),
+            port: 2222,
+            key: Some(PathBuf::from("/tmp/key id_rsa")),
+        };
+        let cmd = SystemSshExecutor::new().build_command(&target, "uname -s -m; echo $(id)");
+        let args = args_of(&cmd);
+
+        // Order matters: -o BatchMode -p PORT [-i KEY] -- user@host CMD.
+        assert_eq!(args[0], "-o");
+        assert_eq!(args[1], "BatchMode=yes");
+        assert_eq!(args[2], "-p");
+        assert_eq!(args[3], "2222");
+        assert_eq!(args[4], "-i");
+        assert_eq!(args[5], "/tmp/key id_rsa"); // single arg, space preserved
+        assert_eq!(args[6], "--");
+        assert_eq!(args[7], "user;rm -rf /@host`whoami`");
+        // Remote command is one arg — ssh ships it to the remote shell as a
+        // single string, but locally it's a single argv entry that the *local*
+        // shell never parses.
+        assert_eq!(args[8], "uname -s -m; echo $(id)");
+        assert_eq!(args.len(), 9);
+    }
+
+    #[test]
+    fn system_ssh_executor_omits_key_flag_when_none() {
+        let target = SshTarget {
+            host: "h".to_string(),
+            user: None,
+            port: 22,
+            key: None,
+        };
+        let cmd = SystemSshExecutor::new().build_command(&target, "echo hi");
+        let args = args_of(&cmd);
+        assert!(!args.iter().any(|a| a == "-i"));
+        // -- precedes the destination
+        let dash_dash_pos = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[dash_dash_pos + 1], "h");
+        assert_eq!(args[dash_dash_pos + 2], "echo hi");
+    }
+
+    #[test]
+    fn system_ssh_executor_emits_no_timeout_options_by_default() {
+        // The default constructor must not silently impose a ConnectTimeout
+        // — long-running flows like `remote add` install the binary across
+        // the network, and a 10s ceiling there would be wrong. The opt-in
+        // `with_wallclock_timeout` constructor is the only path that adds
+        // timeout flags to the argv.
+        let target = SshTarget {
+            host: "h".to_string(),
+            user: None,
+            port: 22,
+            key: None,
+        };
+        let cmd = SystemSshExecutor::new().build_command(&target, "echo hi");
+        let args = args_of(&cmd);
+        assert!(
+            !args.iter().any(|a| a.starts_with("ConnectTimeout=")),
+            "default executor must not impose ConnectTimeout: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("ServerAliveInterval=")),
+            "default executor must not impose ServerAliveInterval: {args:?}"
+        );
+    }
+
+    #[test]
+    fn system_ssh_executor_with_wallclock_timeout_sets_ssh_options() {
+        // The probe path uses `with_wallclock_timeout(N)` to bound a
+        // reachable-but-stalled remote. The fix maps to ssh's own
+        // ConnectTimeout (pre-handshake cap) AND ServerAliveInterval +
+        // ServerAliveCountMax=1 (post-handshake cap) so a remote that
+        // accepts the TCP connection but never speaks can't pin us forever.
+        let target = SshTarget {
+            host: "h".to_string(),
+            user: None,
+            port: 22,
+            key: None,
+        };
+        let cmd = SystemSshExecutor::with_wallclock_timeout(7).build_command(&target, "echo hi");
+        let args = args_of(&cmd);
+        assert!(
+            args.iter().any(|a| a == "ConnectTimeout=7"),
+            "with_wallclock_timeout must set ConnectTimeout: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "ServerAliveInterval=7"),
+            "with_wallclock_timeout must set ServerAliveInterval: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "ServerAliveCountMax=1"),
+            "with_wallclock_timeout must force a single missed-keepalive abort: {args:?}"
+        );
+    }
+
+    // ----- wallclock-kill helper -----
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_wallclock_kill_kills_a_hung_child_within_deadline() {
+        // The motivating case: a child that never exits on its own. The ssh
+        // options in `build_command` only catch transport-level stalls; this
+        // helper is what guarantees a wallclock cap on a reachable-but-
+        // stalled remote command. We use `sleep 30` as a stand-in for any
+        // hung process — it ignores SIGTERM only minimally and dies on
+        // SIGKILL like everything else, so we measure both correctness
+        // (returns Other with the right detail) and that the kill actually
+        // happens (elapsed wallclock < 3s tolerance for CI jitter).
+        use std::time::Instant;
+        let target = SshTarget::parse("u@h", 22, None);
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = Instant::now();
+        let result = run_with_wallclock_kill(&mut cmd, &target, 1, None);
+        let elapsed = start.elapsed();
+        let err = result.expect_err("hung child must error");
+        match err {
+            SshError::Other { detail, .. } => {
+                assert!(
+                    detail.contains("wallclock"),
+                    "detail must mention wallclock: {detail}"
+                );
+                assert!(
+                    detail.contains("1s"),
+                    "detail must mention the 1s budget: {detail}"
+                );
+            }
+            other => panic!("expected SshError::Other, got {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "elapsed {elapsed:?} exceeds 3s CI-jitter tolerance — the kill did not fire"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_wallclock_kill_returns_output_when_child_finishes_in_time() {
+        // The non-timeout path: a child that exits before the deadline must
+        // round-trip its captured stdout/stderr verbatim, so callers see the
+        // same `Output` they'd get from `cmd.output()`. `/bin/echo` (the
+        // binary, not the shell builtin) makes the assertion deterministic
+        // across $SHELL.
+        let target = SshTarget::parse("u@h", 22, None);
+        let mut cmd = Command::new("/bin/echo");
+        cmd.arg("dot-agent-deck 0.24.5");
+        let output = run_with_wallclock_kill(&mut cmd, &target, 5, None)
+            .expect("child finishing in time must Ok with Output");
+        assert!(
+            output.status.success(),
+            "echo must exit cleanly, got {:?}",
+            output.status
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("dot-agent-deck 0.24.5"),
+            "captured stdout must contain echoed line: {stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_wallclock_kill_nulls_stdin() {
+        // Regression: prior to the stdin(Stdio::null()) fix, the helper
+        // inherited the user's terminal stdin for up to the deadline. A
+        // command that reads stdin (e.g. `/bin/cat` with no args) would
+        // have wedged on inherited input until the wallclock fired. With
+        // stdin nulled, the child sees EOF and exits cleanly well before
+        // the 1s budget. The exact exit status doesn't matter — what we
+        // assert is that we did NOT take the wallclock-kill path (no
+        // SshError::Other "wallclock" detail, and elapsed << budget).
+        use std::time::Instant;
+        let target = SshTarget::parse("u@h", 22, None);
+        let mut cmd = Command::new("/bin/cat");
+        let start = Instant::now();
+        let result = run_with_wallclock_kill(&mut cmd, &target, 1, None);
+        let elapsed = start.elapsed();
+        match result {
+            Ok(_) => {}
+            Err(SshError::Other { detail, .. }) if detail.contains("wallclock") => {
+                panic!(
+                    "stdin was inherited — `cat` blocked on stdin and hit the wallclock kill (detail: {detail})"
+                );
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "elapsed {elapsed:?} suggests stdin was not nulled (cat blocked until near-deadline)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_wallclock_kill_caps_stdout_at_the_drain_layer() {
+        // Audit P3 (M2.21 refixup pass 3): exercise the production
+        // bounded-read path with a real child, not the fake executor's
+        // post-hoc truncation. A hostile remote binary that streams
+        // unbounded stdout must not allocate beyond `cap` bytes: the
+        // drainer stops reading once `cap` bytes land, and if the child
+        // keeps writing it blocks on a full pipe and is reaped by the
+        // wallclock kill. Either outcome — clean child exit (when the
+        // child finishes before the pipe fills) or wallclock kill (when
+        // the child blocks) — is acceptable; the property under test is
+        // that capture is bounded and the helper terminates promptly.
+        use std::time::Instant;
+        const CAP: usize = 4 * 1024;
+        const SIZE: usize = 256 * 1024;
+        const WALLCLOCK_SECS: u64 = 2;
+        let target = SshTarget::parse("u@h", 22, None);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("head -c {SIZE} /dev/zero"));
+        let start = Instant::now();
+        let result = run_with_wallclock_kill(&mut cmd, &target, WALLCLOCK_SECS, Some(CAP));
+        let elapsed = start.elapsed();
+        match result {
+            Ok(output) => assert_eq!(
+                output.stdout.len(),
+                CAP,
+                "captured stdout must be exactly CAP={CAP} on clean-exit path; got {}",
+                output.stdout.len()
+            ),
+            Err(SshError::Other { detail, .. }) if detail.contains("wallclock") => {
+                // Child blocked on a full pipe and was reaped — also
+                // acceptable. The cap stopped the drainer from reading,
+                // which is the property under audit.
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(WALLCLOCK_SECS + 2),
+            "elapsed {elapsed:?} exceeds wallclock+slack — helper failed to terminate promptly"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_wallclock_kill_caps_stderr_at_the_drain_layer() {
+        // Audit P2 (M2.21 refixup pass 3): mirror of the stdout cap test
+        // for stderr. A hostile remote that floods stderr (e.g., a
+        // wrapped `daemon hello` that prints `BAD` on stderr in a tight
+        // loop) used to be drained with unbounded `read_to_end`. The
+        // bounded-read drainer now applies to both streams; the cap
+        // stops the drainer from reading further, and if the child
+        // blocks on a full pipe the wallclock kill reaps it. Either
+        // termination path is acceptable.
+        use std::time::Instant;
+        const CAP: usize = 4 * 1024;
+        const SIZE: usize = 256 * 1024;
+        const WALLCLOCK_SECS: u64 = 2;
+        let target = SshTarget::parse("u@h", 22, None);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("head -c {SIZE} /dev/zero >&2"));
+        let start = Instant::now();
+        let result = run_with_wallclock_kill(&mut cmd, &target, WALLCLOCK_SECS, Some(CAP));
+        let elapsed = start.elapsed();
+        match result {
+            Ok(output) => {
+                assert_eq!(
+                    output.stderr.len(),
+                    CAP,
+                    "captured stderr must be exactly CAP={CAP} on clean-exit path; got {}",
+                    output.stderr.len()
+                );
+                assert!(
+                    output.stdout.is_empty(),
+                    "stdout must be empty (everything was redirected to stderr); got {} bytes",
+                    output.stdout.len()
+                );
+            }
+            Err(SshError::Other { detail, .. }) if detail.contains("wallclock") => {
+                // Child blocked on a full stderr pipe and was reaped —
+                // also acceptable. The cap stopped the drainer from
+                // reading, which is the property under audit.
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(WALLCLOCK_SECS + 2),
+            "elapsed {elapsed:?} exceeds wallclock+slack — helper failed to terminate promptly"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_wallclock_kill_drains_large_output_without_deadlocking() {
+        // Regression: a child that writes more than a single pipe buffer
+        // (~64 KiB on Linux, ~16 KiB on macOS) used to deadlock here —
+        // without concurrent draining, the child blocks in `write(2)` before
+        // `try_wait` ever returns Some, the wallclock fires, and the helper
+        // misclassifies a healthy chatty command as a stalled remote.
+        //
+        // We use `head -c 1048576 /dev/zero` to emit exactly 1 MiB of NUL
+        // bytes — well above any platform's pipe-buffer capacity — and
+        // assert all 1 MiB landed in `output.stdout` within a generous 5s
+        // budget. The child must finish well under that; if it hits the
+        // wallclock, the regression has reappeared.
+        use std::time::Instant;
+        const SIZE: usize = 1024 * 1024;
+        let target = SshTarget::parse("u@h", 22, None);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("head -c {SIZE} /dev/zero"));
+        let start = Instant::now();
+        let output = run_with_wallclock_kill(&mut cmd, &target, 5, None)
+            .expect("chatty child must round-trip its full stdout, not hit the wallclock");
+        let elapsed = start.elapsed();
+        assert!(
+            output.status.success(),
+            "head must exit cleanly, got {:?}",
+            output.status
+        );
+        assert_eq!(
+            output.stdout.len(),
+            SIZE,
+            "captured stdout must contain all {SIZE} bytes; got {}",
+            output.stdout.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "elapsed {elapsed:?} suggests pipes were not being drained concurrently"
+        );
+    }
+
+    #[test]
+    fn detect_platform_known() {
+        assert_eq!(detect_platform("Linux x86_64\n"), Some("linux-amd64"));
+        assert_eq!(detect_platform("Linux aarch64"), Some("linux-arm64"));
+        assert_eq!(detect_platform("Linux arm64"), Some("linux-arm64"));
+        assert_eq!(detect_platform("Darwin x86_64"), Some("darwin-amd64"));
+        assert_eq!(detect_platform("Darwin arm64"), Some("darwin-arm64"));
+    }
+
+    #[test]
+    fn detect_platform_unknown() {
+        assert_eq!(detect_platform("Linux riscv64"), None);
+        assert_eq!(detect_platform("FreeBSD amd64"), None);
+        assert_eq!(detect_platform(""), None);
+    }
+
+    #[test]
+    fn parse_version_output_typical() {
+        assert_eq!(
+            parse_version_output("dot-agent-deck 0.24.5\n"),
+            Some("0.24.5".to_string())
+        );
+        assert_eq!(
+            parse_version_output("dot-agent-deck 1.2.3"),
+            Some("1.2.3".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_version_string_accepts_semver_shapes() {
+        for v in [
+            "0.24.5",
+            "v0.24.5",
+            "1.2.3",
+            "0.0.1",
+            "10.20.30",
+            "1.0.0-rc.1",
+            "0.24.5-pre.2",
+        ] {
+            assert!(
+                validate_version_string(v).is_ok(),
+                "expected `{v}` to validate"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_version_string_strips_optional_v_prefix() {
+        // The canonical internal form is unprefixed — both inputs normalize
+        // to `0.24.5`. Without this, `--version v0.24.5` would build a URL
+        // with `vv` in the release-tag segment and 404 on GitHub.
+        assert_eq!(
+            validate_version_string("v0.24.5").unwrap(),
+            "0.24.5".to_string()
+        );
+        assert_eq!(
+            validate_version_string("0.24.5").unwrap(),
+            "0.24.5".to_string()
+        );
+        // Pre-release suffixes are preserved; only the leading `v` is stripped.
+        assert_eq!(
+            validate_version_string("v1.0.0-rc.1").unwrap(),
+            "1.0.0-rc.1".to_string()
+        );
+    }
+
+    #[test]
+    fn validate_version_string_rejects_malformed() {
+        for v in [
+            "",
+            "not-a-version",
+            "1.2",
+            "1.2.3.4",
+            "v1.2",
+            "1.2.3 ", // trailing whitespace
+            " 1.2.3", // leading whitespace
+            "1.2.3;", // metacharacter
+            "1.2.3$x",
+        ] {
+            let err = validate_version_string(v).expect_err(&format!("expected `{v}` to fail"));
+            match err {
+                RemoteAddError::InvalidVersion { input } => assert_eq!(input, v),
+                other => panic!("unexpected error for `{v}`: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn build_install_command_rejects_invalid_version() {
+        let err = build_install_command("https://example.test", "0.24.5; rm -rf ~", "linux-amd64")
+            .expect_err("malicious version must be rejected by the builder too");
+        assert!(matches!(err, RemoteAddError::InvalidVersion { .. }));
+    }
+
+    #[test]
+    fn build_install_command_url_unprefixed_version() {
+        let (url, install_cmd) =
+            build_install_command("https://example.test/releases", "0.24.5", "linux-amd64")
+                .expect("valid version must build an install command");
+        assert_eq!(
+            url,
+            "https://example.test/releases/v0.24.5/dot-agent-deck-linux-amd64"
+        );
+        assert!(install_cmd.contains(&url));
+    }
+
+    #[test]
+    fn build_install_command_is_atomic() {
+        // Regression: previously curl wrote directly to the final path, so an
+        // interrupted download left a truncated binary at the install target
+        // with no rollback. The command must download to a sibling temp file
+        // and `mv` it into place — same-filesystem mv is POSIX-atomic.
+        let (_, install_cmd) =
+            build_install_command("https://example.test/releases", "0.24.5", "linux-amd64")
+                .expect("valid version must build an install command");
+        assert!(
+            install_cmd.contains("mv "),
+            "install command must `mv` the temp file into place: {install_cmd}"
+        );
+        assert!(
+            install_cmd.contains(".dot-agent-deck."),
+            "install command must download to a sibling temp file: {install_cmd}"
+        );
+        assert!(
+            install_cmd.contains("$tmp"),
+            "install command must reference the temp file by variable so chmod and mv target the temp: {install_cmd}"
+        );
+        // The chmod must happen on the temp file, not on the final path —
+        // otherwise an interrupted download still leaves a chmod-ed final
+        // path.
+        assert!(
+            install_cmd.contains("chmod 0755 \"$tmp\""),
+            "chmod must target the temp file, not the final path: {install_cmd}"
+        );
+    }
+
+    #[test]
+    fn build_install_command_url_normalizes_v_prefixed_version() {
+        // Regression: prior to normalization, `v0.24.5` produced a URL with
+        // `vv0.24.5/` and 404'd on GitHub. The builder must strip the leading
+        // `v` so exactly one `v` precedes the version segment.
+        let (url_v, _) =
+            build_install_command("https://example.test/releases", "v0.24.5", "linux-amd64")
+                .expect("v-prefixed version must be accepted");
+        let (url_plain, _) =
+            build_install_command("https://example.test/releases", "0.24.5", "linux-amd64")
+                .expect("plain version must be accepted");
+        assert_eq!(
+            url_v, url_plain,
+            "URL must be the same regardless of leading-`v` input"
+        );
+        assert_eq!(
+            url_v,
+            "https://example.test/releases/v0.24.5/dot-agent-deck-linux-amd64"
+        );
+        assert!(
+            !url_v.contains("vv"),
+            "URL must contain exactly one `v` before the version: {url_v}"
+        );
+    }
+
+    #[test]
+    fn classify_ssh_error_host_key_verification_failed() {
+        let target = SshTarget::parse("user@host", 22, None);
+        let err = classify_ssh_error(&target, "Host key verification failed.\r\n");
+        assert!(
+            matches!(err, SshError::HostKeyVerificationFailed { .. }),
+            "got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("user@host"),
+            "Display should name target: {msg}"
+        );
+        assert!(
+            msg.contains("first-time connection"),
+            "Display should advise the user: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_ssh_error_host_key_changed_routes_to_same_variant() {
+        let target = SshTarget::parse("h", 22, None);
+        let stderr = "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n";
+        let err = classify_ssh_error(&target, stderr);
+        assert!(matches!(err, SshError::HostKeyVerificationFailed { .. }));
+    }
+
+    #[test]
+    fn classify_ssh_error_connection_refused_still_works() {
+        let target = SshTarget::parse("h", 22, None);
+        let err = classify_ssh_error(
+            &target,
+            "ssh: connect to host h port 22: Connection refused",
+        );
+        assert!(matches!(err, SshError::ConnectionRefused { .. }));
+    }
+
+    #[test]
+    fn classify_ssh_error_auth_failed_still_works() {
+        let target = SshTarget::parse("u@h", 22, None);
+        let err = classify_ssh_error(&target, "u@h: Permission denied (publickey).");
+        assert!(matches!(err, SshError::AuthFailed { .. }));
+    }
+
+    #[test]
+    fn remotes_toml_written_at_0o600() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remotes.toml");
+        let file = RemotesFile::default();
+        file.save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "remotes.toml mode is 0o{mode:o}, expected 0o600"
+        );
+
+        // Re-saving over an existing file must keep 0o600 too.
+        file.save(&path).unwrap();
+        let mode2 = std::fs::metadata(&path).unwrap().mode() & 0o777;
+        assert_eq!(
+            mode2, 0o600,
+            "after rewrite, mode is 0o{mode2:o}, expected 0o600"
+        );
+    }
+
+    #[test]
+    fn remotes_toml_save_creates_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two missing levels — exercises create_dir_all.
+        let path = dir.path().join("a/b/remotes.toml");
+        let file = RemotesFile::default();
+        file.save(&path).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn remotes_file_round_trip_two_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remotes.toml");
+        let file = RemotesFile {
+            remotes: vec![
+                RemoteEntry {
+                    name: "hetzner-1".to_string(),
+                    kind: "ssh".to_string(),
+                    host: "viktor@hetzner-1.example.com".to_string(),
+                    port: 22,
+                    key: Some("~/.ssh/id_ed25519".to_string()),
+                    version: "0.24.5".to_string(),
+                    added_at: "2026-05-09T01:23:45+00:00".to_string(),
+                    upgraded_at: None,
+                    last_connected: None,
+                },
+                RemoteEntry {
+                    name: "lab".to_string(),
+                    kind: "ssh".to_string(),
+                    host: "lab.local".to_string(),
+                    port: 2222,
+                    key: None,
+                    version: "0.24.5".to_string(),
+                    added_at: "2026-05-09T02:00:00+00:00".to_string(),
+                    upgraded_at: None,
+                    last_connected: None,
+                },
+            ],
+        };
+        file.save(&path).unwrap();
+        let loaded = RemotesFile::load(&path).unwrap();
+        assert_eq!(loaded, file);
+    }
+}

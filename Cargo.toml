@@ -18,6 +18,7 @@ toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 semver = "1"
 portable-pty = "0.8"
+libc = "0.2"
 vt100 = "0.16"
 regex = "1"
 open = "5"

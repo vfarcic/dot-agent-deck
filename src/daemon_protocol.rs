@@ -1,0 +1,1463 @@
+//! Streaming attach protocol for the daemon (PRD #76, M1.2).
+//!
+//! # Protocol versioning
+//!
+//! [`PROTOCOL_VERSION`] is the on-the-wire shape of this module. Bump it when
+//! a change would cause an older or newer peer to mis-parse a frame:
+//!
+//! - **Bump:** new `KIND_*` codes, payload-schema changes that aren't
+//!   forward-compatible (renames, type changes, removed fields without a
+//!   `#[serde(default)]` shim), new [`AttachRequest`] variants.
+//! - **Do NOT bump:** additive optional fields tagged
+//!   `#[serde(default, skip_serializing_if = "Option::is_none")]` — those are
+//!   forward-compatible by design (older peer ignores the field, newer peer
+//!   tolerates its absence).
+//!
+//! The handshake itself ([`AttachRequest::Hello`]) is enforced only by the
+//! laptop-side `connect` flow — single-binary in-process call sites already
+//! match versions by construction and don't need the check.
+//!
+//! # Wire format
+//!
+//! Length-prefixed binary frames:
+//!
+//! ```text
+//! +-------+--------------------+----------------------+
+//! | 1 B   | 4 B (big-endian)   | N bytes              |
+//! | kind  | payload length     | payload              |
+//! +-------+--------------------+----------------------+
+//! ```
+//!
+//! Justification: PRD line 294 explicitly rules out gRPC / JSON-RPC and
+//! "extra build deps". We have `tokio` and `serde_json` already, so control
+//! frames carry JSON and stream frames carry raw PTY bytes — no new deps,
+//! and the framing is portable to stdio (M2.1). No socket-only assumptions
+//! (no fd passing, no `SCM_RIGHTS`).
+//!
+//! # Frame kinds
+//!
+//! | Kind            | Direction         | Payload                       |
+//! |-----------------|-------------------|-------------------------------|
+//! | `KIND_REQ`      | client → server   | JSON [`AttachRequest`]        |
+//! | `KIND_RESP`     | server → client   | JSON [`AttachResponse`]       |
+//! | `KIND_STREAM_OUT` | server → client | raw PTY bytes                 |
+//! | `KIND_STREAM_IN`  | client → server | raw bytes for PTY stdin       |
+//! | `KIND_DETACH`     | client → server | empty — detach, leave agent   |
+//! | `KIND_STREAM_END` | server → client | optional reason (e.g. lagged) |
+//! | `KIND_EVENT`      | server → client | JSON [`crate::event::BroadcastMsg`] (M2.17/M2.19, after a `SubscribeEvents` request) |
+//!
+//! # Per-connection state machine
+//!
+//! 1. Client sends a single `KIND_REQ` with one of the [`AttachRequest`]
+//!    variants.
+//! 2. Server replies with `KIND_RESP` carrying [`AttachResponse`].
+//! 3. For non-streaming ops (`list-agents`, `start-agent`, `stop-agent`,
+//!    `snapshot`) the server then closes the connection. `snapshot` may
+//!    emit one `KIND_STREAM_OUT` frame with the scrollback bytes, followed
+//!    by `KIND_STREAM_END` and close.
+//! 4. For `attach-stream`, the server immediately follows the OK response
+//!    with a single `KIND_STREAM_OUT` carrying the consistent scrollback
+//!    snapshot, then enters streaming mode: live PTY bytes flow as
+//!    `KIND_STREAM_OUT`, client keystrokes flow as `KIND_STREAM_IN`, and
+//!    either side may end via `KIND_DETACH` (client) or `KIND_STREAM_END`
+//!    (server, e.g. agent died or subscriber lagged).
+//!
+//! # Concurrent attach
+//!
+//! Multiple clients may attach to the same agent. They share a single
+//! [`crate::agent_pty::AgentBus`]: each subscriber gets its own broadcast
+//! receiver, so PTY output fans out to every attached client. Each client's
+//! `KIND_STREAM_IN` is forwarded through a shared writer (under
+//! `tokio::sync::Mutex`), so concurrent keystrokes interleave at byte
+//! granularity — last writer wins per byte, which matches PRD line 199's
+//! "daemon is the single source of truth" model.
+
+use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast;
+use tracing::{error, info, warn};
+
+pub use crate::agent_pty::TabMembership;
+use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
+use crate::event::{AgentType, BroadcastMsg};
+
+// ---------------------------------------------------------------------------
+// Frame kinds
+// ---------------------------------------------------------------------------
+
+pub const KIND_REQ: u8 = 0x01;
+pub const KIND_RESP: u8 = 0x02;
+pub const KIND_STREAM_OUT: u8 = 0x10;
+pub const KIND_STREAM_IN: u8 = 0x11;
+pub const KIND_STREAM_END: u8 = 0x12;
+pub const KIND_DETACH: u8 = 0x13;
+/// PRD #76 M2.17: server → client JSON-encoded `AgentEvent` forwarded over
+/// a long-lived `SubscribeEvents` connection. The TUI's remote-mode
+/// `AppState` is otherwise disconnected from the daemon's hook ingestion
+/// loop; this frame is the bridge.
+pub const KIND_EVENT: u8 = 0x14;
+
+/// PRD #76 M2.21: wire-format version for the attach socket. Bump every time
+/// the on-the-wire shape changes in a way an older client/daemon would
+/// mis-parse — new `KIND_*` codes, payload schema changes, new request
+/// variants. PRD #76 has accumulated several silent bumps (M2.17 added
+/// `KIND_EVENT`, M2.19 changed its payload to `BroadcastMsg`, earlier
+/// milestones added `Resize` / `SetAgentLabel` / `SubscribeEvents`); this
+/// constant starts at the first post-M2.19 version so older daemons fail the
+/// handshake instead of silently dropping live updates.
+///
+/// Additive `#[serde(default, skip_serializing_if = "Option::is_none")]`
+/// fields do NOT require a bump — they're forward-compatible by design. See
+/// the module-level "Protocol versioning" section for the full bump policy.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Hard cap on a single frame's payload length. Defends against a malicious
+/// or buggy peer trying to allocate gigabytes off a forged length prefix.
+/// 16 MiB is well above any reasonable PTY chunk or scrollback snapshot.
+const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+/// Bounded timeout for a single STREAM_OUT/STREAM_END write to a client. If
+/// a client stops draining its socket, the OS send buffer fills and our
+/// `write_all` blocks forever — which would also block lag detection (we
+/// can't drain the broadcast receiver). With a per-write timeout, a wedged
+/// client is dropped within this many seconds instead of pinning the output
+/// task. 5s is a generous upper bound for "client can't accept a frame";
+/// the client can reattach and replay scrollback.
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+// ---------------------------------------------------------------------------
+// Wire I/O
+// ---------------------------------------------------------------------------
+
+/// Read a single frame. Returns `Ok(None)` on clean EOF before any header
+/// bytes have been read (peer closed the connection cleanly between frames).
+/// EOF *after* one or more header bytes is a truncated frame and returns
+/// `Err(UnexpectedEof)` — the peer closed mid-header. Likewise EOF inside
+/// the payload returns an error via `read_exact`.
+pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<(u8, Vec<u8>)>> {
+    let mut header = [0u8; 5];
+    let mut filled = 0usize;
+    while filled < header.len() {
+        let n = r.read(&mut header[filled..]).await?;
+        if n == 0 {
+            if filled == 0 {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("truncated frame header: {filled}/5 bytes before EOF"),
+            ));
+        }
+        filled += n;
+    }
+    let kind = header[0];
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame length {len} exceeds {MAX_FRAME_LEN}"),
+        ));
+    }
+    let mut payload = vec![0u8; len];
+    if len > 0 {
+        r.read_exact(&mut payload).await?;
+    }
+    Ok(Some((kind, payload)))
+}
+
+/// Try to write a single frame within `CLIENT_WRITE_TIMEOUT`. Returns
+/// `true` on success and `false` if the write timed out or errored — the
+/// caller should treat both as "client gone" and bail out.
+async fn write_or_timeout<W: AsyncWrite + Unpin>(w: &mut W, kind: u8, payload: &[u8]) -> bool {
+    matches!(
+        tokio::time::timeout(CLIENT_WRITE_TIMEOUT, write_frame(w, kind, payload)).await,
+        Ok(Ok(()))
+    )
+}
+
+/// Write a single frame.
+pub async fn write_frame<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    kind: u8,
+    payload: &[u8],
+) -> io::Result<()> {
+    if payload.len() > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("frame length {} exceeds {MAX_FRAME_LEN}", payload.len()),
+        ));
+    }
+    let mut header = [0u8; 5];
+    header[0] = kind;
+    header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    w.write_all(&header).await?;
+    if !payload.is_empty() {
+        w.write_all(payload).await?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Message types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+pub enum AttachRequest {
+    ListAgents,
+    /// Spawn an agent process attached to a PTY.
+    ///
+    /// **Trust boundary.** The attach socket is bound at mode `0o600` and
+    /// only accepts connections from the same OS user as the daemon, so
+    /// any peer reaching this request can already exec arbitrary code as
+    /// that user. We deliberately do **not** sandbox `command`, `cwd`, or
+    /// `env`: there is no allowlist, no policy layer, no shell-quoting
+    /// validation. Adding any of those here would be security theater —
+    /// the same user has equivalent local-exec capability via `sh -c`,
+    /// and the daemon's job is to expose PTY plumbing, not to be a
+    /// privilege boundary. Multi-tenant or remote scenarios must be
+    /// handled at a different layer (separate UID, container, SSH).
+    StartAgent {
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default = "default_rows")]
+        rows: u16,
+        #[serde(default = "default_cols")]
+        cols: u16,
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        /// M2.11: human-readable label captured into the daemon's per-agent
+        /// state. `skip_serializing_if` keeps the on-the-wire shape
+        /// backwards-compatible with daemons predating this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        /// M2.12: which tab (mode / orchestration) the spawning UI placed
+        /// this agent pane in. Stored on the daemon-side registry and
+        /// echoed back via `list_agents` so the TUI can rebuild tab
+        /// structure on reconnect. `None` = dashboard pane. Same
+        /// `skip_serializing_if` pattern as `display_name` for forward
+        /// compat with daemons that don't know about this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab_membership: Option<TabMembership>,
+        /// M2.13: which AI agent the spawn command runs (inferred at the
+        /// TUI spawn site via `AgentType::from_command`). Stored on the
+        /// daemon-side registry and echoed back via `list_agents` so a
+        /// remote reconnect can build placeholder sessions with the
+        /// correct agent_type instead of "No agent". Same
+        /// `skip_serializing_if` pattern as the other M2.x fields for
+        /// forward compat with daemons that don't know about it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type: Option<AgentType>,
+    },
+    StopAgent {
+        id: String,
+    },
+    AttachStream {
+        id: String,
+    },
+    Snapshot {
+        id: String,
+    },
+    /// Propagate a TUI-side pane resize to the daemon's PTY. The daemon
+    /// ioctls `TIOCSWINSZ` on the master, which the kernel mirrors to the
+    /// slave and SIGWINCH's the foreground process. Without this op,
+    /// stream-backed panes show width/height mismatches versus the local
+    /// vt100 view (see PRD #76, M2.10).
+    Resize {
+        id: String,
+        rows: u16,
+        cols: u16,
+    },
+    /// M2.11: update the daemon-side display_name and cwd for an agent.
+    /// Either field may be `None` to clear it. Used by the TUI's rename
+    /// flow so renamed panes survive an ssh drop without a separate file
+    /// on disk — the daemon's per-agent state is the source of truth.
+    SetAgentLabel {
+        id: String,
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
+    /// PRD #76 M2.17: long-lived subscription to the daemon's
+    /// `AgentEvent` broadcast. Server replies with an OK `RESP` then
+    /// streams `KIND_EVENT` frames (one per hook event) until either side
+    /// closes the connection or the broadcast receiver lags. The TUI in
+    /// remote mode opens exactly one of these on startup so its
+    /// `AppState` mirrors the daemon's view of live agent activity (agent
+    /// type, tool counts, prompts, last-activity timestamps).
+    SubscribeEvents,
+    /// PRD #76 M2.21: protocol-version handshake. Client sends its
+    /// [`PROTOCOL_VERSION`]; server replies with its own in
+    /// [`AttachResponse::server_version`]. The daemon never rejects on
+    /// `client_version` — only the client decides whether to fail (the
+    /// `connect` strict path) or continue (call sites that have no version
+    /// dependency).
+    Hello {
+        client_version: u32,
+    },
+}
+
+fn default_rows() -> u16 {
+    24
+}
+fn default_cols() -> u16 {
+    80
+}
+
+/// Discriminated by the populated optional fields rather than a tag, since
+/// each request type has a fixed shape and clients can decide what to read
+/// based on which request they sent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AttachResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Legacy listing field: just the ids. Always populated by current
+    /// daemons so older clients (which only know about `agents`) keep
+    /// working. New clients prefer `agent_records` when present so they
+    /// also get the captured `DOT_AGENT_DECK_PANE_ID` per agent — see the
+    /// M2.x rehydration path in `embedded_pane::hydrate_from_daemon`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<String>>,
+    /// Additive companion to `agents`, carrying each agent's spawn-time
+    /// `DOT_AGENT_DECK_PANE_ID`. Older daemons omit this field; newer
+    /// clients fall back to `agents` when it's `None` so a stale daemon
+    /// is forward-compatible (panes hydrate with freshly-allocated ids
+    /// instead of preserved ones).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_records: Option<Vec<AgentRecord>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// PRD #76 M2.21: server's [`PROTOCOL_VERSION`], populated in response to
+    /// a [`AttachRequest::Hello`] request. Optional so the field is omitted
+    /// on unrelated responses and absent on the wire from pre-M2.21 daemons
+    /// (in which case the client treats `None` as "incompatible").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<u32>,
+}
+
+impl AttachResponse {
+    pub fn ok() -> Self {
+        Self {
+            ok: true,
+            ..Default::default()
+        }
+    }
+    pub fn err(msg: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: Some(msg.into()),
+            ..Default::default()
+        }
+    }
+    pub fn agents(ids: Vec<String>) -> Self {
+        Self {
+            ok: true,
+            agents: Some(ids),
+            ..Default::default()
+        }
+    }
+    /// Build a list-agents response that populates *both* the legacy
+    /// `agents` field (just ids) and the new `agent_records` field (ids
+    /// plus captured pane env). The dual shape is what keeps older
+    /// clients reading just `agents` working alongside newer clients
+    /// preferring `agent_records`.
+    pub fn agent_records(records: Vec<AgentRecord>) -> Self {
+        let ids = records.iter().map(|r| r.id.clone()).collect();
+        Self {
+            ok: true,
+            agents: Some(ids),
+            agent_records: Some(records),
+            ..Default::default()
+        }
+    }
+    pub fn with_id(id: String) -> Self {
+        Self {
+            ok: true,
+            id: Some(id),
+            ..Default::default()
+        }
+    }
+    /// PRD #76 M2.21: protocol-version handshake reply. `version` is the
+    /// daemon's [`PROTOCOL_VERSION`]; the client compares it against its own.
+    pub fn hello(version: u32) -> Self {
+        Self {
+            ok: true,
+            server_version: Some(version),
+            ..Default::default()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+/// Bind the attach socket and return the listener, ready for `serve_attach`.
+/// Cleans up any stale socket file before binding. Split from `run_attach_server`
+/// so callers (notably tests) can synchronously confirm the listener is ready
+/// to accept connections before spawning the async serve loop — this removes
+/// the bind/accept readiness race that the old probe-and-retry pattern was
+/// papering over.
+pub fn bind_attach_listener(path: &Path) -> io::Result<UnixListener> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    let listener = crate::daemon::bind_socket(path)?;
+    // Defense in depth — the umask-before-bind in `bind_socket` already
+    // creates the inode at 0o600; restating the mode here means any future
+    // code path that bypasses `bind_socket` still ends up with the right
+    // permissions.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+/// Accept-loop half of the attach server. Runs until the listener errors out
+/// or the future is dropped. Pairs with `bind_attach_listener`.
+///
+/// `event_tx` is the daemon-wide `BroadcastMsg` broadcast (PRD #76
+/// M2.17 for hook events; extended in M2.19 to also carry delegate
+/// signals). It is held here so each accepted connection can call
+/// `subscribe()` if the client opens a `SubscribeEvents` stream. The
+/// cost of holding a `Sender` with zero subscribers is negligible —
+/// `send` only succeeds when at least one `Receiver` exists.
+pub async fn serve_attach(
+    listener: UnixListener,
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+) -> io::Result<()> {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                let registry = registry.clone();
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(stream, registry, event_tx).await {
+                        warn!("attach protocol connection error: {e}");
+                    }
+                });
+            }
+            Err(e) => {
+                error!("attach accept failed: {e}");
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Bind the attach socket and serve protocol connections forever. Cleans up
+/// any stale socket file before binding. Runs until the listener errors out
+/// or the future is dropped.
+pub async fn run_attach_server(
+    path: &Path,
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+) -> io::Result<()> {
+    let listener = bind_attach_listener(path)?;
+    info!("Attach protocol listening on {}", path.display());
+    serve_attach(listener, registry, event_tx).await
+}
+
+async fn handle_connection(
+    mut stream: UnixStream,
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+) -> io::Result<()> {
+    let frame = match read_frame(&mut stream).await? {
+        Some(f) => f,
+        None => return Ok(()),
+    };
+    if frame.0 != KIND_REQ {
+        let resp = AttachResponse::err(format!("expected REQ frame, got kind 0x{:02x}", frame.0));
+        write_resp(&mut stream, &resp).await?;
+        return Ok(());
+    }
+    let req: AttachRequest = match serde_json::from_slice(&frame.1) {
+        Ok(r) => r,
+        Err(e) => {
+            let resp = AttachResponse::err(format!("malformed request: {e}"));
+            write_resp(&mut stream, &resp).await?;
+            return Ok(());
+        }
+    };
+
+    match req {
+        AttachRequest::ListAgents => {
+            let records = registry.agent_records();
+            write_resp(&mut stream, &AttachResponse::agent_records(records)).await?;
+        }
+        AttachRequest::StartAgent {
+            command,
+            cwd,
+            rows,
+            cols,
+            env,
+            display_name,
+            tab_membership,
+            agent_type,
+        } => {
+            // Trust boundary: same OS user, same exec capability — see the
+            // `AttachRequest::StartAgent` docs. We forward `command`/`cwd`/
+            // `env` to the spawn path verbatim. The only check here is a
+            // sanity guard against an empty/whitespace-only `command`,
+            // which is almost certainly a client bug rather than an
+            // attack: it would otherwise resolve to a binary named "" or
+            // " " and fail with a confusing OS error. This is *not* an
+            // allowlist.
+            if let Some(c) = command.as_deref()
+                && c.trim().is_empty()
+            {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err("start-agent: command is empty or whitespace-only"),
+                )
+                .await?;
+                return Ok(());
+            }
+            let opts = SpawnOptions {
+                command: command.as_deref(),
+                cwd: cwd.as_deref(),
+                display_name: display_name.as_deref(),
+                rows,
+                cols,
+                env,
+                tab_membership,
+                agent_type,
+            };
+            match registry.spawn_agent(opts) {
+                Ok(id) => write_resp(&mut stream, &AttachResponse::with_id(id)).await?,
+                Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+            }
+        }
+        AttachRequest::StopAgent { id } => match registry.close_agent(&id) {
+            Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
+            Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+        },
+        AttachRequest::SetAgentLabel {
+            id,
+            display_name,
+            cwd,
+        } => match registry.set_agent_label(&id, display_name, cwd) {
+            Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
+            Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+        },
+        AttachRequest::Snapshot { id } => match registry.snapshot(&id) {
+            Ok(bytes) => {
+                write_resp(&mut stream, &AttachResponse::ok()).await?;
+                // Mirror the attach-stream / subscribe-events policy: bound the
+                // body and STREAM_END writes with `CLIENT_WRITE_TIMEOUT`. A
+                // client that opened a `Snapshot` connection and stopped
+                // reading after the OK response could otherwise park this task
+                // forever on `write_all` (kernel send buffer fills, the write
+                // never completes). On timeout, best-effort STREAM_END with a
+                // typed reason and return Ok(()) — a stuck client doesn't
+                // justify failing the dispatcher task.
+                if !bytes.is_empty()
+                    && !write_or_timeout(&mut stream, KIND_STREAM_OUT, &bytes).await
+                {
+                    let _ = write_or_timeout(&mut stream, KIND_STREAM_END, b"timeout").await;
+                    return Ok(());
+                }
+                if !write_or_timeout(&mut stream, KIND_STREAM_END, &[]).await {
+                    return Ok(());
+                }
+            }
+            Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+        },
+        AttachRequest::AttachStream { id } => {
+            handle_attach_stream(stream, registry, id).await?;
+        }
+        AttachRequest::Resize { id, rows, cols } => match registry.resize(&id, rows, cols) {
+            Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
+            Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+        },
+        AttachRequest::SubscribeEvents => {
+            handle_subscribe_events(stream, event_tx).await?;
+        }
+        AttachRequest::Hello { client_version: _ } => {
+            // PRD #76 M2.21: the daemon never enforces or rejects on
+            // `client_version` — we always reply with our own
+            // `PROTOCOL_VERSION` and let the caller decide. Centralizing the
+            // policy on the client side means a newer client talking to an
+            // older daemon (the upgrade-skew direction the daemon can't
+            // detect anyway) still gets a sensible mismatch error instead of
+            // the daemon rejecting what *would* be its own future shape.
+            write_resp(&mut stream, &AttachResponse::hello(PROTOCOL_VERSION)).await?;
+        }
+    }
+    Ok(())
+}
+
+// CodeRabbit Fix C fixup: bound the response write with `CLIENT_WRITE_TIMEOUT`.
+// Every dispatch arm calls `write_resp` first; without a timeout, a same-UID
+// client that connected and then stopped reading could pin the dispatcher task
+// on this initial OK/Err write (kernel send buffer fills, `write_all` never
+// completes). On timeout, surface `io::ErrorKind::TimedOut` so existing `?`
+// callers propagate up and let the connection drop.
+#[doc(hidden)]
+pub async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse) -> io::Result<()> {
+    let payload = serde_json::to_vec(resp).expect("AttachResponse must serialize");
+    match tokio::time::timeout(CLIENT_WRITE_TIMEOUT, write_frame(w, KIND_RESP, &payload)).await {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "write_resp: client did not drain RESP within CLIENT_WRITE_TIMEOUT",
+        )),
+    }
+}
+
+/// Long-lived `SubscribeEvents` handler (PRD #76 M2.17, extended for
+/// delegate signals in M2.19). Confirms the subscription with an OK
+/// `RESP`, then forwards every `BroadcastMsg` from the daemon-wide
+/// broadcast as a `KIND_EVENT` frame (JSON-tagged variant — see
+/// [`BroadcastMsg`]). Each write is bounded by `CLIENT_WRITE_TIMEOUT`
+/// so a wedged client can't pin this task forever. A lagged receiver —
+/// the client fell further behind than the broadcast capacity — closes
+/// the connection with `KIND_STREAM_END` carrying `"lagged"`; the
+/// TUI's reconnect path drains a `list_agents` snapshot to recover.
+/// Client disconnect is detected by racing a one-byte read against
+/// `rx.recv()` so the broadcast `Receiver` is dropped promptly when
+/// the client goes away between messages — otherwise the
+/// per-connection task and its receiver would leak for the lifetime
+/// of the daemon.
+async fn handle_subscribe_events(
+    stream: UnixStream,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+) -> io::Result<()> {
+    let mut rx = event_tx.subscribe();
+    let (mut rd, mut wr) = stream.into_split();
+    write_resp(&mut wr, &AttachResponse::ok()).await?;
+    loop {
+        tokio::select! {
+            recv = rx.recv() => {
+                match recv {
+                    Ok(msg) => {
+                        let payload = match serde_json::to_vec(&msg) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                // A BroadcastMsg that can't serialize is a daemon
+                                // bug — log and skip rather than tear the
+                                // subscription down for every other client.
+                                warn!("subscribe-events: skipping unserializable broadcast: {e}");
+                                continue;
+                            }
+                        };
+                        if !write_or_timeout(&mut wr, KIND_EVENT, &payload).await {
+                            let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Daemon's event_tx dropped — daemon is shutting down.
+                        let _ = write_or_timeout(&mut wr, KIND_STREAM_END, &[]).await;
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Client fell behind beyond EVENT_BROADCAST_CAPACITY.
+                        // Tear the subscription down with a typed reason so the
+                        // client can drop and reconnect.
+                        let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"lagged").await;
+                        break;
+                    }
+                }
+            }
+            // Disconnect detector: the client never writes after the
+            // SubscribeEvents request, so any read result here means the
+            // socket is gone (EOF / error) or the client is misbehaving.
+            // Either way, exit so the receiver drops.
+            _ = rd.read_u8() => {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_attach_stream(
+    stream: UnixStream,
+    registry: Arc<AgentPtyRegistry>,
+    id: String,
+) -> io::Result<()> {
+    let handle = match registry.subscribe(&id) {
+        Ok(h) => h,
+        Err(e) => {
+            let mut s = stream;
+            write_resp(&mut s, &AttachResponse::err(e.to_string())).await?;
+            return Ok(());
+        }
+    };
+
+    let (mut rd, mut wr) = stream.into_split();
+
+    // 1. Confirm the attach succeeded.
+    write_resp(&mut wr, &AttachResponse::ok()).await?;
+    // 2. Replay the consistent scrollback snapshot before live bytes start
+    //    flowing. `subscribe()` guarantees no overlap or gap with the bytes
+    //    delivered via `rx` below. The write is bounded by
+    //    `CLIENT_WRITE_TIMEOUT` for the same reason live STREAM_OUT writes
+    //    are: a client wedged at attach time would otherwise pin this task
+    //    forever (kernel send buffer fills, `write_all` never completes,
+    //    and the output task never even starts so lag detection can't
+    //    fire). On timeout, mirror the output-task policy — best-effort
+    //    bounded STREAM_END, then drop the writer and bail.
+    if !handle.snapshot.is_empty()
+        && !write_or_timeout(&mut wr, KIND_STREAM_OUT, &handle.snapshot).await
+    {
+        let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
+        return Ok(());
+    }
+
+    let mut rx = handle.rx;
+    let writer = handle.writer;
+
+    // Output task: forward broadcast bytes → STREAM_OUT frames. Owns `wr`
+    // for the duration of streaming.
+    //
+    // Every write goes through `CLIENT_WRITE_TIMEOUT`. Without it, a client
+    // that stops draining its socket pins this task on `write_all` (the
+    // kernel send buffer fills and the write never completes) — which also
+    // suppresses lag detection, since we can't reach the next `rx.recv()`
+    // to observe `RecvError::Lagged`. With the timeout, a wedged client is
+    // detected within bounded time and the connection is dropped.
+    let output_task = tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(bytes) => {
+                    if !write_or_timeout(&mut wr, KIND_STREAM_OUT, &bytes).await {
+                        // Client wedged or socket error: try one bounded
+                        // STREAM_END, then give up. If even STREAM_END
+                        // can't get through, dropping `wr` here closes the
+                        // socket — the client observes EOF either way.
+                        let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    // Agent terminated (reader thread saw EOF).
+                    let _ = write_or_timeout(&mut wr, KIND_STREAM_END, &[]).await;
+                    break;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // This subscriber fell behind beyond BROADCAST_CAPACITY.
+                    // Better to disconnect than to deliver corrupted ANSI;
+                    // the client can reattach and replay scrollback. The
+                    // bounded write timeout matters here too: if the client
+                    // also wedged its socket, we still need to drop within
+                    // a known time rather than block on STREAM_END.
+                    let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"lagged").await;
+                    break;
+                }
+            }
+        }
+    });
+
+    // Input loop: STREAM_IN bytes are forwarded to the shared PTY writer;
+    // DETACH (or unknown frame / EOF) ends the loop.
+    loop {
+        match read_frame(&mut rd).await {
+            Ok(Some((KIND_STREAM_IN, bytes))) => {
+                use std::io::Write;
+                let mut w = writer.lock().await;
+                if w.write_all(&bytes).is_err() {
+                    break;
+                }
+                let _ = w.flush();
+            }
+            Ok(Some((KIND_DETACH, _))) => {
+                // Explicit M2.5 detach: client signalled intent to leave the
+                // agent running. Plain socket EOF takes the `Ok(None)` arm
+                // below and is intentionally *not* counted as a detach —
+                // only voluntary detaches bump the registry counter.
+                registry.record_detach();
+                break;
+            }
+            Ok(Some((kind, _))) => {
+                warn!("unexpected frame kind 0x{kind:02x} on attach stream — closing");
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    // Stop the output task; aborting is fine because either we already saw
+    // STREAM_END and the loop exited on its own, or we're detaching and the
+    // client doesn't expect more bytes.
+    output_task.abort();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn frame_round_trip() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_frame(&mut buf, KIND_STREAM_OUT, b"hello")
+            .await
+            .unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let (kind, payload) = read_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(kind, KIND_STREAM_OUT);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[tokio::test]
+    async fn frame_eof_returns_none() {
+        let buf: Vec<u8> = Vec::new();
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(read_frame(&mut cursor).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn frame_partial_header_returns_err() {
+        // 1, 2, 3, 4 bytes followed by EOF must each be reported as a
+        // truncated frame (Err), not a clean disconnect (Ok(None)). Only
+        // 0-bytes-then-EOF is a clean disconnect.
+        for n in 1usize..=4 {
+            let buf: Vec<u8> = vec![0u8; n];
+            let mut cursor = std::io::Cursor::new(buf);
+            let err = read_frame(&mut cursor)
+                .await
+                .expect_err(&format!("expected Err for {n}-byte partial header"));
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::UnexpectedEof,
+                "wrong error kind for {n}-byte partial header"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_partial_body_returns_err() {
+        // Header claims 16 bytes of payload; only 5 supplied before EOF.
+        // The body read must fail as truncated.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.push(KIND_STREAM_OUT);
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        buf.extend_from_slice(b"hello"); // 5 bytes — short
+        let mut cursor = std::io::Cursor::new(buf);
+        let err = read_frame(&mut cursor)
+            .await
+            .expect_err("expected Err for truncated body");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn frame_zero_length_payload() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_frame(&mut buf, KIND_STREAM_END, &[]).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let (kind, payload) = read_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(kind, KIND_STREAM_END);
+        assert!(payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn frame_rejects_oversize() {
+        // Hand-crafted header claiming 32 MiB payload — must be rejected
+        // before any allocation happens.
+        let mut buf: Vec<u8> = vec![KIND_STREAM_OUT];
+        buf.extend_from_slice(&((MAX_FRAME_LEN as u32 + 1).to_be_bytes()));
+        let mut cursor = std::io::Cursor::new(buf);
+        let err = read_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn request_serde_round_trip() {
+        let req = AttachRequest::StartAgent {
+            command: Some("/bin/sh".into()),
+            cwd: None,
+            rows: 24,
+            cols: 80,
+            env: vec![("FOO".into(), "BAR".into())],
+            display_name: Some("auditor".into()),
+            tab_membership: None,
+            agent_type: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            AttachRequest::StartAgent {
+                command,
+                env,
+                display_name,
+                tab_membership,
+                ..
+            } => {
+                assert_eq!(command.as_deref(), Some("/bin/sh"));
+                assert_eq!(env, vec![("FOO".to_string(), "BAR".to_string())]);
+                assert_eq!(display_name.as_deref(), Some("auditor"));
+                assert!(tab_membership.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn start_agent_omits_display_name_when_none() {
+        // Forward compat: older daemons must accept a StartAgent payload
+        // that doesn't carry `display_name`, and the field must not be
+        // present in JSON when it's None.
+        let req = AttachRequest::StartAgent {
+            command: Some("/bin/sh".into()),
+            cwd: None,
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            display_name: None,
+            tab_membership: None,
+            agent_type: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("display_name"),
+            "display_name=None should be omitted from the wire payload"
+        );
+        assert!(
+            !v.as_object().unwrap().contains_key("tab_membership"),
+            "tab_membership=None should be omitted from the wire payload"
+        );
+        assert!(
+            !v.as_object().unwrap().contains_key("agent_type"),
+            "agent_type=None should be omitted from the wire payload"
+        );
+    }
+
+    #[test]
+    fn start_agent_with_mode_tab_membership_round_trip() {
+        // PRD #76 M2.12: tab_membership round-trips through the wire format
+        // and survives `serde_json::from_str` on a foreign client.
+        let req = AttachRequest::StartAgent {
+            command: Some("claude".into()),
+            cwd: Some("/work".into()),
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            display_name: Some("k8s-ops".into()),
+            tab_membership: Some(TabMembership::Mode {
+                name: "k8s-ops".into(),
+            }),
+            agent_type: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Wire shape sanity: tagged enum with snake_case kind.
+        assert_eq!(v["tab_membership"]["kind"], "mode");
+        assert_eq!(v["tab_membership"]["name"], "k8s-ops");
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            AttachRequest::StartAgent { tab_membership, .. } => {
+                assert_eq!(
+                    tab_membership,
+                    Some(TabMembership::Mode {
+                        name: "k8s-ops".into()
+                    })
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn start_agent_with_orchestration_tab_membership_round_trip() {
+        let req = AttachRequest::StartAgent {
+            command: Some("claude".into()),
+            cwd: Some("/work".into()),
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            display_name: Some("coder".into()),
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "tdd-cycle".into(),
+                role_index: 2,
+            }),
+            agent_type: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["tab_membership"]["kind"], "orchestration");
+        assert_eq!(v["tab_membership"]["name"], "tdd-cycle");
+        assert_eq!(v["tab_membership"]["role_index"], 2);
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            AttachRequest::StartAgent { tab_membership, .. } => {
+                assert_eq!(
+                    tab_membership,
+                    Some(TabMembership::Orchestration {
+                        name: "tdd-cycle".into(),
+                        role_index: 2,
+                    })
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn agent_record_with_tab_membership_round_trip() {
+        // PRD #76 M2.12: the daemon's echo via `list_agents` must serialize
+        // tab_membership so the TUI can rebuild tabs on reconnect. Older
+        // clients ignore the unknown field; older daemons omit it (None).
+        let rec = AgentRecord {
+            id: "7".into(),
+            pane_id_env: Some("pid-7".into()),
+            display_name: Some("coder".into()),
+            cwd: Some("/work".into()),
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "tdd-cycle".into(),
+                role_index: 1,
+            }),
+            agent_type: None,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tab_membership, rec.tab_membership);
+    }
+
+    #[test]
+    fn agent_record_omits_tab_membership_when_none() {
+        let rec = AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("tab_membership"),
+            "tab_membership=None should be omitted from the wire payload"
+        );
+        let back: AgentRecord =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert!(back.tab_membership.is_none());
+    }
+
+    #[test]
+    fn agent_record_without_tab_membership_field_deserializes() {
+        // Forward compat: an older daemon that doesn't know about
+        // tab_membership omits the field. A newer TUI must deserialize the
+        // payload with `tab_membership: None` and treat the agent as a
+        // dashboard pane on hydration.
+        let json = r#"{"id":"1","display_name":"foo","cwd":"/tmp"}"#;
+        let rec: AgentRecord = serde_json::from_str(json).unwrap();
+        assert!(rec.tab_membership.is_none());
+    }
+
+    #[test]
+    fn start_agent_deserializes_old_client_shape_without_tab_membership() {
+        // M2.12 fixup auditor #4: explicit compat test using a
+        // hand-crafted JSON literal in the *old* client shape — no
+        // `tab_membership` field at all. A newer daemon must accept
+        // the payload and decode `tab_membership: None`. Asserting via
+        // round-trip of the current struct doesn't catch this: it'd
+        // serialize the (`skip_serializing_if = None`) field as
+        // absent, but only because our struct produces that shape.
+        // This test pins the actual wire surface an older client
+        // would send.
+        let json = r#"{
+            "op": "start-agent",
+            "command": "/bin/sh",
+            "cwd": "/tmp",
+            "rows": 24,
+            "cols": 80,
+            "env": [],
+            "display_name": "auditor"
+        }"#;
+        let req: AttachRequest = serde_json::from_str(json).unwrap();
+        match req {
+            AttachRequest::StartAgent {
+                command,
+                cwd,
+                display_name,
+                tab_membership,
+                rows,
+                cols,
+                ..
+            } => {
+                assert_eq!(command.as_deref(), Some("/bin/sh"));
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+                assert_eq!(display_name.as_deref(), Some("auditor"));
+                assert_eq!(rows, 24);
+                assert_eq!(cols, 80);
+                assert!(
+                    tab_membership.is_none(),
+                    "old-client payload without tab_membership must decode as None"
+                );
+            }
+            _ => panic!("expected StartAgent variant, got {req:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_record_deserializes_old_daemon_shape_without_tab_membership() {
+        // M2.12 fixup auditor #4 (sibling case): hand-crafted JSON
+        // literal in the *old* daemon shape — `AgentRecord` without a
+        // `tab_membership` field. A newer TUI must accept the payload
+        // and decode `tab_membership: None`, treating the agent as a
+        // dashboard pane on hydration.
+        let json = r#"{
+            "id": "42",
+            "pane_id_env": "pid-42",
+            "display_name": "auditor",
+            "cwd": "/work"
+        }"#;
+        let rec: AgentRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.id, "42");
+        assert_eq!(rec.pane_id_env.as_deref(), Some("pid-42"));
+        assert_eq!(rec.display_name.as_deref(), Some("auditor"));
+        assert_eq!(rec.cwd.as_deref(), Some("/work"));
+        assert!(
+            rec.tab_membership.is_none(),
+            "old-daemon record without tab_membership must decode as None"
+        );
+    }
+
+    #[test]
+    fn set_agent_label_serde_round_trip() {
+        let req = AttachRequest::SetAgentLabel {
+            id: "7".into(),
+            display_name: Some("coder".into()),
+            cwd: Some("/tmp/work".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["op"], "set-agent-label");
+        assert_eq!(v["id"], "7");
+        assert_eq!(v["display_name"], "coder");
+        assert_eq!(v["cwd"], "/tmp/work");
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            AttachRequest::SetAgentLabel {
+                id,
+                display_name,
+                cwd,
+            } => {
+                assert_eq!(id, "7");
+                assert_eq!(display_name.as_deref(), Some("coder"));
+                assert_eq!(cwd.as_deref(), Some("/tmp/work"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn resize_request_serde_round_trip() {
+        // Wire shape must be `op = "resize"` (kebab-case) so existing
+        // dispatcher matches the same way as start-agent / stop-agent.
+        let req = AttachRequest::Resize {
+            id: "agent-7".into(),
+            rows: 50,
+            cols: 200,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["op"], "resize");
+        assert_eq!(v["id"], "agent-7");
+        assert_eq!(v["rows"], 50);
+        assert_eq!(v["cols"], 200);
+
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            AttachRequest::Resize { id, rows, cols } => {
+                assert_eq!(id, "agent-7");
+                assert_eq!(rows, 50);
+                assert_eq!(cols, 200);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn subscribe_events_request_serde_round_trip() {
+        // PRD #76 M2.17: SubscribeEvents has no payload fields, so the
+        // wire shape is just `{"op": "subscribe-events"}`. Older daemons
+        // would respond with `expected REQ frame, got kind 0x...` —
+        // adding the variant doesn't break the existing dispatch.
+        let req = AttachRequest::SubscribeEvents;
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["op"], "subscribe-events");
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, AttachRequest::SubscribeEvents));
+    }
+
+    #[tokio::test]
+    async fn kind_event_frame_round_trip() {
+        // The KIND_EVENT payload is a JSON-encoded BroadcastMsg
+        // (PRD #76 M2.17 / M2.19 — the Event variant wraps the
+        // legacy AgentEvent shape; the Delegate variant carries
+        // orchestrator delegate signals across the external-daemon
+        // hop). Pin the round-trip for both variants here so a future
+        // structural change doesn't silently break wire compatibility
+        // for remote-mode TUIs.
+        use crate::event::{AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType};
+        use chrono::Utc;
+        use std::collections::HashMap;
+
+        let event = AgentEvent {
+            session_id: "sess-1".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::ToolStart,
+            tool_name: Some("Read".into()),
+            tool_detail: Some("src/main.rs".into()),
+            cwd: Some("/work".into()),
+            timestamp: Utc::now(),
+            user_prompt: Some("fix the login bug".into()),
+            metadata: HashMap::new(),
+            pane_id: Some("7".into()),
+        };
+        let payload = serde_json::to_vec(&BroadcastMsg::Event(event)).unwrap();
+
+        // Pin the on-wire JSON shape. A self-symmetric round-trip
+        // would pass even if someone renamed `#[serde(tag = "kind")]`
+        // to `tag = "type"` or renamed the `Event` variant rename
+        // from `"event"`. Spell the contract out so a future
+        // structural rename trips the test.
+        //
+        // The TUI's `apply_event` reads `tool_detail`, `cwd`,
+        // `timestamp`, and `user_prompt` in addition to the discriminator
+        // fields, so pin those too — a self-symmetric round-trip would
+        // otherwise hide a rename or omission that breaks the remote UI.
+        let wire: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(wire["kind"], "event");
+        assert_eq!(wire["session_id"], "sess-1");
+        assert_eq!(wire["agent_type"], "claude_code");
+        assert_eq!(wire["event_type"], "tool_start");
+        assert_eq!(wire["tool_name"], "Read");
+        assert_eq!(wire["tool_detail"], "src/main.rs");
+        assert_eq!(wire["cwd"], "/work");
+        assert!(wire["timestamp"].is_string());
+        assert_eq!(wire["user_prompt"], "fix the login bug");
+        assert_eq!(wire["pane_id"], "7");
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_frame(&mut buf, KIND_EVENT, &payload).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let (kind, body) = read_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(kind, KIND_EVENT);
+        let back: BroadcastMsg = serde_json::from_slice(&body).unwrap();
+        match back {
+            BroadcastMsg::Event(e) => {
+                assert_eq!(e.session_id, "sess-1");
+                assert_eq!(e.event_type, EventType::ToolStart);
+                assert_eq!(e.tool_name.as_deref(), Some("Read"));
+                assert_eq!(e.pane_id.as_deref(), Some("7"));
+            }
+            BroadcastMsg::Delegate(_) => panic!("expected Event variant"),
+        }
+
+        let signal = DelegateSignal {
+            pane_id: "orch-7".into(),
+            task: "implement X".into(),
+            to: vec!["coder".into(), "reviewer".into()],
+            timestamp: Utc::now(),
+        };
+        let payload = serde_json::to_vec(&BroadcastMsg::Delegate(signal)).unwrap();
+
+        // Same wire-shape pin for the Delegate variant.
+        let wire: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(wire["kind"], "delegate");
+        assert_eq!(wire["pane_id"], "orch-7");
+        assert_eq!(wire["task"], "implement X");
+        assert_eq!(
+            wire["to"],
+            serde_json::json!(["coder".to_string(), "reviewer".to_string()])
+        );
+        assert!(wire["timestamp"].is_string());
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_frame(&mut buf, KIND_EVENT, &payload).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let (_, body) = read_frame(&mut cursor).await.unwrap().unwrap();
+        let back: BroadcastMsg = serde_json::from_slice(&body).unwrap();
+        match back {
+            BroadcastMsg::Delegate(s) => {
+                assert_eq!(s.pane_id, "orch-7");
+                assert_eq!(s.task, "implement X");
+                assert_eq!(s.to, vec!["coder".to_string(), "reviewer".to_string()]);
+            }
+            BroadcastMsg::Event(_) => panic!("expected Delegate variant"),
+        }
+    }
+
+    #[test]
+    fn response_helpers() {
+        let r = AttachResponse::ok();
+        assert!(r.ok);
+        assert!(r.error.is_none());
+
+        let r = AttachResponse::err("nope");
+        assert!(!r.ok);
+        assert_eq!(r.error.as_deref(), Some("nope"));
+
+        let r = AttachResponse::agents(vec!["1".into(), "2".into()]);
+        assert!(r.ok);
+        assert_eq!(
+            r.agents.as_deref(),
+            Some(&["1".to_string(), "2".to_string()][..])
+        );
+
+        let r = AttachResponse::with_id("42".into());
+        assert!(r.ok);
+        assert_eq!(r.id.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn hello_request_serde_round_trip() {
+        // PRD #76 M2.21: pin the on-wire JSON shape so a future structural
+        // change to the AttachRequest enum trips the test rather than
+        // silently breaking the handshake. Mirrors the
+        // `kind_event_frame_round_trip` precedent.
+        let req = AttachRequest::Hello {
+            client_version: PROTOCOL_VERSION,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["op"], "hello");
+        assert_eq!(v["client_version"], PROTOCOL_VERSION);
+
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            AttachRequest::Hello { client_version } => {
+                assert_eq!(client_version, PROTOCOL_VERSION);
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_response_serde_round_trip() {
+        let resp = AttachResponse::hello(PROTOCOL_VERSION);
+        let json = serde_json::to_string(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["server_version"], PROTOCOL_VERSION);
+
+        let back: AttachResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.server_version, Some(PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn response_omits_server_version_when_none() {
+        // Forward compat: an unrelated response (e.g. list-agents) must NOT
+        // carry `server_version` on the wire. Pre-M2.21 clients/daemons
+        // ignore the field; newer clients use its absence as the signal to
+        // treat the peer as protocol-too-old.
+        let resp = AttachResponse::ok();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("server_version"),
+            "server_version=None should be omitted from the wire payload"
+        );
+    }
+
+    #[test]
+    fn response_deserializes_legacy_shape_without_server_version() {
+        // A pre-M2.21 daemon never emits `server_version`. A newer client
+        // must accept the payload and decode the field as None — which is
+        // what the protocol-mismatch logic looks for to detect "remote too
+        // old to know about the handshake".
+        let json = r#"{"ok":true}"#;
+        let resp: AttachResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert!(resp.server_version.is_none());
+    }
+
+    #[tokio::test]
+    async fn daemon_hello_dispatch_returns_protocol_version_regardless_of_client_version() {
+        // PRD #76 M2.21: the daemon never rejects on client_version — it
+        // always echoes its own PROTOCOL_VERSION. Probe the dispatcher
+        // end-to-end via a connected pair of UnixStreams, sending a
+        // deliberately bogus client_version to confirm the daemon ignores it.
+        use crate::agent_pty::AgentPtyRegistry;
+        use std::sync::Arc;
+        use tokio::net::UnixStream;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+
+        let server_task = tokio::spawn(async move {
+            handle_connection(server, registry, event_tx).await.unwrap();
+        });
+
+        let (mut rd, mut wr) = client.into_split();
+        let req = AttachRequest::Hello {
+            client_version: 99, // deliberately not PROTOCOL_VERSION
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        write_frame(&mut wr, KIND_REQ, &payload).await.unwrap();
+
+        let (kind, body) = read_frame(&mut rd).await.unwrap().unwrap();
+        assert_eq!(kind, KIND_RESP);
+        let resp: AttachResponse = serde_json::from_slice(&body).unwrap();
+        assert!(resp.ok);
+        assert_eq!(
+            resp.server_version,
+            Some(PROTOCOL_VERSION),
+            "daemon must echo its own PROTOCOL_VERSION, not the client's value"
+        );
+
+        drop(wr);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn daemon_hello_dispatch_handles_u32_max_client_version() {
+        // Audit P3: explicit coverage of the serde boundary. `u32::MAX` is
+        // the largest value `client_version` can hold; the daemon must
+        // accept it and still echo its own `PROTOCOL_VERSION` (the
+        // dispatcher ignores `client_version` by design — only the client
+        // side decides on version compatibility).
+        use crate::agent_pty::AgentPtyRegistry;
+        use std::sync::Arc;
+        use tokio::net::UnixStream;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+
+        let server_task = tokio::spawn(async move {
+            handle_connection(server, registry, event_tx).await.unwrap();
+        });
+
+        let (mut rd, mut wr) = client.into_split();
+        let req = AttachRequest::Hello {
+            client_version: u32::MAX,
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        write_frame(&mut wr, KIND_REQ, &payload).await.unwrap();
+
+        let (kind, body) = read_frame(&mut rd).await.unwrap().unwrap();
+        assert_eq!(kind, KIND_RESP);
+        let resp: AttachResponse = serde_json::from_slice(&body).unwrap();
+        assert!(resp.ok);
+        assert_eq!(
+            resp.server_version,
+            Some(PROTOCOL_VERSION),
+            "daemon must echo its own PROTOCOL_VERSION even at the u32::MAX boundary"
+        );
+
+        drop(wr);
+        let _ = server_task.await;
+    }
+}

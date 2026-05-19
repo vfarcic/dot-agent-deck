@@ -1,31 +1,173 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use portable_pty::PtySize;
 
 use std::any::Any;
 
+use crate::agent_pty::{self, AgentPty, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership};
+use crate::daemon_client::{AttachConnection, DaemonClient, StartAgentOptions};
+use crate::event::AgentType;
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
-use crate::pane::{PaneController, PaneDirection, PaneError, PaneInfo};
+use crate::pane::{
+    AgentSpawnOptions, PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome,
+};
 
-/// State for a single embedded terminal pane.
-struct Pane {
+/// Result of [`EmbeddedPaneController::hydrate_from_daemon`]. One entry per
+/// daemon-side agent that was successfully reconnected on TUI bootstrap; the
+/// caller uses the pair to register the pane with [`crate::state::AppState`]
+/// and seed the UI's display-name maps. Agents that fail to attach (e.g.
+/// terminated between list and attach) are not represented here.
+#[derive(Debug, Clone)]
+pub struct HydratedPane {
+    /// Local pane id assigned by the controller.
+    pub pane_id: String,
+    /// Daemon-side agent id this pane is attached to.
+    pub agent_id: String,
+    /// Display name as last stored on the daemon (M2.11). `None` means
+    /// either the agent was started without a name or the daemon ran an
+    /// older binary that didn't persist it. Callers fall back to
+    /// `agent_id` in that case.
+    pub display_name: Option<String>,
+    /// Working directory captured at spawn time on the daemon (M2.11).
+    /// `None` mirrors the same forward-compat reasoning as `display_name`.
+    pub cwd: Option<String>,
+    /// Which tab the agent belonged to at spawn time (PRD #76 M2.12).
+    /// Drives the hydration partition in `ui.rs`: `None` → dashboard,
+    /// `Some(Mode { ... })` → mode tab rebuild, `Some(Orchestration {
+    /// ... })` → orchestration tab rebuild. `None` is also the
+    /// older-daemon fallback (the field is omitted from the wire shape
+    /// via `skip_serializing_if`), which keeps every legacy agent on
+    /// the dashboard — same behavior as before M2.12.
+    pub tab_membership: Option<TabMembership>,
+    /// Which AI agent the daemon recorded for this pane at spawn time
+    /// (PRD #76 M2.13). Threaded into `insert_placeholder_session` so
+    /// the hydrated session's `agent_type` reflects the daemon's known
+    /// value instead of defaulting to `AgentType::None` (which the
+    /// dashboard renders as "No agent"). `None` means either the daemon
+    /// is older / didn't persist the field, or the spawn command wasn't
+    /// recognized as an agent by [`AgentType::from_command`].
+    pub agent_type: Option<AgentType>,
+}
+
+/// PTY-backed pane state: this process owns the PTY master and child. The
+/// historical (and only) backend before M1.3.
+struct PtyBackend {
     /// Writer to send input to the PTY.
     writer: Box<dyn std::io::Write + Send>,
-    /// Parsed terminal screen (vt100).
-    screen: Arc<Mutex<vt100::Parser>>,
     /// The child process handle.
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Master PTY handle (kept alive for resize).
     master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+/// Commands the per-pane I/O task drains from `input_rx`. `Input` carries
+/// raw keystroke bytes that get framed as `KIND_STREAM_IN`. `Detach`
+/// triggers an explicit `KIND_DETACH` frame and ends the writer half of the
+/// task — used by the M2.5 explicit-detach keybinding so the daemon can
+/// distinguish voluntary detach from abrupt disconnect (PRD #76, M2.5).
+enum StreamCmd {
+    Input(Vec<u8>),
+    Detach,
+}
+
+/// Stream-backed pane state (PRD #76, M1.3): the PTY lives in the daemon,
+/// and this side owns one [`crate::daemon_client::AttachConnection`] per
+/// pane. Bytes flow daemon → STREAM_OUT → vt100 parser; keystrokes flow
+/// vt100 → input channel → STREAM_IN → daemon. The daemon-side agent
+/// outlives the TUI by design (PRD line 199), so dropping this struct is
+/// implicit detach (the `io_task` stops draining and the socket closes —
+/// the daemon's input-loop treats EOF as DETACH). Sending `stop-agent` is
+/// reserved for the explicit user-driven Ctrl+W close path in `close_pane`.
+struct StreamBackend {
+    /// Daemon-side agent id used for `stop-agent` on close.
+    agent_id: String,
+    /// Channel drained by the per-pane I/O task. `Input` becomes one
+    /// `KIND_STREAM_IN` frame on the wire; `Detach` becomes one
+    /// `KIND_DETACH` frame and ends the writer. Unbounded because the TUI
+    /// keystroke rate is human-paced; backpressure here would block the
+    /// input thread for no benefit.
+    input_tx: tokio::sync::mpsc::UnboundedSender<StreamCmd>,
+    /// Owns the I/O task. The `Option` exists so `detach_pane` can `take()`
+    /// the handle, await the writer briefly so the `KIND_DETACH` frame
+    /// flushes, and then drop. On plain `Drop` (TUI exit / pane close) the
+    /// handle is aborted instead, which closes the attach socket and the
+    /// daemon sees EOF — implicit detach (M1.3 survival property).
+    io_task: Option<tokio::task::JoinHandle<()>>,
+    /// Tokio handle so the (blocking) `close_pane` path can issue
+    /// `stop-agent` over a fresh short-lived connection. Also used by the
+    /// M2.5 detach path to await the writer briefly while the explicit
+    /// `KIND_DETACH` frame is flushed before the socket is dropped.
+    runtime: tokio::runtime::Handle,
+    /// Daemon attach socket path used to build the `stop-agent` connection
+    /// — held here rather than referenced from the controller because the
+    /// pane outlives any borrow of the controller's path.
+    daemon_path: PathBuf,
+    /// Single-slot coalescing channel for resize requests. Each
+    /// `resize_pane_pty` overwrites the latest `(rows, cols)` here; the
+    /// per-pane `resize_task` reads the most recent value and dispatches
+    /// it to the daemon. Intermediate values during rapid layout churn
+    /// are dropped on the floor — only the latest size is sent on the
+    /// wire (PRD #76 M2.10 audit follow-up).
+    resize_tx: tokio::sync::watch::Sender<Option<(u16, u16)>>,
+    /// Per-pane resize worker. Aborted on `Drop` so a pane removal can't
+    /// leak a task or an in-flight daemon connection past the pane's
+    /// lifetime. The worker would also exit on its own when `resize_tx`
+    /// drops (the receiver's `changed()` returns `Err`), but explicitly
+    /// aborting bounds the cleanup window.
+    resize_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+enum PaneBackend {
+    Pty(PtyBackend),
+    Stream(StreamBackend),
+}
+
+impl Drop for StreamBackend {
+    /// Plain drop = implicit detach (PRD #76 line 199 — agents survive the
+    /// TUI). Aborting the io_task closes the attach socket; the daemon
+    /// sees EOF on its read half and treats it as a detach. The
+    /// `stop-agent` path lives only in `close_pane` for the explicit
+    /// Ctrl+W close.
+    fn drop(&mut self) {
+        if let Some(h) = self.io_task.take() {
+            h.abort();
+        }
+        // The resize worker would exit on its own once `resize_tx` drops
+        // (its receiver's `changed()` returns `Err`), but it might be mid
+        // I/O against the daemon when that happens. Aborting here bounds
+        // the cleanup window so a slow daemon can't keep the worker (and
+        // its open socket FD) alive past pane removal.
+        if let Some(h) = self.resize_task.take() {
+            h.abort();
+        }
+    }
+}
+
+/// State for a single embedded terminal pane.
+struct Pane {
+    /// Either a locally-owned PTY or a connection to a daemon-managed agent.
+    backend: PaneBackend,
+    /// Parsed terminal screen (vt100). Shared between the renderer and the
+    /// background producer task (PTY reader thread or stream-backed I/O
+    /// task).
+    screen: Arc<Mutex<vt100::Parser>>,
     /// Display name for this pane.
     name: String,
     /// Whether this pane is currently focused.
     is_focused: bool,
     /// The command that was used to create this pane.
     command: Option<String>,
+    /// Working directory recorded at spawn time (M2.11). Cached here so the
+    /// rename flow can re-send it alongside the new display_name in
+    /// `set_agent_label` — the daemon-side API uses `None to clear`
+    /// semantics, so callers that want to update one field must echo
+    /// the other.
+    cwd: Option<String>,
     /// Whether the child app has enabled mouse reporting (e.g., TUI apps like opencode).
     mouse_mode: Arc<AtomicBool>,
     /// Hyperlink URLs extracted from OSC 8 escape sequences, keyed by screen row.
@@ -56,13 +198,28 @@ fn encode_pane_payload(text: &str) -> Vec<u8> {
 /// same applies after a bracketed-paste close marker. 150ms tuned empirically.
 const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// Selects how `create_pane` builds new panes:
+/// - `LocalDeck` spawns a PTY in this process (unchanged from pre-M1.3).
+/// - `RemoteDeckLocal` issues `start-agent` + `attach-stream` against the
+///   daemon at the given socket path. PRD #76, M1.3.
+enum ControllerMode {
+    LocalDeck,
+    RemoteDeckLocal {
+        client: DaemonClient,
+        runtime: tokio::runtime::Handle,
+    },
+}
+
 /// Embedded terminal pane controller using portable-pty + vt100.
 ///
 /// Replaces `ZellijController` by spawning PTY processes directly and parsing
-/// their output with a VT100 terminal emulator.
+/// their output with a VT100 terminal emulator. In M1.3's `RemoteDeckLocal`
+/// mode, panes are stream-backed against the daemon's M1.2 attach protocol
+/// instead — same vt100-based render path, different byte source.
 pub struct EmbeddedPaneController {
     panes: PaneRegistry,
     next_id: Arc<Mutex<u64>>,
+    mode: ControllerMode,
 }
 
 impl Default for EmbeddedPaneController {
@@ -76,7 +233,36 @@ impl EmbeddedPaneController {
         Self {
             panes: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(1)),
+            mode: ControllerMode::LocalDeck,
         }
+    }
+
+    /// Build a controller whose panes are stream-backed against the daemon
+    /// at `socket_path`. Caller is responsible for ensuring the daemon is
+    /// actually running — `DaemonClient::ensure_socket_exists` is the
+    /// recommended pre-flight from `main`.
+    pub fn with_remote_deck(socket_path: PathBuf, runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            panes: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(Mutex::new(1)),
+            mode: ControllerMode::RemoteDeckLocal {
+                client: DaemonClient::new(socket_path),
+                runtime,
+            },
+        }
+    }
+
+    /// Returns true when this controller is backed by an external daemon
+    /// (i.e. agent children live in the daemon process, not this TUI).
+    ///
+    /// The TUI exit / Quit teardown path uses this to skip closing
+    /// orchestration panes: in external-daemon mode the daemon owns the
+    /// agent children and pane Drop closes the attach sockets cleanly,
+    /// which the daemon treats as implicit detach — agents survive.
+    /// In `LocalDeck` mode the panes are local PTYs that would leak past
+    /// TUI exit if not torn down.
+    pub fn is_external_daemon(&self) -> bool {
+        matches!(self.mode, ControllerMode::RemoteDeckLocal { .. })
     }
 
     /// Access the vt100 screen for a pane (used by the terminal widget for rendering).
@@ -109,12 +295,25 @@ impl EmbeddedPaneController {
     }
 
     /// Write raw bytes directly to a pane's PTY stdin without appending CR.
-    /// Used for interactive keyboard input forwarding.
+    /// Used for interactive keyboard input forwarding. For stream-backed
+    /// panes the bytes are queued for the per-pane I/O task to forward as
+    /// `STREAM_IN` on the wire.
     pub fn write_raw_bytes(&self, pane_id: &str, bytes: &[u8]) -> Result<(), PaneError> {
         let mut panes = self.panes.lock().unwrap();
         if let Some(pane) = panes.get_mut(pane_id) {
-            pane.writer.write_all(bytes).map_err(PaneError::Io)?;
-            pane.writer.flush().map_err(PaneError::Io)?;
+            match &mut pane.backend {
+                PaneBackend::Pty(p) => {
+                    p.writer.write_all(bytes).map_err(PaneError::Io)?;
+                    p.writer.flush().map_err(PaneError::Io)?;
+                }
+                PaneBackend::Stream(s) => {
+                    if s.input_tx.send(StreamCmd::Input(bytes.to_vec())).is_err() {
+                        return Err(PaneError::CommandFailed(format!(
+                            "Pane {pane_id} stream I/O task ended"
+                        )));
+                    }
+                }
+            }
             Ok(())
         } else {
             Err(PaneError::CommandFailed(format!(
@@ -150,20 +349,40 @@ impl EmbeddedPaneController {
         }
     }
 
-    /// Resize a pane's PTY and VT100 parser to the given dimensions.
+    /// Resize a pane's PTY and VT100 parser to the given dimensions. For
+    /// stream-backed panes, the local vt100 parser is resized synchronously
+    /// and the new dimensions are written to a per-pane single-slot
+    /// coalescing channel (PRD #76, M2.10): the per-pane `resize_task`
+    /// drains the latest value and forwards a `Resize` op to the daemon
+    /// with a bounded timeout. Intermediate values during rapid layout
+    /// churn are dropped on the floor — only the latest size reaches the
+    /// wire, with at most one in-flight daemon connection per pane.
     pub fn resize_pane_pty(&self, pane_id: &str, rows: u16, cols: u16) -> Result<(), PaneError> {
         let panes = self.panes.lock().unwrap();
         let pane = panes
             .get(pane_id)
             .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
-        pane.master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| PaneError::CommandFailed(format!("PTY resize failed: {e}")))?;
+        match &pane.backend {
+            PaneBackend::Pty(p) => {
+                p.master
+                    .resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .map_err(|e| PaneError::CommandFailed(format!("PTY resize failed: {e}")))?;
+            }
+            PaneBackend::Stream(s) => {
+                // `send_replace` overwrites whatever value was pending and
+                // ignores the no-receivers case (the worker would only be
+                // gone if the pane was being torn down — losing the resize
+                // is the right outcome there). The watch channel cannot
+                // block, so this returns immediately and never holds the
+                // pane lock across daemon I/O.
+                let _ = s.resize_tx.send_replace(Some((rows, cols)));
+            }
+        }
         if let Ok(mut parser) = pane.screen.lock() {
             parser.screen_mut().set_size(rows, cols);
         }
@@ -201,6 +420,851 @@ impl EmbeddedPaneController {
         *id += 1;
         current.to_string()
     }
+
+    /// Build a PTY-backed pane (default `LocalDeck` mode). Behavior is
+    /// byte-identical to the pre-M1.3 path — extracted from `create_pane`
+    /// so the M1.3 `RemoteDeckLocal` mode can sit alongside it without
+    /// disturbing this branch.
+    fn create_local_pane(
+        &self,
+        pane_id: String,
+        command: Option<&str>,
+        cwd: Option<&str>,
+        display_name: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<String, PaneError> {
+        // Tag the spawned process so hooks can identify which pane it belongs to.
+        let env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
+
+        let AgentPty {
+            child,
+            master,
+            writer,
+            mut reader,
+        } = agent_pty::spawn(SpawnOptions {
+            command,
+            cwd,
+            display_name: None,
+            // PRD #76 M2.15: open the PTY at the caller-supplied viewport
+            // dimensions instead of the legacy 24×80. The TUI computes
+            // these from `terminal.get_frame().area()` + the layout the
+            // pane is about to land in, so the agent's first frame draws
+            // at the eventual size rather than at 24×80 inside a much
+            // larger viewport.
+            rows,
+            cols,
+            env,
+            tab_membership: None,
+            // PRD #76 M2.13: local panes don't need to round-trip
+            // agent_type through a daemon registry (the TUI's own
+            // `AppState::apply_event` populates `agent_type` directly
+            // from hook events). Pass `None` so behavior stays
+            // byte-identical to pre-M2.13 for the local-deck path.
+            agent_type: None,
+        })
+        .map_err(|e| PaneError::CommandFailed(e.to_string()))?;
+
+        // Match the vt100 parser to the PTY dims (PRD #76 M2.15): a 24×80
+        // parser receiving an agent's already-correctly-sized initial frame
+        // would clip it, producing the same "tiny frame in big viewport"
+        // hiccup we just fixed at the PTY end. Resize-time keeps the parser
+        // in sync via `resize_pane_pty`; this only affects the initial frame.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
+        let mouse_mode = Arc::new(AtomicBool::new(false));
+        let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
+
+        // Background thread: pump PTY bytes through the shared output
+        // pipeline. Same processing path the stream-backed I/O task uses
+        // — see `process_agent_output_chunk`.
+        let parser_clone = Arc::clone(&parser);
+        let mouse_mode_clone = Arc::clone(&mouse_mode);
+        let hyperlinks_clone = Arc::clone(&hyperlinks);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut osc8 = Osc8Filter::new();
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => process_agent_output_chunk(
+                        &buf[..n],
+                        &mut osc8,
+                        &parser_clone,
+                        &mouse_mode_clone,
+                        &hyperlinks_clone,
+                    ),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let pane = Pane {
+            backend: PaneBackend::Pty(PtyBackend {
+                writer,
+                child,
+                master,
+            }),
+            screen: parser,
+            // The caller already resolved this value via
+            // `resolve_display_name`, so the local-PTY pane stores the
+            // SAME string the stream path sends to the daemon and the
+            // SAME string the UI mirrors into `ui.pane_display_names`.
+            // No second normalization pass here (PRD #76 M2.11 fixup 4).
+            name: display_name.to_string(),
+            is_focused: false,
+            command: command.map(|c| c.to_string()),
+            cwd: cwd.map(|c| c.to_string()),
+            mouse_mode,
+            hyperlinks,
+        };
+
+        self.panes.lock().unwrap().insert(pane_id.clone(), pane);
+
+        Ok(pane_id)
+    }
+
+    /// Build a stream-backed pane against the daemon (M1.3
+    /// `RemoteDeckLocal` mode). The PTY lives in the daemon; this side
+    /// holds an [`crate::daemon_client::AttachConnection`] and feeds the
+    /// shared vt100 parser from STREAM_OUT bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn create_stream_pane(
+        &self,
+        pane_id: String,
+        command: Option<&str>,
+        cwd: Option<&str>,
+        display_name: &str,
+        tab_membership: Option<TabMembership>,
+        agent_type: Option<AgentType>,
+        rows: u16,
+        cols: u16,
+        client: DaemonClient,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<String, PaneError> {
+        // Same hook-tagging as the local path so daemon-spawned agents
+        // see DOT_AGENT_DECK_PANE_ID and can emit hook events back to
+        // this UI's pane.
+        let env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
+
+        // Already resolved by `create_pane_with_display_name`
+        // (single source of truth via `resolve_display_name`).
+        // Sending it as-is keeps the StartAgent payload identical to the
+        // local Pane.name and the UI maps — fixing the divergence M2.11
+        // fixup-3 reviewer P2 and auditor LOW called out.
+        let label = display_name.to_string();
+
+        let opts = StartAgentOptions {
+            command: command.map(|c| c.to_string()),
+            cwd: cwd.map(|c| c.to_string()),
+            display_name: Some(label.clone()),
+            // PRD #76 M2.15: forward the TUI's real viewport-derived dims
+            // so the daemon opens its PTY at the eventual size. Older
+            // daemons fall back to the serde defaults (24/80) via
+            // `default_rows` / `default_cols`, so this is forward + backward
+            // compatible without a wire-format change.
+            rows,
+            cols,
+            env,
+            tab_membership,
+            agent_type,
+        };
+
+        // Start-agent + attach happen on the daemon's runtime; we
+        // `block_on` here because `create_pane` is called from the TUI's
+        // blocking thread.
+        //
+        // CodeRabbit Fix D: if `start_agent` succeeds the daemon has
+        // already spawned a live PTY + session. A subsequent `attach`
+        // failure would otherwise leak that session — the user never gets
+        // a pane to close it through. Capture the agent id immediately
+        // after start, and on attach error issue a best-effort
+        // `stop_agent` before propagating the original attach failure.
+        //
+        // Fix D fixup (reviewer + auditor P3): each RPC inside the
+        // `block_on` is wrapped in `tokio::time::timeout`. Without these
+        // a wedged same-UID daemon could:
+        //   * hang `start_agent` (no agent created, no cleanup needed —
+        //     surface a TimedOut error),
+        //   * answer `attach` with Err promptly then *never* respond to
+        //     the cleanup `stop_agent`, pinning `create_stream_pane`
+        //     forever on the cleanup await (auditor's specific concern),
+        //   * hang `attach` itself, never reaching the cleanup branch.
+        // Cleanup on `attach` error OR `attach` timeout is best-effort
+        // and bounded by `CREATE_PANE_STOP_TIMEOUT`; the original attach
+        // error (or synthesized timeout error) is what propagates.
+        let daemon_path = client.socket_path().to_path_buf();
+        let client_for_calls = client.clone();
+        let (agent_id, conn) = runtime
+            .block_on(async move {
+                use crate::daemon_client::ClientError;
+
+                let id = match tokio::time::timeout(
+                    CREATE_PANE_START_TIMEOUT,
+                    client_for_calls.start_agent(opts),
+                )
+                .await
+                {
+                    Ok(Ok(id)) => id,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(ClientError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "start_agent timed out after {}ms",
+                                CREATE_PANE_START_TIMEOUT.as_millis()
+                            ),
+                        )));
+                    }
+                };
+
+                // Run attach with a timeout. On Ok(conn) we're done. On
+                // Err OR timeout we fall through to the bounded cleanup
+                // path below.
+                let attach_err: ClientError = match tokio::time::timeout(
+                    CREATE_PANE_ATTACH_TIMEOUT,
+                    client_for_calls.attach(&id),
+                )
+                .await
+                {
+                    Ok(Ok(conn)) => return Ok::<_, ClientError>((id, conn)),
+                    Ok(Err(e)) => e,
+                    Err(_) => ClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "attach timed out after {}ms",
+                            CREATE_PANE_ATTACH_TIMEOUT.as_millis()
+                        ),
+                    )),
+                };
+
+                // Best-effort, bounded cleanup. On failure OR timeout we
+                // log at warn (the daemon-side agent may be leaked) but
+                // always propagate the ORIGINAL attach error so callers
+                // see the real cause, not a cleanup-stage symptom.
+                match tokio::time::timeout(
+                    CREATE_PANE_STOP_TIMEOUT,
+                    client_for_calls.stop_agent(&id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(stop_err)) => tracing::warn!(
+                        agent_id = %id,
+                        error = %stop_err,
+                        "create_stream_pane: stop_agent during attach-failure cleanup failed; daemon-side agent may be leaked"
+                    ),
+                    Err(_) => tracing::warn!(
+                        agent_id = %id,
+                        timeout_ms = CREATE_PANE_STOP_TIMEOUT.as_millis() as u64,
+                        "create_stream_pane: stop_agent during attach-failure cleanup timed out; daemon-side agent may be leaked"
+                    ),
+                }
+
+                Err(attach_err)
+            })
+            .map_err(|e| PaneError::CommandFailed(format!("daemon: {e}")))?;
+
+        let name = label;
+        let command = command.map(|c| c.to_string());
+        let cwd_stored = cwd.map(|c| c.to_string());
+        self.wire_stream_pane(
+            pane_id.clone(),
+            agent_id,
+            conn,
+            name,
+            command,
+            cwd_stored,
+            rows,
+            cols,
+            runtime,
+            daemon_path,
+        );
+        Ok(pane_id)
+    }
+
+    /// Internal helper that takes an already-resolved `agent_id` plus an
+    /// active [`AttachConnection`] and stitches together the local-side
+    /// pane state: vt100 parser, mouse-mode flag, hyperlink map, the input
+    /// channel + writer task, and the per-pane resize worker. Pulled out
+    /// of `create_stream_pane` so the M2.x rehydration path
+    /// (`hydrate_from_daemon`) can reuse the exact same wiring without
+    /// re-issuing `start-agent`. Behavior on the wire is identical: the
+    /// daemon replays its scrollback snapshot via STREAM_OUT before live
+    /// bytes (see `daemon_protocol::handle_attach_stream`), so a hydrated
+    /// pane renders the agent's current screen on first paint.
+    #[allow(clippy::too_many_arguments)]
+    fn wire_stream_pane(
+        &self,
+        pane_id: String,
+        agent_id: String,
+        conn: AttachConnection,
+        name: String,
+        command: Option<String>,
+        cwd: Option<String>,
+        rows: u16,
+        cols: u16,
+        runtime: tokio::runtime::Handle,
+        daemon_path: PathBuf,
+    ) {
+        // PRD #76 M2.15: size the local vt100 parser to match the dims the
+        // daemon's PTY was opened at (spawn) or last resized to (hydration).
+        // A 24×80 parser receiving an already-correctly-sized frame would
+        // clip it; resize-time keeps both sides in sync via the per-pane
+        // resize worker + `resize_pane_pty`.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
+        let mouse_mode = Arc::new(AtomicBool::new(false));
+        let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
+
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCmd>();
+        let (resize_tx, resize_rx) = tokio::sync::watch::channel::<Option<(u16, u16)>>(None);
+
+        // Per-pane resize worker: at-most-one in-flight daemon Resize per
+        // pane, with intermediate values coalesced via the watch channel.
+        // Survives until either `resize_tx` drops (pane removed) or the
+        // worker is aborted by `StreamBackend::drop`. See the comment on
+        // `resize_pane_pty` for the full rationale.
+        let resize_task = runtime.spawn(resize_worker(
+            resize_rx,
+            daemon_path.clone(),
+            agent_id.clone(),
+        ));
+
+        let parser_for_task = Arc::clone(&parser);
+        let mouse_mode_for_task = Arc::clone(&mouse_mode);
+        let hyperlinks_for_task = Arc::clone(&hyperlinks);
+
+        let io_task = runtime.spawn(async move {
+            let (mut rd, mut wr) = conn.into_split();
+
+            // Reader half: STREAM_OUT → process pipeline.
+            let reader = async {
+                let mut osc8 = Osc8Filter::new();
+                loop {
+                    match crate::daemon_protocol::read_frame(&mut rd).await {
+                        Ok(None) => break,
+                        Ok(Some((kind, bytes))) => match kind {
+                            crate::daemon_protocol::KIND_STREAM_OUT => {
+                                process_agent_output_chunk(
+                                    &bytes,
+                                    &mut osc8,
+                                    &parser_for_task,
+                                    &mouse_mode_for_task,
+                                    &hyperlinks_for_task,
+                                );
+                            }
+                            crate::daemon_protocol::KIND_STREAM_END => break,
+                            _ => break,
+                        },
+                        Err(_) => break,
+                    }
+                }
+            };
+
+            // Input forwarder: drain the keystroke channel and emit frames.
+            // `Input` becomes one `KIND_STREAM_IN`; `Detach` (M2.5) becomes
+            // one `KIND_DETACH` and ends the writer so the daemon observes
+            // an explicit detach before the socket closes. A failed write
+            // or a closed channel also ends the task — the daemon treats
+            // the resulting EOF as implicit detach (the agent keeps
+            // running).
+            let writer = async {
+                while let Some(cmd) = input_rx.recv().await {
+                    match cmd {
+                        StreamCmd::Input(bytes) => {
+                            if crate::daemon_protocol::write_frame(
+                                &mut wr,
+                                crate::daemon_protocol::KIND_STREAM_IN,
+                                &bytes,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        StreamCmd::Detach => {
+                            // Best-effort: even if the write errors, exiting
+                            // here closes the socket and the daemon will
+                            // observe EOF — the agent still survives.
+                            let _ = crate::daemon_protocol::write_frame(
+                                &mut wr,
+                                crate::daemon_protocol::KIND_DETACH,
+                                &[],
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                }
+            };
+
+            // `select!` ensures whichever half completes first takes the
+            // other down with it: the inactive future is cancelled and
+            // both `rd` and `wr` go out of scope here, releasing the
+            // socket FD deterministically. Without this, a STREAM_END
+            // from the daemon would end the reader but leave the writer
+            // parked on `input_rx.recv()` indefinitely, holding the
+            // socket open until the StreamBackend itself was dropped.
+            tokio::pin!(reader, writer);
+            tokio::select! {
+                _ = &mut reader => {},
+                _ = &mut writer => {},
+            }
+        });
+
+        let pane = Pane {
+            backend: PaneBackend::Stream(StreamBackend {
+                agent_id,
+                input_tx,
+                io_task: Some(io_task),
+                runtime,
+                daemon_path,
+                resize_tx,
+                resize_task: Some(resize_task),
+            }),
+            screen: parser,
+            name,
+            is_focused: false,
+            command,
+            cwd,
+            mouse_mode,
+            hyperlinks,
+        };
+
+        self.panes.lock().unwrap().insert(pane_id, pane);
+    }
+
+    /// Reconnect to every daemon-side agent on TUI bootstrap (PRD #76
+    /// M2.x). In external-daemon mode the agents the user spawned in a
+    /// previous session are still alive in the daemon; without this step
+    /// the dashboard would show "No active sessions" even though the
+    /// daemon owns live PTYs.
+    ///
+    /// For each id returned by `list_agents`, builds a fresh
+    /// `PaneBackend::Stream` and opens an `AttachStream` (no
+    /// `start-agent` — the agent already exists). The daemon replays its
+    /// scrollback snapshot before live bytes, so hydrated panes render
+    /// the agent's current screen on first paint.
+    ///
+    /// Errors are absorbed rather than propagated:
+    /// - `list_agents` failure (transient daemon hiccup): logged at debug,
+    ///   treated as empty. The user can retry by reconnecting.
+    /// - Per-agent `attach` failure (race: the agent terminated between
+    ///   list and attach): logged at debug, that agent is skipped, others
+    ///   continue.
+    /// - In `LocalDeck` mode this is a no-op: the in-process daemon either
+    ///   has no agents yet or shares the same registry as the TUI, so
+    ///   re-discovery is meaningless.
+    ///
+    /// Returns one [`HydratedPane`] per successfully attached agent, in
+    /// the order returned by the daemon. Callers register each pane id
+    /// with [`crate::state::AppState`] and seed the UI's display-name
+    /// maps from `HydratedPane::display_name` (falling back to `agent_id`
+    /// when the daemon has no recorded label — M2.11 added persistence,
+    /// older daemons or unlabelled agents still come back as `None`).
+    pub fn hydrate_from_daemon(&self) -> Vec<HydratedPane> {
+        let (client, runtime) = match &self.mode {
+            ControllerMode::LocalDeck => return Vec::new(),
+            ControllerMode::RemoteDeckLocal { client, runtime } => {
+                (client.clone(), runtime.clone())
+            }
+        };
+
+        // Bounded list_agents call: a parked or hostile same-user daemon
+        // could otherwise hang TUI startup on the blocking `block_on`. On
+        // timeout we treat the result as empty (the user can reconnect)
+        // and emit a debug line so the cause is observable.
+        let list_client = client.clone();
+        let records = match runtime.block_on(async move {
+            tokio::time::timeout(HYDRATE_LIST_TIMEOUT, list_client.list_agents()).await
+        }) {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    error = %e,
+                    "hydrate_from_daemon: list_agents failed, treating as empty"
+                );
+                return Vec::new();
+            }
+            Err(_) => {
+                tracing::debug!(
+                    timeout_ms = HYDRATE_LIST_TIMEOUT.as_millis() as u64,
+                    "hydrate_from_daemon: list_agents timed out, treating as empty"
+                );
+                return Vec::new();
+            }
+        };
+
+        // Cap fan-out so a misbehaving daemon advertising thousands of ids
+        // can't make us open thousands of attach sockets in series. Normal
+        // interactive workloads stay well under this — hitting the cap is
+        // itself a signal worth logging.
+        let mut records = records;
+        if records.len() > HYDRATE_MAX_PANES {
+            tracing::debug!(
+                received = records.len(),
+                cap = HYDRATE_MAX_PANES,
+                "hydrate_from_daemon: agent list exceeded cap, truncating"
+            );
+            records.truncate(HYDRATE_MAX_PANES);
+        }
+
+        let daemon_path = client.socket_path().to_path_buf();
+        let mut hydrated = Vec::new();
+        // Dedup pane ids within this batch (PRD #76 M2.x audit follow-up).
+        // Tracks both reused-from-`pane_id_env` *and* fresh `allocate_id`
+        // outputs so a duplicate `DOT_AGENT_DECK_PANE_ID` from a stale or
+        // hostile daemon (or a value that happens to collide with an id
+        // we already allocated this pass) cannot HashMap::insert-overwrite
+        // an earlier pane in `wire_stream_pane`.
+        let mut used_ids: HashSet<String> = HashSet::new();
+        for record in records {
+            let agent_id = record.id.clone();
+            let client_for_attach = client.clone();
+            let id_for_attach = agent_id.clone();
+            // Bounded per-agent attach: same rationale as the list-agents
+            // timeout above, scaled down because there can be up to
+            // HYDRATE_MAX_PANES of these in series.
+            let attach_result = runtime.block_on(async move {
+                tokio::time::timeout(
+                    HYDRATE_ATTACH_TIMEOUT,
+                    client_for_attach.attach(&id_for_attach),
+                )
+                .await
+            });
+            let conn = match attach_result {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    // Race: agent terminated between list_agents and
+                    // attach, or transient daemon error. Skip this id
+                    // and keep going so a single missing agent doesn't
+                    // sink the rest of the rehydration.
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "hydrate_from_daemon: attach failed, skipping"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        timeout_ms = HYDRATE_ATTACH_TIMEOUT.as_millis() as u64,
+                        "hydrate_from_daemon: attach timed out, skipping"
+                    );
+                    continue;
+                }
+            };
+            // Reuse the daemon-captured `DOT_AGENT_DECK_PANE_ID` when
+            // present so the TUI's local pane id matches whatever the
+            // agent's child process already carries in its env. This is
+            // what lets hook events (delegate / work-done / status)
+            // emitted by the agent route correctly after a reconnect —
+            // see `state::AppState::apply_event`'s managed-pane check.
+            // Older daemons omit this field (`pane_id_env: None`), so we
+            // fall back to allocating a fresh id; that path keeps the
+            // pane visible and the byte stream rendered, but hook
+            // routing won't survive reconnect — same behavior as before
+            // this fix.
+            //
+            // Defense in depth (audit follow-up): re-validate the
+            // daemon-supplied value here too, so an older daemon that
+            // doesn't yet scrub at capture can't poison this client's
+            // pane registry. Same grammar as the daemon-side check.
+            let pane_id = match record.pane_id_env.clone() {
+                Some(id) if agent_pty::is_valid_pane_id_env(&id) && !used_ids.contains(&id) => {
+                    // Bump `next_id` past any reused pane id so a later
+                    // `allocate_id` for a freshly-created pane can't
+                    // collide with one we just rehydrated. Without this,
+                    // the new pane's `insert` would silently replace the
+                    // hydrated one in the HashMap.
+                    if let Ok(parsed) = id.parse::<u64>() {
+                        let mut nxt = self.next_id.lock().unwrap();
+                        if parsed >= *nxt {
+                            *nxt = parsed + 1;
+                        }
+                    }
+                    id
+                }
+                Some(id) => {
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        pane_id_env_len = id.len(),
+                        "hydrate_from_daemon: pane_id_env invalid or duplicate, falling back to allocate_id"
+                    );
+                    self.allocate_id()
+                }
+                None => self.allocate_id(),
+            };
+            used_ids.insert(pane_id.clone());
+            // M2.11: prefer the daemon-stored display_name when present,
+            // falling back to agent_id when older daemons omit it. Pane
+            // metadata (cwd) is also lifted from the record so the
+            // dashboard's cwd column survives a reconnect.
+            let display_name = record.display_name.clone();
+            let cwd_record = record.cwd.clone();
+            let pane_name = display_name.clone().unwrap_or_else(|| agent_id.clone());
+            // PRD #76 M2.15: at hydration time we don't know the daemon's
+            // current PTY dims (the daemon doesn't echo them via
+            // `list_agents`). Seed the local vt100 parser at 24×80 and let
+            // the post-hydration resize sweep in `ui.rs` immediately push
+            // the real viewport dims to the daemon — `resize_pane_pty`
+            // synchronises both sides on its first call.
+            self.wire_stream_pane(
+                pane_id.clone(),
+                agent_id.clone(),
+                conn,
+                pane_name,
+                None,
+                cwd_record.clone(),
+                24,
+                80,
+                runtime.clone(),
+                daemon_path.clone(),
+            );
+            hydrated.push(HydratedPane {
+                pane_id,
+                agent_id,
+                display_name,
+                cwd: cwd_record,
+                tab_membership: record.tab_membership.clone(),
+                agent_type: record.agent_type.clone(),
+            });
+        }
+        hydrated
+    }
+
+    /// Explicit M2.5 detach: tell the daemon "I'm leaving voluntarily,
+    /// keep the agent running." The pane is removed from the registry and
+    /// its writer is given a brief window to flush a `KIND_DETACH` frame
+    /// before the connection closes. After that window the I/O task is
+    /// aborted (via Drop), the socket closes, and the daemon — having
+    /// already seen the explicit detach — keeps the PTY alive.
+    ///
+    /// Differences from [`PaneController::close_pane`]:
+    /// - `close_pane` issues `stop-agent` so the daemon SIGKILLs the child.
+    /// - `detach_pane` issues `KIND_DETACH` so the daemon does *not*.
+    ///
+    /// For PTY-backed panes this is a no-op (the PTY is owned by this
+    /// process; "leaving it running" outside this process is meaningless),
+    /// and an unknown `pane_id` is a soft error so callers iterating across
+    /// all panes don't have to filter first.
+    pub fn detach_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+        let pane = {
+            let mut panes = self.panes.lock().unwrap();
+            match panes.remove(pane_id) {
+                Some(p) => p,
+                None => {
+                    return Err(PaneError::CommandFailed(format!(
+                        "Pane {pane_id} not found"
+                    )));
+                }
+            }
+        };
+        match pane.backend {
+            PaneBackend::Pty(_) => {
+                // Local PTYs can't survive process exit. Treat detach as a
+                // no-op: don't kill the child here (close_pane already
+                // covers that), but don't silently leave the pane in the
+                // registry either — the caller is detaching everything in
+                // preparation for quit, and re-inserting would break that
+                // invariant. Restoring the pane is wrong; dropping it kills
+                // the child via Drop, which matches "we're about to exit."
+                let _ = pane;
+                Ok(())
+            }
+            PaneBackend::Stream(mut s) => {
+                // Surface a closed channel as `CommandFailed` so callers
+                // (e.g. `detach_all_streams`) can include it in their
+                // per-pane error list. Survival is preserved either way:
+                // if the writer task already exited, the socket has
+                // already closed and the daemon has already observed EOF
+                // (implicit detach). The error is purely observability —
+                // the user should know the explicit signal didn't reach
+                // the wire.
+                if s.input_tx.send(StreamCmd::Detach).is_err() {
+                    return Err(PaneError::CommandFailed(format!(
+                        "Pane {pane_id} stream I/O task ended"
+                    )));
+                }
+                if let Some(handle) = s.io_task.take() {
+                    // Hand the runtime a brief window to drain the queued
+                    // `Detach` and put the `KIND_DETACH` frame on the wire
+                    // before the socket goes away. Bound the wait at
+                    // 200ms — generous for a 5-byte frame on a local
+                    // socket. On timeout `tokio::time::timeout` drops the
+                    // wrapped JoinHandle, which only *detaches* the task;
+                    // it does not cancel it. So we capture an
+                    // `AbortHandle` first and call `.abort()`
+                    // unconditionally afterward to terminate the writer
+                    // deterministically. `abort()` on a finished task is
+                    // a no-op, so this is safe regardless of which branch
+                    // (timeout vs. completion) fired.
+                    let abort = handle.abort_handle();
+                    let _ = s.runtime.block_on(async move {
+                        tokio::time::timeout(Duration::from_millis(200), handle).await
+                    });
+                    abort.abort();
+                }
+                // `s` drops here → channel sender drops. The socket halves
+                // owned by the (now-aborted) task will be dropped on the
+                // next runtime tick.
+                Ok(())
+            }
+        }
+    }
+
+    /// Detach every stream-backed pane. Used by the M2.5 "Detach (leave
+    /// agents running)" option in the quit dialog: a single keystroke
+    /// signals voluntary detach for all remote agents before the TUI
+    /// exits. Returns the list of `(pane_id, error)` pairs for any panes
+    /// that failed to detach — the caller can decide whether to surface
+    /// them; a non-empty result does not block the quit.
+    pub fn detach_all_streams(&self) -> Vec<(String, PaneError)> {
+        let stream_ids: Vec<String> = {
+            let panes = self.panes.lock().unwrap();
+            panes
+                .iter()
+                .filter(|(_, p)| matches!(p.backend, PaneBackend::Stream(_)))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut errors = Vec::new();
+        for id in stream_ids {
+            if let Err(e) = self.detach_pane(&id) {
+                errors.push((id, e));
+            }
+        }
+        errors
+    }
+}
+
+/// Bounded wait for an in-flight daemon resize call. Two seconds is far
+/// longer than a healthy local Unix-socket round-trip for a single Resize op
+/// but short enough that a wedged daemon can't park the worker indefinitely.
+/// On timeout the underlying `DaemonClient` connection drops, releasing the
+/// FD and any per-connection daemon-side task.
+const RESIZE_DAEMON_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Hard cap on the number of agents the TUI will hydrate from the daemon
+/// on bootstrap. Far above any realistic interactive workload (the TUI
+/// only renders a handful of panes at once); the cap exists so a buggy or
+/// hostile same-user daemon advertising thousands of fake ids can't fan
+/// out unbounded sockets and tasks at startup. Hits in normal use should
+/// never happen — if they do, the truncation log line is a signal that
+/// something on the daemon side is misbehaving.
+const HYDRATE_MAX_PANES: usize = 256;
+
+/// Bounded wait for the `list_agents` round-trip during rehydration. A
+/// healthy daemon answers in well under a millisecond; a daemon that
+/// fails to respond within five seconds is treated as if it had no
+/// agents (the user can reconnect). Without this bound, a parked daemon
+/// would hang TUI startup indefinitely on the blocking `block_on` call
+/// in `hydrate_from_daemon`.
+const HYDRATE_LIST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded wait for each per-agent `attach` during rehydration. Tighter
+/// than the list timeout because there are up to [`HYDRATE_MAX_PANES`] of
+/// these in series — the TUI shouldn't take HYDRATE_MAX_PANES × 5s on a
+/// pathological daemon. On timeout the agent is skipped (logged at debug)
+/// and rehydration continues with the rest.
+const HYDRATE_ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bounded wait for the `start_agent` RPC inside `create_stream_pane`. The
+/// daemon allocates a PTY and spawns the child process before replying,
+/// which is heavier than `list_agents` but should still complete within a
+/// few seconds on a healthy host. Without this bound a wedged same-UID
+/// daemon would pin the TUI's blocking `block_on` indefinitely.
+const CREATE_PANE_START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded wait for the `attach` RPC inside `create_stream_pane`. Same
+/// rationale as [`HYDRATE_ATTACH_TIMEOUT`]: a single attach round-trip is
+/// well under a millisecond on a healthy daemon; capping at three seconds
+/// keeps a wedged daemon from blocking pane creation forever. On timeout
+/// the cleanup [`CREATE_PANE_STOP_TIMEOUT`] path runs and the timeout is
+/// surfaced as the propagated error.
+const CREATE_PANE_ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bounded wait for the best-effort `stop_agent` cleanup inside
+/// `create_stream_pane` when `attach` fails or times out. Auditor P3 on
+/// Fix D: a wedged daemon could answer `attach` with Err promptly then
+/// never respond to the cleanup `stop_agent`, leaving the function pinned
+/// on the cleanup await. Tight because cleanup is best-effort — on
+/// timeout we log a warning and still propagate the original attach
+/// error (the daemon-side agent may be leaked, same outcome as a stop_agent
+/// that errored).
+const CREATE_PANE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Per-pane resize worker (PRD #76 M2.10 audit follow-up). Reads the most
+/// recent `(rows, cols)` from the watch receiver and dispatches it to the
+/// daemon with [`RESIZE_DAEMON_TIMEOUT`]. While a dispatch is in flight,
+/// `resize_pane_pty` calls keep overwriting the watch value; the worker
+/// re-reads via `borrow_and_update` after each dispatch so only the latest
+/// size reaches the wire. Exits when `resize_tx` drops (`changed()` returns
+/// `Err`) — the watch sender is owned by `StreamBackend`, so this happens
+/// exactly when the pane is dropped.
+async fn resize_worker(
+    mut rx: tokio::sync::watch::Receiver<Option<(u16, u16)>>,
+    daemon_path: PathBuf,
+    agent_id: String,
+) {
+    // Mark the initial `None` value as seen so the first `changed()` call
+    // waits for an actual resize, not the channel's seed value.
+    let _ = rx.borrow_and_update();
+    while rx.changed().await.is_ok() {
+        let dims = *rx.borrow_and_update();
+        let Some((rows, cols)) = dims else { continue };
+
+        let client = DaemonClient::new(daemon_path.clone());
+        match tokio::time::timeout(
+            RESIZE_DAEMON_TIMEOUT,
+            client.resize_agent(&agent_id, rows, cols),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    agent_id = %agent_id,
+                    rows, cols,
+                    error = %e,
+                    "resize-agent failed (transient — next resize will reconcile)"
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    agent_id = %agent_id,
+                    rows, cols,
+                    timeout_ms = RESIZE_DAEMON_TIMEOUT.as_millis() as u64,
+                    "resize-agent timed out (transient — next resize will reconcile)"
+                );
+            }
+        }
+    }
+}
+
+/// Write `payload` to whichever backend a pane uses. Pulled out as a free
+/// helper so `write_to_pane` can dispatch on `&mut PaneBackend` from inside
+/// the `panes` mutex without a closure that re-locks it.
+fn write_payload_to_backend(
+    backend: &mut PaneBackend,
+    payload: &[u8],
+    pane_id: &str,
+) -> Result<(), PaneError> {
+    match backend {
+        PaneBackend::Pty(p) => {
+            p.writer.write_all(payload).map_err(PaneError::Io)?;
+            p.writer.flush().map_err(PaneError::Io)?;
+        }
+        PaneBackend::Stream(s) => {
+            if s.input_tx.send(StreamCmd::Input(payload.to_vec())).is_err() {
+                return Err(PaneError::CommandFailed(format!(
+                    "Pane {pane_id} stream I/O task ended"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Scan PTY output bytes for mouse mode enable/disable escape sequences.
@@ -241,6 +1305,63 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Feed a chunk of agent-output bytes through the OSC 8 filter, the vt100
+/// parser, and the hyperlink map. Shared between the local-PTY reader thread
+/// and the stream-backed I/O task so both backends produce identical render
+/// state from identical bytes.
+fn process_agent_output_chunk(
+    data: &[u8],
+    osc8: &mut Osc8Filter,
+    parser: &Mutex<vt100::Parser>,
+    mouse_mode: &AtomicBool,
+    hyperlinks: &Mutex<HyperlinkMap>,
+) {
+    scan_mouse_mode(data, mouse_mode);
+
+    let segments = osc8.process(data);
+    let mut new_links: Vec<(u16, String)> = Vec::new();
+    let mut scroll_amount: u16 = 0;
+
+    if let Ok(mut p) = parser.lock() {
+        let max_row = p.screen().size().0.saturating_sub(1);
+        for segment in &segments {
+            match segment {
+                Osc8Segment::Text(bytes) => {
+                    let rb = p.screen().cursor_position().0;
+                    p.process(bytes);
+                    let ra = p.screen().cursor_position().0;
+                    if rb >= max_row && ra >= max_row {
+                        let nl = bytes.iter().filter(|&&b| b == b'\n').count() as u16;
+                        scroll_amount += nl;
+                    }
+                }
+                Osc8Segment::LinkedText { url, bytes } => {
+                    let row = p.screen().cursor_position().0;
+                    let rb = row;
+                    p.process(bytes);
+                    let ra = p.screen().cursor_position().0;
+                    new_links.push((row, url.clone()));
+                    if rb >= max_row && ra >= max_row {
+                        let nl = bytes.iter().filter(|&&b| b == b'\n').count() as u16;
+                        scroll_amount += nl;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!new_links.is_empty() || scroll_amount > 0)
+        && let Ok(mut hmap) = hyperlinks.lock()
+    {
+        if scroll_amount > 0 {
+            hmap.shift_up(scroll_amount);
+        }
+        for (row, url) in &new_links {
+            hmap.set_row(*row, url);
+        }
+    }
+}
+
 impl PaneController for EmbeddedPaneController {
     fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
         let mut panes = self.panes.lock().unwrap();
@@ -255,147 +1376,54 @@ impl PaneController for EmbeddedPaneController {
         Ok(())
     }
 
-    fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError> {
-        let pty_system = NativePtySystem::default();
-
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| PaneError::CommandFailed(format!("Failed to open PTY: {e}")))?;
-
-        let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-
-        let mut cmd = match command {
-            Some(c) if c.contains(' ') => {
-                let mut cmd = CommandBuilder::new(&default_shell);
-                cmd.arg("-c");
-                cmd.arg(c);
-                cmd
-            }
-            Some(c) => CommandBuilder::new(c),
-            None => CommandBuilder::new(&default_shell),
-        };
-
-        if let Some(dir) = cwd {
-            cmd.cwd(dir);
-        }
-
+    fn create_pane_with_options(
+        &self,
+        command: Option<&str>,
+        cwd: Option<&str>,
+        opts: AgentSpawnOptions<'_>,
+    ) -> Result<(String, String), PaneError> {
+        // The pane ID is allocated up front because it has to be injected into
+        // the child's environment as DOT_AGENT_DECK_PANE_ID. If the spawn
+        // below fails, the ID is intentionally consumed (a gap in the
+        // sequence is harmless and avoids racing concurrent `create_pane`
+        // calls to revert the counter).
         let pane_id = self.allocate_id();
-        // Tag the spawned process so hooks can identify which pane it belongs to.
-        cmd.env("DOT_AGENT_DECK_PANE_ID", &pane_id);
+        // Single source of truth for the in-session label, local Pane.name,
+        // and the daemon's StartAgent.display_name. `resolve_display_name`
+        // applies trim + `is_valid_display_name` + shell fallback, so all
+        // downstream sites store the SAME string by construction — fixing
+        // the divergence M2.11 fixup-3 reviewer P2 / auditor LOW called
+        // out (bare `"   "`, surround whitespace, and control-byte
+        // commands all converge here).
+        let resolved = agent_pty::resolve_display_name(opts.display_name, command);
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| PaneError::CommandFailed(format!("Failed to spawn command: {e}")))?;
-
-        // Drop the slave — we interact through the master side only.
-        drop(pair.slave);
-
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| PaneError::CommandFailed(format!("Failed to get PTY writer: {e}")))?;
-
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| PaneError::CommandFailed(format!("Failed to get PTY reader: {e}")))?;
-
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
-        let mouse_mode = Arc::new(AtomicBool::new(false));
-        let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
-
-        // Spawn a background thread to read PTY output and feed it to the vt100 parser.
-        // Strips OSC 8 hyperlink sequences and records row → URL associations.
-        let parser_clone = Arc::clone(&parser);
-        let mouse_mode_clone = Arc::clone(&mouse_mode);
-        let hyperlinks_clone = Arc::clone(&hyperlinks);
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let mut osc8 = Osc8Filter::new();
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let data = &buf[..n];
-                        scan_mouse_mode(data, &mouse_mode_clone);
-
-                        let segments = osc8.process(data);
-                        let mut new_links: Vec<(u16, String)> = Vec::new();
-                        let mut scroll_amount: u16 = 0;
-
-                        if let Ok(mut p) = parser_clone.lock() {
-                            let max_row = p.screen().size().0.saturating_sub(1);
-                            for segment in &segments {
-                                match segment {
-                                    Osc8Segment::Text(bytes) => {
-                                        let rb = p.screen().cursor_position().0;
-                                        p.process(bytes);
-                                        let ra = p.screen().cursor_position().0;
-                                        if rb >= max_row && ra >= max_row {
-                                            let nl = bytes.iter().filter(|&&b| b == b'\n').count()
-                                                as u16;
-                                            scroll_amount += nl;
-                                        }
-                                    }
-                                    Osc8Segment::LinkedText { url, bytes } => {
-                                        // cursor_before is the row where link text starts
-                                        let row = p.screen().cursor_position().0;
-                                        let rb = row;
-                                        p.process(bytes);
-                                        let ra = p.screen().cursor_position().0;
-                                        new_links.push((row, url.clone()));
-                                        if rb >= max_row && ra >= max_row {
-                                            let nl = bytes.iter().filter(|&&b| b == b'\n').count()
-                                                as u16;
-                                            scroll_amount += nl;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // parser lock released
-
-                        if (!new_links.is_empty() || scroll_amount > 0)
-                            && let Ok(mut hmap) = hyperlinks_clone.lock()
-                        {
-                            if scroll_amount > 0 {
-                                hmap.shift_up(scroll_amount);
-                            }
-                            for (row, url) in &new_links {
-                                hmap.set_row(*row, url);
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
+        let result = match &self.mode {
+            ControllerMode::LocalDeck => {
+                self.create_local_pane(pane_id, command, cwd, &resolved, opts.rows, opts.cols)
             }
-        });
-
-        let pane = Pane {
-            writer,
-            screen: parser,
-            child,
-            master: pair.master,
-            name: command.unwrap_or("shell").to_string(),
-            is_focused: false,
-            command: command.map(|c| c.to_string()),
-            mouse_mode,
-            hyperlinks,
+            ControllerMode::RemoteDeckLocal { client, runtime } => self.create_stream_pane(
+                pane_id,
+                command,
+                cwd,
+                &resolved,
+                opts.tab_membership,
+                opts.agent_type,
+                opts.rows,
+                opts.cols,
+                client.clone(),
+                runtime.clone(),
+            ),
         };
-
-        self.panes.lock().unwrap().insert(pane_id.clone(), pane);
-
-        Ok(pane_id)
+        result.map(|id| (id, resolved))
     }
 
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
-        let mut pane = {
+        // Hold the registry lock across the whole close so a stop-agent
+        // failure can leave the pane in place for the user to retry. The
+        // backend teardown (blocking child reap or async stop-agent) is
+        // performed without the lock by detaching the pane first and only
+        // re-inserting on the failure path.
+        let pane = {
             let mut panes = self.panes.lock().unwrap();
             match panes.remove(pane_id) {
                 Some(p) => p,
@@ -406,11 +1434,107 @@ impl PaneController for EmbeddedPaneController {
                 }
             }
         };
-        // Kill the child process and wait for it to exit after releasing the
-        // lock so we don't hold the mutex during blocking I/O.
-        let _ = pane.child.kill();
-        let _ = pane.child.wait();
-        Ok(())
+        match pane.backend {
+            PaneBackend::Pty(mut p) => {
+                let _ = p.child.kill();
+                let _ = p.child.wait();
+                Ok(())
+            }
+            PaneBackend::Stream(s) => {
+                // Ctrl+W on a stream-backed pane is the explicit
+                // "kill the agent" path per PRD #76 line 220 — it must
+                // send `stop-agent` over the protocol so the daemon
+                // SIGKILLs the underlying child. Plain TUI exit takes a
+                // different path: panes are dropped, `StreamBackend::drop`
+                // aborts the I/O task, and the daemon sees the closed
+                // socket as implicit detach. Order here matters: send
+                // `stop-agent` first (over a fresh connection), then let
+                // the drop abort the I/O task. If we aborted first, the
+                // daemon would treat the dropped attach connection as a
+                // detach and the agent would survive.
+                let client = DaemonClient::new(s.daemon_path.clone());
+                let agent_id = s.agent_id.clone();
+                // CodeRabbit Fix E: bound the stop-agent RPC. Without this
+                // timeout a wedged daemon would pin the TUI renderer
+                // indefinitely (Ctrl+W happens on the render thread via
+                // `block_on`) while the pane has already been removed from
+                // the registry — the UI would freeze on a phantom-closed
+                // pane. Reusing `CREATE_PANE_STOP_TIMEOUT` (2s): same
+                // semantics — "how long do we wait on a daemon stop-agent
+                // call?" — and same cap as the attach-failure cleanup.
+                let stop_result = s.runtime.block_on(async {
+                    tokio::time::timeout(CREATE_PANE_STOP_TIMEOUT, client.stop_agent(&agent_id))
+                        .await
+                });
+                match stop_result {
+                    Ok(Ok(())) => {
+                        // Drop `s` → io_task aborts. No explicit abort needed.
+                        Ok(())
+                    }
+                    Ok(Err(e)) => {
+                        // Don't silently degrade to detach: a swallowed
+                        // stop-agent error would close the socket, the
+                        // daemon would treat the close as implicit detach,
+                        // and the agent would survive on the remote with
+                        // no signal to the user. Re-insert the pane so a
+                        // retry remains possible (the io_task is still
+                        // alive at this point — `s` has not been dropped).
+                        tracing::error!(
+                            agent_id = %agent_id,
+                            error = %e,
+                            "stop-agent failed during Ctrl+W close — pane retained for retry"
+                        );
+                        let restored = Pane {
+                            backend: PaneBackend::Stream(s),
+                            screen: pane.screen,
+                            name: pane.name,
+                            is_focused: pane.is_focused,
+                            command: pane.command,
+                            cwd: pane.cwd,
+                            mouse_mode: pane.mouse_mode,
+                            hyperlinks: pane.hyperlinks,
+                        };
+                        self.panes
+                            .lock()
+                            .unwrap()
+                            .insert(pane_id.to_string(), restored);
+                        Err(PaneError::CommandFailed(format!(
+                            "stop-agent failed for pane {pane_id}: {e}"
+                        )))
+                    }
+                    Err(_) => {
+                        // Timeout: daemon never answered. Same restore
+                        // path as the RPC-error branch — the io_task is
+                        // still alive (`s` not dropped), the daemon-side
+                        // agent likely still exists, and the user needs
+                        // a visible pane to retry against rather than a
+                        // phantom-closed one.
+                        tracing::error!(
+                            agent_id = %agent_id,
+                            timeout_ms = CREATE_PANE_STOP_TIMEOUT.as_millis() as u64,
+                            "stop-agent timed out during Ctrl+W close — pane retained for retry"
+                        );
+                        let restored = Pane {
+                            backend: PaneBackend::Stream(s),
+                            screen: pane.screen,
+                            name: pane.name,
+                            is_focused: pane.is_focused,
+                            command: pane.command,
+                            cwd: pane.cwd,
+                            mouse_mode: pane.mouse_mode,
+                            hyperlinks: pane.hyperlinks,
+                        };
+                        self.panes
+                            .lock()
+                            .unwrap()
+                            .insert(pane_id.to_string(), restored);
+                        Err(PaneError::CommandFailed(format!(
+                            "stop-agent timed out for pane {pane_id}"
+                        )))
+                    }
+                }
+            }
+        }
     }
 
     fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError> {
@@ -444,16 +1568,102 @@ impl PaneController for EmbeddedPaneController {
         Ok(())
     }
 
-    fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError> {
-        let mut panes = self.panes.lock().unwrap();
-        if let Some(pane) = panes.get_mut(pane_id) {
-            pane.name = name.to_string();
-            Ok(())
-        } else {
-            Err(PaneError::CommandFailed(format!(
-                "Pane {pane_id} not found"
-            )))
+    fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+        // M2.11 fixup 4 — single normalization rule shared with
+        // `create_pane_with_display_name`: trim, then either
+        //   * empty after trim → Cleared (None on daemon, "" locally)
+        //   * trimmed value passes `is_valid_display_name` → Applied
+        //     with that EXACT string on both local pane.name and the
+        //     daemon record
+        //   * non-empty but fails validation (control bytes, oversized,
+        //     etc.) → Rejected — don't touch local or daemon,
+        //     debug-log so the user can see why the label didn't update
+        //
+        // M2.11 fixup 5 — return the outcome so the dashboard rename
+        // handler can mirror the controller-resolved label into the UI
+        // display-name maps. Before this the UI inserted the raw
+        // rename text verbatim and diverged from the controller (a
+        // `"  newname  "` rename left the UI map padded; a
+        // control-byte rename slipped escapes into the dashboard
+        // title even though the controller rejected the change).
+        //
+        // Rejecting on invalid input (rather than silently falling back
+        // to command/"shell") matches the user's intent: they typed
+        // garbage, so the existing label stays put instead of being
+        // replaced with an unrelated string they didn't ask for.
+        //
+        // M2.11 fixup 6 — route through `RenameOutcome::applied` so the
+        // trim + `is_valid_display_name` invariant is enforced by a
+        // single typed constructor instead of repeated inline in every
+        // controller / mock. The constructor returns the same three
+        // outcomes the production controller already maps to: empty
+        // → Cleared, valid → Applied(trimmed), invalid → Rejected.
+        let outcome = RenameOutcome::applied(name);
+        let new_label: Option<String> = match &outcome {
+            RenameOutcome::Applied(label) => Some(label.clone()),
+            RenameOutcome::Cleared => None,
+            RenameOutcome::Rejected => {
+                tracing::debug!(
+                    pane_id = %pane_id,
+                    "rename_pane: rejected — name contains invalid bytes after trim"
+                );
+                return Ok(outcome);
+            }
+        };
+
+        // M2.11: snapshot the stream-backed agent id + cached cwd under
+        // the pane lock, then release the lock before the daemon RPC.
+        // The cwd echo matters because `set_agent_label` uses "None to
+        // clear" semantics; if we passed `cwd: None` here every rename
+        // would erase the daemon-stored cwd captured at spawn time.
+        //
+        // An empty/whitespace-only `name` is the user's "clear" intent —
+        // we map it to `display_name: None` so the daemon-side field is
+        // cleared rather than stored as a blank label. On reconnect,
+        // hydrate_from_daemon then falls back to the agent_id rather
+        // than restoring a stale pre-clear name (PRD #76 M2.11 reviewer
+        // P1 clear-rename case).
+        let local_name = new_label.clone().unwrap_or_default();
+        let stream_update: Option<(String, Option<String>, tokio::runtime::Handle, PathBuf)> = {
+            let mut panes = self.panes.lock().unwrap();
+            let pane = panes
+                .get_mut(pane_id)
+                .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
+            pane.name = local_name;
+            match &pane.backend {
+                PaneBackend::Stream(s) => Some((
+                    s.agent_id.clone(),
+                    pane.cwd.clone(),
+                    s.runtime.clone(),
+                    s.daemon_path.clone(),
+                )),
+                PaneBackend::Pty(_) => None,
+            }
+        };
+        if let Some((agent_id, cwd, runtime, daemon_path)) = stream_update {
+            // Daemon RPC is fire-and-forget on the controller's runtime.
+            // The TUI thread must never block on `set_agent_label`:
+            // `issue_command` awaits `read_response` with no timeout, so
+            // a slow or wedged daemon would otherwise freeze the
+            // renderer until the socket errors out (PRD #76 M2.11
+            // reviewer P1 non-blocking rename). The local pane name has
+            // already been updated above, which is the user-visible
+            // effect; a transient daemon failure resyncs on the next
+            // reconnect.
+            let client = DaemonClient::new(daemon_path);
+            let agent_id_for_log = agent_id.clone();
+            let daemon_label = new_label.clone();
+            runtime.spawn(async move {
+                if let Err(e) = client.set_agent_label(&agent_id, daemon_label, cwd).await {
+                    tracing::debug!(
+                        agent_id = %agent_id_for_log,
+                        error = %e,
+                        "rename_pane: set_agent_label failed — local rename kept, daemon will resync on next reconnect"
+                    );
+                }
+            });
         }
+        Ok(outcome)
     }
 
     fn toggle_layout(&self) -> Result<(), PaneError> {
@@ -480,8 +1690,7 @@ impl PaneController for EmbeddedPaneController {
             let pane = panes
                 .get_mut(pane_id)
                 .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
-            pane.writer.write_all(&payload).map_err(PaneError::Io)?;
-            pane.writer.flush().map_err(PaneError::Io)?;
+            write_payload_to_backend(&mut pane.backend, &payload, pane_id)?;
         }
         std::thread::sleep(SUBMIT_DELAY);
         {
@@ -489,8 +1698,7 @@ impl PaneController for EmbeddedPaneController {
             let pane = panes
                 .get_mut(pane_id)
                 .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
-            pane.writer.write_all(b"\r").map_err(PaneError::Io)?;
-            pane.writer.flush().map_err(PaneError::Io)?;
+            write_payload_to_backend(&mut pane.backend, b"\r", pane_id)?;
         }
         Ok(())
     }
@@ -511,6 +1719,32 @@ impl PaneController for EmbeddedPaneController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PRD #76 — the post-loop teardown in `ui.rs` gates `close_tab` on
+    // this method. Inverting the flag would silently re-introduce the
+    // "Quit kills orchestration agents in external-daemon mode" bug
+    // (the daemon-side child would be SIGKILL'd by `stop-agent` instead
+    // of surviving an implicit-detach EOF).
+    #[test]
+    fn is_external_daemon_distinguishes_modes() {
+        let local = EmbeddedPaneController::new();
+        assert!(
+            !local.is_external_daemon(),
+            "LocalDeck mode must report false — panes are in-process PTYs that the TUI exit needs to clean up"
+        );
+
+        // Build a `with_remote_deck` controller without exercising the
+        // daemon: the constructor only stores the socket path + runtime
+        // handle, it does not connect. A tempdir path is sufficient.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("attach.sock");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let remote = EmbeddedPaneController::with_remote_deck(socket, rt.handle().clone());
+        assert!(
+            remote.is_external_daemon(),
+            "RemoteDeckLocal mode must report true — agents live in the daemon and must survive TUI exit"
+        );
+    }
 
     #[test]
     fn create_and_list_panes() {
@@ -553,10 +1787,200 @@ mod tests {
         let ctrl = EmbeddedPaneController::new();
         let id = ctrl.create_pane(None, None).unwrap();
 
-        ctrl.rename_pane(&id, "my-agent").unwrap();
+        let outcome = ctrl.rename_pane(&id, "my-agent").unwrap();
+        assert_eq!(outcome, RenameOutcome::Applied("my-agent".to_string()));
         let panes = ctrl.list_panes().unwrap();
         assert_eq!(panes[0].title, "my-agent");
 
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    // PRD #76 M2.11 reviewer P2.3 — whitespace-only Names must fall
+    // back to command (or "shell") instead of being recorded verbatim.
+    // `is_valid_display_name` accepts spaces, so a regression here
+    // would surface as a visually blank label on the dashboard.
+    #[test]
+    fn create_pane_with_whitespace_display_name_falls_back_to_command() {
+        let ctrl = EmbeddedPaneController::new();
+        let (id, resolved) = ctrl
+            .create_pane_with_display_name(Some("/bin/sh"), None, Some("   "))
+            .unwrap();
+        assert_eq!(resolved, "/bin/sh");
+        let panes = ctrl.list_panes().unwrap();
+        let info = panes
+            .iter()
+            .find(|p| p.pane_id == id)
+            .expect("created pane in list_panes");
+        assert_eq!(
+            info.title, "/bin/sh",
+            "whitespace-only Name must fall back to command, not be stored verbatim"
+        );
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    #[test]
+    fn create_pane_with_empty_display_name_falls_back_to_command() {
+        let ctrl = EmbeddedPaneController::new();
+        let (id, resolved) = ctrl
+            .create_pane_with_display_name(Some("/bin/sh"), None, Some(""))
+            .unwrap();
+        assert_eq!(resolved, "/bin/sh");
+        let panes = ctrl.list_panes().unwrap();
+        let info = panes.iter().find(|p| p.pane_id == id).unwrap();
+        assert_eq!(info.title, "/bin/sh");
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    #[test]
+    fn create_pane_with_whitespace_name_and_no_command_falls_back_to_shell() {
+        // No command + whitespace Name: both fallbacks chain together
+        // and the controller defaults to "shell". Without the
+        // whitespace filter the pane would be titled "   ".
+        let ctrl = EmbeddedPaneController::new();
+        let (id, resolved) = ctrl
+            .create_pane_with_display_name(None, None, Some("  \t "))
+            .unwrap();
+        assert_eq!(resolved, "shell");
+        let panes = ctrl.list_panes().unwrap();
+        let info = panes.iter().find(|p| p.pane_id == id).unwrap();
+        assert_eq!(info.title, "shell");
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    // PRD #76 M2.11 fixup 4 — surround whitespace is stripped from a
+    // form Name before it reaches `Pane.name` and (for stream panes) the
+    // daemon. Returning the raw `"  foo  "` here was the reviewer P2
+    // bug: UI maps showed `"foo"` while the daemon/local pane stored
+    // `"  foo  "`, so hydrate would flip the label back on reconnect.
+    #[test]
+    fn create_pane_with_surround_whitespace_trims_local_name() {
+        let ctrl = EmbeddedPaneController::new();
+        let (id, resolved) = ctrl
+            .create_pane_with_display_name(Some("/bin/sh"), None, Some("  foo  "))
+            .unwrap();
+        assert_eq!(resolved, "foo");
+        let panes = ctrl.list_panes().unwrap();
+        let info = panes.iter().find(|p| p.pane_id == id).unwrap();
+        assert_eq!(
+            info.title, "foo",
+            "surround whitespace must be trimmed from the local Pane.name"
+        );
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    // PRD #76 M2.11 fixup 4 (auditor LOW): if the form Name is empty and
+    // the command contains an ASCII control byte, the resolver must fall
+    // through to "shell" rather than stuffing the raw command into the
+    // local Pane.name (which `terminal_widget` then writes verbatim into
+    // the TUI title). The daemon already drops such names on the wire;
+    // this pins the same behavior for the LocalDeck path so there is no
+    // window where in-session render disagrees with daemon storage.
+    #[test]
+    fn create_pane_with_control_char_command_falls_back_to_shell() {
+        let ctrl = EmbeddedPaneController::new();
+        let evil_cmd = "echo \x1b[31m"; // real ESC byte
+        let (id, resolved) = ctrl
+            .create_pane_with_display_name(Some(evil_cmd), None, Some(""))
+            .unwrap();
+        assert_eq!(
+            resolved, "shell",
+            "control-byte command must fall through to \"shell\""
+        );
+        let panes = ctrl.list_panes().unwrap();
+        let info = panes.iter().find(|p| p.pane_id == id).unwrap();
+        assert_eq!(info.title, "shell");
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    // PRD #76 M2.11 fixup 4: rename with surround whitespace must store
+    // the trimmed value, not the raw string. Without this, the local
+    // pane.name would carry `"  newname  "` while the daemon (which
+    // applies `is_valid_display_name` and would accept it) stored the
+    // same — but the UI maps would not — perpetuating divergence.
+    #[test]
+    fn rename_pane_trims_surround_whitespace_on_local_backend() {
+        let ctrl = EmbeddedPaneController::new();
+        let id = ctrl.create_pane(None, None).unwrap();
+        let outcome = ctrl.rename_pane(&id, "  newname  ").unwrap();
+        // Fixup 5: the controller now returns the trimmed canonical
+        // label so callers (the dashboard rename handler) can mirror
+        // it into the UI display-name maps without re-trimming.
+        assert_eq!(outcome, RenameOutcome::Applied("newname".to_string()));
+        let panes = ctrl.list_panes().unwrap();
+        let info = panes.iter().find(|p| p.pane_id == id).unwrap();
+        assert_eq!(info.title, "newname");
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    // PRD #76 M2.11 fixup 4: rename text that trims to a string failing
+    // `is_valid_display_name` is REJECTED — neither the local pane.name
+    // nor (for stream panes) the daemon record changes. The previous
+    // label stays put rather than silently fall back to command/"shell"
+    // because the user typed garbage; we don't substitute a different
+    // string they didn't ask for. Debug log captures the rejection.
+    #[test]
+    fn rename_pane_rejects_control_char_input() {
+        let ctrl = EmbeddedPaneController::new();
+        let (id, _) = ctrl
+            .create_pane_with_display_name(Some("/bin/sh"), None, Some("good-name"))
+            .unwrap();
+        // Verify baseline label first.
+        assert_eq!(
+            ctrl.list_panes().unwrap()[0].title,
+            "good-name",
+            "baseline label before rejected rename"
+        );
+        // Rename with control bytes in the trimmed portion — must be a
+        // no-op (returns Ok(Rejected); pane.name unchanged).
+        let outcome = ctrl
+            .rename_pane(&id, "  \x1b[31m  ")
+            .expect("rejected rename still returns Ok");
+        assert_eq!(
+            outcome,
+            RenameOutcome::Rejected,
+            "control-byte rename must report Rejected so the UI keeps the prior label"
+        );
+        let panes = ctrl.list_panes().unwrap();
+        let info = panes.iter().find(|p| p.pane_id == id).unwrap();
+        assert_eq!(
+            info.title, "good-name",
+            "control-byte rename must NOT update pane.name"
+        );
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    // PRD #76 M2.11 reviewer P1 — local-PTY rename with empty/whitespace
+    // text updates pane.name to that string but does not touch any
+    // daemon RPC (there is no daemon in LocalDeck). The daemon-side
+    // clear path is exercised by the integration test in
+    // `tests/agent_metadata.rs::rename_pane_with_empty_text_clears_daemon_display_name`.
+    // This unit test just pins that local rename does not error on an
+    // empty string (would be a regression of the trait contract).
+    #[test]
+    fn rename_pane_with_empty_string_succeeds_on_local_backend() {
+        let ctrl = EmbeddedPaneController::new();
+        let id = ctrl.create_pane(None, None).unwrap();
+        let outcome = ctrl
+            .rename_pane(&id, "")
+            .expect("empty rename must succeed");
+        // Fixup 5: empty input is a "clear" — callers must remove the
+        // corresponding entry from their UI display-name maps so the
+        // dashboard card falls back to the agent_id label.
+        assert_eq!(outcome, RenameOutcome::Cleared);
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    // PRD #76 M2.11 fixup 5 — whitespace-only input is also a "clear"
+    // (trim yields empty). Pins the outcome shape the dashboard
+    // handler now relies on to remove UI display-name entries.
+    #[test]
+    fn rename_pane_with_whitespace_only_returns_cleared() {
+        let ctrl = EmbeddedPaneController::new();
+        let id = ctrl.create_pane(None, None).unwrap();
+        let outcome = ctrl
+            .rename_pane(&id, "   ")
+            .expect("whitespace rename must succeed");
+        assert_eq!(outcome, RenameOutcome::Cleared);
         ctrl.close_pane(&id).unwrap();
     }
 

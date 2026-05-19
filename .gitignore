@@ -1,6 +1,7 @@
 /target
 tmp/
 .dot-agent-deck/
+.claude/scheduled_tasks.lock
 
 # Documentation site
 site/node_modules/

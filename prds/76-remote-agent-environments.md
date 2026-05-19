@@ -1,8 +1,11 @@
 # PRD #76: Remote Agent Environments
 
-**Status**: Not started
+**Status**: In progress
 **Priority**: High
 **Created**: 2026-05-08
+**Scope updated**:
+- 2026-05-09 — Kubernetes transport split out into **PRD #81**.
+- 2026-05-09 (later) — **Architectural pivot**. Phase 6 (laptop-as-real-client with `ProjectIO` trait + extended protocol) was added when M2.x exposed project-parity gaps, then dropped after a cost/value review. v1 now ships the simpler **TUI-on-remote** model: `connect` is an `ssh -t` wrapper, the TUI runs server-side, the daemon owns PTYs as a separate process so they survive ssh disconnects. See the *2026-05-09 architectural pivot* entry in Design Decisions.
 **GitHub Issue**: [#76](https://github.com/vfarcic/dot-agent-deck/issues/76)
 
 ## Problem Statement
@@ -10,28 +13,33 @@
 AI coding agents (Claude Code, OpenCode, etc.) launched from `dot-agent-deck` today live as local PTY children of the deck process. Three concrete consequences:
 
 1. **Laptop is a single point of failure.** When the laptop sleeps, closes, or loses network, every running agent dies. Long-running tasks (codebase-wide refactors, large test runs, multi-step orchestrations) cannot survive a normal day's interruptions.
-2. **No way to offload to a beefier box.** Users with a remote workstation, a Hetzner server, or a Kubernetes cluster cannot point the deck at it; the deck only knows local processes.
+2. **No way to offload to a beefier box.** Users with a remote workstation or a Hetzner-style VM cannot point the deck at it; the deck only knows local processes.
 3. **No persistent context across "I'll come back to this later".** There is no notion of a session that keeps running while the user is away and is reattachable from the same or a different device.
 
-The primitives to fix this exist (ssh, PTYs, hook callbacks already work over a Unix socket) but the deck has no architecture for "the agents live somewhere else." Bolting ssh-wrapping onto the existing command field is fragile (no version negotiation, no session listing, hooks can't reach back) and tmux-wraps-the-app is operationally clumsy.
+The primitives to fix this exist (ssh, PTYs, hook callbacks already work over a Unix socket) but the deck has no architecture for "the agents live somewhere else."
 
 ## Solution Overview
 
-Introduce **remote environments** as a first-class concept in `dot-agent-deck`. A remote environment is a **long-running, per-project box** (VM or single long-running Kubernetes pod) on which a **deck daemon** runs persistently, owns all agent PTYs, accepts hook callbacks on a local socket, and exposes a streaming attach protocol. The local client becomes a thin viewer that connects to the remote daemon over ssh exec or `kubectl exec` (MVP) or a daemon-exposed streaming socket (later).
+Introduce **remote environments** as a first-class concept in `dot-agent-deck`. A remote environment is a **long-running, per-project box** (a VM, in v1) that the user has provisioned. The deck's local CLI manages a **registry** of these environments (add, list, remove, upgrade) and provides a **`connect`** command that opens an `ssh -t` session to the remote and runs the deck TUI there.
+
+The TUI on the remote attaches to a **separate-process daemon** that owns all agent PTYs and accepts hook callbacks on a local Unix socket. Because the daemon is a separate process, it survives ssh disconnects: PTYs and agent state persist across "laptop closed the lid", and re-running `connect` re-attaches a fresh TUI to the still-running daemon.
+
+A future Kubernetes (`kubectl exec`) transport ships separately as **PRD #81**.
 
 ### Core architectural choices
 
 - **Per-project long-running environment, not per-agent ephemeral pods.** The "feels local" criterion wins: shared filesystem, warm build caches, ability to stop one agent and start another against the same in-progress state. Pod-per-agent was considered and rejected — it's the right shape for ephemeral CI runners, the wrong shape for a remote dev box.
-- **Daemon-on-remote, not reverse tunnel.** The deck daemon (already present at `src/daemon.rs` for hook ingestion) is extended to also own agent PTYs and runs as the long-lived process inside the environment. Reverse tunnels were rejected — they tie the hook target's lifetime to the laptop, defeating the persistence goal.
-- **Transport is a config detail, not an architectural fork.** ssh-to-VM and `kubectl exec`-to-pod are isomorphic for this design. Pick whichever matches the user's provisioning preference; the daemon protocol is the same.
-- **Provisioning is out of scope.** The product documents environment requirements (Linux distro, ssh, disk, RAM, network egress, optional container runtime) and users provision via multipass / Hetzner / fly / k3s / whatever. No cloud-provider abstraction in the product, no terraform in-repo.
+- **TUI-on-remote, not laptop-as-real-client.** The deck TUI runs on the environment, not on the laptop. ssh forwards the terminal. This collapses an entire category of "make every UI feature work over a custom protocol" work (directory pickers, project config loading, side panes, watch rules, delegate dispatch) into "they just work, they're running locally on the same box as the daemon."
+- **Daemon as separate process, not in-TUI tokio task.** In remote mode the daemon must outlive the TUI so PTYs survive ssh disconnect. Local mode (the laptop) keeps the in-process daemon for simplicity; the separation is opt-in via the lazy-spawn path that already exists from M4.3.
+- **Transport is a config detail, not an architectural fork.** ssh-to-VM is the v1 transport. `kubectl exec`-to-pod fits the same model (the TUI runs in-pod, kubectl just forwards the terminal); PRD #81 picks that up.
+- **Provisioning is out of scope.** The product documents environment requirements (Linux distro, ssh, disk, RAM, network egress) and users provision via multipass / Hetzner / fly / whatever. No cloud-provider abstraction in the product, no terraform in-repo.
 
 ### User-facing model
 
 Two-level hierarchy:
 
-- **Environment** — long-lived, per project, registered locally by name. Owns the daemon, owns the project filesystem, persists across client disconnects.
-- **Agent** — process inside an environment, started/stopped on demand by the deck.
+- **Environment** — long-lived, per project, registered locally by name. Holds the daemon and the project filesystem; persists across client disconnects.
+- **Agent** — process inside an environment, started/stopped on demand from inside the deck (running on the remote).
 
 CLI surface (noun-verb):
 
@@ -40,19 +48,19 @@ dot-agent-deck remote add <name>      # register a host, install binary + hooks
 dot-agent-deck remote list             # show registered environments + last-known status
 dot-agent-deck remote remove <name>
 dot-agent-deck remote upgrade <name>   # version-bump the remote install
-dot-agent-deck connect [name]          # picker if name omitted; per-env agent picker after
+dot-agent-deck connect [name]          # picker if name omitted; ssh -t into the remote and run the deck TUI
 ```
 
-`connect` flow: pick environment → daemon enumerates running agents → user attaches to existing or starts a new one. Same flow whether the environment is a VM or a pod.
+`connect` flow: pick environment → `ssh -t <target> dot-agent-deck` (with the right args to attach to the persistent daemon) → terminal handed over to the remote TUI.
 
 ### Lifecycle semantics
 
 | Event | Behavior |
 |-------|----------|
-| `Ctrl+W` on agent pane | Stop the agent process. Local: kill PTY child. Remote: send "stop pane X" message to daemon over its socket; daemon kills the child. **Same meaning local or remote.** |
-| Explicit "Detach" action | Disconnect viewer; agent process keeps running on the environment. **Remote-only action**, distinct from Ctrl+W. |
-| Laptop sleep / network drop | Implicit detach. Identical to explicit detach from the remote's point of view. Daemon and agent processes survive. |
-| `dot-agent-deck remote remove` | Tear down the local registration; does **not** destroy the environment. Environment teardown is the user's job (their VM, their pod, their lifecycle). |
+| `Ctrl+W` on agent pane | Stop the agent process. The TUI sends "stop pane X" to its (local-on-remote) daemon over the existing socket protocol; daemon kills the child. **Same meaning local or remote.** |
+| ssh disconnect (laptop sleep, lid close, network drop, or explicit detach) | TUI dies on the remote. Daemon (separate process) keeps running. Agents and their PTYs survive. **No special "detach" keybinding** — closing the ssh session is the detach. |
+| Reconnect (`connect` again) | New TUI spawns on the remote, attaches to the still-running daemon, picks up the existing agent list and scrollback. |
+| `dot-agent-deck remote remove` | Tear down the local registration; does **not** destroy the environment or the daemon on it. Environment teardown is the user's job (their VM, their lifecycle). |
 
 ### Local config
 
@@ -66,26 +74,19 @@ ssh_target = "viktor@1.2.3.4"
 install_path = "~/.local/bin/dot-agent-deck"
 last_known_version = "0.25.0"
 last_connected = "2026-05-08T14:23:00Z"
-
-[[remotes]]
-name = "k3s-prod"
-type = "kubernetes"
-context = "k3s-prod"
-namespace = "agent-deck"
-install_image = "ghcr.io/vfarcic/dot-agent-deck:0.25.0"
-last_known_version = "0.25.0"
-last_connected = "2026-05-07T09:11:00Z"
 ```
 
-No secrets. Auth delegated to ssh / kubeconfig. The file is human-editable; nothing is injected at runtime that the user can't inspect.
+(PRD #81 will extend the registry with a `type = "kubernetes"` shape; the schema is forward-compatible.)
+
+No secrets. Auth delegated to ssh. The file is human-editable; nothing is injected at runtime that the user can't inspect.
 
 ### Failure-mode clarity
 
 The connect flow distinguishes three "can't connect" states:
 
-- **Host unreachable** (network / kubeconfig invalid) — show ssh/kubectl error verbatim, suggest checking network or kubeconfig.
-- **Host reachable, daemon binary missing or version-mismatched** — suggest `remote upgrade <name>`.
-- **Host fine, no running agents** — offer "start new agent" directly.
+- **Host unreachable** (network / ssh config invalid) — show ssh error verbatim, suggest checking network or ssh config.
+- **Host reachable, deck binary missing or version-mismatched** — suggest `remote upgrade <name>`.
+- **Host fine, no daemon yet** — handled by the lazy-spawn path: the TUI on the remote starts the daemon if there isn't one, no user-visible error.
 
 Generic "connect failed" with no diagnostic is the path to user frustration; this is the wrong default and the PRD calls it out explicitly.
 
@@ -93,16 +94,16 @@ Generic "connect failed" with no diagnostic is the path to user frustration; thi
 
 Hooks (`src/hook.rs`) currently POST to a local Unix socket. In the remote model:
 
-- The daemon socket lives **on the environment**, alongside the agents. Hooks reach it via localhost — no network hop, no tunnel, no auth dance.
+- The daemon socket lives **on the environment**, alongside the agents and the TUI. Hooks reach it via localhost — no network hop, no tunnel, no auth dance.
 - Agent images / install scripts pre-wire hook URLs to the local daemon socket.
-- The viewer queries the daemon over the streaming attach protocol for accumulated state on (re)connect — events that fired during disconnect are not lost.
+- The TUI queries the daemon over the same socket protocol for accumulated state on (re)connect — events that fired during disconnect are not lost.
 
 ### Filesystem model
 
 - Project files live on the environment. Agent edits happen there.
 - **Git is the sync layer** between laptop working copy and remote. No bidirectional sync (mutagen, syncthing) baked into the product.
-- For Kubernetes: project state on a PVC per environment, mounted into the pod. Pod restart preserves state.
 - For VM: project state on the VM's disk. Standard.
+- (Kubernetes filesystem model — PVC per environment — covered in PRD #81.)
 
 ## Scope
 
@@ -110,40 +111,46 @@ Hooks (`src/hook.rs`) currently POST to a local Unix socket. In the remote model
 
 - Remote environment as a first-class concept (config, CLI, viewer).
 - ssh-to-VM transport.
-- Kubernetes (`kubectl exec`) transport.
-- Daemon-on-remote architecture: daemon owns agent PTYs, accepts hook callbacks, exposes streaming attach protocol.
+- Daemon as a separate, persistent process on the remote (lazy-spawned by the TUI on first attach; survives ssh disconnect).
+- TUI-attaches-to-external-daemon mode for use on the remote: TUI uses the existing socket protocol instead of an in-process daemon.
 - CLI surface: `remote add | list | remove | upgrade`, `connect`.
 - Local registry file (`~/.config/dot-agent-deck/remotes.toml`).
-- Lifecycle distinction: Ctrl+W (stop agent) vs explicit detach (keep agent running).
+- Lifecycle: `Ctrl+W` stops the agent; ssh disconnect detaches; reconnect resumes.
 - Persistent agent processes across viewer disconnects.
 - Reattachment to existing agents on a known environment.
-- Failure-mode-aware connect UX (three distinct error states).
-- Version negotiation between client and remote daemon.
+- Failure-mode-aware connect UX.
+- Version negotiation between client (laptop install) and remote daemon binary.
 - Documentation: environment requirements, provisioning recipes, daily-use guide.
 - A test environment that the maintainer uses for development of this PRD, set up by following the documented requirements (forcing function on the docs).
 
 ### Out of Scope
 
-- VM / cluster provisioning automation (no terraform, multipass-wrapping, fly-wrapping in core).
+- **Kubernetes (`kubectl exec`) transport — moved to PRD #81.** This PRD ships ssh-to-VM only.
+- **Laptop-as-real-client architecture.** The laptop's TUI does not consume a custom remote-fs/remote-exec protocol; it just forwards terminal bytes over ssh. Extending the protocol with `ListDir`, `ReadFile`, `StateSnapshot`, `SubscribeEvents`, etc. is **explicitly rejected** for v1 (see Design Decisions).
+- **Multi-client viewing** of the same session from two laptops simultaneously. Tmux already solves this if a user really needs it; we won't reimplement it.
+- VM provisioning automation (no terraform, multipass-wrapping, fly-wrapping in core).
 - Multi-provider abstraction layer.
 - Bidirectional file sync (mutagen, syncthing) — git is the sync layer.
-- Multi-host federation: one dashboard controlling agents across multiple environments **simultaneously**. Single-environment-at-a-time is the v1 model.
+- Multi-host federation: one dashboard controlling agents across multiple environments **simultaneously**.
 - Reverse tunnels.
-- Local-dir-mounted-into-remote-pod via reverse sshfs and similar tricks.
+- Local-dir-mounted-into-remote via reverse sshfs and similar tricks.
 - Pod-per-agent ephemeral model.
 - A web UI / browser viewer. Terminal viewer only.
-- Authentication beyond what ssh / kubeconfig already provide.
-- Remote-side multi-user access controls beyond Linux/Kubernetes user separation.
+- Authentication beyond what ssh already provides.
+- Remote-side multi-user access controls beyond Linux user separation.
 
 ## Technical Approach
 
 ### Daemon process model (`src/daemon.rs`)
 
-The current daemon is a Unix-socket consumer that ingests hook events into `SharedState`. Extend it so it can also:
+The daemon is a Unix-socket consumer that ingests hook events and owns agent PTYs (Phase 1 work, already landed). It also exposes a streaming attach protocol used by the TUI to list agents, start/stop them, attach to PTY streams, and pull snapshots.
 
-- **Own agent PTYs.** Today PTYs are spawned by the TUI process via `portable-pty` (`src/embedded_pane.rs`). In the remote model, the daemon spawns and owns them. Locally, the TUI keeps spawning its own — the daemon-PTY split is gated on transport.
-- **Expose a streaming attach protocol.** New socket-based protocol the viewer connects to. Carries: list-agents, start-agent, stop-agent, attach-stream (bidirectional bytes), detach, current-state-snapshot.
-- **Persist as PID-1ish** of the environment. Recommended runtime: a `systemd --user` unit on VMs, an ENTRYPOINT on Kubernetes — both restart the daemon on crash without losing the agent processes (which are children spawned with their own session IDs and survive an orderly daemon restart via re-attach to existing PTYs, or are explicitly cleaned up on daemon hard crash; see Open Decisions).
+For remote use, the daemon must run as a **separate process** so it survives the TUI's exit (i.e., ssh disconnect). The infrastructure for this already exists from M4.3:
+
+- `dot-agent-deck daemon serve` — runs the daemon as a long-lived process.
+- Lazy-spawn: when something tries to attach and no daemon is running, spawn one detached (`setsid` + stdio-redirect + `flock`-serialized + trust-checked socket).
+
+What's new in the pivot: a TUI mode where the TUI **attaches to an existing daemon** via the local Unix socket instead of running the daemon as an in-process tokio task. This is the path used on the remote.
 
 ### Transport: ssh-to-VM
 
@@ -151,124 +158,132 @@ The current daemon is a Unix-socket consumer that ingests hook events into `Shar
   - Verify ssh works (`ssh <target> true`).
   - scp / install the matching `dot-agent-deck` binary to a known path (`~/.local/bin` by default).
   - Install hooks on the remote (run `dot-agent-deck hooks install` over ssh).
-  - Verify the daemon starts and a basic protocol roundtrip succeeds.
+  - Verify the deck launches (`ssh <target> dot-agent-deck --version`).
   - Write the registry entry locally.
-- `connect <name>`: ssh to the target, run `dot-agent-deck daemon attach`, the daemon's streaming attach protocol takes over the ssh stdio. Closing the local viewer kills the local ssh process — daemon and agents keep running.
+- `connect <name>`: `ssh -t <target> dot-agent-deck` (with arguments / env that make it attach to a persistent external daemon, not run an in-process one). Closing the local ssh session detaches; daemon and agents keep running.
 
 ### Transport: Kubernetes
 
-- `dot-agent-deck remote add --type=kubernetes --context=<ctx> --namespace=<ns>`:
-  - Verify `kubectl` works against the context.
-  - Apply a manifest creating a long-running Pod (or StatefulSet for the PVC) running the daemon image. Manifest is opinionated and ships in-repo.
-  - Pod's ENTRYPOINT is the daemon. Pod has a PVC mounted at `/workspace` for project state.
-  - Verify pod becomes Ready and a basic protocol roundtrip succeeds via `kubectl exec`.
-- `connect <name>`: `kubectl exec -it <pod> -- dot-agent-deck daemon attach`. Same protocol, different transport.
-- Image versioning: image tag matches `dot-agent-deck` version. `remote upgrade` re-applies the manifest with a new tag.
+Deferred to PRD #81. The same pattern applies — the TUI runs in-pod, `kubectl exec` forwards the terminal, the daemon is a separate process inside the pod.
 
-### CLI: `remote` subcommand group (new)
+### CLI: `remote` subcommand group
 
-Implementation lives in a new module (e.g., `src/remote.rs`) with subcommands wired into `main.rs`:
+Implementation in `src/remote.rs` with subcommands wired into `main.rs`:
 
-- `add` — interactive prompts or flags for type, target/context, install path; runs install verification.
+- `add` — interactive prompts or flags for type, target, install path; runs install verification.
 - `list` — reads `remotes.toml`, optionally pings each for current status.
 - `remove` — deletes registry entry.
-- `upgrade` — reinstalls binary / re-applies manifest matching the local version.
-- `connect [name]` — picker (TUI or fzf-style) if no name; otherwise direct attach.
+- `upgrade` — reinstalls the matching binary on the remote.
+- `connect [name]` — picker (TUI or fzf-style) if no name; otherwise immediate `ssh -t` into the remote.
 
-### CLI: `daemon attach` (new)
+### CLI: `daemon serve` and TUI external-daemon mode
 
-`dot-agent-deck daemon attach` is what runs **on the remote** when the viewer connects. It speaks the streaming attach protocol over stdio, so it works equally well over ssh exec or kubectl exec.
+`dot-agent-deck daemon serve` runs the daemon as a long-lived process (already exists from M4.3). The TUI on the remote is invoked with a flag/env (e.g. `DOT_AGENT_DECK_DAEMON_SOCKET=<path>` or `--external-daemon`) that switches it from in-process daemon to socket-attached daemon. Lazy-spawn ensures the daemon exists; if not, the TUI starts one detached and then attaches.
 
 ### Local viewer integration
 
-The TUI (`src/ui.rs`, `src/state.rs`) gains a remote-deck mode where panes are not local PTY-backed but **stream-backed**, reading bytes from the daemon's attach protocol and forwarding keystrokes to it. Local-deck mode is unchanged; the two coexist.
+In remote mode, **there is no laptop-side TUI**. The laptop is a terminal. The TUI runs on the remote, talking to the remote daemon over a Unix socket. ssh-the-binary handles forwarding.
+
+The local-deck path (no `connect`, no remote) is unchanged: TUI spawns daemon as an in-process tokio task.
 
 ### Hooks on the remote
 
-`dot-agent-deck hooks install` already writes per-agent hook scripts pointing at a local Unix socket. On the remote, the same install runs and points at the local daemon socket. No code change to the hooks themselves; they're agnostic to local-vs-remote.
+`dot-agent-deck hooks install` already writes per-agent hook scripts pointing at a local Unix socket. On the remote, the same install runs and points at the local daemon socket. No code change to the hooks themselves; they're agnostic to local-vs-remote because the remote *is* "local" from the daemon's point of view.
 
 ### Documentation deliverables
 
-- `docs/remote-environments.md` (new) — what a remote environment is, the lifecycle model, Ctrl+W vs detach, failure modes.
-- `docs/remote-requirements.md` (new) — exact environment requirements (Linux distro, ssh access, disk, RAM, egress, optional container runtime). This doc is what the maintainer follows to set up the dev/test VM, and what users follow to set up theirs.
-- `docs/remote-recipes.md` (new) — copy-pasteable provisioning snippets for multipass, Hetzner, fly, k3s. Maintenance burden kept low: each recipe is a few commands, no abstractions.
-- Update `docs/getting-started.mdx` and `docs/installation.md` to mention the remote option.
+Documentation work for this feature is owned by [PRD #87](87-remote-environments-docs.md) so it can ship on its own release schedule once the code path here is validated end-to-end. The three drafted pages (`docs/remote-environments.md`, `docs/remote-recipes.md`, `docs/remote-requirements.md`) live on disk as the working draft but are intentionally **not** in `site/sidebars.js` — the published docs site is unchanged by this PRD.
 
 ## Success Criteria
 
-- A user with an empty laptop and a fresh remote box (provisioned via the recipes doc) can run `dot-agent-deck remote add hetzner-1`, `dot-agent-deck connect hetzner-1`, start an agent, and have that agent survive `Ctrl+Z`-ing the laptop, closing the lid, and reconnecting from a different network — within 24 hours, the agent is still there with full scrollback.
-- `Ctrl+W` on a remote agent pane stops the agent process on the remote (verified via `ps` on the remote: the process is gone). It does **not** also kill the daemon or the environment.
-- Detach (separate keybinding) leaves the agent running and merely disconnects the viewer.
-- `remote list` shows last-known status; `connect` distinguishes the three failure modes (unreachable / binary missing / no agents) with actionable messages.
-- A user with `kubectl` access to a cluster can run `remote add --type=kubernetes` and get the same UX as the ssh path; the only thing that changes is the transport.
-- The maintainer's own dev/test VM is provisioned by following `docs/remote-requirements.md` from a clean box, with no out-of-band steps. Anything missing from the docs is a docs bug, fixed before merge.
-- Hook callbacks fired during a viewer disconnect are reflected in the viewer state on reattach (the Decision Log / pane events ledger has them).
+- A user with an empty laptop and a fresh remote box can run `dot-agent-deck remote add hetzner-1`, `dot-agent-deck connect hetzner-1`, start an agent, and have that agent survive `Ctrl+Z`-ing the laptop, closing the lid, and reconnecting from a different network — within 24 hours, the agent is still there with full scrollback, and re-running `connect` shows it.
+- `Ctrl+W` on a remote agent pane stops the agent process on the remote (verified via `ps` on the remote: the process is gone). It does **not** also kill the daemon.
+- ssh disconnect leaves the daemon and agents running. Reconnect picks up the existing state.
+- `remote list` shows last-known status; `connect` distinguishes the "host unreachable" vs "binary missing" failure modes with actionable messages.
+- Hook callbacks fired during a viewer disconnect are reflected in the TUI state on reattach.
 - Existing local-deck flow is unchanged. Users who never run `remote add` see no behavioral difference.
+- Every TUI feature behaves identically in remote mode and local mode (because in remote mode it *is* local mode, just running on the remote box). No "this works locally but not remotely" carve-outs.
 
 ## Milestones
 
 ### Phase 0: Test environment and requirements doc
 
-- [ ] **M0.1** — Draft `docs/remote-requirements.md` from scratch based on what the daemon will need (best guess; will be refined as M1+ exposes real requirements).
-- [ ] **M0.2** — Maintainer provisions a personal dev/test VM by following the draft requirements doc end-to-end. **Not** committed to the repo. Anything that had to be done out-of-band is a docs gap to fix.
-- [ ] **M0.3** — Refine the requirements doc until a clean re-provision works without consulting any other source.
+- [x] **M0.1** — Draft `docs/remote-requirements.md` from scratch.
+- [x] **M0.2** — Maintainer provisions a personal dev/test VM by following the draft requirements doc end-to-end.
+- [x] **M0.3** — Refine the requirements doc until a clean re-provision works without consulting any other source.
 
-### Phase 1: Daemon owns PTYs (local-only)
+### Phase 1: Daemon owns PTYs
 
-- [ ] **M1.1** — Refactor `src/daemon.rs` to own agent PTYs (currently spawned by the TUI). Local-deck mode keeps working; PTY ownership simply moves. Existing tests pass.
-- [ ] **M1.2** — Define and implement the streaming attach protocol (over Unix socket initially): list-agents, start-agent, stop-agent, attach-stream, detach, snapshot.
-- [ ] **M1.3** — TUI viewer can attach to its own local daemon over the new protocol (still all on one machine). This proves the protocol works before any network is involved.
+- [x] **M1.1** — Refactor `src/daemon.rs` to own agent PTYs. Local-deck mode keeps working; PTY ownership simply moves. Existing tests pass.
+- [x] **M1.2** — Define and implement the streaming attach protocol over Unix socket: list-agents, start-agent, stop-agent, attach-stream, detach, snapshot.
+- [x] **M1.3** — TUI viewer can attach to its own local daemon over the new protocol (single-machine).
 
-### Phase 2: ssh transport (MVP remote)
+### Phase 2: ssh transport (MVP remote)  [REWORKED post-pivot]
 
-- [ ] **M2.1** — `dot-agent-deck daemon attach` subcommand: speaks the protocol over stdio.
-- [ ] **M2.2** — `remote add --type=ssh` command: verifies ssh, installs binary on the remote, runs `hooks install`, writes registry entry.
-- [ ] **M2.3** — `remote list`, `remote remove`, `remote upgrade` commands.
-- [ ] **M2.4** — `connect [name]` command: picker, ssh exec into the daemon, viewer attaches.
-- [ ] **M2.5** — Lifecycle: `Ctrl+W` stops remote agent; explicit detach keybinding leaves it running; laptop sleep = implicit detach. End-to-end verified on the dev/test VM.
-- [ ] **M2.6** — Failure-mode-aware connect: distinguishes the three error states with clear messages.
+The pre-pivot Phase 2 built a laptop-side bridge that forwarded the daemon socket protocol over ssh. That work is **superseded** by the simpler TUI-on-remote model below; the bridge code is deleted in M2.7.
 
-### Phase 3: Kubernetes transport
+- [x] **M2.1** — `dot-agent-deck daemon serve`: runs the daemon as a long-lived separate process (originally landed as part of M4.3's lazy-spawn work).
+- [x] **M2.2** — `remote add --type=ssh`: verifies ssh, installs binary on the remote, runs `hooks install`, writes registry entry.
+- [x] **M2.3** — `remote list`, `remote remove`, `remote upgrade` commands.
+- [x] **M2.4** — *(superseded — original "ssh-bridge connect" implementation; replaced by M2.8 / M2.9).*
+- [x] **M2.5** — *(superseded — original "Ctrl+W vs explicit detach" semantics. New lifecycle uses ssh disconnect as detach; no separate keybinding.)*
+- [x] **M2.6** — *(superseded — original "failure-mode-aware connect" depended on the bridge implementation. New connect surfaces ssh's own errors plus version mismatch.)*
+- [x] **M2.7** — **Delete the bridge.** Remove `src/connect.rs`'s ssh socket-bridging code (`build_tokio_ssh_command`, `bridge_socket_path`, `ConnectBridge`, the laptop-side stdio↔Unix-socket relay) and the `daemon attach` bridge entrypoint in `src/daemon_attach.rs` / `src/main.rs`. Keep what survives: `state_dir()`, lazy-spawn (used by `daemon serve`), trust-check / O_NOFOLLOW / flock hardening.
+- [x] **M2.8** — **TUI external-daemon mode.** The deck binary, when run with a flag/env (e.g. `DOT_AGENT_DECK_DAEMON_SOCKET=<path>` or `--external-daemon`), connects to an existing daemon socket via the M1.2 protocol instead of spawning an in-process daemon. Lazy-spawns one detached if absent (reusing M4.3's machinery). Local-mode behavior is unchanged when the flag/env is unset.
+- [x] **M2.9** — **`connect` becomes ssh-t wrapper.** Rewrite `connect [name]` to `ssh -t <target> dot-agent-deck <args-that-trigger-external-daemon-mode>`. Picker, version-mismatch detection, host-unreachable error surfacing all live in this milestone. End-to-end verified on the dev/test VM. *(Implementation + tests landed; end-to-end VM verification consolidated into M4.4.)*
+- [x] **M2.10** — Lifecycle verification on the dev/test VM: `Ctrl+W` stops a remote agent (ps confirms); ssh disconnect leaves daemon + agents running; reconnect via `connect` re-attaches to the same agents with scrollback intact. Verified during the M2.21 ship validation pass.
+- [x] **M2.11** — **Persist per-agent display name and cwd in the daemon-side registry.** Daemon rehydration (commits 822770c / 51d8459 / 9d3a42a) replayed agent PTYs and pane_ids, but the daemon never knew display names — so a reconnect showed "1 1, 2 2, 3 3" instead of the user's named panes. The fix extends the existing `RunningAgent` registry (the same one that already stores `pane_id_env`) with `display_name` and `cwd`. `StartAgent` carries an initial `display_name`; renames push a new `SetAgentLabel` request through the attach protocol; `list_agents` returns `AgentRecord { id, pane_id_env, display_name, cwd }` so reconnects hydrate the TUI's pane labels and dashboard cwd column from the daemon. Validation matches the `pane_id_env` pattern (no control chars in display_name, ≤128 bytes; cwd ≤4096 bytes verbatim). Both fields are `Option` with `skip_serializing_if = "Option::is_none"` so older clients keep working. Mode-tab and orchestration-tab structural restoration is split into **M2.12** (separate milestone, not deferred). The "No agent" label after reconnect is split into **M2.13**. The earlier v1 of this milestone added a separate `<state_dir>/tui-state.json` file (commit b3a2a0d) with atomic-write/debounce machinery; that approach was replaced in this commit because the daemon already owned the same lifecycle, narrowing the attack surface and removing the file/symlink/race concerns the auditor flagged.
 
-- [ ] **M3.1** — Daemon container image (Dockerfile in-repo, builds on existing `Dockerfile` work).
-- [ ] **M3.2** — Opinionated manifest (StatefulSet + PVC + Service) shipped in-repo, parameterized by name/namespace.
-- [ ] **M3.3** — `remote add --type=kubernetes` command: verifies kubectl, applies manifest, waits for pod Ready, runs basic roundtrip.
-- [ ] **M3.4** — `connect` over `kubectl exec` works equivalently to ssh path.
-- [ ] **M3.5** — `remote upgrade` re-applies manifest with new image tag; data on PVC preserved.
+- [x] **M2.12** — **Restore mode-tab and orchestration-tab structure on remote reconnect.** After M2.11 hydration, all pre-existing daemon panes land in the dashboard tab. The user's original tab layout (mode tabs, orchestration tabs) is lost on reconnect. `TabManager`'s `open_mode_tab` / `open_orchestration_tab` always spawn fresh panes — there is no "attach existing pane to tab" entry point. The fix: extend `RunningAgent` / `AgentRecord` to carry the tab membership the pane belonged to when it was created (tab kind: dashboard / mode / orchestration, plus identifying metadata: mode name, orchestration id, role slot), have `StartAgent` carry that metadata, and add a hydration code path in `TabManager` that rebuilds the tab structure over already-attached daemon panes instead of spawning new ones.
+
+- [x] **M2.13** — **Track `agent_type` in the daemon registry so reconnect labels agents correctly.** After M2.11 hydration, dashboard rows show "No agent" because `state.rs::insert_placeholder_session` (the path hydration uses) creates sessions with `AgentType::None`, and `AgentType` is only set when a real `SessionStart` hook event arrives. The daemon has the information — it spawned the agent — but the registry doesn't carry `agent_type`. The fix: add `agent_type` to `RunningAgent` and `AgentRecord` (Option for backward compat), have `StartAgent` carry it, and have the hydration path in `src/ui.rs` thread it through instead of defaulting to `AgentType::None`.
+
+- [~] **M2.14** — **DEFERRED to PRD #93.** `--theme` propagation through the `ssh -t` `connect` wrapper is real new code on the diverged-architecture path. PRD #93 collapses local and remote into one daemon-backed architecture; once that lands, theme propagation looks different (likely irrelevant for the directly-connected local case, and still needed for the ssh-tunneled remote case but with a cleaner surface). Doing M2.14 now would be partly wasted. Original scope retained for PRD #93 to pick up: `src/connect.rs:546` has an orphaned comment referencing the original M5.5 plan; the propagation is currently a no-op. The laptop-side `--theme` flag doesn't reach the remote TUI invocation, so the user's theme preference is lost when running over `connect`. *(Note: `--continue` was originally also in scope for this milestone, but [PRD #89](89-auto-restore-tui-state.md) replaces the flag with unconditional auto-restore; nothing left to propagate for that case.)*
+
+- [x] **M2.15** — **Carry initial PTY size in `StartAgent` instead of hardcoding 24×80 for daemon-spawned agents.** `src/embedded_pane.rs:441-446` spawns the PTY at a hardcoded 24×80; the agent then sees a brief 24×80 window before the first `Resize` op (added in M2.7's protocol extension) corrects it. This causes a one-frame visual flicker on agent start and can confuse agents that probe the terminal size at startup. The fix: extend `StartAgent` with `cols` / `rows`, have the TUI send the pane's actual size at spawn time, and have the daemon spawn the PTY at that size from the outset.
+
+- [x] **M2.16** — **Clean up stale "daemon does not track display metadata yet" comment in `src/embedded_pane.rs`.** Cosmetic. The comment was true before M2.11 and is wrong now (M2.11 added `display_name` + `cwd`; M2.12 added `tab_membership`; M2.13 added `agent_type`). Rewritten to describe the current behavior: callers seed display-name maps from `HydratedPane::display_name` with `agent_id` as a fallback. Actual line was `src/embedded_pane.rs:780–781`, not `:708` as originally noted.
+
+- [x] **M2.17** — **Forward hook events from the daemon to the TUI over the attach socket.** Before the M2.7→M2.9 pivot, daemon and TUI shared one `AppState` because the daemon ran in-process. Now that the daemon is a separate process (lazy-spawned under `ssh -t connect`, or `daemon serve` directly), hook events arrive at the daemon's hook socket (`src/daemon.rs:140` `run_hook_loop`) and are applied to the daemon's own `AppState` — which the TUI never reads. The TUI's `AppState` therefore stays at the M2.13 placeholder defaults: "No agent", `Tools: 0`, `Last:` frozen at spawn time, no prompts. Symptom: in remote mode the dashboard cards never update no matter how active the agents are. The fix: add a daemon-wide `broadcast::Sender<AgentEvent>` on `Daemon`; have `run_hook_loop` send each event into it after applying it locally; add a new attach frame kind (e.g. `KIND_EVENT = 0x14`) carrying JSON-encoded `AgentEvent`; spawn a per-connection forwarder task in `handle_attach_stream` (and any long-lived connection path) that subscribes to the broadcast and emits `KIND_EVENT` frames; have the TUI's daemon client recognize `KIND_EVENT`, decode, and call `state.apply_event(event)` on the local `AppState`. Out of scope: replaying events emitted before attach (open as a follow-up if needed) and persisting the daemon's event log across daemon restarts.
+
+- [x] **M2.18** — **Collapse the quit/detach dialog to a single mode-appropriate action.** Today `render_quit_confirm` in `src/ui.rs:5505` offers three options: Quit, Detach, Cancel. In external-daemon mode Quit and Detach are functionally identical from the user's perspective — both exit the TUI and leave daemon-owned agents running; the only difference is whether the TUI sends an explicit `KIND_DETACH` frame before closing the socket (so the daemon can distinguish voluntary detach from a network drop in its log). Users observe two synonymous options and have to guess which to pick. In local mode the situation is worse: "Detach" has no meaning when there is no daemon to detach from, and the existing pending Task #20 already flagged hiding it for that reason. The fix: in local mode (`via_daemon == false`) present a single **Quit** action whose semantics are "exit and reap local PTY children" — for consistency, also reap dashboard agents (currently spared because the post-loop teardown loop iterates `1..tab_count`, skipping the dashboard tab; revisit that quirk here). In remote mode (`via_daemon == true`) present a single **Detach** action whose semantics are "exit the TUI; agents keep running on the daemon" — internally still send `KIND_DETACH` so the daemon's log distinguishes voluntary detach from EOF. The same keybind (Ctrl+C) opens the dialog; only the label and dialog copy change with mode. Subsumes Task #20. Out of scope: a separate "terminate all daemon agents" action — deferred until a real workflow needs it.
+- [x] **M2.19** — **Orchestrator-to-role prompt propagation in external-daemon mode.** User-reported: when the orchestrator agent asks a role agent (e.g. "coder, do X") inside an orchestration tab, the prompt does not reach the role agent. The orchestrator's outgoing prompt is the entry point — this likely sits in the orchestration tab's `delegate` / send-to-role plumbing (`src/orchestration.rs` or wherever the orchestrator's tool calls translate into role-agent input). Reproduce first: confirm whether the prompt is dropped at the orchestrator side, lost in the attach-socket forwarding path (M2.17's hook-event channel is for events, but the role-agent input goes through `KIND_STREAM_IN`), or arrives at the daemon but is routed to the wrong PTY. Fix once the broken link is pinned. Local mode regression check is required because the orchestration cross-agent path is shared.
+- [x] **M2.20** — **Intermittent need to press Enter after sending a prompt to the orchestrator.** User-reported, non-deterministic. Symptom: occasionally a prompt typed into the orchestrator's input does not execute until the user presses Enter a second time. Likely a key-event delivery race (crossterm event polled in the 16 ms tick loop at `src/ui.rs:3440`) or an input forwarder buffering issue in the stream-backed pane writer (`src/embedded_pane.rs:688` `writer` half of the io_task). Needs a reproducer or instrumentation before a fix; capture timing and the surrounding state when it happens.
+- [x] **M2.21** — **Stricter protocol-version handshake on `connect`.** Surfaced by the M2.19 audit. The attach-socket wire format has been bumped silently across PRD #76 (M2.17 added `KIND_EVENT`; M2.19 changed the `KIND_EVENT` payload from raw `AgentEvent` to a tagged `BroadcastMsg` envelope). `src/connect.rs:558` only warns on binary version mismatch and still spawns the remote session, so an upgrade-skewed pair (newer TUI ↔ older daemon, or vice versa) silently disables live updates: every `KIND_EVENT` frame fails to deserialize, the TUI logs and reconnects, and the user sees a frozen dashboard with no error. The fix: add a protocol version field to `AttachRequest`/`AttachResponse`, fail the connect with a clear error message on mismatch (mention which side to upgrade), and bump the version every time the wire format changes. Out of scope: backward-compatible wire shims — PRD #76 is unreleased, so a hard fail is acceptable until the project formally commits to wire stability.
+
+### Phase 3: Kubernetes transport — moved to PRD #81
+
+PRD #81 picks up its own milestones (image, manifest, `remote add --type=kubernetes`, `connect` over `kubectl exec` running an in-pod TUI, PVC-preserving upgrade).
 
 ### Phase 4: Quality
 
-- [ ] **M4.1** — Tests for the streaming attach protocol (round-trip of all message types, disconnect/reconnect, partial frames).
-- [ ] **M4.2** — Integration test: spin up the daemon locally, attach, start an agent, detach, reattach, stop. End-to-end on a single machine.
-- [ ] **M4.3** — Manual end-to-end validation on dev/test VM **and** on a Kubernetes cluster (kind or k3s on the dev VM is fine).
+- [x] **M4.1** — Tests for the streaming attach protocol (round-trip of all message types, disconnect/reconnect, partial frames).
+- [x] **M4.2** — Integration test: spin up the daemon locally, attach, start an agent, detach, reattach, stop. End-to-end on a single machine.
+- [x] **M4.3** — Lazy-spawn-on-attach: `daemon serve` subcommand, detached spawn via `setsid` + stdio-redirect, `flock`-serialized concurrency guard, XDG state dir, O_NOFOLLOW + 0o600 log file, socket trust check (uid + mode 0o600 + is-socket), full unit test coverage.
+- [x] **M4.4** — Manual end-to-end validation on the dev/test VM after M2.7–M2.10: ssh-t wrapper, lazy-spawn from remote TUI startup, hook events round-tripping through the remote daemon, every TUI feature behaves identically to local mode (because in remote mode it *is* local mode, just running on the remote). Verified via the 21-check ship-readiness sweep covering M2.11–M2.21 (handshake fail-fast, lifecycle, tab restoration, orchestrator delegate, display-name/cwd/agent_type persistence, hook event flow, Enter debounce, paste flow, PTY size, reaper, sleep/wake, remote upgrade).
 
 ### Phase 5: Documentation and release
 
-- [ ] **M5.1** — `docs/remote-environments.md`: lifecycle model, Ctrl+W vs detach semantics, failure modes, hook-on-remote behavior.
-- [ ] **M5.2** — `docs/remote-recipes.md`: provisioning snippets for multipass / Hetzner / fly / k3s.
-- [ ] **M5.3** — Final pass on `docs/remote-requirements.md` reflecting anything learned in M1–M4.
-- [ ] **M5.4** — Update `docs/getting-started.mdx` and `docs/installation.md` to mention the remote path.
-- [ ] **M5.5** — Changelog fragment, release.
+Moved to [PRD #87](87-remote-environments-docs.md). The earlier M5.1–M5.5 work on this branch wrote three new pages (`docs/remote-environments.md`, `docs/remote-recipes.md`, `docs/remote-requirements.md`) but they are intentionally **not added to `site/sidebars.js`** so the published docs site is unchanged. The pages remain on disk as the starting draft for PRD #87 to take to release. Cross-references in `docs/getting-started.mdx` and `docs/installation.md` were reverted to the pre-PRD-76 state for the same reason. Changelog fragment + release are owned by PRD #87.
 
 ## Key Files
 
-- `src/daemon.rs` — extended to own PTYs and serve the streaming attach protocol.
-- `src/embedded_pane.rs` — PTY spawn paths refactored to be daemon-owned in remote mode.
-- `src/ui.rs`, `src/state.rs` — viewer integration; remote panes are stream-backed.
+- `src/daemon.rs` — owns PTYs and serves the streaming attach protocol over a Unix socket. (Phase 1.)
+- `src/embedded_pane.rs` — PTY spawn paths; daemon-owned in remote mode. (Phase 1.)
+- `src/ui.rs`, `src/state.rs` — TUI; gains an external-daemon-attach mode (M2.8). Otherwise unchanged.
 - `src/hook.rs` — unchanged; verifies it works pointing at the daemon's socket on the remote.
-- `src/main.rs` — wire new subcommands.
-- `src/remote.rs` (new) — `remote add | list | remove | upgrade | connect` implementations and the `~/.config/dot-agent-deck/remotes.toml` registry.
-- `src/protocol.rs` (new, or inside `daemon.rs`) — streaming attach protocol types and codec.
-- `Dockerfile` — daemon image (extends or reuses existing image work if present).
-- `deploy/k8s/` (new) — opinionated manifest shipped for `remote add --type=kubernetes`.
-- `docs/remote-environments.md` (new), `docs/remote-requirements.md` (new), `docs/remote-recipes.md` (new).
-- `docs/getting-started.mdx`, `docs/installation.md` — minor cross-references.
+- `src/main.rs` — wires `connect`, `remote *`, `daemon serve`. The `daemon attach` bridge subcommand is removed in M2.7.
+- `src/remote.rs` — `remote add | list | remove | upgrade` implementations and the `~/.config/dot-agent-deck/remotes.toml` registry.
+- `src/connect.rs` — substantially shrinks in M2.7; the new `connect` is an `ssh -t` wrapper plus picker.
+- `src/daemon_attach.rs` — the bridge entrypoint is removed in M2.7. Hardening helpers (`state_dir`, `verify_socket_trusted`, `ensure_daemon_running`) survive and are reused by M2.8.
+- `src/daemon_protocol.rs` — unchanged from Phase 1. **No `ListDir` / `ReadFile` / `StateSnapshot` / `SubscribeEvents` ops** (those were Phase 6, dropped).
+- Doc pages — handed off to the docs PRD (this PRD does not publish docs).
 
 ## Design Decisions
 
 ### 2026-05-08: Long-running per-project environment, not pod-per-agent
 
-Considered three models: VM-per-environment, pod-per-agent (ephemeral), and pod-per-environment (long-running). The product requirement "feels local" is decisive: shared filesystem, warm caches, ability to stop one agent and start another in the same in-progress state are all properties of a long-running environment. Pod-per-agent is the right shape for ephemeral CI runners, the wrong shape for a remote dev box. VM and long-running pod are isomorphic for this purpose; transport is a config detail.
+Considered three models: VM-per-environment, pod-per-agent (ephemeral), and pod-per-environment (long-running). The product requirement "feels local" is decisive: shared filesystem, warm caches, ability to stop one agent and start another in the same in-progress state are all properties of a long-running environment. Pod-per-agent is the right shape for ephemeral CI runners, the wrong shape for a remote dev box.
 
 ### 2026-05-08: Daemon-on-remote, not reverse tunnel
 
@@ -278,36 +293,55 @@ The deck already has a daemon (`src/daemon.rs`) that ingests hook events. Extend
 
 Considered building VM creation (`dot-agent-deck remote create-vm --provider=fly`). Rejected: cloud-provider matrix is a maintenance burden the project can't sustain (SDKs, regions, instance types, auth, billing, image rotation), and existing tools (multipass, fly, terraform) already do this well. The product accepts any environment that meets documented requirements; the docs ship recipes for common providers as starting points but no abstraction layer.
 
-### 2026-05-08: Ctrl+W stops the agent (local or remote); detach is a separate action
+### 2026-05-08: Ctrl+W stops the agent (local or remote)
 
-Initial framing had close-deck-on-remote default to detach. Reversed after user feedback: keep the mental model uniform across local and remote. Ctrl+W means "I'm done with this agent" in both. Remote adds a *new* capability — explicit detach — that local doesn't need. This makes "keep it running while I disconnect" the opt-in path, which is the right default for safety (detach-by-default would mean a stray Ctrl+W leaves orphaned agents accumulating on the remote).
+Initial framing had close-deck-on-remote default to detach. Reversed after user feedback: keep the mental model uniform across local and remote. Ctrl+W means "I'm done with this agent" in both. (The post-pivot model also drops the *separate* detach keybinding — ssh disconnect handles that — but Ctrl+W's meaning is still "stop the agent.")
+
+### 2026-05-09: Architectural pivot — laptop is a terminal, not a real client
+
+A first attempt at remote mode kept the laptop's TUI as the user-facing process, bridging the daemon socket protocol over ssh. M2.4–M2.6 implemented the bridge and it worked for PTY data, but project-aware features (directory picker `Ctrl+N`, `.dot-agent-deck.toml`-driven mode tabs and orchestrations, side panes, reactive panes, watch rules, delegate roles) all read laptop-side state, so `connect` was a misleading half-experience.
+
+A "Phase 6" was scoped to fix this by extending the protocol with `ListDir`, `ReadFile`, `Stat`, `StateSnapshot`, `SubscribeEvents`, side-pane spawn, and rewiring all project-aware code through a `ProjectIO` trait. Estimated 9 milestones, plus a state-replication addition that surfaced in testing.
+
+This was rejected on cost/value grounds:
+
+- The complexity of replicating every TUI behavior over a custom protocol is high and ongoing — every new project-aware feature would need a protocol op and a `ProjectIO` branch.
+- The benefit (multi-client viewing, laptop-native scripting against a remote) is not a stated user requirement.
+- A simpler model — the TUI runs on the remote, ssh forwards the terminal, the daemon is a separate process so PTYs survive disconnect — gets the same product outcome (persistence, run-on-beefier-box, "feels local") with a fraction of the code.
+
+The pivot:
+
+- Drop Phase 6 entirely. No `ProjectIO`, no `ListDir`/`ReadFile`/`Stat`/`StateSnapshot`/`SubscribeEvents` protocol ops, no `--project-dir` plumbing through the laptop.
+- Replace the ssh socket-bridge (`src/connect.rs` `ConnectBridge`, `daemon attach` entrypoint in `src/daemon_attach.rs`) with a thin `ssh -t <target> dot-agent-deck` wrapper.
+- Add a TUI mode that attaches to an external daemon process (so the daemon can outlive ssh disconnect). Lazy-spawn (M4.3, already done) starts the daemon when needed.
+- Keep what's still useful: Phase 1 (daemon owns PTYs as a separable process), M4.3 hardening (lazy-spawn, flock, XDG state dir, O_NOFOLLOW, trust-check), `daemon serve`, the `remote add/list/remove/upgrade` registry.
+
+Net code delta is negative: roughly **−1500 LOC** across `src/connect.rs` and `src/daemon_attach.rs`'s bridge half, plus skipping ~9 milestones of Phase 6 work. The release window pulls in.
 
 ### 2026-05-08: Phase 0 is the test environment, set up by the docs
 
-The first task is meta: the maintainer provisions a personal dev/test VM by following the same `docs/remote-requirements.md` that ships to users. The VM itself is not in-repo (no terraform, no scripts beyond what the docs say). This is a forcing function: if the docs aren't enough to set it up from a clean box, they're not enough for users. Re-validation by clean re-provision happens any time the requirements change.
+The first task is meta: the maintainer provisions a personal dev/test VM by following the same `docs/remote-requirements.md` that ships to users. The VM itself is not in-repo (no terraform, no scripts beyond what the docs say). This is a forcing function: if the docs aren't enough to set it up from a clean box, they're not enough for users.
 
 ## Open Decisions
 
 To be resolved during implementation, not blocking PRD acceptance:
 
-- **Daemon persistence layer**: `systemd --user` unit (VM-native, works without containers), container restart-policy (Kubernetes-native), or a deliberate supervisor (`abduco`-wraps-the-daemon, transport-agnostic). Likely answer: systemd for ssh transport, restart-policy for Kubernetes transport — match each transport's idiom.
-- **Attach protocol over the wire**: stdio-piped framed bytes (simple, works over ssh exec and kubectl exec) vs. structured RPC (gRPC, JSON-RPC). Likely answer: framed bytes, custom minimal protocol — gRPC drags in build complexity not justified at this scale.
-- **Transport order in v1**: ship ssh first (smaller surface, no cluster dependency for testing), then Kubernetes; or both at once. Likely answer: ssh first (Phase 2), Kubernetes follows (Phase 3).
-- **Project filesystem on Kubernetes**: PVC per environment with git as the sync layer (recommended) vs. ephemeral with init-container clone vs. mounted ConfigMap-style. Likely answer: PVC + git.
-- **Picker UX in `connect`**: TUI list inside `dot-agent-deck` (consistent with rest of app) vs. shell-out to `fzf` (zero-effort, requires fzf installed). Likely answer: in-app TUI, fzf as fallback if not interactive.
+- **TUI external-daemon switch shape**: env var (`DOT_AGENT_DECK_DAEMON_SOCKET=<path>`), CLI flag (`--external-daemon`), or auto-detect (if a known socket path exists, use it). Likely answer: env var driven by `connect` so the laptop's `connect` decides; explicit flag for power-users invoking the deck on the remote directly.
+- **Daemon persistence layer (VM)**: ad-hoc `setsid`-detached process from lazy-spawn (current M4.3 behavior, survives shell exit) is sufficient for v1. `systemd --user` units are an optional hardening step the docs can recommend; not required.
+- **Picker UX in `connect`**: TUI list inside `dot-agent-deck` (consistent with rest of app) vs. shell-out to `fzf`. Likely answer: in-app TUI, fzf as fallback if not interactive.
+- **Daemon-side socket file permissions**: ~~`src/daemon.rs` currently binds the Unix socket without explicit `set_permissions` / `chmod`...~~ **Resolved in M1.1** — `umask 0o177` (serialized via `UMASK_LOCK`) before `UnixListener::bind` so the socket inode is created at mode `0o600`, with a post-bind `chmod` retained as defense-in-depth. Verified by `daemon::tests::socket_is_0600_immediately_after_bind`.
 
 ## Risks & Mitigations
 
 | Risk | Mitigation |
 |------|------------|
-| Streaming attach protocol design is over- or under-engineered, requires churn after Phase 2 | Start with the simplest framing (length-prefixed JSON or msgpack frames) on Unix socket in Phase 1; only generalize to network-grade in Phase 2 once real ssh-exec usage exposes problems. Version the protocol from day one. |
-| Version drift between client and remote daemon causes wire-format breakage | `connect` performs a version handshake; on mismatch, refuses with a clear `remote upgrade` recommendation. Hook event schema (`src/event.rs`) is the highest-risk surface — version-tag it. |
-| Hooks fire during disconnect and are silently lost | Daemon ingests hooks regardless of viewer presence (already true today). On reattach, viewer requests a state snapshot. Bound the buffer (lines, bytes, or "since last attach") and document the limit. |
-| Daemon crash on the remote leaves orphaned agent processes | Daemon spawns agents with explicit process-group IDs and tracks them on disk; on restart, the daemon reconciles (reattach to existing PTYs where possible, mark unattachable as crashed). |
-| `kubectl exec` keystroke latency is too high to feel local | Document the RTT-bound nature; recommend co-located clusters; do not over-promise. Mosh-style UDP is **not** in scope — users with high-latency setups should run the deck on the remote and ssh into it (the original "run app on remote" pattern). |
+| Streaming attach protocol design is over- or under-engineered | Already used in production via Phase 1. The pivot **reduces** the protocol's exposure (only used over local Unix sockets, never over the network), which lowers the risk further. |
+| Version drift between client (laptop install) and remote daemon binary causes wire-format breakage | `connect` performs a version check via `ssh <target> dot-agent-deck --version` before handing off the terminal; on mismatch, refuses with a clear `remote upgrade` recommendation. |
+| Hooks fire during disconnect and are silently lost | Daemon ingests hooks regardless of TUI presence (already true today). On reattach, the new TUI requests a state snapshot from the still-running daemon. |
+| Daemon crash on the remote leaves orphaned agent processes | Daemon spawns agents with explicit process-group IDs and tracks them on disk; on restart (via lazy-spawn), reconciles (reattach to existing PTYs where possible, mark unattachable as crashed). |
 | Docs drift from reality once dev VM is set up | M0.3 explicitly requires a clean re-provision from docs alone. Repeat any time `remote-requirements.md` changes. |
-| The Kubernetes manifest shipped in-repo gets stale or doesn't fit users' clusters | Manifest is a starting point, documented as such. Users can apply their own manifest and point `remote add` at the resulting pod. |
-| Local-deck users see regressions from the daemon refactor | Phase 1 is gated on existing local tests passing. Daemon-owns-PTYs change is observable only in remote mode; local-deck PTY spawning path stays.|
+| Local-deck users see regressions from the daemon refactor | Phase 1 is gated on existing local tests passing. The post-pivot M2.8 (TUI external-daemon mode) is opt-in; the in-process daemon path is the default and unchanged. |
+| Removing the bridge code (M2.7) breaks something subtle the bridge was doing | M2.7 is a delete-only milestone for the bridge halves; nothing else depends on them (the daemon protocol, hardening helpers, registry, and hooks are all bridge-independent). M4.4 verifies end-to-end on the VM after the delete. |
 
 ## References
 

@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use dot_agent_deck::config::{SavedPane, SavedSession};
-use dot_agent_deck::pane::{PaneController, PaneDirection, PaneError, PaneInfo};
+use dot_agent_deck::pane::{PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome};
 use dot_agent_deck::project_config::{CONFIG_FILE_NAME, load_project_config};
 use dot_agent_deck::tab::TabManager;
 
@@ -91,8 +91,8 @@ impl PaneController for MockPaneController {
         Ok(())
     }
 
-    fn rename_pane(&self, _pane_id: &str, _name: &str) -> Result<(), PaneError> {
-        Ok(())
+    fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+        Ok(RenameOutcome::applied(name))
     }
 
     fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
@@ -333,7 +333,7 @@ fn save_then_restore_recreates_side_panes() {
     let mut tab_manager = TabManager::new(mock.clone());
     let agent_pane_id = mock.create_pane(None, Some(&restored.dir)).unwrap();
     let (_idx, side_ids) = tab_manager
-        .open_mode_tab(&mode_cfg, &restored.dir, agent_pane_id.clone())
+        .open_mode_tab(&mode_cfg, &restored.dir, agent_pane_id.clone(), (24, 80))
         .expect("open_mode_tab must succeed on restore");
 
     // Two persistent + default reactive panes (matches the existing

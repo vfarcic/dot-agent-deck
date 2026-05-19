@@ -469,6 +469,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm 0.28.1",
+ "libc",
  "open",
  "portable-pty",
  "ratatui",

@@ -319,6 +319,10 @@ Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orche
 - [x] **M12: Tests** — config parsing ✓, message bus ✓, work-done handling ✓, delegation dispatch ✓, parallel fan-out ✓ (3 tests: multi-worker dispatch, clear/restart panes, selective role targeting), feedback loop ✓ (4 tests: immediate injection, independent multi-worker forwarding, orchestrator done/completion, deferred when not ready)
 - [x] **M13: No regressions** — all 399 tests passing after M12 implementation
 
+### Phase 4: Follow-ups
+
+- [ ] **M14 — Truncate `work-done-{role}.md` on each delegate so worker agents write into empty files.** Observed during PRD #76 orchestration work: when an agent role (coder, reviewer, auditor) is re-delegated within a session, the `work-done-{role}.md` file from the previous delegation still exists. The agent's `Write` tool requires a prior `Read` for existing files, so the worker burns one extra round-trip per delegation reading content that is about to be overwritten — content the worker doesn't actually consume (each role writes a fresh report, not an update). Fix: in `dot-agent-deck delegate --to <role>` (CLI subcommand from M4c, `src/main.rs` / `src/orchestration.rs`), truncate or remove the per-role work-done file before the daemon injects the prompt into the worker pane. Truncate beats remove: the file stays at a predictable path for the orchestrator's read, just empty. Verify behavior matches: orchestrator-side reads after the worker signals done still see fresh content; race window is closed because truncation completes before the worker is told to start. Tests: extend the existing delegate-CLI tests to assert the work-done file is empty (or absent) immediately after the delegate command runs and before the worker writes. Out of scope: changing the file path naming, archiving prior content, or moving the cleanup to the worker side (centralizing in the CLI avoids per-role-spec coordination).
+
 ## Key Files
 
 - `src/project_config.rs` — Orchestration config structs and TOML parsing

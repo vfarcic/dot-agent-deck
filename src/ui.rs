@@ -13,13 +13,14 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Tabs},
 };
 
+use crate::agent_pty::TabMembership;
 use crate::ascii_art::{AsciiArtResult, generate_ascii_art};
 use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::config_validation::sanitize_role_name;
-use crate::embedded_pane::EmbeddedPaneController;
+use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
 use crate::event::{AgentType, EventType};
-use crate::pane::{PaneController, PaneError};
+use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
@@ -119,7 +120,7 @@ enum UiMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PaneLayout {
+pub(crate) enum PaneLayout {
     Stacked,
     Tiled,
 }
@@ -450,6 +451,34 @@ impl NewPaneFormState {
 /// transient info messages don't linger past their usefulness.
 const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// PRD #76 M2.20 — minimum gap between the last forwarded keystroke and an
+/// Enter keystroke that follows it on the human-typing path. Agent TUIs like
+/// claude treat a CR fused to preceding bytes as newline-in-input, not submit;
+/// only a CR separated by a brief pause is honored as Enter. Mirrors the
+/// programmatic submit guard in `src/embedded_pane.rs:199` (`SUBMIT_DELAY`),
+/// which was tuned empirically — keep the two values in sync.
+const SUBMIT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Returns how long the human-typing dispatch should sleep before forwarding
+/// `bytes` to the pane, to ensure an Enter keystroke arrives as a standalone
+/// event rather than fused to recent typing. Returns `Duration::ZERO` unless
+/// `bytes` contains `\r` and the elapsed time since the previous forward is
+/// below `SUBMIT_DEBOUNCE`. Extracted as a helper so the policy is unit-testable.
+fn submit_debounce_duration(
+    now: std::time::Instant,
+    last: Option<std::time::Instant>,
+    bytes: &[u8],
+) -> std::time::Duration {
+    if !bytes.contains(&b'\r') {
+        return std::time::Duration::ZERO;
+    }
+    let Some(prev) = last else {
+        return std::time::Duration::ZERO;
+    };
+    let elapsed = now.saturating_duration_since(prev);
+    SUBMIT_DEBOUNCE.checked_sub(elapsed).unwrap_or_default()
+}
+
 /// A prompt queued for injection into a pane once its agent is ready.
 /// Used by M5 delegation dispatch when `clear = true` restarts a pane.
 struct PendingDispatch {
@@ -504,14 +533,24 @@ struct UiState {
     config_gen_target: Option<(String, String)>,
     /// Selected option index in the config-gen modal (0=Yes, 1=No, 2=Never).
     config_gen_selected: usize,
-    /// Selected option in quit confirm modal (0=Quit, 1=Cancel).
+    /// Selected option in quit confirm modal (0=action, 1=Cancel).
     quit_confirm_selected: usize,
+    /// PRD #76 M2.18: true when the TUI is attached to an external daemon,
+    /// so the quit dialog shows "Detach" instead of "Quit".
+    via_daemon: bool,
     /// Orchestration tab IDs whose start-role prompt has already been injected.
     orchestration_prompted: HashSet<TabId>,
     /// Tracks when orchestration tabs were created (for delayed prompt injection).
     orchestration_created_at: HashMap<TabId, std::time::Instant>,
     /// Prompts waiting to be injected into panes once their agent is ready (M5 dispatch).
     pending_dispatches: Vec<PendingDispatch>,
+    /// PRD #76 M2.20: timestamp of the most recent keystroke forwarded to a
+    /// pane via `ForwardToPane`. Drives the submit-debounce in `PaneInput` mode
+    /// so an Enter keystroke arriving fused to preceding typed bytes is
+    /// delayed just enough that the agent TUI treats it as a standalone submit
+    /// (matches `write_to_pane`'s SUBMIT_DELAY rationale at
+    /// src/embedded_pane.rs:199).
+    last_pane_keystroke_at: Option<std::time::Instant>,
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -562,9 +601,11 @@ impl UiState {
             config_gen_target: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
+            via_daemon: false,
             orchestration_prompted: HashSet::new(),
             orchestration_created_at: HashMap::new(),
             pending_dispatches: Vec::new(),
+            last_pane_keystroke_at: None,
         }
     }
 }
@@ -583,6 +624,184 @@ impl Default for UiState {
 // Session filtering
 // ---------------------------------------------------------------------------
 
+// PRD #76 M2.15 layout-math helpers — single source of truth for the
+// dimensions a freshly-spawned agent PTY (`AgentSpawnOptions.rows/cols`)
+// and a resize-time `resize_pane_pty` call should agree on. Before this,
+// every spawn site hardcoded 24×80 and every resize site reimplemented
+// the layout math inline, so the two could (and did) drift. Now the spawn
+// callsites and `resize_dashboard_panes` / `resize_mode_tab_panes` all
+// call these, so the agent's first frame paints at the eventual size and
+// stays there. All helpers return `(rows, cols)` (= `(height, width)` of
+// the inner area inside the pane's border).
+
+/// Agent pane of a mode tab: left half × full height minus 3 rows of
+/// chrome (tab bar + hints bar). Mirrors the mode-tab render layout.
+pub(crate) fn mode_agent_pane_dims(area: Rect) -> (u16, u16) {
+    let half_width = (area.width / 2).saturating_sub(2);
+    let rows = area.height.saturating_sub(3);
+    (rows, half_width)
+}
+
+/// Side panes of a mode tab: right half divided equally by `side_count`,
+/// minus the per-pane border. `side_count` is clamped to ≥1 so the layout
+/// math doesn't divide by zero before the first side pane appears.
+pub(crate) fn mode_side_pane_dims(area: Rect, side_count: u16) -> (u16, u16) {
+    let half_width = (area.width / 2).saturating_sub(2);
+    let count = side_count.max(1);
+    let rows = (area.height / count).saturating_sub(2);
+    (rows, half_width)
+}
+
+/// Shared layout constants for the dashboard and orchestration tab
+/// renderers. Extracted into `const`s (rather than inlined at each
+/// `Layout::horizontal(...)` callsite) so the SSOT helpers below and the
+/// renderer in `draw_active_tab` mathematically agree by construction.
+/// PRD #76 M2.15 fixup F3 — the orchestration helper would silently drift
+/// from the renderer the next time someone touched one of the percentages
+/// if the value lived in two places.
+pub(crate) const DASHBOARD_LEFT_PERCENT: u16 = 33;
+pub(crate) const DASHBOARD_PANES_PERCENT: u16 = 67;
+pub(crate) const ORCHESTRATION_LEFT_PERCENT: u16 = 34;
+pub(crate) const ORCHESTRATION_PANES_PERCENT: u16 = 66;
+
+/// Inner helper: right column dims for a dashboard/orchestration-style tab
+/// where the right column holds a vertical stack of `pane_count` panes.
+/// Factors out the common chrome/stack math so the dashboard (67%) and
+/// orchestration (66%) helpers can share the body and only differ on the
+/// width percentage.
+fn right_column_pane_dims(
+    area: Rect,
+    width_percent: u16,
+    pane_count: u16,
+    is_focused: bool,
+    layout: PaneLayout,
+    show_tab_bar: bool,
+) -> (u16, u16) {
+    let chrome_rows: u16 = if show_tab_bar { 1 } else { 0 };
+    let main_height = area.height.saturating_sub(chrome_rows + 1); // +1 for hints bar
+    let right_width = area.width * width_percent / 100;
+    let count = pane_count.max(1);
+    let chunk_height = match layout {
+        PaneLayout::Tiled => main_height / count,
+        PaneLayout::Stacked => {
+            if is_focused {
+                let unfocused = count.saturating_sub(1);
+                main_height.saturating_sub(unfocused)
+            } else {
+                1
+            }
+        }
+    };
+    let rows = chunk_height.saturating_sub(2);
+    let cols = right_width.saturating_sub(2);
+    (rows, cols)
+}
+
+/// Dashboard pane: right 67% of width, height divided across `pane_count`
+/// panes per the active `PaneLayout`. `is_focused` matters in `Stacked`
+/// mode (focused gets the lion's share, unfocused collapse to a 1-row
+/// title bar); in `Tiled` it's ignored. `show_tab_bar` matches
+/// `TabManager::show_tab_bar` and adds 1 row of chrome.
+pub(crate) fn dashboard_pane_dims(
+    area: Rect,
+    pane_count: u16,
+    is_focused: bool,
+    layout: PaneLayout,
+    show_tab_bar: bool,
+) -> (u16, u16) {
+    right_column_pane_dims(
+        area,
+        DASHBOARD_PANES_PERCENT,
+        pane_count,
+        is_focused,
+        layout,
+        show_tab_bar,
+    )
+}
+
+/// Orchestration role pane: right 66% of width (the orchestration
+/// renderer uses a `[34%, 66%]` horizontal split — one column narrower
+/// than the dashboard's `[33%, 67%]` to leave room for the role status
+/// gutter), height divided across `role_count` role panes per `layout`.
+///
+/// `role_index` and `focused_role_index` matter only in `Stacked` mode.
+/// The helper treats the role at `focused_role_index` as expanded so
+/// the daemon-side PTY dims match the renderer's "expanded slot"
+/// decision in `render_terminal_panes` (see ui.rs Stacked branch around
+/// `focused_idx`). When `focused_role_index` is `None`, role 0 is
+/// expanded — mirroring the renderer's "expand the first slot if
+/// nothing is focused" fallback. In `Tiled` mode both indices are
+/// ignored.
+///
+/// `show_tab_bar` is exposed for symmetry with `dashboard_pane_dims` and
+/// because hydration-time callers may briefly be in a "single-tab" state
+/// before the orchestration tab is added; production callsites pass the
+/// live `TabManager::show_tab_bar()`.
+///
+/// PRD #76 M2.15 fixup F3 — before this helper, every spawn / resize
+/// site for orchestration role panes called `dashboard_pane_dims`, which
+/// uses the dashboard's 67% column. The daemon-side PTY ended up one
+/// column wider than the rendered area, recreating exactly the
+/// spawn-vs-render drift M2.15 was meant to fix.
+///
+/// PRD #76 M2.15 fixup pass 2 G2 — before this parameter existed, the
+/// helper hardcoded `role_index == 0` as the expanded slot. That
+/// matched the renderer only when nothing was focused. As soon as the
+/// orchestrator handed off to a non-zero role (or the user tabbed
+/// across roles), the resize sweep gave role 0 the expanded height
+/// while the visibly-expanded focused role kept the collapsed height —
+/// recreating the exact spawn-vs-render drift M2.15 was meant to fix.
+/// `focused_role_index` lets resize callers thread the renderer's
+/// focus decision (via [`focused_orchestration_role_index`]) through
+/// to the helper so the two stay aligned by construction.
+pub(crate) fn orchestration_role_pane_dims(
+    frame_area: Rect,
+    role_count: usize,
+    role_index: usize,
+    focused_role_index: Option<usize>,
+    layout: PaneLayout,
+    show_tab_bar: bool,
+) -> (u16, u16) {
+    let is_focused = match focused_role_index {
+        Some(focused) => focused == role_index,
+        // Mirror the renderer's "expand the first slot if nothing is
+        // focused" fallback (see `render_terminal_panes` Stacked
+        // branch — when `focused_idx` is None it sets index 0 to
+        // `Constraint::Fill(1)`).
+        None => role_index == 0,
+    };
+    right_column_pane_dims(
+        frame_area,
+        ORCHESTRATION_PANES_PERCENT,
+        role_count as u16,
+        is_focused,
+        layout,
+        show_tab_bar,
+    )
+}
+
+/// PRD #76 M2.15 fixup pass 2 G2 — single source of truth for "which
+/// orchestration role is currently the expanded slot". Used by both
+/// the resize sweep (so PTY dims match the renderer's expanded slot)
+/// and any callsite that needs the same notion of focused-role index.
+/// Mirrors `render_terminal_panes` Stacked branch: a slot is focused
+/// iff `embedded.focused_pane_id()` points at its pane id. Returns
+/// `None` if the embedded controller reports no focused pane, or the
+/// focused pane id doesn't belong to `role_pane_ids` (e.g. focus moved
+/// to the dashboard before the resize sweep ran).
+///
+/// `role_pane_ids` may include the empty-string sentinels that the
+/// hydration path uses for dead orchestration slots (M2.12); those
+/// entries never match a live focused pane id, so they're handled
+/// implicitly without an extra filter step.
+pub(crate) fn focused_orchestration_role_index(
+    embedded: &EmbeddedPaneController,
+    role_pane_ids: &[String],
+) -> Option<usize> {
+    let focused = embedded.focused_pane_id()?;
+    role_pane_ids.iter().position(|id| id == &focused)
+}
+
 /// Resize dashboard panes to match the dashboard layout after a tab switch.
 /// Resize PTYs for a mode tab's agent + side panes to 50% width.
 fn resize_mode_tab_panes(pane: &dyn PaneController, tab_manager: &TabManager, area: Rect) {
@@ -594,17 +813,29 @@ fn resize_mode_tab_panes(pane: &dyn PaneController, tab_manager: &TabManager, ar
         } => (agent_pane_id.clone(), mode_manager.managed_pane_ids()),
         _ => return,
     };
+    resize_mode_tab_panes_for(pane, &agent_pane_id, &side_pane_ids, area);
+}
+
+/// Inner helper: resize a specific mode tab's agent + side panes regardless
+/// of which tab is currently active. Pulled out so the M2.15 post-hydration
+/// sweep can iterate every rebuilt mode tab without temporarily switching
+/// tabs to make each one "active" first.
+fn resize_mode_tab_panes_for(
+    pane: &dyn PaneController,
+    agent_pane_id: &str,
+    side_pane_ids: &[String],
+    area: Rect,
+) {
     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-        let half_width = (area.width / 2).saturating_sub(2);
-        let agent_rows = area.height.saturating_sub(3);
-        if agent_rows > 0 && half_width > 0 {
-            let _ = embedded.resize_pane_pty(&agent_pane_id, agent_rows, half_width);
+        let (agent_rows, agent_cols) = mode_agent_pane_dims(area);
+        if agent_rows > 0 && agent_cols > 0 {
+            let _ = embedded.resize_pane_pty(agent_pane_id, agent_rows, agent_cols);
         }
         let side_count = side_pane_ids.len().max(1) as u16;
-        let side_rows = (area.height / side_count).saturating_sub(2);
-        if side_rows > 0 && half_width > 0 {
-            for id in &side_pane_ids {
-                let _ = embedded.resize_pane_pty(id, side_rows, half_width);
+        let (side_rows, side_cols) = mode_side_pane_dims(area, side_count);
+        if side_rows > 0 && side_cols > 0 {
+            for id in side_pane_ids {
+                let _ = embedded.resize_pane_pty(id, side_rows, side_cols);
             }
         }
     }
@@ -616,6 +847,10 @@ fn resize_dashboard_panes(
     tab_manager: &TabManager,
     area: Rect,
 ) {
+    // PRD #76 M2.15 fixup F3: orchestration role panes live in the
+    // `[34%, 66%]` column, not the dashboard's `[33%, 67%]`. Branch on
+    // active tab so each routes through the matching SSOT helper.
+    let is_orchestration = matches!(tab_manager.active_tab(), Tab::Orchestration { .. });
     let orch_pane_ids = match tab_manager.active_tab() {
         Tab::Dashboard => None,
         Tab::Orchestration { role_pane_ids, .. } => Some(role_pane_ids.clone()),
@@ -633,33 +868,123 @@ fn resize_dashboard_panes(
             return;
         }
 
-        // Mirror the render layout exactly: tab bar + main content + hints bar.
-        let chrome_rows: u16 = if tab_manager.show_tab_bar() { 1 } else { 0 };
-        let main_height = area.height.saturating_sub(chrome_rows + 1); // +1 for hints bar
-        // Right panel is 67% of width.
-        let right_width = area.width * 67 / 100;
         let pane_count = pane_ids.len() as u16;
+        let focused = embedded.focused_pane_id();
+        let show_tab_bar = tab_manager.show_tab_bar();
 
-        // Mirror the stacked/tiled layout from render_terminal_panes.
-        for pane_id in &pane_ids {
-            let is_focused = embedded.focused_pane_id().as_deref() == Some(pane_id.as_str())
-                || (embedded.focused_pane_id().is_none() && pane_id == &pane_ids[0]);
-            let chunk_height = match ui.pane_layout {
-                PaneLayout::Tiled => main_height / pane_count,
-                PaneLayout::Stacked => {
-                    if is_focused {
-                        // Fill(1) gets: total - (unfocused_count * 1)
-                        let unfocused = pane_count.saturating_sub(1);
-                        main_height.saturating_sub(unfocused)
-                    } else {
-                        1 // collapsed title bar
-                    }
-                }
+        // PRD #76 M2.15 fixup pass 2 G2 — derive the focused role index
+        // via the shared helper so the resize sweep agrees with the
+        // renderer's "which slot is expanded" decision in Stacked
+        // layout. Before this, the helper hardcoded role_index==0 as
+        // the expanded slot, so a non-zero focused role would get the
+        // collapsed height while role 0 got the expanded height.
+        let orch_focused_role_index = if is_orchestration {
+            focused_orchestration_role_index(embedded, &pane_ids)
+        } else {
+            None
+        };
+
+        // PRD #76 M2.15: route through the shared layout helpers so the
+        // spawn callsites (which call the same helpers to pre-compute
+        // `AgentSpawnOptions.rows/cols`) agree by construction with what
+        // resize-time eventually applies.
+        for (idx, pane_id) in pane_ids.iter().enumerate() {
+            let is_focused = focused.as_deref() == Some(pane_id.as_str())
+                || (focused.is_none() && pane_id == &pane_ids[0]);
+            let (rows, cols) = if is_orchestration {
+                orchestration_role_pane_dims(
+                    area,
+                    pane_ids.len(),
+                    idx,
+                    orch_focused_role_index,
+                    ui.pane_layout,
+                    show_tab_bar,
+                )
+            } else {
+                dashboard_pane_dims(area, pane_count, is_focused, ui.pane_layout, show_tab_bar)
             };
-            // Inner rows = chunk height minus border (2 rows for top+bottom).
-            let rows = chunk_height.saturating_sub(2);
-            // Inner cols = right panel width minus border (2 cols for left+right).
-            let cols = right_width.saturating_sub(2);
+            if rows > 0 && cols > 0 {
+                let _ = embedded.resize_pane_pty(pane_id, rows, cols);
+            }
+        }
+    }
+}
+
+/// PRD #76 M2.15 fixup F1 — saved-session restore spawn dims for a
+/// dashboard pane. Computes the eventual layout from the current
+/// `frame_area`, the embedded controller's pane count (incremented to
+/// account for the pane about to be added), and the live
+/// `show_tab_bar` state, then routes through `dashboard_pane_dims`.
+/// Each restore site previously called `pane.create_pane(...)` which
+/// fell through to `AgentSpawnOptions::default()` and opened the
+/// daemon-side PTY at 24×80 — the exact bug M2.15 was meant to
+/// eliminate, just on the restore entry point that wasn't on the
+/// original radar. The post-loop `resize_dashboard_panes` sweep still
+/// runs and reconciles any rounding, but spawning at the right size
+/// removes the visible 24×80 hiccup.
+///
+/// `is_focused=false` is used because the restore loop doesn't focus
+/// any pane until the post-loop sweep; the helper is forgiving in
+/// Tiled mode where `is_focused` is ignored.
+fn dashboard_restore_pane_dims(
+    pane: &dyn PaneController,
+    tab_manager: &TabManager,
+    frame_area: Rect,
+) -> (u16, u16) {
+    let embedded_pane_count = pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .map(|e| e.pane_ids().len())
+        .unwrap_or(0);
+    let pane_count_after = (embedded_pane_count as u16).saturating_add(1);
+    dashboard_pane_dims(
+        frame_area,
+        pane_count_after,
+        false,
+        PaneLayout::Tiled,
+        tab_manager.show_tab_bar(),
+    )
+}
+
+/// Inner helper for orchestration role panes: routes through
+/// `orchestration_role_pane_dims` (right 66% column) rather than the
+/// dashboard's 67% column, matching the orchestration renderer's
+/// `[34%, 66%]` horizontal split. Reachable regardless of which tab is
+/// active so the M2.15 post-hydration sweep can iterate every rebuilt
+/// orchestration tab even though hydration ends with the dashboard
+/// active. Uses `PaneLayout::Tiled` as a spawn-time approximation;
+/// switching to the orchestration tab re-runs `resize_dashboard_panes`
+/// with the real focus state.
+fn resize_orchestration_role_panes_for(
+    pane: &dyn PaneController,
+    role_pane_ids: &[String],
+    area: Rect,
+    show_tab_bar: bool,
+) {
+    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+        // Filter out empty-string sentinels for dead orchestration slots
+        // (M2.12) so we don't issue a resize against a non-existent pane id.
+        let live: Vec<&String> = role_pane_ids.iter().filter(|id| !id.is_empty()).collect();
+        if live.is_empty() {
+            return;
+        }
+        let role_count = live.len();
+        // PRD #76 M2.15 fixup pass 2 G2 — share the focused-role
+        // decision with the renderer. `Tiled` is hardcoded below so
+        // focus doesn't affect the geometry today, but threading the
+        // value keeps the API consistent and prevents future drift if
+        // this path ever uses `Stacked`.
+        let live_owned: Vec<String> = live.iter().map(|s| (*s).clone()).collect();
+        let focused_role_index = focused_orchestration_role_index(embedded, &live_owned);
+        for (role_index, pane_id) in live.into_iter().enumerate() {
+            let (rows, cols) = orchestration_role_pane_dims(
+                area,
+                role_count,
+                role_index,
+                focused_role_index,
+                PaneLayout::Tiled,
+                show_tab_bar,
+            );
             if rows > 0 && cols > 0 {
                 let _ = embedded.resize_pane_pty(pane_id, rows, cols);
             }
@@ -794,6 +1119,166 @@ fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Optio
 }
 
 // ---------------------------------------------------------------------------
+// PRD #76 M2.12: hydration partition
+// ---------------------------------------------------------------------------
+
+/// One mode bucket from [`partition_hydrated_panes`]: the agent pane id
+/// captured from a single hydrated daemon record claiming
+/// `TabMembership::Mode { name }` for the given `cwd`. Multiple records
+/// matching the same `(cwd, mode_name)` are flagged as drift by the
+/// partition (only the first survives; the rest are dropped to dashboard).
+#[derive(Debug, Clone)]
+pub(crate) struct ModeHydrationBucket {
+    pub cwd: String,
+    pub mode_name: String,
+    pub agent_pane_id: String,
+}
+
+/// One orchestration bucket from [`partition_hydrated_panes`]:
+/// the role slots for a single `(cwd, orchestration_name)` pairing. Each
+/// entry is `(role_index, pane_id)`. The hydration glue then expands this
+/// to a `Vec<Option<String>>` of length `config.roles.len()`, treating
+/// any missing index as a dead slot (design decision 4) and any
+/// out-of-range index as config drift (design decision 5).
+#[derive(Debug, Clone)]
+pub(crate) struct OrchestrationHydrationBucket {
+    pub cwd: String,
+    pub orchestration_name: String,
+    pub role_slots: Vec<(usize, String)>,
+}
+
+/// Diagnostic info for a hydrated pane the partition couldn't bucket
+/// cleanly. Surfaced via `HydrationPartition.rejections` so the caller
+/// can emit `tracing::error!` at the hydration site and the partition
+/// helper itself stays pure (no I/O, no tracing) — M2.12 fixup reviewer
+/// #3.
+///
+/// Rejected panes are still routed to `dashboard_pane_ids`, so the
+/// rejection record is purely informational: the user sees the pane on
+/// the dashboard regardless. Today the only rejection reason is a
+/// duplicate `(cwd, mode_name)` claim, but the variant shape leaves
+/// room for future reasons without breaking call sites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HydrationRejection {
+    /// More than one hydrated pane claimed `Mode { name }` for the same
+    /// `cwd`. The first claimant won the bucket; this is the i-th
+    /// duplicate that got dropped to the dashboard instead.
+    DuplicateMode {
+        cwd: String,
+        mode_name: String,
+        agent_id: String,
+        pane_id: String,
+    },
+}
+
+/// Output of [`partition_hydrated_panes`]: separates hydrated panes into
+/// "stays on dashboard" (`dashboard_pane_ids`) and "needs a tab rebuilt"
+/// (`mode_buckets`, `orchestration_buckets`). Panes that name a mode or
+/// orchestration that doesn't exist in the cwd's project config end up
+/// here only via the dispatcher's fallback path — the partition itself
+/// is config-agnostic so it stays a pure function and can be unit-tested
+/// without spinning up a full TUI.
+///
+/// `rejections` carries deferred diagnostics for panes that couldn't be
+/// bucketed cleanly (e.g. duplicate mode claims). The partition helper
+/// stays pure — no I/O, no `tracing` — so the caller is responsible for
+/// logging each rejection at the hydration site (M2.12 fixup reviewer
+/// #3).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HydrationPartition {
+    pub dashboard_pane_ids: Vec<String>,
+    pub mode_buckets: Vec<ModeHydrationBucket>,
+    pub orchestration_buckets: Vec<OrchestrationHydrationBucket>,
+    pub rejections: Vec<HydrationRejection>,
+}
+
+/// PRD #76 M2.12: partition hydrated daemon panes into dashboard / mode
+/// / orchestration buckets based on each agent's recorded
+/// `tab_membership`. Pure function for testability.
+///
+/// Rules:
+/// - `tab_membership == None` → dashboard.
+/// - `Some(Mode { name })` → mode bucket keyed by `(cwd, mode_name)`.
+///   Cwd defaults to `""` when the daemon record omits it (older daemon
+///   shape). The first record claiming a `(cwd, mode_name)` wins; later
+///   duplicates from the same pairing are logged and dropped to the
+///   dashboard so a buggy daemon can't double-build a single mode tab.
+/// - `Some(Orchestration { name, role_index })` → orchestration bucket
+///   keyed by `(cwd, orch_name)`, collecting `(role_index, pane_id)`.
+///   The bucket may be sparse (a role can be missing if its agent died
+///   before the TUI reattached); the dispatcher expands this to a
+///   `Vec<Option<String>>` of full role-count length.
+///
+/// Ordering is stable: dashboard panes preserve input order, mode and
+/// orchestration buckets preserve the order in which their (cwd, name)
+/// pairing was first seen so the user's mental "which tab opened first"
+/// model survives reconnect (TabManager appends in iteration order).
+pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition {
+    use std::collections::HashSet;
+
+    let mut out = HydrationPartition::default();
+    // Bucket lookup tables are local: in-memory only, only used during
+    // this partition pass. Index into `out.mode_buckets` /
+    // `out.orchestration_buckets` keyed by `(cwd, name)`.
+    let mut mode_keys: HashSet<(String, String)> = HashSet::new();
+    let mut orch_index: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+
+    for h in hydrated {
+        let cwd = h.cwd.clone().unwrap_or_default();
+        match &h.tab_membership {
+            None => {
+                out.dashboard_pane_ids.push(h.pane_id.clone());
+            }
+            Some(TabMembership::Mode { name }) => {
+                let key = (cwd.clone(), name.clone());
+                if !mode_keys.insert(key) {
+                    // Duplicate `(cwd, mode_name)` claim. Pure helper:
+                    // record the rejection for the caller to log via
+                    // `tracing::error!`, then route the pane to the
+                    // dashboard. M2.12 fixup reviewer #3.
+                    out.rejections.push(HydrationRejection::DuplicateMode {
+                        cwd: cwd.clone(),
+                        mode_name: name.clone(),
+                        agent_id: h.agent_id.clone(),
+                        pane_id: h.pane_id.clone(),
+                    });
+                    out.dashboard_pane_ids.push(h.pane_id.clone());
+                    continue;
+                }
+                out.mode_buckets.push(ModeHydrationBucket {
+                    cwd,
+                    mode_name: name.clone(),
+                    agent_pane_id: h.pane_id.clone(),
+                });
+            }
+            Some(TabMembership::Orchestration { name, role_index }) => {
+                let key = (cwd.clone(), name.clone());
+                let idx = match orch_index.get(&key) {
+                    Some(i) => *i,
+                    None => {
+                        let i = out.orchestration_buckets.len();
+                        orch_index.insert(key, i);
+                        out.orchestration_buckets
+                            .push(OrchestrationHydrationBucket {
+                                cwd,
+                                orchestration_name: name.clone(),
+                                role_slots: Vec::new(),
+                            });
+                        i
+                    }
+                };
+                out.orchestration_buckets[idx]
+                    .role_slots
+                    .push((*role_index, h.pane_id.clone()));
+            }
+        }
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // M5: Delegation dispatch
 // ---------------------------------------------------------------------------
 
@@ -843,6 +1328,12 @@ fn dispatch_delegate_events(
     pane: &Arc<dyn PaneController>,
     tab_manager: &mut TabManager,
     ui: &mut UiState,
+    // PRD #76 M2.15: the current frame area is needed to compute spawn-time
+    // PTY dims for restarted role panes (`role.clear = true`). Without it
+    // the restart would open at 24×80, then immediately mismatch the
+    // viewport until the next user-triggered resize. Tests that don't care
+    // pass `Rect::new(0, 0, 80, 24)` and accept default dims.
+    frame_area: Rect,
 ) {
     // 1. Drain all pending delegate events under a short write-lock.
     let events: Vec<_> = state.blocking_write().delegate_events.drain(..).collect();
@@ -905,14 +1396,61 @@ fn dispatch_delegate_events(
 
                 let _ = pane.close_pane(&old_pane_id);
 
-                let new_pane_id = match pane.create_pane(None, Some(&cwd)) {
-                    Ok(id) => id,
+                // M2.12 fixup reviewer #1: thread `tab_membership`
+                // through to `StartAgent` here, mirroring the
+                // orchestration-spawn site in
+                // `TabManager::open_orchestration_tab`. Without this,
+                // the daemon stores the restarted role with
+                // `tab_membership = None`, and a later remote
+                // reconnect would strand the role on the dashboard
+                // instead of rebuilding it into its orchestration
+                // tab.
+                // PRD #76 M2.15: pre-compute spawn dims using the shared
+                // orchestration-layout helper so the restarted role's PTY
+                // opens at the viewport size (right 66% column, matching
+                // the orchestration renderer's `[34%, 66%]` split — fixup
+                // F3), not the legacy 24×80. The next resize sweep
+                // reconciles per-role focus state.
+                // PRD #76 M2.15 fixup pass 2 G2 — `Tiled` is hardcoded
+                // here (role-restart geometry is per-role uniform under
+                // tiled layout), so `focused_role_index` doesn't affect
+                // the dims; pass `None` for symmetry with other
+                // Tiled-spawn callsites and to match the renderer's
+                // behavior when no role is focused on the just-restarted
+                // pane.
+                let (rows, cols) = orchestration_role_pane_dims(
+                    frame_area,
+                    config.roles.len(),
+                    role_idx,
+                    None,
+                    PaneLayout::Tiled,
+                    tab_manager.show_tab_bar(),
+                );
+                let (new_pane_id, _resolved) = match pane.create_pane_with_options(
+                    None,
+                    Some(&cwd),
+                    AgentSpawnOptions {
+                        display_name: Some(role.name.as_str()),
+                        tab_membership: Some(TabMembership::Orchestration {
+                            name: config.name.clone(),
+                            role_index: role_idx,
+                        }),
+                        rows,
+                        cols,
+                        // PRD #76 M2.13: tag the role's daemon-side
+                        // registry entry with the agent type inferred
+                        // from the role command so a reconnect can
+                        // hydrate the placeholder with the right type
+                        // instead of "No agent".
+                        agent_type: AgentType::from_command(Some(&role.command)),
+                    },
+                ) {
+                    Ok(p) => p,
                     Err(e) => {
                         tracing::error!(role = %role.name, error = %e, "dispatch: failed to create pane");
                         continue;
                     }
                 };
-                let _ = pane.rename_pane(&new_pane_id, &role.name);
 
                 // Update Tab::Orchestration role_pane_ids.
                 if let Tab::Orchestration { role_pane_ids, .. } =
@@ -935,7 +1473,16 @@ fn dispatch_delegate_events(
                     if role.start {
                         st.orchestrator_pane_ids.insert(new_pane_id.clone());
                     }
-                    st.insert_placeholder_session(new_pane_id.clone(), Some(cwd.clone()));
+                    // PRD #76 M2.13: the daemon-bound spawn above tags the
+                    // registry entry via `AgentType::from_command(...)` so a
+                    // remote reconnect's hydration carries the right type.
+                    // The local placeholder, however, starts at `None`: the
+                    // next `SessionStart` hook fills `agent_type` in (per the
+                    // pre-M2.13 contract). Seeding the placeholder with the
+                    // inferred type here would trip the orchestration
+                    // readiness gate at `dispatch_orchestrator` and bypass
+                    // the 10-second fallback.
+                    st.insert_placeholder_session(new_pane_id.clone(), Some(cwd.clone()), None);
                 }
 
                 // Update UI display names.
@@ -1120,9 +1667,17 @@ struct NewPaneRequest {
 enum KeyResult {
     Continue,
     Quit,
+    /// PRD #76, M2.5: detach every stream-backed pane (sending an explicit
+    /// `KIND_DETACH` frame so the daemon distinguishes voluntary detach
+    /// from abrupt disconnect) and then exit. Local-PTY panes are torn
+    /// down by the normal quit path — they can't survive process exit.
+    DetachAndQuit,
     Focus,
     NewPane(NewPaneRequest),
-    SendConfigGenPrompt { pane_id: String, cwd: String },
+    SendConfigGenPrompt {
+        pane_id: String,
+        cwd: String,
+    },
     RequestConfigGen,
     ForwardToPane(Vec<u8>),
 }
@@ -1330,25 +1885,37 @@ fn handle_pane_input_key(key: KeyEvent) -> KeyResult {
 }
 
 fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    // PRD #76 M2.18: index 0 is the mode-dependent action (Quit locally,
+    // Detach in external-daemon mode); index 1 is Cancel.
+    const QUIT_OPTION_COUNT: usize = 2;
     match key.code {
-        // Ctrl+C again: actually quit (legacy shortcut)
+        // Ctrl+C again: legacy escape-hatch that always exits without
+        // KIND_DETACH. In external mode the daemon treats EOF as implicit
+        // detach so agents still survive.
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyResult::Quit,
         KeyCode::Up | KeyCode::Char('k') => {
-            ui.quit_confirm_selected = 0;
+            ui.quit_confirm_selected = ui.quit_confirm_selected.saturating_sub(1);
             KeyResult::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            ui.quit_confirm_selected = 1;
+            if ui.quit_confirm_selected + 1 < QUIT_OPTION_COUNT {
+                ui.quit_confirm_selected += 1;
+            }
             KeyResult::Continue
         }
-        KeyCode::Enter => {
-            if ui.quit_confirm_selected == 0 {
-                KeyResult::Quit
-            } else {
+        KeyCode::Enter => match ui.quit_confirm_selected {
+            0 => {
+                if ui.via_daemon {
+                    KeyResult::DetachAndQuit
+                } else {
+                    KeyResult::Quit
+                }
+            }
+            _ => {
                 ui.mode = UiMode::Normal;
                 KeyResult::Continue
             }
-        }
+        },
         KeyCode::Esc => {
             ui.mode = UiMode::Normal;
             KeyResult::Continue
@@ -1472,33 +2039,18 @@ fn focus_deck(
                         "PaneInput mode — type to interact, Ctrl+d for dashboard".to_string(),
                         std::time::Instant::now(),
                     ));
-                    // Recompute PTY dimensions after focus change so stacked
-                    // panes get the correct expanded/collapsed sizes.
-                    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-                        let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
-                        let right_width = (term_w * 67 / 100).saturating_sub(2);
-                        // Account for UI chrome (tab bar + info bar + hints bar).
-                        // Use 3 as safe default; tab bar is shown whenever tabs exist.
-                        let usable_h = term_h.saturating_sub(3);
-                        let pane_ids = embedded.pane_ids();
-                        let pane_count = pane_ids.len() as u16;
-                        for pid in &pane_ids {
-                            let is_focused = pid == pane_id;
-                            let rows = match ui.pane_layout {
-                                PaneLayout::Tiled => (usable_h / pane_count).saturating_sub(2),
-                                PaneLayout::Stacked => {
-                                    if is_focused {
-                                        usable_h.saturating_sub(2 + pane_count.saturating_sub(1))
-                                    } else {
-                                        0
-                                    }
-                                }
-                            };
-                            if rows > 0 {
-                                let _ = embedded.resize_pane_pty(pid, rows, right_width);
-                            }
-                        }
-                    }
+                    // PRD #76 M2.15 fixup F2: the post-focus resize sweep is
+                    // performed by the caller (which has access to
+                    // `tab_manager` + the real `frame_area`) via
+                    // `resize_dashboard_panes`, the same SSOT helper used
+                    // at spawn and tab-switch time. The inline `crossterm::
+                    // terminal::size()` + hardcoded `(term_w * 67 / 100)` /
+                    // `saturating_sub(3)` math that used to live here
+                    // diverged from the helpers (no orchestration `66%`
+                    // branch, no `show_tab_bar` chrome accounting) so
+                    // stacked / orchestration focuses produced
+                    // off-by-one-column PTYs until the next user-triggered
+                    // resize.
                 }
                 Err(PaneError::CommandFailed(ref msg)) => {
                     state.blocking_write().sessions.remove(*sid);
@@ -1605,10 +2157,68 @@ fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     KeyResult::Continue
 }
 
+/// Decide what value to push to the daemon on a Rename-mode keypress.
+/// Returns `Some(text)` only on Enter; the caller then forwards `text` to
+/// `PaneController::rename_pane`. An empty/whitespace-only `text` means
+/// "clear" — `rename_pane` maps it to a daemon-side `None` so hydrate
+/// falls back to the agent_id on reconnect rather than restoring a stale
+/// label. Returns `None` for any non-Enter key (typing, Esc, backspace),
+/// so the daemon isn't pinged on every keystroke.
+///
+/// Pulled out of the inline match arm in `run_app` so the empty-Enter
+/// clear path stays unit-testable without a full TUI harness (PRD #76
+/// M2.11 reviewer P1 & P2.4).
+fn rename_commit_value(key: KeyEvent, rename_text: &str) -> Option<String> {
+    matches!(key.code, KeyCode::Enter).then(|| rename_text.to_string())
+}
+
+/// Apply a [`RenameOutcome`] returned by `PaneController::rename_pane`
+/// to the dashboard's two display-name maps (`display_names` keyed
+/// by session_id, `pane_display_names` keyed by pane_id). Pulled out
+/// of the inline match in `run_app` so the mirroring rules are
+/// directly unit-testable without a full TUI harness — the
+/// dashboard rename path's correctness is now `controller-outcome
+/// → these maps`, with no separate UI-side normalization that could
+/// drift from the controller (PRD #76 M2.11 fixup 5).
+///
+/// Semantics:
+/// * `Applied(name)` — insert the trimmed canonical label into
+///   both maps so the dashboard card title and any later
+///   session-restart restore reflect EXACTLY what the controller
+///   stored on `Pane.name` (and queued for the daemon).
+/// * `Cleared` — remove the entry from both maps so the card
+///   falls back to the agent_id-based default; matches the
+///   controller's `display_name: None` clear on the daemon side.
+/// * `Rejected` — leave both maps untouched; the prior label
+///   stays visible because the controller refused to mutate
+///   anything.
+fn apply_rename_outcome(
+    display_names: &mut HashMap<String, String>,
+    pane_display_names: &mut HashMap<String, String>,
+    session_id: &str,
+    pane_id: &str,
+    outcome: RenameOutcome,
+) {
+    match outcome {
+        RenameOutcome::Applied(name) => {
+            display_names.insert(session_id.to_string(), name.clone());
+            pane_display_names.insert(pane_id.to_string(), name);
+        }
+        RenameOutcome::Cleared => {
+            display_names.remove(session_id);
+            pane_display_names.remove(pane_id);
+        }
+        RenameOutcome::Rejected => {
+            // No-op by design. Re-asserting the prior label would
+            // require a redundant clone; the maps already hold it.
+        }
+    }
+}
+
 fn handle_rename_key(
     key: KeyEvent,
     ui: &mut UiState,
-    selected_session_id: Option<&str>,
+    _selected_session_id: Option<&str>,
 ) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
@@ -1620,15 +2230,16 @@ fn handle_rename_key(
             ui.rename_text.clear();
             ui.mode = UiMode::Normal;
         }
+        // M2.11 fixup 5 — handler no longer writes to ui.display_names.
+        // The dashboard dispatch loop calls `pane.rename_pane` and
+        // mirrors the controller-returned RenameOutcome into both
+        // display-name maps so the UI reflects EXACTLY what the
+        // controller stored (a `"  newname  "` rename lands as
+        // `"newname"`; a control-byte rename leaves the existing
+        // label intact). Writing the raw rename_text here would
+        // re-introduce the divergence reviewer P2 / auditor LOW
+        // flagged in fixup 4.
         KeyCode::Enter => {
-            if let Some(id) = selected_session_id {
-                if ui.rename_text.is_empty() {
-                    ui.display_names.remove(id);
-                } else {
-                    ui.display_names
-                        .insert(id.to_string(), ui.rename_text.clone());
-                }
-            }
             ui.rename_text.clear();
             ui.mode = UiMode::Normal;
         }
@@ -1849,6 +2460,55 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
 // TUI entry point
 // ---------------------------------------------------------------------------
 
+/// Tear down every non-dashboard tab (mode + orchestration) and unregister
+/// their pane IDs from `state`.
+///
+/// PRD #76: gated on local-deck mode. In external-daemon mode the daemon
+/// owns the agent children and Quit/Detach must both leave them running.
+/// The Detach path explicitly calls `detach_all_streams` first (which
+/// removes the panes from the controller's local registry), so by the
+/// time this teardown ran on Detach the close_pane lookups missed and
+/// became no-ops — the daemon agents survived. The Quit path has no such
+/// pre-step, so the unconditional teardown was issuing `stop-agent`
+/// against the daemon for every orchestration role pane and killing the
+/// agents. Skipping the loop in external-daemon mode is correct: pane
+/// Drop closes the attach sockets, the daemon observes EOF, and the
+/// agents survive as the spec requires. In local-deck mode the loop
+/// stays — those panes are real PTY children that would leak past TUI
+/// exit otherwise.
+pub fn run_post_loop_teardown(
+    pane: &Arc<dyn PaneController>,
+    state: &SharedState,
+    tab_manager: &mut TabManager,
+) {
+    let external_daemon = pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .is_some_and(|c| c.is_external_daemon());
+    if external_daemon {
+        // Quit in external-daemon mode must leave daemon agents running (spec).
+        // Detach removes stream panes from the controller's local registry
+        // before this helper runs, so `close_pane` would no-op for them
+        // anyway. Quit has no such pre-step, so without this gate
+        // `close_pane` → `client.stop_agent` would SIGKILL orchestration
+        // agents on the daemon.
+        return;
+    }
+    // PRD #76 M2.18: skip tab 0 (Dashboard) deliberately. `TabManager::close_tab(0)`
+    // returns `Err(CannotCloseDashboard)` by design, and the `Tab::Dashboard`
+    // variant carries no pane IDs anyway — dashboard PTY children are tracked
+    // through `state`/the pane controller directly and die with the TUI
+    // process on exit. Iterating from 1 here is the only correct range; a
+    // `0..tab_count()` bound would error on tab 0 and return nothing.
+    for i in (1..tab_manager.tab_count()).rev() {
+        if let Ok(ids) = tab_manager.close_tab(i) {
+            for id in ids {
+                state.blocking_write().unregister_pane(&id);
+            }
+        }
+    }
+}
+
 pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
@@ -1877,6 +2537,10 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, palette);
+    ui.via_daemon = pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .is_some_and(|c| c.is_external_daemon());
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -1884,6 +2548,327 @@ pub fn run_tui(
     ui.star_prompt_state = star_state;
     if should_show_star {
         ui.mode = UiMode::StarPrompt;
+    }
+
+    // PRD #76 M2.x / M2.11: in external-daemon mode the daemon may already
+    // own live agents from a previous TUI session (the user ssh-disconnected
+    // and reconnected via `dot-agent-deck connect`). Ask the daemon for its
+    // agent list and rebuild stream-backed panes for each one before the
+    // event loop starts so the dashboard shows the live sessions instead of
+    // "No active sessions". `hydrate_from_daemon` is a no-op for the
+    // in-process (`LocalDeck`) controller — the in-process daemon shares
+    // the TUI's registry directly. Errors during list_agents/attach are
+    // absorbed so a transient daemon hiccup doesn't block startup.
+    //
+    // M2.11: each hydrated record also carries the agent's `display_name`
+    // and `cwd` as stored in the daemon-side registry, so renamed panes
+    // and their working directories reappear with their organizational
+    // metadata intact — no separate persistence file is required.
+    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+        let hydrated = embedded.hydrate_from_daemon();
+        for h in &hydrated {
+            let mut st = state.blocking_write();
+            st.register_pane(h.pane_id.clone());
+            // Carry the daemon-recorded cwd through to the placeholder session
+            // so the session card shows the right directory until the agent
+            // emits its first SessionStart event.
+            //
+            // PRD #76 M2.13: also carry the daemon-recorded `agent_type`
+            // through so the dashboard card renders the real agent label
+            // (ClaudeCode / OpenCode) on reconnect instead of "No agent".
+            // The daemon captured the value at spawn time from
+            // `StartAgent.agent_type` (inferred from the command via
+            // `AgentType::from_command`); a `None` here means either the
+            // command wasn't recognized or an older daemon predated the
+            // field, in which case the placeholder shows "No agent" until
+            // the next `SessionStart` event — same legacy behavior.
+            st.insert_placeholder_session(h.pane_id.clone(), h.cwd.clone(), h.agent_type.clone());
+            drop(st);
+            let display_name = h.display_name.clone().unwrap_or_else(|| h.agent_id.clone());
+            ui.pane_display_names
+                .insert(h.pane_id.clone(), display_name.clone());
+            ui.pane_names.insert(h.pane_id.clone(), display_name);
+            if let Some(dir) = h.cwd.clone() {
+                // Mode buckets need a `SavedPane.mode` hint for the
+                // existing tab-restore path elsewhere in the UI; the
+                // hydration dispatcher below also reads this map for
+                // mode tab rebuild, so populate `.mode` from
+                // tab_membership rather than leaving it None.
+                let mode_hint = match &h.tab_membership {
+                    Some(TabMembership::Mode { name }) => Some(name.clone()),
+                    _ => None,
+                };
+                ui.pane_metadata.insert(
+                    h.pane_id.clone(),
+                    config::SavedPane {
+                        dir,
+                        name: ui
+                            .pane_display_names
+                            .get(&h.pane_id)
+                            .cloned()
+                            .unwrap_or_else(|| h.agent_id.clone()),
+                        command: String::new(),
+                        mode: mode_hint,
+                    },
+                );
+            }
+        }
+
+        // PRD #76 M2.12: partition hydrated panes by tab_membership and
+        // rebuild mode/orchestration tabs from the project config. Panes
+        // claiming a mode/orchestration that the cwd's project config
+        // doesn't know about (config-drift case from design decision 5)
+        // get logged loudly and left on the dashboard rather than getting
+        // a limbo tab.
+        let partition = partition_hydrated_panes(&hydrated);
+        // Emit deferred diagnostics from the pure partition helper
+        // (M2.12 fixup reviewer #3: partition stays I/O-free; logging
+        // lives at the hydration call site).
+        for rejection in &partition.rejections {
+            match rejection {
+                HydrationRejection::DuplicateMode {
+                    cwd,
+                    mode_name,
+                    agent_id,
+                    pane_id,
+                } => {
+                    tracing::error!(
+                        cwd = %cwd,
+                        mode = %mode_name,
+                        agent_id = %agent_id,
+                        pane_id = %pane_id,
+                        "hydration: duplicate Mode tab_membership for (cwd, name); dropping to dashboard"
+                    );
+                }
+            }
+        }
+        // Cache cwd → project config so the lookup happens once per
+        // distinct cwd regardless of how many buckets share it.
+        let mut config_cache: std::collections::HashMap<
+            String,
+            Option<crate::project_config::ProjectConfig>,
+        > = std::collections::HashMap::new();
+        let lookup_config = |cache: &mut std::collections::HashMap<
+            String,
+            Option<crate::project_config::ProjectConfig>,
+        >,
+                             cwd: &str|
+         -> Option<crate::project_config::ProjectConfig> {
+            if let Some(cached) = cache.get(cwd) {
+                return cached.clone();
+            }
+            let loaded = match load_project_config(std::path::Path::new(cwd)) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::error!(
+                        cwd = %cwd,
+                        error = %e,
+                        "hydration: failed to load project config; dropping mode/orchestration tabs to dashboard"
+                    );
+                    None
+                }
+            };
+            cache.insert(cwd.to_string(), loaded.clone());
+            loaded
+        };
+
+        // PRD #76 M2.15 fixup pass 2 G1 — compute side-pane dims for
+        // hydration mode-tab rebuilds. Side panes spawn fresh from the
+        // project config (they're not daemon-tracked), so they need
+        // viewport-aware dims at create time. The post-loop hydration
+        // resize sweep below also runs, but spawning at the right size
+        // avoids the 24×80 hiccup.
+        let hydration_frame_area = terminal.get_frame().area();
+        for bucket in &partition.mode_buckets {
+            let cfg = lookup_config(&mut config_cache, &bucket.cwd);
+            let mode_config = cfg
+                .as_ref()
+                .and_then(|c| c.modes.iter().find(|m| m.name == bucket.mode_name).cloned());
+            let Some(mode_config) = mode_config else {
+                tracing::error!(
+                    cwd = %bucket.cwd,
+                    mode = %bucket.mode_name,
+                    agent_pane_id = %bucket.agent_pane_id,
+                    "hydration: hydrated agent claims mode that is not in project config; dropping to dashboard"
+                );
+                continue;
+            };
+            let total_side_count = (mode_config.panes.len() + mode_config.reactive_panes) as u16;
+            let side_pane_dims = mode_side_pane_dims(hydration_frame_area, total_side_count);
+            match tab_manager.open_mode_tab_with_existing_agent_pane(
+                &mode_config,
+                &bucket.cwd,
+                bucket.agent_pane_id.clone(),
+                side_pane_dims,
+            ) {
+                Ok((_idx, side_ids)) => {
+                    for id in &side_ids {
+                        state.blocking_write().register_pane(id.clone());
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        cwd = %bucket.cwd,
+                        mode = %bucket.mode_name,
+                        error = %e,
+                        "hydration: failed to rebuild mode tab; agent pane stays on dashboard"
+                    );
+                }
+            }
+        }
+
+        for bucket in &partition.orchestration_buckets {
+            let cfg = lookup_config(&mut config_cache, &bucket.cwd);
+            let orch_config = cfg.as_ref().and_then(|c| {
+                c.orchestrations
+                    .iter()
+                    .find(|o| o.name == bucket.orchestration_name)
+                    .cloned()
+            });
+            let Some(orch_config) = orch_config else {
+                tracing::error!(
+                    cwd = %bucket.cwd,
+                    orchestration = %bucket.orchestration_name,
+                    role_count = bucket.role_slots.len(),
+                    "hydration: hydrated agents claim orchestration that is not in project config; dropping to dashboard"
+                );
+                continue;
+            };
+            // Build a Vec<Option<String>> of length config.roles.len()
+            // from the (role_index, pane_id) entries. Out-of-range
+            // indices are config drift (design decision 5): log loudly
+            // and leave the pane on the dashboard.
+            let mut role_pane_ids: Vec<Option<String>> = vec![None; orch_config.roles.len()];
+            for (role_index, pane_id) in &bucket.role_slots {
+                if *role_index >= orch_config.roles.len() {
+                    tracing::error!(
+                        cwd = %bucket.cwd,
+                        orchestration = %bucket.orchestration_name,
+                        role_index = role_index,
+                        role_count = orch_config.roles.len(),
+                        pane_id = %pane_id,
+                        "hydration: orchestration role_index out of range; dropping pane to dashboard"
+                    );
+                    continue;
+                }
+                if role_pane_ids[*role_index].is_some() {
+                    tracing::error!(
+                        cwd = %bucket.cwd,
+                        orchestration = %bucket.orchestration_name,
+                        role_index = role_index,
+                        pane_id = %pane_id,
+                        "hydration: duplicate role_index in orchestration bucket; keeping first, dropping rest to dashboard"
+                    );
+                    continue;
+                }
+                role_pane_ids[*role_index] = Some(pane_id.clone());
+            }
+            // M2.12 fixup auditor #2: if every claimed role slot was
+            // rejected above (out-of-range / duplicate), don't rebuild
+            // an empty orchestration tab — the user didn't ask for one,
+            // and it would only show dead frames. Drop the whole
+            // bucket; the rejected panes already routed themselves to
+            // the dashboard via the logs above.
+            if role_pane_ids.iter().all(Option::is_none) {
+                tracing::warn!(
+                    cwd = %bucket.cwd,
+                    orchestration = %bucket.orchestration_name,
+                    role_count = orch_config.roles.len(),
+                    "hydration: skipping orchestration tab rebuild — no role slots survived filtering"
+                );
+                continue;
+            }
+            // Now register the orchestrator pane mapping for any live
+            // start role so M5 dispatch keeps routing work-done events
+            // back to the right place.
+            let start_role_index = orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+            let orchestrator_pane = role_pane_ids.get(start_role_index).and_then(|s| s.clone());
+            match tab_manager.open_orchestration_tab_with_existing_role_panes(
+                &orch_config,
+                &bucket.cwd,
+                role_pane_ids.clone(),
+            ) {
+                Ok(_) => {
+                    let mut st = state.blocking_write();
+                    for (i, role) in orch_config.roles.iter().enumerate() {
+                        if let Some(Some(pane_id)) = role_pane_ids.get(i) {
+                            st.pane_role_map.insert(pane_id.clone(), role.name.clone());
+                            st.pane_cwd_map.insert(pane_id.clone(), bucket.cwd.clone());
+                            if role.start {
+                                st.orchestrator_pane_ids.insert(pane_id.clone());
+                            }
+                        }
+                    }
+                    drop(st);
+                    if let Some(pane_id) = orchestrator_pane {
+                        let _ = pane_id; // silence "unused" if no further uses below
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        cwd = %bucket.cwd,
+                        orchestration = %bucket.orchestration_name,
+                        error = %e,
+                        "hydration: failed to rebuild orchestration tab; role panes stay on dashboard"
+                    );
+                }
+            }
+        }
+        // After hydration, snap back to the dashboard so the user gets
+        // the overview first. open_mode_tab / open_orchestration_tab
+        // change active_index to the new tab; without this reset, a
+        // multi-tab reconnect would land on whichever tab was built
+        // last.
+        tab_manager.switch_to(0);
+
+        // PRD #76 M2.15: push the real viewport dims to every hydrated
+        // pane's daemon-side PTY. `hydrate_from_daemon` rebuilt panes from
+        // the daemon's existing PTYs (at whatever dims the previous TUI
+        // session resized them to) and the local vt100 parsers were seeded
+        // at 24×80. Without this sweep, the agent keeps drawing at the
+        // previous viewport size — often visibly mismatched when the new
+        // session has a different terminal size — until the user's next
+        // window resize or tab switch fires `resize_dashboard_panes` /
+        // `resize_mode_tab_panes`. One pass here covers it.
+        //
+        // We need `terminal.autoresize()` first so `get_frame().area()`
+        // reflects the current terminal, not stale init defaults (no
+        // `draw()` has happened yet at this point in startup).
+        //
+        // Each tab gets the inner helper that matches its layout, not
+        // the active-tab-only public wrappers — at this point the
+        // dashboard is active, so a naive `resize_mode_tab_panes` call
+        // would early-return and leave every mode/orchestration tab's
+        // panes at the wrong dims until the user navigates to them.
+        let _ = terminal.autoresize();
+        let frame_area = terminal.get_frame().area();
+        resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
+        let show_tab_bar = tab_manager.show_tab_bar();
+        for tab in tab_manager.tabs() {
+            match tab {
+                Tab::Mode {
+                    agent_pane_id,
+                    mode_manager,
+                    ..
+                } => {
+                    resize_mode_tab_panes_for(
+                        &*pane,
+                        agent_pane_id,
+                        &mode_manager.managed_pane_ids(),
+                        frame_area,
+                    );
+                }
+                Tab::Orchestration { role_pane_ids, .. } => {
+                    resize_orchestration_role_panes_for(
+                        &*pane,
+                        role_pane_ids,
+                        frame_area,
+                        show_tab_bar,
+                    );
+                }
+                Tab::Dashboard => {}
+            }
+        }
     }
 
     if continue_session {
@@ -1940,12 +2925,43 @@ pub fn run_tui(
             } else {
                 Some(saved_pane.command.as_str())
             };
-            match pane.create_pane(cmd, Some(&saved_pane.dir)) {
-                Ok(new_id) => {
+            // PRD #76 M2.15 fixup F1: route through `create_pane_with_options`
+            // with real viewport dims so the restored pane's daemon-side PTY
+            // opens at the dashboard layout instead of the legacy 24×80
+            // bleed-through from `AgentSpawnOptions::default()`. The
+            // post-loop `resize_dashboard_panes` sweep still runs to
+            // reconcile any rounding once every restored pane is in place.
+            let (rows, cols) =
+                dashboard_restore_pane_dims(&*pane, &tab_manager, terminal.get_frame().area());
+            // PRD #76 M2.13: infer agent_type from the restored command so
+            // the daemon's registry echo on reconnect carries the right
+            // type. Local-mode session card pick-up still happens via the
+            // next `SessionStart` hook.
+            match pane.create_pane_with_options(
+                cmd,
+                Some(&saved_pane.dir),
+                AgentSpawnOptions {
+                    display_name: None,
+                    tab_membership: None,
+                    rows,
+                    cols,
+                    agent_type: AgentType::from_command(cmd),
+                },
+            ) {
+                Ok((new_id, _resolved)) => {
                     {
                         let mut st = state.blocking_write();
                         st.register_pane(new_id.clone());
-                        st.insert_placeholder_session(new_id.clone(), Some(saved_pane.dir.clone()));
+                        // PRD #76 M2.13: the daemon-bound spawn above tags
+                        // the registry entry with the inferred agent type so
+                        // a later reconnect's hydration knows it; the local
+                        // placeholder stays at `None` until the next
+                        // `SessionStart` hook fires (pre-M2.13 contract).
+                        st.insert_placeholder_session(
+                            new_id.clone(),
+                            Some(saved_pane.dir.clone()),
+                            None,
+                        );
                     }
                     if !saved_pane.name.is_empty() {
                         if let Err(e) = pane.rename_pane(&new_id, &saved_pane.name) {
@@ -1972,8 +2988,42 @@ pub fn run_tui(
         // Restore mode tabs — create agent pane (empty shell), open mode tab,
         // resize PTYs, then send init + agent commands at the right size.
         for (saved_pane, mode_config) in deferred_mode_panes {
-            match pane.create_pane(None, Some(&saved_pane.dir)) {
-                Ok(new_id) => {
+            // M2.12: tag the daemon-side agent with this mode tab's
+            // membership so the next reconnect can rebuild this tab
+            // from `list_agents` rather than dropping the agent to the
+            // dashboard. `create_pane_with_options` is the only path
+            // that reaches `StartAgent.tab_membership` on the wire.
+            let mode_tab_membership = Some(TabMembership::Mode {
+                name: mode_config.name.clone(),
+            });
+            // PRD #76 M2.15: open the daemon-side PTY at the mode-tab agent
+            // layout (left half × full height minus chrome) so the agent's
+            // first frame paints at the eventual size. The resize call
+            // below this match arm still runs and reconciles any rounding;
+            // this just removes the visible 24×80 hiccup.
+            let frame_area = terminal.get_frame().area();
+            let (rows, cols) = mode_agent_pane_dims(frame_area);
+            // PRD #76 M2.13: mode-tab agent panes spawn as empty shells
+            // (the agent command is sent later via `write_to_pane`), so
+            // infer agent_type from the saved command rather than from
+            // the spawn command (which is `None` here).
+            let mode_agent_type = if saved_pane.command.is_empty() {
+                None
+            } else {
+                AgentType::from_command(Some(saved_pane.command.as_str()))
+            };
+            match pane.create_pane_with_options(
+                None,
+                Some(&saved_pane.dir),
+                AgentSpawnOptions {
+                    display_name: None,
+                    tab_membership: mode_tab_membership,
+                    rows,
+                    cols,
+                    agent_type: mode_agent_type,
+                },
+            ) {
+                Ok((new_id, _resolved)) => {
                     state.blocking_write().register_pane(new_id.clone());
                     if !saved_pane.name.is_empty() {
                         let _ = pane.rename_pane(&new_id, &saved_pane.name);
@@ -1983,29 +3033,27 @@ pub fn run_tui(
                             .insert(new_id.clone(), saved_pane.name.clone());
                     }
                     ui.pane_metadata.insert(new_id.clone(), saved_pane.clone());
-                    match tab_manager.open_mode_tab(&mode_config, &saved_pane.dir, new_id.clone()) {
+                    // PRD #76 M2.15 fixup pass 2 G1 — compute side-pane
+                    // dims so the restored mode's side panes spawn at the
+                    // viewport-derived size, not the 24×80 default.
+                    let total_side_count =
+                        (mode_config.panes.len() + mode_config.reactive_panes) as u16;
+                    let side_pane_dims = mode_side_pane_dims(frame_area, total_side_count);
+                    match tab_manager.open_mode_tab(
+                        &mode_config,
+                        &saved_pane.dir,
+                        new_id.clone(),
+                        side_pane_dims,
+                    ) {
                         Ok((_tab_idx, side_ids)) => {
                             for id in &side_ids {
                                 state.blocking_write().register_pane(id.clone());
                             }
-                            if let Some(embedded) =
-                                pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                            {
-                                let frame_area = terminal.get_frame().area();
-                                let half_width = (frame_area.width / 2).saturating_sub(2);
-                                let agent_rows = frame_area.height.saturating_sub(3);
-                                if agent_rows > 0 && half_width > 0 {
-                                    let _ =
-                                        embedded.resize_pane_pty(&new_id, agent_rows, half_width);
-                                }
-                                let side_count = side_ids.len().max(1) as u16;
-                                let side_rows = (frame_area.height / side_count).saturating_sub(2);
-                                if side_rows > 0 && half_width > 0 {
-                                    for id in &side_ids {
-                                        let _ = embedded.resize_pane_pty(id, side_rows, half_width);
-                                    }
-                                }
-                            }
+                            // PRD #76 M2.15: route through the shared
+                            // helpers so spawn-time and resize-time use the
+                            // same layout math.
+                            let frame_area = terminal.get_frame().area();
+                            resize_mode_tab_panes_for(&*pane, &new_id, &side_ids, frame_area);
                             let _ = tab_manager.start_mode_commands();
                             if let Some(ref init_cmd) = mode_config.init_command {
                                 let _ = pane.write_to_pane(&new_id, init_cmd);
@@ -2031,14 +3079,36 @@ pub fn run_tui(
                             } else {
                                 Some(saved_pane.command.as_str())
                             };
-                            match pane.create_pane(cmd, Some(&saved_pane.dir)) {
-                                Ok(fb_id) => {
+                            // PRD #76 M2.15 fixup F1: real viewport dims via
+                            // SSOT helper so the fallback dashboard pane
+                            // opens at the dashboard layout, not 24×80.
+                            let (fb_rows, fb_cols) = dashboard_restore_pane_dims(
+                                &*pane,
+                                &tab_manager,
+                                terminal.get_frame().area(),
+                            );
+                            // PRD #76 M2.13: infer agent_type from the
+                            // saved command for the fallback path too.
+                            let fb_agent_type = AgentType::from_command(cmd);
+                            match pane.create_pane_with_options(
+                                cmd,
+                                Some(&saved_pane.dir),
+                                AgentSpawnOptions {
+                                    display_name: None,
+                                    tab_membership: None,
+                                    rows: fb_rows,
+                                    cols: fb_cols,
+                                    agent_type: fb_agent_type.clone(),
+                                },
+                            ) {
+                                Ok((fb_id, _resolved)) => {
                                     {
                                         let mut st = state.blocking_write();
                                         st.register_pane(fb_id.clone());
                                         st.insert_placeholder_session(
                                             fb_id.clone(),
                                             Some(saved_pane.dir.clone()),
+                                            None,
                                         );
                                     }
                                     if !saved_pane.name.is_empty() {
@@ -2070,14 +3140,36 @@ pub fn run_tui(
                     } else {
                         Some(saved_pane.command.as_str())
                     };
-                    match pane.create_pane(cmd, Some(&saved_pane.dir)) {
-                        Ok(fb_id) => {
+                    // PRD #76 M2.15 fixup F1: real viewport dims via SSOT
+                    // helper so the outer-error fallback also opens at the
+                    // dashboard layout instead of 24×80.
+                    let (fb_rows, fb_cols) = dashboard_restore_pane_dims(
+                        &*pane,
+                        &tab_manager,
+                        terminal.get_frame().area(),
+                    );
+                    // PRD #76 M2.13: infer agent_type from saved command
+                    // for this outer-error fallback as well.
+                    let fb_agent_type = AgentType::from_command(cmd);
+                    match pane.create_pane_with_options(
+                        cmd,
+                        Some(&saved_pane.dir),
+                        AgentSpawnOptions {
+                            display_name: None,
+                            tab_membership: None,
+                            rows: fb_rows,
+                            cols: fb_cols,
+                            agent_type: fb_agent_type.clone(),
+                        },
+                    ) {
+                        Ok((fb_id, _resolved)) => {
                             {
                                 let mut st = state.blocking_write();
                                 st.register_pane(fb_id.clone());
                                 st.insert_placeholder_session(
                                     fb_id.clone(),
                                     Some(saved_pane.dir.clone()),
+                                    None,
                                 );
                             }
                             if !saved_pane.name.is_empty() {
@@ -2125,6 +3217,25 @@ pub fn run_tui(
 
         let snapshot = state.blocking_read().clone();
 
+        // PRD #76 M2.15 fixup pass 2 G1 — refresh each Mode tab's cached
+        // side-pane dims from the current frame area so the reactive
+        // replacement spawn inside `ModeManager::handle_command` opens
+        // the daemon-side PTY at the right size, not the legacy 24×80
+        // default. `handle_command` is invoked from
+        // `route_reactive_commands` below, which doesn't have
+        // `frame_area` in scope — caching on the manager keeps the
+        // routing API clean while still tracking viewport changes.
+        {
+            let frame_area = terminal.get_frame().area();
+            for tab in tab_manager.tabs_mut() {
+                if let Tab::Mode { mode_manager, .. } = tab {
+                    let side_count = mode_manager.managed_pane_ids().len() as u16;
+                    let dims = mode_side_pane_dims(frame_area, side_count);
+                    mode_manager.set_side_pane_dims(dims);
+                }
+            }
+        }
+
         // Route new Bash commands through mode tabs for reactive panes.
         let pane_changes = tab_manager.route_reactive_commands(&snapshot.sessions);
         for (old_id, new_id) in &pane_changes {
@@ -2132,16 +3243,16 @@ pub fn run_tui(
             st.unregister_pane(old_id);
             st.register_pane(new_id.clone());
             drop(st);
-            // Resize the new pane PTY to match the current side pane dimensions.
+            // Resize the new pane PTY to match the current side pane
+            // dimensions. PRD #76 M2.15 fixup F2: route through the SSOT
+            // helper instead of recomputing `(width/2).saturating_sub(2)`
+            // / `height/side_count - 2` inline — the helper clamps
+            // `side_count` to 1 so the previous `checked_div` fallback to
+            // `height - 3` is no longer needed.
             if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
                 let frame_area = terminal.get_frame().area();
-                let half_width = (frame_area.width / 2).saturating_sub(2);
                 let side_pane_count = embedded.pane_ids().len().saturating_sub(1) as u16; // exclude agent
-                let pane_rows = frame_area
-                    .height
-                    .checked_div(side_pane_count)
-                    .map(|v| v.saturating_sub(2))
-                    .unwrap_or_else(|| frame_area.height.saturating_sub(3));
+                let (pane_rows, half_width) = mode_side_pane_dims(frame_area, side_pane_count);
                 if pane_rows > 0 && half_width > 0 {
                     let _ = embedded.resize_pane_pty(new_id, pane_rows, half_width);
                 }
@@ -2367,7 +3478,13 @@ pub fn run_tui(
         }
 
         // M5: Dispatch delegation events from orchestrator to workers.
-        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+        dispatch_delegate_events(
+            &state,
+            &pane,
+            &mut tab_manager,
+            &mut ui,
+            terminal.get_frame().area(),
+        );
 
         // M5b: Forward worker results back to the orchestrator.
         feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
@@ -2738,6 +3855,12 @@ pub fn run_tui(
                         payload.extend_from_slice(b"\x1b[201~");
                     }
                     let _ = embedded.write_raw_bytes(&pane_id, &payload);
+                    // PRD #76 M2.20: a paste is a forwarded keystroke event
+                    // too — mark the timestamp so a following Enter
+                    // (`KeyResult::ForwardToPane(b"\r")`) is debounced and
+                    // arrives at the agent as a standalone submit, not fused
+                    // with the paste tail.
+                    ui.last_pane_keystroke_at = Some(std::time::Instant::now());
                 }
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     break;
@@ -2814,46 +3937,20 @@ pub fn run_tui(
                             PaneLayout::Stacked => "stacked",
                             PaneLayout::Tiled => "tiled",
                         };
-                        // Resize PTYs to match new layout dimensions.
-                        // Mode tabs use 50% width; dashboard uses 67%.
-                        if let Some(embedded) =
-                            pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                        {
-                            let frame_area = terminal.get_frame().area();
-                            let is_mode_tab = tab_manager.active_mode_name().is_some();
-                            let pane_width = if is_mode_tab {
-                                (frame_area.width / 2).saturating_sub(2)
-                            } else {
-                                (frame_area.width * 67 / 100).saturating_sub(2)
-                            };
-                            let pane_ids = embedded.pane_ids();
-                            let pane_count = pane_ids.len() as u16;
-                            for pane_id in &pane_ids {
-                                let rows = match ui.pane_layout {
-                                    PaneLayout::Tiled => frame_area
-                                        .height
-                                        .checked_div(pane_count)
-                                        .unwrap_or(0)
-                                        .saturating_sub(2),
-                                    PaneLayout::Stacked => {
-                                        let is_focused = embedded.focused_pane_id().as_deref()
-                                            == Some(pane_id.as_str());
-                                        if is_focused
-                                            || (embedded.focused_pane_id().is_none()
-                                                && pane_id == &pane_ids[0])
-                                        {
-                                            frame_area
-                                                .height
-                                                .saturating_sub(2 + pane_count.saturating_sub(1))
-                                        } else {
-                                            0
-                                        }
-                                    }
-                                };
-                                if rows > 0 {
-                                    let _ = embedded.resize_pane_pty(pane_id, rows, pane_width);
-                                }
-                            }
+                        // PRD #76 M2.15 fixup F2: route through the same
+                        // SSOT sweep helpers that handle spawn / tab-switch
+                        // resize, so a layout toggle can't end up with a
+                        // different geometry than the rest of the
+                        // codebase. The previous inline math used 67%
+                        // (dashboard) for the non-mode-tab branch, which
+                        // silently produced a 1-col-wider PTY for
+                        // orchestration tabs (66%); it also skipped the
+                        // `show_tab_bar` chrome accounting.
+                        let frame_area = terminal.get_frame().area();
+                        if tab_manager.active_mode_name().is_some() {
+                            resize_mode_tab_panes(&*pane, &tab_manager, frame_area);
+                        } else {
+                            resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
                         }
                         ui.status_message =
                             Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
@@ -3100,7 +4197,50 @@ pub fn run_tui(
                     UiMode::Normal => handle_normal_key(key, &mut ui, total),
                     UiMode::Filter => handle_filter_key(key, &mut ui),
                     UiMode::Help => handle_help_key(key, &mut ui),
-                    UiMode::Rename => handle_rename_key(key, &mut ui, selected_id.as_deref()),
+                    UiMode::Rename => {
+                        // Capture commit intent before the handler clears
+                        // `rename_text`. M2.11 fixup 5 — the dispatch
+                        // loop drives both the controller call AND the
+                        // UI display-name maps so the dashboard mirrors
+                        // EXACTLY the controller-resolved label
+                        // (Applied → trimmed canonical; Cleared → remove
+                        // entries; Rejected → leave existing label
+                        // intact). Empty/whitespace-only text reaches
+                        // the controller as a "clear" → daemon-side
+                        // `None`, so hydrate falls back to the agent_id
+                        // on reconnect rather than restoring a stale
+                        // label (PRD #76 M2.11 reviewer P1).
+                        let commit = rename_commit_value(key, &ui.rename_text);
+                        let r = handle_rename_key(key, &mut ui, selected_id.as_deref());
+                        if let Some(new_name) = commit
+                            && let Some(ref sid) = selected_id
+                            && let Some(session) = snapshot.sessions.get(sid)
+                            && let Some(ref pane_id) = session.pane_id
+                        {
+                            // Best-effort daemon update — rename_pane's
+                            // own error path already logs and swallows
+                            // transient daemon failures, and the daemon
+                            // RPC is spawned off the UI thread so a
+                            // wedged daemon can't freeze the renderer.
+                            match pane.rename_pane(pane_id, &new_name) {
+                                Ok(outcome) => apply_rename_outcome(
+                                    &mut ui.display_names,
+                                    &mut ui.pane_display_names,
+                                    sid,
+                                    pane_id,
+                                    outcome,
+                                ),
+                                Err(e) => {
+                                    tracing::debug!(
+                                        pane_id = %pane_id,
+                                        error = %e,
+                                        "rename_pane returned an error; UI maps unchanged"
+                                    );
+                                }
+                            }
+                        }
+                        r
+                    }
                     UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
                     UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
                     UiMode::PaneInput => handle_pane_input_key(key),
@@ -3112,6 +4252,23 @@ pub fn run_tui(
 
             match result {
                 KeyResult::Quit => break 'outer,
+                KeyResult::DetachAndQuit => {
+                    // M2.5: emit explicit `KIND_DETACH` frames for every
+                    // stream-backed pane so the daemon distinguishes
+                    // voluntary detach from abrupt disconnect, then exit.
+                    // Local-PTY panes have nothing to detach from — they
+                    // die with the process either way.
+                    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                        let errs = embedded.detach_all_streams();
+                        if !errs.is_empty() {
+                            tracing::warn!(
+                                error_count = errs.len(),
+                                "detach_all_streams reported errors during quit — proceeding"
+                            );
+                        }
+                    }
+                    break 'outer;
+                }
                 KeyResult::Focus => {
                     // Dismiss idle art on the focused card
                     if let Some(ref sid) = selected_id
@@ -3188,16 +4345,59 @@ pub fn run_tui(
                         // Orchestration path — manage own panes, no agent pane.
                         if let Some(orch_config) = req.orchestration_config {
                             let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
-                            match tab_manager.open_orchestration_tab(&orch_config, &dir_str, prompt)
-                            {
+                            // PRD #76 M2.15: pre-compute spawn dims using
+                            // the orchestration-layout helper (right 66%
+                            // column, matching the orchestration
+                            // renderer's `[34%, 66%]` split — fixup F3,
+                            // not the dashboard's `[33%, 67%]`) so role
+                            // PTYs open at the viewport size.
+                            let frame_area = terminal.get_frame().area();
+                            // show_tab_bar=true: opening an orchestration
+                            // adds a new tab next to Dashboard, so the
+                            // post-spawn render has ≥2 tabs.
+                            // All roles share the same spawn dims (Tiled
+                            // layout); pass role_index=0 and
+                            // focused_role_index=None so the helper falls
+                            // back to "role 0 expanded" — matching the
+                            // renderer's "first slot expands" default when
+                            // no role is focused yet (panes haven't been
+                            // created at this point).
+                            // PRD #76 M2.15 fixup pass 2 G2 — `Tiled` is
+                            // hardcoded here so the focused_role_index
+                            // parameter is geometrically a no-op, but pass
+                            // it for symmetry / future safety.
+                            let spawn_dims = orchestration_role_pane_dims(
+                                frame_area,
+                                orch_config.roles.len(),
+                                0,
+                                None,
+                                PaneLayout::Tiled,
+                                true,
+                            );
+                            match tab_manager.open_orchestration_tab(
+                                &orch_config,
+                                &dir_str,
+                                prompt,
+                                spawn_dims,
+                            ) {
                                 Ok((_tab_idx, role_pane_ids)) => {
                                     {
                                         let mut st = state.blocking_write();
+                                        // PRD #76 M2.13: `open_orchestration_tab`
+                                        // already tags each role's daemon-bound
+                                        // spawn with `AgentType::from_command(...)`,
+                                        // so a reconnect's hydration carries the
+                                        // right type. The local placeholder stays
+                                        // at `None` until each role's first
+                                        // `SessionStart` hook fires — preserving
+                                        // the orchestration readiness gate's
+                                        // 10-second fallback (pre-M2.13 contract).
                                         for id in &role_pane_ids {
                                             st.register_pane(id.clone());
                                             st.insert_placeholder_session(
                                                 id.clone(),
                                                 Some(dir_str.clone()),
+                                                None,
                                             );
                                         }
                                         // Register pane-to-role and pane-to-cwd mappings for work-done resolution.
@@ -3268,8 +4468,83 @@ pub fn run_tui(
                             } else {
                                 Some(req.command.as_str())
                             };
-                            match pane.create_pane(cmd, Some(&dir_str)) {
-                                Ok(new_id) => {
+                            // Thread the form's Name through to `StartAgent.display_name`
+                            // so a disconnect or crash between create and rename can't
+                            // persist the command-based fallback label on the daemon
+                            // (PRD #76 M2.11 reviewer P2). The controller resolves the
+                            // form Name + command via `agent_pty::resolve_display_name`
+                            // and returns the canonical string it stored on Pane.name
+                            // (and sent as `StartAgent.display_name` for stream panes)
+                            // so the UI maps below mirror EXACTLY what the daemon has —
+                            // no separate normalization helper to drift (M2.11 fixup 4).
+                            let form_name = Some(req.name.as_str());
+                            // PRD #76 M2.12: tag the agent pane with its
+                            // mode-tab membership so the daemon-side
+                            // registry can echo it back via `list_agents`
+                            // on the next reconnect, letting the
+                            // hydration partition rebuild this mode tab
+                            // instead of stranding the agent on the
+                            // dashboard.
+                            let tab_membership =
+                                req.mode_config.as_ref().map(|m| TabMembership::Mode {
+                                    name: m.name.clone(),
+                                });
+                            // PRD #76 M2.15: pre-compute spawn dims via the
+                            // shared layout helpers so the agent PTY opens
+                            // at the eventual size (no 24×80 → resize
+                            // hiccup). Mode-tab panes use the mode-agent
+                            // layout (left half × height-minus-chrome);
+                            // dashboard panes use the dashboard right-67%
+                            // column layout with `is_focused=true` (this
+                            // path immediately focuses the new pane via
+                            // `focus_pane(&new_id)` below).
+                            let frame_area = terminal.get_frame().area();
+                            let (spawn_rows, spawn_cols) = if req.mode_config.is_some() {
+                                mode_agent_pane_dims(frame_area)
+                            } else {
+                                let embedded_pane_count = pane
+                                    .as_any()
+                                    .downcast_ref::<EmbeddedPaneController>()
+                                    .map(|e| e.pane_ids().len())
+                                    .unwrap_or(0);
+                                let pane_count_after =
+                                    (embedded_pane_count as u16).saturating_add(1);
+                                dashboard_pane_dims(
+                                    frame_area,
+                                    pane_count_after,
+                                    true,
+                                    ui.pane_layout,
+                                    tab_manager.show_tab_bar(),
+                                )
+                            };
+                            // PRD #76 M2.13: infer agent_type from the
+                            // form's command (the canonical "what runs in
+                            // this pane" hint) — `cmd` is `None` for mode
+                            // panes (which spawn empty and run the
+                            // command later via `write_to_pane`), so use
+                            // `req.command` directly to cover both flows.
+                            // The inferred type goes ONLY into the daemon-
+                            // bound spawn options so a remote reconnect's
+                            // hydration carries it; the local placeholder
+                            // stays at `None` until the first `SessionStart`
+                            // hook fires (pre-M2.13 contract).
+                            let spawn_agent_type = if req.command.is_empty() {
+                                None
+                            } else {
+                                AgentType::from_command(Some(req.command.as_str()))
+                            };
+                            match pane.create_pane_with_options(
+                                cmd,
+                                Some(&dir_str),
+                                AgentSpawnOptions {
+                                    display_name: form_name,
+                                    tab_membership,
+                                    rows: spawn_rows,
+                                    cols: spawn_cols,
+                                    agent_type: spawn_agent_type,
+                                },
+                            ) {
+                                Ok((new_id, resolved_name)) => {
                                     // Register so only events from our panes are accepted,
                                     // and create a placeholder session for an immediate dashboard card.
                                     {
@@ -3278,14 +4553,12 @@ pub fn run_tui(
                                         st.insert_placeholder_session(
                                             new_id.clone(),
                                             Some(dir_str.clone()),
+                                            None,
                                         );
                                     }
-                                    if !req.name.is_empty() {
-                                        let _ = pane.rename_pane(&new_id, &req.name);
-                                        ui.pane_display_names
-                                            .insert(new_id.clone(), req.name.clone());
-                                        ui.pane_names.insert(new_id.clone(), req.name.clone());
-                                    }
+                                    ui.pane_display_names
+                                        .insert(new_id.clone(), resolved_name.clone());
+                                    ui.pane_names.insert(new_id.clone(), resolved_name);
                                     let mode_name_for_save =
                                         req.mode_config.as_ref().map(|m| m.name.clone());
                                     ui.pane_metadata.insert(
@@ -3301,10 +4574,22 @@ pub fn run_tui(
                                     if let Some(mode_config) = req.mode_config {
                                         // Mode selected — open a mode tab.
                                         let mode_name = mode_config.name.clone();
+                                        // PRD #76 M2.15 fixup pass 2 G1 — compute
+                                        // side-pane dims so the side panes spawn
+                                        // at the viewport-derived size, not the
+                                        // 24×80 default.
+                                        let total_side_count = (mode_config.panes.len()
+                                            + mode_config.reactive_panes)
+                                            as u16;
+                                        let side_pane_dims = mode_side_pane_dims(
+                                            terminal.get_frame().area(),
+                                            total_side_count,
+                                        );
                                         match tab_manager.open_mode_tab(
                                             &mode_config,
                                             &dir_str,
                                             new_id.clone(),
+                                            side_pane_dims,
                                         ) {
                                             Ok((_tab_idx, side_ids)) => {
                                                 for id in &side_ids {
@@ -3314,32 +4599,14 @@ pub fn run_tui(
                                                 }
                                                 let _ = pane.focus_pane(&new_id);
                                                 ui.mode = UiMode::PaneInput;
-                                                if let Some(embedded) =
-                                                    pane.as_any()
-                                                        .downcast_ref::<EmbeddedPaneController>()
-                                                {
-                                                    let frame_area = terminal.get_frame().area();
-                                                    let half_width =
-                                                        (frame_area.width / 2).saturating_sub(2);
-                                                    let agent_rows =
-                                                        frame_area.height.saturating_sub(3);
-                                                    if agent_rows > 0 && half_width > 0 {
-                                                        let _ = embedded.resize_pane_pty(
-                                                            &new_id, agent_rows, half_width,
-                                                        );
-                                                    }
-                                                    let side_count = side_ids.len().max(1) as u16;
-                                                    let side_rows = (frame_area.height
-                                                        / side_count)
-                                                        .saturating_sub(2);
-                                                    if side_rows > 0 && half_width > 0 {
-                                                        for id in &side_ids {
-                                                            let _ = embedded.resize_pane_pty(
-                                                                id, side_rows, half_width,
-                                                            );
-                                                        }
-                                                    }
-                                                }
+                                                // PRD #76 M2.15: shared
+                                                // layout helpers — spawn
+                                                // and resize math are now
+                                                // identical.
+                                                let frame_area = terminal.get_frame().area();
+                                                resize_mode_tab_panes_for(
+                                                    &*pane, &new_id, &side_ids, frame_area,
+                                                );
                                                 // Start commands now that panes are correctly sized
                                                 let _ = tab_manager.start_mode_commands();
                                                 // Send the agent pane command after resize
@@ -3373,31 +4640,17 @@ pub fn run_tui(
                                         let _ = pane.focus_pane(&new_id);
                                         ui.mode = UiMode::PaneInput;
                                         ui.selected_index = filtered.len();
-                                        if let Some(embedded) =
-                                            pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                                        {
-                                            let frame_area = terminal.get_frame().area();
-                                            let right_width =
-                                                (frame_area.width * 67 / 100).saturating_sub(2);
-                                            let pane_count = embedded.pane_ids().len() as u16;
-                                            let rows = match ui.pane_layout {
-                                                PaneLayout::Tiled => (frame_area.height
-                                                    / pane_count.max(1))
-                                                .saturating_sub(2),
-                                                PaneLayout::Stacked => {
-                                                    frame_area.height.saturating_sub(
-                                                        2 + pane_count.saturating_sub(1),
-                                                    )
-                                                }
-                                            };
-                                            if rows > 0 && right_width > 0 {
-                                                let _ = embedded.resize_pane_pty(
-                                                    &new_id,
-                                                    rows,
-                                                    right_width,
-                                                );
-                                            }
-                                        }
+                                        // PRD #76 M2.15: route through the
+                                        // shared dashboard-layout helper so
+                                        // spawn-time and resize-time math
+                                        // can't drift.
+                                        let frame_area = terminal.get_frame().area();
+                                        resize_dashboard_panes(
+                                            &*pane,
+                                            &ui,
+                                            &tab_manager,
+                                            frame_area,
+                                        );
                                         ui.status_message = Some((
                                             format!("Created pane {new_id} in {dir_str}"),
                                             std::time::Instant::now(),
@@ -3446,26 +4699,40 @@ pub fn run_tui(
                     {
                         // Reset scrollback to live output on any keystroke.
                         embedded.reset_scrollback(&pane_id);
+                        // PRD #76 M2.20: separate a CR-bearing keystroke from
+                        // the preceding typed bytes so the agent TUI treats it
+                        // as a standalone submit, not newline-in-input.
+                        let sleep = submit_debounce_duration(
+                            std::time::Instant::now(),
+                            ui.last_pane_keystroke_at,
+                            &bytes,
+                        );
+                        if !sleep.is_zero() {
+                            std::thread::sleep(sleep);
+                        }
                         if let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes) {
                             ui.status_message =
                                 Some((format!("PTY write failed: {e}"), std::time::Instant::now()));
                         }
+                        ui.last_pane_keystroke_at = Some(std::time::Instant::now());
                     }
                 }
                 KeyResult::Continue => {}
             }
 
-            // Keep pane_display_names in sync with display_names
-            // so renames persist across session restarts.
-            for (sid, session) in &snapshot.sessions {
-                if let Some(ref pane_id) = session.pane_id {
-                    if let Some(name) = ui.display_names.get(sid) {
-                        ui.pane_display_names.insert(pane_id.clone(), name.clone());
-                    } else {
-                        ui.pane_display_names.remove(pane_id);
-                    }
-                }
-            }
+            // M2.11 fixup 5 — the deferred display_names ↔
+            // pane_display_names mirror that used to live here was
+            // the path that copied raw rename_text into
+            // pane_display_names (so a `"  newname  "` rename
+            // landed as `"  newname  "` in the dashboard while the
+            // controller stored `"newname"`). Both maps are now
+            // updated inline by the Rename dispatch arm above
+            // using the controller-returned RenameOutcome, and
+            // every other write path already touches both maps
+            // (the new-pane handler, the apply-pending-names
+            // block, and the restore paths). Reintroducing the
+            // deferred mirror would re-open the divergence
+            // reviewer P2 / auditor LOW flagged.
 
             // In PaneInput mode, drain remaining events to reduce typing latency.
             // In all other modes, break immediately to re-render so UI state
@@ -3503,14 +4770,9 @@ pub fn run_tui(
         }
     }
 
-    // Tear down all mode/orchestration tabs (clean up their panes).
-    for i in (1..tab_manager.tab_count()).rev() {
-        if let Ok(ids) = tab_manager.close_tab(i) {
-            for id in ids {
-                state.blocking_write().unregister_pane(&id);
-            }
-        }
-    }
+    // Tear down all mode/orchestration tabs (clean up their panes),
+    // gated on external-daemon mode — see `run_post_loop_teardown`.
+    run_post_loop_teardown(&pane, &state, &mut tab_manager);
 
     let _ = crossterm::execute!(
         std::io::stdout(),
@@ -3640,9 +4902,11 @@ fn render_frame(
             let (dashboard_area, panes_area) = if pane_ids.is_empty() {
                 (main_area, None)
             } else {
-                let chunks =
-                    Layout::horizontal([Constraint::Percentage(33), Constraint::Percentage(67)])
-                        .split(main_area);
+                let chunks = Layout::horizontal([
+                    Constraint::Percentage(DASHBOARD_LEFT_PERCENT),
+                    Constraint::Percentage(DASHBOARD_PANES_PERCENT),
+                ])
+                .split(main_area);
                 (chunks[0], Some(chunks[1]))
             };
             (pane_ids, dashboard_area, panes_area)
@@ -3655,9 +4919,11 @@ fn render_frame(
             let (dashboard_area, panes_area) = if pane_ids.is_empty() {
                 (main_area, None)
             } else {
-                let chunks =
-                    Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)])
-                        .split(main_area);
+                let chunks = Layout::horizontal([
+                    Constraint::Percentage(ORCHESTRATION_LEFT_PERCENT),
+                    Constraint::Percentage(ORCHESTRATION_PANES_PERCENT),
+                ])
+                .split(main_area);
                 (chunks[0], Some(chunks[1]))
             };
             (pane_ids, dashboard_area, panes_area)
@@ -3904,7 +5170,7 @@ fn render_overlays(
         render_config_gen_prompt(frame, ui.config_gen_selected, palette);
     }
     if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame, ui.quit_confirm_selected, palette);
+        render_quit_confirm(frame, ui.quit_confirm_selected, ui.via_daemon, palette);
     }
 }
 
@@ -4313,9 +5579,14 @@ fn render_bottom_bar(
     }
 }
 
-fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette) {
+fn render_quit_confirm(
+    frame: &mut Frame,
+    selected: usize,
+    via_daemon: bool,
+    palette: ColorPalette,
+) {
     let area = frame.area();
-    let popup_width = 44.min(area.width.saturating_sub(4));
+    let popup_width = 60u16.min(area.width.saturating_sub(4));
     let popup_height = 9u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -4323,15 +5594,35 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
 
     frame.render_widget(Clear, popup_area);
 
+    // PRD #76 M2.18: in external-daemon mode the only meaningful exit is
+    // Detach (TUI exits, daemon-owned agents keep running, KIND_DETACH frame
+    // emitted so the daemon log distinguishes voluntary detach from EOF).
+    // In local mode there is no daemon to detach from, so the action is
+    // Quit (exit and reap local PTY children).
+    let (action_label, action_desc, title, prompt) = if via_daemon {
+        (
+            "Detach",
+            "leave agents running on the daemon",
+            " Detach ",
+            "  Detach from this TUI?",
+        )
+    } else {
+        (
+            "Quit",
+            "exit and reap local agents",
+            " Quit ",
+            "  Are you sure you want to quit?",
+        )
+    };
     let options = [
-        ("Quit", "exit the application"),
+        (action_label, action_desc),
         ("Cancel", "return to dashboard"),
     ];
 
     let mut text = vec![
         Line::from(""),
         Line::styled(
-            "  Are you sure you want to quit?",
+            prompt,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -4361,7 +5652,7 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
     ));
 
     let block = Block::default()
-        .title(" Quit ")
+        .title(title)
         .title_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -5368,6 +6659,463 @@ mod tests {
         UiState::default()
     }
 
+    // PRD #76 M2.15: pin the layout-math helpers so a future change to the
+    // mode-tab / dashboard render layout can't silently divorce spawn-time
+    // dims from resize-time dims. The helpers are the single source of
+    // truth for both `AgentSpawnOptions.rows/cols` (spawn) and
+    // `resize_pane_pty` (resize); if one diverges from the render, the
+    // agent draws into a mismatched buffer.
+
+    #[test]
+    fn mode_agent_pane_dims_uses_left_half_minus_chrome() {
+        // 80×24 terminal: half_width = 80/2 - 2 = 38; rows = 24 - 3 = 21.
+        // The -2 accounts for the agent pane's borders; the -3 covers tab
+        // bar + hints bar chrome around the mode-tab content area.
+        let (rows, cols) = mode_agent_pane_dims(Rect::new(0, 0, 80, 24));
+        assert_eq!((rows, cols), (21, 38));
+    }
+
+    #[test]
+    fn mode_agent_pane_dims_saturates_on_tiny_viewport() {
+        // height < 3 must not underflow into u16::MAX rows — saturating
+        // arithmetic keeps the inner dims at 0 so `resize_pane_pty`
+        // skips the call (rows == 0) rather than handing the daemon a
+        // pathological dimension.
+        let (rows, cols) = mode_agent_pane_dims(Rect::new(0, 0, 2, 1));
+        assert_eq!((rows, cols), (0, 0));
+    }
+
+    #[test]
+    fn mode_side_pane_dims_divides_height_by_side_count() {
+        // 100×30 terminal with 3 side panes: half_width = 100/2 - 2 = 48,
+        // rows per side = 30/3 - 2 = 8.
+        let (rows, cols) = mode_side_pane_dims(Rect::new(0, 0, 100, 30), 3);
+        assert_eq!((rows, cols), (8, 48));
+    }
+
+    #[test]
+    fn mode_side_pane_dims_clamps_zero_count_to_one() {
+        // side_count == 0 must clamp to 1 to dodge a division-by-zero.
+        let (rows, cols) = mode_side_pane_dims(Rect::new(0, 0, 100, 30), 0);
+        assert_eq!((rows, cols), (28, 48));
+    }
+
+    #[test]
+    fn dashboard_pane_dims_tiled_divides_main_height() {
+        // 100×30 terminal, no tab bar, 2 panes, tiled. main_height = 30-1
+        // (hints bar) = 29; chunk = 29/2 = 14; rows = 14 - 2 = 12.
+        // right_width = 100 * 67 / 100 = 67; cols = 67 - 2 = 65.
+        let (rows, cols) =
+            dashboard_pane_dims(Rect::new(0, 0, 100, 30), 2, false, PaneLayout::Tiled, false);
+        assert_eq!((rows, cols), (12, 65));
+    }
+
+    #[test]
+    fn dashboard_pane_dims_tiled_with_tab_bar_subtracts_chrome() {
+        // Same shape but show_tab_bar=true: chrome_rows = 1, main_height
+        // = 30 - 2 = 28; chunk = 14; rows = 12.
+        let (rows, cols) =
+            dashboard_pane_dims(Rect::new(0, 0, 100, 30), 2, false, PaneLayout::Tiled, true);
+        assert_eq!((rows, cols), (12, 65));
+    }
+
+    #[test]
+    fn dashboard_pane_dims_stacked_focused_takes_remainder() {
+        // 100×30, 3 panes, stacked, focused: unfocused = 2; main = 29;
+        // chunk = 29 - 2 = 27; rows = 25. The other two panes collapse
+        // to 1-row title bars (next assertion).
+        let (rows, cols) = dashboard_pane_dims(
+            Rect::new(0, 0, 100, 30),
+            3,
+            true,
+            PaneLayout::Stacked,
+            false,
+        );
+        assert_eq!((rows, cols), (25, 65));
+    }
+
+    #[test]
+    fn dashboard_pane_dims_stacked_unfocused_collapses_to_title_bar() {
+        // Unfocused in stacked mode: chunk = 1; rows = saturating_sub(2) = 0.
+        // `resize_pane_pty` callers gate on rows > 0, so this just signals
+        // "don't bother dispatching a resize for this pane right now."
+        let (rows, _cols) = dashboard_pane_dims(
+            Rect::new(0, 0, 100, 30),
+            3,
+            false,
+            PaneLayout::Stacked,
+            false,
+        );
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn dashboard_pane_dims_zero_pane_count_does_not_divide_by_zero() {
+        // Edge case: pane_count = 0 (the very first pane is about to be
+        // added). Clamp to 1 so the math produces a sane value instead
+        // of a panic / overflow.
+        let (rows, cols) =
+            dashboard_pane_dims(Rect::new(0, 0, 100, 30), 0, false, PaneLayout::Tiled, false);
+        assert_eq!((rows, cols), (27, 65));
+    }
+
+    // PRD #76 M2.15 fixup F3 — pin the orchestration helper's geometry to
+    // the orchestration renderer's `[34%, 66%]` split. Before this helper
+    // existed, every spawn / resize site for orchestration role panes
+    // routed through `dashboard_pane_dims` (67%), so the daemon-side PTY
+    // ran one column wider than the rendered area.
+
+    #[test]
+    fn orchestration_role_pane_dims_uses_right_66_percent_width() {
+        // 100×30 terminal, no tab bar, 2 roles, tiled. main_height = 30-1
+        // (hints bar) = 29; chunk = 29/2 = 14; rows = 12. right_width =
+        // 100 * 66 / 100 = 66; cols = 64. Critical assertion: cols = 64,
+        // NOT 65 (which is what `dashboard_pane_dims` would return for
+        // the same input). The 1-col gap is exactly the F3 drift bug.
+        let (rows, cols) = orchestration_role_pane_dims(
+            Rect::new(0, 0, 100, 30),
+            2,
+            0,
+            None,
+            PaneLayout::Tiled,
+            false,
+        );
+        assert_eq!((rows, cols), (12, 64));
+    }
+
+    #[test]
+    fn orchestration_role_pane_dims_matches_renderer_constants() {
+        // Drift guard: the helper's width and the renderer's
+        // `Layout::horizontal([ORCHESTRATION_LEFT_PERCENT, ORCHESTRATION_PANES_PERCENT])`
+        // must produce the same right-column width by construction.
+        // Without this, a future tweak to one but not the other silently
+        // re-introduces the F3 spawn-vs-render drift.
+        let area = Rect::new(0, 0, 200, 50);
+        let (_rows, helper_cols) =
+            orchestration_role_pane_dims(area, 3, 0, None, PaneLayout::Tiled, false);
+        // Inner cols = right-column width - 2 (pane borders).
+        let renderer_cols = (area.width * ORCHESTRATION_PANES_PERCENT / 100).saturating_sub(2);
+        assert_eq!(helper_cols, renderer_cols);
+        // Sanity: dashboard helper differs because of the 67 vs 66 split.
+        let dashboard_renderer_cols =
+            (area.width * DASHBOARD_PANES_PERCENT / 100).saturating_sub(2);
+        assert_ne!(renderer_cols, dashboard_renderer_cols);
+    }
+
+    #[test]
+    fn orchestration_role_pane_dims_tiled_divides_height_equally() {
+        // 4 roles, Tiled: every role_index returns the same dims.
+        let area = Rect::new(0, 0, 100, 30);
+        let r0 = orchestration_role_pane_dims(area, 4, 0, None, PaneLayout::Tiled, true);
+        let r1 = orchestration_role_pane_dims(area, 4, 1, None, PaneLayout::Tiled, true);
+        let r2 = orchestration_role_pane_dims(area, 4, 2, None, PaneLayout::Tiled, true);
+        let r3 = orchestration_role_pane_dims(area, 4, 3, None, PaneLayout::Tiled, true);
+        assert_eq!(r0, r1);
+        assert_eq!(r1, r2);
+        assert_eq!(r2, r3);
+    }
+
+    #[test]
+    fn orchestration_role_pane_dims_stacked_role_zero_expands() {
+        // In Stacked mode with no focused role, role_index 0 mirrors
+        // the renderer's "expand the first slot if nothing is focused"
+        // fallback (see `render_terminal_panes` Stacked branch). Role
+        // 0 gets the lion's share; others collapse to the 1-row
+        // sentinel that resize callers gate on (`rows > 0` skips the
+        // resize).
+        let area = Rect::new(0, 0, 100, 30);
+        let (rows_focused, _) =
+            orchestration_role_pane_dims(area, 3, 0, None, PaneLayout::Stacked, false);
+        let (rows_unfocused, _) =
+            orchestration_role_pane_dims(area, 3, 1, None, PaneLayout::Stacked, false);
+        assert!(rows_focused > rows_unfocused);
+        assert_eq!(rows_unfocused, 0);
+    }
+
+    // PRD #76 M2.15 fixup pass 2 G2 — pin the focus-aware behavior so a
+    // future refactor of `orchestration_role_pane_dims` can't silently
+    // re-introduce the "role 0 hardcoded as expanded" bug.
+
+    #[test]
+    fn orchestration_role_pane_dims_stacked_expands_focused_non_zero_role() {
+        // The reviewer R1 / fixup-pass-2 G2 bug: when the focused role
+        // is non-zero, the resize sweep must expand THAT role's PTY,
+        // not role 0. Pre-fix, the helper hardcoded role_index==0 as
+        // expanded, so a focused non-zero role got the collapsed (1
+        // row → 0 inner rows after border) height while role 0 got
+        // the lion's share. With `focused_role_index=Some(2)`, the
+        // helper must give role 2 the expanded rows and role 0 the
+        // collapsed sentinel.
+        let area = Rect::new(0, 0, 100, 30);
+        let (r0_rows, _) =
+            orchestration_role_pane_dims(area, 3, 0, Some(2), PaneLayout::Stacked, false);
+        let (r1_rows, _) =
+            orchestration_role_pane_dims(area, 3, 1, Some(2), PaneLayout::Stacked, false);
+        let (r2_rows, _) =
+            orchestration_role_pane_dims(area, 3, 2, Some(2), PaneLayout::Stacked, false);
+        assert_eq!(r0_rows, 0, "role 0 must collapse when role 2 is focused");
+        assert_eq!(r1_rows, 0, "role 1 must collapse when role 2 is focused");
+        assert!(
+            r2_rows > 0,
+            "focused role must receive the expanded rows, got {r2_rows}"
+        );
+        // The focused row count must match what role 0 would have
+        // received under the no-focus fallback — i.e. swapping which
+        // slot is expanded, not changing the geometry.
+        let (rows_when_role0_expanded, _) =
+            orchestration_role_pane_dims(area, 3, 0, None, PaneLayout::Stacked, false);
+        assert_eq!(
+            r2_rows, rows_when_role0_expanded,
+            "focused role's expanded rows must equal the no-focus role-0 expansion"
+        );
+    }
+
+    #[test]
+    fn orchestration_role_pane_dims_tiled_ignores_focused_role_index() {
+        // Tiled layout divides height equally across all roles, so
+        // `focused_role_index` must be a geometric no-op there.
+        let area = Rect::new(0, 0, 100, 30);
+        let none_dims = orchestration_role_pane_dims(area, 3, 1, None, PaneLayout::Tiled, false);
+        let focused_self =
+            orchestration_role_pane_dims(area, 3, 1, Some(1), PaneLayout::Tiled, false);
+        let focused_other =
+            orchestration_role_pane_dims(area, 3, 1, Some(2), PaneLayout::Tiled, false);
+        assert_eq!(none_dims, focused_self);
+        assert_eq!(none_dims, focused_other);
+    }
+
+    #[test]
+    fn orchestration_role_pane_dims_matches_renderer_when_focused_role_nonzero() {
+        // Extended drift guard (fixup pass 2 G2): the helper's
+        // expanded-row height for a focused role must equal the
+        // renderer's expanded height for the same slot. The renderer
+        // gives the focused slot `Constraint::Fill(1)` after carving
+        // 1-row title bars off the other (count-1) slots — i.e. the
+        // expanded inner height = main_height - (count-1) - 2 (border).
+        let area = Rect::new(0, 0, 200, 50);
+        let role_count: u16 = 4;
+        let chrome_rows: u16 = 1; // hints bar; no tab bar in this test
+        let main_height = area.height.saturating_sub(chrome_rows);
+        let expanded_outer = main_height.saturating_sub(role_count - 1);
+        let expanded_inner = expanded_outer.saturating_sub(2);
+        let (helper_rows, _) = orchestration_role_pane_dims(
+            area,
+            role_count as usize,
+            2,
+            Some(2),
+            PaneLayout::Stacked,
+            false,
+        );
+        assert_eq!(helper_rows, expanded_inner);
+    }
+
+    #[test]
+    fn orchestration_role_pane_dims_zero_role_count_does_not_divide_by_zero() {
+        // Defensive: role_count = 0 (transient state during a tab
+        // teardown). Clamp to 1 so the helper returns a sane value.
+        let (rows, cols) = orchestration_role_pane_dims(
+            Rect::new(0, 0, 100, 30),
+            0,
+            0,
+            None,
+            PaneLayout::Tiled,
+            false,
+        );
+        // main_height = 29, count = 1, chunk = 29, rows = 27.
+        // right_width = 66, cols = 64.
+        assert_eq!((rows, cols), (27, 64));
+    }
+
+    // PRD #76 M2.12: pin the hydration partition's bucket semantics so
+    // a future tweak to `partition_hydrated_panes` can't silently strand
+    // mode/orchestration panes on the dashboard or double-build a tab.
+
+    fn hydrated(
+        pane_id: &str,
+        agent_id: &str,
+        cwd: Option<&str>,
+        membership: Option<TabMembership>,
+    ) -> HydratedPane {
+        HydratedPane {
+            pane_id: pane_id.to_string(),
+            agent_id: agent_id.to_string(),
+            display_name: None,
+            cwd: cwd.map(|s| s.to_string()),
+            tab_membership: membership,
+            agent_type: None,
+        }
+    }
+
+    #[test]
+    fn partition_routes_dashboard_panes_unchanged() {
+        let panes = vec![
+            hydrated("1", "a-1", Some("/work"), None),
+            hydrated("2", "a-2", None, None),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.dashboard_pane_ids, vec!["1".to_string(), "2".to_string()]);
+        assert!(p.mode_buckets.is_empty());
+        assert!(p.orchestration_buckets.is_empty());
+    }
+
+    #[test]
+    fn partition_groups_mode_membership_by_cwd_and_name() {
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/work"),
+                Some(TabMembership::Mode {
+                    name: "k8s-ops".into(),
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/work2"),
+                Some(TabMembership::Mode {
+                    name: "k8s-ops".into(),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert!(p.dashboard_pane_ids.is_empty());
+        assert_eq!(p.mode_buckets.len(), 2);
+        assert_eq!(p.mode_buckets[0].cwd, "/work");
+        assert_eq!(p.mode_buckets[0].mode_name, "k8s-ops");
+        assert_eq!(p.mode_buckets[0].agent_pane_id, "1");
+        assert_eq!(p.mode_buckets[1].cwd, "/work2");
+        assert_eq!(p.mode_buckets[1].agent_pane_id, "2");
+    }
+
+    #[test]
+    fn partition_duplicate_mode_bucket_drops_extras_to_dashboard() {
+        // Two agents claim the same (cwd, mode_name) — that's a logic
+        // error (mode tabs have one agent each), so the first wins and
+        // the rest end up on the dashboard rather than getting a doubled
+        // mode tab. M2.12 fixup reviewer #3: the helper is pure, so the
+        // duplicate is surfaced via `rejections` for the caller to log.
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/work"),
+                Some(TabMembership::Mode {
+                    name: "k8s-ops".into(),
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/work"),
+                Some(TabMembership::Mode {
+                    name: "k8s-ops".into(),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.mode_buckets.len(), 1);
+        assert_eq!(p.mode_buckets[0].agent_pane_id, "1");
+        assert_eq!(p.dashboard_pane_ids, vec!["2".to_string()]);
+        assert_eq!(
+            p.rejections,
+            vec![HydrationRejection::DuplicateMode {
+                cwd: "/work".into(),
+                mode_name: "k8s-ops".into(),
+                agent_id: "a-2".into(),
+                pane_id: "2".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn partition_collects_orchestration_role_slots() {
+        let panes = vec![
+            hydrated(
+                "10",
+                "a-10",
+                Some("/work"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                }),
+            ),
+            hydrated(
+                "11",
+                "a-11",
+                Some("/work"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 2,
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.orchestration_buckets.len(), 1);
+        let bucket = &p.orchestration_buckets[0];
+        assert_eq!(bucket.cwd, "/work");
+        assert_eq!(bucket.orchestration_name, "tdd-cycle");
+        assert_eq!(bucket.role_slots.len(), 2);
+        assert!(bucket.role_slots.contains(&(0, "10".to_string())));
+        assert!(bucket.role_slots.contains(&(2, "11".to_string())));
+    }
+
+    #[test]
+    fn partition_separates_orchestrations_by_cwd() {
+        // Same orchestration name, different cwds — two separate tabs.
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/work-a"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/work-b"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.orchestration_buckets.len(), 2);
+    }
+
+    #[test]
+    fn partition_mixed_input_preserves_order() {
+        // dashboard pane, then mode, then orchestration in input order.
+        let panes = vec![
+            hydrated("1", "a-1", Some("/w"), None),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/w"),
+                Some(TabMembership::Mode { name: "m".into() }),
+            ),
+            hydrated(
+                "3",
+                "a-3",
+                Some("/w"),
+                Some(TabMembership::Orchestration {
+                    name: "o".into(),
+                    role_index: 0,
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.dashboard_pane_ids, vec!["1".to_string()]);
+        assert_eq!(p.mode_buckets.len(), 1);
+        assert_eq!(p.mode_buckets[0].agent_pane_id, "2");
+        assert_eq!(p.orchestration_buckets.len(), 1);
+        assert_eq!(p.orchestration_buckets[0].role_slots, vec![(0, "3".into())]);
+    }
+
     #[test]
     fn test_format_elapsed() {
         let now = Utc::now();
@@ -5829,6 +7577,143 @@ mod tests {
             .unwrap();
     }
 
+    /// Concatenate every cell symbol on a row into a single string and join
+    /// rows with newlines. Used by the render-decision tests below to grep
+    /// the rendered buffer for the placeholder lines.
+    fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut out = String::with_capacity((area.width as usize + 1) * area.height as usize);
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #76 M2.13: dashboard placeholder render-decision tests.
+    //
+    // `render_session_card` flips a single gate on `session.agent_type ==
+    // AgentType::None`: when set, the card shows the "Launch an agent to
+    // get started" empty state and the "No agent" status badge; when
+    // populated (e.g. by the hydration path threading
+    // `AgentRecord.agent_type` through `insert_placeholder_session`), the
+    // card renders as a real session.
+    //
+    // Wire-format and AppState-side coverage live in `tests/rehydration.rs`
+    // (`hydrate_preserves_agent_type_end_to_end` + its OpenCode counterpart).
+    // These two tests pin the render side specifically so a future change to
+    // the gate, the placeholder copy, or the agent-type field can't silently
+    // re-introduce the "reconnect shows Launch an agent" bug.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dashboard_placeholder_with_agent_type_does_not_show_launch_an_agent() {
+        // Simulate the post-hydration state: a placeholder session whose
+        // `agent_type` was populated from the daemon's registry via
+        // `insert_placeholder_session(.., Some(ClaudeCode))`. The dashboard
+        // card must render the agent (no "Launch an agent" empty state,
+        // no "No agent" status badge).
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            Some(AgentType::ClaudeCode),
+        );
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
+                )
+            })
+            .unwrap();
+
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            !rendered.contains("Launch an agent to get started"),
+            "hydrated placeholder (agent_type=ClaudeCode) must not render the \
+             empty-state line; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("No agent"),
+            "hydrated placeholder (agent_type=ClaudeCode) must not show the \
+             'No agent' status badge; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn dashboard_placeholder_without_agent_type_shows_launch_an_agent() {
+        // Negative case: a placeholder created without an `agent_type` (the
+        // legacy local-mode path, or hydration from a pre-M2.13 daemon that
+        // doesn't echo the field) still renders the empty state. This pins
+        // the gate in the other direction so a refactor that drops the
+        // distinction can't silently change the empty-state UX either.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session("1".to_string(), Some("/tmp".to_string()), None);
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
+                )
+            })
+            .unwrap();
+
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            rendered.contains("Launch an agent to get started"),
+            "unhydrated placeholder (agent_type=None) must render the \
+             empty-state line; got:\n{rendered}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------
@@ -6282,8 +8167,17 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
     }
 
+    // M2.11 fixup 5 — handle_rename_key no longer writes to
+    // ui.display_names on Enter; the dispatch loop now calls
+    // `pane.rename_pane` first and mirrors the controller-returned
+    // RenameOutcome into both display-name maps. These tests pin
+    // the residual handler responsibilities: clearing rename_text
+    // and returning to Normal mode. The full commit pathway (handler
+    // → controller → UI maps) is covered by
+    // `tests/agent_metadata.rs::rename_outcome_*` and
+    // `rename_pane_*_on_local_backend` in this crate.
     #[test]
-    fn test_rename_commits_on_enter() {
+    fn test_rename_handler_clears_buffer_and_exits_on_enter() {
         let mut ui = default_ui();
         ui.mode = UiMode::Rename;
         ui.rename_text = "my-agent".to_string();
@@ -6295,14 +8189,24 @@ mod tests {
         );
 
         assert_eq!(ui.mode, UiMode::Normal);
-        assert_eq!(
-            ui.display_names.get("session-123"),
-            Some(&"my-agent".to_string())
+        assert!(
+            ui.rename_text.is_empty(),
+            "rename_text must be cleared after Enter"
+        );
+        // Crucially: handler does NOT touch display_names. The
+        // dispatch loop mirrors the controller's RenameOutcome
+        // into the maps so the raw input never reaches them.
+        assert!(
+            !ui.display_names.contains_key("session-123"),
+            "handler must not insert raw rename_text into display_names"
         );
     }
 
     #[test]
-    fn test_rename_empty_removes_name() {
+    fn test_rename_handler_preserves_existing_label_on_enter() {
+        // Even when the handler runs with non-empty rename_text, it
+        // must not mutate display_names — the dispatch loop owns
+        // both maps now, gated by the RenameOutcome.
         let mut ui = default_ui();
         ui.display_names
             .insert("s1".to_string(), "old-name".to_string());
@@ -6316,7 +8220,12 @@ mod tests {
         );
 
         assert_eq!(ui.mode, UiMode::Normal);
-        assert!(!ui.display_names.contains_key("s1"));
+        assert_eq!(
+            ui.display_names.get("s1"),
+            Some(&"old-name".to_string()),
+            "handler must NOT remove existing display_names entry — \
+             the dispatch loop owns that based on RenameOutcome::Cleared"
+        );
     }
 
     #[test]
@@ -6765,6 +8674,46 @@ mod tests {
             KeyResult::ForwardToPane(bytes) => assert_eq!(bytes, vec![b'l']),
             other => panic!("Expected ForwardToPane, got {:?}", other),
         }
+    }
+
+    // PRD #76 M2.20 — submit-debounce policy tests.
+
+    #[test]
+    fn enter_following_recent_keystroke_sleeps_at_least_debounce_minus_elapsed() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_millis(30);
+        let sleep = submit_debounce_duration(now, Some(last), b"\r");
+        // Expected ~120ms (150 - 30). Allow a few ms tolerance for arithmetic.
+        let expected = std::time::Duration::from_millis(120);
+        let lower = expected.saturating_sub(std::time::Duration::from_millis(5));
+        let upper = expected + std::time::Duration::from_millis(5);
+        assert!(
+            sleep >= lower && sleep <= upper,
+            "expected ~{expected:?}, got {sleep:?}"
+        );
+    }
+
+    #[test]
+    fn enter_with_stale_last_keystroke_does_not_sleep() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_millis(500);
+        let sleep = submit_debounce_duration(now, Some(last), b"\r");
+        assert_eq!(sleep, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn enter_with_no_prior_keystroke_does_not_sleep() {
+        let now = std::time::Instant::now();
+        let sleep = submit_debounce_duration(now, None, b"\r");
+        assert_eq!(sleep, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn non_enter_bytes_never_sleep_even_when_recent() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_millis(10);
+        let sleep = submit_debounce_duration(now, Some(last), b"hello");
+        assert_eq!(sleep, std::time::Duration::ZERO);
     }
 
     // -----------------------------------------------------------------------
@@ -7584,7 +9533,13 @@ mod tests {
             });
         }
 
-        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+        dispatch_delegate_events(
+            &state,
+            &pane,
+            &mut tab_manager,
+            &mut ui,
+            Rect::new(0, 0, 80, 24),
+        );
 
         assert!(ui.pending_dispatches.is_empty());
         assert!(state.blocking_read().delegate_events.is_empty());
@@ -7612,7 +9567,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let (_, role_pane_ids) = tab_manager
-            .open_orchestration_tab(&config, cwd, None)
+            .open_orchestration_tab(&config, cwd, None, (24, 80))
             .unwrap();
 
         let orch_pane_id = role_pane_ids[0].clone();
@@ -7634,7 +9589,13 @@ mod tests {
         }
 
         let mut ui = default_ui();
-        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+        dispatch_delegate_events(
+            &state,
+            &pane,
+            &mut tab_manager,
+            &mut ui,
+            Rect::new(0, 0, 80, 24),
+        );
 
         // Should not panic or queue anything — just warn and skip.
         assert!(ui.pending_dispatches.is_empty());
@@ -7725,12 +9686,12 @@ mod tests {
             Ok(())
         }
 
-        fn rename_pane(&self, pane_id: &str, name: &str) -> Result<(), PaneError> {
+        fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
             self.renamed
                 .lock()
                 .unwrap()
                 .push((pane_id.to_string(), name.to_string()));
-            Ok(())
+            Ok(RenameOutcome::applied(name))
         }
 
         fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
@@ -7765,6 +9726,160 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #76 M2.11 — rename commit-intent helper.
+    //
+    // These tests exercise the helper the dashboard Enter handler now
+    // calls (`rename_commit_value`), not the daemon RPC. Together with
+    // the integration test in `tests/agent_metadata.rs` they pin the
+    // full path: handler decides what to commit → forwards to
+    // `PaneController::rename_pane` → controller maps empty/whitespace
+    // to a daemon-side `None` clear (reviewer P1 clear-rename case,
+    // P2.4 handler coverage).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rename_commit_value_returns_empty_string_on_enter_with_empty_text() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        // Empty text is still a commit: the controller will see "" and
+        // translate it to a daemon-side `None` clear. Returning `None`
+        // here would skip the daemon update entirely and leave the
+        // stale label on the daemon (the original P1 clear-rename bug).
+        assert_eq!(rename_commit_value(key, ""), Some(String::new()));
+    }
+
+    #[test]
+    fn rename_commit_value_returns_whitespace_on_enter_with_whitespace_text() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        // Whitespace passes through verbatim; the controller applies
+        // the trim. This keeps the helper purely about commit intent
+        // (Enter vs not Enter) and the trim policy in one place.
+        assert_eq!(rename_commit_value(key, "   "), Some("   ".to_string()));
+    }
+
+    #[test]
+    fn rename_commit_value_returns_text_on_enter() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            rename_commit_value(key, "new-label"),
+            Some("new-label".to_string())
+        );
+    }
+
+    #[test]
+    fn rename_commit_value_returns_none_on_non_enter_keys() {
+        // Typing, navigation, backspace, escape — none of these are a
+        // commit. The handler must not ping the daemon on every
+        // keystroke (would amount to a per-keystroke `SetAgentLabel`
+        // RPC storm and break the "only commit on Enter" contract).
+        for code in [KeyCode::Char('a'), KeyCode::Esc, KeyCode::Backspace] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            assert_eq!(rename_commit_value(key, "anything"), None);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #76 M2.11 fixup 5 — `apply_rename_outcome` is the single
+    // place that mutates the dashboard's two display-name maps in
+    // response to a `PaneController::rename_pane` result. These
+    // tests pin the three outcome branches the dispatch loop now
+    // relies on. Together with the controller-side outcome tests
+    // in `src/embedded_pane.rs::rename_pane_*` and the daemon
+    // round-trip tests in `tests/agent_metadata.rs`, they cover
+    // the full path: raw rename text → controller-resolved label
+    // → UI map mirror.
+    // -----------------------------------------------------------------------
+
+    fn make_rename_maps(
+        sid: &str,
+        pane_id: &str,
+        label: &str,
+    ) -> (HashMap<String, String>, HashMap<String, String>) {
+        let mut display = HashMap::new();
+        let mut pane = HashMap::new();
+        display.insert(sid.to_string(), label.to_string());
+        pane.insert(pane_id.to_string(), label.to_string());
+        (display, pane)
+    }
+
+    /// Reviewer P2 / Auditor LOW: surround-whitespace input must
+    /// mirror the controller's trimmed label, not the raw text.
+    /// Before fixup 5 the dashboard mirror stored `"  newname  "`
+    /// while the controller (and the daemon) stored `"newname"`.
+    #[test]
+    fn apply_rename_outcome_applied_overwrites_both_maps_with_trimmed_name() {
+        let (mut display, mut pane) = make_rename_maps("s1", "p1", "old");
+        apply_rename_outcome(
+            &mut display,
+            &mut pane,
+            "s1",
+            "p1",
+            RenameOutcome::Applied("newname".to_string()),
+        );
+        assert_eq!(display.get("s1"), Some(&"newname".to_string()));
+        assert_eq!(pane.get("p1"), Some(&"newname".to_string()));
+    }
+
+    /// Reviewer P2 / Auditor LOW: a rename rejected by the
+    /// controller (control bytes after trim) must NOT touch the UI
+    /// maps. Before fixup 5 the raw `\x1b[31m` text landed in the
+    /// dashboard mirror and emitted terminal escapes into the card
+    /// title even though the controller correctly refused the
+    /// mutation locally and on the daemon.
+    #[test]
+    fn apply_rename_outcome_rejected_leaves_both_maps_unchanged() {
+        let (mut display, mut pane) = make_rename_maps("s1", "p1", "good-name");
+        apply_rename_outcome(&mut display, &mut pane, "s1", "p1", RenameOutcome::Rejected);
+        assert_eq!(
+            display.get("s1"),
+            Some(&"good-name".to_string()),
+            "Rejected outcome must NOT mutate display_names"
+        );
+        assert_eq!(
+            pane.get("p1"),
+            Some(&"good-name".to_string()),
+            "Rejected outcome must NOT mutate pane_display_names"
+        );
+    }
+
+    /// Reviewer P1 (extended): empty/whitespace rename text reaches
+    /// the controller as a "clear" → `RenameOutcome::Cleared`. The
+    /// UI mirror must remove the entries from BOTH maps so the
+    /// card falls back to the agent_id-based default label,
+    /// matching what hydrate would produce against the daemon's
+    /// `display_name: None`.
+    #[test]
+    fn apply_rename_outcome_cleared_removes_entries_from_both_maps() {
+        let (mut display, mut pane) = make_rename_maps("s1", "p1", "old");
+        apply_rename_outcome(&mut display, &mut pane, "s1", "p1", RenameOutcome::Cleared);
+        assert!(
+            !display.contains_key("s1"),
+            "Cleared must remove display_names entry"
+        );
+        assert!(
+            !pane.contains_key("p1"),
+            "Cleared must remove pane_display_names entry"
+        );
+    }
+
+    /// First-time rename (no prior label): Applied must still
+    /// populate both maps. Guards against a regression where the
+    /// helper only updates existing entries.
+    #[test]
+    fn apply_rename_outcome_applied_inserts_when_no_prior_label() {
+        let mut display: HashMap<String, String> = HashMap::new();
+        let mut pane: HashMap<String, String> = HashMap::new();
+        apply_rename_outcome(
+            &mut display,
+            &mut pane,
+            "s1",
+            "p1",
+            RenameOutcome::Applied("foo".to_string()),
+        );
+        assert_eq!(display.get("s1"), Some(&"foo".to_string()));
+        assert_eq!(pane.get("p1"), Some(&"foo".to_string()));
     }
 
     // -----------------------------------------------------------------------
@@ -7826,7 +9941,7 @@ mod tests {
         let state = Arc::new(tokio::sync::RwLock::new(AppState::default()));
 
         let (_, role_pane_ids) = tab_manager
-            .open_orchestration_tab(config, cwd, None)
+            .open_orchestration_tab(config, cwd, None, (24, 80))
             .unwrap();
 
         // Register all panes in state with role and cwd mappings.
@@ -7878,7 +9993,13 @@ mod tests {
             });
         }
 
-        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+        dispatch_delegate_events(
+            &state,
+            &pane,
+            &mut tab_manager,
+            &mut ui,
+            Rect::new(0, 0, 80, 24),
+        );
 
         // Both workers should have received prompts.
         let written = mock.written.lock().unwrap();
@@ -7931,7 +10052,13 @@ mod tests {
             });
         }
 
-        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+        dispatch_delegate_events(
+            &state,
+            &pane,
+            &mut tab_manager,
+            &mut ui,
+            Rect::new(0, 0, 80, 24),
+        );
 
         // Old panes should be closed.
         let closed = mock.closed.lock().unwrap();
@@ -8000,7 +10127,13 @@ mod tests {
             });
         }
 
-        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+        dispatch_delegate_events(
+            &state,
+            &pane,
+            &mut tab_manager,
+            &mut ui,
+            Rect::new(0, 0, 80, 24),
+        );
 
         let written = mock.written.lock().unwrap();
 
@@ -8269,5 +10402,64 @@ mod tests {
         );
         assert_eq!(ui.pending_dispatches[0].pane_id, *orchestrator_pane);
         assert!(ui.pending_dispatches[0].prompt.contains("coder"));
+    }
+
+    // PRD #76 M2.18: the quit dialog collapsed from three options (Quit /
+    // Detach / Cancel) to two mode-dependent ones. Pin the dispatch so a
+    // future refactor can't silently drop the mode-awareness — local mode
+    // must yield `KeyResult::Quit` (reap local children) and external mode
+    // must yield `KeyResult::DetachAndQuit` (emit KIND_DETACH so the daemon
+    // log distinguishes voluntary detach from EOF).
+    #[test]
+    fn quit_confirm_enter_in_local_mode_returns_quit() {
+        let mut ui = default_ui();
+        ui.via_daemon = false;
+        ui.mode = UiMode::QuitConfirm;
+        ui.quit_confirm_selected = 0;
+
+        let result =
+            handle_quit_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+        assert!(matches!(result, KeyResult::Quit));
+    }
+
+    #[test]
+    fn quit_confirm_enter_in_external_daemon_mode_returns_detach() {
+        let mut ui = default_ui();
+        ui.via_daemon = true;
+        ui.mode = UiMode::QuitConfirm;
+        ui.quit_confirm_selected = 0;
+
+        let result =
+            handle_quit_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+        assert!(matches!(result, KeyResult::DetachAndQuit));
+    }
+
+    #[test]
+    fn quit_confirm_cancel_returns_to_normal_mode() {
+        for via_daemon in [false, true] {
+            let mut ui = default_ui();
+            ui.via_daemon = via_daemon;
+            ui.mode = UiMode::QuitConfirm;
+            ui.quit_confirm_selected = 1;
+
+            let result =
+                handle_quit_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+            assert!(matches!(result, KeyResult::Continue));
+            assert_eq!(ui.mode, UiMode::Normal);
+        }
+    }
+
+    #[test]
+    fn quit_confirm_down_clamps_to_two_options() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::QuitConfirm;
+        ui.quit_confirm_selected = 0;
+
+        // Two presses on Down — selection must stop at index 1 (Cancel),
+        // proving QUIT_OPTION_COUNT == 2.
+        handle_quit_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui);
+        assert_eq!(ui.quit_confirm_selected, 1);
+        handle_quit_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui);
+        assert_eq!(ui.quit_confirm_selected, 1);
     }
 }

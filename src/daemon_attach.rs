@@ -1,0 +1,1032 @@
+//! Lazy-spawn machinery for the on-remote daemon (PRD #76, M4.3 + M2.8).
+//!
+//! After the 2026-05-09 architectural pivot the laptop-side bridge that
+//! ssh-exec'd `dot-agent-deck daemon attach` on the remote was removed
+//! (M2.7). What survives in this module is the pieces that lazy-spawn the
+//! daemon on the remote when something else needs it (the on-remote TUI
+//! bootstrap from M2.8, or M2.9's `ssh -t` connect):
+//!
+//! - [`ensure_daemon_running`] — `flock(2)`-serialized "is the attach socket
+//!   present? if not, run `spawn_fn` and poll for it" loop. Concurrent
+//!   first-attaches serialize on `<state_dir>/spawn.lock` so only one races
+//!   the bind. The loser re-checks after acquiring the lock and short-circuits.
+//! - [`verify_socket_trusted`] — checks the path is a Unix socket owned by
+//!   the current uid at mode 0o600 before any caller connects, defending
+//!   against a same-uid attacker who pre-binds at the attach path.
+//! - [`spawn_daemon_serve_detached`] — `setsid(2)` + `O_NOFOLLOW` + 0o600
+//!   detach-spawn of `dot-agent-deck daemon serve` so the daemon survives
+//!   the parent's exit.
+//! - [`ensure_external_daemon_or_die`] — M2.8 entry point used by the TUI
+//!   when `DOT_AGENT_DECK_VIA_DAEMON=1`: glues the three primitives above
+//!   together against the production `state_dir()` and the production
+//!   `dot-agent-deck daemon serve` binary.
+
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use thiserror::Error;
+
+use crate::agent_pty::DOT_AGENT_DECK_VIA_DAEMON;
+use crate::config::state_dir;
+
+/// Errors surfaced by the lazy-spawn machinery. The CLI handler renders
+/// these to stderr before exiting nonzero; tests match on the variant.
+#[derive(Debug, Error)]
+pub enum AttachError {
+    #[error("failed to spawn detached daemon: {source}")]
+    DaemonSpawnFailed {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "daemon failed to start within {timeout_ms}ms: socket {path} never appeared. Check {log_path} for daemon stderr."
+    )]
+    DaemonStartTimeout {
+        path: PathBuf,
+        log_path: PathBuf,
+        timeout_ms: u128,
+    },
+    #[error(
+        "refusing to connect to daemon attach socket {path}: {reason}. \
+         Another user (or a hostile same-uid process) may have placed this file."
+    )]
+    SocketUntrusted { path: PathBuf, reason: String },
+}
+
+/// If `socket_path` doesn't exist, run `spawn_fn` to start a detached
+/// daemon, then poll for the socket file at `poll_interval` until either
+/// it appears (Ok) or `poll_timeout` elapses (`DaemonStartTimeout`).
+///
+/// Concurrent callers serialize on an exclusive `flock(2)` over
+/// `<state_dir>/spawn.lock` so only one of them runs `spawn_fn`; losers see
+/// the socket present after acquiring the lock and short-circuit. This is
+/// the only correct way to dedupe — a sleep-and-poll without the lock just
+/// shrinks the race.
+///
+/// Pure of process-spawning details so tests can drive the loop by passing
+/// a closure that synchronously creates the socket file (or doesn't). The
+/// real production callsite uses [`spawn_daemon_serve_detached`].
+///
+/// Both the pre-existing-socket and freshly-spawned-socket branches run
+/// [`verify_socket_trusted`] before returning so the caller knows the
+/// socket is owned by the current uid at mode 0o600.
+pub async fn ensure_daemon_running<F>(
+    socket_path: &Path,
+    state_dir: &Path,
+    spawn_fn: F,
+    poll_interval: Duration,
+    poll_timeout: Duration,
+) -> Result<(), AttachError>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    // Lock file lives inside the state dir, so we have to make sure the dir
+    // exists first. `prepare_state_dir` creates idempotently AND enforces
+    // mode 0o700 unconditionally — including repairing a pre-existing dir
+    // that was left at looser permissions by a stale install.
+    prepare_state_dir(state_dir).map_err(|source| AttachError::DaemonSpawnFailed { source })?;
+
+    // Acquire the spawn mutex. flock(2) blocks until granted, so this also
+    // serves as the "wait for the in-flight spawn to finish" barrier.
+    let lock_path = state_dir.join("spawn.lock");
+    let _lock = acquire_spawn_lock(&lock_path)
+        .await
+        .map_err(|source| AttachError::DaemonSpawnFailed { source })?;
+
+    // First check happens INSIDE the lock so a waiter that lost the race sees
+    // the socket the winner created and skips the spawn.
+    if socket_path.exists() {
+        verify_socket_trusted(socket_path)?;
+        // Trust check only validates the inode (type, owner, mode) — it
+        // doesn't know whether anyone is listening. A daemon that died
+        // without unlinking (crash, SIGKILL, host reboot mid-write) leaves
+        // a stale socket on disk that would otherwise short-circuit lazy-
+        // spawn forever, with every subsequent client connect failing
+        // `ECONNREFUSED`. Probe-connect here so we can distinguish a live
+        // daemon from a leftover file; on failure, the inode is ours
+        // (trust check just validated uid + mode) so unlinking and
+        // falling through to the spawn branch is safe.
+        if probe_socket_alive(socket_path).await {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    spawn_fn().map_err(|source| AttachError::DaemonSpawnFailed { source })?;
+
+    let log_path = state_dir.join("daemon.log");
+    let start = Instant::now();
+    loop {
+        if socket_path.exists() {
+            verify_socket_trusted(socket_path)?;
+            return Ok(());
+        }
+        if start.elapsed() >= poll_timeout {
+            return Err(AttachError::DaemonStartTimeout {
+                path: socket_path.to_path_buf(),
+                log_path,
+                timeout_ms: poll_timeout.as_millis(),
+            });
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Verify `path` is a Unix socket owned by the current uid at mode 0o600.
+///
+/// Defends against a same-uid attacker pre-creating a socket at the attach
+/// path before the real daemon binds: in that scenario `bind(2)` fails with
+/// `EADDRINUSE` for the daemon and `connect(2)` succeeds for us against the
+/// attacker's socket. Validating ownership and mode out-of-band closes the
+/// gap. Stat is not racy here because we never re-stat after this check —
+/// the FD we then connect to is anchored to the inode the kernel resolves
+/// during this single call (and any swap underneath us produces an obvious
+/// connection error from `UnixStream::connect`).
+pub(crate) fn verify_socket_trusted(path: &Path) -> Result<(), AttachError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = std::fs::metadata(path).map_err(|source| AttachError::SocketUntrusted {
+        path: path.to_path_buf(),
+        reason: format!("stat failed: {source}"),
+    })?;
+
+    if !metadata.file_type().is_socket() {
+        return Err(AttachError::SocketUntrusted {
+            path: path.to_path_buf(),
+            reason: "not a Unix domain socket".to_string(),
+        });
+    }
+
+    // SAFETY: getuid(2) is async-signal-safe, has no failure mode, and
+    // returns the calling process's real uid.
+    let our_uid = unsafe { libc::getuid() };
+    if metadata.uid() != our_uid {
+        return Err(AttachError::SocketUntrusted {
+            path: path.to_path_buf(),
+            reason: format!("owned by uid {} (expected {})", metadata.uid(), our_uid),
+        });
+    }
+
+    let mode = metadata.mode() & 0o777;
+    if mode != 0o600 {
+        return Err(AttachError::SocketUntrusted {
+            path: path.to_path_buf(),
+            reason: format!("mode is 0o{mode:o} (expected 0o600)"),
+        });
+    }
+
+    Ok(())
+}
+
+/// Best-effort liveness probe for a Unix domain socket. Returns true iff
+/// `connect(2)` succeeds; any error (typically `ECONNREFUSED` from a stale
+/// inode whose binder is dead) returns false. The connection is dropped
+/// immediately — this is only a "is anything listening" signal.
+///
+/// Used inside [`ensure_daemon_running`] to differentiate a live daemon
+/// from a leftover socket file: file existence is not sufficient evidence
+/// that the daemon is up, since `bind(2)` doesn't auto-unlink on the
+/// binder's death.
+async fn probe_socket_alive(path: &Path) -> bool {
+    tokio::net::UnixStream::connect(path).await.is_ok()
+}
+
+/// RAII guard for the `spawn.lock` flock. Drop releases the lock by
+/// closing the file descriptor (and explicitly LOCK_UN'ing for clarity).
+pub(crate) struct SpawnLock {
+    file: std::fs::File,
+}
+
+impl Drop for SpawnLock {
+    fn drop(&mut self) {
+        // SAFETY: fd is valid for the lifetime of self.file; flock(LOCK_UN)
+        // on a held lock is safe and reverses the LOCK_EX taken in
+        // acquire_spawn_lock. Closing the file (next, via File::Drop) would
+        // also release the lock — the explicit unlock just keeps the
+        // semantics readable.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// Open or create `path` and acquire an exclusive `flock(2)` on it. flock is
+/// blocking, so we run the syscall on `spawn_blocking` to avoid stalling
+/// other tasks scheduled on the same tokio worker when contention is real
+/// (i.e., another caller on this host is mid-spawn).
+async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)?;
+        // SAFETY: passing a valid fd and a valid op constant; flock(2) does
+        // not retain any reference to the address space, so the unsafe is a
+        // formality of the libc binding.
+        let res = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if res != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(SpawnLock { file })
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+/// Create `state_dir` with mode 0o700, repairing the mode on pre-existing
+/// directories. `DirBuilder::mode(0o700)` only applies to a directory
+/// freshly created by the call — an existing `state_dir` at 0o755 (stale
+/// install, prior misconfigured run) would slip through and leave the
+/// per-uid socket dir world-readable. We follow up with an unconditional
+/// `set_permissions(0o700)`, matching the chmod-after-bind pattern used
+/// for the daemon socket in `src/daemon.rs`.
+///
+/// Race-safety: `prepare_state_dir` runs before `spawn.lock` is acquired,
+/// so two first-time callers (twin TUI launches, or TUI + `daemon serve`)
+/// can both observe "missing" and try to create. `DirBuilder::recursive(true)`
+/// makes the mkdir idempotent — the stdlib internally converts
+/// `AlreadyExists` to `Ok(())` when the existing path is a directory — so
+/// the loser's create call succeeds against whatever the winner left behind.
+/// Real I/O errors (permission denied, ENOSPC) still surface unchanged.
+fn prepare_state_dir(state_dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(state_dir)?;
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Spawn `dot-agent-deck daemon serve` as a detached background process
+/// that survives the parent's exit. Used by lazy-spawn-on-attach (M4.3).
+///
+/// - The binary is located via [`std::env::current_exe`] rather than `$PATH`
+///   because non-interactive ssh shells routinely skip `~/.local/bin` (we
+///   hit this exact bug three times — commits 493248b, bbf2236, ea8c748).
+/// - `setsid(2)` runs in the child via `pre_exec` so the daemon becomes
+///   its own session leader and won't receive `SIGHUP` when the parent
+///   shell exits.
+/// - stdin is `/dev/null` and stdout/stderr append to `<state_dir>/daemon.log`.
+///   The log is opened with `O_NOFOLLOW` and mode 0o600 so a same-uid
+///   attacker can't pre-place a symlink to redirect daemon output (which
+///   contains hook payloads and agent task strings) and the log file
+///   itself isn't world-readable on the default umask.
+///
+/// Note: we do not wait for the child here — the spawned daemon stays up
+/// after this function returns. Callers should poll the attach socket
+/// (see [`ensure_daemon_running`]) to know when the daemon is ready.
+pub fn spawn_daemon_serve_detached(state_dir: &Path) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    spawn_daemon_serve_detached_with_exe(state_dir, &exe).map(|_| ())
+}
+
+/// Same as [`spawn_daemon_serve_detached`] but takes an explicit `exe`
+/// path and returns the spawned daemon's pid on success. Production callers
+/// should always go through [`spawn_daemon_serve_detached`] (which discards
+/// the pid); this variant exists so integration tests in `tests/` can
+/// fork-exec the cargo-built `dot-agent-deck` binary (the test runner's
+/// `current_exe()` is the test harness, not our binary) and recover the
+/// pid for `kill(2)`-based cleanup.
+pub fn spawn_daemon_serve_detached_with_exe(state_dir: &Path, exe: &Path) -> std::io::Result<u32> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::CommandExt;
+
+    prepare_state_dir(state_dir)?;
+    let log_path = state_dir.join("daemon.log");
+    let stdout = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(&log_path)
+    {
+        Ok(f) => f,
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            // O_NOFOLLOW + open of a symlink fails with ELOOP. A symlink at
+            // the daemon log path means someone placed it there ahead of us;
+            // refuse to write through it rather than silently following.
+            return Err(std::io::Error::other(format!(
+                "daemon log path {} is a symlink — refusing to follow (someone may have planted it to redirect daemon output)",
+                log_path.display()
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let stderr = stdout.try_clone()?;
+    let stdin = std::fs::File::open("/dev/null")?;
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon")
+        .arg("serve")
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr);
+
+    // SAFETY: `pre_exec` runs in the child between fork and exec. Only
+    // async-signal-safe libc calls are permitted here; `setsid(2)` is on
+    // POSIX's async-signal-safe list. We do nothing else in the closure.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    // Spawn and immediately drop the handle. The child is now its own
+    // session leader; when this process exits, init reaps the child. We
+    // don't wait — the caller will poll the attach socket. The pid is
+    // returned for tests that need to clean up the spawned daemon; the
+    // production wrapper [`spawn_daemon_serve_detached`] discards it.
+    let child = cmd.spawn()?;
+    Ok(child.id())
+}
+
+/// Returns true if `DOT_AGENT_DECK_VIA_DAEMON` is set to a truthy value
+/// (`1`, `true`, `yes`, case-insensitive). The TUI bootstrap branches on this
+/// to decide between in-process daemon (false) and lazy-spawn-an-external
+/// one (true). Centralized here so the test that asserts the unset case
+/// doesn't duplicate the parsing rule that lives in production.
+pub fn via_daemon_enabled() -> bool {
+    std::env::var(DOT_AGENT_DECK_VIA_DAEMON)
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// M2.8 TUI bootstrap entry point. When the dashboard is invoked with
+/// `DOT_AGENT_DECK_VIA_DAEMON=1`, the TUI calls this before the first
+/// [`crate::daemon_client::DaemonClient`] connect:
+///
+/// - If the attach socket is missing, fork-execs `dot-agent-deck daemon
+///   serve` detached so it outlives the TUI (agents must survive TUI exit
+///   per PRD #76 line 199), under [`flock`]-serialized
+///   `<state_dir>/spawn.lock` so concurrent first-attaches don't double-spawn.
+/// - Either way, runs [`verify_socket_trusted`] on the resulting socket
+///   before returning Ok. A pre-existing regular file or wrong-mode socket
+///   at the path is rejected with [`AttachError::SocketUntrusted`] — the
+///   TUI must not silently fall back to the in-process daemon, since that
+///   would mask a same-uid attacker.
+///
+/// Errors are surfaced as-is to the caller (the dashboard renders them to
+/// stderr and exits nonzero — there is no in-process fallback). Polling
+/// timeout is 5s with 50ms intervals; that's enough headroom for the
+/// daemon's bind path on a loaded host without making error output feel
+/// hung.
+pub async fn ensure_external_daemon_or_die(attach_path: &Path) -> Result<(), AttachError> {
+    let state = state_dir();
+    let state_for_spawn = state.clone();
+    ensure_daemon_running(
+        attach_path,
+        &state,
+        move || spawn_daemon_serve_detached(&state_for_spawn),
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `tempfile::tempdir()` calls `mkdir(2)` with mode `0o700 & ~umask`. The
+    /// crate's `bind_socket` (src/daemon.rs) briefly flips the process-global
+    /// umask to `0o177`, and any concurrent `mkdir` (in another test) lands
+    /// during that window with mode `0o700 & ~0o177 = 0o600` — no execute
+    /// bit, so files inside the dir become unreachable. Re-apply 0o700 after
+    /// creation so our tests are robust to the race.
+    fn race_safe_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    /// Bind a real Unix listener at `path` with mode 0o600 so it passes the
+    /// trust check. Returns the listener; the caller keeps it alive for the
+    /// duration of the test (drop unbinds nothing — the inode persists, so
+    /// only the test's tempdir cleanup removes it).
+    fn bind_trusted_socket(path: &Path) -> std::os::unix::net::UnixListener {
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        listener
+    }
+
+    #[tokio::test]
+    async fn ensure_returns_immediately_when_socket_present() {
+        let dir = race_safe_tempdir();
+        let sock = dir.path().join("attach.sock");
+        let _listener = bind_trusted_socket(&sock);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = calls.clone();
+        ensure_daemon_running(
+            &sock,
+            dir.path(),
+            move || {
+                calls_inner.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("should short-circuit when socket already exists");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "spawn_fn must not run when socket is already present"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_recovers_from_stale_socket() {
+        // Regression: a daemon that died without unlinking its socket leaves
+        // a file at the attach path that passes `verify_socket_trusted`
+        // (type/owner/mode are intact — the inode is just unbound). Before
+        // the probe-connect was added, `ensure_daemon_running` would
+        // short-circuit on file existence and every subsequent client
+        // connect would fail with `ECONNREFUSED`, forcing users to manually
+        // unlink the socket to recover. The lazy-spawn must instead detect
+        // the dead inode, unlink it, and run `spawn_fn`.
+        let dir = race_safe_tempdir();
+        let sock = dir.path().join("attach.sock");
+
+        // Bind then drop the listener — the inode survives on disk but no
+        // one is listening, so connect attempts return ECONNREFUSED.
+        {
+            let _stale = bind_trusted_socket(&sock);
+        }
+        assert!(
+            sock.exists(),
+            "precondition: stale socket file must remain after listener drop"
+        );
+
+        let sock_for_spawn = sock.clone();
+        let listener_slot: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixListener>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot = listener_slot.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = calls.clone();
+
+        ensure_daemon_running(
+            &sock,
+            dir.path(),
+            move || {
+                calls_inner.fetch_add(1, Ordering::SeqCst);
+                let l = bind_trusted_socket(&sock_for_spawn);
+                *slot.lock().unwrap() = Some(l);
+                Ok(())
+            },
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("stale-socket path must recover by unlinking + respawning");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "spawn_fn must run exactly once after the stale socket was unlinked"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_spawns_then_succeeds_when_socket_appears() {
+        let dir = race_safe_tempdir();
+        let sock = dir.path().join("attach.sock");
+        let sock_for_spawn = sock.clone();
+        // Hold the listener handle outside so it lives past the closure.
+        let listener_slot: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixListener>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot = listener_slot.clone();
+
+        ensure_daemon_running(
+            &sock,
+            dir.path(),
+            move || {
+                // Simulate a daemon that binds the socket synchronously.
+                let l = bind_trusted_socket(&sock_for_spawn);
+                *slot.lock().unwrap() = Some(l);
+                Ok(())
+            },
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("should observe the spawned daemon's socket");
+    }
+
+    #[tokio::test]
+    async fn ensure_polls_until_socket_appears() {
+        let dir = race_safe_tempdir();
+        let sock = dir.path().join("attach.sock");
+        let sock_async = sock.clone();
+        let listener_slot: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixListener>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot = listener_slot.clone();
+
+        // Background task creates the socket after a short delay, so
+        // ensure_daemon_running must actually iterate the poll loop.
+        let creator = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let l = bind_trusted_socket(&sock_async);
+            *slot.lock().unwrap() = Some(l);
+        });
+
+        ensure_daemon_running(
+            &sock,
+            dir.path(),
+            || Ok(()), // pretend the spawn succeeded; the task above mimics binding.
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("should succeed once the background task creates the socket");
+        creator.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_times_out_when_socket_never_appears() {
+        let dir = race_safe_tempdir();
+        let sock = dir.path().join("attach.sock");
+
+        let err = ensure_daemon_running(
+            &sock,
+            dir.path(),
+            || Ok(()),
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("should time out");
+        match err {
+            AttachError::DaemonStartTimeout {
+                path,
+                log_path,
+                timeout_ms,
+            } => {
+                assert_eq!(path, sock);
+                assert_eq!(log_path, dir.path().join("daemon.log"));
+                assert_eq!(timeout_ms, 50);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_propagates_spawn_failure() {
+        let dir = race_safe_tempdir();
+        let sock = dir.path().join("attach.sock");
+
+        let err = ensure_daemon_running(
+            &sock,
+            dir.path(),
+            || Err(std::io::Error::other("boom")),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("spawn failure should bubble up");
+        match err {
+            AttachError::DaemonSpawnFailed { source } => {
+                assert_eq!(source.to_string(), "boom");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn trust_check_rejects_regular_file() {
+        let dir = race_safe_tempdir();
+        let sock = dir.path().join("attach.sock");
+        // A regular file at the socket path — wrong type. Created at 0o600
+        // and same-uid so type is the only failing check.
+        std::fs::write(&sock, b"").unwrap();
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let err = ensure_daemon_running(
+            &sock,
+            dir.path(),
+            || Ok(()),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("non-socket file at attach path must be rejected");
+        match err {
+            AttachError::SocketUntrusted { path, reason } => {
+                assert_eq!(path, sock);
+                assert!(
+                    reason.contains("not a Unix domain socket"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn trust_check_rejects_wrong_mode_socket() {
+        let dir = race_safe_tempdir();
+        let sock = dir.path().join("attach.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // Deliberately wrong mode — too permissive.
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = ensure_daemon_running(
+            &sock,
+            dir.path(),
+            || Ok(()),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("non-0600 socket must be rejected");
+        match err {
+            AttachError::SocketUntrusted { path, reason } => {
+                assert_eq!(path, sock);
+                assert!(reason.contains("mode"), "unexpected reason: {reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn trust_check_rejects_wrong_owner_socket() {
+        // A non-root process can't chown to another uid, so we simulate
+        // wrong-owner by chown'ing to a uid that almost certainly differs
+        // from ours when we ARE root, and skipping the test otherwise.
+        // SAFETY: getuid is async-signal-safe and infallible.
+        let our_uid = unsafe { libc::getuid() };
+        if our_uid != 0 {
+            // Same-uid is the only realistic threat model — verifying the
+            // negative path requires root to call chown, so skip otherwise.
+            eprintln!("skipping: requires root to set foreign uid on test socket");
+            return;
+        }
+        let dir = race_safe_tempdir();
+        let sock = dir.path().join("attach.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Chown to nobody-ish uid 65534 (only works as root).
+        let cpath = std::ffi::CString::new(sock.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid path, valid uid_t, valid gid_t (-1 means "leave gid").
+        let res = unsafe { libc::chown(cpath.as_ptr(), 65534, u32::MAX) };
+        assert_eq!(res, 0, "chown should succeed when running as root");
+
+        let err = ensure_daemon_running(
+            &sock,
+            dir.path(),
+            || Ok(()),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("foreign-owned socket must be rejected");
+        match err {
+            AttachError::SocketUntrusted { path, reason } => {
+                assert_eq!(path, sock);
+                assert!(
+                    reason.contains("owned by uid"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn flock_serializes_concurrent_ensure_calls() {
+        // Two ensure_daemon_running calls hit the same state_dir at the
+        // same time. The flock must serialize them so only the first runs
+        // its spawn closure; the second sees the socket present after
+        // acquiring the lock and short-circuits.
+        let dir = race_safe_tempdir();
+        let state_dir = dir.path().to_path_buf();
+        let sock = state_dir.join("attach.sock");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener_slot: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixListener>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        let s1 = sock.clone();
+        let s1_for_spawn = sock.clone();
+        let sd1 = state_dir.clone();
+        let c1 = calls.clone();
+        let slot1 = listener_slot.clone();
+        let h1 = tokio::spawn(async move {
+            ensure_daemon_running(
+                &s1,
+                &sd1,
+                move || {
+                    c1.fetch_add(1, Ordering::SeqCst);
+                    // Sleep WHILE holding the spawn lock so the second
+                    // task is parked on flock acquire — that's the race
+                    // we want to demonstrate the lock fixes.
+                    std::thread::sleep(Duration::from_millis(150));
+                    let l = bind_trusted_socket(&s1_for_spawn);
+                    *slot1.lock().unwrap() = Some(l);
+                    Ok(())
+                },
+                Duration::from_millis(10),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        // Give the first task time to enter spawn_fn.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let s2 = sock.clone();
+        let sd2 = state_dir.clone();
+        let c2 = calls.clone();
+        let h2 = tokio::spawn(async move {
+            ensure_daemon_running(
+                &s2,
+                &sd2,
+                move || {
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                Duration::from_millis(10),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        h1.await.unwrap().expect("first ensure should succeed");
+        h2.await
+            .unwrap()
+            .expect("second ensure should short-circuit on the socket the first one bound");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "spawn_fn must run exactly once — flock should serialize the two callers"
+        );
+    }
+
+    /// Test-only RAII guard for `DOT_AGENT_DECK_STATE_DIR`. Callers must
+    /// hold `crate::config::STATE_DIR_ENV_LOCK` while the guard exists so
+    /// the env var observed by [`state_dir`] is stable for the test.
+    struct StateDirEnvGuard {
+        prev: Option<String>,
+    }
+
+    impl StateDirEnvGuard {
+        fn set(value: &Path) -> Self {
+            let prev = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
+            // SAFETY: caller holds STATE_DIR_ENV_LOCK; this serializes env
+            // mutations against other tests in the lock's scope.
+            unsafe {
+                std::env::set_var("DOT_AGENT_DECK_STATE_DIR", value);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for StateDirEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still under the same lock for the lifetime of the
+            // test that owns this guard; restoring previous state.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
+                    None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+                }
+            }
+        }
+    }
+
+    /// RAII guard for `DOT_AGENT_DECK_VIA_DAEMON`. Same pattern as
+    /// [`StateDirEnvGuard`]; tests exercising [`via_daemon_enabled`] hold
+    /// the state-dir lock since this env-var is also process-global.
+    struct ViaDaemonEnvGuard {
+        prev: Option<String>,
+    }
+
+    impl ViaDaemonEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let prev = std::env::var(DOT_AGENT_DECK_VIA_DAEMON).ok();
+            // SAFETY: caller holds STATE_DIR_ENV_LOCK.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, v),
+                    None => std::env::remove_var(DOT_AGENT_DECK_VIA_DAEMON),
+                }
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for ViaDaemonEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still under the same lock for the lifetime of the
+            // test that owns this guard; restoring previous state.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, v),
+                    None => std::env::remove_var(DOT_AGENT_DECK_VIA_DAEMON),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn via_daemon_enabled_recognizes_truthy_values() {
+        let _g = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for v in ["1", "true", "TRUE", "yes", "Yes"] {
+            let _env = ViaDaemonEnvGuard::set(Some(v));
+            assert!(via_daemon_enabled(), "{v:?} should be truthy");
+        }
+    }
+
+    #[test]
+    fn via_daemon_enabled_rejects_falsy_and_unset() {
+        let _g = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _env = ViaDaemonEnvGuard::set(None);
+        assert!(
+            !via_daemon_enabled(),
+            "unset DOT_AGENT_DECK_VIA_DAEMON must select the in-process daemon path"
+        );
+        for v in ["0", "false", "no", "", "maybe"] {
+            let _env = ViaDaemonEnvGuard::set(Some(v));
+            assert!(!via_daemon_enabled(), "{v:?} should be falsy");
+        }
+    }
+
+    // The three tests below hold `STATE_DIR_ENV_LOCK` across an `.await`.
+    // That trips clippy's `await_holding_lock` — but this is exactly the
+    // intended use: the env var that `state_dir()` reads is process-global,
+    // and `ensure_external_daemon_or_die` reads it during the call (which
+    // is itself an awaitable future). Releasing the lock before awaiting
+    // would let a parallel test mutate the env var mid-call. Allow the lint
+    // for the test fns and document why.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn external_daemon_or_die_short_circuits_on_trusted_socket() {
+        // Pre-existing trusted socket: no spawn happens. We verify by
+        // observing that the call returns Ok within the poll window —
+        // ensure_daemon_running's first lock-then-check sees the socket and
+        // skips spawn_fn entirely (which in production would fork-exec
+        // `dot-agent-deck daemon serve` — invoking that from inside a unit
+        // test is exactly what this short-circuit avoids).
+        let _g = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = race_safe_tempdir();
+        let _state_env = StateDirEnvGuard::set(dir.path());
+        let sock = dir.path().join("attach.sock");
+        let _listener = bind_trusted_socket(&sock);
+
+        ensure_external_daemon_or_die(&sock)
+            .await
+            .expect("trusted pre-existing socket should pass without invoking the spawn path");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn external_daemon_or_die_rejects_untrusted_regular_file() {
+        // Same setup as the previous test but the path is a regular file —
+        // the trust check must fire BEFORE any spawn is attempted (a
+        // pre-existing file at the attach path means the lock-then-check
+        // branch runs first), and there must be no in-process fallback.
+        let _g = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = race_safe_tempdir();
+        let _state_env = StateDirEnvGuard::set(dir.path());
+        let sock = dir.path().join("attach.sock");
+        std::fs::write(&sock, b"").unwrap();
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let err = ensure_external_daemon_or_die(&sock)
+            .await
+            .expect_err("regular file at attach path must be rejected");
+        match err {
+            AttachError::SocketUntrusted { path, reason } => {
+                assert_eq!(path, sock);
+                assert!(
+                    reason.contains("not a Unix domain socket"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn external_daemon_or_die_rejects_wrong_mode_socket() {
+        let _g = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = race_safe_tempdir();
+        let _state_env = StateDirEnvGuard::set(dir.path());
+        let sock = dir.path().join("attach.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // Too-permissive mode — same-uid attacker scenario.
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = ensure_external_daemon_or_die(&sock)
+            .await
+            .expect_err("0o644 socket at attach path must be rejected");
+        match err {
+            AttachError::SocketUntrusted { path, reason } => {
+                assert_eq!(path, sock);
+                assert!(reason.contains("mode"), "unexpected reason: {reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_state_dir_is_race_safe() {
+        // CodeRabbit P2 on PR #95: `prepare_state_dir` runs before
+        // `spawn.lock` is acquired, so concurrent first-time callers can
+        // race on `create_dir`. With `DirBuilder::recursive(true)` the
+        // stdlib treats `AlreadyExists` as success when the existing path
+        // is a directory, so every racer should observe `Ok(())`.
+        //
+        // The Barrier forces all eight threads to arrive at the call site
+        // together — without it the threads can serialize on `spawn` /
+        // OS scheduling latency and the test passes by luck rather than
+        // demonstrating concurrent contention.
+        let dir = race_safe_tempdir();
+        let target = Arc::new(dir.path().join("state"));
+        assert!(
+            !target.exists(),
+            "precondition: state_dir must not exist before the race"
+        );
+
+        const RACERS: usize = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(RACERS));
+        let mut handles = Vec::new();
+        for _ in 0..RACERS {
+            let target = target.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                prepare_state_dir(&target)
+            }));
+        }
+        for h in handles {
+            h.join()
+                .expect("worker thread panicked")
+                .expect("prepare_state_dir must return Ok for every concurrent caller");
+        }
+
+        assert!(
+            target.is_dir(),
+            "state_dir must exist as a directory after the race"
+        );
+        let mode = std::fs::metadata(&*target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "freshly-created state_dir must be 0o700, got {mode:o}"
+        );
+    }
+
+    #[test]
+    fn prepare_state_dir_repairs_loose_mode() {
+        // `DirBuilder::mode(0o700)` only applies when the call actually
+        // creates the directory. A pre-existing state_dir at 0o755 (stale
+        // install, prior misconfigured run) would otherwise slip through
+        // the idempotent create with its loose mode intact. Verify the
+        // unconditional `set_permissions(0o700)` on the success path
+        // tightens it back down.
+        let dir = race_safe_tempdir();
+        let target = dir.path().join("state");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pre_mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            pre_mode, 0o755,
+            "precondition: pre-existing state_dir must be at 0o755"
+        );
+
+        prepare_state_dir(&target).expect("prepare_state_dir must succeed against existing dir");
+
+        let post_mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            post_mode, 0o700,
+            "prepare_state_dir must repair a loose-mode pre-existing state_dir to 0o700, got {post_mode:o}"
+        );
+    }
+}
