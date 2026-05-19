@@ -7601,7 +7601,7 @@ mod tests {
     // `AgentRecord.agent_type` through `insert_placeholder_session`), the
     // card renders as a real session.
     //
-    // Wire-format and AppState-side coverage live in `tests/m2_rehydration.rs`
+    // Wire-format and AppState-side coverage live in `tests/rehydration.rs`
     // (`hydrate_preserves_agent_type_end_to_end` + its OpenCode counterpart).
     // These two tests pin the render side specifically so a future change to
     // the gate, the placeholder copy, or the agent-type field can't silently
@@ -8173,7 +8173,7 @@ mod tests {
     // the residual handler responsibilities: clearing rename_text
     // and returning to Normal mode. The full commit pathway (handler
     // → controller → UI maps) is covered by
-    // `tests/m2_agent_metadata.rs::rename_outcome_*` and
+    // `tests/agent_metadata.rs::rename_outcome_*` and
     // `rename_pane_*_on_local_backend` in this crate.
     #[test]
     fn test_rename_handler_clears_buffer_and_exits_on_enter() {
@@ -9732,7 +9732,7 @@ mod tests {
     //
     // These tests exercise the helper the dashboard Enter handler now
     // calls (`rename_commit_value`), not the daemon RPC. Together with
-    // the integration test in `tests/m2_agent_metadata.rs` they pin the
+    // the integration test in `tests/agent_metadata.rs` they pin the
     // full path: handler decides what to commit → forwards to
     // `PaneController::rename_pane` → controller maps empty/whitespace
     // to a daemon-side `None` clear (reviewer P1 clear-rename case,
@@ -9786,7 +9786,7 @@ mod tests {
     // tests pin the three outcome branches the dispatch loop now
     // relies on. Together with the controller-side outcome tests
     // in `src/embedded_pane.rs::rename_pane_*` and the daemon
-    // round-trip tests in `tests/m2_agent_metadata.rs`, they cover
+    // round-trip tests in `tests/agent_metadata.rs`, they cover
     // the full path: raw rename text → controller-resolved label
     // → UI map mirror.
     // -----------------------------------------------------------------------

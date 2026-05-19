@@ -13,7 +13,7 @@ The dot-agent-deck TUI is validated end-to-end by hand. Pane creation, status tr
 2. **Refactors are expensive.** Touching `state.rs`, `tab.rs`, `pane.rs`, `mode_manager.rs`, or `terminal_widget.rs` requires the author to manually reproduce a long checklist of flows. Confidence is a function of how patient the author is feeling.
 3. **The PR feedback loop is human-bottlenecked.** Reviewers cannot verify TUI behavior without checking out the branch and running it locally. CI runs are silent on the question "does this still render the dashboard correctly?"
 
-The two test files in `tests/` (`integration_test.rs`, `mode_integration_test.rs`, `m1_3_local_attach.rs`, etc.) cover protocol- and state-layer logic. They do not exercise a spawned binary, do not parse rendered screens, and do not run real agent CLIs.
+The two test files in `tests/` (`integration_test.rs`, `mode_integration_test.rs`, `local_attach.rs`, etc.) cover protocol- and state-layer logic. They do not exercise a spawned binary, do not parse rendered screens, and do not run real agent CLIs.
 
 ## Solution Overview
 

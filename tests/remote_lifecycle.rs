@@ -26,7 +26,7 @@ fn err_status(status: i32, stderr: &str) -> Result<SshOutput, SshError> {
 
 // ---------------------------------------------------------------------------
 // FakeSshExecutor — pops responses in FIFO order, records every call.
-// (Duplicated from `m2_2_remote_add.rs` — `tests/*.rs` are independent
+// (Duplicated from `remote_add.rs` — `tests/*.rs` are independent
 // crates, and a tiny duplication beats a `mod common` ceremony for two files.)
 // ---------------------------------------------------------------------------
 

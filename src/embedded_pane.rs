@@ -1953,7 +1953,7 @@ mod tests {
     // text updates pane.name to that string but does not touch any
     // daemon RPC (there is no daemon in LocalDeck). The daemon-side
     // clear path is exercised by the integration test in
-    // `tests/m2_agent_metadata.rs::rename_pane_with_empty_text_clears_daemon_display_name`.
+    // `tests/agent_metadata.rs::rename_pane_with_empty_text_clears_daemon_display_name`.
     // This unit test just pins that local rename does not error on an
     // empty string (would be a regression of the trait contract).
     #[test]

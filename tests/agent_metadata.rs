@@ -9,7 +9,7 @@
 //!     `cwd` from `AgentRecord` JSON.
 //!
 //! The harness reuses the in-process `AgentPtyRegistry` + `serve_attach`
-//! pattern from `m2_rehydration.rs` so the wire shape is exercised end
+//! pattern from `rehydration.rs` so the wire shape is exercised end
 //! to end via the real `daemon_client::DaemonClient`.
 
 #![cfg(unix)]

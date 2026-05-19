@@ -944,7 +944,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::sync::Mutex;
 
-    /// Same FIFO-canned-response pattern as `tests/m2_2_remote_add.rs`'s
+    /// Same FIFO-canned-response pattern as `tests/remote_add.rs`'s
     /// `FakeSshExecutor`, kept in-module so connect.rs's unit tests don't
     /// need a separate integration-test crate. We only mock the probe, not
     /// the spawn — `FakeConnectSpawner` covers that side.

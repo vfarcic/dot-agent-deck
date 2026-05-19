@@ -1,7 +1,7 @@
 //! PRD #76, M2.5 — three lifecycle paths for stream-backed panes:
 //!
 //! 1. **Stop** (`Ctrl+W` / `close_pane`): registry entry must be removed.
-//!    Already covered end-to-end in `m1_3_local_attach::close_pane_stops_agent_in_daemon`;
+//!    Already covered end-to-end in `local_attach::close_pane_stops_agent_in_daemon`;
 //!    re-asserted here as a focused regression test alongside the new
 //!    detach path so all three lifecycle modes live in one place.
 //! 2. **Detach** (`detach_pane` / quit-dialog "Detach"): registry entry
@@ -11,7 +11,7 @@
 //!    entry must survive; the daemon observes the implicit detach as
 //!    socket EOF, which intentionally does *not* bump `detach_count`.
 //!
-//! The harness mirrors `m1_3_local_attach`: an in-process attach server
+//! The harness mirrors `local_attach`: an in-process attach server
 //! bound to a tempdir socket, with a process-wide `BIND_LOCK` because
 //! `bind_attach_listener` flips the umask while binding.
 
@@ -187,7 +187,7 @@ async fn detach_pane_leaves_agent_running_and_emits_detach_frame() {
     );
 
     // Belt-and-suspenders: assert OS-level liveness, the same way
-    // `m1_3_local_attach::dropping_controller_detaches_but_agent_survives`
+    // `local_attach::dropping_controller_detaches_but_agent_survives`
     // catches the "registry entry survives but child was killed" inversion.
     let kill_rc = unsafe { libc::kill(pid as i32, 0) };
     assert_eq!(
