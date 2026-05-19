@@ -128,26 +128,41 @@ jobs:
           merge-multiple: true
       - name: Generate checksums
         run: task checksums
+      - name: Detect channel
+        id: channel
+        # Pre-release tags contain a SemVer pre-release suffix (e.g. `-alpha.0`,
+        # `-rc.1`). They route to a parallel `dot-agent-deck-beta` formula /
+        # manifest so stable users on `brew upgrade dot-agent-deck` never see
+        # them; opt-in via `brew install vfarcic/tap/dot-agent-deck-beta`.
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == *"-"* ]]; then
+            echo "name=dot-agent-deck-beta" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=dot-agent-deck" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.prepare.outputs.version }}
           name: v${{ needs.prepare.outputs.version }}
           body: ${{ needs.prepare.outputs.changelog }}
+          prerelease: ${{ steps.channel.outputs.prerelease }}
           files: |
             dist/dot-agent-deck-*
             dist/checksums.txt
           fail_on_unmatched_files: true
       - name: Generate Homebrew formula
-        run: task homebrew-formula VERSION=v${{ needs.prepare.outputs.version }}
+        run: task homebrew-formula VERSION=v${{ needs.prepare.outputs.version }} NAME=${{ steps.channel.outputs.name }}
       - name: Publish Homebrew formula
-        run: task homebrew-publish VERSION=v${{ needs.prepare.outputs.version }}
+        run: task homebrew-publish VERSION=v${{ needs.prepare.outputs.version }} NAME=${{ steps.channel.outputs.name }}
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
       - name: Generate Scoop manifest
-        run: task scoop-manifest VERSION=v${{ needs.prepare.outputs.version }}
+        run: task scoop-manifest VERSION=v${{ needs.prepare.outputs.version }} NAME=${{ steps.channel.outputs.name }}
       - name: Publish Scoop manifest
-        run: task scoop-publish VERSION=v${{ needs.prepare.outputs.version }}
+        run: task scoop-publish VERSION=v${{ needs.prepare.outputs.version }} NAME=${{ steps.channel.outputs.name }}
         env:
           SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
 

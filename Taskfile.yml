@@ -32,10 +32,13 @@ tasks:
       - shasum -a 256 dot-agent-deck-* > checksums.txt
 
   homebrew-formula:
-    desc: Generate Homebrew formula from release binaries
+    desc: Generate Homebrew formula from release binaries (NAME defaults to dot-agent-deck; pass NAME=dot-agent-deck-beta to publish a parallel pre-release formula)
     requires:
       vars: [VERSION]
     vars:
+      NAME: '{{.NAME | default "dot-agent-deck"}}'
+      CLASS_NAME:
+        sh: echo "{{.NAME | default "dot-agent-deck"}}" | awk -F'-' '{for(i=1;i<=NF;i++) printf "%s", toupper(substr($i,1,1)) substr($i,2)}'
       VERSION_NO_V:
         sh: echo "{{.VERSION}}" | sed 's/^v//'
       BASE_URL: https://github.com/vfarcic/dot-agent-deck/releases/download/{{.VERSION}}
@@ -57,8 +60,8 @@ tasks:
             exit 1
           fi
         done
-        cat > dist/dot-agent-deck.rb << 'FORMULA'
-        class DotAgentDeck < Formula
+        cat > dist/{{.NAME}}.rb << 'FORMULA'
+        class {{.CLASS_NAME}} < Formula
           desc "TUI dashboard for monitoring AI agent sessions"
           homepage "https://github.com/vfarcic/dot-agent-deck"
           version "{{.VERSION_NO_V}}"
@@ -85,20 +88,22 @@ tasks:
           end
 
           def install
-            bin.install Dir["dot-agent-deck-*"].first => "dot-agent-deck"
+            bin.install Dir["dot-agent-deck-*"].first => "{{.NAME}}"
           end
 
           test do
-            assert_match "dot-agent-deck", shell_output("#{bin}/dot-agent-deck --help")
+            assert_match "{{.NAME}}", shell_output("#{bin}/{{.NAME}} --help")
           end
         end
         FORMULA
-        sed -i.bak -e 's/^        //' dist/dot-agent-deck.rb && rm -f dist/dot-agent-deck.rb.bak
+        sed -i.bak -e 's/^        //' dist/{{.NAME}}.rb && rm -f dist/{{.NAME}}.rb.bak
 
   homebrew-publish:
-    desc: Push Homebrew formula to the tap repository
+    desc: Push Homebrew formula to the tap repository (NAME defaults to dot-agent-deck; pass NAME=dot-agent-deck-beta to update the parallel pre-release formula)
     requires:
       vars: [VERSION]
+    vars:
+      NAME: '{{.NAME | default "dot-agent-deck"}}'
     cmds:
       - |
         if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
@@ -110,18 +115,19 @@ tasks:
         cd "$WORK_DIR"
         git clone --quiet "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/vfarcic/homebrew-tap.git" .
         mkdir -p Formula
-        cp {{.TASKFILE_DIR}}/dist/dot-agent-deck.rb Formula/dot-agent-deck.rb
-        git add Formula/dot-agent-deck.rb
+        cp {{.TASKFILE_DIR}}/dist/{{.NAME}}.rb Formula/{{.NAME}}.rb
+        git add Formula/{{.NAME}}.rb
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        git diff --cached --quiet || git commit -m "Update dot-agent-deck formula to {{.VERSION}}"
+        git diff --cached --quiet || git commit -m "Update {{.NAME}} formula to {{.VERSION}}"
         git push origin main
 
   scoop-manifest:
-    desc: Generate Scoop manifest from release binaries
+    desc: Generate Scoop manifest from release binaries (NAME defaults to dot-agent-deck; pass NAME=dot-agent-deck-beta to publish a parallel pre-release manifest)
     requires:
       vars: [VERSION]
     vars:
+      NAME: '{{.NAME | default "dot-agent-deck"}}'
       VERSION_NO_V:
         sh: echo "{{.VERSION}}" | sed 's/^v//'
       BASE_URL: https://github.com/vfarcic/dot-agent-deck/releases/download/{{.VERSION}}
@@ -129,7 +135,7 @@ tasks:
         sh: grep 'dot-agent-deck-windows-amd64.exe$' dist/checksums.txt | awk '{print $1}'
     cmds:
       - |
-        cat > dist/dot-agent-deck.json << MANIFEST
+        cat > dist/{{.NAME}}.json << MANIFEST
         {
             "version": "{{.VERSION_NO_V}}",
             "description": "TUI dashboard for monitoring AI agent sessions",
@@ -141,7 +147,7 @@ tasks:
                     "hash": "{{.SHA_WINDOWS_AMD64}}"
                 }
             },
-            "bin": [["dot-agent-deck-windows-amd64.exe", "dot-agent-deck"]],
+            "bin": [["dot-agent-deck-windows-amd64.exe", "{{.NAME}}"]],
             "checkver": "github",
             "autoupdate": {
                 "architecture": {
@@ -152,12 +158,14 @@ tasks:
             }
         }
         MANIFEST
-        sed -i.bak -e 's/^        //' dist/dot-agent-deck.json && rm -f dist/dot-agent-deck.json.bak
+        sed -i.bak -e 's/^        //' dist/{{.NAME}}.json && rm -f dist/{{.NAME}}.json.bak
 
   scoop-publish:
-    desc: Push Scoop manifest to the bucket repository
+    desc: Push Scoop manifest to the bucket repository (NAME defaults to dot-agent-deck; pass NAME=dot-agent-deck-beta to update the parallel pre-release manifest)
     requires:
       vars: [VERSION]
+    vars:
+      NAME: '{{.NAME | default "dot-agent-deck"}}'
     cmds:
       - |
         if [ -z "$SCOOP_BUCKET_TOKEN" ]; then
@@ -168,9 +176,9 @@ tasks:
         trap 'rm -rf "$WORK_DIR"' EXIT
         cd "$WORK_DIR"
         git clone --quiet "https://x-access-token:$SCOOP_BUCKET_TOKEN@github.com/vfarcic/scoop-bucket.git" .
-        cp {{.TASKFILE_DIR}}/dist/dot-agent-deck.json dot-agent-deck.json
-        git add dot-agent-deck.json
+        cp {{.TASKFILE_DIR}}/dist/{{.NAME}}.json {{.NAME}}.json
+        git add {{.NAME}}.json
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        git diff --cached --quiet || git commit -m "Update dot-agent-deck manifest to {{.VERSION}}"
+        git diff --cached --quiet || git commit -m "Update {{.NAME}} manifest to {{.VERSION}}"
         git push origin main
