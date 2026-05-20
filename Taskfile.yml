@@ -39,6 +39,11 @@ tasks:
       NAME: '{{.NAME | default "dot-agent-deck"}}'
       CLASS_NAME:
         sh: echo "{{.NAME | default "dot-agent-deck"}}" | awk -F'-' '{for(i=1;i<=NF;i++) printf "%s", toupper(substr($i,1,1)) substr($i,2)}'
+      # Each channel declares conflicts_with the other channel's formula name
+      # so a user installing one is forced to uninstall the other. The invoked
+      # binary is always `dot-agent-deck` regardless of channel — no CLI surface
+      # divergence between stable and beta.
+      CONFLICTS_WITH: '{{if eq .NAME "dot-agent-deck-beta"}}dot-agent-deck{{else}}dot-agent-deck-beta{{end}}'
       VERSION_NO_V:
         sh: echo "{{.VERSION}}" | sed 's/^v//'
       BASE_URL: https://github.com/vfarcic/dot-agent-deck/releases/download/{{.VERSION}}
@@ -67,6 +72,9 @@ tasks:
           version "{{.VERSION_NO_V}}"
           license "MIT"
 
+          conflicts_with "{{.CONFLICTS_WITH}}",
+            because: "both install a `dot-agent-deck` binary; only one channel can be active at a time"
+
           on_macos do
             if Hardware::CPU.arm?
               url "{{.BASE_URL}}/dot-agent-deck-darwin-arm64"
@@ -88,11 +96,11 @@ tasks:
           end
 
           def install
-            bin.install Dir["dot-agent-deck-*"].first => "{{.NAME}}"
+            bin.install Dir["dot-agent-deck-*"].first => "dot-agent-deck"
           end
 
           test do
-            assert_match "{{.NAME}}", shell_output("#{bin}/{{.NAME}} --help")
+            assert_match "dot-agent-deck", shell_output("#{bin}/dot-agent-deck --help")
           end
         end
         FORMULA
@@ -147,7 +155,7 @@ tasks:
                     "hash": "{{.SHA_WINDOWS_AMD64}}"
                 }
             },
-            "bin": [["dot-agent-deck-windows-amd64.exe", "{{.NAME}}"]],
+            "bin": [["dot-agent-deck-windows-amd64.exe", "dot-agent-deck"]],
             "checkver": "github",
             "autoupdate": {
                 "architecture": {
