@@ -1253,10 +1253,13 @@ mod tests {
         // (PRD #76 M2.17 / M2.19 — the Event variant wraps the
         // legacy AgentEvent shape; the Delegate variant carries
         // orchestrator delegate signals across the external-daemon
-        // hop). Pin the round-trip for both variants here so a future
-        // structural change doesn't silently break wire compatibility
-        // for remote-mode TUIs.
-        use crate::event::{AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType};
+        // hop; the WorkDone variant carries worker completion
+        // signals back the same way). Pin the round-trip for all
+        // variants here so a future structural change doesn't
+        // silently break wire compatibility for remote-mode TUIs.
+        use crate::event::{
+            AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType, WorkDoneSignal,
+        };
         use chrono::Utc;
         use std::collections::HashMap;
 
@@ -1309,7 +1312,9 @@ mod tests {
                 assert_eq!(e.tool_name.as_deref(), Some("Read"));
                 assert_eq!(e.pane_id.as_deref(), Some("7"));
             }
-            BroadcastMsg::Delegate(_) => panic!("expected Event variant"),
+            BroadcastMsg::Delegate(_) | BroadcastMsg::WorkDone(_) => {
+                panic!("expected Event variant")
+            }
         }
 
         let signal = DelegateSignal {
@@ -1342,7 +1347,41 @@ mod tests {
                 assert_eq!(s.task, "implement X");
                 assert_eq!(s.to, vec!["coder".to_string(), "reviewer".to_string()]);
             }
-            BroadcastMsg::Event(_) => panic!("expected Delegate variant"),
+            BroadcastMsg::Event(_) | BroadcastMsg::WorkDone(_) => {
+                panic!("expected Delegate variant")
+            }
+        }
+
+        let signal = WorkDoneSignal {
+            pane_id: "worker-9".into(),
+            task: "implemented X".into(),
+            done: false,
+            timestamp: Utc::now(),
+        };
+        let payload = serde_json::to_vec(&BroadcastMsg::WorkDone(signal)).unwrap();
+
+        // Wire-shape pin for the WorkDone variant: same hop as Delegate.
+        let wire: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(wire["kind"], "work_done");
+        assert_eq!(wire["pane_id"], "worker-9");
+        assert_eq!(wire["task"], "implemented X");
+        assert_eq!(wire["done"], false);
+        assert!(wire["timestamp"].is_string());
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_frame(&mut buf, KIND_EVENT, &payload).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let (_, body) = read_frame(&mut cursor).await.unwrap().unwrap();
+        let back: BroadcastMsg = serde_json::from_slice(&body).unwrap();
+        match back {
+            BroadcastMsg::WorkDone(s) => {
+                assert_eq!(s.pane_id, "worker-9");
+                assert_eq!(s.task, "implemented X");
+                assert!(!s.done);
+            }
+            BroadcastMsg::Event(_) | BroadcastMsg::Delegate(_) => {
+                panic!("expected WorkDone variant")
+            }
         }
     }
 

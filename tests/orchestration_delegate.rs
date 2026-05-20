@@ -38,7 +38,7 @@ use tokio::task::JoinHandle;
 
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::DaemonClient;
-use dot_agent_deck::event::{BroadcastMsg, DaemonMessage, DelegateSignal};
+use dot_agent_deck::event::{BroadcastMsg, DaemonMessage, DelegateSignal, WorkDoneSignal};
 use dot_agent_deck::state::AppState;
 
 static HARNESS_BIND_LOCK: Mutex<()> = Mutex::new(());
@@ -102,6 +102,15 @@ async fn send_delegate(hook_path: &PathBuf, signal: &DelegateSignal) {
     stream.shutdown().await.unwrap();
 }
 
+async fn send_work_done(hook_path: &PathBuf, signal: &WorkDoneSignal) {
+    let mut stream = UnixStream::connect(hook_path).await.expect("connect hook");
+    let msg = DaemonMessage::WorkDone(signal.clone());
+    let mut json = serde_json::to_vec(&msg).unwrap();
+    json.push(b'\n');
+    stream.write_all(&json).await.unwrap();
+    stream.shutdown().await.unwrap();
+}
+
 /// Full chain: orchestrator's delegate JSON → daemon hook loop →
 /// broadcast → attached TUI subscriber → TUI-side `AppState`.
 #[tokio::test]
@@ -134,6 +143,9 @@ async fn delegate_signal_round_trips_to_attached_appstate() {
                 }
                 BroadcastMsg::Delegate(signal) => {
                     state_for_task.write().await.handle_delegate(signal);
+                }
+                BroadcastMsg::WorkDone(signal) => {
+                    state_for_task.write().await.handle_work_done(signal);
                 }
             }
         }
@@ -216,6 +228,88 @@ async fn delegate_signal_from_non_orchestrator_is_dropped() {
         s.delegate_events.is_empty(),
         "non-orchestrator delegate must not enqueue"
     );
+
+    forwarder.abort();
+}
+
+/// Symmetric regression guard for the `work-done` direction. Same shape
+/// of bug as the delegate variant above: `dot-agent-deck work-done` from
+/// a worker pane sent a `WorkDoneSignal` to the daemon hook socket, but
+/// in external-daemon mode the daemon's `pane_role_map` / `pane_cwd_map`
+/// are empty (the TUI owns them), so `state.handle_work_done` rejected
+/// every signal as "work-done from unknown pane" and the orchestrator
+/// pane never got the feedback message. Mirrors `Delegate` by adding a
+/// `BroadcastMsg::WorkDone` hop that the TUI-side subscriber re-applies
+/// against the real state.
+#[tokio::test]
+async fn work_done_signal_round_trips_to_attached_appstate() {
+    let daemon = spawn_daemon().await;
+
+    // TUI-side state: the worker pane is registered with its role and cwd
+    // so the TUI's `handle_work_done` can resolve role → summary file.
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let tui_state = Arc::new(RwLock::new(AppState::default()));
+    {
+        let mut st = tui_state.write().await;
+        st.register_pane("coder-pane".into());
+        st.pane_role_map.insert("coder-pane".into(), "coder".into());
+        st.pane_cwd_map.insert(
+            "coder-pane".into(),
+            cwd_dir.path().to_string_lossy().into_owned(),
+        );
+    }
+
+    let client = DaemonClient::new(daemon.attach_path.clone());
+    let mut sub = client.subscribe_events().await.expect("subscribe ok");
+
+    let state_for_task = tui_state.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Ok(Some(msg)) = sub.next_event().await {
+            if let BroadcastMsg::WorkDone(signal) = msg {
+                state_for_task.write().await.handle_work_done(signal);
+            }
+        }
+    });
+
+    send_work_done(
+        &daemon.hook_path,
+        &WorkDoneSignal {
+            pane_id: "coder-pane".into(),
+            task: "implemented the auth module".into(),
+            done: false,
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw = false;
+    while tokio::time::Instant::now() < deadline {
+        let s = tui_state.read().await;
+        if let Some(received) = s.work_done_events.first() {
+            assert_eq!(received.pane_id, "coder-pane");
+            assert_eq!(received.task, "implemented the auth module");
+            assert!(!received.done);
+            saw = true;
+            break;
+        }
+        drop(s);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        saw,
+        "expected WorkDoneSignal to reach the TUI's AppState via subscribe_events"
+    );
+
+    // Summary file is the user-visible side effect — the feedback
+    // message pointing the orchestrator at it would be dead without it.
+    let summary = cwd_dir.path().join(".dot-agent-deck/work-done-coder.md");
+    assert!(
+        summary.exists(),
+        "work-done-coder.md must be written to the worker's cwd"
+    );
+    let body = std::fs::read_to_string(&summary).unwrap();
+    assert_eq!(body, "implemented the auth module");
 
     forwarder.abort();
 }

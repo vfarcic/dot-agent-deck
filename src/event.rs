@@ -118,6 +118,13 @@ pub enum BroadcastMsg {
     /// An orchestrator's delegate signal (M2.19).
     #[serde(rename = "delegate")]
     Delegate(DelegateSignal),
+    /// A worker's work-done signal (or orchestrator's `--done`). Same
+    /// rationale as `Delegate`: in external-daemon mode the daemon's
+    /// `pane_role_map` / `pane_cwd_map` are empty, so the daemon can't
+    /// resolve the role or write the summary file. The TUI-side
+    /// subscriber re-applies the signal against the real state.
+    #[serde(rename = "work_done")]
+    WorkDone(WorkDoneSignal),
 }
 
 /// Signal sent by a worker via `dot-agent-deck work-done`.

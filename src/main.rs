@@ -681,6 +681,10 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
 ///   validate delegate signals in external-daemon mode (its own
 ///   `pane_role_map` is empty); the TUI re-runs the orchestrator-role
 ///   guard against its own role map before enqueueing.
+/// - [`BroadcastMsg::WorkDone`] → `handle_work_done`. Same reason: the
+///   daemon can't resolve the role or write `.dot-agent-deck/work-done-
+///   {role}.md` in external mode, so the TUI re-applies the signal
+///   against its own state and feeds the orchestrator pane.
 ///
 /// Reconnects with a small backoff on transport errors so a daemon
 /// restart or a `KIND_STREAM_END "lagged"` tear-down recovers
@@ -711,6 +715,9 @@ fn spawn_event_subscriber(
                             }
                             Ok(Some(BroadcastMsg::Delegate(signal))) => {
                                 state.write().await.handle_delegate(signal);
+                            }
+                            Ok(Some(BroadcastMsg::WorkDone(signal))) => {
+                                state.write().await.handle_work_done(signal);
                             }
                             Ok(None) => break,
                             Err(e) => {

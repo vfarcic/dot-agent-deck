@@ -458,7 +458,27 @@ async fn run_hook_loop(
                                         done = signal.done,
                                         "Received work-done signal"
                                     );
-                                    state.write().await.handle_work_done(signal);
+                                    // Same external-vs-in-process split as
+                                    // Delegate above: the daemon's local
+                                    // `pane_role_map` / `pane_cwd_map` are
+                                    // empty in external mode, so the TUI has
+                                    // to be the one running `handle_work_done`
+                                    // (resolves role, writes summary file,
+                                    // enqueues feedback for the orchestrator
+                                    // pane).
+                                    if is_external_mode {
+                                        if event_tx
+                                            .send(BroadcastMsg::WorkDone(signal.clone()))
+                                            .is_err()
+                                        {
+                                            warn!(
+                                                pane_id = %signal.pane_id,
+                                                "work-done dropped: no attached TUI subscribers (reconnect race?)"
+                                            );
+                                        }
+                                    } else {
+                                        state.write().await.handle_work_done(signal);
+                                    }
                                 }
                             }
                         } else if let Ok(event) = serde_json::from_str::<AgentEvent>(&line) {
