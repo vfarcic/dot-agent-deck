@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::agent_pty::DOT_AGENT_DECK_VIA_DAEMON;
+use crate::agent_pty::{DOT_AGENT_DECK_LOCAL_DAEMON, DOT_AGENT_DECK_VIA_DAEMON};
 use crate::config::state_dir;
 
 /// Errors surfaced by the lazy-spawn machinery. The CLI handler renders
@@ -351,15 +351,42 @@ pub fn spawn_daemon_serve_detached_with_exe(state_dir: &Path, exe: &Path) -> std
 }
 
 /// Returns true if `DOT_AGENT_DECK_VIA_DAEMON` is set to a truthy value
-/// (`1`, `true`, `yes`, case-insensitive). The TUI bootstrap branches on this
-/// to decide between in-process daemon (false) and lazy-spawn-an-external
-/// one (true). Centralized here so the test that asserts the unset case
-/// doesn't duplicate the parsing rule that lives in production.
+/// (`1`, `true`, `yes`, case-insensitive). Pre-PRD-93 this controlled the
+/// in-process-vs-external decision directly; now (PRD #93 M1.1) the default
+/// is "external," and this helper exists only to recognize the historical
+/// opt-in spelling. Kept because `connect.rs` still injects
+/// `DOT_AGENT_DECK_VIA_DAEMON=1` over `ssh -t` for the remote bootstrap (a
+/// no-op against the new default but harmless), and a few tests still drive
+/// the parser directly.
 pub fn via_daemon_enabled() -> bool {
     std::env::var(DOT_AGENT_DECK_VIA_DAEMON)
         .ok()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
+}
+
+/// PRD #93 M1.1: returns `true` when the TUI should connect to (or
+/// auto-spawn) an external daemon. The default is `true` — every fresh
+/// `dot-agent-deck` invocation auto-spawns a per-user daemon over the
+/// `attach_socket_path()` Unix socket unless explicitly opted out.
+///
+/// The opt-out lever is `DOT_AGENT_DECK_LOCAL_DAEMON` set to a truthy value
+/// (`1`/`true`/`yes`). Phase 2 of the PRD removes the in-process path
+/// entirely; until then this lever exists so tests and any caller that
+/// hits an external-daemon edge case can fall back to the legacy in-process
+/// `Daemon::with_attach_in_process` path. `DOT_AGENT_DECK_VIA_DAEMON=1` is
+/// still honored as a *positive* signal (legacy connect bootstrap), but it
+/// no longer matters in the unset case — the new default already selects
+/// external.
+pub fn use_external_daemon() -> bool {
+    // Explicit opt-out wins over both the default and the legacy opt-in,
+    // so a developer who already has DOT_AGENT_DECK_VIA_DAEMON set in their
+    // shell can still drop back to the in-process path for debugging.
+    let local = std::env::var(DOT_AGENT_DECK_LOCAL_DAEMON)
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    !local
 }
 
 /// M2.8 TUI bootstrap entry point. When the dashboard is invoked with

@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
-use dot_agent_deck::daemon_attach::{ensure_external_daemon_or_die, via_daemon_enabled};
+use dot_agent_deck::daemon_attach::{ensure_external_daemon_or_die, use_external_daemon};
 use dot_agent_deck::daemon_client::DaemonClient;
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::hook::handle_hook;
@@ -561,28 +561,30 @@ fn init_logging_from_env() {
 }
 
 /// The TUI body extracted from `run_dashboard` so `connect` can reuse it.
-/// Reads `DOT_AGENT_DECK_VIA_DAEMON` + `DOT_AGENT_DECK_ATTACH_SOCKET` to
-/// decide whether to spawn an in-process daemon (false) or lazy-spawn-and-
-/// attach to an external one (true, the M2.8 behavior). The `connect`
-/// subcommand will set both env vars in M2.9 so the TUI runs against the
-/// remote daemon over `ssh -t`.
+/// PRD #93 M1.1: the external-daemon path is now the default. Every fresh
+/// `dot-agent-deck` invocation lazy-spawns a per-user daemon on the
+/// `attach_socket_path()` Unix socket and attaches to it via the same
+/// protocol the remote-mode `connect` flow uses. Setting
+/// `DOT_AGENT_DECK_LOCAL_DAEMON=1` keeps the legacy in-process daemon path
+/// alive as an escape hatch until Phase 2 removes it.
 ///
 /// Returns `ExitCode::FAILURE` when the external-daemon bootstrap fails
 /// (spawn error, start timeout, or trust-check rejection). Successful TUI
 /// runs return `ExitCode::SUCCESS` — including TUI-task errors, which are
-/// already surfaced to stderr (matching the pre-M2.8 behavior).
+/// already surfaced to stderr (matching the pre-PRD-93 behavior).
 async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> ExitCode {
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();
     let attach_path = attach_socket_path();
 
-    // PRD #76, M2.8: lazy-spawn-on-attach for the external-daemon code path.
-    // When DOT_AGENT_DECK_VIA_DAEMON=1, ensure_external_daemon_or_die fork-
-    // execs `dot-agent-deck daemon serve` detached if the attach socket is
-    // absent, and trust-checks any existing socket (uid + 0o600 + is-socket)
-    // before the TUI's DaemonClient touches it. No in-process fallback —
-    // failures are reported and the dashboard exits nonzero.
-    let via_daemon = via_daemon_enabled();
+    // PRD #93 M1.1: default to the external-daemon path. If the attach
+    // socket is missing, `ensure_external_daemon_or_die` fork-execs
+    // `dot-agent-deck daemon serve` detached under flock-serialized
+    // contention (so two simultaneous TUIs can't both win the bind — M1.3)
+    // and trust-checks any existing socket (uid + 0o600 + is-socket) before
+    // the TUI's DaemonClient touches it. `DOT_AGENT_DECK_LOCAL_DAEMON=1`
+    // selects the legacy in-process daemon path instead.
+    let via_daemon = use_external_daemon();
 
     let daemon_handle = if via_daemon {
         if let Err(e) = ensure_external_daemon_or_die(&attach_path).await {

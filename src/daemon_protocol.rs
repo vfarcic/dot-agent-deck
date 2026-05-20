@@ -436,12 +436,47 @@ pub async fn serve_attach(
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> io::Result<()> {
+    // Discard counter so callers that don't care don't need to construct one.
+    // The daemon's idle-shutdown path uses [`serve_attach_with_counter`].
+    let dummy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    serve_attach_with_counter(listener, registry, event_tx, dummy).await
+}
+
+/// PRD #93 M1.2 variant of [`serve_attach`] that maintains `client_count`
+/// across the lifetime of each accepted connection. The daemon's idle
+/// monitor reads this count alongside the PTY registry size to decide when
+/// the daemon may exit (both must be zero for the configured idle window).
+///
+/// The counter is incremented immediately after `accept` returns and
+/// decremented in the per-connection task's exit branch (panic or not — the
+/// `tokio::spawn` future is wrapped so the decrement always runs).
+pub async fn serve_attach_with_counter(
+    listener: UnixListener,
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    client_count: Arc<std::sync::atomic::AtomicUsize>,
+) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let registry = registry.clone();
                 let event_tx = event_tx.clone();
+                let counter = client_count.clone();
                 tokio::spawn(async move {
+                    // RAII guard: increments on creation, decrements on drop,
+                    // so a `handle_connection` task that panics or is dropped
+                    // still releases its slot in the client count. Without
+                    // the guard, an unwinding task would leak a slot and
+                    // keep the daemon alive past the idle threshold.
+                    struct ClientGuard(Arc<std::sync::atomic::AtomicUsize>);
+                    impl Drop for ClientGuard {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _guard = ClientGuard(counter.clone());
                     if let Err(e) = handle_connection(stream, registry, event_tx).await {
                         warn!("attach protocol connection error: {e}");
                     }
@@ -466,6 +501,20 @@ pub async fn run_attach_server(
     let listener = bind_attach_listener(path)?;
     info!("Attach protocol listening on {}", path.display());
     serve_attach(listener, registry, event_tx).await
+}
+
+/// PRD #93 M1.2 counter-aware sibling of [`run_attach_server`]. The daemon
+/// loop uses this so the idle monitor sees attached-client transitions in
+/// real time.
+pub async fn run_attach_server_with_counter(
+    path: &Path,
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    client_count: Arc<std::sync::atomic::AtomicUsize>,
+) -> io::Result<()> {
+    let listener = bind_attach_listener(path)?;
+    info!("Attach protocol listening on {}", path.display());
+    serve_attach_with_counter(listener, registry, event_tx, client_count).await
 }
 
 async fn handle_connection(

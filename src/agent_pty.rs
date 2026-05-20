@@ -23,6 +23,22 @@ use crate::event::AgentType;
 /// this constant so two string literals can't drift apart.
 pub const DOT_AGENT_DECK_VIA_DAEMON: &str = "DOT_AGENT_DECK_VIA_DAEMON";
 
+/// PRD #93 M1.1 opt-out flag: when set to a truthy value
+/// (`1`/`true`/`yes`), the TUI runs the legacy in-process daemon instead of
+/// the (now-default) external auto-spawned daemon. Exists as an escape hatch
+/// for tests and any caller that needs the historical local-mode behavior
+/// while Phase 2 is still in progress. Defined here so the read site
+/// (in `daemon_attach::use_external_daemon`) and the scrub site
+/// (in [`spawn`] below) share one constant.
+pub const DOT_AGENT_DECK_LOCAL_DAEMON: &str = "DOT_AGENT_DECK_LOCAL_DAEMON";
+
+/// PRD #93 M1.2 idle-shutdown override: when set to a non-negative integer,
+/// the daemon exits N seconds after the last attached client disconnects
+/// *and* no managed agents remain. `0` disables the timer (matching the
+/// pre-PRD-93 "stay up forever" behavior). Defaults to
+/// [`crate::daemon::DEFAULT_IDLE_SHUTDOWN_SECS`] when unset or unparseable.
+pub const DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS: &str = "DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS";
+
 /// Per-pane id the TUI injects into agent children so hooks running inside
 /// the agent (or anything that shells out via `dot-agent-deck`) can route
 /// events back to the originating pane. Defined here for the same
@@ -439,6 +455,12 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     //     pane-id would tag every spawned agent with the wrong pane.
     cmd.env_remove(DOT_AGENT_DECK_VIA_DAEMON);
     cmd.env_remove(DOT_AGENT_DECK_PANE_ID);
+    // PRD #93 escape-hatch / tuning env vars: same scrub rationale — a deck
+    // launched with these set would otherwise leak them into every child it
+    // spawns, where they're meaningless and (for LOCAL_DAEMON) would push a
+    // nested `dot-agent-deck` invocation onto the wrong daemon path.
+    cmd.env_remove(DOT_AGENT_DECK_LOCAL_DAEMON);
+    cmd.env_remove(DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS);
 
     for (k, v) in &opts.env {
         cmd.env(k, v);
