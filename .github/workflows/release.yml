@@ -53,6 +53,10 @@ jobs:
           git add CHANGELOG.md changelog.d/
           git stash
           git checkout main
+          # Sync local main to remote before re-applying our changes so the
+          # push at the end fast-forwards cleanly even if main advanced between
+          # checkout and this step (e.g. a parallel push).
+          git pull --rebase --autostash origin main
           git stash pop || true
           git add CHANGELOG.md changelog.d/
           git diff --cached --quiet || git commit -m "docs: update changelog for v${{ steps.version.outputs.version }}"
@@ -130,12 +134,18 @@ jobs:
         run: task checksums
       - name: Detect channel
         id: channel
-        # Pre-release tags contain a SemVer pre-release suffix (e.g. `-alpha.0`,
-        # `-rc.1`). They route to a parallel `dot-agent-deck-beta` formula /
-        # manifest so stable users on `brew upgrade dot-agent-deck` never see
-        # them; opt-in via `brew install vfarcic/tap/dot-agent-deck-beta`.
+        # Pre-release versions carry a SemVer pre-release suffix (e.g.
+        # `-alpha.0`, `-rc.1`). They route to a parallel `dot-agent-deck-beta`
+        # formula / manifest so stable users on `brew upgrade dot-agent-deck`
+        # never see them; opt-in via `brew install vfarcic/tap/dot-agent-deck-beta`.
+        #
+        # Read from prepare.outputs.version (not GITHUB_REF_NAME) so the
+        # discriminator works for both tag-push and workflow_dispatch triggers:
+        # on workflow_dispatch GITHUB_REF_NAME is the branch ('main'), which
+        # would mask any pre-release input and wrongly publish to stable.
         run: |
-          if [[ "${GITHUB_REF_NAME}" == *"-"* ]]; then
+          VERSION="${{ needs.prepare.outputs.version }}"
+          if [[ "${VERSION}" == *"-"* ]]; then
             echo "name=dot-agent-deck-beta" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
           else
@@ -209,6 +219,11 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git stash
           git checkout main
+          # The `finalize` job has already pushed a changelog commit to main,
+          # so origin/main is ahead of the SHA `actions/checkout` resolved at
+          # workflow start. Sync local main to remote before re-applying our
+          # changes so the push at the end fast-forwards cleanly.
+          git pull --rebase --autostash origin main
           git stash pop || true
           git add site/helm/Chart.yaml site/helm/values.yaml
           git diff --cached --quiet || git commit -m "chore: update docs chart to v${{ needs.prepare.outputs.version }} [skip ci]"
