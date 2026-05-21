@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -40,198 +39,18 @@ pub fn idle_shutdown_from_env() -> Option<Duration> {
     }
 }
 
-/// Daemon-wide broadcast capacity for `BroadcastMsg`s forwarded to attached
-/// TUIs (PRD #76 M2.17 / M2.19). Generous so a slow client doesn't drop
-/// events during a normal burst; a subscriber that falls further behind
-/// than this is signalled via `RecvError::Lagged` and the per-connection
-/// forwarder drops the connection (the TUI reconnects).
+/// Daemon-wide broadcast capacity for hook-event `BroadcastMsg`s forwarded
+/// to attached TUIs (PRD #76 M2.17). Generous so a slow client doesn't
+/// drop events during a normal burst; a subscriber that falls further
+/// behind than this is signalled via `RecvError::Lagged` and the
+/// per-connection forwarder drops the connection (the TUI reconnects).
+///
+/// PRD #93 round-5: only hook events ride this channel now —
+/// orchestration signals (delegate / work-done) bypass it entirely by
+/// being written directly into the target pane's PTY. The previous
+/// `PendingBroadcasts` replay buffer, salvage loop, and test gate are
+/// gone; the PTY scrollback is the journal.
 const EVENT_BROADCAST_CAPACITY: usize = 1024;
-
-/// Maximum number of `BroadcastMsg`s the daemon keeps in [`PendingBroadcasts`]
-/// while no TUI is attached. Bounds the worst-case memory cost of a runaway
-/// worker (or an orchestrator firing many delegates) during a detach window.
-/// Beyond this, the oldest entries are evicted — the alternative (unbounded
-/// growth) would let a single misbehaving pane balloon daemon memory.
-const PENDING_BROADCAST_CAP: usize = 256;
-
-/// Static variant name for a `BroadcastMsg`. Used in eviction logs so an
-/// operator who sees the buffer overflow warning can tell at a glance
-/// whether a Delegate signal, a WorkDone, or an Event was dropped without
-/// having to parse the structured `Debug` impl. Cheap (`&'static str`),
-/// matches the names used in the wire-format `#[serde(rename = ...)]`.
-fn broadcast_variant_name(msg: &BroadcastMsg) -> &'static str {
-    match msg {
-        BroadcastMsg::Event(_) => "event",
-        BroadcastMsg::Delegate(_) => "delegate",
-        BroadcastMsg::WorkDone(_) => "work_done",
-    }
-}
-
-/// PRD #93 round-3 test instrumentation: pause point inside
-/// [`crate::daemon_protocol::handle_subscribe_events`] between the main
-/// select loop break and the receiver salvage step. Production code
-/// never installs this; the regression test for the detach-race salvage
-/// path drives the race against `broadcast::send` deterministically by
-/// installing a gate, waiting until `reached` fires (the handler is
-/// parked between loop-break and salvage), pushing a message into the
-/// dying rx via the hook socket, then signalling `proceed` so the
-/// handler runs salvage with the buffered message still in rx.
-///
-/// Exposed unconditionally (rather than `#[cfg(test)]`) because
-/// integration tests under `tests/` compile against the lib crate
-/// without the `test` cfg and need to install a gate. The production
-/// cost is one mutex acquire + `Option` check per subscribe-events
-/// disconnect — negligible.
-#[derive(Debug, Default)]
-#[doc(hidden)]
-pub struct SubscribeEventsTestGate {
-    /// Handler fires `notify_one` after the main loop breaks and before
-    /// salvage runs. The test awaits this to confirm rx is alive and no
-    /// longer being polled.
-    pub reached: Notify,
-    /// Test fires `notify_one` to release the handler into the salvage
-    /// step.
-    pub proceed: Notify,
-}
-
-/// Bounded replay buffer for orchestration `BroadcastMsg`s (Delegate /
-/// WorkDone) that arrived while no TUI was subscribed.
-///
-/// In external-daemon mode the daemon is a dumb pipe: it cannot validate
-/// these signals locally (no role map), so it forwards them to the
-/// attached TUI over the broadcast channel. When the user detaches the
-/// deck and a worker calls `dot-agent-deck delegate` or `work-done`,
-/// `broadcast::Sender::send` returns `Err` because zero subscribers
-/// exist — and without this buffer the signal is silently lost forever.
-///
-/// We record only on send-Err (so a normally-connected subscriber never
-/// sees a duplicate), and drain on the next [`AttachRequest::SubscribeEvents`]
-/// connection before joining the live stream.
-///
-/// Events (`BroadcastMsg::Event`) are **not** buffered: the event stream
-/// is continuous and the TUI's `apply_event` already tolerates loss on a
-/// reconnect (it pulls a fresh `list_agents` snapshot to rebuild state).
-/// Buffering events would also balloon memory unboundedly on a busy
-/// project — orchestration signals are the rare, irreplaceable case.
-#[derive(Debug, Default)]
-pub struct PendingBroadcasts {
-    inner: Mutex<VecDeque<BroadcastMsg>>,
-    /// PRD #93 round-3 test instrumentation; production code never sets
-    /// this. See [`SubscribeEventsTestGate`].
-    subscribe_events_test_gate: Mutex<Option<Arc<SubscribeEventsTestGate>>>,
-}
-
-impl PendingBroadcasts {
-    /// Empty buffer with capacity reserved up to [`PENDING_BROADCAST_CAP`].
-    pub fn new() -> Self {
-        Self {
-            inner: Mutex::new(VecDeque::with_capacity(PENDING_BROADCAST_CAP)),
-            subscribe_events_test_gate: Mutex::new(None),
-        }
-    }
-
-    /// PRD #93 round-3 test instrumentation; production code never calls
-    /// this. Install a gate that the subscribe-events handler awaits on
-    /// between its main loop break and the receiver salvage step. See
-    /// [`SubscribeEventsTestGate`].
-    #[doc(hidden)]
-    pub fn install_subscribe_events_test_gate(&self, gate: Option<Arc<SubscribeEventsTestGate>>) {
-        *self
-            .subscribe_events_test_gate
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = gate;
-    }
-
-    /// PRD #93 round-3 test instrumentation; production code returns
-    /// `None`. Cloned out under a short-held lock so the caller can
-    /// `await` on the gate without holding the mutex.
-    #[doc(hidden)]
-    pub fn subscribe_events_test_gate(&self) -> Option<Arc<SubscribeEventsTestGate>> {
-        self.subscribe_events_test_gate
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-    }
-
-    /// Push `msg` onto the buffer, evicting the oldest entry if the cap is
-    /// reached. The caller is expected to invoke this only on send-Err
-    /// (zero subscribers): a normally-attached TUI receives the signal
-    /// live and recording here would duplicate it on reconnect.
-    ///
-    /// Eviction is logged at `warn!`: a silent drop hides the case where a
-    /// long detach storm + a runaway worker push the buffer past its cap
-    /// and the orchestrator quietly misses signals. The log lets operators
-    /// correlate "we lost a delegate/work-done" with "buffer overflowed."
-    pub fn record(&self, msg: BroadcastMsg) {
-        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if g.len() >= PENDING_BROADCAST_CAP
-            && let Some(dropped) = g.pop_front()
-        {
-            let dropped_variant = broadcast_variant_name(&dropped);
-            let incoming_variant = broadcast_variant_name(&msg);
-            warn!(
-                dropped_variant,
-                incoming_variant,
-                depth = g.len() + 1,
-                cap = PENDING_BROADCAST_CAP,
-                "PendingBroadcasts buffer at cap — evicting oldest entry (signal will not replay on reattach)"
-            );
-        }
-        g.push_back(msg);
-    }
-
-    /// Re-enqueue a batch of messages at the *front* of the buffer,
-    /// preserving the original FIFO order between the entries in `msgs`.
-    /// Used by the `SubscribeEvents` replay drain to put messages back
-    /// when a write to the client fails partway through — without this,
-    /// `drain()`-then-fail-mid-write would silently lose every entry the
-    /// drain pulled out (PRD #93 reviewer/auditor finding on adb13e9).
-    ///
-    /// If re-enqueuing would exceed [`PENDING_BROADCAST_CAP`], newer
-    /// entries already in the buffer (pushed at the back by concurrent
-    /// `record` calls during the drain window) are evicted first via
-    /// `pop_back`. This preserves the older, failed-to-deliver batch the
-    /// caller is trying to save — they're the ones the next subscriber
-    /// most needs to receive in FIFO order.
-    pub fn push_front_batch(&self, msgs: Vec<BroadcastMsg>) {
-        if msgs.is_empty() {
-            return;
-        }
-        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        // Iterate in reverse so the original head of `msgs` ends up at the
-        // front of the buffer (each push_front prepends one element).
-        for msg in msgs.into_iter().rev() {
-            while g.len() >= PENDING_BROADCAST_CAP {
-                // Newer entries (push_back-ed during the drain window) lose
-                // out so the failed-batch FIFO ordering is preserved.
-                if let Some(dropped) = g.pop_back() {
-                    let dropped_variant = broadcast_variant_name(&dropped);
-                    warn!(
-                        dropped_variant,
-                        depth = g.len() + 1,
-                        cap = PENDING_BROADCAST_CAP,
-                        "PendingBroadcasts buffer at cap during requeue — evicting newest entry"
-                    );
-                } else {
-                    break;
-                }
-            }
-            g.push_front(msg);
-        }
-    }
-
-    /// Atomically take every buffered entry. Called by the attach server
-    /// when a new `SubscribeEvents` subscriber joins, before it enters
-    /// the live `recv` loop. The first subscriber to attach after a
-    /// detach window drains the queue; later subscribers (rare —
-    /// typically only one TUI is attached at a time) see nothing, which
-    /// matches the at-most-one-handler invariant the TUI side enforces
-    /// for orchestrator feedback anyway.
-    pub fn drain(&self) -> Vec<BroadcastMsg> {
-        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.drain(..).collect()
-    }
-}
 
 /// Mode for the daemon's Unix socket: owner-only read/write. Without this the
 /// socket file inherits the process umask, which on most systems leaves it
@@ -370,27 +189,24 @@ pub struct Daemon {
     /// (`main.rs`) populate this from `config::attach_socket_path()`.
     pub attach_socket_path: Option<PathBuf>,
     /// `true` when this daemon shares its `state` Arc with a TUI in the
-    /// same process (the local-mode in-TUI-process daemon). The delegate
-    /// router uses this to decide between a direct `state.handle_delegate`
-    /// call (fast path, no socket round-trip, role-validation runs against
-    /// the TUI's own role map) and a `BroadcastMsg::Delegate` over the
-    /// attach socket (external-daemon mode, where the daemon's own state
-    /// has no role map and a subscribing TUI runs the guard instead).
+    /// same process (the local-mode in-TUI-process daemon).
     ///
-    /// Defaults to `false`; the in-process constructor `with_attach_in_process`
-    /// flips it explicitly. Standalone `daemon serve` and tests use the
-    /// default so the broadcast path is exercised end-to-end.
+    /// PRD #93 round-5: orchestration dispatch is now identical in both
+    /// modes — the daemon always owns the role map and writes the prompt
+    /// directly into the target pane's PTY. The `in_process` flag now
+    /// only gates idle-shutdown (in-process daemons die with the TUI;
+    /// firing idle-shutdown from underneath the TUI would race its own
+    /// drop path).
     pub in_process: bool,
-    /// Daemon-wide broadcast of hook messages (PRD #76 M2.17 for events,
-    /// extended in M2.19 to carry delegate signals). The hook loop wraps
-    /// every successfully-parsed payload in a `BroadcastMsg` variant and
-    /// publishes it here; the attach server hands each
-    /// `SubscribeEvents` connection its own `Receiver`. Delegate signals
-    /// in external-daemon mode rely on this bridge because the daemon's
-    /// own `AppState` has no role map to validate against — see
-    /// `BroadcastMsg::Delegate` and `state::handle_delegate`. In the
-    /// in-process daemon path the receiver is unused — the TUI shares
-    /// `state` directly.
+    /// Daemon-wide broadcast of hook events (PRD #76 M2.17). The hook
+    /// loop wraps every successfully-parsed `AgentEvent` in
+    /// `BroadcastMsg::Event` and publishes it here; the attach server
+    /// hands each `SubscribeEvents` connection its own `Receiver`.
+    ///
+    /// PRD #93 round-5: this used to carry `Delegate` / `WorkDone`
+    /// variants too — the daemon's "dumb pipe" in external mode. With
+    /// the orchestration logic moved daemon-side, only hook events ride
+    /// this channel now.
     pub event_tx: broadcast::Sender<BroadcastMsg>,
     /// PRD #93 M1.2 attached-client gauge, shared with the attach server.
     /// Incremented at `accept` time, decremented when the connection task
@@ -408,13 +224,6 @@ pub struct Daemon {
     /// [`idle_shutdown_from_env`]; [`with_attach_in_process`] forces it
     /// to `None` (the daemon dies with its TUI either way).
     pub idle_shutdown: Option<Duration>,
-    /// Bounded ring buffer of orchestration `BroadcastMsg`s (Delegate /
-    /// WorkDone) that arrived while no TUI was subscribed. Populated in
-    /// external-daemon mode only — see [`PendingBroadcasts`] for the
-    /// rationale, and the Delegate / WorkDone arms in `run_hook_loop`
-    /// for the recording site. Drained by the next `SubscribeEvents`
-    /// subscriber before it joins the live stream.
-    pub pending_broadcasts: Arc<PendingBroadcasts>,
 }
 
 impl Daemon {
@@ -434,15 +243,12 @@ impl Daemon {
             // registry consumers either. Leave the timer off; callers
             // that want it can opt in via [`with_idle_shutdown`].
             idle_shutdown: None,
-            pending_broadcasts: Arc::new(PendingBroadcasts::new()),
         }
     }
 
     /// Daemon configured to also serve the M1.2 streaming attach protocol
     /// on `attach_path`. Hook ingestion still uses the path passed to
-    /// `run_daemon_with`. Used by `daemon serve` and tests — the daemon's
-    /// `state` is not shared with any TUI, so delegate signals are routed
-    /// via the broadcast for a subscribing TUI to handle.
+    /// `run_daemon_with`. Used by `daemon serve` and tests.
     ///
     /// PRD #93 M1.2: idle shutdown defaults to the environment-configured
     /// window ([`idle_shutdown_from_env`]) so an auto-spawned daemon
@@ -459,17 +265,18 @@ impl Daemon {
             event_tx,
             client_count: Arc::new(AtomicUsize::new(0)),
             idle_shutdown: idle_shutdown_from_env(),
-            pending_broadcasts: Arc::new(PendingBroadcasts::new()),
         }
     }
 
     /// Same as [`with_attach`](Self::with_attach) but flags the daemon as
-    /// sharing `state` with a TUI in the same process. Delegate signals
-    /// take the direct `state.handle_delegate` path so the local TUI sees
-    /// them without needing to subscribe to its own daemon's broadcast.
-    /// Used by the local-mode TUI's in-process daemon (`run_tui_session`
-    /// when the PRD #93 escape-hatch [`crate::agent_pty::DOT_AGENT_DECK_LOCAL_DAEMON`]
-    /// is set).
+    /// sharing `state` with a TUI in the same process. PRD #93 round-5:
+    /// the dispatch routing no longer branches on this flag — the daemon
+    /// owns the role map and writes directly into target PTYs in both
+    /// modes. The flag survives only to keep idle-shutdown off when the
+    /// daemon's lifetime is already tied to the TUI's. Used by the
+    /// local-mode TUI's in-process daemon (`run_tui_session` when the
+    /// PRD #93 escape-hatch
+    /// [`crate::agent_pty::DOT_AGENT_DECK_LOCAL_DAEMON`] is set).
     pub fn with_attach_in_process(state: SharedState, attach_path: PathBuf) -> Self {
         let mut daemon = Self::with_attach(state, attach_path);
         daemon.in_process = true;
@@ -568,17 +375,17 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let event_tx = daemon.event_tx;
     let client_count = daemon.client_count;
     let idle_shutdown = daemon.idle_shutdown;
-    let pending_broadcasts = daemon.pending_broadcasts;
 
-    // Route delegates by daemon mode, not by attach-socket presence: the
-    // in-process TUI daemon ALSO binds an attach socket (so a future
-    // `connect` from another laptop could reach it), but its `state`
-    // is shared with the TUI, so a direct call is correct and the
-    // broadcast would have no subscriber. Standalone `daemon serve`
-    // and tests construct via the default `with_attach` (in_process=false)
-    // so the broadcast path runs and any attached TUI's subscriber
-    // re-runs role validation against its own state.
-    let is_external_mode = !daemon.in_process;
+    // PRD #93 round-5: orchestration dispatch is now unified across
+    // in-process and external modes — both call
+    // `state.handle_delegate` / `state.handle_work_done` against the
+    // daemon's own `AppState`, which now owns the role map (populated
+    // at `StartAgent` time) and the PTY registry. The previous
+    // `is_external_mode` branching only kept the in-process variant on
+    // the direct-call path while the external variant rode a broadcast
+    // hop; that bifurcation was the root of every detach-window
+    // round-1..4 fix. With one code path, there is nothing to lose.
+    let is_in_process = daemon.in_process;
 
     // PRD #93 M1.2 shutdown signal — `Notify` is single-shot/level-triggered
     // enough for our needs: the idle monitor notifies once when the timer
@@ -592,14 +399,14 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         let registry = pty_registry.clone();
         let attach_event_tx = event_tx.clone();
         let attach_counter = client_count.clone();
-        let attach_pending = pending_broadcasts.clone();
+        let attach_state = state.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::daemon_protocol::run_attach_server_with_counter(
                 &path,
                 registry,
                 attach_event_tx,
                 attach_counter,
-                attach_pending,
+                attach_state,
             )
             .await
             {
@@ -618,8 +425,8 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // (attach counter via `ClientGuard`, registry via spawn/close/exit)
     // wake it immediately. No polling cadence to race against a brief
     // reconnect.
-    let idle_handle = match (idle_shutdown, is_external_mode) {
-        (Some(window), true) => {
+    let idle_handle = match (idle_shutdown, is_in_process) {
+        (Some(window), false) => {
             let counter = client_count.clone();
             let registry = pty_registry.clone();
             let shutdown_signal = shutdown.clone();
@@ -631,15 +438,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         _ => None,
     };
 
-    let result = run_hook_loop(
-        listener,
-        state,
-        event_tx,
-        is_external_mode,
-        pending_broadcasts,
-        shutdown,
-    )
-    .await;
+    let result = run_hook_loop(listener, state, event_tx, pty_registry.clone(), shutdown).await;
 
     if let Some(h) = attach_handle {
         h.abort();
@@ -754,8 +553,7 @@ async fn run_hook_loop(
     listener: UnixListener,
     state: SharedState,
     event_tx: broadcast::Sender<BroadcastMsg>,
-    is_external_mode: bool,
-    pending_broadcasts: Arc<PendingBroadcasts>,
+    pty_registry: Arc<AgentPtyRegistry>,
     shutdown: Arc<Notify>,
 ) -> Result<(), DaemonError> {
     loop {
@@ -773,7 +571,7 @@ async fn run_hook_loop(
             Ok((stream, _addr)) => {
                 let state = state.clone();
                 let event_tx = event_tx.clone();
-                let pending_broadcasts = pending_broadcasts.clone();
+                let pty_registry = pty_registry.clone();
                 tokio::spawn(async move {
                     let reader = tokio::io::BufReader::new(stream);
                     let mut lines = reader.lines();
@@ -787,47 +585,13 @@ async fn run_hook_loop(
                                         targets = ?signal.to,
                                         "Received delegate signal"
                                     );
-                                    // PRD #76 M2.19: route delegates by
-                                    // mode using the deterministic
-                                    // attach-socket flag (not the
-                                    // broadcast's delivery count, which
-                                    // briefly reports zero subscribers
-                                    // during TUI startup, reconnect, and
-                                    // lagged-stream teardown).
-                                    if is_external_mode {
-                                        // External-daemon mode: the TUI-side
-                                        // AppState owns the role map and
-                                        // validates the delegate. Daemon is
-                                        // a dumb pipe. If `send` returns
-                                        // Err right now there are zero
-                                        // attached subscribers — typically
-                                        // because the user has detached
-                                        // the deck. Buffer the signal in
-                                        // `pending_broadcasts` so the next
-                                        // attaching TUI replays it; without
-                                        // this, `dot-agent-deck delegate`
-                                        // issued during a detach window
-                                        // would be silently lost forever.
-                                        if event_tx
-                                            .send(BroadcastMsg::Delegate(signal.clone()))
-                                            .is_err()
-                                        {
-                                            warn!(
-                                                pane_id = %signal.pane_id,
-                                                "delegate buffered: no attached TUI subscribers (will replay on reattach)"
-                                            );
-                                            pending_broadcasts
-                                                .record(BroadcastMsg::Delegate(signal));
-                                        }
-                                    } else {
-                                        // In-process daemon mode: TUI
-                                        // shares `state` directly, so the
-                                        // daemon-local call is the real
-                                        // enqueue path. The broadcast has
-                                        // no subscribers in this mode and
-                                        // would be a no-op.
-                                        state.write().await.handle_delegate(signal);
-                                    }
+                                    // PRD #93 round-5: one path for both
+                                    // modes. The daemon owns the role map
+                                    // and the PTY registry, so it routes
+                                    // the prompt directly into the worker
+                                    // pane's PTY — no broadcast hop, no
+                                    // detach-window loss surface.
+                                    state.read().await.handle_delegate(signal, &pty_registry).await;
                                 }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
@@ -835,39 +599,7 @@ async fn run_hook_loop(
                                         done = signal.done,
                                         "Received work-done signal"
                                     );
-                                    // Same external-vs-in-process split as
-                                    // Delegate above: the daemon's local
-                                    // `pane_role_map` / `pane_cwd_map` are
-                                    // empty in external mode, so the TUI has
-                                    // to be the one running `handle_work_done`
-                                    // (resolves role, writes summary file,
-                                    // enqueues feedback for the orchestrator
-                                    // pane).
-                                    if is_external_mode {
-                                        // Same detach-loss risk as the
-                                        // Delegate arm above (and the real
-                                        // user-reported bug here): a worker
-                                        // calling `dot-agent-deck work-done`
-                                        // while the deck is detached must
-                                        // not vanish — the orchestrator
-                                        // depends on the feedback to know
-                                        // the task is finished. Buffer on
-                                        // send-Err and let the next attached
-                                        // TUI replay it.
-                                        if event_tx
-                                            .send(BroadcastMsg::WorkDone(signal.clone()))
-                                            .is_err()
-                                        {
-                                            warn!(
-                                                pane_id = %signal.pane_id,
-                                                "work-done buffered: no attached TUI subscribers (will replay on reattach)"
-                                            );
-                                            pending_broadcasts
-                                                .record(BroadcastMsg::WorkDone(signal));
-                                        }
-                                    } else {
-                                        state.write().await.handle_work_done(signal);
-                                    }
+                                    state.read().await.handle_work_done(signal, &pty_registry).await;
                                 }
                             }
                         } else if let Ok(event) = serde_json::from_str::<AgentEvent>(&line) {
@@ -961,81 +693,6 @@ mod tests {
         assert_eq!(mode, SOCKET_MODE, "expected 0600, got {mode:o}");
 
         handle.abort();
-    }
-
-    #[tokio::test]
-    async fn delegate_routes_direct_in_in_process_mode() {
-        // Regression for "delegate silently no-op in local-mode TUI":
-        // `with_attach_in_process` must route delegates via the shared
-        // state's `handle_delegate`, not via a broadcast that has no
-        // subscriber in this mode.
-        use crate::event::{DaemonMessage, DelegateSignal};
-        use chrono::Utc;
-        use tokio::io::AsyncWriteExt;
-
-        let dir = race_safe_tempdir();
-        let hook_path = dir.path().join("hook.sock");
-        let attach_path = dir.path().join("attach.sock");
-
-        let state = Arc::new(RwLock::new(AppState::default()));
-        // Mimic the TUI's pane registration so handle_delegate accepts the signal.
-        {
-            let mut st = state.write().await;
-            st.register_pane("orch".into());
-            st.pane_role_map
-                .insert("orch".into(), "orchestrator".into());
-            st.orchestrator_pane_ids.insert("orch".into());
-        }
-
-        let daemon_state = state.clone();
-        let attach_for_daemon = attach_path.clone();
-        let hook_for_daemon = hook_path.clone();
-        let handle = tokio::spawn(async move {
-            let daemon = Daemon::with_attach_in_process(daemon_state, attach_for_daemon);
-            let _ = run_daemon_with(&hook_for_daemon, daemon).await;
-        });
-
-        // Wait for the hook socket to bind.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while tokio::time::Instant::now() < deadline {
-            if hook_path.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(hook_path.exists(), "hook socket did not appear");
-
-        // Send a delegate signal. No subscriber on the broadcast — this
-        // must still land in `state.delegate_events` via the direct path.
-        let signal = DelegateSignal {
-            pane_id: "orch".into(),
-            task: "test".into(),
-            to: vec!["coder".into()],
-            timestamp: Utc::now(),
-        };
-        let msg = DaemonMessage::Delegate(signal);
-        let mut json = serde_json::to_vec(&msg).unwrap();
-        json.push(b'\n');
-        let mut stream = tokio::net::UnixStream::connect(&hook_path).await.unwrap();
-        stream.write_all(&json).await.unwrap();
-        stream.shutdown().await.unwrap();
-
-        // Wait briefly for the hook loop to enqueue.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        let mut saw = false;
-        while tokio::time::Instant::now() < deadline {
-            if !state.read().await.delegate_events.is_empty() {
-                saw = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        handle.abort();
-        assert!(
-            saw,
-            "in-process daemon must enqueue delegate via direct handle_delegate; \
-             a broadcast-only path would silently drop it (no subscriber in local mode)"
-        );
     }
 
     #[test]
@@ -1686,101 +1343,5 @@ mod tests {
         );
 
         handle.abort();
-    }
-
-    #[test]
-    fn pending_broadcasts_logs_warn_on_eviction() {
-        // PRD #93 round-2 reviewer/auditor #6: silent eviction at cap was
-        // hiding the "long detach storm + runaway worker dropped a signal"
-        // case. The record() helper now logs a warn! when the buffer is
-        // full. We can't easily assert on the logger output without a
-        // tracing subscriber, but we can at least verify the eviction
-        // *behavior* — the buffer never exceeds the cap and the oldest
-        // entry is the one that's dropped.
-        use crate::event::DelegateSignal;
-        use chrono::Utc;
-
-        let buf = PendingBroadcasts::new();
-        // Push CAP+1 distinguishable entries.
-        for i in 0..=PENDING_BROADCAST_CAP {
-            buf.record(BroadcastMsg::Delegate(DelegateSignal {
-                pane_id: format!("p-{i}"),
-                task: format!("t-{i}"),
-                to: vec![],
-                timestamp: Utc::now(),
-            }));
-        }
-
-        let drained = buf.drain();
-        assert_eq!(
-            drained.len(),
-            PENDING_BROADCAST_CAP,
-            "buffer must cap at PENDING_BROADCAST_CAP entries; got {}",
-            drained.len()
-        );
-
-        // The first push (p-0) must have been evicted. The remaining
-        // entries should be p-1 .. p-CAP in FIFO order.
-        match &drained[0] {
-            BroadcastMsg::Delegate(s) => {
-                assert_eq!(
-                    s.pane_id, "p-1",
-                    "oldest survivor must be p-1 — p-0 should have been evicted"
-                );
-            }
-            other => panic!("expected Delegate, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn pending_broadcasts_push_front_batch_preserves_fifo() {
-        // PRD #93 round-2 reviewer/auditor #5: re-enqueueing a failed
-        // drain batch must preserve the FIFO order between entries so a
-        // fresh subscriber drains them in the same order as the wedged
-        // one would have.
-        use crate::event::DelegateSignal;
-        use chrono::Utc;
-
-        let buf = PendingBroadcasts::new();
-        // Simulate: drain pulled out [a, b, c]; write of `b` failed, so
-        // we re-enqueue [b, c] (a was successfully written). The next
-        // subscriber must drain [b, c] in that order.
-        let mk = |id: &str| {
-            BroadcastMsg::Delegate(DelegateSignal {
-                pane_id: id.into(),
-                task: "t".into(),
-                to: vec![],
-                timestamp: Utc::now(),
-            })
-        };
-        buf.push_front_batch(vec![mk("b"), mk("c")]);
-        let drained = buf.drain();
-        assert_eq!(drained.len(), 2);
-        match (&drained[0], &drained[1]) {
-            (BroadcastMsg::Delegate(d0), BroadcastMsg::Delegate(d1)) => {
-                assert_eq!(d0.pane_id, "b", "first replayed must be the failed one");
-                assert_eq!(d1.pane_id, "c", "second replayed must follow in FIFO");
-            }
-            other => panic!("expected two Delegate entries, got {other:?}"),
-        }
-
-        // Re-enqueued batch must sit at the FRONT, even if newer entries
-        // arrived via `record` during the drain window.
-        buf.record(mk("d"));
-        buf.record(mk("e"));
-        buf.push_front_batch(vec![mk("b"), mk("c")]);
-        let drained = buf.drain();
-        let ids: Vec<&str> = drained
-            .iter()
-            .map(|m| match m {
-                BroadcastMsg::Delegate(d) => d.pane_id.as_str(),
-                _ => unreachable!(),
-            })
-            .collect();
-        assert_eq!(
-            ids,
-            vec!["b", "c", "d", "e"],
-            "failed-batch must sit at the front, in FIFO order, ahead of entries recorded during the drain window"
-        );
     }
 }

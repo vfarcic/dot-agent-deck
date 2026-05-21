@@ -1,28 +1,24 @@
-//! Orchestrator → role-agent delegate propagation across the
-//! external-daemon hop.
+//! End-to-end tests for daemon-side orchestration dispatch.
 //!
-//! Regression guard for the bug where `dot-agent-deck delegate` from an
-//! orchestrator pane sent its `DelegateSignal` to the daemon's hook
-//! socket but the signal never reached the TUI: the daemon's own
-//! `AppState.pane_role_map` is always empty in external-daemon mode (the
-//! TUI owns the role map), so `state.handle_delegate` rejected every
-//! signal as "delegate from unknown pane" and dropped it silently. The
-//! `AgentEvent` broadcast added in M2.17 already forwards hook events to
-//! attached TUIs; this test pins the equivalent forwarding for delegate
-//! signals.
+//! PRD #93 round-5: the daemon owns delegate/work-done dispatch entirely.
+//! When a worker's hook socket receives a `Delegate` signal from an
+//! orchestrator pane, the daemon resolves the target role's pane, builds
+//! a file-backed task prompt, and writes the one-liner directly into the
+//! target pane's PTY via [`AgentPtyRegistry::write_to_pane`]. The PTY
+//! scrollback is the "journal" surface — the bytes survive any number of
+//! detach/reattach cycles via the standard pane snapshot replay.
 //!
-//! End-to-end: a real daemon + attach server, a `subscribe_events`
-//! connection from a synthetic TUI client, a `DelegateSignal` written
-//! to the daemon's hook socket as JSON (same wire format
-//! `crate::hook::send_to_socket` produces), and an assertion that the
-//! signal materialises in the TUI-side `AppState.delegate_events` via
-//! the broadcast bridge.
+//! Previous rounds had a `BroadcastMsg::Delegate` / `BroadcastMsg::WorkDone`
+//! hop between daemon and TUI guarded by a `PendingBroadcasts` replay
+//! buffer and a `try_recv` salvage path; all of that is gone. The tests
+//! below pin the new contract: direct PTY writes, scoped to the
+//! orchestration tab, surviving subscriber detach.
 //!
-//! NOTE: `pane_role_map` and `orchestrator_pane_ids` must be populated
-//! in the TUI-side state *before* the signal arrives — the TUI-side
-//! `handle_delegate` still validates that the sender is a registered
-//! orchestrator (preserves the same anti-spoofing guard the daemon-side
-//! pre-broadcast code applied in shared-state mode).
+//! The harness spawns an integer-named agent (`cat -u`) per role. `cat -u`
+//! echoes stdin verbatim to stdout, which in turn surfaces on the PTY
+//! master and lands in the registry's per-agent scrollback bus. That's
+//! what we read via `pty_registry.snapshot(agent_id)` to assert "the
+//! prompt arrived in the pane's scrollback".
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,23 +32,33 @@ use tokio::net::UnixStream;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-use dot_agent_deck::daemon::{Daemon, SubscribeEventsTestGate, run_daemon_with};
-use dot_agent_deck::daemon_client::DaemonClient;
-use dot_agent_deck::event::{BroadcastMsg, DaemonMessage, DelegateSignal, WorkDoneSignal};
-use dot_agent_deck::state::AppState;
+use dot_agent_deck::agent_pty::{
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, TabMembership, is_valid_pane_id_env,
+};
+use dot_agent_deck::daemon::{Daemon, run_daemon_with};
+use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
+use dot_agent_deck::event::{DaemonMessage, DelegateSignal, WorkDoneSignal};
+use dot_agent_deck::state::{AppState, SharedState};
 
 static HARNESS_BIND_LOCK: Mutex<()> = Mutex::new(());
 
+/// Owns the spawned daemon coroutine plus the live clones of the daemon's
+/// `state` and `pty_registry`. Tests hold onto these to drive PTY reads
+/// (`pty_registry.snapshot`) and inspect the daemon-side role map directly
+/// — they're the same Arcs the daemon's hook loop mutates.
 struct DaemonHandle {
     _dir: TempDir,
     hook_path: PathBuf,
     attach_path: PathBuf,
+    state: SharedState,
+    pty_registry: Arc<AgentPtyRegistry>,
     handle: JoinHandle<()>,
 }
 
 impl Drop for DaemonHandle {
     fn drop(&mut self) {
         self.handle.abort();
+        self.pty_registry.shutdown_all();
     }
 }
 
@@ -65,11 +71,12 @@ async fn spawn_daemon() -> DaemonHandle {
         (dir, hook, attach)
     };
 
-    let daemon_state = Arc::new(RwLock::new(AppState::default()));
-    let attach_for_daemon = attach_path.clone();
+    let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+    let daemon = Daemon::with_attach(state.clone(), attach_path.clone()).with_idle_shutdown(None);
+    let pty_registry = daemon.pty_registry.clone();
+
     let hook_for_daemon = hook_path.clone();
     let handle = tokio::spawn(async move {
-        let daemon = Daemon::with_attach(daemon_state, attach_for_daemon);
         let _ = run_daemon_with(&hook_for_daemon, daemon).await;
     });
 
@@ -89,6 +96,8 @@ async fn spawn_daemon() -> DaemonHandle {
         _dir: dir,
         hook_path,
         attach_path,
+        state,
+        pty_registry,
         handle,
     }
 }
@@ -111,165 +120,171 @@ async fn send_work_done(hook_path: &PathBuf, signal: &WorkDoneSignal) {
     stream.shutdown().await.unwrap();
 }
 
-/// Full chain: orchestrator's delegate JSON → daemon hook loop →
-/// broadcast → attached TUI subscriber → TUI-side `AppState`.
-#[tokio::test]
-async fn delegate_signal_round_trips_to_attached_appstate() {
-    let daemon = spawn_daemon().await;
-
-    // Stand in for the TUI's `AppState` — separate from the daemon's
-    // (external-daemon mode). Populate the role map and mark the
-    // orchestrator pane so `handle_delegate` accepts the signal.
-    let tui_state = Arc::new(RwLock::new(AppState::default()));
-    {
-        let mut st = tui_state.write().await;
-        st.register_pane("orch-pane".into());
-        st.pane_role_map
-            .insert("orch-pane".into(), "orchestrator".into());
-        st.orchestrator_pane_ids.insert("orch-pane".into());
-    }
-
+/// Spawn an orchestration role agent attached to a PTY running `cat -u`.
+/// `cat -u` echoes its stdin verbatim to stdout, which the registry
+/// captures in the agent's scrollback bus — that's the surface the daemon
+/// writes the delegate prompt to and the surface our assertions read.
+///
+/// Returns the daemon-side agent id; the pane_id is the caller-supplied
+/// `pane_id` argument (passed via the `DOT_AGENT_DECK_PANE_ID` env so the
+/// daemon registry mirrors it on `pane_id_env`).
+async fn start_role_pane(
+    daemon: &DaemonHandle,
+    orchestration_name: &str,
+    role_name: &str,
+    is_start_role: bool,
+    role_index: usize,
+    pane_id: &str,
+    cwd: &str,
+) -> String {
+    assert!(is_valid_pane_id_env(pane_id), "test pane_id must be valid");
     let client = DaemonClient::new(daemon.attach_path.clone());
-    let mut sub = client.subscribe_events().await.expect("subscribe ok");
-
-    // Mirror what `spawn_event_subscriber` does in production: route the
-    // delegate variant into `state.handle_delegate`.
-    let state_for_task = tui_state.clone();
-    let forwarder = tokio::spawn(async move {
-        while let Ok(Some(msg)) = sub.next_event().await {
-            match msg {
-                BroadcastMsg::Event(event) => {
-                    state_for_task.write().await.apply_event(event);
-                }
-                BroadcastMsg::Delegate(signal) => {
-                    state_for_task.write().await.handle_delegate(signal);
-                }
-                BroadcastMsg::WorkDone(signal) => {
-                    state_for_task.write().await.handle_work_done(signal);
-                }
-            }
-        }
-    });
-
-    let signal = DelegateSignal {
-        pane_id: "orch-pane".into(),
-        task: "implement the auth module".into(),
-        to: vec!["coder".into()],
-        timestamp: Utc::now(),
-    };
-    send_delegate(&daemon.hook_path, &signal).await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut saw = false;
-    while tokio::time::Instant::now() < deadline {
-        let s = tui_state.read().await;
-        if let Some(received) = s.delegate_events.first() {
-            assert_eq!(received.pane_id, "orch-pane");
-            assert_eq!(received.task, "implement the auth module");
-            assert_eq!(received.to, vec!["coder".to_string()]);
-            saw = true;
-            break;
-        }
-        drop(s);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        saw,
-        "expected DelegateSignal to reach the TUI's AppState via subscribe_events"
-    );
-
-    forwarder.abort();
+    client
+        .start_agent(StartAgentOptions {
+            command: Some("cat -u".to_string()),
+            cwd: Some(cwd.to_string()),
+            display_name: Some(role_name.to_string()),
+            rows: 24,
+            cols: 80,
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+            tab_membership: Some(TabMembership::Orchestration {
+                name: orchestration_name.to_string(),
+                role_index,
+                role_name: role_name.to_string(),
+                is_start_role,
+            }),
+            agent_type: None,
+        })
+        .await
+        .expect("start_agent")
 }
 
-/// A delegate from a pane the TUI doesn't recognise as an orchestrator
-/// must still be dropped on the TUI side (the daemon is a dumb pipe in
-/// external mode, but the role-validation guard moves to the TUI).
-#[tokio::test]
-async fn delegate_signal_from_non_orchestrator_is_dropped() {
-    let daemon = spawn_daemon().await;
-
-    let tui_state = Arc::new(RwLock::new(AppState::default()));
-    {
-        let mut st = tui_state.write().await;
-        st.register_pane("worker-pane".into());
-        st.pane_role_map
-            .insert("worker-pane".into(), "coder".into());
-        // Deliberately NOT in `orchestrator_pane_ids`.
-    }
-
-    let client = DaemonClient::new(daemon.attach_path.clone());
-    let mut sub = client.subscribe_events().await.expect("subscribe ok");
-
-    let state_for_task = tui_state.clone();
-    let forwarder = tokio::spawn(async move {
-        while let Ok(Some(msg)) = sub.next_event().await {
-            if let BroadcastMsg::Delegate(signal) = msg {
-                state_for_task.write().await.handle_delegate(signal);
-            }
+/// Poll the agent's scrollback (via the daemon's registry, in-process) for
+/// `needle`. Returns the full snapshot on success, panics on timeout. The
+/// indirection through the registry avoids re-implementing the snapshot
+/// wire protocol and keeps the test focused on "did the bytes arrive in
+/// the PTY scrollback" rather than "does the snapshot frame round-trip"
+/// (covered separately in `tests/daemon_protocol.rs`).
+async fn wait_for_in_snapshot(
+    registry: &AgentPtyRegistry,
+    agent_id: &str,
+    needle: &str,
+    timeout: Duration,
+) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(snap) = registry.snapshot(agent_id)
+            && snap.windows(needle.len()).any(|w| w == needle.as_bytes())
+        {
+            return snap;
         }
-    });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let last = registry.snapshot(agent_id).unwrap_or_default();
+    panic!(
+        "needle {:?} not found in agent {} scrollback within {:?}; last snapshot: {:?}",
+        needle,
+        agent_id,
+        timeout,
+        String::from_utf8_lossy(&last)
+    );
+}
+
+/// Headline test: a delegate signal from the orchestrator's hook socket
+/// must land as a worker-task prompt directly in the target role pane's
+/// PTY scrollback — no broadcast hop, no buffer.
+#[tokio::test]
+async fn daemon_writes_delegate_prompt_to_target_role_pane() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let _orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let coder_agent_id =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    // Sanity: the daemon-side role map was populated by StartAgent.
+    {
+        let st = daemon.state.read().await;
+        assert_eq!(
+            st.pane_role_map.get("orch-pane").map(String::as_str),
+            Some("orchestrator")
+        );
+        assert_eq!(
+            st.pane_role_map.get("coder-pane").map(String::as_str),
+            Some("coder")
+        );
+        assert!(st.orchestrator_pane_ids.contains("orch-pane"));
+        assert!(!st.orchestrator_pane_ids.contains("coder-pane"));
+    }
 
     send_delegate(
         &daemon.hook_path,
         &DelegateSignal {
-            pane_id: "worker-pane".into(),
-            task: "spoof".into(),
-            to: vec!["reviewer".into()],
+            pane_id: "orch-pane".into(),
+            task: "Implement the auth module".into(),
+            to: vec!["coder".into()],
             timestamp: Utc::now(),
         },
     )
     .await;
 
-    // Give the forwarder a generous window to receive + drop. A
-    // straight sleep is the cleanest assertion of "nothing happened."
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let s = tui_state.read().await;
+    // The daemon writes a file-backed one-liner to the worker pane. Pin
+    // the one-liner shape — the per-role file path is what surfaces in
+    // the scrollback (Claude Code would otherwise fragment a multi-line
+    // task across multiple prompts).
+    let snap = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &coder_agent_id,
+        ".dot-agent-deck/worker-task-coder.md",
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(
-        s.delegate_events.is_empty(),
-        "non-orchestrator delegate must not enqueue"
+        String::from_utf8_lossy(&snap).contains("Read .dot-agent-deck/worker-task-coder.md"),
+        "expected the worker-task one-liner in coder pane scrollback"
     );
 
-    forwarder.abort();
+    // And the task file itself must exist alongside it.
+    let task_file = std::path::Path::new(&cwd).join(".dot-agent-deck/worker-task-coder.md");
+    assert!(
+        task_file.exists(),
+        "daemon should write the task body to a file the worker can read in one shot"
+    );
+    let body = std::fs::read_to_string(&task_file).unwrap();
+    assert_eq!(body, "Implement the auth module");
 }
 
-/// Symmetric regression guard for the `work-done` direction. Same shape
-/// of bug as the delegate variant above: `dot-agent-deck work-done` from
-/// a worker pane sent a `WorkDoneSignal` to the daemon hook socket, but
-/// in external-daemon mode the daemon's `pane_role_map` / `pane_cwd_map`
-/// are empty (the TUI owns them), so `state.handle_work_done` rejected
-/// every signal as "work-done from unknown pane" and the orchestrator
-/// pane never got the feedback message. Mirrors `Delegate` by adding a
-/// `BroadcastMsg::WorkDone` hop that the TUI-side subscriber re-applies
-/// against the real state.
+/// Symmetric guard: a work-done signal from a worker must write the
+/// per-role summary file AND inject the "Worker {role} has completed..."
+/// feedback directly into the orchestrator pane's PTY.
 #[tokio::test]
-async fn work_done_signal_round_trips_to_attached_appstate() {
+async fn daemon_writes_work_done_feedback_to_orchestrator_pane() {
     let daemon = spawn_daemon().await;
-
-    // TUI-side state: the worker pane is registered with its role and cwd
-    // so the TUI's `handle_work_done` can resolve role → summary file.
     let cwd_dir = tempfile::tempdir().unwrap();
-    let tui_state = Arc::new(RwLock::new(AppState::default()));
-    {
-        let mut st = tui_state.write().await;
-        st.register_pane("coder-pane".into());
-        st.pane_role_map.insert("coder-pane".into(), "coder".into());
-        st.pane_cwd_map.insert(
-            "coder-pane".into(),
-            cwd_dir.path().to_string_lossy().into_owned(),
-        );
-    }
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
-    let client = DaemonClient::new(daemon.attach_path.clone());
-    let mut sub = client.subscribe_events().await.expect("subscribe ok");
-
-    let state_for_task = tui_state.clone();
-    let forwarder = tokio::spawn(async move {
-        while let Ok(Some(msg)) = sub.next_event().await {
-            if let BroadcastMsg::WorkDone(signal) = msg {
-                state_for_task.write().await.handle_work_done(signal);
-            }
-        }
-    });
+    let orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let _coder_agent_id =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
 
     send_work_done(
         &daemon.hook_path,
@@ -282,83 +297,130 @@ async fn work_done_signal_round_trips_to_attached_appstate() {
     )
     .await;
 
+    // Summary file is the user-visible artifact the orchestrator will be
+    // prompted to read.
+    let summary = std::path::Path::new(&cwd).join(".dot-agent-deck/work-done-coder.md");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut saw = false;
     while tokio::time::Instant::now() < deadline {
-        let s = tui_state.read().await;
-        if let Some(received) = s.work_done_events.first() {
-            assert_eq!(received.pane_id, "coder-pane");
-            assert_eq!(received.task, "implemented the auth module");
-            assert!(!received.done);
-            saw = true;
+        if summary.exists() {
             break;
         }
-        drop(s);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    assert!(
-        saw,
-        "expected WorkDoneSignal to reach the TUI's AppState via subscribe_events"
-    );
-
-    // Summary file is the user-visible side effect — the feedback
-    // message pointing the orchestrator at it would be dead without it.
-    let summary = cwd_dir.path().join(".dot-agent-deck/work-done-coder.md");
     assert!(
         summary.exists(),
-        "work-done-coder.md must be written to the worker's cwd"
+        "daemon must write the work-done summary file"
     );
-    let body = std::fs::read_to_string(&summary).unwrap();
-    assert_eq!(body, "implemented the auth module");
+    assert_eq!(
+        std::fs::read_to_string(&summary).unwrap(),
+        "implemented the auth module"
+    );
 
-    forwarder.abort();
+    // Feedback one-liner must appear in the orchestrator pane's scrollback.
+    let snap = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &orch_agent_id,
+        "Worker coder has completed their task.",
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&snap).contains(".dot-agent-deck/work-done-coder.md"),
+        "feedback must point the orchestrator at the per-role summary file"
+    );
 }
 
-/// Detach-window replay guard for `work-done`.
-///
-/// The original bug: with no TUI attached, a worker's `dot-agent-deck
-/// work-done` reached the daemon's hook loop but `event_tx.send(...)`
-/// returned Err (zero subscribers), the signal was logged and dropped,
-/// and the orchestrator never saw the feedback message on reattach.
-///
-/// This test pins the fix: with no subscriber, the signal must be
-/// recorded into the daemon's `pending_broadcasts` and replayed to the
-/// next attaching subscriber before live broadcasts resume.
+/// Anti-spoofing: a delegate from a worker pane (or any non-orchestrator
+/// pane) must be dropped daemon-side and produce no PTY write.
 #[tokio::test]
-async fn work_done_signal_replayed_after_reattach() {
+async fn delegate_from_non_orchestrator_is_rejected_daemon_side() {
     let daemon = spawn_daemon().await;
-
-    // Worker pane setup mirrors the live-path test — the TUI's
-    // handle_work_done resolves role → summary file using these maps.
     let cwd_dir = tempfile::tempdir().unwrap();
-    let tui_state = Arc::new(RwLock::new(AppState::default()));
-    {
-        let mut st = tui_state.write().await;
-        st.register_pane("coder-pane".into());
-        st.pane_role_map.insert("coder-pane".into(), "coder".into());
-        st.pane_cwd_map.insert(
-            "coder-pane".into(),
-            cwd_dir.path().to_string_lossy().into_owned(),
-        );
-    }
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
-    // First attach: open a subscription, immediately drop it. This
-    // reproduces the "user detached the deck" state — at the moment of
-    // the work-done signal below, zero subscribers exist on the daemon's
-    // broadcast channel.
+    let _orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let coder_agent_id =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    // Spoof: a worker pane sends a delegate to another worker. The
+    // daemon's `handle_delegate` must reject it because `coder-pane` is
+    // not in `orchestrator_pane_ids`.
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "coder-pane".into(),
+            task: "spoofed task".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    // Hook loop is async; give it time to process and drop.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let snap = daemon.pty_registry.snapshot(&coder_agent_id).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&snap).contains("spoofed task"),
+        "spoofed delegate from a non-orchestrator pane must not reach any PTY"
+    );
+    assert!(
+        !std::path::Path::new(&cwd)
+            .join(".dot-agent-deck/worker-task-coder.md")
+            .exists(),
+        "spoofed delegate must not produce a task file either"
+    );
+}
+
+/// The headline empirical test that rounds 1-4 could not pass cleanly:
+/// a worker fires `work-done` while no TUI subscriber is attached, and a
+/// fresh subscriber attached later must still see the feedback.
+///
+/// Under the broadcast hop this was a multi-round bug (the daemon's
+/// `event_tx.send` returned Err with zero subscribers, the
+/// `PendingBroadcasts` replay buffer plus salvage loop tried to plug
+/// every detach race). Under the new design the orchestrator pane's PTY
+/// scrollback retains the feedback indefinitely, so a reattach reads it
+/// back via `pty_registry.snapshot` regardless of subscriber state at
+/// the moment of the signal.
+#[tokio::test]
+async fn work_done_survives_subscriber_detach_and_reattach() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let _coder_agent_id =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    // Open and immediately drop a subscriber. Wait long enough for the
+    // daemon-side per-connection task to observe the EOF.
     let client = DaemonClient::new(daemon.attach_path.clone());
     {
         let _initial = client.subscribe_events().await.expect("initial subscribe");
-        // Allow the daemon-side per-connection task to actually call
-        // `event_tx.subscribe()` and then observe the EOF when we drop.
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // Wait for the daemon's receiver to be torn down — `send` only
-    // returns Err once the receiver count actually drops to zero, which
-    // happens asynchronously after our subscriber socket closes.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Worker fires while the deck is detached.
+    // Worker fires while no subscriber is attached.
     send_work_done(
         &daemon.hook_path,
         &WorkDoneSignal {
@@ -369,278 +431,31 @@ async fn work_done_signal_replayed_after_reattach() {
         },
     )
     .await;
-    // Hook loop is async — give it time to drain the line and record.
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Reattach. The new subscriber must receive the buffered signal as
-    // its first event, before any live messages.
-    let mut sub = client.subscribe_events().await.expect("reattach subscribe");
-    let state_for_task = tui_state.clone();
-    let forwarder = tokio::spawn(async move {
-        while let Ok(Some(msg)) = sub.next_event().await {
-            if let BroadcastMsg::WorkDone(signal) = msg {
-                state_for_task.write().await.handle_work_done(signal);
-            }
-        }
-    });
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut saw = false;
-    while tokio::time::Instant::now() < deadline {
-        let s = tui_state.read().await;
-        if let Some(received) = s.work_done_events.first() {
-            assert_eq!(received.pane_id, "coder-pane");
-            assert_eq!(received.task, "implemented under detached deck");
-            saw = true;
-            break;
-        }
-        drop(s);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        saw,
-        "WorkDoneSignal sent during detach window must be replayed to the next subscriber \
-         (regression for the silent-loss bug)"
-    );
-
-    forwarder.abort();
-}
-
-/// PRD #93 round-3 regression guard for the detach race that the
-/// adb13e9 send-Err buffer alone doesn't cover.
-///
-/// The bug: when a subscribing TUI's socket is torn down, there is a
-/// window where `broadcast::Sender::send` still sees 1 subscriber
-/// (because the daemon-side receiver hasn't been dropped yet), returns
-/// `Ok`, and deposits the message into a receiver buffer that will
-/// never be drained — the send-Err path on `daemon.rs` never fires for
-/// these messages because `send` returned `Ok`. The fix in
-/// `handle_subscribe_events` is to drain anything still buffered in the
-/// dying `rx` via `try_recv` before the receiver drops, and push it
-/// into `pending_broadcasts` so the next attaching subscriber's replay
-/// path delivers it.
-///
-/// This test drives the race deterministically via a
-/// [`SubscribeEventsTestGate`] installed on the daemon's
-/// `pending_broadcasts`: the handler signals `reached` after its main
-/// select loop breaks and parks on `proceed` before running salvage. The
-/// test pushes a `WorkDone` into the broadcast (via the hook socket)
-/// while the handler is parked — `event_tx.send` sees the dying `rx` as
-/// alive, returns `Ok`, and the message lands in `rx`'s receiver-local
-/// buffer with no live polling. The test then signals `proceed`,
-/// salvage runs, the message is recorded into `pending_broadcasts`, and
-/// a fresh subscriber's replay drain delivers it.
-#[tokio::test]
-async fn work_done_signal_replayed_when_send_succeeds_to_dying_receiver() {
-    // Build the daemon by hand so we can install the test gate on its
-    // `pending_broadcasts` before the daemon starts serving. The shape
-    // mirrors `spawn_daemon` above — same hook-vs-attach socket split,
-    // same `with_attach` constructor — but we keep an `Arc` to the
-    // daemon's `pending_broadcasts` so the test can install the gate.
-    let (dir, hook_path, attach_path) = {
-        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let hook = dir.path().join("hook.sock");
-        let attach = dir.path().join("attach.sock");
-        (dir, hook, attach)
-    };
-
-    let gate = Arc::new(SubscribeEventsTestGate::default());
-    let daemon_state = Arc::new(RwLock::new(AppState::default()));
-    let daemon = Daemon::with_attach(daemon_state, attach_path.clone());
-    daemon
-        .pending_broadcasts
-        .install_subscribe_events_test_gate(Some(gate.clone()));
-
-    let hook_for_daemon = hook_path.clone();
-    let handle: JoinHandle<()> = tokio::spawn(async move {
-        let _ = run_daemon_with(&hook_for_daemon, daemon).await;
-    });
-    let _daemon_guard = DaemonHandle {
-        _dir: dir,
-        hook_path: hook_path.clone(),
-        attach_path: attach_path.clone(),
-        handle,
-    };
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline {
-        if attach_path.exists() && UnixStream::connect(&attach_path).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        attach_path.exists(),
-        "attach socket did not appear within 5s"
-    );
-
-    // Worker pane setup so the eventual `handle_work_done` on the
-    // attached TUI resolves role → summary file.
-    let cwd_dir = tempfile::tempdir().unwrap();
-    let tui_state = Arc::new(RwLock::new(AppState::default()));
-    {
-        let mut st = tui_state.write().await;
-        st.register_pane("coder-pane".into());
-        st.pane_role_map.insert("coder-pane".into(), "coder".into());
-        st.pane_cwd_map.insert(
-            "coder-pane".into(),
-            cwd_dir.path().to_string_lossy().into_owned(),
-        );
-    }
-
-    let client = DaemonClient::new(attach_path.clone());
-
-    // 1. Subscribe A and immediately drop the subscription so the
-    //    daemon-side handler exits its main select loop via the
-    //    read-side disconnect detector. The gate then parks the handler
-    //    after loop-break and before salvage — `rx` is still alive but
-    //    no longer being polled.
-    {
-        let _sub = client.subscribe_events().await.expect("initial subscribe");
-        // Brief yield so the daemon-side handler actually subscribes its
-        // `rx` and enters its main select loop before we drop the
-        // subscription. Without this, the handler could observe the
-        // socket EOF before reaching the `loop { select! }` body and
-        // skip the salvage path entirely on the unrelated `?` error
-        // shape — the test would then assert against the wrong code
-        // path. 50ms matches the existing tests in this file.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // 2. Await the handler reaching the gate (after main-loop break,
-    //    before salvage). Once it fires, `rx` is alive and unpolled —
-    //    the precondition for the bug.
-    gate.reached.notified().await;
-
-    // 3. Worker fires while the handler is parked. The daemon's hook
-    //    loop processes the JSON line, calls `event_tx.send(WorkDone)`
-    //    — receiver_count is 1 (dying `rx`), so `send` returns Ok and
-    //    the send-Err record path in daemon.rs DOES NOT fire. The
-    //    message lands in `rx`'s receiver-local buffer where it would
-    //    be silently lost without the salvage step.
-    send_work_done(
-        &hook_path,
-        &WorkDoneSignal {
-            pane_id: "coder-pane".into(),
-            task: "implemented under detach race".into(),
-            done: false,
-            timestamp: Utc::now(),
-        },
+    // The feedback must already be in the orchestrator pane's
+    // scrollback — the daemon wrote it directly into the PTY, no
+    // broadcast involved.
+    let snap = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &orch_agent_id,
+        "Worker coder has completed their task.",
+        Duration::from_secs(5),
     )
     .await;
-    // Hook loop is async — give it time to drain the line and call
-    // event_tx.send so the message is definitely in rx's buffer before
-    // we release the handler. Same 200ms shape as the sibling
-    // detach-window tests above.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // 4. Release the handler. Salvage drains rx, finds the WorkDone,
-    //    and records it into pending_broadcasts.
-    gate.proceed.notify_one();
-    // Give the salvage step a moment to record before subscriber B
-    // attaches and drains pending_broadcasts.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // 5. Reattach as subscriber B. The replay path drains
-    //    pending_broadcasts and delivers the salvaged message as B's
-    //    first event.
-    let mut sub = client.subscribe_events().await.expect("reattach subscribe");
-    let state_for_task = tui_state.clone();
-    let forwarder = tokio::spawn(async move {
-        while let Ok(Some(msg)) = sub.next_event().await {
-            if let BroadcastMsg::WorkDone(signal) = msg {
-                state_for_task.write().await.handle_work_done(signal);
-            }
-        }
-    });
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut saw = false;
-    while tokio::time::Instant::now() < deadline {
-        let s = tui_state.read().await;
-        if let Some(received) = s.work_done_events.first() {
-            assert_eq!(received.pane_id, "coder-pane");
-            assert_eq!(received.task, "implemented under detach race");
-            saw = true;
-            break;
-        }
-        drop(s);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     assert!(
-        saw,
-        "WorkDone landing in a dying receiver's buffer must be salvaged into PendingBroadcasts \
-         and replayed to the next subscriber (regression for the detach-race bug that adb13e9 \
-         did not close)"
+        String::from_utf8_lossy(&snap).contains(".dot-agent-deck/work-done-coder.md"),
+        "feedback bytes must include the per-role summary path"
     );
 
-    forwarder.abort();
-}
-
-/// Parallel guard for `delegate`: same shape of bug, same fix. An
-/// orchestrator's `dot-agent-deck delegate` fired while the deck is
-/// detached must be replayed to the next attaching TUI.
-#[tokio::test]
-async fn delegate_signal_replayed_after_reattach() {
-    let daemon = spawn_daemon().await;
-
-    let tui_state = Arc::new(RwLock::new(AppState::default()));
-    {
-        let mut st = tui_state.write().await;
-        st.register_pane("orch-pane".into());
-        st.pane_role_map
-            .insert("orch-pane".into(), "orchestrator".into());
-        st.orchestrator_pane_ids.insert("orch-pane".into());
-    }
-
-    let client = DaemonClient::new(daemon.attach_path.clone());
-    {
-        let _initial = client.subscribe_events().await.expect("initial subscribe");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    send_delegate(
-        &daemon.hook_path,
-        &DelegateSignal {
-            pane_id: "orch-pane".into(),
-            task: "delegated while detached".into(),
-            to: vec!["coder".into()],
-            timestamp: Utc::now(),
-        },
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let mut sub = client.subscribe_events().await.expect("reattach subscribe");
-    let state_for_task = tui_state.clone();
-    let forwarder = tokio::spawn(async move {
-        while let Ok(Some(msg)) = sub.next_event().await {
-            if let BroadcastMsg::Delegate(signal) = msg {
-                state_for_task.write().await.handle_delegate(signal);
-            }
-        }
-    });
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut saw = false;
-    while tokio::time::Instant::now() < deadline {
-        let s = tui_state.read().await;
-        if let Some(received) = s.delegate_events.first() {
-            assert_eq!(received.pane_id, "orch-pane");
-            assert_eq!(received.task, "delegated while detached");
-            assert_eq!(received.to, vec!["coder".to_string()]);
-            saw = true;
-            break;
-        }
-        drop(s);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // Fresh subscriber reattaches and reads the same scrollback — the
+    // user-visible "after reattach the orchestrator pane shows the
+    // feedback" path. We assert via the registry rather than
+    // round-tripping the snapshot frame for the same reason as
+    // [`daemon_writes_delegate_prompt_to_target_role_pane`].
+    let _reattach = client.subscribe_events().await.expect("reattach subscribe");
+    let snap2 = daemon.pty_registry.snapshot(&orch_agent_id).unwrap();
     assert!(
-        saw,
-        "DelegateSignal sent during detach window must be replayed to the next subscriber"
+        String::from_utf8_lossy(&snap2).contains("Worker coder has completed their task."),
+        "reattached subscriber must still observe the feedback in the orchestrator pane's scrollback"
     );
-
-    forwarder.abort();
 }

@@ -253,6 +253,8 @@ impl TabManager {
                 tab_membership: Some(TabMembership::Orchestration {
                     name: config.name.clone(),
                     role_index,
+                    role_name: role.name.clone(),
+                    is_start_role: role.start,
                 }),
                 rows: spawn_rows,
                 cols: spawn_cols,

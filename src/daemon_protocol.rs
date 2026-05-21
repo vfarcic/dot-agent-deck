@@ -86,8 +86,9 @@ use tracing::{error, info, warn};
 
 pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
-use crate::daemon::PendingBroadcasts;
+use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, is_valid_pane_id_env};
 use crate::event::{AgentType, BroadcastMsg};
+use crate::state::SharedState;
 
 // ---------------------------------------------------------------------------
 // Frame kinds
@@ -437,13 +438,15 @@ pub async fn serve_attach(
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> io::Result<()> {
-    // Discard counter and empty replay buffer so callers that don't care
-    // about idle shutdown or replay don't need to construct either. The
-    // daemon's idle-shutdown + replay path uses [`serve_attach_with_counter`]
-    // and supplies the daemon-wide [`PendingBroadcasts`].
-    let dummy_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let dummy_pending = Arc::new(PendingBroadcasts::new());
-    serve_attach_with_counter(listener, registry, event_tx, dummy_count, dummy_pending).await
+    // Discard counter and use an empty state so callers that don't care
+    // about idle shutdown or daemon-side orchestration don't need to
+    // construct either. The daemon's main path uses
+    // [`serve_attach_with_counter`] with its real state.
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::RwLock;
+    let dummy_count = Arc::new(AtomicUsize::new(0));
+    let dummy_state: SharedState = Arc::new(RwLock::new(crate::state::AppState::default()));
+    serve_attach_with_counter(listener, registry, event_tx, dummy_count, dummy_state).await
 }
 
 /// PRD #93 M1.2 variant of [`serve_attach`] that maintains `client_count`
@@ -459,7 +462,7 @@ pub async fn serve_attach_with_counter(
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
     client_count: Arc<std::sync::atomic::AtomicUsize>,
-    pending_broadcasts: Arc<PendingBroadcasts>,
+    state: SharedState,
 ) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
@@ -477,7 +480,7 @@ pub async fn serve_attach_with_counter(
                 let registry = registry.clone();
                 let event_tx = event_tx.clone();
                 let counter = client_count.clone();
-                let pending = pending_broadcasts.clone();
+                let state = state.clone();
                 let notify = change_notify.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
@@ -508,7 +511,7 @@ pub async fn serve_attach_with_counter(
                         counter: counter.clone(),
                         notify: notify.clone(),
                     };
-                    if let Err(e) = handle_connection(stream, registry, event_tx, pending).await {
+                    if let Err(e) = handle_connection(stream, registry, event_tx, state).await {
                         warn!("attach protocol connection error: {e}");
                     }
                 });
@@ -542,25 +545,18 @@ pub async fn run_attach_server_with_counter(
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
     client_count: Arc<std::sync::atomic::AtomicUsize>,
-    pending_broadcasts: Arc<PendingBroadcasts>,
+    state: SharedState,
 ) -> io::Result<()> {
     let listener = bind_attach_listener(path)?;
     info!("Attach protocol listening on {}", path.display());
-    serve_attach_with_counter(
-        listener,
-        registry,
-        event_tx,
-        client_count,
-        pending_broadcasts,
-    )
-    .await
+    serve_attach_with_counter(listener, registry, event_tx, client_count, state).await
 }
 
 async fn handle_connection(
     mut stream: UnixStream,
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
-    pending_broadcasts: Arc<PendingBroadcasts>,
+    state: SharedState,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -613,6 +609,37 @@ async fn handle_connection(
                 .await?;
                 return Ok(());
             }
+
+            // PRD #93 round-5: capture the bits we need to populate the
+            // daemon's `AppState` role map BEFORE the spawn (we'll need
+            // the pane id from env and the orchestration metadata from
+            // tab_membership). The spawn moves `opts`, so we clone what
+            // we need first.
+            let pane_id_env: Option<String> = env
+                .iter()
+                .find(|(k, _)| k == DOT_AGENT_DECK_PANE_ID)
+                .map(|(_, v)| v.clone())
+                .and_then(|v| {
+                    if is_valid_pane_id_env(&v) {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                });
+            let orchestration_meta: Option<(String, String, bool)> =
+                tab_membership.as_ref().and_then(|tm| match tm {
+                    TabMembership::Orchestration {
+                        name,
+                        role_name,
+                        is_start_role,
+                        ..
+                    } if !role_name.is_empty() => {
+                        Some((name.clone(), role_name.clone(), *is_start_role))
+                    }
+                    _ => None,
+                });
+            let cwd_for_state = cwd.clone();
+
             let opts = SpawnOptions {
                 command: command.as_deref(),
                 cwd: cwd.as_deref(),
@@ -624,14 +651,57 @@ async fn handle_connection(
                 agent_type,
             };
             match registry.spawn_agent(opts) {
-                Ok(id) => write_resp(&mut stream, &AttachResponse::with_id(id)).await?,
+                Ok(id) => {
+                    // PRD #93 round-5: populate daemon-side role maps so
+                    // `handle_delegate` / `handle_work_done` can resolve
+                    // the worker pane and orchestrator pane purely from
+                    // daemon state — no TUI round-trip, no broadcast hop.
+                    // We do this only for orchestration panes; dashboard
+                    // and mode panes don't participate in delegate
+                    // dispatch.
+                    if let (Some(pane_id), Some((orch_name, role_name, is_start_role))) =
+                        (pane_id_env.as_deref(), orchestration_meta)
+                    {
+                        let mut st = state.write().await;
+                        st.register_pane(pane_id.to_string());
+                        st.pane_role_map
+                            .insert(pane_id.to_string(), role_name.clone());
+                        st.pane_orchestration_map
+                            .insert(pane_id.to_string(), orch_name);
+                        if let Some(c) = cwd_for_state.clone() {
+                            st.pane_cwd_map.insert(pane_id.to_string(), c);
+                        }
+                        if is_start_role {
+                            st.orchestrator_pane_ids.insert(pane_id.to_string());
+                        }
+                    }
+                    write_resp(&mut stream, &AttachResponse::with_id(id)).await?
+                }
                 Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
             }
         }
-        AttachRequest::StopAgent { id } => match registry.close_agent(&id) {
-            Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
-            Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
-        },
+        AttachRequest::StopAgent { id } => {
+            // PRD #93 round-5: capture the agent's `pane_id_env` BEFORE
+            // close_agent removes the registry entry, so we can clean up
+            // the daemon's per-pane role-map entries after a successful
+            // close. Without this, a closed pane's role/cwd would linger
+            // in the maps and a subsequent `handle_delegate` aimed at
+            // that role would still resolve the dead pane.
+            let pane_id_env = registry
+                .agent_records()
+                .into_iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.pane_id_env);
+            match registry.close_agent(&id) {
+                Ok(()) => {
+                    if let Some(pane_id) = pane_id_env {
+                        state.write().await.unregister_pane(&pane_id);
+                    }
+                    write_resp(&mut stream, &AttachResponse::ok()).await?
+                }
+                Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+            }
+        }
         AttachRequest::SetAgentLabel {
             id,
             display_name,
@@ -671,7 +741,7 @@ async fn handle_connection(
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
         AttachRequest::SubscribeEvents => {
-            handle_subscribe_events(stream, event_tx, pending_broadcasts).await?;
+            handle_subscribe_events(stream, event_tx).await?;
         }
         AttachRequest::Hello { client_version: _ } => {
             // PRD #76 M2.21: the daemon never enforces or rejects on
@@ -705,13 +775,12 @@ pub async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse)
     }
 }
 
-/// Long-lived `SubscribeEvents` handler (PRD #76 M2.17, extended for
-/// delegate signals in M2.19). Confirms the subscription with an OK
-/// `RESP`, then forwards every `BroadcastMsg` from the daemon-wide
-/// broadcast as a `KIND_EVENT` frame (JSON-tagged variant — see
-/// [`BroadcastMsg`]). Each write is bounded by `CLIENT_WRITE_TIMEOUT`
-/// so a wedged client can't pin this task forever. A lagged receiver —
-/// the client fell further behind than the broadcast capacity — closes
+/// Long-lived `SubscribeEvents` handler (PRD #76 M2.17). Confirms the
+/// subscription with an OK `RESP`, then forwards every hook
+/// [`BroadcastMsg::Event`] from the daemon-wide broadcast as a
+/// `KIND_EVENT` frame. Each write is bounded by `CLIENT_WRITE_TIMEOUT`
+/// so a wedged client can't pin this task forever. A lagged receiver
+/// (the client fell further behind than the broadcast capacity) closes
 /// the connection with `KIND_STREAM_END` carrying `"lagged"`; the
 /// TUI's reconnect path drains a `list_agents` snapshot to recover.
 /// Client disconnect is detected by racing a one-byte read against
@@ -719,63 +788,22 @@ pub async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse)
 /// the client goes away between messages — otherwise the
 /// per-connection task and its receiver would leak for the lifetime
 /// of the daemon.
+///
+/// PRD #93 round-5: orchestration signals (delegate / work-done) used
+/// to ride this channel via `BroadcastMsg::Delegate` / `WorkDone`,
+/// guarded by a replay buffer (`PendingBroadcasts`), a salvage loop on
+/// detach, and a test gate to drive the salvage race. All of that is
+/// gone — orchestration prompts now flow directly into target PTYs
+/// (see [`AppState::handle_delegate`] /
+/// [`AppState::handle_work_done`]) and the surviving PTY scrollback
+/// makes a separate replay path unnecessary.
 async fn handle_subscribe_events(
     stream: UnixStream,
     event_tx: broadcast::Sender<BroadcastMsg>,
-    pending_broadcasts: Arc<PendingBroadcasts>,
 ) -> io::Result<()> {
-    // Subscribe *before* draining the replay buffer so a Delegate/WorkDone
-    // arriving during the drain window (after `record` has stopped being
-    // the destination but before we're in the live recv loop) still lands
-    // on this subscriber via the live channel instead of falling between
-    // the two paths.
     let mut rx = event_tx.subscribe();
     let (mut rd, mut wr) = stream.into_split();
     write_resp(&mut wr, &AttachResponse::ok()).await?;
-
-    // PRD #76 / PRD #93 replay: drain any orchestration signals that
-    // arrived while no TUI was attached. Each entry is written as a
-    // KIND_EVENT frame, identical to the live-recv arm below — the TUI's
-    // subscriber loop is shape-agnostic about live vs replayed.
-    //
-    // Drain semantics matter for correctness here. The earlier shape
-    // (PRD #93 round-1) was `drain()` → write-or-bail; if a write failed
-    // mid-drain the *remaining* entries were silently lost because they
-    // were no longer in the buffer and no one re-enqueued them. A
-    // wedged-then-recovering client would see only the entries that
-    // happened to fit before the timeout. Now we copy the drained vec out
-    // first, write each entry outside any lock, and on the first failure
-    // re-enqueue the failed entry plus every untried entry at the FRONT
-    // of the buffer (preserving FIFO) so the next `SubscribeEvents`
-    // subscriber picks up exactly where we left off.
-    let replay = pending_broadcasts.drain();
-    let mut iter = replay.into_iter();
-    while let Some(msg) = iter.next() {
-        let payload = match serde_json::to_vec(&msg) {
-            Ok(b) => b,
-            Err(e) => {
-                // Unserializable entries are a daemon bug, not a client
-                // problem — drop just this one and keep replaying the rest
-                // rather than re-enqueueing a poison message that would
-                // fail the same way for the next subscriber.
-                warn!("subscribe-events: skipping unserializable replay entry: {e}");
-                continue;
-            }
-        };
-        if !write_or_timeout(&mut wr, KIND_EVENT, &payload).await {
-            // Client wedged or socket error: rebuild the failed-batch list
-            // (the current `msg` plus every still-untried entry from
-            // `iter`) and re-enqueue at the front so a fresh subscriber
-            // can drain them next. Without this, every entry the drain
-            // pulled out would be lost on first write failure.
-            let mut requeue = Vec::with_capacity(1 + iter.size_hint().0);
-            requeue.push(msg);
-            requeue.extend(iter);
-            pending_broadcasts.push_front_batch(requeue);
-            let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
-            return Ok(());
-        }
-    }
 
     loop {
         tokio::select! {
@@ -818,66 +846,6 @@ async fn handle_subscribe_events(
             _ = rd.read_u8() => {
                 break;
             }
-        }
-    }
-
-    // PRD #93 round-3 test instrumentation: park the handler between
-    // loop-break and salvage so the regression test can deterministically
-    // deposit a message into `rx`'s receiver-local buffer (after the
-    // select loop is no longer polling but before `rx` is dropped).
-    // Production callers never install this gate; the accessor returns
-    // `None`, no waiting happens, and salvage runs immediately.
-    if let Some(gate) = pending_broadcasts.subscribe_events_test_gate() {
-        gate.reached.notify_one();
-        gate.proceed.notified().await;
-    }
-
-    // PRD #93 round-3 salvage: close the detach race where
-    // `broadcast::send` observed our `rx` as alive (1 subscriber, return
-    // `Ok`) and deposited a `Delegate` / `WorkDone` signal into its
-    // receiver-local buffer *between* the read-side disconnect detector
-    // firing and `rx` being dropped. The send-Err recording path in
-    // `daemon.rs` never fired (send returned Ok), and dropping `rx` here
-    // would silently lose the signal forever.
-    //
-    // Drain anything still buffered with `try_recv` and push it back into
-    // `PendingBroadcasts` so the next attaching subscriber's replay
-    // delivers it. `try_recv` drains FIFO, so a straight loop + `record`
-    // per item preserves send order for the next subscriber.
-    //
-    // - `BroadcastMsg::Event` is unbounded and intentionally not buffered
-    //   (see `PendingBroadcasts` docs); skip it inline.
-    // - Any `TryRecvError` ends the loop. `Empty`/`Closed` are normal
-    //   terminators; `Lagged` means we missed unrecoverable messages —
-    //   guessing what to replay would inject corruption, so bail out the
-    //   same as the normal terminators.
-    let mut salvaged = 0usize;
-    while let Ok(msg) = rx.try_recv() {
-        match msg {
-            BroadcastMsg::Event(_) => continue,
-            BroadcastMsg::Delegate(_) | BroadcastMsg::WorkDone(_) => {
-                pending_broadcasts.record(msg);
-                salvaged += 1;
-            }
-        }
-    }
-    if salvaged > 0 {
-        // event_tx.receiver_count() still includes our own (about-to-drop)
-        // `rx`, so > 1 means at least one *other* subscriber is still
-        // attached. In that case the surviving subscriber already received
-        // the broadcast live and a future subscriber will pull the
-        // salvaged copy out of `PendingBroadcasts` too — a duplicate
-        // delivery from the system's POV. The deck almost never runs with
-        // two attached TUIs against the same daemon, so the simplification
-        // is acceptable; the debug log lets operators correlate if a
-        // dup-delivery report ever shows up.
-        let other_subs = event_tx.receiver_count().saturating_sub(1);
-        if other_subs > 0 {
-            tracing::debug!(
-                salvaged,
-                other_subscribers = other_subs,
-                "subscribe-events: salvaged stranded broadcasts from dying receiver while other subscribers still attached — possible duplicate delivery to the next attaching subscriber"
-            );
         }
     }
     Ok(())
@@ -1184,6 +1152,8 @@ mod tests {
             tab_membership: Some(TabMembership::Orchestration {
                 name: "tdd-cycle".into(),
                 role_index: 2,
+                role_name: "coder".into(),
+                is_start_role: false,
             }),
             agent_type: None,
         };
@@ -1192,6 +1162,8 @@ mod tests {
         assert_eq!(v["tab_membership"]["kind"], "orchestration");
         assert_eq!(v["tab_membership"]["name"], "tdd-cycle");
         assert_eq!(v["tab_membership"]["role_index"], 2);
+        assert_eq!(v["tab_membership"]["role_name"], "coder");
+        assert_eq!(v["tab_membership"]["is_start_role"], false);
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
         match back {
             AttachRequest::StartAgent { tab_membership, .. } => {
@@ -1200,6 +1172,8 @@ mod tests {
                     Some(TabMembership::Orchestration {
                         name: "tdd-cycle".into(),
                         role_index: 2,
+                        role_name: "coder".into(),
+                        is_start_role: false,
                     })
                 );
             }
@@ -1220,6 +1194,8 @@ mod tests {
             tab_membership: Some(TabMembership::Orchestration {
                 name: "tdd-cycle".into(),
                 role_index: 1,
+                role_name: "coder".into(),
+                is_start_role: false,
             }),
             agent_type: None,
         };
@@ -1400,17 +1376,13 @@ mod tests {
 
     #[tokio::test]
     async fn kind_event_frame_round_trip() {
-        // The KIND_EVENT payload is a JSON-encoded BroadcastMsg
-        // (PRD #76 M2.17 / M2.19 — the Event variant wraps the
-        // legacy AgentEvent shape; the Delegate variant carries
-        // orchestrator delegate signals across the external-daemon
-        // hop; the WorkDone variant carries worker completion
-        // signals back the same way). Pin the round-trip for all
-        // variants here so a future structural change doesn't
-        // silently break wire compatibility for remote-mode TUIs.
-        use crate::event::{
-            AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType, WorkDoneSignal,
-        };
+        // The KIND_EVENT payload is a JSON-encoded BroadcastMsg.
+        // PRD #93 round-5: only the Event variant rides this channel
+        // now — Delegate / WorkDone are dispatched directly into PTYs
+        // by the daemon. Pin the on-wire shape so a future rename of
+        // the enum tag or the variant name trips the build instead of
+        // silently breaking remote-mode TUIs.
+        use crate::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
         use chrono::Utc;
         use std::collections::HashMap;
 
@@ -1456,84 +1428,11 @@ mod tests {
         let (kind, body) = read_frame(&mut cursor).await.unwrap().unwrap();
         assert_eq!(kind, KIND_EVENT);
         let back: BroadcastMsg = serde_json::from_slice(&body).unwrap();
-        match back {
-            BroadcastMsg::Event(e) => {
-                assert_eq!(e.session_id, "sess-1");
-                assert_eq!(e.event_type, EventType::ToolStart);
-                assert_eq!(e.tool_name.as_deref(), Some("Read"));
-                assert_eq!(e.pane_id.as_deref(), Some("7"));
-            }
-            BroadcastMsg::Delegate(_) | BroadcastMsg::WorkDone(_) => {
-                panic!("expected Event variant")
-            }
-        }
-
-        let signal = DelegateSignal {
-            pane_id: "orch-7".into(),
-            task: "implement X".into(),
-            to: vec!["coder".into(), "reviewer".into()],
-            timestamp: Utc::now(),
-        };
-        let payload = serde_json::to_vec(&BroadcastMsg::Delegate(signal)).unwrap();
-
-        // Same wire-shape pin for the Delegate variant.
-        let wire: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(wire["kind"], "delegate");
-        assert_eq!(wire["pane_id"], "orch-7");
-        assert_eq!(wire["task"], "implement X");
-        assert_eq!(
-            wire["to"],
-            serde_json::json!(["coder".to_string(), "reviewer".to_string()])
-        );
-        assert!(wire["timestamp"].is_string());
-
-        let mut buf: Vec<u8> = Vec::new();
-        write_frame(&mut buf, KIND_EVENT, &payload).await.unwrap();
-        let mut cursor = std::io::Cursor::new(buf);
-        let (_, body) = read_frame(&mut cursor).await.unwrap().unwrap();
-        let back: BroadcastMsg = serde_json::from_slice(&body).unwrap();
-        match back {
-            BroadcastMsg::Delegate(s) => {
-                assert_eq!(s.pane_id, "orch-7");
-                assert_eq!(s.task, "implement X");
-                assert_eq!(s.to, vec!["coder".to_string(), "reviewer".to_string()]);
-            }
-            BroadcastMsg::Event(_) | BroadcastMsg::WorkDone(_) => {
-                panic!("expected Delegate variant")
-            }
-        }
-
-        let signal = WorkDoneSignal {
-            pane_id: "worker-9".into(),
-            task: "implemented X".into(),
-            done: false,
-            timestamp: Utc::now(),
-        };
-        let payload = serde_json::to_vec(&BroadcastMsg::WorkDone(signal)).unwrap();
-
-        // Wire-shape pin for the WorkDone variant: same hop as Delegate.
-        let wire: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(wire["kind"], "work_done");
-        assert_eq!(wire["pane_id"], "worker-9");
-        assert_eq!(wire["task"], "implemented X");
-        assert_eq!(wire["done"], false);
-        assert!(wire["timestamp"].is_string());
-
-        let mut buf: Vec<u8> = Vec::new();
-        write_frame(&mut buf, KIND_EVENT, &payload).await.unwrap();
-        let mut cursor = std::io::Cursor::new(buf);
-        let (_, body) = read_frame(&mut cursor).await.unwrap().unwrap();
-        let back: BroadcastMsg = serde_json::from_slice(&body).unwrap();
-        match back {
-            BroadcastMsg::WorkDone(s) => {
-                assert_eq!(s.pane_id, "worker-9");
-                assert_eq!(s.task, "implemented X");
-                assert!(!s.done);
-            }
-            BroadcastMsg::Event(_) | BroadcastMsg::Delegate(_) => {
-                panic!("expected WorkDone variant")
-            }
-        }
+        let BroadcastMsg::Event(e) = back;
+        assert_eq!(e.session_id, "sess-1");
+        assert_eq!(e.event_type, EventType::ToolStart);
+        assert_eq!(e.tool_name.as_deref(), Some("Read"));
+        assert_eq!(e.pane_id.as_deref(), Some("7"));
     }
 
     #[test]
@@ -1635,9 +1534,10 @@ mod tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let (event_tx, _event_rx) = broadcast::channel(16);
 
-        let pending = Arc::new(PendingBroadcasts::new());
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let server_task = tokio::spawn(async move {
-            handle_connection(server, registry, event_tx, pending)
+            handle_connection(server, registry, event_tx, state)
                 .await
                 .unwrap();
         });
@@ -1678,9 +1578,10 @@ mod tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let (event_tx, _event_rx) = broadcast::channel(16);
 
-        let pending = Arc::new(PendingBroadcasts::new());
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let server_task = tokio::spawn(async move {
-            handle_connection(server, registry, event_tx, pending)
+            handle_connection(server, registry, event_tx, state)
                 .await
                 .unwrap();
         });

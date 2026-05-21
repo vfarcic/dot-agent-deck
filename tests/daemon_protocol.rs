@@ -246,6 +246,8 @@ async fn start_agent_with_orchestration_membership_round_trip() {
         TabMembership::Orchestration {
             name: "tdd-cycle".into(),
             role_index: 2,
+            role_name: "coder".into(),
+            is_start_role: false,
         },
     )
     .await;
@@ -260,6 +262,8 @@ async fn start_agent_with_orchestration_membership_round_trip() {
         Some(TabMembership::Orchestration {
             name: "tdd-cycle".into(),
             role_index: 2,
+            role_name: "coder".into(),
+            is_start_role: false,
         })
     );
     server.registry.shutdown_all();

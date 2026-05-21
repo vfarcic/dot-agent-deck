@@ -186,7 +186,23 @@ pub enum TabMembership {
     /// of this role in `OrchestrationConfig.roles`; on reconnect a dead
     /// slot (between role-index 0 and `roles.len()` with no surviving
     /// agent) is marked failed rather than respawned.
-    Orchestration { name: String, role_index: usize },
+    ///
+    /// PRD #93 round-5: the daemon now owns the orchestration dispatch flow
+    /// (delegate / work-done) and writes the per-role prompt directly into
+    /// the target pane's PTY. To do that without needing to load the
+    /// orchestration config on the daemon side, `role_name` and
+    /// `is_start_role` are carried inline alongside the index: `role_name`
+    /// populates [`crate::state::AppState::pane_role_map`] and
+    /// `is_start_role` populates
+    /// [`crate::state::AppState::orchestrator_pane_ids`].
+    Orchestration {
+        name: String,
+        role_index: usize,
+        #[serde(default)]
+        role_name: String,
+        #[serde(default)]
+        is_start_role: bool,
+    },
 }
 
 impl TabMembership {
@@ -954,6 +970,41 @@ impl AgentPtyRegistry {
         // harmless — the monitor will re-check counters anyway.
         self.change_notify.notify_one();
         Ok(id)
+    }
+
+    /// Write `bytes` to the PTY of the agent whose `pane_id_env` matches
+    /// `pane_id`.
+    ///
+    /// PRD #93 round-5: orchestration dispatch (delegate / work-done) now
+    /// lives on the daemon side, and routing happens via this method. The
+    /// caller (typically `AppState::handle_delegate` /
+    /// `AppState::handle_work_done` inside the daemon's hook loop) holds the
+    /// TUI's pane id, not the registry's agent id; we look up by
+    /// `pane_id_env` so the daemon can target panes without keeping a
+    /// separate pane→agent index. Bytes that land in the PTY surface as
+    /// normal terminal output in the pane's scrollback — that's the new
+    /// "journal" surface for orchestration feedback (no separate
+    /// broadcast / file cursor / buffer).
+    pub async fn write_to_pane(&self, pane_id: &str, bytes: &[u8]) -> Result<(), AgentPtyError> {
+        // Resolve writer under the sync lock, then drop the lock before
+        // awaiting the async writer mutex — otherwise we'd hold the
+        // registry mutex across an `await`, blocking every other registry
+        // op (spawn, subscribe, list) until the PTY accepted the bytes.
+        let writer = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .agents
+                .values()
+                .find(|a| a.pane_id_env.as_deref() == Some(pane_id))
+                .map(|a| a.writer.clone())
+                .ok_or_else(|| AgentPtyError::NotFound(pane_id.to_string()))?
+        };
+        use std::io::Write as _;
+        let mut w = writer.lock().await;
+        w.write_all(bytes)
+            .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
+        let _ = w.flush();
+        Ok(())
     }
 
     /// Stop an agent: SIGKILL the child, reap it, drop its handles. Any

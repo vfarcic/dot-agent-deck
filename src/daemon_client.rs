@@ -634,6 +634,8 @@ mod tests {
             tab_membership: Some(TabMembership::Orchestration {
                 name: "tdd-cycle".into(),
                 role_index: 2,
+                role_name: "coder".into(),
+                is_start_role: false,
             }),
             agent_type: None,
         };
@@ -643,6 +645,8 @@ mod tests {
             Some(TabMembership::Orchestration {
                 name: "tdd-cycle".into(),
                 role_index: 2,
+                role_name: "coder".into(),
+                is_start_role: false,
             }),
         );
     }

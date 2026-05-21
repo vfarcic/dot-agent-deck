@@ -133,9 +133,8 @@ async fn hook_event_round_trips_to_attached_appstate() {
     let state_for_task = tui_state.clone();
     let forwarder = tokio::spawn(async move {
         while let Ok(Some(msg)) = sub.next_event().await {
-            if let BroadcastMsg::Event(event) = msg {
-                state_for_task.write().await.apply_event(event);
-            }
+            let BroadcastMsg::Event(event) = msg;
+            state_for_task.write().await.apply_event(event);
         }
     });
 

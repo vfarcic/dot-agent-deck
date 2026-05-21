@@ -98,33 +98,22 @@ pub struct DelegateSignal {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Daemon → attached-TUI broadcast (PRD #76 M2.17/M2.19). The daemon
-/// publishes one of these per ingested hook message; subscribers receive
-/// them as `KIND_EVENT` frames on the attach socket.
+/// Daemon → attached-TUI broadcast (PRD #76 M2.17). The daemon publishes
+/// one of these per ingested hook event; subscribers receive them as
+/// `KIND_EVENT` frames on the attach socket.
 ///
-/// In external-daemon mode the daemon's own `AppState` doesn't carry the
-/// role map (the TUI does), so the daemon can't validate delegate
-/// signals locally. The broadcast is what lets the TUI's `AppState`
-/// receive the signal and run role-validation against its own
-/// `pane_role_map` / `orchestrator_pane_ids`. In the in-process daemon
-/// path the TUI and daemon share state directly and no subscriber is
-/// attached — `send` returns Err(no receivers) and is ignored.
+/// PRD #93 round-5: the `Delegate` / `WorkDone` variants used to ride this
+/// channel too, because the daemon couldn't validate or dispatch them
+/// locally in external-daemon mode (the role map lived on the TUI side).
+/// The daemon now owns the role map and the PTY registry, so it dispatches
+/// those signals directly into the target pane's PTY — no broadcast hop,
+/// no replay buffer, no salvage. Only hook events keep using this channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum BroadcastMsg {
     /// A hook event (existing M2.17 wire shape, now wrapped).
     #[serde(rename = "event")]
     Event(AgentEvent),
-    /// An orchestrator's delegate signal (M2.19).
-    #[serde(rename = "delegate")]
-    Delegate(DelegateSignal),
-    /// A worker's work-done signal (or orchestrator's `--done`). Same
-    /// rationale as `Delegate`: in external-daemon mode the daemon's
-    /// `pane_role_map` / `pane_cwd_map` are empty, so the daemon can't
-    /// resolve the role or write the summary file. The TUI-side
-    /// subscriber re-applies the signal against the real state.
-    #[serde(rename = "work_done")]
-    WorkDone(WorkDoneSignal),
 }
 
 /// Signal sent by a worker via `dot-agent-deck work-done`.

@@ -674,17 +674,14 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
 
 /// PRD #76 M2.17 (hook events) / M2.19 (delegate signals): open a
 /// long-lived `SubscribeEvents` connection against the daemon and
-/// route each `BroadcastMsg` into the TUI's `AppState`:
+/// route each [`BroadcastMsg::Event`] into the TUI's `AppState` via
+/// `apply_event`.
 ///
-/// - [`BroadcastMsg::Event`] → `apply_event`.
-/// - [`BroadcastMsg::Delegate`] → `handle_delegate`. The daemon can't
-///   validate delegate signals in external-daemon mode (its own
-///   `pane_role_map` is empty); the TUI re-runs the orchestrator-role
-///   guard against its own role map before enqueueing.
-/// - [`BroadcastMsg::WorkDone`] → `handle_work_done`. Same reason: the
-///   daemon can't resolve the role or write `.dot-agent-deck/work-done-
-///   {role}.md` in external mode, so the TUI re-applies the signal
-///   against its own state and feeds the orchestrator pane.
+/// PRD #93 round-5: the delegate / work-done variants used to ride this
+/// channel too — the daemon couldn't dispatch them locally and the TUI
+/// re-ran the role-validation guards. The daemon now owns dispatch end
+/// to end (writes the prompt directly into the target pane's PTY), so
+/// only hook events flow through here.
 ///
 /// Reconnects with a small backoff on transport errors so a daemon
 /// restart or a `KIND_STREAM_END "lagged"` tear-down recovers
@@ -712,12 +709,6 @@ fn spawn_event_subscriber(
                         match sub.next_event().await {
                             Ok(Some(BroadcastMsg::Event(event))) => {
                                 state.write().await.apply_event(event);
-                            }
-                            Ok(Some(BroadcastMsg::Delegate(signal))) => {
-                                state.write().await.handle_delegate(signal);
-                            }
-                            Ok(Some(BroadcastMsg::WorkDone(signal))) => {
-                                state.write().await.handle_work_done(signal);
                             }
                             Ok(None) => break,
                             Err(e) => {
