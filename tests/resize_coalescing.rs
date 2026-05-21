@@ -147,7 +147,7 @@ async fn start_mock_server() -> MockServer {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rapid_resize_calls_coalesce_to_few_daemon_requests() {
     let server = start_mock_server().await;
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));

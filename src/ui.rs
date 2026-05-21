@@ -2167,52 +2167,6 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
 /// Tear down every non-dashboard tab (mode + orchestration) and unregister
 /// their pane IDs from `state`.
 ///
-/// PRD #76: gated on local-deck mode. In external-daemon mode the daemon
-/// owns the agent children and Quit/Detach must both leave them running.
-/// The Detach path explicitly calls `detach_all_streams` first (which
-/// removes the panes from the controller's local registry), so by the
-/// time this teardown ran on Detach the close_pane lookups missed and
-/// became no-ops — the daemon agents survived. The Quit path has no such
-/// pre-step, so the unconditional teardown was issuing `stop-agent`
-/// against the daemon for every orchestration role pane and killing the
-/// agents. Skipping the loop in external-daemon mode is correct: pane
-/// Drop closes the attach sockets, the daemon observes EOF, and the
-/// agents survive as the spec requires. In local-deck mode the loop
-/// stays — those panes are real PTY children that would leak past TUI
-/// exit otherwise.
-pub fn run_post_loop_teardown(
-    pane: &Arc<dyn PaneController>,
-    state: &SharedState,
-    tab_manager: &mut TabManager,
-) {
-    let external_daemon = pane
-        .as_any()
-        .downcast_ref::<EmbeddedPaneController>()
-        .is_some_and(|c| c.is_external_daemon());
-    if external_daemon {
-        // Quit in external-daemon mode must leave daemon agents running (spec).
-        // Detach removes stream panes from the controller's local registry
-        // before this helper runs, so `close_pane` would no-op for them
-        // anyway. Quit has no such pre-step, so without this gate
-        // `close_pane` → `client.stop_agent` would SIGKILL orchestration
-        // agents on the daemon.
-        return;
-    }
-    // PRD #76 M2.18: skip tab 0 (Dashboard) deliberately. `TabManager::close_tab(0)`
-    // returns `Err(CannotCloseDashboard)` by design, and the `Tab::Dashboard`
-    // variant carries no pane IDs anyway — dashboard PTY children are tracked
-    // through `state`/the pane controller directly and die with the TUI
-    // process on exit. Iterating from 1 here is the only correct range; a
-    // `0..tab_count()` bound would error on tab 0 and return nothing.
-    for i in (1..tab_manager.tab_count()).rev() {
-        if let Ok(ids) = tab_manager.close_tab(i) {
-            for id in ids {
-                state.blocking_write().unregister_pane(&id);
-            }
-        }
-    }
-}
-
 pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
@@ -2241,10 +2195,11 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, palette);
-    ui.via_daemon = pane
-        .as_any()
-        .downcast_ref::<EmbeddedPaneController>()
-        .is_some_and(|c| c.is_external_daemon());
+    // PRD #93 Phase 2: the deck always talks to an external daemon, so
+    // the quit dialog always lands on the "Detach (leave agents
+    // running)" wording. M4.2 will collapse the dialog entirely; until
+    // then this flag stays as the rendering knob.
+    ui.via_daemon = true;
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -4469,9 +4424,10 @@ pub fn run_tui(
         }
     }
 
-    // Tear down all mode/orchestration tabs (clean up their panes),
-    // gated on external-daemon mode — see `run_post_loop_teardown`.
-    run_post_loop_teardown(&pane, &state, &mut tab_manager);
+    // PRD #93 Phase 2: there's no local-deck teardown path anymore.
+    // Dropping `pane` closes the attach sockets, the daemon observes
+    // EOF, and the agents survive — same property the round-7 loop
+    // already guarded for the external-daemon case.
 
     let _ = crossterm::execute!(
         std::io::stdout(),
@@ -6866,7 +6822,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 render_frame(
                     frame,
                     &state,
@@ -6933,7 +6889,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 render_frame(
                     frame,
                     &state,
@@ -7048,7 +7004,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 render_frame(
                     frame,
                     &state,
@@ -7263,7 +7219,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 render_frame(
                     frame,
                     &state,
@@ -7340,7 +7296,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 render_frame(
                     frame,
                     &state,
@@ -7393,7 +7349,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 render_frame(
                     frame,
                     &state,
@@ -9206,7 +9162,8 @@ mod tests {
 
     #[test]
     fn pending_dispatch_timeout() {
-        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
+        let pane_ctrl =
+            Arc::new(crate::embedded_pane::EmbeddedPaneController::for_render_only_tests());
         let pane: Arc<dyn PaneController> = pane_ctrl;
         let snapshot = AppState::default();
         let mut ui = default_ui();
@@ -9226,7 +9183,8 @@ mod tests {
 
     #[test]
     fn pending_dispatch_waits_for_agent_ready() {
-        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
+        let pane_ctrl =
+            Arc::new(crate::embedded_pane::EmbeddedPaneController::for_render_only_tests());
         let pane: Arc<dyn PaneController> = pane_ctrl;
         let snapshot = AppState::default(); // No sessions → agent not ready
         let mut ui = default_ui();

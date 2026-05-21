@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::agent_pty::{DOT_AGENT_DECK_LOCAL_DAEMON, DOT_AGENT_DECK_VIA_DAEMON};
+use crate::agent_pty::DOT_AGENT_DECK_VIA_DAEMON;
 use crate::config::state_dir;
 
 /// Errors surfaced by the lazy-spawn machinery. The CLI handler renders
@@ -369,30 +369,6 @@ pub fn via_daemon_enabled() -> bool {
         .ok()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
-}
-
-/// PRD #93 M1.1: returns `true` when the TUI should connect to (or
-/// auto-spawn) an external daemon. The default is `true` — every fresh
-/// `dot-agent-deck` invocation auto-spawns a per-user daemon over the
-/// `attach_socket_path()` Unix socket unless explicitly opted out.
-///
-/// The opt-out lever is `DOT_AGENT_DECK_LOCAL_DAEMON` set to a truthy value
-/// (`1`/`true`/`yes`). Phase 2 of the PRD removes the in-process path
-/// entirely; until then this lever exists so tests and any caller that
-/// hits an external-daemon edge case can fall back to the legacy in-process
-/// `Daemon::with_attach_in_process` path. `DOT_AGENT_DECK_VIA_DAEMON=1` is
-/// still honored as a *positive* signal (legacy connect bootstrap), but it
-/// no longer matters in the unset case — the new default already selects
-/// external.
-pub fn use_external_daemon() -> bool {
-    // Explicit opt-out wins over both the default and the legacy opt-in,
-    // so a developer who already has DOT_AGENT_DECK_VIA_DAEMON set in their
-    // shell can still drop back to the in-process path for debugging.
-    let local = std::env::var(DOT_AGENT_DECK_LOCAL_DAEMON)
-        .ok()
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
-    !local
 }
 
 /// M2.8 TUI bootstrap entry point. When the dashboard is invoked with

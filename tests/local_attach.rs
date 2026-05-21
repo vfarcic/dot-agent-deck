@@ -89,7 +89,7 @@ fn screen_contains(ctrl: &EmbeddedPaneController, pane_id: &str, needle: &str) -
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_pane_receives_daemon_output() {
     let server = start_server().await;
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -131,7 +131,7 @@ async fn stream_pane_receives_daemon_output() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_pane_keystrokes_reach_agent() {
     let server = start_server().await;
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -180,7 +180,7 @@ async fn dropping_controller_detaches_but_agent_survives() {
         let server_path = server.path.clone();
         let runtime = tokio::runtime::Handle::current();
         move || -> EmbeddedPaneController {
-            let ctrl = EmbeddedPaneController::with_remote_deck(server_path, runtime);
+            let ctrl = EmbeddedPaneController::new(server_path, runtime);
             ctrl.create_pane(Some("sh -c 'sleep 30'"), None).unwrap();
             ctrl
         }
@@ -238,7 +238,7 @@ async fn dropping_controller_detaches_but_agent_survives() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_pane_stops_agent_in_daemon() {
     let server = start_server().await;
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -306,7 +306,7 @@ async fn close_pane_surfaces_stop_agent_error() {
     // than silently degrade to detach (which would leak the agent on the
     // remote with no signal to the user).
     let server = start_server().await;
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));

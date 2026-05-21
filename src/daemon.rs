@@ -188,16 +188,6 @@ pub struct Daemon {
     /// tests that only exercise hook ingestion. Production callers
     /// (`main.rs`) populate this from `config::attach_socket_path()`.
     pub attach_socket_path: Option<PathBuf>,
-    /// `true` when this daemon shares its `state` Arc with a TUI in the
-    /// same process (the local-mode in-TUI-process daemon).
-    ///
-    /// PRD #93 round-5: orchestration dispatch is now identical in both
-    /// modes — the daemon always owns the role map and writes the prompt
-    /// directly into the target pane's PTY. The `in_process` flag now
-    /// only gates idle-shutdown (in-process daemons die with the TUI;
-    /// firing idle-shutdown from underneath the TUI would race its own
-    /// drop path).
-    pub in_process: bool,
     /// Daemon-wide broadcast of hook events (PRD #76 M2.17). The hook
     /// loop wraps every successfully-parsed `AgentEvent` in
     /// `BroadcastMsg::Event` and publishes it here; the attach server
@@ -215,14 +205,10 @@ pub struct Daemon {
     /// PRD #93 M1.2 idle-shutdown window. When `Some`, the daemon's idle
     /// monitor signals shutdown after the configured duration of zero
     /// attached clients *and* zero managed agents. `None` disables idle
-    /// shutdown entirely — the daemon stays up indefinitely.
-    ///
-    /// Idle shutdown is meaningful only for the standalone (`!in_process`)
-    /// daemon: the in-process daemon's lifetime is already tied to the
-    /// TUI's, and exiting it on idle would race the still-running TUI.
-    /// The standalone constructor [`with_attach`] populates this from
-    /// [`idle_shutdown_from_env`]; [`with_attach_in_process`] forces it
-    /// to `None` (the daemon dies with its TUI either way).
+    /// shutdown entirely — the daemon stays up indefinitely. PRD #93
+    /// Phase 2 deleted the in-process variant that used to force this
+    /// off; the standalone constructor [`with_attach`] is now the only
+    /// path and it picks up [`idle_shutdown_from_env`].
     pub idle_shutdown: Option<Duration>,
 }
 
@@ -235,7 +221,6 @@ impl Daemon {
             state,
             pty_registry: Arc::new(AgentPtyRegistry::new()),
             attach_socket_path: None,
-            in_process: false,
             event_tx,
             client_count: Arc::new(AtomicUsize::new(0)),
             // Hook-only daemons don't accept attaches, so idle-shutdown
@@ -261,30 +246,10 @@ impl Daemon {
             state,
             pty_registry: Arc::new(AgentPtyRegistry::new()),
             attach_socket_path: Some(attach_path),
-            in_process: false,
             event_tx,
             client_count: Arc::new(AtomicUsize::new(0)),
             idle_shutdown: idle_shutdown_from_env(),
         }
-    }
-
-    /// Same as [`with_attach`](Self::with_attach) but flags the daemon as
-    /// sharing `state` with a TUI in the same process. PRD #93 round-5:
-    /// the dispatch routing no longer branches on this flag — the daemon
-    /// owns the role map and writes directly into target PTYs in both
-    /// modes. The flag survives only to keep idle-shutdown off when the
-    /// daemon's lifetime is already tied to the TUI's. Used by the
-    /// local-mode TUI's in-process daemon (`run_tui_session` when the
-    /// PRD #93 escape-hatch
-    /// [`crate::agent_pty::DOT_AGENT_DECK_LOCAL_DAEMON`] is set).
-    pub fn with_attach_in_process(state: SharedState, attach_path: PathBuf) -> Self {
-        let mut daemon = Self::with_attach(state, attach_path);
-        daemon.in_process = true;
-        // In-process daemons die with the TUI; the idle monitor would
-        // race the TUI thread by calling exit on an empty registry while
-        // the TUI is still alive. Force off.
-        daemon.idle_shutdown = None;
-        daemon
     }
 
     /// PRD #93 M1.2 fluent override of the idle-shutdown window. Pass
@@ -376,17 +341,6 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let client_count = daemon.client_count;
     let idle_shutdown = daemon.idle_shutdown;
 
-    // PRD #93 round-5: orchestration dispatch is now unified across
-    // in-process and external modes — both call
-    // `state.handle_delegate` / `state.handle_work_done` against the
-    // daemon's own `AppState`, which now owns the role map (populated
-    // at `StartAgent` time) and the PTY registry. The previous
-    // `is_external_mode` branching only kept the in-process variant on
-    // the direct-call path while the external variant rode a broadcast
-    // hop; that bifurcation was the root of every detach-window
-    // round-1..4 fix. With one code path, there is nothing to lose.
-    let is_in_process = daemon.in_process;
-
     // PRD #93 M1.2 shutdown signal — `Notify` is single-shot/level-triggered
     // enough for our needs: the idle monitor notifies once when the timer
     // expires, the hook loop's `select!` arm wakes up, and the loop exits.
@@ -415,28 +369,21 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     });
 
-    // PRD #93 M1.2 idle monitor — runs only for the standalone daemon
-    // path. In-process daemons skip this because their lifetime is tied
-    // to the TUI (the TUI's `Drop` aborts the daemon task and unlinks
-    // the sockets directly).
-    //
-    // PRD #93 round-2 reviewer REV-1: monitor is edge-triggered — it
-    // shares the registry's `change_notify` so transitions on both sides
-    // (attach counter via `ClientGuard`, registry via spawn/close/exit)
-    // wake it immediately. No polling cadence to race against a brief
-    // reconnect.
-    let idle_handle = match (idle_shutdown, is_in_process) {
-        (Some(window), false) => {
-            let counter = client_count.clone();
-            let registry = pty_registry.clone();
-            let shutdown_signal = shutdown.clone();
-            let notify = pty_registry.change_notify();
-            Some(tokio::spawn(async move {
-                run_idle_monitor(counter, registry, window, shutdown_signal, notify).await;
-            }))
-        }
-        _ => None,
-    };
+    // PRD #93 M1.2 idle monitor — edge-triggered via the registry's
+    // `change_notify` so transitions on both sides (attach counter via
+    // `ClientGuard`, registry via spawn/close/exit) wake it
+    // immediately. No polling cadence to race against a brief
+    // reconnect. PRD #93 Phase 2 deleted the in-process variant that
+    // used to skip this; the daemon is always standalone now.
+    let idle_handle = idle_shutdown.map(|window| {
+        let counter = client_count.clone();
+        let registry = pty_registry.clone();
+        let shutdown_signal = shutdown.clone();
+        let notify = pty_registry.change_notify();
+        tokio::spawn(async move {
+            run_idle_monitor(counter, registry, window, shutdown_signal, notify).await;
+        })
+    });
 
     let result = run_hook_loop(listener, state, event_tx, pty_registry.clone(), shutdown).await;
 

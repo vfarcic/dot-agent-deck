@@ -125,7 +125,7 @@ async fn hydrate_creates_panes_for_existing_agents() {
     // emitted its echo, and the parser assertion below would race.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -191,7 +191,7 @@ async fn hydrate_returns_empty_when_no_agents_exist() {
     // normal "No active sessions..." view. The hydrate call must not error
     // and must not create any panes.
     let server = start_real_server().await;
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -221,7 +221,7 @@ async fn hydrate_treats_list_agents_failure_as_empty() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("does-not-exist.sock");
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         missing,
         tokio::runtime::Handle::current(),
     ));
@@ -331,7 +331,7 @@ async fn hydrate_preserves_pane_id_from_agent_env() {
         .await
         .expect("start_agent should succeed");
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -426,7 +426,7 @@ async fn hydrate_falls_back_to_allocated_id_for_legacy_daemon() {
         run_legacy_list_server(listener).await;
     });
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         path,
         tokio::runtime::Handle::current(),
     ));
@@ -496,7 +496,7 @@ async fn hydrate_treats_list_agents_timeout_as_empty() {
         run_silent_list_server(listener).await;
     });
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         path,
         tokio::runtime::Handle::current(),
     ));
@@ -540,7 +540,7 @@ async fn hydrate_skips_agent_that_disappears_between_list_and_attach() {
         run_partial_attach_server(listener).await;
     });
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         path,
         tokio::runtime::Handle::current(),
     ));
@@ -613,7 +613,7 @@ async fn hydrate_drops_oversize_pane_id_env_at_capture() {
     );
 
     // Client-side: hydrate must produce a numeric (allocate_id) pane id.
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -672,7 +672,7 @@ async fn hydrate_drops_control_char_pane_id_env_at_capture() {
         record.pane_id_env
     );
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -732,7 +732,7 @@ async fn hydrate_dedups_duplicate_pane_id_env() {
         .await
         .expect("start_agent B should succeed");
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -814,7 +814,7 @@ async fn hydrate_preserves_agent_type_end_to_end() {
         .await
         .expect("start_agent should succeed");
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -878,7 +878,7 @@ async fn hydrate_preserves_agent_type_end_to_end_opencode() {
         .await
         .expect("start_agent should succeed");
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));

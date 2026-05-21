@@ -210,7 +210,7 @@ async fn attach_failure_cleans_up_daemon_agent() {
     let expected_id = server.start_id.clone();
     let stop_calls = server.stop_calls.clone();
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         socket,
         tokio::runtime::Handle::current(),
     ));
@@ -286,7 +286,7 @@ async fn attach_failure_cleanup_does_not_hang_on_unresponsive_daemon() {
     let expected_id = server.start_id.clone();
     let stop_calls = server.stop_calls.clone();
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         socket,
         tokio::runtime::Handle::current(),
     ));
@@ -371,7 +371,7 @@ async fn attach_hang_does_not_pin_create_stream_pane() {
     let expected_id = server.start_id.clone();
     let stop_calls = server.stop_calls.clone();
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         socket,
         tokio::runtime::Handle::current(),
     ));
@@ -454,7 +454,7 @@ async fn ctrl_w_stop_agent_timeout_restores_pane_and_returns_error() {
     .await;
     let socket = server.path.clone();
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         socket,
         tokio::runtime::Handle::current(),
     ));

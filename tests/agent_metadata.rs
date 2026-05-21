@@ -600,18 +600,17 @@ async fn rename_pane_with_empty_text_clears_daemon_display_name() {
     let server = start_real_server().await;
     let client = DaemonClient::new(server.path.clone());
 
-    // Build a controller against the same in-process daemon — this is
-    // the same construction the production `main` path uses for
-    // RemoteDeckLocal mode.
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    // Build a controller against the in-process test daemon — this is
+    // the same construction the production `main` path uses.
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
 
     // Spawn an agent through the controller so rename_pane has a real
-    // Stream backend (PaneBackend::Pty would skip the daemon path).
-    // create_pane_with_display_name internally `block_on`s the daemon
-    // client, so run it on a blocking thread.
+    // attach connection to the daemon. `create_pane_with_display_name`
+    // internally `block_on`s the daemon client, so run it on a blocking
+    // thread.
     let (pane_id, resolved) = {
         let ctrl = ctrl.clone();
         tokio::task::spawn_blocking(move || {
@@ -667,7 +666,7 @@ async fn rename_pane_with_empty_text_clears_daemon_display_name() {
 async fn rename_pane_with_whitespace_clears_daemon_display_name() {
     let server = start_real_server().await;
     let client = DaemonClient::new(server.path.clone());
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -719,7 +718,7 @@ async fn rename_pane_with_whitespace_clears_daemon_display_name() {
 async fn create_pane_with_whitespace_name_falls_back_via_stream_path() {
     let server = start_real_server().await;
     let client = DaemonClient::new(server.path.clone());
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -768,7 +767,7 @@ async fn create_pane_with_whitespace_name_falls_back_via_stream_path() {
 async fn create_pane_with_surround_whitespace_name_stores_trimmed_on_daemon() {
     let server = start_real_server().await;
     let client = DaemonClient::new(server.path.clone());
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -816,7 +815,7 @@ async fn create_pane_with_surround_whitespace_name_stores_trimmed_on_daemon() {
 async fn create_pane_with_control_char_command_stores_shell_on_daemon() {
     let server = start_real_server().await;
     let client = DaemonClient::new(server.path.clone());
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -856,7 +855,7 @@ async fn create_pane_with_control_char_command_stores_shell_on_daemon() {
 async fn rename_pane_trims_surround_whitespace_on_daemon() {
     let server = start_real_server().await;
     let client = DaemonClient::new(server.path.clone());
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -910,7 +909,7 @@ async fn rename_pane_trims_surround_whitespace_on_daemon() {
 async fn rename_pane_with_control_chars_is_rejected_on_daemon() {
     let server = start_real_server().await;
     let client = DaemonClient::new(server.path.clone());
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -979,7 +978,7 @@ async fn rename_pane_with_control_chars_is_rejected_on_daemon() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rename_outcome_applied_carries_trimmed_label_for_surround_whitespace() {
     let server = start_real_server().await;
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -1023,7 +1022,7 @@ async fn rename_outcome_applied_carries_trimmed_label_for_surround_whitespace() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rename_outcome_rejected_for_control_bytes() {
     let server = start_real_server().await;
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -1069,7 +1068,7 @@ async fn rename_outcome_rejected_for_control_bytes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rename_outcome_cleared_for_empty_and_whitespace() {
     let server = start_real_server().await;
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));

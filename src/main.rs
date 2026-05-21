@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
-use dot_agent_deck::daemon_attach::{ensure_external_daemon_or_die, use_external_daemon};
+use dot_agent_deck::daemon_attach::ensure_external_daemon_or_die;
 use dot_agent_deck::daemon_client::DaemonClient;
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::hook::handle_hook;
@@ -561,56 +561,32 @@ fn init_logging_from_env() {
 }
 
 /// The TUI body extracted from `run_dashboard` so `connect` can reuse it.
-/// PRD #93 M1.1: the external-daemon path is now the default. Every fresh
-/// `dot-agent-deck` invocation lazy-spawns a per-user daemon on the
-/// `attach_socket_path()` Unix socket and attaches to it via the same
-/// protocol the remote-mode `connect` flow uses. Setting
-/// `DOT_AGENT_DECK_LOCAL_DAEMON=1` keeps the legacy in-process daemon path
-/// alive as an escape hatch until Phase 2 removes it.
+/// PRD #93 Phase 2: every fresh `dot-agent-deck` invocation lazy-spawns a
+/// per-user daemon on the `attach_socket_path()` Unix socket and
+/// attaches to it via the streaming protocol. The legacy in-process
+/// daemon path (and its env-var escape hatch) is gone — the daemon is
+/// always external.
 ///
 /// Returns `ExitCode::FAILURE` when the external-daemon bootstrap fails
 /// (spawn error, start timeout, or trust-check rejection). Successful TUI
 /// runs return `ExitCode::SUCCESS` — including TUI-task errors, which are
-/// already surfaced to stderr (matching the pre-PRD-93 behavior).
+/// already surfaced to stderr.
 async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> ExitCode {
     let state = Arc::new(RwLock::new(AppState::default()));
-    let path = socket_path();
     let attach_path = attach_socket_path();
 
-    // PRD #93 M1.1: default to the external-daemon path. If the attach
-    // socket is missing, `ensure_external_daemon_or_die` fork-execs
-    // `dot-agent-deck daemon serve` detached under flock-serialized
-    // contention (so two simultaneous TUIs can't both win the bind — M1.3)
-    // and trust-checks any existing socket (uid + 0o600 + is-socket) before
-    // the TUI's DaemonClient touches it. `DOT_AGENT_DECK_LOCAL_DAEMON=1`
-    // selects the legacy in-process daemon path instead.
-    let via_daemon = use_external_daemon();
-
-    let daemon_handle = if via_daemon {
-        if let Err(e) = ensure_external_daemon_or_die(&attach_path).await {
-            eprintln!("remote-deck-local mode: {e}");
-            return ExitCode::FAILURE;
-        }
-        // PRD #76 M2.17: subscribe to the daemon's `AgentEvent` broadcast
-        // so the remote-mode TUI's `AppState` mirrors live agent activity.
-        // In the in-process daemon path the TUI and daemon already share
-        // `state`, so this branch is the only one that needs the bridge.
-        spawn_event_subscriber(attach_path.clone(), state.clone());
-        None
-    } else {
-        let daemon_state = state.clone();
-        let daemon_path = path.clone();
-        let daemon_attach_path = attach_path.clone();
-        Some(tokio::spawn(async move {
-            // In-process daemon shares its state with the TUI, so delegate
-            // signals must take the direct-call path (no broadcast — the
-            // TUI doesn't subscribe to its own daemon in local mode).
-            let daemon = Daemon::with_attach_in_process(daemon_state, daemon_attach_path);
-            if let Err(e) = run_daemon_with(&daemon_path, daemon).await {
-                eprintln!("Daemon error: {e}");
-            }
-        }))
-    };
+    // If the attach socket is missing, `ensure_external_daemon_or_die`
+    // fork-execs `dot-agent-deck daemon serve` detached under
+    // flock-serialized contention (so two simultaneous TUIs can't both
+    // win the bind — M1.3) and trust-checks any existing socket
+    // (uid + 0o600 + is-socket) before the TUI's DaemonClient touches it.
+    if let Err(e) = ensure_external_daemon_or_die(&attach_path).await {
+        eprintln!("remote-deck-local mode: {e}");
+        return ExitCode::FAILURE;
+    }
+    // PRD #76 M2.17: subscribe to the daemon's `AgentEvent` broadcast so
+    // the TUI's `AppState` mirrors live agent activity.
+    spawn_event_subscriber(attach_path.clone(), state.clone());
 
     let version_state = state.clone();
     tokio::spawn(async move {
@@ -628,14 +604,10 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
     let effective_theme = cli_theme.unwrap_or(config.theme);
     // Detect terminal theme *before* raw mode / alternate screen takes over.
     let palette = dot_agent_deck::theme::resolve_palette(effective_theme);
-    let pane_controller: Arc<dyn PaneController> = if via_daemon {
-        Arc::new(EmbeddedPaneController::with_remote_deck(
-            attach_path.clone(),
-            tokio::runtime::Handle::current(),
-        ))
-    } else {
-        dot_agent_deck::pane::detect_multiplexer()
-    };
+    let pane_controller: Arc<dyn PaneController> = Arc::new(EmbeddedPaneController::new(
+        attach_path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
     let tui_state = state.clone();
     let tui_result = tokio::task::spawn_blocking(move || {
         run_tui(
@@ -648,21 +620,11 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
     })
     .await;
 
-    // TUI exited — clean up. In via_daemon mode `daemon_handle` is `None`
-    // (the daemon was fork-execed detached by ensure_external_daemon_or_die,
-    // setsid'd into its own session, and is intentionally outside this
-    // process tree), so this branch is a no-op for that path: we do not
-    // abort the daemon and do not unlink its sockets. Agents must survive
+    // TUI exited — clean up. The daemon was fork-execed detached by
+    // ensure_external_daemon_or_die (setsid'd into its own session) so
+    // it is intentionally outside this process tree: we do not abort
+    // the daemon and do not unlink its sockets. Agents must survive
     // TUI exit (PRD #76 line 199).
-    if let Some(handle) = daemon_handle {
-        handle.abort();
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-        }
-        if attach_path.exists() {
-            let _ = std::fs::remove_file(&attach_path);
-        }
-    }
 
     if let Err(e) = tui_result {
         eprintln!("TUI task error: {e}");

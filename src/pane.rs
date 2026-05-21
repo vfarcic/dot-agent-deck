@@ -1,5 +1,4 @@
 use std::any::Any;
-use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -279,24 +278,9 @@ pub trait PaneController: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-// ---------------------------------------------------------------------------
-// Detection
-// ---------------------------------------------------------------------------
-
-pub fn detect_multiplexer() -> Arc<dyn PaneController> {
-    Arc::new(crate::embedded_pane::EmbeddedPaneController::new())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detect_multiplexer_returns_embedded() {
-        let ctrl = detect_multiplexer();
-        assert_eq!(ctrl.name(), "embedded");
-        assert!(ctrl.is_available());
-    }
 
     // M2.11 fixup 6 — pin the typed `RenameOutcome::applied` constructor
     // semantics. These tests are what makes the constructor a meaningful
