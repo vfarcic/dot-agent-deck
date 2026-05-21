@@ -820,6 +820,66 @@ async fn handle_subscribe_events(
             }
         }
     }
+
+    // PRD #93 round-3 test instrumentation: park the handler between
+    // loop-break and salvage so the regression test can deterministically
+    // deposit a message into `rx`'s receiver-local buffer (after the
+    // select loop is no longer polling but before `rx` is dropped).
+    // Production callers never install this gate; the accessor returns
+    // `None`, no waiting happens, and salvage runs immediately.
+    if let Some(gate) = pending_broadcasts.subscribe_events_test_gate() {
+        gate.reached.notify_one();
+        gate.proceed.notified().await;
+    }
+
+    // PRD #93 round-3 salvage: close the detach race where
+    // `broadcast::send` observed our `rx` as alive (1 subscriber, return
+    // `Ok`) and deposited a `Delegate` / `WorkDone` signal into its
+    // receiver-local buffer *between* the read-side disconnect detector
+    // firing and `rx` being dropped. The send-Err recording path in
+    // `daemon.rs` never fired (send returned Ok), and dropping `rx` here
+    // would silently lose the signal forever.
+    //
+    // Drain anything still buffered with `try_recv` and push it back into
+    // `PendingBroadcasts` so the next attaching subscriber's replay
+    // delivers it. `try_recv` drains FIFO, so a straight loop + `record`
+    // per item preserves send order for the next subscriber.
+    //
+    // - `BroadcastMsg::Event` is unbounded and intentionally not buffered
+    //   (see `PendingBroadcasts` docs); skip it inline.
+    // - Any `TryRecvError` ends the loop. `Empty`/`Closed` are normal
+    //   terminators; `Lagged` means we missed unrecoverable messages —
+    //   guessing what to replay would inject corruption, so bail out the
+    //   same as the normal terminators.
+    let mut salvaged = 0usize;
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            BroadcastMsg::Event(_) => continue,
+            BroadcastMsg::Delegate(_) | BroadcastMsg::WorkDone(_) => {
+                pending_broadcasts.record(msg);
+                salvaged += 1;
+            }
+        }
+    }
+    if salvaged > 0 {
+        // event_tx.receiver_count() still includes our own (about-to-drop)
+        // `rx`, so > 1 means at least one *other* subscriber is still
+        // attached. In that case the surviving subscriber already received
+        // the broadcast live and a future subscriber will pull the
+        // salvaged copy out of `PendingBroadcasts` too — a duplicate
+        // delivery from the system's POV. The deck almost never runs with
+        // two attached TUIs against the same daemon, so the simplification
+        // is acceptable; the debug log lets operators correlate if a
+        // dup-delivery report ever shows up.
+        let other_subs = event_tx.receiver_count().saturating_sub(1);
+        if other_subs > 0 {
+            tracing::debug!(
+                salvaged,
+                other_subscribers = other_subs,
+                "subscribe-events: salvaged stranded broadcasts from dying receiver while other subscribers still attached — possible duplicate delivery to the next attaching subscriber"
+            );
+        }
+    }
     Ok(())
 }
 

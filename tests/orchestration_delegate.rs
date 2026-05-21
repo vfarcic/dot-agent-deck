@@ -36,7 +36,7 @@ use tokio::net::UnixStream;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-use dot_agent_deck::daemon::{Daemon, run_daemon_with};
+use dot_agent_deck::daemon::{Daemon, SubscribeEventsTestGate, run_daemon_with};
 use dot_agent_deck::daemon_client::DaemonClient;
 use dot_agent_deck::event::{BroadcastMsg, DaemonMessage, DelegateSignal, WorkDoneSignal};
 use dot_agent_deck::state::AppState;
@@ -401,6 +401,178 @@ async fn work_done_signal_replayed_after_reattach() {
         saw,
         "WorkDoneSignal sent during detach window must be replayed to the next subscriber \
          (regression for the silent-loss bug)"
+    );
+
+    forwarder.abort();
+}
+
+/// PRD #93 round-3 regression guard for the detach race that the
+/// adb13e9 send-Err buffer alone doesn't cover.
+///
+/// The bug: when a subscribing TUI's socket is torn down, there is a
+/// window where `broadcast::Sender::send` still sees 1 subscriber
+/// (because the daemon-side receiver hasn't been dropped yet), returns
+/// `Ok`, and deposits the message into a receiver buffer that will
+/// never be drained — the send-Err path on `daemon.rs` never fires for
+/// these messages because `send` returned `Ok`. The fix in
+/// `handle_subscribe_events` is to drain anything still buffered in the
+/// dying `rx` via `try_recv` before the receiver drops, and push it
+/// into `pending_broadcasts` so the next attaching subscriber's replay
+/// path delivers it.
+///
+/// This test drives the race deterministically via a
+/// [`SubscribeEventsTestGate`] installed on the daemon's
+/// `pending_broadcasts`: the handler signals `reached` after its main
+/// select loop breaks and parks on `proceed` before running salvage. The
+/// test pushes a `WorkDone` into the broadcast (via the hook socket)
+/// while the handler is parked — `event_tx.send` sees the dying `rx` as
+/// alive, returns `Ok`, and the message lands in `rx`'s receiver-local
+/// buffer with no live polling. The test then signals `proceed`,
+/// salvage runs, the message is recorded into `pending_broadcasts`, and
+/// a fresh subscriber's replay drain delivers it.
+#[tokio::test]
+async fn work_done_signal_replayed_when_send_succeeds_to_dying_receiver() {
+    // Build the daemon by hand so we can install the test gate on its
+    // `pending_broadcasts` before the daemon starts serving. The shape
+    // mirrors `spawn_daemon` above — same hook-vs-attach socket split,
+    // same `with_attach` constructor — but we keep an `Arc` to the
+    // daemon's `pending_broadcasts` so the test can install the gate.
+    let (dir, hook_path, attach_path) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("hook.sock");
+        let attach = dir.path().join("attach.sock");
+        (dir, hook, attach)
+    };
+
+    let gate = Arc::new(SubscribeEventsTestGate::default());
+    let daemon_state = Arc::new(RwLock::new(AppState::default()));
+    let daemon = Daemon::with_attach(daemon_state, attach_path.clone());
+    daemon
+        .pending_broadcasts
+        .install_subscribe_events_test_gate(Some(gate.clone()));
+
+    let hook_for_daemon = hook_path.clone();
+    let handle: JoinHandle<()> = tokio::spawn(async move {
+        let _ = run_daemon_with(&hook_for_daemon, daemon).await;
+    });
+    let _daemon_guard = DaemonHandle {
+        _dir: dir,
+        hook_path: hook_path.clone(),
+        attach_path: attach_path.clone(),
+        handle,
+    };
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if attach_path.exists() && UnixStream::connect(&attach_path).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        attach_path.exists(),
+        "attach socket did not appear within 5s"
+    );
+
+    // Worker pane setup so the eventual `handle_work_done` on the
+    // attached TUI resolves role → summary file.
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let tui_state = Arc::new(RwLock::new(AppState::default()));
+    {
+        let mut st = tui_state.write().await;
+        st.register_pane("coder-pane".into());
+        st.pane_role_map.insert("coder-pane".into(), "coder".into());
+        st.pane_cwd_map.insert(
+            "coder-pane".into(),
+            cwd_dir.path().to_string_lossy().into_owned(),
+        );
+    }
+
+    let client = DaemonClient::new(attach_path.clone());
+
+    // 1. Subscribe A and immediately drop the subscription so the
+    //    daemon-side handler exits its main select loop via the
+    //    read-side disconnect detector. The gate then parks the handler
+    //    after loop-break and before salvage — `rx` is still alive but
+    //    no longer being polled.
+    {
+        let _sub = client.subscribe_events().await.expect("initial subscribe");
+        // Brief yield so the daemon-side handler actually subscribes its
+        // `rx` and enters its main select loop before we drop the
+        // subscription. Without this, the handler could observe the
+        // socket EOF before reaching the `loop { select! }` body and
+        // skip the salvage path entirely on the unrelated `?` error
+        // shape — the test would then assert against the wrong code
+        // path. 50ms matches the existing tests in this file.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 2. Await the handler reaching the gate (after main-loop break,
+    //    before salvage). Once it fires, `rx` is alive and unpolled —
+    //    the precondition for the bug.
+    gate.reached.notified().await;
+
+    // 3. Worker fires while the handler is parked. The daemon's hook
+    //    loop processes the JSON line, calls `event_tx.send(WorkDone)`
+    //    — receiver_count is 1 (dying `rx`), so `send` returns Ok and
+    //    the send-Err record path in daemon.rs DOES NOT fire. The
+    //    message lands in `rx`'s receiver-local buffer where it would
+    //    be silently lost without the salvage step.
+    send_work_done(
+        &hook_path,
+        &WorkDoneSignal {
+            pane_id: "coder-pane".into(),
+            task: "implemented under detach race".into(),
+            done: false,
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+    // Hook loop is async — give it time to drain the line and call
+    // event_tx.send so the message is definitely in rx's buffer before
+    // we release the handler. Same 200ms shape as the sibling
+    // detach-window tests above.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 4. Release the handler. Salvage drains rx, finds the WorkDone,
+    //    and records it into pending_broadcasts.
+    gate.proceed.notify_one();
+    // Give the salvage step a moment to record before subscriber B
+    // attaches and drains pending_broadcasts.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 5. Reattach as subscriber B. The replay path drains
+    //    pending_broadcasts and delivers the salvaged message as B's
+    //    first event.
+    let mut sub = client.subscribe_events().await.expect("reattach subscribe");
+    let state_for_task = tui_state.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Ok(Some(msg)) = sub.next_event().await {
+            if let BroadcastMsg::WorkDone(signal) = msg {
+                state_for_task.write().await.handle_work_done(signal);
+            }
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw = false;
+    while tokio::time::Instant::now() < deadline {
+        let s = tui_state.read().await;
+        if let Some(received) = s.work_done_events.first() {
+            assert_eq!(received.pane_id, "coder-pane");
+            assert_eq!(received.task, "implemented under detach race");
+            saw = true;
+            break;
+        }
+        drop(s);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        saw,
+        "WorkDone landing in a dying receiver's buffer must be salvaged into PendingBroadcasts \
+         and replayed to the next subscriber (regression for the detach-race bug that adb13e9 \
+         did not close)"
     );
 
     forwarder.abort();

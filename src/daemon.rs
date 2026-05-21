@@ -67,6 +67,33 @@ fn broadcast_variant_name(msg: &BroadcastMsg) -> &'static str {
     }
 }
 
+/// PRD #93 round-3 test instrumentation: pause point inside
+/// [`crate::daemon_protocol::handle_subscribe_events`] between the main
+/// select loop break and the receiver salvage step. Production code
+/// never installs this; the regression test for the detach-race salvage
+/// path drives the race against `broadcast::send` deterministically by
+/// installing a gate, waiting until `reached` fires (the handler is
+/// parked between loop-break and salvage), pushing a message into the
+/// dying rx via the hook socket, then signalling `proceed` so the
+/// handler runs salvage with the buffered message still in rx.
+///
+/// Exposed unconditionally (rather than `#[cfg(test)]`) because
+/// integration tests under `tests/` compile against the lib crate
+/// without the `test` cfg and need to install a gate. The production
+/// cost is one mutex acquire + `Option` check per subscribe-events
+/// disconnect — negligible.
+#[derive(Debug, Default)]
+#[doc(hidden)]
+pub struct SubscribeEventsTestGate {
+    /// Handler fires `notify_one` after the main loop breaks and before
+    /// salvage runs. The test awaits this to confirm rx is alive and no
+    /// longer being polled.
+    pub reached: Notify,
+    /// Test fires `notify_one` to release the handler into the salvage
+    /// step.
+    pub proceed: Notify,
+}
+
 /// Bounded replay buffer for orchestration `BroadcastMsg`s (Delegate /
 /// WorkDone) that arrived while no TUI was subscribed.
 ///
@@ -89,6 +116,9 @@ fn broadcast_variant_name(msg: &BroadcastMsg) -> &'static str {
 #[derive(Debug, Default)]
 pub struct PendingBroadcasts {
     inner: Mutex<VecDeque<BroadcastMsg>>,
+    /// PRD #93 round-3 test instrumentation; production code never sets
+    /// this. See [`SubscribeEventsTestGate`].
+    subscribe_events_test_gate: Mutex<Option<Arc<SubscribeEventsTestGate>>>,
 }
 
 impl PendingBroadcasts {
@@ -96,7 +126,31 @@ impl PendingBroadcasts {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(VecDeque::with_capacity(PENDING_BROADCAST_CAP)),
+            subscribe_events_test_gate: Mutex::new(None),
         }
+    }
+
+    /// PRD #93 round-3 test instrumentation; production code never calls
+    /// this. Install a gate that the subscribe-events handler awaits on
+    /// between its main loop break and the receiver salvage step. See
+    /// [`SubscribeEventsTestGate`].
+    #[doc(hidden)]
+    pub fn install_subscribe_events_test_gate(&self, gate: Option<Arc<SubscribeEventsTestGate>>) {
+        *self
+            .subscribe_events_test_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = gate;
+    }
+
+    /// PRD #93 round-3 test instrumentation; production code returns
+    /// `None`. Cloned out under a short-held lock so the caller can
+    /// `await` on the gate without holding the mutex.
+    #[doc(hidden)]
+    pub fn subscribe_events_test_gate(&self) -> Option<Arc<SubscribeEventsTestGate>> {
+        self.subscribe_events_test_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Push `msg` onto the buffer, evicting the oldest entry if the cap is
