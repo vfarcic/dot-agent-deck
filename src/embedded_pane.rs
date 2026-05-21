@@ -1659,8 +1659,22 @@ impl PaneController for EmbeddedPaneController {
     /// architecture is single-threaded for pane I/O, so this is a latent constraint
     /// rather than an active hazard; a per-pane submit mutex would enforce it if
     /// concurrent callers are ever introduced.
+    ///
+    /// PRD #93 round-8: an embedded bracketed-paste marker in a multi-line
+    /// `text` causes [`encode_pane_payload`] to return Err — log at warn
+    /// and drop the write, same handling as a missing pane below.
     fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
-        let payload = encode_pane_payload(text);
+        let payload = match encode_pane_payload(text) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!(
+                    pane_id = %pane_id,
+                    error = %e,
+                    "write_to_pane: dropping write — encode_pane_payload rejected the input"
+                );
+                return Ok(());
+            }
+        };
         // Write the payload (content, optionally bracketed-paste-wrapped), flush, then
         // pause briefly before sending the submit CR. Agent TUIs like claude treat a
         // CR that arrives fused to the preceding text as newline-in-input; only a CR

@@ -605,3 +605,158 @@ async fn write_to_pane_wraps_multiline_in_bracketed_paste() {
         String::from_utf8_lossy(&snap)
     );
 }
+
+/// PRD #93 round-8 (auditor HIGH): two concurrent writes to the *same*
+/// pane must not interleave. Earlier rounds released the writer mutex
+/// around `SUBMIT_DELAY`, so two delegates could fuse as
+/// `payload_A + payload_B + CR + CR` — the slave's canonical line then
+/// contained both payloads, cat printed them as a single fused line,
+/// and the second prompt never reached the worker as its own input.
+///
+/// We use distinct, easy-to-grep run-length payloads so a single
+/// canonical "complete line" assertion suffices: cat -u with the
+/// PTY's default termios echoes each *complete* line back as
+/// `<payload>\r\n` on its stdout (ICRNL → LF closes the canonical
+/// line, cat reads it, ONLCR rewrites the trailing LF to CRLF on
+/// output). With the fix both `AAAA…\r\n` and `BBBB…\r\n` appear as
+/// contiguous slices. Without it the slave sees `AAAA…BBBB…\r\r`
+/// and only the fused `AAAA…BBBB…\r\n` reaches the master — neither
+/// individual `payload\r\n` substring is present.
+#[tokio::test]
+async fn write_to_pane_serializes_concurrent_writes_per_pane() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let coder_agent_id =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    let payload_a = "A".repeat(20);
+    let payload_b = "B".repeat(20);
+
+    let registry_a = daemon.pty_registry.clone();
+    let registry_b = daemon.pty_registry.clone();
+    let payload_a_for_task = payload_a.clone();
+    let payload_b_for_task = payload_b.clone();
+    let write_a = tokio::spawn(async move {
+        registry_a
+            .write_to_pane("coder-pane", &payload_a_for_task)
+            .await
+            .expect("write A");
+    });
+    let write_b = tokio::spawn(async move {
+        registry_b
+            .write_to_pane("coder-pane", &payload_b_for_task)
+            .await
+            .expect("write B");
+    });
+    let (a, b) = tokio::join!(write_a, write_b);
+    a.unwrap();
+    b.unwrap();
+
+    let needle_a = format!("{payload_a}\r\n");
+    let needle_b = format!("{payload_b}\r\n");
+
+    // Wait for both submitted lines to surface on cat's stdout. If the
+    // writes interleaved, the slave sees `AAA…BBB…\r\r` and the two
+    // payloads collapse into a single canonical line — `payload\r\n`
+    // for each one will never appear.
+    let snap = wait_for_bytes_in_snapshot(
+        &daemon.pty_registry,
+        &coder_agent_id,
+        needle_a.as_bytes(),
+        Duration::from_secs(5),
+    )
+    .await;
+    let snap = if snap
+        .windows(needle_b.len())
+        .any(|w| w == needle_b.as_bytes())
+    {
+        snap
+    } else {
+        wait_for_bytes_in_snapshot(
+            &daemon.pty_registry,
+            &coder_agent_id,
+            needle_b.as_bytes(),
+            Duration::from_secs(5),
+        )
+        .await
+    };
+
+    // Each payload appearing followed by its own CRLF is the signature
+    // of a serialized submit: cat's canonical mode delivered each line
+    // to cat *separately*, so cat wrote two distinct `payload\r\n` lines
+    // to its stdout. Without the round-8 fix, the slave would see
+    // `AAA…BBB…\r\r` as one canonical line + an empty one — cat would
+    // emit `AAA…BBB…\r\n\r\n` and neither `AAA…\r\n` nor `BBB…\r\n`
+    // would appear individually.
+    //
+    // (The slave's input *echo* of B's incoming bytes can land on the
+    // master *between* cat's two stdout writes, producing apparent
+    // interleaving in the snapshot — that's a master-side rendering
+    // artifact of how echo and stdout race, not evidence of fused
+    // daemon writes. The two `payload\r\n` substrings are the cleanest
+    // assertion that doesn't depend on that race.)
+    assert!(
+        snap.windows(needle_a.len())
+            .any(|w| w == needle_a.as_bytes()),
+        "payload_A\\r\\n missing from scrollback — concurrent writes interleaved: {:?}",
+        String::from_utf8_lossy(&snap)
+    );
+    assert!(
+        snap.windows(needle_b.len())
+            .any(|w| w == needle_b.as_bytes()),
+        "payload_B\\r\\n missing from scrollback — concurrent writes interleaved: {:?}",
+        String::from_utf8_lossy(&snap)
+    );
+}
+
+/// PRD #93 round-8: the per-pane lock must not serialize writes across
+/// *different* panes. Each agent owns its own `writer` mutex, so two
+/// concurrent `write_to_pane` calls to different panes should run in
+/// parallel — about one `SUBMIT_DELAY` of wall clock, not two.
+///
+/// We allow a generous slack on the upper bound because the daemon
+/// background work (spawn threads, broadcast push) can add jitter; the
+/// purpose is to catch a regression that serializes across panes
+/// (e.g. a global writer lock), which would push the total to roughly
+/// 2× `SUBMIT_DELAY` and well past the threshold below.
+#[tokio::test]
+async fn write_to_pane_concurrent_writes_to_different_panes_run_in_parallel() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let _orch_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let _coder_id =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    let registry_a = daemon.pty_registry.clone();
+    let registry_b = daemon.pty_registry.clone();
+    let start = std::time::Instant::now();
+    let write_a = tokio::spawn(async move { registry_a.write_to_pane("orch-pane", "alpha").await });
+    let write_b = tokio::spawn(async move { registry_b.write_to_pane("coder-pane", "beta").await });
+    let (a, b) = tokio::join!(write_a, write_b);
+    a.unwrap().expect("write to orch-pane");
+    b.unwrap().expect("write to coder-pane");
+    let elapsed = start.elapsed();
+
+    // SUBMIT_DELAY is 150ms; serial would be ~300ms, parallel ~150ms.
+    // 250ms upper bound leaves room for task scheduling jitter without
+    // letting an across-pane serialization regression slip through.
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "two concurrent writes to different panes took {:?} — expected ~SUBMIT_DELAY \
+         (~150ms), suggesting the per-pane lock is over-serializing",
+        elapsed
+    );
+}

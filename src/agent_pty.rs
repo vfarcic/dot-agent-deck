@@ -16,7 +16,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast};
 
 use crate::event::AgentType;
-use crate::pane_input::{SUBMIT_DELAY, encode_pane_payload};
+use crate::pane_input::{PaneInputError, SUBMIT_DELAY, encode_pane_payload};
 
 /// Trigger flag the deck client honors to mean "the daemon is already
 /// running; attach over its stream socket instead of spawning one." The
@@ -257,6 +257,13 @@ pub enum AgentPtyError {
     /// reclassify the pane as dashboard).
     #[error("Invalid spawn options: {0}")]
     Validation(String),
+    /// The text handed to [`AgentPtyRegistry::write_to_pane`] could not be
+    /// encoded into a safe pane payload (PRD #93 round-8). Today this
+    /// fires when a multi-line input contains an embedded bracketed-paste
+    /// marker (`ESC[200~` / `ESC[201~`) that would terminate the outer
+    /// wrapper and leak the tail as raw keystrokes inside the agent TUI.
+    #[error("Invalid pane payload: {0}")]
+    InvalidPayload(#[from] PaneInputError),
 }
 
 /// How to spawn an agent.
@@ -996,12 +1003,17 @@ impl AgentPtyRegistry {
     /// multi-line), flush, wait [`SUBMIT_DELAY`] so the CR isn't fused with
     /// the preceding text into "newline-in-input", then write the CR.
     ///
-    /// Concurrency: callers must not invoke this concurrently for the same
-    /// `pane_id` — interleaved writes would produce
-    /// `payload_A + payload_B + CR + CR`, fusing two prompts. Mirrors the
-    /// constraint documented at `EmbeddedPaneController::write_to_pane`. The
-    /// writer mutex is released around the sleep so other panes can keep
-    /// being written to.
+    /// PRD #93 round-8: per-pane serialization is now enforced by holding
+    /// the agent's writer mutex across the *entire* payload + sleep + CR
+    /// sequence. Earlier rounds released the lock around the sleep so
+    /// other panes could be written to in parallel — which already worked
+    /// because each agent owns its own writer mutex — but released it for
+    /// the *same* pane too, letting two concurrent calls interleave as
+    /// `payload_A + payload_B + CR + CR` (auditor finding). `tokio::sync::Mutex`
+    /// can be held across `.await` safely, and writes to other panes use
+    /// other writer mutexes, so holding for the ~150ms `SUBMIT_DELAY`
+    /// affects only the offending pane and the deck dispatches at most
+    /// one delegate or work-done per pane at a time in practice.
     pub async fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), AgentPtyError> {
         // Resolve writer under the sync lock, then drop the lock before
         // awaiting the async writer mutex — otherwise we'd hold the
@@ -1017,20 +1029,15 @@ impl AgentPtyRegistry {
                 .ok_or_else(|| AgentPtyError::NotFound(pane_id.to_string()))?
         };
         use std::io::Write as _;
-        let payload = encode_pane_payload(text);
-        {
-            let mut w = writer.lock().await;
-            w.write_all(&payload)
-                .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
-            let _ = w.flush();
-        }
+        let payload = encode_pane_payload(text)?;
+        let mut w = writer.lock().await;
+        w.write_all(&payload)
+            .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
+        let _ = w.flush();
         tokio::time::sleep(SUBMIT_DELAY).await;
-        {
-            let mut w = writer.lock().await;
-            w.write_all(b"\r")
-                .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
-            let _ = w.flush();
-        }
+        w.write_all(b"\r")
+            .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
+        let _ = w.flush();
         Ok(())
     }
 
