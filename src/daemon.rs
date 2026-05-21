@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -45,6 +46,70 @@ pub fn idle_shutdown_from_env() -> Option<Duration> {
 /// than this is signalled via `RecvError::Lagged` and the per-connection
 /// forwarder drops the connection (the TUI reconnects).
 const EVENT_BROADCAST_CAPACITY: usize = 1024;
+
+/// Maximum number of `BroadcastMsg`s the daemon keeps in [`PendingBroadcasts`]
+/// while no TUI is attached. Bounds the worst-case memory cost of a runaway
+/// worker (or an orchestrator firing many delegates) during a detach window.
+/// Beyond this, the oldest entries are evicted — the alternative (unbounded
+/// growth) would let a single misbehaving pane balloon daemon memory.
+const PENDING_BROADCAST_CAP: usize = 256;
+
+/// Bounded replay buffer for orchestration `BroadcastMsg`s (Delegate /
+/// WorkDone) that arrived while no TUI was subscribed.
+///
+/// In external-daemon mode the daemon is a dumb pipe: it cannot validate
+/// these signals locally (no role map), so it forwards them to the
+/// attached TUI over the broadcast channel. When the user detaches the
+/// deck and a worker calls `dot-agent-deck delegate` or `work-done`,
+/// `broadcast::Sender::send` returns `Err` because zero subscribers
+/// exist — and without this buffer the signal is silently lost forever.
+///
+/// We record only on send-Err (so a normally-connected subscriber never
+/// sees a duplicate), and drain on the next [`AttachRequest::SubscribeEvents`]
+/// connection before joining the live stream.
+///
+/// Events (`BroadcastMsg::Event`) are **not** buffered: the event stream
+/// is continuous and the TUI's `apply_event` already tolerates loss on a
+/// reconnect (it pulls a fresh `list_agents` snapshot to rebuild state).
+/// Buffering events would also balloon memory unboundedly on a busy
+/// project — orchestration signals are the rare, irreplaceable case.
+#[derive(Debug, Default)]
+pub struct PendingBroadcasts {
+    inner: Mutex<VecDeque<BroadcastMsg>>,
+}
+
+impl PendingBroadcasts {
+    /// Empty buffer with capacity reserved up to [`PENDING_BROADCAST_CAP`].
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::with_capacity(PENDING_BROADCAST_CAP)),
+        }
+    }
+
+    /// Push `msg` onto the buffer, evicting the oldest entry if the cap is
+    /// reached. The caller is expected to invoke this only on send-Err
+    /// (zero subscribers): a normally-attached TUI receives the signal
+    /// live and recording here would duplicate it on reconnect.
+    pub fn record(&self, msg: BroadcastMsg) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if g.len() >= PENDING_BROADCAST_CAP {
+            g.pop_front();
+        }
+        g.push_back(msg);
+    }
+
+    /// Atomically take every buffered entry. Called by the attach server
+    /// when a new `SubscribeEvents` subscriber joins, before it enters
+    /// the live `recv` loop. The first subscriber to attach after a
+    /// detach window drains the queue; later subscribers (rare —
+    /// typically only one TUI is attached at a time) see nothing, which
+    /// matches the at-most-one-handler invariant the TUI side enforces
+    /// for orchestrator feedback anyway.
+    pub fn drain(&self) -> Vec<BroadcastMsg> {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.drain(..).collect()
+    }
+}
 
 /// Mode for the daemon's Unix socket: owner-only read/write. Without this the
 /// socket file inherits the process umask, which on most systems leaves it
@@ -150,6 +215,13 @@ pub struct Daemon {
     /// [`idle_shutdown_from_env`]; [`with_attach_in_process`] forces it
     /// to `None` (the daemon dies with its TUI either way).
     pub idle_shutdown: Option<Duration>,
+    /// Bounded ring buffer of orchestration `BroadcastMsg`s (Delegate /
+    /// WorkDone) that arrived while no TUI was subscribed. Populated in
+    /// external-daemon mode only — see [`PendingBroadcasts`] for the
+    /// rationale, and the Delegate / WorkDone arms in `run_hook_loop`
+    /// for the recording site. Drained by the next `SubscribeEvents`
+    /// subscriber before it joins the live stream.
+    pub pending_broadcasts: Arc<PendingBroadcasts>,
 }
 
 impl Daemon {
@@ -169,6 +241,7 @@ impl Daemon {
             // registry consumers either. Leave the timer off; callers
             // that want it can opt in via [`with_idle_shutdown`].
             idle_shutdown: None,
+            pending_broadcasts: Arc::new(PendingBroadcasts::new()),
         }
     }
 
@@ -193,6 +266,7 @@ impl Daemon {
             event_tx,
             client_count: Arc::new(AtomicUsize::new(0)),
             idle_shutdown: idle_shutdown_from_env(),
+            pending_broadcasts: Arc::new(PendingBroadcasts::new()),
         }
     }
 
@@ -270,6 +344,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let event_tx = daemon.event_tx;
     let client_count = daemon.client_count;
     let idle_shutdown = daemon.idle_shutdown;
+    let pending_broadcasts = daemon.pending_broadcasts;
 
     // Route delegates by daemon mode, not by attach-socket presence: the
     // in-process TUI daemon ALSO binds an attach socket (so a future
@@ -293,12 +368,14 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         let registry = pty_registry.clone();
         let attach_event_tx = event_tx.clone();
         let attach_counter = client_count.clone();
+        let attach_pending = pending_broadcasts.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::daemon_protocol::run_attach_server_with_counter(
                 &path,
                 registry,
                 attach_event_tx,
                 attach_counter,
+                attach_pending,
             )
             .await
             {
@@ -323,7 +400,15 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         _ => None,
     };
 
-    let result = run_hook_loop(listener, state, event_tx, is_external_mode, shutdown).await;
+    let result = run_hook_loop(
+        listener,
+        state,
+        event_tx,
+        is_external_mode,
+        pending_broadcasts,
+        shutdown,
+    )
+    .await;
 
     if let Some(h) = attach_handle {
         h.abort();
@@ -383,6 +468,7 @@ async fn run_hook_loop(
     state: SharedState,
     event_tx: broadcast::Sender<BroadcastMsg>,
     is_external_mode: bool,
+    pending_broadcasts: Arc<PendingBroadcasts>,
     shutdown: Arc<Notify>,
 ) -> Result<(), DaemonError> {
     loop {
@@ -400,6 +486,7 @@ async fn run_hook_loop(
             Ok((stream, _addr)) => {
                 let state = state.clone();
                 let event_tx = event_tx.clone();
+                let pending_broadcasts = pending_broadcasts.clone();
                 tokio::spawn(async move {
                     let reader = tokio::io::BufReader::new(stream);
                     let mut lines = reader.lines();
@@ -427,20 +514,23 @@ async fn run_hook_loop(
                                         // a dumb pipe. If `send` returns
                                         // Err right now there are zero
                                         // attached subscribers — typically
-                                        // a brief reconnect window — and
-                                        // the delegate is lost (no replay
-                                        // buffer; a recent-delegates buffer
-                                        // is the follow-up if this race
-                                        // ever bites a user in practice).
-                                        // Log so an operator can correlate.
+                                        // because the user has detached
+                                        // the deck. Buffer the signal in
+                                        // `pending_broadcasts` so the next
+                                        // attaching TUI replays it; without
+                                        // this, `dot-agent-deck delegate`
+                                        // issued during a detach window
+                                        // would be silently lost forever.
                                         if event_tx
                                             .send(BroadcastMsg::Delegate(signal.clone()))
                                             .is_err()
                                         {
                                             warn!(
                                                 pane_id = %signal.pane_id,
-                                                "delegate dropped: no attached TUI subscribers (reconnect race?)"
+                                                "delegate buffered: no attached TUI subscribers (will replay on reattach)"
                                             );
+                                            pending_broadcasts
+                                                .record(BroadcastMsg::Delegate(signal));
                                         }
                                     } else {
                                         // In-process daemon mode: TUI
@@ -467,14 +557,26 @@ async fn run_hook_loop(
                                     // enqueues feedback for the orchestrator
                                     // pane).
                                     if is_external_mode {
+                                        // Same detach-loss risk as the
+                                        // Delegate arm above (and the real
+                                        // user-reported bug here): a worker
+                                        // calling `dot-agent-deck work-done`
+                                        // while the deck is detached must
+                                        // not vanish — the orchestrator
+                                        // depends on the feedback to know
+                                        // the task is finished. Buffer on
+                                        // send-Err and let the next attached
+                                        // TUI replay it.
                                         if event_tx
                                             .send(BroadcastMsg::WorkDone(signal.clone()))
                                             .is_err()
                                         {
                                             warn!(
                                                 pane_id = %signal.pane_id,
-                                                "work-done dropped: no attached TUI subscribers (reconnect race?)"
+                                                "work-done buffered: no attached TUI subscribers (will replay on reattach)"
                                             );
+                                            pending_broadcasts
+                                                .record(BroadcastMsg::WorkDone(signal));
                                         }
                                     } else {
                                         state.write().await.handle_work_done(signal);

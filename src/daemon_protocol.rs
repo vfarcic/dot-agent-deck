@@ -86,6 +86,7 @@ use tracing::{error, info, warn};
 
 pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
+use crate::daemon::PendingBroadcasts;
 use crate::event::{AgentType, BroadcastMsg};
 
 // ---------------------------------------------------------------------------
@@ -436,10 +437,13 @@ pub async fn serve_attach(
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> io::Result<()> {
-    // Discard counter so callers that don't care don't need to construct one.
-    // The daemon's idle-shutdown path uses [`serve_attach_with_counter`].
-    let dummy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    serve_attach_with_counter(listener, registry, event_tx, dummy).await
+    // Discard counter and empty replay buffer so callers that don't care
+    // about idle shutdown or replay don't need to construct either. The
+    // daemon's idle-shutdown + replay path uses [`serve_attach_with_counter`]
+    // and supplies the daemon-wide [`PendingBroadcasts`].
+    let dummy_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dummy_pending = Arc::new(PendingBroadcasts::new());
+    serve_attach_with_counter(listener, registry, event_tx, dummy_count, dummy_pending).await
 }
 
 /// PRD #93 M1.2 variant of [`serve_attach`] that maintains `client_count`
@@ -455,6 +459,7 @@ pub async fn serve_attach_with_counter(
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
     client_count: Arc<std::sync::atomic::AtomicUsize>,
+    pending_broadcasts: Arc<PendingBroadcasts>,
 ) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     loop {
@@ -463,6 +468,7 @@ pub async fn serve_attach_with_counter(
                 let registry = registry.clone();
                 let event_tx = event_tx.clone();
                 let counter = client_count.clone();
+                let pending = pending_broadcasts.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
                     // so a `handle_connection` task that panics or is dropped
@@ -477,7 +483,7 @@ pub async fn serve_attach_with_counter(
                     }
                     counter.fetch_add(1, Ordering::SeqCst);
                     let _guard = ClientGuard(counter.clone());
-                    if let Err(e) = handle_connection(stream, registry, event_tx).await {
+                    if let Err(e) = handle_connection(stream, registry, event_tx, pending).await {
                         warn!("attach protocol connection error: {e}");
                     }
                 });
@@ -511,16 +517,25 @@ pub async fn run_attach_server_with_counter(
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
     client_count: Arc<std::sync::atomic::AtomicUsize>,
+    pending_broadcasts: Arc<PendingBroadcasts>,
 ) -> io::Result<()> {
     let listener = bind_attach_listener(path)?;
     info!("Attach protocol listening on {}", path.display());
-    serve_attach_with_counter(listener, registry, event_tx, client_count).await
+    serve_attach_with_counter(
+        listener,
+        registry,
+        event_tx,
+        client_count,
+        pending_broadcasts,
+    )
+    .await
 }
 
 async fn handle_connection(
     mut stream: UnixStream,
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
+    pending_broadcasts: Arc<PendingBroadcasts>,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -631,7 +646,7 @@ async fn handle_connection(
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
         AttachRequest::SubscribeEvents => {
-            handle_subscribe_events(stream, event_tx).await?;
+            handle_subscribe_events(stream, event_tx, pending_broadcasts).await?;
         }
         AttachRequest::Hello { client_version: _ } => {
             // PRD #76 M2.21: the daemon never enforces or rejects on
@@ -682,10 +697,39 @@ pub async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse)
 async fn handle_subscribe_events(
     stream: UnixStream,
     event_tx: broadcast::Sender<BroadcastMsg>,
+    pending_broadcasts: Arc<PendingBroadcasts>,
 ) -> io::Result<()> {
+    // Subscribe *before* draining the replay buffer so a Delegate/WorkDone
+    // arriving during the drain window (after `record` has stopped being
+    // the destination but before we're in the live recv loop) still lands
+    // on this subscriber via the live channel instead of falling between
+    // the two paths.
     let mut rx = event_tx.subscribe();
     let (mut rd, mut wr) = stream.into_split();
     write_resp(&mut wr, &AttachResponse::ok()).await?;
+
+    // PRD #76 / PRD #93 replay: drain any orchestration signals that
+    // arrived while no TUI was attached. Each entry is written as a
+    // KIND_EVENT frame, identical to the live-recv arm below — the TUI's
+    // subscriber loop is shape-agnostic about live vs replayed. On a
+    // bounded-write timeout we tear the subscription down the same way
+    // the live recv arm does (the client will reconnect and pick up
+    // anything still pending).
+    let replay = pending_broadcasts.drain();
+    for msg in replay {
+        let payload = match serde_json::to_vec(&msg) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("subscribe-events: skipping unserializable replay entry: {e}");
+                continue;
+            }
+        };
+        if !write_or_timeout(&mut wr, KIND_EVENT, &payload).await {
+            let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
+            return Ok(());
+        }
+    }
+
     loop {
         tokio::select! {
             recv = rx.recv() => {
@@ -1484,8 +1528,11 @@ mod tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let (event_tx, _event_rx) = broadcast::channel(16);
 
+        let pending = Arc::new(PendingBroadcasts::new());
         let server_task = tokio::spawn(async move {
-            handle_connection(server, registry, event_tx).await.unwrap();
+            handle_connection(server, registry, event_tx, pending)
+                .await
+                .unwrap();
         });
 
         let (mut rd, mut wr) = client.into_split();
@@ -1524,8 +1571,11 @@ mod tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let (event_tx, _event_rx) = broadcast::channel(16);
 
+        let pending = Arc::new(PendingBroadcasts::new());
         let server_task = tokio::spawn(async move {
-            handle_connection(server, registry, event_tx).await.unwrap();
+            handle_connection(server, registry, event_tx, pending)
+                .await
+                .unwrap();
         });
 
         let (mut rd, mut wr) = client.into_split();

@@ -313,3 +313,162 @@ async fn work_done_signal_round_trips_to_attached_appstate() {
 
     forwarder.abort();
 }
+
+/// Detach-window replay guard for `work-done`.
+///
+/// The original bug: with no TUI attached, a worker's `dot-agent-deck
+/// work-done` reached the daemon's hook loop but `event_tx.send(...)`
+/// returned Err (zero subscribers), the signal was logged and dropped,
+/// and the orchestrator never saw the feedback message on reattach.
+///
+/// This test pins the fix: with no subscriber, the signal must be
+/// recorded into the daemon's `pending_broadcasts` and replayed to the
+/// next attaching subscriber before live broadcasts resume.
+#[tokio::test]
+async fn work_done_signal_replayed_after_reattach() {
+    let daemon = spawn_daemon().await;
+
+    // Worker pane setup mirrors the live-path test — the TUI's
+    // handle_work_done resolves role → summary file using these maps.
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let tui_state = Arc::new(RwLock::new(AppState::default()));
+    {
+        let mut st = tui_state.write().await;
+        st.register_pane("coder-pane".into());
+        st.pane_role_map.insert("coder-pane".into(), "coder".into());
+        st.pane_cwd_map.insert(
+            "coder-pane".into(),
+            cwd_dir.path().to_string_lossy().into_owned(),
+        );
+    }
+
+    // First attach: open a subscription, immediately drop it. This
+    // reproduces the "user detached the deck" state — at the moment of
+    // the work-done signal below, zero subscribers exist on the daemon's
+    // broadcast channel.
+    let client = DaemonClient::new(daemon.attach_path.clone());
+    {
+        let _initial = client.subscribe_events().await.expect("initial subscribe");
+        // Allow the daemon-side per-connection task to actually call
+        // `event_tx.subscribe()` and then observe the EOF when we drop.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Wait for the daemon's receiver to be torn down — `send` only
+    // returns Err once the receiver count actually drops to zero, which
+    // happens asynchronously after our subscriber socket closes.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Worker fires while the deck is detached.
+    send_work_done(
+        &daemon.hook_path,
+        &WorkDoneSignal {
+            pane_id: "coder-pane".into(),
+            task: "implemented under detached deck".into(),
+            done: false,
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+    // Hook loop is async — give it time to drain the line and record.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Reattach. The new subscriber must receive the buffered signal as
+    // its first event, before any live messages.
+    let mut sub = client.subscribe_events().await.expect("reattach subscribe");
+    let state_for_task = tui_state.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Ok(Some(msg)) = sub.next_event().await {
+            if let BroadcastMsg::WorkDone(signal) = msg {
+                state_for_task.write().await.handle_work_done(signal);
+            }
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw = false;
+    while tokio::time::Instant::now() < deadline {
+        let s = tui_state.read().await;
+        if let Some(received) = s.work_done_events.first() {
+            assert_eq!(received.pane_id, "coder-pane");
+            assert_eq!(received.task, "implemented under detached deck");
+            saw = true;
+            break;
+        }
+        drop(s);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        saw,
+        "WorkDoneSignal sent during detach window must be replayed to the next subscriber \
+         (regression for the silent-loss bug)"
+    );
+
+    forwarder.abort();
+}
+
+/// Parallel guard for `delegate`: same shape of bug, same fix. An
+/// orchestrator's `dot-agent-deck delegate` fired while the deck is
+/// detached must be replayed to the next attaching TUI.
+#[tokio::test]
+async fn delegate_signal_replayed_after_reattach() {
+    let daemon = spawn_daemon().await;
+
+    let tui_state = Arc::new(RwLock::new(AppState::default()));
+    {
+        let mut st = tui_state.write().await;
+        st.register_pane("orch-pane".into());
+        st.pane_role_map
+            .insert("orch-pane".into(), "orchestrator".into());
+        st.orchestrator_pane_ids.insert("orch-pane".into());
+    }
+
+    let client = DaemonClient::new(daemon.attach_path.clone());
+    {
+        let _initial = client.subscribe_events().await.expect("initial subscribe");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "delegated while detached".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut sub = client.subscribe_events().await.expect("reattach subscribe");
+    let state_for_task = tui_state.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Ok(Some(msg)) = sub.next_event().await {
+            if let BroadcastMsg::Delegate(signal) = msg {
+                state_for_task.write().await.handle_delegate(signal);
+            }
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw = false;
+    while tokio::time::Instant::now() < deadline {
+        let s = tui_state.read().await;
+        if let Some(received) = s.delegate_events.first() {
+            assert_eq!(received.pane_id, "orch-pane");
+            assert_eq!(received.task, "delegated while detached");
+            assert_eq!(received.to, vec!["coder".to_string()]);
+            saw = true;
+            break;
+        }
+        drop(s);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        saw,
+        "DelegateSignal sent during detach window must be replayed to the next subscriber"
+    );
+
+    forwarder.abort();
+}
