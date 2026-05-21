@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt;
 use tokio::net::UnixListener;
@@ -54,6 +54,19 @@ const EVENT_BROADCAST_CAPACITY: usize = 1024;
 /// growth) would let a single misbehaving pane balloon daemon memory.
 const PENDING_BROADCAST_CAP: usize = 256;
 
+/// Static variant name for a `BroadcastMsg`. Used in eviction logs so an
+/// operator who sees the buffer overflow warning can tell at a glance
+/// whether a Delegate signal, a WorkDone, or an Event was dropped without
+/// having to parse the structured `Debug` impl. Cheap (`&'static str`),
+/// matches the names used in the wire-format `#[serde(rename = ...)]`.
+fn broadcast_variant_name(msg: &BroadcastMsg) -> &'static str {
+    match msg {
+        BroadcastMsg::Event(_) => "event",
+        BroadcastMsg::Delegate(_) => "delegate",
+        BroadcastMsg::WorkDone(_) => "work_done",
+    }
+}
+
 /// Bounded replay buffer for orchestration `BroadcastMsg`s (Delegate /
 /// WorkDone) that arrived while no TUI was subscribed.
 ///
@@ -90,12 +103,67 @@ impl PendingBroadcasts {
     /// reached. The caller is expected to invoke this only on send-Err
     /// (zero subscribers): a normally-attached TUI receives the signal
     /// live and recording here would duplicate it on reconnect.
+    ///
+    /// Eviction is logged at `warn!`: a silent drop hides the case where a
+    /// long detach storm + a runaway worker push the buffer past its cap
+    /// and the orchestrator quietly misses signals. The log lets operators
+    /// correlate "we lost a delegate/work-done" with "buffer overflowed."
     pub fn record(&self, msg: BroadcastMsg) {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if g.len() >= PENDING_BROADCAST_CAP {
-            g.pop_front();
+        if g.len() >= PENDING_BROADCAST_CAP
+            && let Some(dropped) = g.pop_front()
+        {
+            let dropped_variant = broadcast_variant_name(&dropped);
+            let incoming_variant = broadcast_variant_name(&msg);
+            warn!(
+                dropped_variant,
+                incoming_variant,
+                depth = g.len() + 1,
+                cap = PENDING_BROADCAST_CAP,
+                "PendingBroadcasts buffer at cap — evicting oldest entry (signal will not replay on reattach)"
+            );
         }
         g.push_back(msg);
+    }
+
+    /// Re-enqueue a batch of messages at the *front* of the buffer,
+    /// preserving the original FIFO order between the entries in `msgs`.
+    /// Used by the `SubscribeEvents` replay drain to put messages back
+    /// when a write to the client fails partway through — without this,
+    /// `drain()`-then-fail-mid-write would silently lose every entry the
+    /// drain pulled out (PRD #93 reviewer/auditor finding on adb13e9).
+    ///
+    /// If re-enqueuing would exceed [`PENDING_BROADCAST_CAP`], newer
+    /// entries already in the buffer (pushed at the back by concurrent
+    /// `record` calls during the drain window) are evicted first via
+    /// `pop_back`. This preserves the older, failed-to-deliver batch the
+    /// caller is trying to save — they're the ones the next subscriber
+    /// most needs to receive in FIFO order.
+    pub fn push_front_batch(&self, msgs: Vec<BroadcastMsg>) {
+        if msgs.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Iterate in reverse so the original head of `msgs` ends up at the
+        // front of the buffer (each push_front prepends one element).
+        for msg in msgs.into_iter().rev() {
+            while g.len() >= PENDING_BROADCAST_CAP {
+                // Newer entries (push_back-ed during the drain window) lose
+                // out so the failed-batch FIFO ordering is preserved.
+                if let Some(dropped) = g.pop_back() {
+                    let dropped_variant = broadcast_variant_name(&dropped);
+                    warn!(
+                        dropped_variant,
+                        depth = g.len() + 1,
+                        cap = PENDING_BROADCAST_CAP,
+                        "PendingBroadcasts buffer at cap during requeue — evicting newest entry"
+                    );
+                } else {
+                    break;
+                }
+            }
+            g.push_front(msg);
+        }
     }
 
     /// Atomically take every buffered entry. Called by the attach server
@@ -123,6 +191,18 @@ const SOCKET_MODE: u32 = 0o600;
 /// bypasses the lock and can still race with the swap-and-restore here —
 /// so don't treat this as a process-global umask guard.
 static UMASK_LOCK: Mutex<()> = Mutex::new(());
+
+/// Sibling lock file path for a daemon socket. Used to serialize concurrent
+/// `daemon serve` starts against the same `socket_path` (PRD #93 round-2
+/// auditor BLOCKER). Each socket gets a dedicated `.lock` file so daemons
+/// at different paths don't contend with each other — and the hook socket
+/// and attach socket end up on the same lock path scheme without further
+/// coordination (each `run_daemon_with` only protects its own bind).
+fn lock_path_for(socket_path: &Path) -> PathBuf {
+    let mut s = socket_path.as_os_str().to_owned();
+    s.push(".lock");
+    PathBuf::from(s)
+}
 
 /// PRD #93 M1.3 live-socket probe. Used by [`run_daemon_with`] to
 /// distinguish a still-running daemon from a stale inode left behind by a
@@ -307,16 +387,32 @@ pub async fn run_daemon(socket_path: &Path, state: SharedState) -> Result<(), Da
 /// is spawned alongside the hook-ingestion loop and aborted when this
 /// function returns.
 pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), DaemonError> {
-    // PRD #93 M1.3 race protection. The pre-existing code unconditionally
-    // unlinked any file at `socket_path` before binding. Two `daemon serve`
-    // processes racing each other would both see the other's socket as
-    // "stale," remove it, and bind a fresh inode — silently rebinding the
-    // path away from the still-running winner and leaving its clients
-    // stranded.
+    // PRD #93 M1.3 / round-2 auditor BLOCKER: race protection for the
+    // probe-remove-bind sequence.
     //
-    // Probe-connect first: if connecting succeeds, another daemon owns
-    // this path and we must lose the race. Otherwise the socket is stale
-    // (its binder died without unlinking) and we can safely remove it.
+    // The pre-existing code unconditionally unlinked any file at
+    // `socket_path` before binding. Two `daemon serve` processes racing
+    // each other would both see the other's socket as "stale," remove it,
+    // and bind a fresh inode — silently rebinding the path away from the
+    // still-running winner and leaving its clients stranded.
+    //
+    // Round-1 added a probe-connect to distinguish a live winner from a
+    // stale crash leftover. That helps the common case (one daemon, plus
+    // a crash leftover) but is still racy: two starters can both observe
+    // "exists but not alive" between their probes and proceed to both
+    // remove + bind. Audit BLOCKER #1 calls this out explicitly.
+    //
+    // Fix: hold an exclusive `flock(2)` over a sibling `{socket}.lock`
+    // file across the entire probe → remove → bind sequence. The
+    // `daemon_attach::ensure_daemon_running` path already uses this same
+    // primitive on `<state_dir>/spawn.lock` for the launcher side; we
+    // reuse it here so the two halves of the racing pair share one
+    // serialization point. The lock is released as soon as `bind_socket`
+    // succeeds — afterwards, any further start attempt's probe will see
+    // the live socket and return AddrInUse without needing the lock.
+    let lock_path = lock_path_for(socket_path);
+    let _start_lock = crate::daemon_attach::acquire_spawn_lock(&lock_path).await?;
+
     if socket_path.exists() {
         if probe_socket_alive(socket_path).await {
             return Err(DaemonError::Io(io::Error::new(
@@ -331,6 +427,12 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     }
 
     let listener = bind_socket(socket_path)?;
+    // Lock has done its job: subsequent starters' probe-connect will now
+    // succeed against this listener and return AddrInUse without needing
+    // to contend on the lock. Dropping releases the flock and closes the
+    // fd; the `.lock` file itself stays on disk (cheap, empty, reused on
+    // next start).
+    drop(_start_lock);
     // Defense in depth: `bind_socket` already created the inode at 0o600 via
     // umask, but restating the mode here makes the requirement explicit and
     // would cover any future code path that bypasses `bind_socket`.
@@ -388,13 +490,20 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // path. In-process daemons skip this because their lifetime is tied
     // to the TUI (the TUI's `Drop` aborts the daemon task and unlinks
     // the sockets directly).
+    //
+    // PRD #93 round-2 reviewer REV-1: monitor is edge-triggered — it
+    // shares the registry's `change_notify` so transitions on both sides
+    // (attach counter via `ClientGuard`, registry via spawn/close/exit)
+    // wake it immediately. No polling cadence to race against a brief
+    // reconnect.
     let idle_handle = match (idle_shutdown, is_external_mode) {
         (Some(window), true) => {
             let counter = client_count.clone();
             let registry = pty_registry.clone();
             let shutdown_signal = shutdown.clone();
+            let notify = pty_registry.change_notify();
             Some(tokio::spawn(async move {
-                run_idle_monitor(counter, registry, window, shutdown_signal).await;
+                run_idle_monitor(counter, registry, window, shutdown_signal, notify).await;
             }))
         }
         _ => None,
@@ -421,45 +530,100 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     result
 }
 
-/// PRD #93 M1.2 idle monitor. Polls every `poll_interval` for the
-/// joint-zero condition (no attached clients *and* no managed agents);
-/// once it has held continuously for `threshold`, fires `shutdown` and
-/// exits.
+/// PRD #93 M1.2 idle monitor — edge-triggered.
 ///
-/// `poll_interval` is derived from `threshold` so tests with short
-/// windows finish quickly while the production 30s window only wakes a
-/// couple of times per second.
+/// Originally a polling loop (round 1). Round-2 reviewer REV-1 flagged the
+/// reconnect-race: between two polls a client could disconnect+reconnect
+/// briefly, and if the poll cadence happened to land in the zero-clients
+/// window the timer would start; if a follow-up poll happened to miss
+/// the reconnect-then-disconnect cycle the daemon could fire shutdown
+/// while a TUI was actively re-attaching.
+///
+/// Edge-triggered fixes this: every counter transition (client connect /
+/// disconnect, agent spawn / close / exit) signals `change_notify`. The
+/// monitor parks on that signal and re-evaluates the joint-zero gate. On
+/// entering the idle state, it spawns a child timer task that fires
+/// shutdown after `threshold` *iff* the gate still holds when the timer
+/// expires. On leaving the idle state, it aborts the pending timer.
+///
+/// The child timer's re-check on expiry is the second line of defense:
+/// it handles the race where the timer's `sleep(threshold)` future is
+/// just about to complete when a reconnect arrives, and our abort loses
+/// the race with the wake-up. Re-reading the counters before signaling
+/// shutdown keeps that race from misfiring.
 async fn run_idle_monitor(
     client_count: Arc<AtomicUsize>,
     pty_registry: Arc<AgentPtyRegistry>,
     threshold: Duration,
     shutdown: Arc<Notify>,
+    change_notify: Arc<Notify>,
 ) {
-    // Sub-second floor keeps test runs fast; cap at 1s so production wakes
-    // are cheap. `threshold / 4` gives at least 3–4 samples per window even
-    // for short test thresholds.
-    let poll_interval =
-        std::cmp::min(threshold / 4, Duration::from_secs(1)).max(Duration::from_millis(50));
-    let mut idle_since: Option<Instant> = None;
+    // RAII guard so aborting `run_idle_monitor` (the outer
+    // `run_daemon_with` cleanup path) doesn't leak a still-running timer
+    // task. tokio JoinHandle::Drop is a *detach*, not an abort — without
+    // this guard a timer scheduled just before abort would keep running
+    // and possibly fire a stray `shutdown.notify_one()` against a
+    // subsequent daemon's listener.
+    struct TimerGuard(Option<tokio::task::JoinHandle<()>>);
+    impl TimerGuard {
+        fn arm(&mut self, h: tokio::task::JoinHandle<()>) {
+            // Abort any pre-existing timer before storing the new one.
+            if let Some(prev) = self.0.take() {
+                prev.abort();
+            }
+            self.0 = Some(h);
+        }
+        fn disarm(&mut self) {
+            if let Some(h) = self.0.take() {
+                h.abort();
+            }
+        }
+    }
+    impl Drop for TimerGuard {
+        fn drop(&mut self) {
+            self.disarm();
+        }
+    }
+    let mut timer = TimerGuard(None);
+
     loop {
-        tokio::time::sleep(poll_interval).await;
         let clients = client_count.load(Ordering::SeqCst);
-        let agents = pty_registry.len();
-        if clients == 0 && agents == 0 {
-            let started = idle_since.get_or_insert_with(Instant::now);
-            if started.elapsed() >= threshold {
-                info!(
-                    threshold_secs = threshold.as_secs(),
-                    "Daemon idle window elapsed (no clients, no agents); signaling shutdown"
-                );
-                shutdown.notify_one();
-                return;
+        let agents = pty_registry.live_count();
+        let is_idle = clients == 0 && agents == 0;
+
+        if is_idle {
+            if timer.0.is_none() {
+                // 1→0 transition (or fresh-startup idle): arm the timer.
+                let counter = client_count.clone();
+                let registry = pty_registry.clone();
+                let shutdown_signal = shutdown.clone();
+                let dur = threshold;
+                let handle = tokio::spawn(async move {
+                    tokio::time::sleep(dur).await;
+                    // Re-check just before firing — covers the narrow race
+                    // where an abort loses to the sleep completing. Without
+                    // it, a connect arriving in that gap would still fire
+                    // shutdown.
+                    if counter.load(Ordering::SeqCst) == 0 && registry.live_count() == 0 {
+                        info!(
+                            threshold_secs = dur.as_secs(),
+                            "Daemon idle window elapsed (no clients, no agents); signaling shutdown"
+                        );
+                        shutdown_signal.notify_one();
+                    }
+                });
+                timer.arm(handle);
             }
         } else {
-            // Either a client (re)connected or an agent is alive — reset the
-            // clock so the next idle stretch is measured from scratch.
-            idle_since = None;
+            // 0→1 transition (or fresh-startup non-idle): tear down any
+            // pending timer so the next idle window starts from scratch.
+            timer.disarm();
         }
+
+        // Park until the next transition. Tokio Notify stores a permit if
+        // notify_one was called between iterations, so a signal that lands
+        // after we read the counters but before we await isn't lost.
+        change_notify.notified().await;
     }
 }
 
@@ -781,16 +945,19 @@ mod tests {
         let client_count = Arc::new(AtomicUsize::new(0));
         let registry = Arc::new(AgentPtyRegistry::new());
         let shutdown = Arc::new(Notify::new());
+        let change_notify = registry.change_notify();
 
         let monitor_shutdown = shutdown.clone();
         let monitor_clients = client_count.clone();
         let monitor_registry = registry.clone();
+        let monitor_notify = change_notify.clone();
         tokio::spawn(async move {
             run_idle_monitor(
                 monitor_clients,
                 monitor_registry,
                 Duration::from_millis(150),
                 monitor_shutdown,
+                monitor_notify,
             )
             .await;
         });
@@ -806,13 +973,21 @@ mod tests {
         // We bump the counter halfway through the window; the monitor must
         // *not* fire by the original threshold and must require another
         // full window of zero-clients-zero-agents from the drop point.
+        //
+        // PRD #93 round-2 reviewer REV-1: the monitor is now edge-triggered,
+        // so the test signals `change_notify` after each counter mutation
+        // — exactly the way production's `ClientGuard` does. A test that
+        // mutated the counter without notifying would never wake the
+        // monitor and the assertion would be vacuous.
         let client_count = Arc::new(AtomicUsize::new(0));
         let registry = Arc::new(AgentPtyRegistry::new());
         let shutdown = Arc::new(Notify::new());
+        let change_notify = registry.change_notify();
 
         let monitor_shutdown = shutdown.clone();
         let monitor_clients = client_count.clone();
         let monitor_registry = registry.clone();
+        let monitor_notify = change_notify.clone();
         let threshold = Duration::from_millis(300);
         let handle = tokio::spawn(async move {
             run_idle_monitor(
@@ -820,6 +995,7 @@ mod tests {
                 monitor_registry,
                 threshold,
                 monitor_shutdown,
+                monitor_notify,
             )
             .await;
         });
@@ -827,6 +1003,7 @@ mod tests {
         // Half-way: bump client count so the idle accumulator resets.
         tokio::time::sleep(Duration::from_millis(150)).await;
         client_count.fetch_add(1, Ordering::SeqCst);
+        change_notify.notify_one();
 
         // Wait *past* the original threshold deadline. With the reset, no
         // notification should arrive yet.
@@ -838,6 +1015,7 @@ mod tests {
 
         // Drop the client; monitor should fire again after `threshold` elapses.
         client_count.fetch_sub(1, Ordering::SeqCst);
+        change_notify.notify_one();
         tokio::time::timeout(threshold * 4, shutdown.notified())
             .await
             .expect("idle monitor must re-fire once clients drop back to zero");
@@ -860,10 +1038,12 @@ mod tests {
             })
             .expect("spawn should succeed");
         let shutdown = Arc::new(Notify::new());
+        let change_notify = registry.change_notify();
 
         let monitor_shutdown = shutdown.clone();
         let monitor_clients = client_count.clone();
         let monitor_registry = registry.clone();
+        let monitor_notify = change_notify.clone();
         let threshold = Duration::from_millis(150);
         let handle = tokio::spawn(async move {
             run_idle_monitor(
@@ -871,6 +1051,7 @@ mod tests {
                 monitor_registry,
                 threshold,
                 monitor_shutdown,
+                monitor_notify,
             )
             .await;
         });
@@ -1001,5 +1182,244 @@ mod tests {
             .await
             .expect("daemon must exit within bounded window of idle threshold");
         res.expect("daemon should return Ok on idle shutdown");
+    }
+
+    #[tokio::test]
+    async fn run_daemon_with_serializes_concurrent_starts_on_lock() {
+        // PRD #93 round-2 auditor BLOCKER: two `run_daemon_with` calls
+        // against the same socket path must serialize on the sibling
+        // `.lock` file's flock(2). Exactly one should bind successfully;
+        // the loser must fail with AddrInUse against the winner's live
+        // socket (the live-socket probe inside the lock catches it).
+        // Without the flock, both could race past the probe-and-remove
+        // and both bind a fresh inode, silently clobbering each other.
+        let dir = race_safe_tempdir();
+        let sock_path = Arc::new(dir.path().join("hook.sock"));
+        let attach1 = dir.path().join("attach1.sock");
+        let attach2 = dir.path().join("attach2.sock");
+
+        let sock1 = sock_path.clone();
+        let h1 = tokio::spawn(async move {
+            let state = Arc::new(RwLock::new(AppState::default()));
+            let daemon = Daemon::with_attach(state, attach1)
+                .with_idle_shutdown(Some(Duration::from_secs(2)));
+            run_daemon_with(&sock1, daemon).await
+        });
+
+        // Give the first task a moment to bind so the second's probe
+        // observes a live socket. Without the head-start the test would
+        // become a coin-flip — either ordering is technically legal under
+        // the flock (one wins, one loses), but pinning the head-start
+        // gives the assertion below a stable winner.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let sock2 = sock_path.clone();
+        let h2 = tokio::spawn(async move {
+            let state = Arc::new(RwLock::new(AppState::default()));
+            let daemon = Daemon::with_attach(state, attach2)
+                .with_idle_shutdown(Some(Duration::from_secs(2)));
+            run_daemon_with(&sock2, daemon).await
+        });
+
+        // The second must fail with AddrInUse — the lock ensured the
+        // probe ran AFTER the first bound, so the live-socket probe in
+        // the second task observed a connectable socket.
+        let r2 = tokio::time::timeout(Duration::from_secs(3), h2)
+            .await
+            .expect("loser must return within a bounded window")
+            .expect("loser task should not panic");
+        match r2 {
+            Err(DaemonError::Io(e)) => {
+                assert_eq!(
+                    e.kind(),
+                    io::ErrorKind::AddrInUse,
+                    "loser must surface AddrInUse, got {e:?}"
+                );
+            }
+            Ok(()) => panic!("second daemon must NOT bind while the first is live"),
+            Err(other) => panic!("expected AddrInUse Io error, got {other:?}"),
+        }
+
+        // Clean up the first task. It's still running its idle window;
+        // aborting drops it. The lock file remains on disk (cheap, empty)
+        // — that's expected, the lock is held via flock not file presence.
+        h1.abort();
+    }
+
+    #[tokio::test]
+    async fn run_daemon_with_uses_sibling_lock_file() {
+        // Sanity: the lock path is deterministic and lives next to the
+        // socket, not somewhere global. A future refactor that puts the
+        // lock under a per-user dir would still need this invariant for
+        // the per-socket race-protection to be meaningful.
+        let dir = race_safe_tempdir();
+        let sock_path = dir.path().join("hook.sock");
+        let attach_path = dir.path().join("attach.sock");
+        let lock_path = lock_path_for(&sock_path);
+        assert_eq!(lock_path, dir.path().join("hook.sock.lock"));
+
+        let state = Arc::new(RwLock::new(AppState::default()));
+        let daemon = Daemon::with_attach(state, attach_path)
+            .with_idle_shutdown(Some(Duration::from_millis(150)));
+        let res = tokio::time::timeout(Duration::from_secs(3), run_daemon_with(&sock_path, daemon))
+            .await
+            .expect("daemon must exit within bounded window of idle threshold");
+        res.expect("daemon should return Ok on idle shutdown");
+
+        assert!(
+            lock_path.exists(),
+            "lock file should remain on disk for the next start"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_monitor_survives_brief_reconnect_inside_window() {
+        // PRD #93 round-2 reviewer REV-1: an edge-triggered monitor must
+        // tolerate a disconnect+reconnect that hits the joint-zero gate
+        // for less than `threshold`. Simulates: client present, drops,
+        // monitor arms timer; well before timer fires, client reconnects;
+        // shutdown must NOT fire even after timer would have expired.
+        let client_count = Arc::new(AtomicUsize::new(1));
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let shutdown = Arc::new(Notify::new());
+        let change_notify = registry.change_notify();
+
+        let monitor_shutdown = shutdown.clone();
+        let monitor_clients = client_count.clone();
+        let monitor_registry = registry.clone();
+        let monitor_notify = change_notify.clone();
+        let threshold = Duration::from_millis(300);
+        let handle = tokio::spawn(async move {
+            run_idle_monitor(
+                monitor_clients,
+                monitor_registry,
+                threshold,
+                monitor_shutdown,
+                monitor_notify,
+            )
+            .await;
+        });
+
+        // Give the monitor one notify so it parks on `change_notify`. The
+        // start state is (1 client, 0 agents) — not idle — so on the first
+        // loop iteration the timer stays None and the monitor parks.
+        change_notify.notify_one();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Client disconnects: counter→0, signal.
+        client_count.fetch_sub(1, Ordering::SeqCst);
+        change_notify.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Reconnect before threshold elapses.
+        client_count.fetch_add(1, Ordering::SeqCst);
+        change_notify.notify_one();
+
+        // Wait well past the original timer's expiry. With the abort
+        // path working, shutdown must NOT fire — the monitor saw the
+        // counter go back to 1 and aborted the timer.
+        let res = tokio::time::timeout(threshold * 3, shutdown.notified()).await;
+        assert!(
+            res.is_err(),
+            "edge-triggered monitor must NOT fire shutdown when a client reconnects inside the idle window"
+        );
+
+        handle.abort();
+    }
+
+    #[test]
+    fn pending_broadcasts_logs_warn_on_eviction() {
+        // PRD #93 round-2 reviewer/auditor #6: silent eviction at cap was
+        // hiding the "long detach storm + runaway worker dropped a signal"
+        // case. The record() helper now logs a warn! when the buffer is
+        // full. We can't easily assert on the logger output without a
+        // tracing subscriber, but we can at least verify the eviction
+        // *behavior* — the buffer never exceeds the cap and the oldest
+        // entry is the one that's dropped.
+        use crate::event::DelegateSignal;
+        use chrono::Utc;
+
+        let buf = PendingBroadcasts::new();
+        // Push CAP+1 distinguishable entries.
+        for i in 0..=PENDING_BROADCAST_CAP {
+            buf.record(BroadcastMsg::Delegate(DelegateSignal {
+                pane_id: format!("p-{i}"),
+                task: format!("t-{i}"),
+                to: vec![],
+                timestamp: Utc::now(),
+            }));
+        }
+
+        let drained = buf.drain();
+        assert_eq!(
+            drained.len(),
+            PENDING_BROADCAST_CAP,
+            "buffer must cap at PENDING_BROADCAST_CAP entries; got {}",
+            drained.len()
+        );
+
+        // The first push (p-0) must have been evicted. The remaining
+        // entries should be p-1 .. p-CAP in FIFO order.
+        match &drained[0] {
+            BroadcastMsg::Delegate(s) => {
+                assert_eq!(
+                    s.pane_id, "p-1",
+                    "oldest survivor must be p-1 — p-0 should have been evicted"
+                );
+            }
+            other => panic!("expected Delegate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_broadcasts_push_front_batch_preserves_fifo() {
+        // PRD #93 round-2 reviewer/auditor #5: re-enqueueing a failed
+        // drain batch must preserve the FIFO order between entries so a
+        // fresh subscriber drains them in the same order as the wedged
+        // one would have.
+        use crate::event::DelegateSignal;
+        use chrono::Utc;
+
+        let buf = PendingBroadcasts::new();
+        // Simulate: drain pulled out [a, b, c]; write of `b` failed, so
+        // we re-enqueue [b, c] (a was successfully written). The next
+        // subscriber must drain [b, c] in that order.
+        let mk = |id: &str| {
+            BroadcastMsg::Delegate(DelegateSignal {
+                pane_id: id.into(),
+                task: "t".into(),
+                to: vec![],
+                timestamp: Utc::now(),
+            })
+        };
+        buf.push_front_batch(vec![mk("b"), mk("c")]);
+        let drained = buf.drain();
+        assert_eq!(drained.len(), 2);
+        match (&drained[0], &drained[1]) {
+            (BroadcastMsg::Delegate(d0), BroadcastMsg::Delegate(d1)) => {
+                assert_eq!(d0.pane_id, "b", "first replayed must be the failed one");
+                assert_eq!(d1.pane_id, "c", "second replayed must follow in FIFO");
+            }
+            other => panic!("expected two Delegate entries, got {other:?}"),
+        }
+
+        // Re-enqueued batch must sit at the FRONT, even if newer entries
+        // arrived via `record` during the drain window.
+        buf.record(mk("d"));
+        buf.record(mk("e"));
+        buf.push_front_batch(vec![mk("b"), mk("c")]);
+        let drained = buf.drain();
+        let ids: Vec<&str> = drained
+            .iter()
+            .map(|m| match m {
+                BroadcastMsg::Delegate(d) => d.pane_id.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["b", "c", "d", "e"],
+            "failed-batch must sit at the front, in FIFO order, ahead of entries recorded during the drain window"
+        );
     }
 }

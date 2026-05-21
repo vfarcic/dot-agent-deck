@@ -8,12 +8,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast};
 
 use crate::event::AgentType;
 
@@ -597,7 +597,20 @@ impl AgentBus {
 /// otherwise terminated). The thread is detached — `RunningAgent` does not
 /// hold a `JoinHandle` for it because shutdown is driven entirely by closing
 /// the PTY (see `AgentPtyRegistry::close_agent`).
-fn pump_reader(mut reader: Box<dyn std::io::Read + Send>, bus: Arc<AgentBus>) {
+///
+/// On loop exit (EOF or read error — both mean the child is gone) the
+/// per-agent `exited` flag is set and `change_notify` is signaled. The
+/// daemon's idle monitor reads `exited` via [`AgentPtyRegistry::live_count`]
+/// so an agent that died but whose registry entry hasn't been closed yet
+/// stops pinning the daemon up past its idle window (PRD #93 round-2
+/// reviewer REV-3 — `len()` on its own counted exited entries and broke
+/// idle shutdown).
+fn pump_reader(
+    mut reader: Box<dyn std::io::Read + Send>,
+    bus: Arc<AgentBus>,
+    exited: Arc<AtomicBool>,
+    change_notify: Arc<Notify>,
+) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {
@@ -606,6 +619,8 @@ fn pump_reader(mut reader: Box<dyn std::io::Read + Send>, bus: Arc<AgentBus>) {
             Err(_) => break,
         }
     }
+    exited.store(true, Ordering::SeqCst);
+    change_notify.notify_one();
 }
 
 /// Snapshot of the writer + bus needed to attach a streaming client.
@@ -665,6 +680,16 @@ pub struct RunningAgent {
     /// rationale as `display_name` / `tab_membership` — older clients
     /// that omit the field round-trip as `None`.
     pub agent_type: Option<AgentType>,
+    /// PRD #93 round-2 reviewer REV-3: set to `true` by the reader thread
+    /// once the PTY returns EOF (the child died or was killed). The daemon's
+    /// idle monitor consults this via [`AgentPtyRegistry::live_count`] so an
+    /// agent whose registry entry hasn't been closed yet stops blocking
+    /// idle shutdown — otherwise `len()` would include exited entries and
+    /// the daemon would stay up forever. The flag is *not* drained from the
+    /// registry: tests and tooling that explicitly call `close_agent` /
+    /// `shutdown_all` still find the entry; only the idle gate filters it
+    /// out. `Arc` because the reader thread holds an independent clone.
+    pub exited: Arc<AtomicBool>,
 }
 
 /// Snapshot of one daemon-side agent that the M2.x rehydration path needs.
@@ -724,6 +749,15 @@ pub struct AgentPtyRegistry {
     /// to detach, not just disconnect," and lightweight observability if a
     /// future status command wants it.
     detach_count: AtomicU64,
+    /// PRD #93 round-2 (reviewer REV-1 / REV-3): signaled whenever the set
+    /// of *live* agents changes — i.e. when a spawn lands, when a close
+    /// runs, or when the reader thread for an agent observes EOF. The
+    /// daemon's edge-triggered idle monitor waits on this so a brief
+    /// detach+reconnect or an agent dying mid-window wakes the monitor
+    /// immediately instead of waiting for the next poll. Cloned by the
+    /// per-agent pump_reader so the EOF path can notify without holding a
+    /// registry lock.
+    change_notify: Arc<Notify>,
 }
 
 struct RegistryInner {
@@ -745,7 +779,17 @@ impl AgentPtyRegistry {
                 agents: HashMap::new(),
             }),
             detach_count: AtomicU64::new(0),
+            change_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// PRD #93 round-2 reviewer REV-1: borrow the change-notify the daemon's
+    /// idle monitor waits on. Cloned by callers so they can `.notified()`
+    /// without owning the registry. Public so `daemon::run_daemon_with` can
+    /// hand the same Arc to the idle monitor it spawns alongside the
+    /// hook-ingestion loop.
+    pub fn change_notify(&self) -> Arc<Notify> {
+        self.change_notify.clone()
     }
 
     /// Bump the global detach counter. Called by the attach protocol handler
@@ -878,8 +922,16 @@ impl AgentPtyRegistry {
 
         let bus = Arc::new(AgentBus::new());
         let bus_for_thread = bus.clone();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_for_thread = exited.clone();
+        let notify_for_thread = self.change_notify.clone();
         // Detached thread: exits when the PTY returns EOF (child killed).
-        std::thread::spawn(move || pump_reader(reader, bus_for_thread));
+        // On exit, pump_reader sets `exited` and signals `change_notify` so
+        // the idle monitor learns about the death immediately instead of
+        // waiting for the next poll cycle.
+        std::thread::spawn(move || {
+            pump_reader(reader, bus_for_thread, exited_for_thread, notify_for_thread)
+        });
 
         let agent = RunningAgent {
             child,
@@ -891,11 +943,16 @@ impl AgentPtyRegistry {
             cwd: cwd_stored,
             tab_membership,
             agent_type,
+            exited,
         };
 
         let id = inner.next_id.to_string();
         inner.next_id += 1;
         inner.agents.insert(id.clone(), agent);
+        // Signal *after* releasing the lock would be cleaner, but we still
+        // hold `inner` here. Notify is cheap and a spurious wake-up is
+        // harmless — the monitor will re-check counters anyway.
+        self.change_notify.notify_one();
         Ok(id)
     }
 
@@ -912,6 +969,12 @@ impl AgentPtyRegistry {
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?
         };
         force_kill_child_and_wait(&mut agent.child);
+        // Notify the idle monitor so it observes the registry shrink
+        // immediately. The pump_reader thread will *also* signal once it
+        // sees EOF from the kill, but doing it here makes the
+        // explicit-close path edge-trigger the monitor without depending
+        // on the kernel's PTY drain timing.
+        self.change_notify.notify_one();
         Ok(())
     }
 
@@ -1069,6 +1132,23 @@ impl AgentPtyRegistry {
         self.inner.lock().unwrap().agents.is_empty()
     }
 
+    /// PRD #93 round-2 reviewer REV-3: count of *live* (non-exited) agents.
+    /// The daemon's idle monitor uses this instead of [`len`] so an agent
+    /// whose child died but whose registry entry is still around (no
+    /// `close_agent` yet) doesn't pin the daemon up past its idle window.
+    /// An exited entry is reaped only when something else (an explicit
+    /// `close_agent`, a `shutdown_all`, or the daemon's drop) removes it
+    /// — `live_count` is the gate, not the cleanup.
+    pub fn live_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .values()
+            .filter(|a| !a.exited.load(Ordering::SeqCst))
+            .count()
+    }
+
     /// SIGKILL every agent and drain the registry. Idempotent.
     pub fn shutdown_all(&self) {
         let agents: Vec<RunningAgent> = {
@@ -1078,6 +1158,10 @@ impl AgentPtyRegistry {
         for mut agent in agents {
             force_kill_child_and_wait(&mut agent.child);
         }
+        // Wake the idle monitor if it's parked on `change_notify` — the
+        // registry just emptied, so the next gate check should see
+        // live_count == 0.
+        self.change_notify.notify_one();
     }
 }
 
@@ -1090,6 +1174,7 @@ impl Drop for AgentPtyRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     // PRD #76 M2.11 fixup 4 — pin the canonical name resolver so the UI
     // helper, the controller's new-pane path, and the rename path all
@@ -1336,6 +1421,94 @@ mod tests {
 
         // Idempotent.
         registry.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn live_count_excludes_exited_agent_after_child_dies() {
+        // PRD #93 round-2 reviewer REV-3: the daemon's idle monitor calls
+        // `live_count()` (not `len()`) so an agent whose child exited but
+        // whose registry entry hasn't been removed doesn't pin the daemon
+        // up past its idle window. Test: spawn a command that exits
+        // immediately, wait for the reader thread to observe EOF and set
+        // the `exited` flag, then assert `live_count` is 0 even though
+        // `len` is still 1.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/true"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        assert_eq!(registry.len(), 1);
+
+        // Wait up to a few seconds for the reader thread to drain to EOF
+        // and set `exited`. /bin/true exits quickly, but the PTY drain +
+        // OS scheduling can take a couple of hundred ms on a loaded box.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if registry.live_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "registry.live_count must drop to 0 once the child has exited and the reader sees EOF"
+        );
+        assert_eq!(
+            registry.len(),
+            1,
+            "len() still counts the exited entry — only live_count filters"
+        );
+
+        // Cleanup leaves the registry empty so other tests can't observe
+        // the leftover entry via shared global state.
+        registry.close_agent(&id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn change_notify_fires_on_spawn_and_close_and_agent_exit() {
+        // PRD #93 round-2 reviewer REV-1: the registry signals
+        // `change_notify` on spawn, close, and (via pump_reader) when the
+        // child exits. Without these signals an edge-triggered idle
+        // monitor would miss transitions and either fire too early or
+        // never re-arm.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let notify = registry.change_notify();
+
+        // Spawn → must notify.
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("spawn must signal change_notify");
+
+        // Close → must notify.
+        registry.close_agent(&id).expect("close should succeed");
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("close must signal change_notify");
+
+        // Agent dies on its own (no explicit close) → must notify via
+        // pump_reader on EOF.
+        let _id2 = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/true"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        // Drain the spawn signal first so we test the exit signal in
+        // isolation. The spawn notify might already have a permit stored.
+        let _ = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
+        // Now wait for the exit signal.
+        tokio::time::timeout(Duration::from_secs(3), notify.notified())
+            .await
+            .expect("agent exit must signal change_notify");
     }
 
     #[test]

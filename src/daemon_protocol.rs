@@ -462,6 +462,15 @@ pub async fn serve_attach_with_counter(
     pending_broadcasts: Arc<PendingBroadcasts>,
 ) -> io::Result<()> {
     use std::sync::atomic::Ordering;
+    use tokio::sync::Notify;
+    // PRD #93 round-2 reviewer REV-1: the same Notify the registry uses for
+    // spawn/close/exit transitions also fires on every attach-counter
+    // transition. The daemon's edge-triggered idle monitor waits on it, so
+    // a brief detach+reconnect wakes the monitor before any timer can fire.
+    // Cloned once per accepted connection — `notify_one` is cheap and tokio
+    // Notify stores a permit if no waiter is registered, so a signal sent
+    // between the monitor's loop iterations isn't lost.
+    let change_notify: Arc<Notify> = registry.change_notify();
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
@@ -469,20 +478,36 @@ pub async fn serve_attach_with_counter(
                 let event_tx = event_tx.clone();
                 let counter = client_count.clone();
                 let pending = pending_broadcasts.clone();
+                let notify = change_notify.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
                     // so a `handle_connection` task that panics or is dropped
                     // still releases its slot in the client count. Without
                     // the guard, an unwinding task would leak a slot and
                     // keep the daemon alive past the idle threshold.
-                    struct ClientGuard(Arc<std::sync::atomic::AtomicUsize>);
+                    //
+                    // The guard also signals `change_notify` on drop so the
+                    // edge-triggered idle monitor wakes immediately on
+                    // disconnect (PRD #93 round-2 reviewer REV-1).
+                    struct ClientGuard {
+                        counter: Arc<std::sync::atomic::AtomicUsize>,
+                        notify: Arc<Notify>,
+                    }
                     impl Drop for ClientGuard {
                         fn drop(&mut self) {
-                            self.0.fetch_sub(1, Ordering::SeqCst);
+                            self.counter.fetch_sub(1, Ordering::SeqCst);
+                            self.notify.notify_one();
                         }
                     }
                     counter.fetch_add(1, Ordering::SeqCst);
-                    let _guard = ClientGuard(counter.clone());
+                    // Signal the increment too so the monitor cancels any
+                    // pending shutdown timer the moment a fresh client
+                    // connects, not after the next decrement.
+                    notify.notify_one();
+                    let _guard = ClientGuard {
+                        counter: counter.clone(),
+                        notify: notify.clone(),
+                    };
                     if let Err(e) = handle_connection(stream, registry, event_tx, pending).await {
                         warn!("attach protocol connection error: {e}");
                     }
@@ -711,20 +736,42 @@ async fn handle_subscribe_events(
     // PRD #76 / PRD #93 replay: drain any orchestration signals that
     // arrived while no TUI was attached. Each entry is written as a
     // KIND_EVENT frame, identical to the live-recv arm below — the TUI's
-    // subscriber loop is shape-agnostic about live vs replayed. On a
-    // bounded-write timeout we tear the subscription down the same way
-    // the live recv arm does (the client will reconnect and pick up
-    // anything still pending).
+    // subscriber loop is shape-agnostic about live vs replayed.
+    //
+    // Drain semantics matter for correctness here. The earlier shape
+    // (PRD #93 round-1) was `drain()` → write-or-bail; if a write failed
+    // mid-drain the *remaining* entries were silently lost because they
+    // were no longer in the buffer and no one re-enqueued them. A
+    // wedged-then-recovering client would see only the entries that
+    // happened to fit before the timeout. Now we copy the drained vec out
+    // first, write each entry outside any lock, and on the first failure
+    // re-enqueue the failed entry plus every untried entry at the FRONT
+    // of the buffer (preserving FIFO) so the next `SubscribeEvents`
+    // subscriber picks up exactly where we left off.
     let replay = pending_broadcasts.drain();
-    for msg in replay {
+    let mut iter = replay.into_iter();
+    while let Some(msg) = iter.next() {
         let payload = match serde_json::to_vec(&msg) {
             Ok(b) => b,
             Err(e) => {
+                // Unserializable entries are a daemon bug, not a client
+                // problem — drop just this one and keep replaying the rest
+                // rather than re-enqueueing a poison message that would
+                // fail the same way for the next subscriber.
                 warn!("subscribe-events: skipping unserializable replay entry: {e}");
                 continue;
             }
         };
         if !write_or_timeout(&mut wr, KIND_EVENT, &payload).await {
+            // Client wedged or socket error: rebuild the failed-batch list
+            // (the current `msg` plus every still-untried entry from
+            // `iter`) and re-enqueue at the front so a fresh subscriber
+            // can drain them next. Without this, every entry the drain
+            // pulled out would be lost on first write failure.
+            let mut requeue = Vec::with_capacity(1 + iter.size_hint().0);
+            requeue.push(msg);
+            requeue.extend(iter);
+            pending_broadcasts.push_front_batch(requeue);
             let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
             return Ok(());
         }

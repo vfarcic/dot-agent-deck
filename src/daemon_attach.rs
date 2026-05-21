@@ -215,7 +215,13 @@ impl Drop for SpawnLock {
 /// blocking, so we run the syscall on `spawn_blocking` to avoid stalling
 /// other tasks scheduled on the same tokio worker when contention is real
 /// (i.e., another caller on this host is mid-spawn).
-async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
+///
+/// `pub(crate)` so the daemon's `run_daemon_with` can reuse the same
+/// primitive to serialize its own probe-remove-bind sequence against
+/// concurrent `daemon serve` starts (PRD #93 auditor BLOCKER — two
+/// daemons probing a stale socket would otherwise both `remove_file` and
+/// both `bind`, clobbering each other's clients).
+pub(crate) async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let path = path.to_path_buf();
