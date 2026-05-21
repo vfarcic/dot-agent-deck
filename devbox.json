@@ -23,7 +23,7 @@
       "agent-big":          ["claude --model opus"],
       "agent-orchestrator": ["claude --model opus"],
       "agent-coder":        ["claude --model opus"],
-      "agent-reviewer":     ["opencode --model openai/gpt-5.5"],
+      "agent-reviewer":     ["opencode --model openrouter/openai/gpt-5.5"],
       "agent-auditor":      ["opencode --model openai/gpt-5.5"],
       "agent-release":      ["claude --model haiku"],
       "oc-release":  ["opencode --model openai/gpt-5.4-mini"],
