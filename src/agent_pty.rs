@@ -16,6 +16,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast};
 
 use crate::event::AgentType;
+use crate::pane_input::{SUBMIT_DELAY, encode_pane_payload};
 
 /// Trigger flag the deck client honors to mean "the daemon is already
 /// running; attach over its stream socket instead of spawning one." The
@@ -972,8 +973,8 @@ impl AgentPtyRegistry {
         Ok(id)
     }
 
-    /// Write `bytes` to the PTY of the agent whose `pane_id_env` matches
-    /// `pane_id`.
+    /// Write `text` as a submitted prompt to the PTY of the agent whose
+    /// `pane_id_env` matches `pane_id`.
     ///
     /// PRD #93 round-5: orchestration dispatch (delegate / work-done) now
     /// lives on the daemon side, and routing happens via this method. The
@@ -985,7 +986,23 @@ impl AgentPtyRegistry {
     /// normal terminal output in the pane's scrollback — that's the new
     /// "journal" surface for orchestration feedback (no separate
     /// broadcast / file cursor / buffer).
-    pub async fn write_to_pane(&self, pane_id: &str, bytes: &[u8]) -> Result<(), AgentPtyError> {
+    ///
+    /// PRD #93 round-6: the daemon must mirror the TUI's submit contract
+    /// (see [`crate::pane_input`] and `EmbeddedPaneController::write_to_pane`
+    /// in `src/embedded_pane.rs`). Just dropping the prompt bytes into the
+    /// PTY leaves them sitting in the agent TUI's input box — the worker
+    /// never starts processing until the user manually presses Enter.
+    /// So: encode the payload (raw for single-line, bracketed paste for
+    /// multi-line), flush, wait [`SUBMIT_DELAY`] so the CR isn't fused with
+    /// the preceding text into "newline-in-input", then write the CR.
+    ///
+    /// Concurrency: callers must not invoke this concurrently for the same
+    /// `pane_id` — interleaved writes would produce
+    /// `payload_A + payload_B + CR + CR`, fusing two prompts. Mirrors the
+    /// constraint documented at `EmbeddedPaneController::write_to_pane`. The
+    /// writer mutex is released around the sleep so other panes can keep
+    /// being written to.
+    pub async fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), AgentPtyError> {
         // Resolve writer under the sync lock, then drop the lock before
         // awaiting the async writer mutex — otherwise we'd hold the
         // registry mutex across an `await`, blocking every other registry
@@ -1000,10 +1017,20 @@ impl AgentPtyRegistry {
                 .ok_or_else(|| AgentPtyError::NotFound(pane_id.to_string()))?
         };
         use std::io::Write as _;
-        let mut w = writer.lock().await;
-        w.write_all(bytes)
-            .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
-        let _ = w.flush();
+        let payload = encode_pane_payload(text);
+        {
+            let mut w = writer.lock().await;
+            w.write_all(&payload)
+                .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
+            let _ = w.flush();
+        }
+        tokio::time::sleep(SUBMIT_DELAY).await;
+        {
+            let mut w = writer.lock().await;
+            w.write_all(b"\r")
+                .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
+            let _ = w.flush();
+        }
         Ok(())
     }
 

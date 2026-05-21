@@ -177,26 +177,7 @@ struct Pane {
 /// Thread-safe pane registry.
 type PaneRegistry = Arc<Mutex<HashMap<String, Pane>>>;
 
-/// Encode the payload portion of a pane input (content + bracketed paste markers if
-/// multi-line) without the trailing submit byte. Trailing whitespace is stripped.
-fn encode_pane_payload(text: &str) -> Vec<u8> {
-    let trimmed = text.trim_end_matches(['\n', '\r', ' ', '\t']);
-    let mut out = Vec::with_capacity(trimmed.len() + 16);
-    if trimmed.contains('\n') {
-        out.extend_from_slice(b"\x1b[200~");
-        out.extend_from_slice(trimmed.as_bytes());
-        out.extend_from_slice(b"\x1b[201~");
-    } else {
-        out.extend_from_slice(trimmed.as_bytes());
-    }
-    out
-}
-
-/// Delay between writing input bytes and the submit CR. Agent TUIs like claude
-/// treat a CR that arrives fused to the preceding text as newline-in-input; only
-/// a CR that arrives as a separate event after a pause is honored as Enter. The
-/// same applies after a bracketed-paste close marker. 150ms tuned empirically.
-const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+use crate::pane_input::{SUBMIT_DELAY, encode_pane_payload};
 
 /// Selects how `create_pane` builds new panes:
 /// - `LocalDeck` spawns a PTY in this process (unchanged from pre-M1.3).
@@ -2005,41 +1986,6 @@ mod tests {
         ctrl.write_to_pane(&id, "echo hello").unwrap();
 
         ctrl.close_pane(&id).unwrap();
-    }
-
-    #[test]
-    fn encode_pane_payload_single_line() {
-        assert_eq!(encode_pane_payload("ls -la"), b"ls -la");
-    }
-
-    #[test]
-    fn encode_pane_payload_strips_trailing_whitespace() {
-        assert_eq!(encode_pane_payload("ls -la\n"), b"ls -la");
-        assert_eq!(encode_pane_payload("ls -la  \n\n"), b"ls -la");
-    }
-
-    #[test]
-    fn encode_pane_payload_wraps_multiline() {
-        assert_eq!(
-            encode_pane_payload("line1\nline2\nline3"),
-            b"\x1b[200~line1\nline2\nline3\x1b[201~"
-        );
-    }
-
-    #[test]
-    fn encode_pane_payload_multiline_with_trailing_newline() {
-        // Trailing newline is stripped, but embedded newlines still trigger paste wrapping.
-        assert_eq!(
-            encode_pane_payload("line1\nline2\n"),
-            b"\x1b[200~line1\nline2\x1b[201~"
-        );
-    }
-
-    #[test]
-    fn encode_pane_payload_empty() {
-        assert_eq!(encode_pane_payload(""), b"");
-        // Edge case: trailing whitespace stripped to empty → no embedded newline → no markers.
-        assert_eq!(encode_pane_payload("\n\n"), b"");
     }
 
     #[test]

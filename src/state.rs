@@ -250,7 +250,7 @@ impl AppState {
             };
 
             for pane_id in target_panes {
-                if let Err(e) = registry.write_to_pane(&pane_id, one_liner.as_bytes()).await {
+                if let Err(e) = registry.write_to_pane(&pane_id, &one_liner).await {
                     warn!(
                         pane_id = %pane_id,
                         role = %target_role,
@@ -339,10 +339,7 @@ impl AppState {
             "Worker {safe_name} has completed their task. \
              Read .dot-agent-deck/work-done-{safe_name}.md for their full report."
         );
-        if let Err(e) = registry
-            .write_to_pane(&orch_pane_id, feedback.as_bytes())
-            .await
-        {
+        if let Err(e) = registry.write_to_pane(&orch_pane_id, &feedback).await {
             warn!(
                 pane_id = %orch_pane_id,
                 role = %role_name,

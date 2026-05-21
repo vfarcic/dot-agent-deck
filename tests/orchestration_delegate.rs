@@ -459,3 +459,143 @@ async fn work_done_survives_subscriber_detach_and_reattach() {
         "reattached subscriber must still observe the feedback in the orchestrator pane's scrollback"
     );
 }
+
+/// Poll the agent's scrollback for an arbitrary byte pattern (not just
+/// a UTF-8 needle) and return the full snapshot once it matches. Used by
+/// the round-6 tests below to wait for control-byte patterns
+/// (`\x1b[201~`, `\r\n`) that `wait_for_in_snapshot`'s string interface
+/// can't express conveniently.
+async fn wait_for_bytes_in_snapshot(
+    registry: &AgentPtyRegistry,
+    agent_id: &str,
+    needle: &[u8],
+    timeout: Duration,
+) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(snap) = registry.snapshot(agent_id)
+            && snap.windows(needle.len()).any(|w| w == needle)
+        {
+            return snap;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let last = registry.snapshot(agent_id).unwrap_or_default();
+    panic!(
+        "byte pattern {:?} not found in agent {} scrollback within {:?}; last snapshot: {:?}",
+        needle,
+        agent_id,
+        timeout,
+        String::from_utf8_lossy(&last)
+    );
+}
+
+/// PRD #93 round-6: the daemon's `write_to_pane` must follow the same
+/// submit contract as the TUI's `EmbeddedPaneController::write_to_pane`
+/// — write the encoded prompt, wait `SUBMIT_DELAY`, then write a carriage
+/// return. Without the trailing CR the agent TUI sees the prompt sitting
+/// in its input box and never starts processing.
+///
+/// We exercise the contract by writing through the registry directly
+/// (the same call site `AppState::handle_delegate` uses) and asserting
+/// that the prompt text *and* a submit-induced newline land in the
+/// role pane's scrollback. The `cat -u` agent reads the line and writes
+/// it back to its stdout once the submit CR is interpreted as Enter
+/// (ICRNL flips the input `\r` to `\n`, which closes the canonical line;
+/// cat then echoes the buffered line and ONLCR rewrites the trailing
+/// `\n` to `\r\n` on the master side). Without the round-6 fix the
+/// daemon never writes the CR, the line never closes, and cat's stdout
+/// stays empty — so the test fails at exactly the layer round-6 broke.
+#[tokio::test]
+async fn write_to_pane_emits_submit_cr_after_single_line_prompt() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let coder_agent_id =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    daemon
+        .pty_registry
+        .write_to_pane("coder-pane", "hello world")
+        .await
+        .expect("write_to_pane should succeed for a known pane");
+
+    // Look for cat -u's stdout output: "hello world\r\n" (the slave
+    // termios processed the submitted line — ICRNL on input made it a
+    // complete line, ONLCR on output appended the CR before the LF).
+    // Polling, not a single read, because pump_reader pushes bytes to
+    // the bus on its own thread and may lag the write by a few ms.
+    let snap = wait_for_bytes_in_snapshot(
+        &daemon.pty_registry,
+        &coder_agent_id,
+        b"hello world\r\n",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(
+        snap.windows(b"hello world\r\n".len())
+            .any(|w| w == b"hello world\r\n"),
+        "scrollback must contain the submitted line with its trailing CRLF; \
+         snapshot = {:?}",
+        String::from_utf8_lossy(&snap)
+    );
+}
+
+/// PRD #93 round-6: a multi-line prompt must be wrapped in
+/// bracketed-paste markers so the receiving agent TUI treats it as one
+/// paste rather than fragmenting it into N submissions (one per
+/// embedded newline). Mirrors the TUI's `encode_pane_payload` contract.
+///
+/// We assert the markers appear in `cat -u`'s stdout output (the raw
+/// ESC form, `\x1b[200~ ... \x1b[201~`). The slave's *echo* of the same
+/// input also surfaces on the master, but ECHOCTL on the slave termios
+/// renders ESC as the two-byte `^[` literal there — so the only place
+/// the raw markers reach the master is the stdout path, and only after
+/// the round-6 submit CR closes the line and lets `cat` flush.
+#[tokio::test]
+async fn write_to_pane_wraps_multiline_in_bracketed_paste() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let coder_agent_id =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    daemon
+        .pty_registry
+        .write_to_pane("coder-pane", "line1\nline2\nline3")
+        .await
+        .expect("write_to_pane should succeed for a known pane");
+
+    // Wait for the END marker in cat's stdout (raw ESC form) — that's
+    // the last byte of the encoded payload, so its presence implies the
+    // full payload + submit CR sequence has flowed through.
+    let snap = wait_for_bytes_in_snapshot(
+        &daemon.pty_registry,
+        &coder_agent_id,
+        b"\x1b[201~",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(
+        snap.windows(b"\x1b[200~".len()).any(|w| w == b"\x1b[200~"),
+        "bracketed-paste START marker (ESC[200~) missing from scrollback: {:?}",
+        String::from_utf8_lossy(&snap)
+    );
+    assert!(
+        snap.windows(b"\x1b[201~".len()).any(|w| w == b"\x1b[201~"),
+        "bracketed-paste END marker (ESC[201~) missing from scrollback: {:?}",
+        String::from_utf8_lossy(&snap)
+    );
+    // And the wrapped content must sit between the markers (we don't
+    // pin the exact slice because ONLCR rewrites the embedded LFs to
+    // CRLF on the way out — but `line2` is unambiguous).
+    assert!(
+        snap.windows(b"line2".len()).any(|w| w == b"line2"),
+        "middle content line missing from scrollback: {:?}",
+        String::from_utf8_lossy(&snap)
+    );
+}
