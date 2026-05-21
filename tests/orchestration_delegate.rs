@@ -241,17 +241,23 @@ async fn daemon_writes_delegate_prompt_to_target_role_pane() {
     // The daemon writes a file-backed one-liner to the worker pane. Pin
     // the one-liner shape — the per-role file path is what surfaces in
     // the scrollback (Claude Code would otherwise fragment a multi-line
-    // task across multiple prompts).
+    // task across multiple prompts). The work-done footer
+    // (round-7 restore) is the last block of the payload, so waiting on
+    // it guarantees the file reference has already flushed too.
     let snap = wait_for_in_snapshot(
         &daemon.pty_registry,
         &coder_agent_id,
-        ".dot-agent-deck/worker-task-coder.md",
+        "dot-agent-deck work-done",
         Duration::from_secs(5),
     )
     .await;
     assert!(
         String::from_utf8_lossy(&snap).contains("Read .dot-agent-deck/worker-task-coder.md"),
         "expected the worker-task one-liner in coder pane scrollback"
+    );
+    assert!(
+        String::from_utf8_lossy(&snap).contains("dot-agent-deck work-done"),
+        "delegate prompt must include the work-done footer so the worker signals completion"
     );
 
     // And the task file itself must exist alongside it.

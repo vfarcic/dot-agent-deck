@@ -80,6 +80,27 @@ pub struct AppState {
 
 pub type SharedState = Arc<RwLock<AppState>>;
 
+/// Compose the prompt that the daemon writes into a worker pane on
+/// delegation: the caller-supplied `task_body` (typically a one-liner
+/// pointing at `.dot-agent-deck/worker-task-{role}.md`), a blank line,
+/// then the work-done footer that reminds the worker to signal
+/// completion via `dot-agent-deck work-done` once they finish.
+///
+/// The footer used to be appended per-role by the TUI's
+/// `OrchestrationConfig.roles[*].prompt_template` wrapping. PRD #93
+/// round-5 moved dispatch into the daemon but left
+/// `OrchestrationConfig` out of scope, so without this helper every
+/// delegated task lost the footer and workers stopped signaling back.
+pub fn compose_delegate_prompt(task_body: &str) -> String {
+    format!(
+        "{task_body}\n\n## When done\n\n\
+         Signal completion by running this command via Bash:\n\
+         ```bash\n\
+         dot-agent-deck work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
+         ```"
+    )
+}
+
 impl AppState {
     pub fn aggregate_stats(&self) -> DashboardStats {
         let mut stats = DashboardStats::default();
@@ -225,7 +246,7 @@ impl AppState {
             // so a multi-line task pasted through the PTY would fragment
             // into separate prompts. The file indirection keeps the task
             // atomic.
-            let one_liner = if let Some(cwd) = cwd.as_deref() {
+            let task_body = if let Some(cwd) = cwd.as_deref() {
                 let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
                 if let Err(e) = std::fs::create_dir_all(&dir) {
                     warn!(
@@ -248,6 +269,7 @@ impl AppState {
             } else {
                 signal.task.clone()
             };
+            let one_liner = compose_delegate_prompt(&task_body);
 
             for pane_id in target_panes {
                 if let Err(e) = registry.write_to_pane(&pane_id, &one_liner).await {
@@ -1101,6 +1123,24 @@ mod tests {
     // on non-orchestrator senders) is exercised by the
     // `tests/orchestration_delegate.rs` integration tests against a
     // real daemon + PTY pair.
+
+    #[test]
+    fn compose_delegate_prompt_appends_work_done_footer() {
+        let prompt =
+            compose_delegate_prompt("Read .dot-agent-deck/worker-task-coder.md for your task.");
+        assert!(
+            prompt.starts_with("Read .dot-agent-deck/worker-task-coder.md for your task.\n\n"),
+            "task body must lead, then a blank line before the footer"
+        );
+        assert!(
+            prompt.contains("## When done"),
+            "footer must include the ## When done heading"
+        );
+        assert!(
+            prompt.contains("dot-agent-deck work-done --task"),
+            "footer must instruct the worker to call dot-agent-deck work-done"
+        );
+    }
 
     #[test]
     fn work_done_writes_summary_file_in_isolation() {
