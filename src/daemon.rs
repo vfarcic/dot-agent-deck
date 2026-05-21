@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -246,16 +246,75 @@ const SOCKET_MODE: u32 = 0o600;
 /// so don't treat this as a process-global umask guard.
 static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
-/// Sibling lock file path for a daemon socket. Used to serialize concurrent
+/// Lock file path for a daemon socket. Used to serialize concurrent
 /// `daemon serve` starts against the same `socket_path` (PRD #93 round-2
-/// auditor BLOCKER). Each socket gets a dedicated `.lock` file so daemons
-/// at different paths don't contend with each other — and the hook socket
-/// and attach socket end up on the same lock path scheme without further
-/// coordination (each `run_daemon_with` only protects its own bind).
+/// auditor BLOCKER). Each socket gets a dedicated `.lock` file derived
+/// deterministically from its path so daemons at different paths don't
+/// contend with each other.
+///
+/// PRD #93 round-4 auditor BLOCKER: the lock file is rooted in a
+/// user-owned directory regardless of where the socket lives. When the
+/// socket falls back to `/tmp` (no `XDG_RUNTIME_DIR`), a sibling `.lock`
+/// in `/tmp` is world-creatable: a local non-privileged user can
+/// pre-create `/tmp/<socket-name>.lock` (or symlink it elsewhere) and
+/// hold an exclusive `flock` on it forever, DoS-ing daemon startup for
+/// the target user. Anchoring the lock under `$XDG_RUNTIME_DIR` (when
+/// set) or `~/.cache/dot-agent-deck` (mkdir 0700) eliminates that vector
+/// — the parent dir is not world-writable, so a foreign uid can't
+/// pre-create the lock entry. The socket itself stays where it is.
+///
+/// The filename is `{basename}-{hash}.lock` where `hash` is a stable hash
+/// of the *full* socket path. The hash keeps two unrelated daemons
+/// (e.g. tests with different tempdirs but the same socket basename)
+/// from contending on the same lock — without it, parallel tests using
+/// `hook.sock` would all serialize through one global lock file.
 fn lock_path_for(socket_path: &Path) -> PathBuf {
-    let mut s = socket_path.as_os_str().to_owned();
-    s.push(".lock");
-    PathBuf::from(s)
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    socket_path.as_os_str().hash(&mut hasher);
+    let hash = hasher.finish();
+    let basename = socket_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("daemon");
+    lock_root().join(format!("{basename}-{hash:016x}.lock"))
+}
+
+/// User-owned root directory for daemon lock files. Mirrors the socket
+/// resolution order (`XDG_RUNTIME_DIR` first, then a HOME-anchored
+/// fallback) but never lands in `/tmp`. Falls back to `~/.cache/dot-agent-deck`
+/// when `XDG_RUNTIME_DIR` is unset — that path is owner-only (we mkdir
+/// 0700) and is the standard freedesktop user cache root.
+///
+/// Tests can pin a deterministic root via `DOT_AGENT_DECK_LOCK_DIR` so
+/// they don't pollute `$HOME/.cache` or contend with the user's real
+/// daemon.
+fn lock_root() -> PathBuf {
+    if let Ok(explicit) = std::env::var("DOT_AGENT_DECK_LOCK_DIR") {
+        return PathBuf::from(explicit);
+    }
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR")
+        && !runtime_dir.is_empty()
+    {
+        return PathBuf::from(runtime_dir).join("dot-agent-deck");
+    }
+    crate::config::dirs_home()
+        .join(".cache")
+        .join("dot-agent-deck")
+}
+
+/// Create `dir` (recursively) with mode 0o700 and re-apply the mode to
+/// pre-existing directories — same defense-in-depth pattern as
+/// `daemon_attach::prepare_state_dir`. We invoke this just before
+/// acquiring the spawn lock so a fresh install on a system without a
+/// runtime dir or `~/.cache/dot-agent-deck` succeeds without manual setup.
+fn ensure_lock_root(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
 /// PRD #93 M1.3 live-socket probe. Used by [`run_daemon_with`] to
@@ -456,15 +515,24 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // "exists but not alive" between their probes and proceed to both
     // remove + bind. Audit BLOCKER #1 calls this out explicitly.
     //
-    // Fix: hold an exclusive `flock(2)` over a sibling `{socket}.lock`
-    // file across the entire probe → remove → bind sequence. The
+    // Fix: hold an exclusive `flock(2)` over a per-socket `.lock` file
+    // (anchored in a user-owned directory — see `lock_path_for`) across
+    // the entire probe → remove → bind sequence. The
     // `daemon_attach::ensure_daemon_running` path already uses this same
     // primitive on `<state_dir>/spawn.lock` for the launcher side; we
     // reuse it here so the two halves of the racing pair share one
     // serialization point. The lock is released as soon as `bind_socket`
     // succeeds — afterwards, any further start attempt's probe will see
     // the live socket and return AddrInUse without needing the lock.
+    //
+    // PRD #93 round-4 auditor BLOCKER: the lock file lives under
+    // `XDG_RUNTIME_DIR` or `~/.cache/dot-agent-deck` (never `/tmp`) so a
+    // local foreign uid can't pre-create the lock entry to DoS startup
+    // for the target user. See `lock_path_for` for the resolution rules.
     let lock_path = lock_path_for(socket_path);
+    if let Some(parent) = lock_path.parent() {
+        ensure_lock_root(parent)?;
+    }
     let _start_lock = crate::daemon_attach::acquire_spawn_lock(&lock_path).await?;
 
     if socket_path.exists() {
@@ -584,7 +652,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     result
 }
 
-/// PRD #93 M1.2 idle monitor — edge-triggered.
+/// PRD #93 M1.2 idle monitor — edge-triggered, generation-gated.
 ///
 /// Originally a polling loop (round 1). Round-2 reviewer REV-1 flagged the
 /// reconnect-race: between two polls a client could disconnect+reconnect
@@ -593,18 +661,22 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
 /// the reconnect-then-disconnect cycle the daemon could fire shutdown
 /// while a TUI was actively re-attaching.
 ///
-/// Edge-triggered fixes this: every counter transition (client connect /
-/// disconnect, agent spawn / close / exit) signals `change_notify`. The
-/// monitor parks on that signal and re-evaluates the joint-zero gate. On
-/// entering the idle state, it spawns a child timer task that fires
-/// shutdown after `threshold` *iff* the gate still holds when the timer
-/// expires. On leaving the idle state, it aborts the pending timer.
+/// Round-2 replaced that with edge-triggering + an in-flight timer that
+/// the monitor *aborted* when the joint-zero gate broke. Round-4 reviewer
+/// BLOCKER: abort is racy. Between the timer task waking from its
+/// `sleep(threshold)` and the monitor's cancel landing, the timer can
+/// fire and the daemon exits even though a client just reconnected. A
+/// brief 1→0→1→0 transition cycle inside one window has the same
+/// failure mode: the *old* timer's deadline can still fire even after
+/// the monitor scheduled (or thinks it scheduled) a fresh one.
 ///
-/// The child timer's re-check on expiry is the second line of defense:
-/// it handles the race where the timer's `sleep(threshold)` future is
-/// just about to complete when a reconnect arrives, and our abort loses
-/// the race with the wake-up. Re-reading the counters before signaling
-/// shutdown keeps that race from misfiring.
+/// Fix: replace the abort with an `AtomicU64` generation counter. The
+/// monitor increments the generation on every 1→0 transition, spawns a
+/// timer task that captures the new value, sleeps `threshold`, and
+/// signals shutdown only if the generation hasn't moved since (and the
+/// joint-zero gate still holds). A 0→1 transition just bumps the
+/// generation — the in-flight timer becomes a no-op when it wakes,
+/// without any await on the cancel path.
 async fn run_idle_monitor(
     client_count: Arc<AtomicUsize>,
     pty_registry: Arc<AgentPtyRegistry>,
@@ -612,33 +684,13 @@ async fn run_idle_monitor(
     shutdown: Arc<Notify>,
     change_notify: Arc<Notify>,
 ) {
-    // RAII guard so aborting `run_idle_monitor` (the outer
-    // `run_daemon_with` cleanup path) doesn't leak a still-running timer
-    // task. tokio JoinHandle::Drop is a *detach*, not an abort — without
-    // this guard a timer scheduled just before abort would keep running
-    // and possibly fire a stray `shutdown.notify_one()` against a
-    // subsequent daemon's listener.
-    struct TimerGuard(Option<tokio::task::JoinHandle<()>>);
-    impl TimerGuard {
-        fn arm(&mut self, h: tokio::task::JoinHandle<()>) {
-            // Abort any pre-existing timer before storing the new one.
-            if let Some(prev) = self.0.take() {
-                prev.abort();
-            }
-            self.0 = Some(h);
-        }
-        fn disarm(&mut self) {
-            if let Some(h) = self.0.take() {
-                h.abort();
-            }
-        }
-    }
-    impl Drop for TimerGuard {
-        fn drop(&mut self) {
-            self.disarm();
-        }
-    }
-    let mut timer = TimerGuard(None);
+    // Generation counter shared with every in-flight timer task. Each
+    // task captures the value it was spawned with; on wake it compares
+    // against the current value and bails if they differ. Cancellation
+    // is therefore atomic and synchronous (one `fetch_add`) — no abort,
+    // no await, no race with the timer's wake-up.
+    let generation = Arc::new(AtomicU64::new(0));
+    let mut armed = false;
 
     loop {
         let clients = client_count.load(Ordering::SeqCst);
@@ -646,18 +698,32 @@ async fn run_idle_monitor(
         let is_idle = clients == 0 && agents == 0;
 
         if is_idle {
-            if timer.0.is_none() {
-                // 1→0 transition (or fresh-startup idle): arm the timer.
+            if !armed {
+                // 1→0 transition (or fresh-startup idle): bump the
+                // generation so any prior in-flight timer becomes a
+                // no-op when it wakes, then spawn a new timer that
+                // captures this generation.
+                let my_gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
                 let counter = client_count.clone();
                 let registry = pty_registry.clone();
                 let shutdown_signal = shutdown.clone();
+                let gen_check = generation.clone();
                 let dur = threshold;
-                let handle = tokio::spawn(async move {
+                tokio::spawn(async move {
                     tokio::time::sleep(dur).await;
-                    // Re-check just before firing — covers the narrow race
-                    // where an abort loses to the sleep completing. Without
-                    // it, a connect arriving in that gap would still fire
-                    // shutdown.
+                    if gen_check.load(Ordering::SeqCst) != my_gen {
+                        // A 0→1 (or subsequent 1→0) transition has
+                        // happened since we were spawned; the live
+                        // timer is someone else's. Bail.
+                        return;
+                    }
+                    // Re-check the joint-zero gate too — defense in depth
+                    // for the narrow window between the generation check
+                    // and the notify, where a connect could in principle
+                    // land without the monitor having yet incremented
+                    // the generation (the increment happens on the next
+                    // `change_notify` wake-up, not synchronously with
+                    // the counter mutation).
                     if counter.load(Ordering::SeqCst) == 0 && registry.live_count() == 0 {
                         info!(
                             threshold_secs = dur.as_secs(),
@@ -666,12 +732,15 @@ async fn run_idle_monitor(
                         shutdown_signal.notify_one();
                     }
                 });
-                timer.arm(handle);
+                armed = true;
             }
-        } else {
-            // 0→1 transition (or fresh-startup non-idle): tear down any
-            // pending timer so the next idle window starts from scratch.
-            timer.disarm();
+        } else if armed {
+            // 0→1 transition: invalidate the in-flight timer by bumping
+            // the generation. The timer task is still scheduled; it'll
+            // wake at its old deadline, see the mismatch, and exit
+            // silently. No await needed.
+            generation.fetch_add(1, Ordering::SeqCst);
+            armed = false;
         }
 
         // Park until the next transition. Tokio Notify stores a permit if
@@ -1301,16 +1370,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_daemon_with_uses_sibling_lock_file() {
-        // Sanity: the lock path is deterministic and lives next to the
-        // socket, not somewhere global. A future refactor that puts the
-        // lock under a per-user dir would still need this invariant for
-        // the per-socket race-protection to be meaningful.
+    #[allow(clippy::await_holding_lock)]
+    async fn run_daemon_with_uses_user_owned_lock_dir() {
+        // PRD #93 round-4 auditor BLOCKER: the lock path must root in a
+        // user-owned directory, NEVER under the world-writable `/tmp`
+        // even when the socket itself falls back there. We pin the lock
+        // root to a tempdir via DOT_AGENT_DECK_LOCK_DIR (test-only env
+        // hook) and assert the resolved lock lives inside it.
+        let _g = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev_lock = std::env::var("DOT_AGENT_DECK_LOCK_DIR").ok();
+
         let dir = race_safe_tempdir();
+        let lock_dir = dir.path().join("locks");
+        // SAFETY: env-var lock held; restored on the way out.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_LOCK_DIR", &lock_dir);
+        }
+
         let sock_path = dir.path().join("hook.sock");
         let attach_path = dir.path().join("attach.sock");
         let lock_path = lock_path_for(&sock_path);
-        assert_eq!(lock_path, dir.path().join("hook.sock.lock"));
+        assert!(
+            lock_path.starts_with(&lock_dir),
+            "lock path must root in the user-owned lock dir, got {}",
+            lock_path.display()
+        );
+        assert!(
+            !lock_path.starts_with("/tmp/dot-agent-deck"),
+            "lock path must not land under any predictable /tmp prefix, got {}",
+            lock_path.display()
+        );
 
         let state = Arc::new(RwLock::new(AppState::default()));
         let daemon = Daemon::with_attach(state, attach_path)
@@ -1324,6 +1415,222 @@ mod tests {
             lock_path.exists(),
             "lock file should remain on disk for the next start"
         );
+        let parent_mode =
+            std::fs::metadata(&lock_dir).expect("lock dir must exist after daemon start");
+        assert_eq!(
+            parent_mode.permissions().mode() & 0o777,
+            0o700,
+            "lock dir must be 0o700 so a foreign uid can't pre-create entries inside it"
+        );
+
+        // SAFETY: same env lock held; restoring previous value.
+        unsafe {
+            match prev_lock {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_LOCK_DIR", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_LOCK_DIR"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_dir_falls_back_to_home_cache_when_xdg_unset() {
+        // PRD #93 round-4 auditor BLOCKER regression: with both
+        // XDG_RUNTIME_DIR and DOT_AGENT_DECK_LOCK_DIR unset, the lock
+        // root must resolve under $HOME/.cache/dot-agent-deck — never
+        // /tmp. Without this, the auditor's DoS vector (a foreign uid
+        // pre-creating /tmp/<sock>.sock.lock) re-opens.
+        let _g = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev_lock = std::env::var("DOT_AGENT_DECK_LOCK_DIR").ok();
+        let prev_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        let prev_home = std::env::var("HOME").ok();
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        // SAFETY: env-var lock held; restored on the way out.
+        unsafe {
+            std::env::remove_var("DOT_AGENT_DECK_LOCK_DIR");
+            std::env::remove_var("XDG_RUNTIME_DIR");
+            std::env::set_var("HOME", home_dir.path());
+        }
+
+        let resolved = lock_root();
+        let expected = home_dir.path().join(".cache").join("dot-agent-deck");
+        assert_eq!(
+            resolved, expected,
+            "lock root must fall back to $HOME/.cache/dot-agent-deck when XDG and override are unset"
+        );
+        // Even when the socket path itself is in /tmp, the lock must
+        // root under our configured HOME (specifically `.cache/...`),
+        // not next to the socket in /tmp where a foreign uid can
+        // pre-create files.
+        let lock_path = lock_path_for(std::path::Path::new("/tmp/dot-agent-deck-1000.sock"));
+        assert!(
+            lock_path.starts_with(&expected),
+            "lock must root under $HOME/.cache/dot-agent-deck even when the socket lives in /tmp, got {}",
+            lock_path.display()
+        );
+
+        // SAFETY: same env lock held; restoring previous values.
+        unsafe {
+            match prev_lock {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_LOCK_DIR", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_LOCK_DIR"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn daemon_startup_unaffected_by_pre_created_tmp_lock() {
+        // PRD #93 round-4 auditor BLOCKER DoS regression: a local
+        // foreign uid pre-creating a file at the OLD `/tmp` lock path
+        // (and holding an exclusive flock on it forever) must NOT block
+        // daemon startup for the target user. With the lock now anchored
+        // under a user-owned root, the daemon's flock target lives
+        // elsewhere — the pre-created /tmp file is irrelevant.
+        let _g = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev_lock = std::env::var("DOT_AGENT_DECK_LOCK_DIR").ok();
+
+        let dir = race_safe_tempdir();
+        let lock_dir = dir.path().join("locks");
+        // SAFETY: env-var lock held; restored on the way out.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_LOCK_DIR", &lock_dir);
+        }
+
+        // Pre-create a file at the OLD sibling-lock path (what the
+        // pre-round-4 code would have used) and hold a flock on it for
+        // the duration of the test. If lock_path_for still pointed
+        // there, the daemon's `acquire_spawn_lock` would block on this
+        // flock indefinitely and the test would time out.
+        let sock_path = dir.path().join("hook.sock");
+        let old_lock_path = {
+            let mut s = sock_path.as_os_str().to_owned();
+            s.push(".lock");
+            std::path::PathBuf::from(s)
+        };
+        let attacker_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&old_lock_path)
+            .expect("attacker can create file at sibling lock path");
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: valid fd; LOCK_EX | LOCK_NB returns immediately. We
+        // hold the file across the daemon run.
+        let rc = unsafe { libc::flock(attacker_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "attacker must successfully flock the old path");
+
+        let attach_path = dir.path().join("attach.sock");
+        let state = Arc::new(RwLock::new(AppState::default()));
+        let daemon = Daemon::with_attach(state, attach_path)
+            .with_idle_shutdown(Some(Duration::from_millis(150)));
+        let res = tokio::time::timeout(Duration::from_secs(3), run_daemon_with(&sock_path, daemon))
+            .await
+            .expect(
+                "daemon must NOT block on the foreign-held /tmp lock — \
+                 the lock now lives under a user-owned dir",
+            );
+        res.expect("daemon should return Ok on idle shutdown");
+
+        // Tidy up: release attacker's flock by dropping the file.
+        drop(attacker_file);
+
+        // SAFETY: same env lock held; restoring previous value.
+        unsafe {
+            match prev_lock {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_LOCK_DIR", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_LOCK_DIR"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_monitor_survives_rapid_disconnect_reconnect_cycle() {
+        // PRD #93 round-4 reviewer BLOCKER: the round-2 abort-based
+        // cancel was racy. The reviewer's specific scenario:
+        // counter goes 1→0 (timer scheduled at T+N), 0→1 (cancel
+        // queued), 1→0 again (a new timer should run at T+N+ε). But
+        // the *first* timer can still wake at its original deadline T+N
+        // — between the timer task's wake-up and the monitor's
+        // abort/cancel landing — and fire shutdown spuriously, even
+        // though a client was attached for part of the window.
+        //
+        // The generation-counter fix invalidates any in-flight timer
+        // synchronously on every 0→1 transition; on the next 1→0 a
+        // fresh timer starts from zero. We drive the precise 1→0→1→0
+        // sequence with a sub-window sleep between transitions to land
+        // the old timer's wake inside the new window, and assert
+        // shutdown does NOT fire before the new timer's deadline.
+        let client_count = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let shutdown = Arc::new(Notify::new());
+        let change_notify = registry.change_notify();
+
+        let monitor_shutdown = shutdown.clone();
+        let monitor_clients = client_count.clone();
+        let monitor_registry = registry.clone();
+        let monitor_notify = change_notify.clone();
+        let threshold = Duration::from_millis(200);
+        let handle = tokio::spawn(async move {
+            run_idle_monitor(
+                monitor_clients,
+                monitor_registry,
+                threshold,
+                monitor_shutdown,
+                monitor_notify,
+            )
+            .await;
+        });
+
+        // T=0: counter starts at 0 (idle) → monitor arms timer A at deadline ~T+200ms.
+        change_notify.notify_one();
+        // Wait close to the deadline but not past it: 150ms < 200ms.
+        // Crucially, the *next* transitions must land BEFORE the abort
+        // path of the old code could possibly land — under the round-2
+        // abort approach, timer A's wake at T+200 was racing with the
+        // cancel. Under the generation counter, the new timer is
+        // scheduled at T+150+ε, deadline T+350+ε, and timer A's wake
+        // at T+200 sees the generation has moved and bails.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // 0→1: invalidate timer A.
+        client_count.fetch_add(1, Ordering::SeqCst);
+        change_notify.notify_one();
+        // Brief reconnect — sub-window, just long enough to make the
+        // monitor process the 0→1 transition and bump the generation.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // 1→0: schedule timer B at deadline ~T+360.
+        client_count.fetch_sub(1, Ordering::SeqCst);
+        change_notify.notify_one();
+
+        // Wait through timer A's original deadline (T+200) plus a slack
+        // margin. Under the abort-race bug, timer A fires here and
+        // shutdown lands ~T+200. Under the generation-counter fix,
+        // timer A's wake sees the moved generation and exits silently;
+        // only timer B can fire shutdown, and it's not due until ~T+360.
+        let res = tokio::time::timeout(Duration::from_millis(120), shutdown.notified()).await;
+        assert!(
+            res.is_err(),
+            "idle monitor must NOT fire on the OLD timer's deadline after a reconnect+disconnect cycle"
+        );
+
+        // Sanity: timer B does eventually fire (joint-zero still holds).
+        tokio::time::timeout(threshold * 4, shutdown.notified())
+            .await
+            .expect("the freshly-armed timer must still fire once its own deadline arrives");
+
+        handle.abort();
     }
 
     #[tokio::test]
