@@ -84,8 +84,8 @@ Concretely:
 
 ### Phase 4: Docs and release
 
-- [ ] **M4.1** — Update `docs/installation.md` and `docs/getting-started.mdx` to describe the daemon lifecycle in a "How it runs" subsection (short, not user-facing concern in the common case).
-- [ ] **M4.2** — Reconsider PRD #76 M2.18 (quit/detach dialog) — now that local and remote share the same lifecycle, the dialog choice probably collapses further.
+- [x] **M4.1** — Update `docs/installation.md` and `docs/getting-started.mdx` to describe the daemon lifecycle in a "How it runs" subsection. *90c8139.*
+- [x] **M4.2** — Reconsider PRD #76 M2.18 (quit/detach dialog). *90c8139 — collapsed to single Detach confirmation; `via_daemon` field deleted along with its mode-dependent branching.*
 - [ ] **M4.3** — Changelog fragment via `dot-ai-changelog-fragment`. Focus on user-visible behavior change (daemon now persistent across deck restarts; agents survive).
 - [ ] **M4.4** — PR, review, audit, merge, release.
 
