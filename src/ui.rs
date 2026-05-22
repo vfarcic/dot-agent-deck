@@ -1458,6 +1458,16 @@ enum KeyResult {
         cwd: String,
     },
     RequestConfigGen,
+    /// PRD #92 F2 (PRD #18 follow-through): the user pressed `y` or `n` on a
+    /// dashboard card whose status is `WaitingForInput`. The bool is the
+    /// approve/deny choice (true = approve). The dispatcher forwards a single
+    /// `y` or `n` character to the selected pane's PTY via `write_to_pane`,
+    /// which handles the submit-key parity dance (encode → wait `SUBMIT_DELAY`
+    /// → CR), so the agent sees the same input it would have seen if the user
+    /// had switched into the pane and typed it directly. The status-gating
+    /// happens in `handle_normal_key` so this variant is only emitted when
+    /// the response is actually warranted.
+    SendPermissionResponse(bool),
     ForwardToPane(Vec<u8>),
 }
 
@@ -1850,7 +1860,12 @@ fn focus_deck(
     true
 }
 
-fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
+fn handle_normal_key(
+    key: KeyEvent,
+    ui: &mut UiState,
+    total: usize,
+    selected_status: Option<SessionStatus>,
+) -> KeyResult {
     // Ctrl+C from dashboard: show quit confirmation
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
@@ -1888,6 +1903,26 @@ fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult
         }
         KeyCode::Enter if total > 0 => KeyResult::Focus,
         KeyCode::Char('g') if total > 0 => KeyResult::RequestConfigGen,
+        // PRD #92 F2 (PRD #18 follow-through): y / n approve / deny permission.
+        // Only fires when the selected card is in `WaitingForInput` — any
+        // other status, or no card selected, no-ops silently so y / n don't
+        // accidentally clobber some future keybinding. `KeyModifiers::NONE`
+        // is required so Ctrl+n (new pane, handled in the outer dispatch
+        // loop) still wins.
+        KeyCode::Char('y')
+            if total > 0
+                && key.modifiers == KeyModifiers::NONE
+                && selected_status == Some(SessionStatus::WaitingForInput) =>
+        {
+            KeyResult::SendPermissionResponse(true)
+        }
+        KeyCode::Char('n')
+            if total > 0
+                && key.modifiers == KeyModifiers::NONE
+                && selected_status == Some(SessionStatus::WaitingForInput) =>
+        {
+            KeyResult::SendPermissionResponse(false)
+        }
         KeyCode::Esc => {
             if !ui.filter_text.is_empty() {
                 ui.filter_text.clear();
@@ -3928,7 +3963,13 @@ pub fn run_tui(
                 KeyResult::Continue
             } else {
                 match ui.mode {
-                    UiMode::Normal => handle_normal_key(key, &mut ui, total),
+                    UiMode::Normal => {
+                        let selected_status = selected_id
+                            .as_ref()
+                            .and_then(|sid| snapshot.sessions.get(sid))
+                            .map(|session| session.status.clone());
+                        handle_normal_key(key, &mut ui, total, selected_status)
+                    }
                     UiMode::Filter => handle_filter_key(key, &mut ui),
                     UiMode::Help => handle_help_key(key, &mut ui),
                     UiMode::Rename => {
@@ -4070,6 +4111,36 @@ pub fn run_tui(
                             "No active agent session to send prompt to.".to_string(),
                             std::time::Instant::now(),
                         ));
+                    }
+                }
+                KeyResult::SendPermissionResponse(approve) => {
+                    // The handler already gated on `WaitingForInput` plus a
+                    // non-empty selection; re-resolve the pane here so the
+                    // PTY write goes to the right place. If `pane_id` is
+                    // missing (placeholder session with no agent yet), this
+                    // silently no-ops — same shape as RequestConfigGen.
+                    if let Some(ref sid) = selected_id
+                        && let Some(session) = snapshot.sessions.get(sid)
+                        && let Some(ref pane_id) = session.pane_id
+                    {
+                        let key_char = if approve { "y" } else { "n" };
+                        match pane.write_to_pane(pane_id, key_char) {
+                            Ok(()) => {
+                                ui.status_message = Some((
+                                    format!(
+                                        "Permission {}.",
+                                        if approve { "approved" } else { "denied" }
+                                    ),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                            Err(e) => {
+                                ui.status_message = Some((
+                                    format!("Permission response failed: {e}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
                     }
                 }
                 KeyResult::NewPane(req) => {
@@ -8071,6 +8142,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
             &mut ui,
             3,
+            None,
         );
         assert_eq!(ui.mode, UiMode::Filter);
 
@@ -8083,6 +8155,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
             &mut ui,
             3,
+            None,
         );
         assert_eq!(ui.mode, UiMode::Help);
 
@@ -8095,6 +8168,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             3,
+            None,
         );
         assert_eq!(ui.mode, UiMode::Rename);
 
@@ -8211,7 +8285,12 @@ mod tests {
         let mut ui = default_ui();
         ui.filter_text = "active-filter".to_string();
 
-        handle_normal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui, 5);
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+            5,
+            None,
+        );
         assert!(ui.filter_text.is_empty());
     }
 
@@ -8223,8 +8302,119 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             0,
+            None,
         );
         assert_eq!(ui.mode, UiMode::Normal);
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #92 F2 — y / n permission key tests
+    //
+    // Behavior: pressing `y` on a dashboard card whose selected session is in
+    // `WaitingForInput` returns `KeyResult::SendPermissionResponse(true)` so
+    // the dispatcher forwards `y` to the agent's PTY. Pressing `n` returns
+    // `SendPermissionResponse(false)`. Any other status, or `total == 0`,
+    // falls through to `KeyResult::Continue`. PRD #18 documented these keys
+    // on the help overlay since baseline but no handler existed until now.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn permission_y_on_waiting_for_input_returns_approve() {
+        let mut ui = default_ui();
+        let result = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut ui,
+            1,
+            Some(SessionStatus::WaitingForInput),
+        );
+        assert!(
+            matches!(result, KeyResult::SendPermissionResponse(true)),
+            "y on a WaitingForInput card must approve, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn permission_n_on_waiting_for_input_returns_deny() {
+        let mut ui = default_ui();
+        let result = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut ui,
+            1,
+            Some(SessionStatus::WaitingForInput),
+        );
+        assert!(
+            matches!(result, KeyResult::SendPermissionResponse(false)),
+            "n on a WaitingForInput card must deny, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn permission_y_n_on_non_waiting_status_is_no_op() {
+        // Any non-WaitingForInput status: keys must NOT trigger the permission
+        // response. They fall through to `Continue` so future keybindings or
+        // ignored input remain unaffected. Cover a representative sample of
+        // statuses (Working, Idle, Thinking, Error) to pin the gate.
+        for status in [
+            SessionStatus::Working,
+            SessionStatus::Idle,
+            SessionStatus::Thinking,
+            SessionStatus::Error,
+            SessionStatus::Compacting,
+        ] {
+            let mut ui = default_ui();
+            let result_y = handle_normal_key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                &mut ui,
+                1,
+                Some(status.clone()),
+            );
+            assert!(
+                matches!(result_y, KeyResult::Continue),
+                "y on status {status:?} must no-op, got {result_y:?}"
+            );
+            let result_n = handle_normal_key(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                &mut ui,
+                1,
+                Some(status.clone()),
+            );
+            assert!(
+                matches!(result_n, KeyResult::Continue),
+                "n on status {status:?} must no-op, got {result_n:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_y_n_with_no_card_selected_is_no_op() {
+        // No card selected (total == 0, status None): both keys must
+        // no-op. Belt-and-braces — the handler gates on `total > 0` AND on
+        // status, so either guard alone is sufficient, but tests pin both.
+        let mut ui = default_ui();
+        let result_y = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut ui,
+            0,
+            None,
+        );
+        assert!(matches!(result_y, KeyResult::Continue));
+        let result_n = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut ui,
+            0,
+            None,
+        );
+        assert!(matches!(result_n, KeyResult::Continue));
+        // Also exercise the case where `total > 0` but `selected_status` is
+        // None (the selected session is missing from the snapshot — a race we
+        // tolerate gracefully).
+        let result_y_no_status = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut ui,
+            1,
+            None,
+        );
+        assert!(matches!(result_y_no_status, KeyResult::Continue));
     }
 
     // -----------------------------------------------------------------------
