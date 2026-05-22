@@ -64,8 +64,9 @@ async fn spawn_daemon() -> DaemonHandle {
 
     let state = Arc::new(RwLock::new(AppState::default()));
     let attach_for_daemon = attach_path.clone();
+    let lock_dir = common::lock_dir_path();
     let handle = tokio::spawn(async move {
-        let daemon = Daemon::with_attach(state, attach_for_daemon);
+        let daemon = Daemon::with_attach(state, attach_for_daemon).with_lock_dir_override(lock_dir);
         let _ = run_daemon_with(&hook_path, daemon).await;
     });
 

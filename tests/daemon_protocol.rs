@@ -248,6 +248,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             role_index: 2,
             role_name: "coder".into(),
             is_start_role: false,
+            orchestration_cwd: None,
         },
     )
     .await;
@@ -264,6 +265,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             role_index: 2,
             role_name: "coder".into(),
             is_start_role: false,
+            orchestration_cwd: None,
         })
     );
     server.registry.shutdown_all();

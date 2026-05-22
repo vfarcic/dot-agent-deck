@@ -75,7 +75,9 @@ async fn spawn_daemon() -> DaemonHandle {
     };
 
     let state: SharedState = Arc::new(RwLock::new(AppState::default()));
-    let daemon = Daemon::with_attach(state.clone(), attach_path.clone()).with_idle_shutdown(None);
+    let daemon = Daemon::with_attach(state.clone(), attach_path.clone())
+        .with_idle_shutdown(None)
+        .with_lock_dir_override(common::lock_dir_path());
     let pty_registry = daemon.pty_registry.clone();
 
     let hook_for_daemon = hook_path.clone();
@@ -140,6 +142,34 @@ async fn start_role_pane(
     pane_id: &str,
     cwd: &str,
 ) -> String {
+    // For the common case where every role pane shares the
+    // orchestration's cwd, `orchestration_cwd == cwd`. The round-9 #2
+    // regression test (`delegate_writes_task_file_to_each_workers_own_cwd`)
+    // exercises divergence via `start_role_pane_with_orch_cwd`.
+    start_role_pane_with_orch_cwd(
+        daemon,
+        orchestration_name,
+        role_name,
+        is_start_role,
+        role_index,
+        pane_id,
+        cwd,
+        cwd,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_role_pane_with_orch_cwd(
+    daemon: &DaemonHandle,
+    orchestration_name: &str,
+    role_name: &str,
+    is_start_role: bool,
+    role_index: usize,
+    pane_id: &str,
+    cwd: &str,
+    orchestration_cwd: &str,
+) -> String {
     assert!(is_valid_pane_id_env(pane_id), "test pane_id must be valid");
     let client = DaemonClient::new(daemon.attach_path.clone());
     client
@@ -155,6 +185,7 @@ async fn start_role_pane(
                 role_index,
                 role_name: role_name.to_string(),
                 is_start_role,
+                orchestration_cwd: Some(orchestration_cwd.to_string()),
             }),
             agent_type: None,
         })
@@ -356,7 +387,13 @@ async fn delegate_writes_task_file_to_each_workers_own_cwd() {
         "test setup: orchestrator and worker cwds must differ"
     );
 
-    let _orch_agent_id = start_role_pane(
+    // Round-11 auditor #C: the orchestration's identity is shared
+    // across all role panes via TabMembership.orchestration_cwd —
+    // each pane's *own* `cwd` (per-pane cwd, used for the file
+    // write) can still diverge, which is exactly what this test
+    // pins. Both panes carry `orchestration_cwd = orch_cwd` so the
+    // daemon groups them as the same orchestration.
+    let _orch_agent_id = start_role_pane_with_orch_cwd(
         &daemon,
         "tdd-cycle",
         "orchestrator",
@@ -364,9 +401,10 @@ async fn delegate_writes_task_file_to_each_workers_own_cwd() {
         0,
         "orch-pane",
         &orch_cwd,
+        &orch_cwd,
     )
     .await;
-    let coder_agent_id = start_role_pane(
+    let coder_agent_id = start_role_pane_with_orch_cwd(
         &daemon,
         "tdd-cycle",
         "coder",
@@ -374,6 +412,7 @@ async fn delegate_writes_task_file_to_each_workers_own_cwd() {
         1,
         "coder-pane",
         &worker_cwd,
+        &orch_cwd,
     )
     .await;
 
@@ -588,6 +627,118 @@ prompt_template = "You are the coder for an unnamed orchestration."
     assert!(
         body.contains("You are the coder for an unnamed orchestration."),
         "unnamed orchestration must still pick up prompt_template wrapping; got:\n{body}"
+    );
+}
+
+/// CodeRabbit round-11 auditor #C: two distinct unnamed
+/// orchestrations whose cwd-basenames happen to match must NOT
+/// cross-route delegates. Pre-round-11 the orchestration identity in
+/// `pane_orchestration_map` was just the resolved name, so
+/// `~/a/foo/` and `~/b/foo/` both resolved to `"foo"` and a delegate
+/// from A's orchestrator could land in B's coder. Round 11 scopes
+/// the identity by `(name, cwd)` so the lookup distinguishes them.
+#[tokio::test]
+async fn delegate_does_not_cross_route_between_same_basename_orchestrations() {
+    let daemon = spawn_daemon().await;
+    // Two distinct cwds whose basenames are identical (the
+    // resolve_orchestration_name fallback would collapse them).
+    let parent_a = tempfile::tempdir().unwrap();
+    let cwd_a = parent_a.path().join("collision");
+    std::fs::create_dir_all(&cwd_a).unwrap();
+    let parent_b = tempfile::tempdir().unwrap();
+    let cwd_b = parent_b.path().join("collision");
+    std::fs::create_dir_all(&cwd_b).unwrap();
+    assert_ne!(cwd_a, cwd_b);
+
+    let cwd_a_str = cwd_a.to_string_lossy().into_owned();
+    let cwd_b_str = cwd_b.to_string_lossy().into_owned();
+    // Both directories' resolved basename is "collision" — the
+    // collision the auditor flagged.
+    let shared_name = "collision";
+
+    // Both A and B are unnamed orchestrations (TUI fills in basename
+    // for the TabMembership name). Spawn role panes in each.
+    let _orch_a = start_role_pane(
+        &daemon,
+        shared_name,
+        "orchestrator",
+        true,
+        0,
+        "orch-a",
+        &cwd_a_str,
+    )
+    .await;
+    let coder_a = start_role_pane(
+        &daemon,
+        shared_name,
+        "coder",
+        false,
+        1,
+        "coder-a",
+        &cwd_a_str,
+    )
+    .await;
+    let _orch_b = start_role_pane(
+        &daemon,
+        shared_name,
+        "orchestrator",
+        true,
+        0,
+        "orch-b",
+        &cwd_b_str,
+    )
+    .await;
+    let coder_b = start_role_pane(
+        &daemon,
+        shared_name,
+        "coder",
+        false,
+        1,
+        "coder-b",
+        &cwd_b_str,
+    )
+    .await;
+
+    // Orchestrator A delegates to "coder". Only coder-a should receive.
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-a".into(),
+            task: "marker-for-A".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    let snap_a = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &coder_a,
+        "Read .dot-agent-deck/worker-task-coder.md",
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&snap_a).contains("worker-task-coder"),
+        "coder-a must receive the prompt for A's delegate"
+    );
+
+    // After the wait above, give the daemon a beat in case any
+    // mis-routing was in flight, then assert coder-b is untouched.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let snap_b = daemon.pty_registry.snapshot(&coder_b).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&snap_b).contains("worker-task-coder"),
+        "coder-b must NOT receive the delegate aimed at orchestration A"
+    );
+    // And the task file must land in A's cwd, NOT B's.
+    let task_a = cwd_a.join(".dot-agent-deck/worker-task-coder.md");
+    let task_b = cwd_b.join(".dot-agent-deck/worker-task-coder.md");
+    assert!(task_a.exists(), "task file must land in A's cwd");
+    assert!(
+        !task_b.exists(),
+        "task file must NOT also land in B's cwd; spurious file at {}",
+        task_b.display()
     );
 }
 

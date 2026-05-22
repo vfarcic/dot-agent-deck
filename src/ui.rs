@@ -6814,6 +6814,7 @@ mod tests {
                     role_index: 0,
                     role_name: String::new(),
                     is_start_role: false,
+                    orchestration_cwd: None,
                 }),
             ),
             hydrated(
@@ -6825,6 +6826,7 @@ mod tests {
                     role_index: 2,
                     role_name: String::new(),
                     is_start_role: false,
+                    orchestration_cwd: None,
                 }),
             ),
         ];
@@ -6851,6 +6853,7 @@ mod tests {
                     role_index: 0,
                     role_name: String::new(),
                     is_start_role: false,
+                    orchestration_cwd: None,
                 }),
             ),
             hydrated(
@@ -6862,6 +6865,7 @@ mod tests {
                     role_index: 0,
                     role_name: String::new(),
                     is_start_role: false,
+                    orchestration_cwd: None,
                 }),
             ),
         ];
@@ -6889,6 +6893,7 @@ mod tests {
                     role_index: 0,
                     role_name: String::new(),
                     is_start_role: false,
+                    orchestration_cwd: None,
                 }),
             ),
         ];

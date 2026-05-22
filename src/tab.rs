@@ -270,6 +270,11 @@ impl TabManager {
                     role_index,
                     role_name: role.name.clone(),
                     is_start_role: role.start,
+                    // Round-11 auditor #C: carry the orchestration's
+                    // cwd (shared across every role pane in this tab)
+                    // so the daemon can disambiguate two unnamed
+                    // orchestrations whose basenames collide.
+                    orchestration_cwd: Some(cwd.to_string()),
                 }),
                 rows: spawn_rows,
                 cols: spawn_cols,

@@ -87,7 +87,7 @@ static UMASK_LOCK: Mutex<()> = Mutex::new(());
 /// (e.g. tests with different tempdirs but the same socket basename)
 /// from contending on the same lock — without it, parallel tests using
 /// `hook.sock` would all serialize through one global lock file.
-fn lock_path_for(socket_path: &Path) -> PathBuf {
+fn lock_path_for(socket_path: &Path, override_root: Option<&Path>) -> PathBuf {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -97,7 +97,7 @@ fn lock_path_for(socket_path: &Path) -> PathBuf {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("daemon");
-    lock_root().join(format!("{basename}-{hash:016x}.lock"))
+    lock_root(override_root).join(format!("{basename}-{hash:016x}.lock"))
 }
 
 /// User-owned root directory for daemon lock files. Mirrors the socket
@@ -106,14 +106,18 @@ fn lock_path_for(socket_path: &Path) -> PathBuf {
 /// when `XDG_RUNTIME_DIR` is unset — that path is owner-only (we mkdir
 /// 0700) and is the standard freedesktop user cache root.
 ///
-/// Tests can pin a deterministic root via `DOT_AGENT_DECK_LOCK_DIR` so
-/// they don't pollute `$HOME/.cache` or contend with the user's real
-/// daemon. In-process tests should prefer [`LOCK_DIR_OVERRIDE`] —
-/// setting a `OnceLock<PathBuf>` is race-free, while `set_var` races
-/// against any thread doing `getenv` concurrently (round-10 auditor #4).
-fn lock_root() -> PathBuf {
-    if let Some(p) = LOCK_DIR_OVERRIDE.get() {
-        return p.clone();
+/// `override_root` is the per-`Daemon` builder-supplied override
+/// (round-11 reviewer #B): tests pass it via
+/// [`Daemon::with_lock_dir_override`] to pin the resolved root at a
+/// per-binary tempdir. Production never supplies one — production
+/// `Daemon::new` / `Daemon::with_attach` leave the field at `None`,
+/// and there is no public way to set a process-wide override.
+/// Subprocess daemons (spawned via `dot-agent-deck daemon serve`)
+/// inherit `DOT_AGENT_DECK_LOCK_DIR` from their parent's environment,
+/// so the env-var fallback still applies when the override is absent.
+fn lock_root(override_root: Option<&Path>) -> PathBuf {
+    if let Some(p) = override_root {
+        return p.to_path_buf();
     }
     if let Ok(explicit) = std::env::var("DOT_AGENT_DECK_LOCK_DIR") {
         return PathBuf::from(explicit);
@@ -127,24 +131,6 @@ fn lock_root() -> PathBuf {
         .join(".cache")
         .join("dot-agent-deck")
 }
-
-/// In-process test override for [`lock_root`]. A `OnceLock<PathBuf>`
-/// that, when set, replaces both env-var and HOME-based resolution.
-/// Tests use this in preference to mutating `DOT_AGENT_DECK_LOCK_DIR`
-/// via `std::env::set_var` — the latter is `unsafe` precisely because
-/// it races with any concurrent `getenv` (including libc-internal
-/// reads of unrelated variables that walk the same `environ` array
-/// libc rewrites on update). `OnceLock::set` has well-defined memory
-/// ordering and never touches process-wide env state.
-///
-/// Production never writes to this — it's an unset `OnceLock` at
-/// runtime, costing one extra atomic load per `lock_root()` call.
-/// Subprocess-based tests (`tests/external_daemon.rs`) can't see the
-/// in-memory `OnceLock` of the spawning process, so they additionally
-/// set the env var on the child's `Command::env`; that mutation lives
-/// in the test code that already accepts the race for other vars,
-/// not in the shared `init_test_env` helper.
-pub static LOCK_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Create `dir` (recursively) with mode 0o700 and re-apply the mode to
 /// pre-existing directories — same defense-in-depth pattern as
@@ -233,6 +219,23 @@ pub struct Daemon {
     /// off; the standalone constructor [`with_attach`] is now the only
     /// path and it picks up [`idle_shutdown_from_env`].
     pub idle_shutdown: Option<Duration>,
+    /// Round-11 reviewer #B: optional lock-file root override for
+    /// in-process tests. When `Some`, [`run_daemon_with`] resolves
+    /// the per-socket `.lock` file under this directory instead of
+    /// consulting `DOT_AGENT_DECK_LOCK_DIR` / `XDG_RUNTIME_DIR` /
+    /// `~/.cache/dot-agent-deck`. Production callers leave it at
+    /// `None`; tests set it via [`Self::with_lock_dir_override`].
+    ///
+    /// Replaces the round-10 `pub static LOCK_DIR_OVERRIDE`. A
+    /// per-daemon field has no production API surface — without a
+    /// builder call there is no way to pin the lock dir, so a
+    /// production binary cannot have its lock root steered by code
+    /// elsewhere in the process. Subprocess daemons (spawned via
+    /// `dot-agent-deck daemon serve`) inherit the
+    /// `DOT_AGENT_DECK_LOCK_DIR` env var from their parent's
+    /// environment, so the env-var fallback in `lock_root` continues
+    /// to serve them.
+    pub lock_dir_override: Option<PathBuf>,
 }
 
 impl Daemon {
@@ -251,6 +254,7 @@ impl Daemon {
             // registry consumers either. Leave the timer off; callers
             // that want it can opt in via [`with_idle_shutdown`].
             idle_shutdown: None,
+            lock_dir_override: None,
         }
     }
 
@@ -272,6 +276,7 @@ impl Daemon {
             event_tx,
             client_count: Arc::new(AtomicUsize::new(0)),
             idle_shutdown: idle_shutdown_from_env(),
+            lock_dir_override: None,
         }
     }
 
@@ -281,6 +286,17 @@ impl Daemon {
     /// process-global env vars.
     pub fn with_idle_shutdown(mut self, dur: Option<Duration>) -> Self {
         self.idle_shutdown = dur;
+        self
+    }
+
+    /// Round-11 reviewer #B fluent override: pin the daemon's lock-file
+    /// root at `dir` instead of resolving via `DOT_AGENT_DECK_LOCK_DIR`
+    /// / `XDG_RUNTIME_DIR` / `~/.cache/dot-agent-deck`. Used by
+    /// in-process tests so each test binary's daemons all share one
+    /// writable tempdir; production never calls this. Pass `None` to
+    /// clear a previously-set override.
+    pub fn with_lock_dir_override(mut self, dir: Option<PathBuf>) -> Self {
+        self.lock_dir_override = dir;
         self
     }
 }
@@ -324,7 +340,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // `XDG_RUNTIME_DIR` or `~/.cache/dot-agent-deck` (never `/tmp`) so a
     // local foreign uid can't pre-create the lock entry to DoS startup
     // for the target user. See `lock_path_for` for the resolution rules.
-    let lock_path = lock_path_for(socket_path);
+    let lock_path = lock_path_for(socket_path, daemon.lock_dir_override.as_deref());
     if let Some(parent) = lock_path.parent() {
         ensure_lock_root(parent)?;
     }
@@ -1033,7 +1049,7 @@ mod tests {
 
         let sock_path = dir.path().join("hook.sock");
         let attach_path = dir.path().join("attach.sock");
-        let lock_path = lock_path_for(&sock_path);
+        let lock_path = lock_path_for(&sock_path, None);
         assert!(
             lock_path.starts_with(&lock_dir),
             "lock path must root in the user-owned lock dir, got {}",
@@ -1095,7 +1111,7 @@ mod tests {
             std::env::set_var("HOME", home_dir.path());
         }
 
-        let resolved = lock_root();
+        let resolved = lock_root(None);
         let expected = home_dir.path().join(".cache").join("dot-agent-deck");
         assert_eq!(
             resolved, expected,
@@ -1105,7 +1121,7 @@ mod tests {
         // root under our configured HOME (specifically `.cache/...`),
         // not next to the socket in /tmp where a foreign uid can
         // pre-create files.
-        let lock_path = lock_path_for(std::path::Path::new("/tmp/dot-agent-deck-1000.sock"));
+        let lock_path = lock_path_for(std::path::Path::new("/tmp/dot-agent-deck-1000.sock"), None);
         assert!(
             lock_path.starts_with(&expected),
             "lock must root under $HOME/.cache/dot-agent-deck even when the socket lives in /tmp, got {}",

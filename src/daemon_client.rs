@@ -636,6 +636,7 @@ mod tests {
                 role_index: 2,
                 role_name: "coder".into(),
                 is_start_role: false,
+                orchestration_cwd: None,
             }),
             agent_type: None,
         };
@@ -647,6 +648,7 @@ mod tests {
                 role_index: 2,
                 role_name: "coder".into(),
                 is_start_role: false,
+                orchestration_cwd: None,
             }),
         );
     }

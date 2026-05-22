@@ -72,11 +72,21 @@ pub struct AppState {
     pub pane_cwd_map: HashMap<String, String>,
     /// Pane IDs that are orchestrator (start=true) roles — only these can delegate.
     pub orchestrator_pane_ids: HashSet<String>,
-    /// Maps pane_id → orchestration name. Lets the daemon's dispatch
-    /// (`handle_delegate` / `handle_work_done`) scope target lookups to
-    /// panes in the *same* orchestration tab when several tabs run in
-    /// parallel (PRD #93 round-5).
-    pub pane_orchestration_map: HashMap<String, String>,
+    /// Maps pane_id → (orchestration name, orchestration cwd). Lets the
+    /// daemon's dispatch (`handle_delegate` / `handle_work_done`) scope
+    /// target lookups to panes in the *same* orchestration tab when
+    /// several tabs run in parallel (PRD #93 round-5).
+    ///
+    /// Round-11 auditor #C: the identity is a `(name, cwd)` tuple, not
+    /// just name. Two unnamed orchestrations whose `name`s both fall
+    /// back to the same cwd-basename — e.g. `~/project-a/foo` and
+    /// `~/project-b/foo` — would otherwise collide here and a
+    /// `Delegate` from A's orchestrator could cross-route to B's
+    /// coder. The cwd disambiguator is the cwd the TUI passed at
+    /// StartAgent time; in practice all role panes in one orchestration
+    /// share that cwd, so within-orchestration scoping still finds all
+    /// the right panes.
+    pub pane_orchestration_map: HashMap<String, (String, String)>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -300,7 +310,7 @@ impl AppState {
                 // the lookup means "no template, fall back to raw task"
                 // which matches the pre-round-9 behavior.
                 let role_config = match (cwd.as_deref(), orchestration) {
-                    (Some(c), Some(orch_name)) => {
+                    (Some(c), Some((orch_name, _orch_cwd))) => {
                         lookup_orchestration_role(c, orch_name, target_role)
                     }
                     _ => None,

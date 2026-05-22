@@ -820,7 +820,14 @@ async fn create_pane_with_control_char_command_stores_shell_on_daemon() {
         tokio::runtime::Handle::current(),
     ));
 
-    let evil_cmd = "echo \x1b[31m"; // real ESC byte after `echo `
+    // Round-11 reviewer #A: `agent_records` now filters out exited
+    // entries, so the spawned child must stay alive long enough for
+    // the subsequent `list_agents` call to observe it. A bare
+    // `echo \x1b[31m` exits in microseconds, hits the filter, and
+    // would return 0 records. Prefix a `sleep 30` so the shell stays
+    // alive for the assertion; the ESC byte is still in the command,
+    // so `resolve_display_name`'s fallback still resolves to "shell".
+    let evil_cmd = "sleep 30; echo \x1b[31m";
     let (_pane_id, resolved) = {
         let ctrl = ctrl.clone();
         let cmd = evil_cmd.to_string();

@@ -60,8 +60,10 @@ async fn spawn_daemon() -> DaemonHandle {
     let state_for_daemon = daemon_state.clone();
     let attach_for_daemon = attach_path.clone();
     let hook_for_daemon = hook_path.clone();
+    let lock_dir = common::lock_dir_path();
     let handle = tokio::spawn(async move {
-        let daemon = Daemon::with_attach(state_for_daemon, attach_for_daemon);
+        let daemon = Daemon::with_attach(state_for_daemon, attach_for_daemon)
+            .with_lock_dir_override(lock_dir);
         let _ = run_daemon_with(&hook_for_daemon, daemon).await;
     });
 

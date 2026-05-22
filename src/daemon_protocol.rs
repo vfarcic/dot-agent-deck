@@ -626,16 +626,27 @@ async fn handle_connection(
                         None
                     }
                 });
-            let orchestration_meta: Option<(String, String, bool)> =
+            // Round-11 auditor #C: also pull `orchestration_cwd` out of
+            // the membership so the daemon can use it (not StartAgent.cwd)
+            // as the disambiguator in `pane_orchestration_map`. This keeps
+            // round-9 #2's "workers can have different per-pane cwds"
+            // contract intact — pane_cwd_map gets StartAgent.cwd
+            // per-pane, but pane_orchestration_map keys on the shared
+            // orchestration cwd from the TabMembership.
+            let orchestration_meta: Option<(String, String, bool, Option<String>)> =
                 tab_membership.as_ref().and_then(|tm| match tm {
                     TabMembership::Orchestration {
                         name,
                         role_name,
                         is_start_role,
+                        orchestration_cwd,
                         ..
-                    } if !role_name.is_empty() => {
-                        Some((name.clone(), role_name.clone(), *is_start_role))
-                    }
+                    } if !role_name.is_empty() => Some((
+                        name.clone(),
+                        role_name.clone(),
+                        *is_start_role,
+                        orchestration_cwd.clone(),
+                    )),
                     _ => None,
                 });
             let cwd_for_state = cwd.clone();
@@ -659,15 +670,35 @@ async fn handle_connection(
                     // We do this only for orchestration panes; dashboard
                     // and mode panes don't participate in delegate
                     // dispatch.
-                    if let (Some(pane_id), Some((orch_name, role_name, is_start_role))) =
-                        (pane_id_env.as_deref(), orchestration_meta)
+                    if let (
+                        Some(pane_id),
+                        Some((orch_name, role_name, is_start_role, orchestration_cwd)),
+                    ) = (pane_id_env.as_deref(), orchestration_meta)
                     {
+                        // Round-11 auditor #C: scope the orchestration
+                        // identity by `(name, orchestration_cwd)` so
+                        // two unnamed orchestrations in different cwds
+                        // (`~/a/foo` and `~/b/foo`, both resolving
+                        // `name` to "foo") don't collide. The
+                        // `orchestration_cwd` is shared across every
+                        // role pane in one orchestration tab (round-9
+                        // #2: per-pane cwd may diverge, but the
+                        // orchestration's identity does not). Older
+                        // clients that don't carry the field fall back
+                        // to StartAgent.cwd — preserves backwards
+                        // compat at the cost of re-opening the
+                        // collision; `Some` vs `None` is detectable so
+                        // this is documented behavior, not a silent
+                        // misroute.
+                        let orch_cwd = orchestration_cwd
+                            .or_else(|| cwd_for_state.clone())
+                            .unwrap_or_default();
                         let mut st = state.write().await;
                         st.register_pane(pane_id.to_string());
                         st.pane_role_map
                             .insert(pane_id.to_string(), role_name.clone());
                         st.pane_orchestration_map
-                            .insert(pane_id.to_string(), orch_name);
+                            .insert(pane_id.to_string(), (orch_name, orch_cwd));
                         if let Some(c) = cwd_for_state.clone() {
                             st.pane_cwd_map.insert(pane_id.to_string(), c);
                         }
@@ -1154,6 +1185,7 @@ mod tests {
                 role_index: 2,
                 role_name: "coder".into(),
                 is_start_role: false,
+                orchestration_cwd: None,
             }),
             agent_type: None,
         };
@@ -1174,6 +1206,7 @@ mod tests {
                         role_index: 2,
                         role_name: "coder".into(),
                         is_start_role: false,
+                        orchestration_cwd: None,
                     })
                 );
             }
@@ -1196,6 +1229,7 @@ mod tests {
                 role_index: 1,
                 role_name: "coder".into(),
                 is_start_role: false,
+                orchestration_cwd: None,
             }),
             agent_type: None,
         };

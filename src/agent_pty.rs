@@ -194,6 +194,20 @@ pub enum TabMembership {
         role_name: String,
         #[serde(default)]
         is_start_role: bool,
+        /// Round-11 auditor #C: the absolute cwd of the orchestration
+        /// tab, shared across every role pane in the same orchestration.
+        /// Used as a disambiguator in `pane_orchestration_map` so two
+        /// unnamed orchestrations whose cwd-basenames collide (e.g.
+        /// `~/a/foo` and `~/b/foo`) get distinct identities. Distinct
+        /// from each pane's own per-pane cwd: orchestrator and workers
+        /// may have different per-pane cwds (PRD #93 round-9 #2) but
+        /// they share one orchestration_cwd because they belong to the
+        /// same tab. `Option<String>` with `#[serde(default)]` so an
+        /// older client/daemon that omits the field still parses.
+        /// `None` means "no disambiguator" — the lookup falls back to
+        /// name-only, matching the pre-round-11 behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orchestration_cwd: Option<String>,
     },
 }
 
@@ -948,10 +962,12 @@ impl AgentPtyRegistry {
         // contract is "an exited entry is reaped only when something
         // else (an explicit close or close_all) actually removes it,"
         // so a dead-but-not-yet-reaped entry would otherwise block
-        // reuse of its pane_id_env forever. Mirror the same
-        // `exited.load(...)` filter that `live_count` uses so this
-        // routing-uniqueness check and the idle-shutdown gate
-        // disagree on nothing.
+        // reuse of its pane_id_env forever. The same `exited.load`
+        // filter is applied across every operational lookup —
+        // `write_to_pane`, `agent_records`, and this dup check —
+        // so the live/dead boundary stays consistent
+        // (round-11 reviewer #A). Cleanup paths (`close_agent`,
+        // `shutdown_all`) deliberately still touch exited entries.
         if let Some(ref candidate) = pane_id_env
             && inner.agents.values().any(|a| {
                 a.pane_id_env.as_deref() == Some(candidate.as_str())
@@ -1044,12 +1060,23 @@ impl AgentPtyRegistry {
         // awaiting the async writer mutex — otherwise we'd hold the
         // registry mutex across an `await`, blocking every other registry
         // op (spawn, subscribe, list) until the PTY accepted the bytes.
+        //
+        // Round-11 reviewer #A: skip exited agents in the find. Round
+        // 10 added the exited filter on the spawn-side dup check so a
+        // new agent can reuse an exited agent's pane_id_env; without
+        // the symmetric filter HERE, this find could still match the
+        // dead entry and route bytes into a closed PTY whose pump
+        // thread already saw EOF. Mirrors `live_count`'s contract:
+        // operational lookups treat exited entries as gone, cleanup
+        // paths (`close_agent`, `shutdown_all`) still touch them.
         let writer = {
             let inner = self.inner.lock().unwrap();
             inner
                 .agents
                 .values()
-                .find(|a| a.pane_id_env.as_deref() == Some(pane_id))
+                .find(|a| {
+                    a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst)
+                })
                 .map(|a| a.writer.clone())
                 .ok_or_else(|| AgentPtyError::NotFound(pane_id.to_string()))?
         };
@@ -1166,17 +1193,26 @@ impl AgentPtyRegistry {
         self.agent_records().into_iter().map(|r| r.id).collect()
     }
 
-    /// All currently-owned agents as `(id, pane_id_env)` records, sorted
-    /// ascending by id. M2.x rehydration relies on the captured
-    /// `pane_id_env` to rebind the TUI's local pane id to whatever value
-    /// the agent's child process already carries in its environment —
-    /// without this, hook events emitted by the agent would be silently
-    /// dropped after a reconnect (see `RunningAgent::pane_id_env`).
+    /// All currently-owned *live* agents as `(id, pane_id_env)`
+    /// records, sorted ascending by id. M2.x rehydration relies on the
+    /// captured `pane_id_env` to rebind the TUI's local pane id to
+    /// whatever value the agent's child process already carries in its
+    /// environment — without this, hook events emitted by the agent
+    /// would be silently dropped after a reconnect (see
+    /// `RunningAgent::pane_id_env`).
+    ///
+    /// Round-11 reviewer #A: exited-but-not-reaped entries are
+    /// filtered out. Hydration uses this to rebuild the TUI's pane
+    /// set on reattach; surfacing a dead entry alongside a live
+    /// reuse of the same pane_id_env would materialize a ghost
+    /// pane on the dashboard or, worse, race the live entry for
+    /// which one wins the local pane_id slot in `wire_stream_pane`.
     pub fn agent_records(&self) -> Vec<AgentRecord> {
         let inner = self.inner.lock().unwrap();
         let mut records: Vec<AgentRecord> = inner
             .agents
             .iter()
+            .filter(|(_, agent)| !agent.exited.load(Ordering::SeqCst))
             .map(|(id, agent)| AgentRecord {
                 id: id.clone(),
                 pane_id_env: agent.pane_id_env.clone(),
@@ -1552,6 +1588,117 @@ mod tests {
             })
             .expect("reuse of an exited agent's pane_id_env must succeed");
         assert_ne!(id1, id2);
+
+        registry.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn agent_records_filters_exited_entries() {
+        // Round-11 reviewer #A: agent_records is the hydration source.
+        // An exited-but-not-reaped entry must not show up — the TUI
+        // would otherwise materialize a ghost pane for a dead agent
+        // (or race a fresh agent that reused the same pane_id_env).
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/true"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "ghost".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn /bin/true");
+
+        // Wait for `exited` to flip.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if registry.live_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(registry.live_count(), 0);
+        assert_eq!(
+            registry.len(),
+            1,
+            "exited entry still present in agents map"
+        );
+        assert!(
+            registry.agent_records().is_empty(),
+            "agent_records must drop exited entries so hydration doesn't materialize ghost panes"
+        );
+
+        registry.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn write_to_pane_skips_exited_agent_and_routes_to_live_reuser() {
+        // Round-11 reviewer #A: the symmetric guard for the spawn-side
+        // exited filter added in round 10. Without filtering on the
+        // WRITE side, `write_to_pane(pane_id_env=X)` could still find
+        // the dead entry first and route delegate/work-done bytes
+        // into a closed PTY whose pump thread already saw EOF.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _dead = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/true"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "reuse-me".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn dead agent");
+
+        // Wait for the dead agent's reader to see EOF and flip `exited`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if registry.live_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(registry.live_count(), 0, "dead agent must have exited");
+
+        // Reuse the same pane_id_env for a fresh agent. `/bin/sh` will
+        // stay alive long enough to receive a write.
+        let live_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "reuse-me".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn live agent reusing the pane_id_env");
+        assert_eq!(registry.live_count(), 1);
+
+        // Take a snapshot before the write so we can detect bytes
+        // arriving on the live agent's scrollback specifically.
+        let before = registry.snapshot(&live_id).unwrap();
+
+        // Operational write must route to the live agent, not the
+        // dead one. We can't easily prove "dead agent received
+        // nothing" because its writer is gone — but we CAN prove the
+        // live one did receive something. The dead agent's writer
+        // would error out anyway, so a misroute would surface as Err.
+        registry
+            .write_to_pane("reuse-me", "echo round11-routing-marker")
+            .await
+            .expect("write_to_pane to a live reuser must succeed");
+
+        // Allow the PTY to echo the input back into scrollback.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut found = false;
+        while tokio::time::Instant::now() < deadline {
+            let snap = registry.snapshot(&live_id).unwrap();
+            if snap
+                .windows(b"round11-routing-marker".len())
+                .any(|w| w == b"round11-routing-marker")
+                && snap.len() > before.len()
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            found,
+            "write_to_pane must have landed bytes in the LIVE reuser's scrollback, not the exited entry's"
+        );
 
         registry.shutdown_all();
     }
