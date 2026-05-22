@@ -8,6 +8,7 @@ use tracing::warn;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
 use crate::event::{AgentEvent, AgentType, DelegateSignal, EventType, WorkDoneSignal};
+use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
 const MAX_RECENT_EVENTS: usize = 50;
 const MAX_FIRST_PROMPTS: usize = 3;
@@ -99,6 +100,44 @@ pub fn compose_delegate_prompt(task_body: &str) -> String {
          dot-agent-deck work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
          ```"
     )
+}
+
+/// CodeRabbit (PRD #93 round-9): build the file contents written to
+/// `.dot-agent-deck/worker-task-{role}.md` for a delegation. When the
+/// role config supplies a `prompt_template`, wrap the task under a
+/// `## Task` header beneath the template — mirrors the pre-Round-5 TUI
+/// dispatch path that Round 5 lost when it moved orchestration onto
+/// the daemon side without bringing the per-role template wrapping
+/// along. With no template the file content is the raw task; the
+/// PTY-injected one-liner still appends the work-done footer in both
+/// shapes via [`compose_delegate_prompt`].
+pub fn compose_worker_task_file(prompt_template: Option<&str>, task: &str) -> String {
+    match prompt_template {
+        Some(tpl) if !tpl.trim().is_empty() => format!("{tpl}\n\n## Task\n\n{task}"),
+        _ => task.to_string(),
+    }
+}
+
+/// Look up the role config for `role_name` inside the orchestration
+/// named `orchestration_name`, by parsing the project config file at
+/// `cwd`. Returns `None` when any layer is missing (no project config,
+/// no matching orchestration, no matching role) — the caller treats
+/// "no config" as "no template, no clear" and falls through to the
+/// default behavior. Centralizing the lookup here keeps
+/// `handle_delegate` from juggling three layers of `Option` inline.
+fn lookup_orchestration_role(
+    cwd: &str,
+    orchestration_name: &str,
+    role_name: &str,
+) -> Option<OrchestrationRoleConfig> {
+    let cfg = load_project_config(std::path::Path::new(cwd))
+        .ok()
+        .flatten()?;
+    let orch = cfg
+        .orchestrations
+        .into_iter()
+        .find(|o| o.name == orchestration_name)?;
+    orch.roles.into_iter().find(|r| r.name == role_name)
 }
 
 impl AppState {
@@ -216,8 +255,6 @@ impl AppState {
 
         let orchestration = self.pane_orchestration_map.get(&signal.pane_id);
 
-        let cwd = self.pane_cwd_map.get(&signal.pane_id).cloned();
-
         for target_role in &signal.to {
             // Find the worker pane(s) in the same orchestration with the
             // matching role name. Skip the orchestrator itself (a role that
@@ -241,37 +278,97 @@ impl AppState {
             }
 
             let safe_name = sanitize_role_name(target_role);
-            // Write the task to a file the worker can read in one chunk
-            // — Claude Code submits each PTY-injected line as it arrives,
-            // so a multi-line task pasted through the PTY would fragment
-            // into separate prompts. The file indirection keeps the task
-            // atomic.
-            let task_body = if let Some(cwd) = cwd.as_deref() {
-                let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-                if let Err(e) = std::fs::create_dir_all(&dir) {
-                    warn!(
-                        dir = %dir.display(),
-                        role = %target_role,
-                        error = %e,
-                        "delegate: failed to create task directory"
-                    );
-                }
-                let file_path = dir.join(format!("worker-task-{safe_name}.md"));
-                if let Err(e) = std::fs::write(&file_path, &signal.task) {
-                    warn!(
-                        path = %file_path.display(),
-                        role = %target_role,
-                        error = %e,
-                        "delegate: failed to write worker task file"
-                    );
-                }
-                format!("Read .dot-agent-deck/worker-task-{safe_name}.md for your task.")
-            } else {
-                signal.task.clone()
-            };
-            let one_liner = compose_delegate_prompt(&task_body);
-
+            // CodeRabbit (PRD #93 round-9): the task file lands in the
+            // *worker's* cwd, not the orchestrator's. Earlier rounds
+            // captured `pane_cwd_map[&signal.pane_id]` once outside the
+            // loop and reused it for every worker — fine when every
+            // worker shared the orchestrator's directory, broken the
+            // moment two role panes were started in different cwds.
+            // Per-target lookup also means the per-worker file write
+            // happens once per pane and not once per role-name + reused.
             for pane_id in target_panes {
+                let cwd = self.pane_cwd_map.get(&pane_id).cloned();
+                // CodeRabbit (PRD #93 round-9): look the role config up
+                // by `(worker cwd, orchestration name, target role)` so
+                // we can apply the per-role `prompt_template` wrapping
+                // that Round 5 lost. Approach (b) from the brief: load
+                // the project config from the worker's cwd rather than
+                // threading prompt_template/clear through
+                // `TabMembership` — no wire-format change, and a config
+                // edit between sessions takes effect on the next
+                // delegate without needing a pane respawn. `None` from
+                // the lookup means "no template, fall back to raw task"
+                // which matches the pre-round-9 behavior.
+                let role_config = match (cwd.as_deref(), orchestration) {
+                    (Some(c), Some(orch_name)) => {
+                        lookup_orchestration_role(c, orch_name, target_role)
+                    }
+                    _ => None,
+                };
+                let prompt_template = role_config
+                    .as_ref()
+                    .and_then(|r| r.prompt_template.as_deref());
+                let task_body = if let Some(cwd) = cwd.as_deref() {
+                    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
+                    if let Err(e) = std::fs::create_dir_all(&dir) {
+                        warn!(
+                            dir = %dir.display(),
+                            role = %target_role,
+                            pane_id = %pane_id,
+                            error = %e,
+                            "delegate: failed to create task directory"
+                        );
+                    }
+                    let file_path = dir.join(format!("worker-task-{safe_name}.md"));
+                    let file_content = compose_worker_task_file(prompt_template, &signal.task);
+                    if let Err(e) = std::fs::write(&file_path, &file_content) {
+                        warn!(
+                            path = %file_path.display(),
+                            role = %target_role,
+                            pane_id = %pane_id,
+                            error = %e,
+                            "delegate: failed to write worker task file"
+                        );
+                    }
+                    format!("Read .dot-agent-deck/worker-task-{safe_name}.md for your task.")
+                } else {
+                    // Defensive: the daemon's StartAgent handler always
+                    // records `pane_cwd_map` for orchestration panes (see
+                    // `daemon_protocol.rs`), so this branch should be
+                    // unreachable in production. Log and fall back to
+                    // inlining the task body so the worker still gets
+                    // *something* useful rather than a dangling reference.
+                    warn!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        "delegate: no cwd recorded for worker pane — inlining task body"
+                    );
+                    compose_worker_task_file(prompt_template, &signal.task)
+                };
+                // CodeRabbit (PRD #93 round-9): the per-role `clear`
+                // flag (pre-Round-5: kill the worker pane and respawn
+                // the role's command before injecting the new prompt)
+                // is not yet wired through on the daemon side. Restart
+                // requires the daemon to know the role's spawn command,
+                // re-issue the StartAgent / close+spawn dance from
+                // inside the hook loop, and defer the prompt-write
+                // until the fresh agent is ready — substantial new
+                // machinery that's deliberately out of scope for this
+                // commit (see commit message). Log the deferral here
+                // so a `clear = true` regression test or operator
+                // running with a `clear`-bearing config sees a clear
+                // signal rather than silent drift.
+                if let Some(role) = role_config.as_ref()
+                    && role.clear
+                {
+                    tracing::debug!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        "delegate: role.clear=true is not yet implemented on the daemon side; \
+                         injecting prompt into the existing pane without restart"
+                    );
+                }
+                let one_liner = compose_delegate_prompt(&task_body);
                 if let Err(e) = registry.write_to_pane(&pane_id, &one_liner).await {
                     warn!(
                         pane_id = %pane_id,

@@ -346,17 +346,30 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // expires, the hook loop's `select!` arm wakes up, and the loop exits.
     let shutdown = Arc::new(Notify::new());
 
-    // Optionally spawn the M1.2 streaming attach server with the shared
+    // Optionally start the M1.2 streaming attach server with the shared
     // client counter. We hold its JoinHandle and abort it on exit so it
     // doesn't outlive the daemon.
-    let attach_handle = daemon.attach_socket_path.map(|path| {
+    //
+    // CodeRabbit (PRD #93 round-9): bind the attach listener INLINE
+    // before spawning the accept loop, so a bind() error (e.g. a stale
+    // socket the cleanup couldn't unlink, or a permission denial on the
+    // parent dir) propagates up through `run_daemon_with`'s `Result`
+    // instead of getting swallowed by the spawned task's `error!` log.
+    // Earlier rounds spawned and discarded the future, so the
+    // hook-ingestion daemon "started successfully" while no TUI could
+    // ever connect to the attach socket. Returning Err here lets the
+    // caller (production `main`, or a test) treat it as a daemon-start
+    // failure.
+    let attach_handle = if let Some(path) = daemon.attach_socket_path {
+        let listener = crate::daemon_protocol::bind_attach_listener(&path)?;
+        info!("Attach protocol listening on {}", path.display());
         let registry = pty_registry.clone();
         let attach_event_tx = event_tx.clone();
         let attach_counter = client_count.clone();
         let attach_state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::daemon_protocol::run_attach_server_with_counter(
-                &path,
+        Some(tokio::spawn(async move {
+            if let Err(e) = crate::daemon_protocol::serve_attach_with_counter(
+                listener,
                 registry,
                 attach_event_tx,
                 attach_counter,
@@ -366,8 +379,10 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
             {
                 error!("attach protocol server error: {e}");
             }
-        })
-    });
+        }))
+    } else {
+        None
+    };
 
     // PRD #93 M1.2 idle monitor — edge-triggered via the registry's
     // `change_notify` so transitions on both sides (attach counter via

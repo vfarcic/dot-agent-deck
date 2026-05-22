@@ -339,6 +339,164 @@ async fn daemon_writes_work_done_feedback_to_orchestrator_pane() {
     );
 }
 
+/// CodeRabbit #2 (PRD #93 round-9): a delegate must land the task file
+/// in *each worker's* cwd, not the orchestrator's. Earlier rounds
+/// captured the orchestrator's cwd once and reused it for every
+/// target, which silently misrouted when role panes were started in
+/// different directories.
+#[tokio::test]
+async fn delegate_writes_task_file_to_each_workers_own_cwd() {
+    let daemon = spawn_daemon().await;
+    let orch_cwd_dir = tempfile::tempdir().unwrap();
+    let orch_cwd = orch_cwd_dir.path().to_string_lossy().into_owned();
+    let worker_cwd_dir = tempfile::tempdir().unwrap();
+    let worker_cwd = worker_cwd_dir.path().to_string_lossy().into_owned();
+    assert_ne!(
+        orch_cwd, worker_cwd,
+        "test setup: orchestrator and worker cwds must differ"
+    );
+
+    let _orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &orch_cwd,
+    )
+    .await;
+    let coder_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "coder",
+        false,
+        1,
+        "coder-pane",
+        &worker_cwd,
+    )
+    .await;
+
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "Implement the auth module".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    // Worker should see the one-liner in its own scrollback.
+    let _ = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &coder_agent_id,
+        "Read .dot-agent-deck/worker-task-coder.md",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // The task file MUST exist in the worker's cwd…
+    let worker_task =
+        std::path::Path::new(&worker_cwd).join(".dot-agent-deck/worker-task-coder.md");
+    assert!(
+        worker_task.exists(),
+        "task file must land in the worker's cwd, not the orchestrator's; expected {}",
+        worker_task.display()
+    );
+
+    // …and MUST NOT exist in the orchestrator's cwd.
+    let orch_task = std::path::Path::new(&orch_cwd).join(".dot-agent-deck/worker-task-coder.md");
+    assert!(
+        !orch_task.exists(),
+        "task file must not be written to the orchestrator's cwd; spurious file at {}",
+        orch_task.display()
+    );
+}
+
+/// CodeRabbit #3 (PRD #93 round-9): a role config's `prompt_template`
+/// must wrap the task body in the file the worker reads. Round 5
+/// dropped this when dispatch moved daemon-side; the daemon now
+/// re-loads `.dot-agent-deck/config.toml` from the worker's cwd to
+/// apply per-role wrapping (approach (b) from the brief).
+#[tokio::test]
+async fn delegate_wraps_task_with_role_prompt_template() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    // Write a project config file with a prompt_template on the coder
+    // role. The daemon's `lookup_orchestration_role` parses
+    // `<cwd>/.dot-agent-deck.toml` via `load_project_config`.
+    let config_toml = r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "cat -u"
+prompt_template = "You are the coder. Always run tests before finishing."
+"#;
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let coder_agent_id =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "Implement the auth module".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    let _ = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &coder_agent_id,
+        "Read .dot-agent-deck/worker-task-coder.md",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let task_file = std::path::Path::new(&cwd).join(".dot-agent-deck/worker-task-coder.md");
+    let body = std::fs::read_to_string(&task_file).unwrap();
+    assert!(
+        body.contains("You are the coder. Always run tests before finishing."),
+        "task file must include the role's prompt_template; got:\n{body}"
+    );
+    assert!(
+        body.contains("## Task"),
+        "wrapped file must include the `## Task` header that separates the template from the task body; got:\n{body}"
+    );
+    assert!(
+        body.contains("Implement the auth module"),
+        "wrapped file must still include the original task body; got:\n{body}"
+    );
+}
+
 /// Anti-spoofing: a delegate from a worker pane (or any non-orchestrator
 /// pane) must be dropped daemon-side and produce no PTY write.
 #[tokio::test]

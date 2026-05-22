@@ -2525,6 +2525,26 @@ pub fn run_tui(
         let _ = terminal.autoresize();
 
         let saved = config::SavedSession::load();
+        // CodeRabbit (PRD #93 round-9): dedupe against panes the daemon
+        // already hydrated. The hydration loop above populated
+        // `ui.pane_metadata` with a `SavedPane`-shaped entry for every
+        // daemon agent that carried a cwd, keyed by the daemon pane id.
+        // The saved-session file is independent of that path — if the
+        // user's previous TUI process saved its panes and the daemon
+        // still owns them, both code paths recreate the same logical
+        // pane and the user ends up with duplicate ghost cards. Match
+        // by the `(dir, name, mode)` triple — pane ids are
+        // daemon-allocated and shift every spawn, so they're useless
+        // here; the user-visible identity of a pane is its directory +
+        // label + tab membership. Saved panes that *don't* match any
+        // hydrated pane are still restored (covers the case where the
+        // daemon was restarted between sessions and hydration returned
+        // empty).
+        let hydrated_keys: std::collections::HashSet<(String, String, Option<String>)> = ui
+            .pane_metadata
+            .values()
+            .map(|p| (p.dir.clone(), p.name.clone(), p.mode.clone()))
+            .collect();
         // Collect deferred mode pane restores — we need the terminal ready
         // before we can resize PTYs, so mode tabs are opened after the loop.
         let mut deferred_mode_panes: Vec<(config::SavedPane, ModeConfig)> = Vec::new();
@@ -2535,6 +2555,20 @@ pub fn run_tui(
                     "Warning: skipping pane '{}' — directory {} not found",
                     saved_pane.name, saved_pane.dir
                 ));
+                continue;
+            }
+            let dedupe_key = (
+                saved_pane.dir.clone(),
+                saved_pane.name.clone(),
+                saved_pane.mode.clone(),
+            );
+            if hydrated_keys.contains(&dedupe_key) {
+                tracing::debug!(
+                    dir = %saved_pane.dir,
+                    name = %saved_pane.name,
+                    mode = ?saved_pane.mode,
+                    "restore: skipping saved pane — already hydrated from daemon"
+                );
                 continue;
             }
             // If the pane belonged to a mode tab, defer it so we can open a

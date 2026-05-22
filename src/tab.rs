@@ -243,6 +243,26 @@ impl TabManager {
         let mut role_pane_ids: Vec<String> = Vec::with_capacity(config.roles.len());
         let (spawn_rows, spawn_cols) = spawn_dims;
 
+        // CodeRabbit (PRD #93 round-9): `config.name` defaults to an empty
+        // string when the user didn't name their orchestration. We fall
+        // back to the cwd basename so the daemon-side `TabMembership`
+        // carries the same resolved label as the local Tab record
+        // (computed identically below and in
+        // `open_orchestration_tab_with_existing_role_panes`). Without
+        // this, every Orchestration TabMembership would echo "" on
+        // reconnect, which `partition_hydrated_panes` then keys against
+        // `("", cwd)` — collapsing every nameless orchestration in the
+        // same cwd into one bucket and randomly dropping panes whose
+        // role_indices collide.
+        let resolved_name = if config.name.is_empty() {
+            std::path::Path::new(cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| cwd.to_string())
+        } else {
+            config.name.clone()
+        };
+
         // PRD #76 M2.12: tag each role pane with its orchestration tab
         // membership so the daemon-side registry can echo it back via
         // `list_agents` and the TUI rebuilds the orchestration tab on
@@ -251,7 +271,7 @@ impl TabManager {
             let opts = AgentSpawnOptions {
                 display_name: Some(role.name.as_str()),
                 tab_membership: Some(TabMembership::Orchestration {
-                    name: config.name.clone(),
+                    name: resolved_name.clone(),
                     role_index,
                     role_name: role.name.clone(),
                     is_start_role: role.start,
@@ -288,18 +308,9 @@ impl TabManager {
 
         let start_role_index = config.roles.iter().position(|r| r.start).unwrap_or(0);
 
-        let name = if config.name.is_empty() {
-            std::path::Path::new(cwd)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| cwd.to_string())
-        } else {
-            config.name.clone()
-        };
-
         self.tabs.push(Tab::Orchestration {
             id,
-            name,
+            name: resolved_name,
             role_pane_ids: role_pane_ids.clone(),
             role_statuses: vec![OrchestrationRoleStatus::Waiting; config.roles.len()],
             cwd: cwd.to_string(),

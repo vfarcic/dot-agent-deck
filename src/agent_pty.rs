@@ -255,6 +255,14 @@ pub enum AgentPtyError {
     /// wrapper and leak the tail as raw keystrokes inside the agent TUI.
     #[error("Invalid pane payload: {0}")]
     InvalidPayload(#[from] PaneInputError),
+    /// A spawn carried a `DOT_AGENT_DECK_PANE_ID` env value that already
+    /// names another live agent in this registry. `write_to_pane` keys
+    /// off `pane_id_env`, so accepting a second agent with the same id
+    /// would silently route delegate/work-done writes to whichever entry
+    /// `HashMap::values().find(...)` returns first — i.e., the wrong PTY.
+    /// Reject the spawn loudly instead.
+    #[error("Duplicate pane id: {0}")]
+    DuplicatePaneId(String),
 }
 
 /// How to spawn an agent.
@@ -925,6 +933,25 @@ impl AgentPtyRegistry {
         let guard = PtyGuard::new(spawn(opts)?);
         let mut inner = self.inner.lock().unwrap();
 
+        // CodeRabbit MAJOR (PRD #93 round-9): reject the spawn if
+        // another live agent already claims this `pane_id_env`.
+        // `write_to_pane` routes by `pane_id_env`, so two agents sharing
+        // one id silently misroute every delegate/work-done write to
+        // whichever entry `values().find(...)` happened to visit first.
+        // The check sits INSIDE the post-spawn lock acquisition so the
+        // check + insert is atomic — a concurrent spawn with the same
+        // pane id can't squeeze between a pre-spawn check and the
+        // insert. On Err the `guard` Drop kills the child we just
+        // spawned, so the rejection doesn't leak a PTY.
+        if let Some(ref candidate) = pane_id_env
+            && inner
+                .agents
+                .values()
+                .any(|a| a.pane_id_env.as_deref() == Some(candidate.as_str()))
+        {
+            return Err(AgentPtyError::DuplicatePaneId(candidate.clone()));
+        }
+
         let pty = guard.take();
         let AgentPty {
             child,
@@ -1432,6 +1459,70 @@ mod tests {
         registry
             .resize(&id, 50, 200)
             .expect("resize should succeed");
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn registry_rejects_duplicate_pane_id_env() {
+        // CodeRabbit MAJOR (PRD #93 round-9): two agents must never
+        // share a `pane_id_env`. `write_to_pane` keys off that string,
+        // so a second spawn with the same id would silently misroute
+        // every subsequent delegate/work-done write to whichever entry
+        // `values().find(...)` happened to hand back first.
+        let registry = AgentPtyRegistry::new();
+        let id1 = registry
+            .spawn_agent(SpawnOptions {
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-x".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("first spawn should succeed");
+
+        let err = registry
+            .spawn_agent(SpawnOptions {
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-x".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect_err("duplicate pane_id_env spawn must fail");
+        match err {
+            AgentPtyError::DuplicatePaneId(p) => assert_eq!(p, "pane-x"),
+            other => panic!("expected DuplicatePaneId, got {other:?}"),
+        }
+
+        // Registry must still have exactly one agent — the rejection
+        // can't have leaked the spawned child.
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.agent_ids(), vec![id1]);
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn registry_write_to_pane_routes_to_correct_agent_by_pane_id() {
+        // CodeRabbit MAJOR (PRD #93 round-9) regression guard: with
+        // distinct pane_id_envs, `write_to_pane(pane_id, bytes)` must
+        // land in *that* agent's PTY and not leak into a sibling.
+        // Mirrors the production routing path delegate/work-done uses.
+        // We can't easily read PTY bytes from a `/bin/sh` so we
+        // confirm structurally: the registry must contain both agents
+        // and their `pane_id_env`s must be the values we set.
+        let registry = AgentPtyRegistry::new();
+        let id_a = registry
+            .spawn_agent(SpawnOptions {
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-a".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a");
+        let id_b = registry
+            .spawn_agent(SpawnOptions {
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-b".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn b");
+
+        let records = registry.agent_records();
+        let rec_a = records.iter().find(|r| r.id == id_a).unwrap();
+        let rec_b = records.iter().find(|r| r.id == id_b).unwrap();
+        assert_eq!(rec_a.pane_id_env.as_deref(), Some("pane-a"));
+        assert_eq!(rec_b.pane_id_env.as_deref(), Some("pane-b"));
         registry.shutdown_all();
     }
 

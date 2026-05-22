@@ -581,7 +581,10 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
     // win the bind — M1.3) and trust-checks any existing socket
     // (uid + 0o600 + is-socket) before the TUI's DaemonClient touches it.
     if let Err(e) = ensure_external_daemon_or_die(&attach_path).await {
-        eprintln!("remote-deck-local mode: {e}");
+        eprintln!(
+            "failed to connect to daemon at {}: {e}",
+            attach_path.display()
+        );
         return ExitCode::FAILURE;
     }
     // PRD #76 M2.17: subscribe to the daemon's `AgentEvent` broadcast so
