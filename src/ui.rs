@@ -3844,6 +3844,20 @@ pub fn run_tui(
                         shortcut_handled = true;
                     }
                     // Ctrl+w: close selected pane (or entire mode tab if it's the agent pane)
+                    //
+                    // PRD #92 F4: previously the result of `close_pane` was
+                    // discarded with `let _ =` and the card / session was
+                    // removed unconditionally. A failed `StopAgent` RPC then
+                    // left the underlying agent alive in the daemon
+                    // registry while the dashboard card vanished — the user
+                    // had no visibility and no retry. We now inspect each
+                    // close result and preserve the card / session on
+                    // failure so the user can see the error in
+                    // `ui.status_message` and try again. For group-close
+                    // (mode-tab teardown / orchestration tab teardown) we
+                    // consume `CloseTabOutcome::closed` to remove
+                    // successfully-closed cards and `CloseTabOutcome::failed`
+                    // to keep failed cards with a status-bar summary.
                     KeyCode::Char('w') => {
                         if let Some(sid) =
                             filtered.get(ui.selected_index).map(|(id, _)| (*id).clone())
@@ -3857,49 +3871,118 @@ pub fn run_tui(
                                 .or_else(|| tab_manager.tab_index_for_pane(pane_id));
                             if let Some(tab_idx) = mode_tab_idx {
                                 // Close the entire tab (agent + side panes, or all role panes).
-                                // close_tab already calls close_pane on orchestration role panes.
-                                if let Ok(all_ids) = tab_manager.close_tab(tab_idx) {
-                                    let mut st = state.blocking_write();
-                                    // Collect all pane IDs to clean up (returned + selected).
-                                    let mut pane_ids_to_remove: Vec<String> = all_ids;
-                                    if !pane_ids_to_remove.contains(&closed_pane_id) {
-                                        pane_ids_to_remove.push(closed_pane_id.clone());
+                                // close_tab returns a per-pane outcome — successful closes
+                                // get their cards removed, failed closes keep theirs.
+                                match tab_manager.close_tab(tab_idx) {
+                                    Ok(outcome) => {
+                                        let mut st = state.blocking_write();
+                                        for id in &outcome.closed {
+                                            st.unregister_pane(id);
+                                        }
+                                        // Remove sessions whose pane_id is in the closed set ONLY.
+                                        // Failed panes retain their sessions so the user can retry.
+                                        let closed_set: std::collections::HashSet<&str> =
+                                            outcome.closed.iter().map(String::as_str).collect();
+                                        st.sessions.retain(|_, s| {
+                                            s.pane_id.as_ref().is_none_or(|pid| {
+                                                !closed_set.contains(pid.as_str())
+                                            })
+                                        });
+                                        drop(st);
+                                        // Clean pane_metadata only for the successfully-closed panes.
+                                        for id in &outcome.closed {
+                                            ui.pane_metadata.remove(id);
+                                        }
+                                        if outcome.is_clean() {
+                                            ui.status_message = Some((
+                                                format!(
+                                                    "Closed tab containing pane {closed_pane_id}"
+                                                ),
+                                                std::time::Instant::now(),
+                                            ));
+                                        } else {
+                                            // List which panes failed plus the first error so the
+                                            // status bar stays readable (single-line). Full per-pane
+                                            // errors are tracing-logged for the daemon log.
+                                            let failed_ids: Vec<&str> = outcome
+                                                .failed
+                                                .iter()
+                                                .map(|(id, _)| id.as_str())
+                                                .collect();
+                                            let first_err = outcome
+                                                .failed
+                                                .first()
+                                                .map(|(_, e)| e.as_str())
+                                                .unwrap_or("");
+                                            for (id, e) in &outcome.failed {
+                                                tracing::warn!(
+                                                    pane_id = %id,
+                                                    error = %e,
+                                                    "F4: close_pane failed during tab teardown — card preserved"
+                                                );
+                                            }
+                                            ui.status_message = Some((
+                                                format!(
+                                                    "Close partially failed for {} pane(s) — first error: {first_err}",
+                                                    failed_ids.len()
+                                                ),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
+                                        let area = terminal.get_frame().area();
+                                        resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
                                     }
-                                    for id in &pane_ids_to_remove {
-                                        st.unregister_pane(id);
+                                    Err(e) => {
+                                        ui.status_message = Some((
+                                            format!("Failed to close tab: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
                                     }
-                                    // Remove all sessions whose pane_id is in the closed set.
-                                    st.sessions.retain(|_, s| {
-                                        s.pane_id
-                                            .as_ref()
-                                            .is_none_or(|pid| !pane_ids_to_remove.contains(pid))
-                                    });
-                                    drop(st);
                                 }
-                                ui.pane_metadata.remove(&closed_pane_id);
-                                let area = terminal.get_frame().area();
-                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
                             } else {
-                                // Plain dashboard pane — close just this one.
-                                let _ = pane.close_pane(pane_id);
-                                let mut st = state.blocking_write();
-                                st.sessions.remove(&sid);
-                                st.unregister_pane(&closed_pane_id);
-                                drop(st);
-                                ui.pane_metadata.remove(&closed_pane_id);
+                                // Plain dashboard pane — close just this one and inspect
+                                // the result. On Err the controller has already restored
+                                // the local pane state (see EmbeddedPaneController::close_pane),
+                                // so we leave the card / session in place for retry.
+                                match pane.close_pane(pane_id) {
+                                    Ok(()) => {
+                                        let mut st = state.blocking_write();
+                                        st.sessions.remove(&sid);
+                                        st.unregister_pane(&closed_pane_id);
+                                        drop(st);
+                                        ui.pane_metadata.remove(&closed_pane_id);
+                                        ui.status_message = Some((
+                                            format!("Closed pane {closed_pane_id}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            pane_id = %closed_pane_id,
+                                            error = %e,
+                                            "F4: close_pane failed — card preserved for retry"
+                                        );
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Failed to close pane {closed_pane_id}: {e} — press Ctrl+W to retry"
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
                             }
                             if ui.mode == UiMode::PaneInput {
                                 ui.mode = UiMode::Normal;
                             }
                             // Clamp selected_index so it doesn't point past
-                            // the now-shorter card list.
+                            // the now-shorter card list. (Only meaningful if
+                            // at least one pane was actually removed; on a
+                            // pure-failure close the card count is unchanged
+                            // and this is a no-op since selected_index
+                            // already points at the (preserved) card.)
                             if ui.selected_index > 0 {
                                 ui.selected_index = ui.selected_index.saturating_sub(1);
                             }
-                            ui.status_message = Some((
-                                format!("Closed pane {closed_pane_id}"),
-                                std::time::Instant::now(),
-                            ));
                         }
                         shortcut_handled = true;
                     }

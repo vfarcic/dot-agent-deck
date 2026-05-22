@@ -33,6 +33,54 @@ pub struct PaneInfo {
     pub command: Option<String>,
 }
 
+/// PRD #92 F4: per-pane result of a multi-pane close operation (a mode
+/// tab teardown via [`crate::tab::TabManager::close_tab`], or a mode
+/// deactivation via [`crate::mode_manager::ModeManager::deactivate_mode`]).
+///
+/// Pre-F4 the same operations returned `Result<Vec<String>, _>` and
+/// silently dropped any [`PaneController::close_pane`] errors. That
+/// produced the user-visible bug where pressing `Ctrl+W` on an
+/// unhealthy mode-tab destroyed the dashboard cards while the underlying
+/// agent processes survived in the daemon registry — the TUI thought
+/// they were gone.
+///
+/// Callers consume the outcome like this: `closed` is the set of pane
+/// IDs whose `close_pane` returned `Ok(())` — the UI should remove
+/// those sessions, cards, and pane metadata as before. `failed` is the
+/// set of `(pane_id, rendered_error)` pairs — the UI keeps those
+/// cards / sessions, restores the local pane state (the controller
+/// already did this on its `Err` path), and surfaces the errors in
+/// `ui.status_message` so the user can retry.
+///
+/// The error half is rendered to `String` rather than carried as
+/// [`PaneError`] because [`PaneError::Io`] wraps [`std::io::Error`]
+/// which is not `Clone`. The caller renders errors into the status
+/// message anyway, so collecting strings is what we already want.
+#[derive(Debug, Default)]
+pub struct CloseTabOutcome {
+    /// Pane IDs whose `close_pane` returned `Ok(())`.
+    pub closed: Vec<String>,
+    /// Pane IDs whose `close_pane` returned `Err`, paired with the
+    /// rendered error message (`format!("{}", e)`).
+    pub failed: Vec<(String, String)>,
+}
+
+impl CloseTabOutcome {
+    /// Record one pane's close result. `Ok(())` pushes to `closed`;
+    /// `Err(e)` pushes `(pane_id, e.to_string())` to `failed`.
+    pub fn record(&mut self, pane_id: String, result: Result<(), PaneError>) {
+        match result {
+            Ok(()) => self.closed.push(pane_id),
+            Err(e) => self.failed.push((pane_id, e.to_string())),
+        }
+    }
+
+    /// True iff every `close_pane` call in the outcome returned `Ok`.
+    pub fn is_clean(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
 /// Outcome of a [`PaneController::rename_pane`] call.
 ///
 /// M2.11 fixup 5 — the rename path now returns what the controller

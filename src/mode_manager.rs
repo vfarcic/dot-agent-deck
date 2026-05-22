@@ -3,7 +3,7 @@ use std::sync::Arc;
 use regex::Regex;
 use thiserror::Error;
 
-use crate::pane::{AgentSpawnOptions, PaneController, PaneError};
+use crate::pane::{AgentSpawnOptions, CloseTabOutcome, PaneController, PaneError};
 use crate::project_config::ModeConfig;
 
 // ---------------------------------------------------------------------------
@@ -332,23 +332,35 @@ impl ModeManager {
         Ok(())
     }
 
-    pub fn deactivate_mode(&mut self) -> Result<(), ModeManagerError> {
+    /// PRD #92 F4: tear down the active mode's persistent + reactive
+    /// panes and return a [`CloseTabOutcome`] capturing per-pane close
+    /// results. Pre-F4 this discarded every `close_pane` error with a
+    /// silent `let _ =`, so a failed `StopAgent` RPC left the underlying
+    /// agent alive in the daemon registry while the TUI thought it was
+    /// gone. The outcome carries the failures back to the caller so
+    /// `ui.status_message` can surface them and the matching dashboard
+    /// cards can be preserved for retry.
+    pub fn deactivate_mode(&mut self) -> Result<CloseTabOutcome, ModeManagerError> {
         let mode = self
             .active_mode
             .take()
             .ok_or(ModeManagerError::NoActiveMode)?;
 
+        let mut outcome = CloseTabOutcome::default();
+
         // Close persistent panes
         for id in &mode.persistent_pane_ids {
-            let _ = self.pane_controller.close_pane(id);
+            let result = self.pane_controller.close_pane(id);
+            outcome.record(id.clone(), result);
         }
 
         // Close reactive panes
         for id in mode.reactive_pool.all_ids() {
-            let _ = self.pane_controller.close_pane(id);
+            let result = self.pane_controller.close_pane(id);
+            outcome.record(id.to_string(), result);
         }
 
-        Ok(())
+        Ok(outcome)
     }
 
     /// Routes a command to a matching reactive pane. Returns pane change info:

@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::agent_pty::TabMembership;
 use crate::event::{AgentType, EventType};
 use crate::mode_manager::{ModeManager, ModeManagerError};
-use crate::pane::{AgentSpawnOptions, PaneController};
+use crate::pane::{AgentSpawnOptions, CloseTabOutcome, PaneController};
 use crate::project_config::{ModeConfig, OrchestrationConfig, resolve_orchestration_name};
 use crate::state::SessionState;
 
@@ -438,8 +438,19 @@ impl TabManager {
         Ok((index, role_pane_ids_flat))
     }
 
-    /// Close a mode tab by index. Returns the pane IDs that were managed.
-    pub fn close_tab(&mut self, index: usize) -> Result<Vec<String>, TabError> {
+    /// PRD #92 F4: close a mode or orchestration tab and return a
+    /// [`CloseTabOutcome`] capturing per-pane close results. Pre-F4
+    /// this returned `Vec<String>` of "managed pane IDs" with every
+    /// `close_pane` error silently swallowed via `let _ =`; the
+    /// resulting partial failure left agents alive in the daemon
+    /// registry while their cards vanished from the dashboard.
+    ///
+    /// Callers now inspect `outcome.closed` to know which dashboard
+    /// cards may be removed and `outcome.failed` to know which cards
+    /// must be preserved (with the rendered error surfaced via
+    /// `ui.status_message`). The tab itself is always removed from
+    /// `self.tabs` — only the cards behave differently.
+    pub fn close_tab(&mut self, index: usize) -> Result<CloseTabOutcome, TabError> {
         if index == 0 {
             return Err(TabError::CannotCloseDashboard);
         }
@@ -448,23 +459,28 @@ impl TabManager {
         }
 
         let tab = self.tabs.remove(index);
-        let pane_ids = match tab {
+        let outcome = match tab {
             Tab::Mode {
                 mut mode_manager,
                 agent_pane_id,
                 ..
             } => {
-                let mut ids = mode_manager.managed_pane_ids();
-                let _ = mode_manager.deactivate_mode();
+                // `deactivate_mode` now returns the per-pane outcome
+                // for the persistent + reactive side panes. `Err` only
+                // fires when there is no active mode — propagating it
+                // here would lose the agent-pane close result, so we
+                // fold a NoActiveMode into a fresh empty outcome and
+                // let the agent-pane close drive the merge below.
+                let mut outcome = mode_manager.deactivate_mode().unwrap_or_default();
                 // Close the agent pane PTY so it doesn't linger on the dashboard.
                 if !agent_pane_id.is_empty() {
-                    let _ = self.pane_controller.close_pane(&agent_pane_id);
-                    ids.push(agent_pane_id);
+                    let result = self.pane_controller.close_pane(&agent_pane_id);
+                    outcome.record(agent_pane_id, result);
                 }
-                ids
+                outcome
             }
             Tab::Orchestration { role_pane_ids, .. } => {
-                let mut closed_ids = Vec::with_capacity(role_pane_ids.len());
+                let mut outcome = CloseTabOutcome::default();
                 for id in &role_pane_ids {
                     // M2.12: skip the empty-string dead-slot sentinel
                     // inserted by `open_orchestration_tab_with_existing_role_panes`
@@ -474,12 +490,12 @@ impl TabManager {
                     if id.is_empty() {
                         continue;
                     }
-                    let _ = self.pane_controller.close_pane(id);
-                    closed_ids.push(id.clone());
+                    let result = self.pane_controller.close_pane(id);
+                    outcome.record(id.clone(), result);
                 }
-                closed_ids
+                outcome
             }
-            Tab::Dashboard => Vec::new(),
+            Tab::Dashboard => CloseTabOutcome::default(),
         };
 
         // Adjust active_index after removal.
@@ -492,7 +508,7 @@ impl TabManager {
             self.active_index = 0;
         }
 
-        Ok(pane_ids)
+        Ok(outcome)
     }
 
     /// Collect all managed pane IDs across all mode tabs.
@@ -804,11 +820,18 @@ mod tests {
             .unwrap();
         assert_eq!(tm.tab_count(), 2);
 
-        let closed_ids = tm.close_tab(1).unwrap();
+        let outcome = tm.close_tab(1).unwrap();
         // Should include both side pane IDs AND the agent pane ID.
-        assert!(closed_ids.contains(&agent_id));
+        // (The mock controller returns Ok from close_pane, so everything
+        // lands in `closed`; `failed` stays empty.)
+        assert!(
+            outcome.is_clean(),
+            "expected no failures, got {:?}",
+            outcome.failed
+        );
+        assert!(outcome.closed.contains(&agent_id));
         for id in &side_ids {
-            assert!(closed_ids.contains(id));
+            assert!(outcome.closed.contains(id));
         }
         assert_eq!(tm.tab_count(), 1);
         assert_eq!(tm.active_index(), 0);
@@ -1157,8 +1180,9 @@ mod tests {
             .unwrap();
         assert_eq!(tm.tab_count(), 2);
 
-        let closed_ids = tm.close_tab(1).unwrap();
-        assert_eq!(closed_ids, ids);
+        let outcome = tm.close_tab(1).unwrap();
+        assert!(outcome.is_clean());
+        assert_eq!(outcome.closed, ids);
         assert_eq!(tm.tab_count(), 1);
         assert_eq!(tm.active_index(), 0);
         let closed = mock.closed.lock().unwrap();
@@ -1202,10 +1226,14 @@ mod tests {
         // Sanity-check the hydration result: middle slot is the "" sentinel.
         assert_eq!(flat_ids, vec!["real-1", "", "real-2"]);
 
-        let closed_ids = tm.close_tab(1).unwrap();
+        let outcome = tm.close_tab(1).unwrap();
 
         // Only real pane IDs come back — no "" sentinels leak.
-        assert_eq!(closed_ids, vec!["real-1".to_string(), "real-2".to_string()]);
+        assert!(outcome.is_clean());
+        assert_eq!(
+            outcome.closed,
+            vec!["real-1".to_string(), "real-2".to_string()]
+        );
 
         // close_pane was invoked once per real ID, never for the sentinel.
         let closed = mock.closed.lock().unwrap();
