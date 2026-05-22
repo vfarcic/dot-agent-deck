@@ -53,7 +53,11 @@ Together these mean: the upgrade-path race becomes detectable (TUI tells the use
 - **Wire-format contract for both new fields**: see "Wire format" subsection below — both fields are `Option<String>` with `#[serde(default, skip_serializing_if = "Option::is_none")]` so older peers (which omit them) round-trip cleanly. Non-negotiable for forward-compat.
 - **TUI-side check in `run_tui_session`** (`src/main.rs`): after `ensure_external_daemon_or_die`, open the attach socket, send `Hello { client_version: PROTOCOL_VERSION, client_build_version: Some(env!("DAD_BUILD_ID").into()) }`, parse the response, compare `build_version`. Mismatch (including `None`) → write a clear error to stderr that names the local TUI build-id, the daemon build-id, and the recovery command (`dot-agent-deck daemon stop`), then exit non-zero.
 - **Remote-side comparison in `probe_remote_protocol`** (`src/connect.rs`): the existing strict pre-flight already parses the remote daemon's `AttachResponse` from `daemon hello`. Extend it to compare `build_version` against the local `env!("DAD_BUILD_ID")` and surface a `ProtocolMismatch { remote, local, .. }`-style error on divergence. **Policy difference vs local**: remote-build skew is a *configuration* concern (the user can `dot-agent-deck remote upgrade` per PRD #90), not a stale-daemon concern, so the error must point at the *remote-upgrade* command, not at `daemon stop`. Local and remote share the field but route to different remediation.
-- **PID discovery via socket peer credentials** (no protocol change). After opening the attach socket, read the peer credentials on the connected `UnixStream` to obtain the daemon's PID. Linux: `SO_PEERCRED` (`struct ucred { pid, uid, gid }`). macOS: `LOCAL_PEERPID` (returns `pid_t`) combined with `getpeereid` for uid/gid. Both are exposed by `std::os::unix::net::UnixStream::peer_cred()` (returns `UCred`); on macOS `UCred::pid()` returns `Some(pid)` on modern Rust stable, but in case of stale-toolchain concerns, drop to `nix::sys::socket::getsockopt::<PeerCredentials>` on Linux and a raw `getsockopt(socket, SOL_LOCAL, LOCAL_PEERPID, ...)` on macOS. Either implementation works against **any** daemon version, because it does not depend on the daemon's protocol handlers. No new `AttachRequest` variant is added; no `PROTOCOL_VERSION` bump is needed.
+- **PID discovery via socket peer credentials** (no protocol change). After opening the attach socket, call `getsockopt` directly on the connected `UnixStream`'s raw fd to read the peer's PID. **Do not use `std::os::unix::net::UnixStream::peer_cred()`** — on rustc 1.94 stable (our toolchain) that API is still nightly-only behind the `peer_credentials_unix_socket` feature, and `UCred` exposes raw fields rather than the `pid()`/`uid()`/`gid()` accessor methods seen in nightly docs. The primary implementation uses `libc::getsockopt` (or the `nix::sys::socket::getsockopt` thin wrapper, since `nix` is already a stable dependency and saves us writing `unsafe` blocks). Per-OS specifics:
+  - **Linux** (`cfg(target_os = "linux")`): `libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_PEERCRED, &mut ucred as *mut libc::ucred as *mut _, &mut size)` — `libc::ucred` has `pid: pid_t`, `uid: uid_t`, `gid: gid_t`. Or `nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)` which returns a `UnixCredentials` newtype with `.pid()`/`.uid()`/`.gid()` accessors.
+  - **macOS** (`cfg(target_os = "macos")`): `LOCAL_PEERCRED` returns `struct xucred`, which does **not** carry a PID — so use **`LOCAL_PEERPID`** instead: `libc::getsockopt(fd, libc::SOL_LOCAL, libc::LOCAL_PEERPID, &mut pid as *mut libc::pid_t as *mut _, &mut size)`. `nix` does not yet ship a typed wrapper for `LOCAL_PEERPID`, so a small `unsafe` libc call is fine (still trivially soundness-auditable: a single getsockopt with stack-allocated output).
+  
+  This helper exchanges **no protocol bytes** with the daemon, so it works against any daemon binary — including the v0.24.x daemon that motivated this PRD. No new `AttachRequest` variant is added; no `PROTOCOL_VERSION` bump is needed.
 - **No pidfile** (see Out of Scope). The socket itself is the rendezvous; peer credentials are the source of truth.
 - **New CLI subcommand `daemon stop`**: opens the attach socket; reads peer-cred PID; sends `ListAgents` (existing variant — supported by current daemons, including stale ones we need to recover from). If any agents are alive and not `--force`, refuses with a message naming the live agent IDs. Otherwise sends `SIGTERM`; polls socket-file disappearance every 100ms up to ~5s; on timeout with `--force`, sends `SIGKILL`; on timeout without `--force`, reports the daemon did not exit cleanly and exits non-zero. If the socket is missing, prints "no daemon running" and exits 0 (idempotent). **Stale-daemon coverage**: because PID discovery uses peer-cred and the agent-liveness check uses the already-existing `ListAgents` variant, `daemon stop` works against *any* daemon version including the stale daemon that motivated this PRD.
 - **Data-loss guard**: enforced inline in the `daemon stop` flow above (the `ListAgents` check before `SIGTERM`). Documented separately for emphasis: a stale daemon that is *still* hosting live managed agents should not be killed silently; the user must either detach the agents first or pass `--force` consciously.
@@ -129,7 +133,47 @@ pub struct AttachResponse {
 
 ### Phase 1.5: PID discovery via socket peer credentials
 
-- [ ] **M1.5** — Add a small `peer_pid(stream: &UnixStream) -> io::Result<u32>` helper next to the attach-socket plumbing (e.g. `src/daemon_attach.rs`). Implementation: prefer `std::os::unix::net::UnixStream::peer_cred()` and extract `UCred::pid()` (returns `Option<u32>`; on a modern Rust toolchain `Some(pid)` on both Linux and macOS). If `peer_cred().pid()` returns `None` at runtime, fall back to direct `getsockopt`: `SO_PEERCRED` on Linux (target_os = "linux") returning `struct ucred`, and `LOCAL_PEERPID` on macOS (target_os = "macos") via `getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, ...)` — both via the `nix` crate or `libc` directly. Unit tests bind a `UnixListener`, connect, and assert the helper returns the current process's PID on both supported targets (or `#[cfg]`-gates the test per-OS). Critically: **this helper exchanges no protocol bytes with the daemon**, so it works against any daemon binary — including the v0.24.x daemon that motivated this PRD.
+- [ ] **M1.5** — Add a small `peer_pid(stream: &UnixStream) -> io::Result<u32>` helper next to the attach-socket plumbing (e.g. `src/daemon_attach.rs`). **Do NOT use `std::os::unix::net::UnixStream::peer_cred()`** — on rustc 1.94 stable that API is gated behind the unstable `peer_credentials_unix_socket` feature and would not compile on our toolchain. Implementation uses `libc::getsockopt` directly (or `nix::sys::socket::getsockopt` as a stable wrapper where one exists):
+  
+  ```rust
+  #[cfg(target_os = "linux")]
+  fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
+      use std::os::unix::io::AsRawFd;
+      let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+      let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+      let rc = unsafe {
+          libc::getsockopt(
+              stream.as_raw_fd(),
+              libc::SOL_SOCKET,
+              libc::SO_PEERCRED,
+              &mut cred as *mut _ as *mut libc::c_void,
+              &mut len,
+          )
+      };
+      if rc != 0 { return Err(io::Error::last_os_error()); }
+      Ok(cred.pid as u32)
+  }
+  
+  #[cfg(target_os = "macos")]
+  fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
+      use std::os::unix::io::AsRawFd;
+      let mut pid: libc::pid_t = 0;
+      let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+      let rc = unsafe {
+          libc::getsockopt(
+              stream.as_raw_fd(),
+              libc::SOL_LOCAL,
+              libc::LOCAL_PEERPID,
+              &mut pid as *mut _ as *mut libc::c_void,
+              &mut len,
+          )
+      };
+      if rc != 0 { return Err(io::Error::last_os_error()); }
+      Ok(pid as u32)
+  }
+  ```
+  
+  On Linux the `nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)` wrapper is an equally acceptable substitute (no `unsafe` in our code). `nix` does not currently ship a typed wrapper for macOS `LOCAL_PEERPID`, so the macOS arm stays as the libc call shown. Unit tests `#[cfg(...)]`-gated per-OS: bind a `UnixListener`, connect, call `peer_pid` on the server-side accepted stream, assert the returned PID equals `std::process::id()`. Critically: **this helper exchanges no protocol bytes with the daemon**, so it works against any daemon binary — including the v0.24.x daemon that motivated this PRD.
 
 ### Phase 2: TUI local-attach check
 
@@ -144,7 +188,7 @@ pub struct AttachResponse {
 ### Phase 3: `daemon stop` and `daemon restart` CLI
 
 - [ ] **M3.1** — Add `DaemonCmd::Stop { force: bool }` and `DaemonCmd::Restart { force: bool }` variants in `src/main.rs:135`. Wire them through the existing `Daemon` subcommand dispatcher.
-- [ ] **M3.2** — Implement `daemon stop`: open the attach socket; if the socket is missing or connect fails with `ECONNREFUSED`/`ENOENT`, print "no daemon running" and exit 0 (idempotent). Call `peer_pid()` from M1.5 to learn the daemon's PID — this is the load-bearing step that works against stale daemons. Send `ListAgents` (existing variant — supported by all daemon versions back to PRD #76 era). If any agents are alive and `!force`, print a clear refusal message naming the live agent IDs and exit non-zero. Otherwise send `SIGTERM`; poll the socket file disappearance every 100ms up to 5s; on timeout with `--force`, send `SIGKILL`; on timeout without `--force`, report the daemon did not exit cleanly and exit non-zero. **Add an integration test that explicitly exercises the stale-daemon recovery path**: spawn a daemon built without `build_version` support (simulated via a feature flag or a test-only protocol stub that omits the field), then run `daemon stop` against it and assert success — this verifies the command is not transitively dependent on any new protocol surface.
+- [ ] **M3.2** — Implement `daemon stop`: open the attach socket; if the socket is missing or connect fails with `ECONNREFUSED`/`ENOENT`, print "no daemon running" and exit 0 (idempotent). Call `peer_pid()` from M1.5 (the libc-`getsockopt`-based helper, NOT `std::peer_cred`) to learn the daemon's PID — this is the load-bearing step that works against stale daemons because it does not invoke any protocol handler on the daemon side. Send `ListAgents` (existing variant — supported by all daemon versions back to PRD #76 era). If any agents are alive and `!force`, print a clear refusal message naming the live agent IDs and exit non-zero. Otherwise send `SIGTERM`; poll the socket file disappearance every 100ms up to 5s; on timeout with `--force`, send `SIGKILL`; on timeout without `--force`, report the daemon did not exit cleanly and exit non-zero. **Add an integration test that explicitly exercises the stale-daemon recovery path via `peer_pid()`**: spawn a daemon built against a protocol stub that omits all post-PRD-103 surface (no `build_version` on `AttachResponse`, no `client_build_version` on `Hello`, and crucially no awareness of any new request types this PRD might have considered), then run `daemon stop` against it and assert (a) `peer_pid()` returned a non-zero PID, (b) `ListAgents` succeeded, (c) `SIGTERM` shut the daemon down. This is the regression guard that the recovery command actually recovers stale daemons.
 - [ ] **M3.3** — Implement `daemon restart`: just `daemon stop` with the same flags, then return. Lazy-spawn on next TUI invocation per PRD #93.
 
 ### Phase 4: Tests
@@ -182,8 +226,8 @@ pub struct AttachResponse {
   - *Mitigation*: Document that `daemon stop` is a user-initiated recovery, not a routine. The race produces a clean error in the TUI ("connection refused" or socket disappearance) rather than corruption. No need to coordinate.
 - **Risk**: PID resolution is fragile if the daemon was not started by us (e.g. `systemctl --user` unit, or a developer running `cargo run -- daemon serve` directly).
   - *Mitigation*: We use `SO_PEERCRED` / `LOCAL_PEERPID` on the connected attach socket (M1.5) — an OS-level facility that returns the actual PID of the process holding the other end, regardless of how that process was started or what protocol surface it implements. No pidfile; no protocol round-trip. If we cannot reach the socket, there is no daemon to stop and `daemon stop` exits 0 idempotently.
-- **Risk**: `std::os::unix::net::UCred::pid()` historically returned `None` on macOS in older Rust versions, even though the OS supports `LOCAL_PEERPID`.
-  - *Mitigation*: M1.5 specifies a fallback to direct `getsockopt`(`LOCAL_PEERPID`) on macOS via `nix`/`libc`. A unit test gated by `#[cfg(target_os = "macos")]` confirms the helper returns a real PID on the current toolchain. If the Rust stdlib already returns `Some(pid)`, the fallback is dead code that costs nothing.
+- **Risk**: An earlier draft of this PRD recommended `std::os::unix::net::UnixStream::peer_cred()` as the primary implementation. That API is nightly-only on rustc 1.94 (gated behind `peer_credentials_unix_socket`), and its `UCred` type uses field access rather than the `pid()`/`uid()`/`gid()` accessor methods seen in nightly docs.
+  - *Mitigation*: M1.5 prescribes `libc::getsockopt` directly (`SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS), with `nix::sys::socket::getsockopt` accepted as a stable wrapper on Linux. The `unsafe` surface is one `getsockopt` call per OS arm — trivially auditable. Per-OS unit tests bind a `UnixListener`, accept, and assert `peer_pid(&server_stream) == std::process::id()` to confirm both arms work on our toolchain.
 - **Risk**: `daemon stop` against a *stale* daemon — the very case this command exists for — must not depend on any protocol surface the stale daemon doesn't implement.
   - *Mitigation*: PID discovery is OS-level peer-cred (no protocol). The agent-liveness check uses `ListAgents`, which is an existing variant supported by every daemon in scope (PRD #76 era and later). M3.2 includes an explicit integration test that exercises `daemon stop` against a daemon stubbed to omit `build_version` (i.e. simulating the v0.24.x stale daemon) and asserts success.
 - **Risk**: `DAD_BUILD_ID` derivation in `build.rs` fails in shallow clones (CI, `cargo install` from crates.io, tarball builds) where git metadata is absent.
