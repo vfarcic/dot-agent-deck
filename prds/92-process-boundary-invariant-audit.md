@@ -70,10 +70,14 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 - The audit document opens with a coverage statement: which baseline feature categories were checked, which were deferred and why. A future re-audit can extend the statement rather than redo the work.
 - No numeric floor on findings. Count is not the goal; honest coverage is.
 
-**F1 fix — force-shutdown command:**
+**F1 fix — Stop option in the Ctrl+C dialog:**
 
-- A documented in-product command exists that stops the daemon (with semantics to be finalized in the F1 design subsection of Design Decisions before M6.2 begins). The command surfaces in `dot-agent-deck --help` and has a help line that documents its multi-agent behavior.
-- Existing daemon-lifecycle behaviors are unchanged: the Detach/Cancel quit dialog still detaches without killing agents; idle shutdown still fires only when `clients == 0 AND agents == 0`; persist-when-agents-alive still holds for the implicit-quit path.
+- The Ctrl+d → Ctrl+C confirmation dialog (currently *Detach / Cancel*) gains a third option **Stop**, in the order *Detach / Stop / Cancel* (Detach remains the default).
+- Selecting Stop with `managed_agents_count == 0`: proceeds to shutdown immediately, no secondary prompt.
+- Selecting Stop with `managed_agents_count > 0`: shows a secondary `y / n` confirmation dialog. The dialog text names the count ("{N} managed agent(s) will be terminated and the daemon will shut down. Continue?"). Defaults to **No**. Pressing `y` or Enter on Yes confirms; pressing `n`, Esc, or Enter on No returns to the primary dialog.
+- On confirmed Stop, the TUI sends a `KIND_SHUTDOWN` attach-protocol message; the daemon stops accepting new clients, terminates every managed agent (SIGTERM, with a short grace before SIGKILL), and exits. The TUI's session state is saved per the normal exit path so `--continue` from the same cwd is not poisoned.
+- Existing daemon-lifecycle behaviors are unchanged: the Detach option still detaches without killing agents; idle shutdown still fires only when `clients == 0 AND agents == 0`; persist-when-agents-alive still holds for the implicit-quit path. Stop is purely additive.
+- **No CLI command this round.** `dot-agent-deck stop` and `dot-agent-deck remote stop <name>` are explicitly deferred to a successor PRD (filed as F4 in the audit doc).
 
 **F2 fix — `y` / `n` permission key:**
 
@@ -116,11 +120,11 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 - [x] **M5.2** — Wire the approve / deny path to whatever PRD #18's permission-prompt infrastructure expects. If PRD #18's machinery does not currently expose a clean approve/deny entry point, decide whether to extend it or to defer the key arms behind a guard that no-ops until the infrastructure lands. *Shipped: PRD #18's richer mechanism (`PermissionResponders` map, blocking-hook response channel, `pending_permission` on `SessionState`) is not present in current code — only the `EventType::PermissionRequest` mapping and the resulting `WaitingForInput` status survived through the PRD #76 / #93 pivots. Chose the simpler PTY-forward model per the F2 context: the dispatcher writes the literal `y` / `n` character to the selected pane's PTY via `pane.write_to_pane`, which already handles encode + `SUBMIT_DELAY` + CR. The agent's prompt is waiting on the PTY for the same input the user would type if they switched to the pane.*
 - [x] **M5.3** — Add unit tests for both handlers: the approve / deny key arms, the `WaitingForInput` gating (no-op on other statuses), and (if the wiring in M5.2 is in place) the end-to-end approve/deny outcome on `SessionState`. *Shipped: 4 new unit tests in `src/ui.rs` — `permission_y_on_waiting_for_input_returns_approve`, `permission_n_on_waiting_for_input_returns_deny`, `permission_y_n_on_non_waiting_status_is_no_op` (covers Working / Idle / Thinking / Error / Compacting), `permission_y_n_with_no_card_selected_is_no_op` (covers `total == 0` and `selected_status == None` while a card exists). The PTY-write side effect itself is exercised by the existing `write_to_pane` test cluster.*
 
-### Phase 6: Design + implement F1 — force-shutdown command
+### Phase 6: Design + implement F1 — Stop option in Ctrl+C dialog
 
-- [ ] **M6.1** — Lock the F1 design. The open questions are listed under "F1 design (open questions — to be locked in M6.1)" in Design Decisions below; the orchestrator drives this conversation with the user and writes the locked decisions back into Design Decisions before M6.2 begins.
-- [ ] **M6.2** — Implement the command per the locked design. Likely touches `src/main.rs` (new subcommand variant on `DaemonCmd` and/or `RemoteCmd`), `src/daemon.rs` (shutdown handler), and `src/daemon_protocol.rs` (new message kind if the design needs a wire-level signal).
-- [ ] **M6.3** — Tests covering: daemon shuts down when called with no agents; daemon shuts down (per the locked semantics — refuse, force, or prompt) when agents are alive; idempotency when called repeatedly; behavior when no daemon is running; remote variant (if in scope per M6.1) over SSH.
+- [x] **M6.1** — Lock the F1 design. *Shipped: see the locked "F1 design" subsection in Design Decisions below. Stop is a third option in the existing Ctrl+C dialog (Detach default / Stop / Cancel). Secondary y/n confirmation only when agents are alive (defaults to No). `KIND_SHUTDOWN` is the wire signal; the daemon iterates the registry, SIGTERMs each agent with a short grace before SIGKILL, then exits. No CLI command this round — `dot-agent-deck stop` deferred to F4.*
+- [ ] **M6.2** — Implement Stop per the locked design. Touches `src/ui.rs` (dialog rendering + key handler for the primary and secondary dialogs), `src/daemon_protocol.rs` (`KIND_SHUTDOWN` frame definition), `src/daemon_client.rs` (TUI-side send-and-await-ack helper), `src/daemon.rs` (handler that triggers the existing shutdown path immediately), `src/agent_pty.rs` (terminate-all path with SIGTERM→SIGKILL escalation if not already present).
+- [ ] **M6.3** — Tests covering: primary dialog shows Detach / Stop / Cancel with Detach default; Stop with `agents_count == 0` skips the secondary dialog and triggers shutdown; Stop with `agents_count > 0` shows the secondary dialog with the agent count rendered in the text; secondary dialog defaults to No; Yes confirms (triggers shutdown), No returns to the primary dialog without shutting down; daemon receives `KIND_SHUTDOWN`, terminates managed agents, and exits within a bounded window; idempotency — two `KIND_SHUTDOWN` frames in quick succession do not crash the daemon; session save runs on the Stop path.
 
 ### Phase 7: Pre-release
 
@@ -160,7 +164,7 @@ Fix targets (Phases 4–6):
 
 - **F3** (doc fix): `docs/configuration.md` (line 22 plus surrounding env-var table), `docs/installation.md`, `docs/remote-requirements.md`.
 - **F2** (`y` / `n` permission key): `src/ui.rs` (`handle_normal_key`, `WaitingForInput` gating, plus any approve/deny wiring); `src/state.rs` if approve / deny needs to mutate session state. Unit tests inline in `src/ui.rs` next to the existing `test_mode_transitions` cluster.
-- **F1** (force-shutdown command): `src/main.rs` (new `DaemonCmd` and/or `RemoteCmd` variant per the M6.1 design), `src/daemon.rs` (shutdown handler), `src/daemon_protocol.rs` (new message kind if the M6.1 design calls for a wire-level signal — see open question in Design Decisions). Tests under `tests/` (likely a new file alongside `tests/daemon_lifecycle.rs` or extensions to it).
+- **F1** (Stop option in Ctrl+C dialog): `src/ui.rs` (primary and secondary dialog rendering + key handlers + `KeyResult::Stop` variant), `src/daemon_protocol.rs` (`KIND_SHUTDOWN` frame), `src/daemon_client.rs` (TUI-side `send_shutdown` helper), `src/daemon.rs` (handler that triggers the existing shutdown path immediately on `KIND_SHUTDOWN`), `src/agent_pty.rs` (terminate-all path with SIGTERM→SIGKILL escalation). Tests under `tests/` — a new `tests/stop_dialog.rs` for the dialog flow plus `KIND_SHUTDOWN` round-trip tests added to `tests/daemon_protocol.rs` and `tests/daemon_lifecycle.rs`. No CLI command this round, so `src/main.rs` is untouched.
 
 ## Design Decisions
 
@@ -172,17 +176,57 @@ This decision **partially supersedes** the 2026-05-17 "Audit, not refactor" entr
 
 Acknowledged trade-off: this PRD now mixes audit and fix work, which the prior decision warned against. The trade is accepted because the audit deliverable is already committed and reviewed — reviewer/auditor coverage of the audit itself is no longer at risk from interleaving with fix work. The cost is a thicker PRD; the win is one PR instead of four.
 
-#### F1 design (open questions — to be locked in M6.1)
+#### F1 design (locked 2026-05-22)
 
-Placeholders. The orchestrator will lock these with the user before M6.2 begins and write the decisions back into this subsection. Each line is a question, not a pre-committed answer.
+The seven open questions from earlier are now resolved. F1 ships as a **dialog option**, not a CLI command — the user gesture being restored is "one keystroke that takes everything down," and the existing Ctrl+d → Ctrl+C dialog is the right place to host it. Scripted shutdown (a CLI `stop` command and its `remote stop` cousin) is deferred to a successor PRD; see the F4 follow-up draft in the audit doc.
 
-- **Command name and surface.** `dot-agent-deck daemon stop` (mirroring `daemon serve` / `daemon hello`)? `dot-agent-deck remote stop <name>` (mirroring `remote remove`)? Both? Just one?
-- **Force-shutdown semantics with managed agents alive.** Refuse and prompt the user (matches the persist-when-agents-alive philosophy)? Refuse unless `--force`? Always kill the agents and shut down? Default to refuse-and-prompt and gate the destructive path behind `--force` is the orchestrator's current leaning.
-- **Confirmation prompt.** Y/n at the CLI when refusing-without-`--force`? A separate dialog in the TUI? No prompt and let the `--force` flag be the only friction?
-- **Multi-agent handling under force.** Kill all agents in one go, or stop them sequentially with a per-agent kill log? Drain the daemon's event broadcast first so observers can record the shutdown?
-- **Local vs remote scope.** Local-only first (`daemon stop`), with the remote variant deferred to a successor? Or both together? PRD #93 line 39 anticipated both, so doing them together is symmetric — but local-first lets us validate the design before adding SSH plumbing.
-- **Wire-level signal.** Does the daemon need a new `AttachRequest::Stop` (or similar) message kind in `src/daemon_protocol.rs`, or is sending SIGTERM to the daemon's PID (via the per-user lock file) enough?
-- **Idempotency and missing-daemon cases.** What does `daemon stop` do when no daemon is running? When it has already been called and is in the middle of shutting down?
+**User-facing UX.**
+
+The primary dialog (the existing Ctrl+d → Ctrl+C confirmation) now has three options instead of two:
+
+- Index 0: **Detach** (default — unchanged behavior).
+- Index 1: **Stop** (new).
+- Index 2: **Cancel** (unchanged).
+
+Detach stays the default so the muscle memory built up around the existing dialog does not become destructive. Stop sits between Detach and Cancel so the destructive option requires a deliberate selection: a user who hammers Enter still gets Detach.
+
+When Stop is selected, the behavior depends on the managed-agent count:
+
+- **`managed_agents_count == 0`** — proceed to shutdown immediately. The "no agents to terminate" case is the no-stakes case; a secondary prompt would be friction without value.
+- **`managed_agents_count > 0`** — show a secondary `y / n` confirmation dialog whose text names the count: *"{N} managed agent(s) will be terminated and the daemon will shut down. Continue?"*. The dialog defaults to **No** (safer default for a destructive action). Pressing `y` or Enter on Yes confirms. Pressing `n`, Esc, or Enter on No returns to the primary dialog (Stop selected, so the user can re-confirm or pick Detach/Cancel without re-opening the dialog).
+
+The "return to primary" behavior on No is chosen over "dismiss" because it is more discoverable — a user who reads the count and decides not to proceed can immediately move to Detach without restarting the Ctrl+C sequence.
+
+**Effect when Stop is confirmed** (whether via the primary dialog with 0 agents or via the secondary confirmation with >0):
+
+1. TUI saves session state per the normal exit path. `--continue` from the same cwd must still work after a Stop.
+2. TUI sends a `KIND_SHUTDOWN` attach-protocol frame to the daemon.
+3. Daemon stops accepting new clients, broadcasts a "daemon stopping" `BroadcastMsg::Event` to all attached clients (so any second TUI disconnects cleanly), iterates the agent registry and terminates each PTY (SIGTERM, then SIGKILL after a short grace), then exits.
+4. TUI waits a brief moment for the daemon's socket close to confirm shutdown — falls back to closing on a ~1s timeout — then exits cleanly with `ExitCode::SUCCESS`. SIGTERM to the daemon's PID via the per-user lock file is the last-resort fallback if the protocol frame cannot be delivered.
+
+**Implementation choices.**
+
+- **Wire signal**: new attach-protocol message kind `KIND_SHUTDOWN`, header-only frame (no payload). Mirrors the existing `KIND_DETACH` shape so the daemon's protocol dispatcher recognizes it via the same machinery. Ack is daemon-side socket close (the daemon exits as soon as the shutdown path finishes); the TUI does not require a positive ack frame.
+- **Daemon behavior on `KIND_SHUTDOWN`**: trigger the existing idle-shutdown teardown immediately, bypassing the `clients == 0 && agents == 0` gate. The idle-shutdown path already knows how to cleanly stop the daemon; Stop is "skip the wait, do it now."
+- **Agent termination**: SIGTERM first; SIGKILL after a 3-second grace if the child has not exited. The grace gives long-running tool invocations a chance to flush state. Coder discretion to tune the 3s if it surfaces problems during implementation.
+- **Idempotency**: if the daemon is already in the shutdown path (e.g., a second `KIND_SHUTDOWN` arrives mid-tear-down, or idle-shutdown already started), the new signal is a no-op. The shutdown path checks a `shutting_down: AtomicBool` (or equivalent generation counter — coder's call) before re-entering.
+- **No-daemon case**: not reachable from the dialog (the dialog only exists in an attached TUI), so no explicit handling needed. The TUI's existing detach-on-exit flow handles a missing daemon already.
+
+**Scope boundaries.**
+
+- **No CLI command** in this PRD. `dot-agent-deck stop` (and `dot-agent-deck remote stop <name>` for remote daemons) is anticipated by PRD #93 line 39 but deferred from F1's gesture-restoration scope. The audit's follow-up draft for scripted shutdown is filed as **F4** to be picked up once F1 is proven.
+- **Remote-daemon Stop**: same deferral. The dialog Stop only affects the daemon the TUI is attached to. Stopping a remote daemon you have not attached to is the deferred CLI-command's job.
+- **No `--force` semantics**: there is no "always force without prompting" surface this round. The secondary y/n dialog is the only friction, and it suffices because the dialog only appears when there is actually something destructive to confirm.
+
+**Open questions explicitly resolved.**
+
+1. ~~Command name and surface~~ → no CLI command this round; dialog option only.
+2. ~~Force-shutdown semantics with managed agents alive~~ → user confirms via secondary dialog; on confirm, agents are SIGTERM'd (then SIGKILL after a short grace) and the daemon exits.
+3. ~~Confirmation prompt~~ → primary dialog is the confirmation when no agents; secondary y/n dialog when agents alive. No `--force` flag.
+4. ~~Multi-agent handling under force~~ → daemon iterates the registry and terminates each PTY in order.
+5. ~~Local vs remote scope~~ → local only this round; remote-stop deferred to F4.
+6. ~~Wire-level signal~~ → new `KIND_SHUTDOWN` protocol frame; SIGTERM to the daemon PID as last-resort fallback if the frame cannot be delivered.
+7. ~~Idempotency / missing-daemon cases~~ → second signal is a no-op (guarded by a `shutting_down` flag in the daemon); no-daemon case is unreachable from the dialog.
 
 ### 2026-05-22: Parity audit framing
 
