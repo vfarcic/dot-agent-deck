@@ -957,6 +957,20 @@ impl EmbeddedPaneController {
         }
         errors
     }
+
+    /// PRD #92 F1: send `KIND_SHUTDOWN` to the daemon, asking it to
+    /// terminate every managed agent and exit. Used by the **Stop** option
+    /// in the Ctrl+C dialog. Returns `Ok(())` once the daemon has
+    /// acknowledged the shutdown (via socket close) or after the 1-second
+    /// fallback inside [`DaemonClient::send_shutdown`]. The TUI proceeds to
+    /// quit regardless of the result — Stop has already committed at the
+    /// dialog level. A wrapped error is returned for observability only.
+    pub fn shutdown_daemon(&self) -> Result<(), PaneError> {
+        let client = self.client.clone();
+        self.runtime
+            .block_on(async move { client.send_shutdown().await })
+            .map_err(|e| PaneError::CommandFailed(format!("send_shutdown: {e}")))
+    }
 }
 
 /// Bounded wait for an in-flight daemon resize call. Two seconds is far

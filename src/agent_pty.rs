@@ -10,6 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use thiserror::Error;
@@ -820,6 +821,12 @@ pub struct AgentPtyRegistry {
     /// per-agent pump_reader so the EOF path can notify without holding a
     /// registry lock.
     change_notify: Arc<Notify>,
+    /// PRD #92 F1: latch set the first time the daemon enters its
+    /// `KIND_SHUTDOWN` teardown so a second `KIND_SHUTDOWN` (or a SIGTERM
+    /// landing during shutdown) doesn't re-iterate the agent map or fight
+    /// the original shutdown for ownership of each `Child`. Read by
+    /// [`shutdown_all_graceful`]; a second call returns immediately.
+    shutting_down: AtomicBool,
 }
 
 struct RegistryInner {
@@ -842,6 +849,7 @@ impl AgentPtyRegistry {
             }),
             detach_count: AtomicU64::new(0),
             change_notify: Arc::new(Notify::new()),
+            shutting_down: AtomicBool::new(false),
         }
     }
 
@@ -1348,6 +1356,78 @@ impl AgentPtyRegistry {
         // Wake the idle monitor if it's parked on `change_notify` — the
         // registry just emptied, so the next gate check should see
         // live_count == 0.
+        self.change_notify.notify_one();
+    }
+
+    /// PRD #92 F1: graceful shutdown of every agent in the registry. Sends
+    /// SIGTERM to each child, waits up to `grace` for them to exit (polling
+    /// `try_wait` so an early exiter isn't penalised by the wall-clock
+    /// deadline), then SIGKILLs anything that's still alive. Idempotent —
+    /// a second call (e.g. from a second `KIND_SHUTDOWN` arriving during
+    /// teardown, or from a SIGTERM-triggered drop path racing the protocol
+    /// handler) returns immediately so we don't fight ourselves for
+    /// ownership of each `Child`.
+    ///
+    /// The Drop impl still calls [`shutdown_all`] for the SIGKILL-without-grace
+    /// path — that path is reached on idle shutdown and test cleanup where
+    /// the grace period is unnecessary. F1's graceful path is invoked
+    /// explicitly via the `KIND_SHUTDOWN` handler.
+    pub fn shutdown_all_graceful(&self, grace: Duration) {
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            // Already shutting down — second-signal idempotency.
+            return;
+        }
+        let mut agents: Vec<RunningAgent> = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.agents.drain().map(|(_, a)| a).collect()
+        };
+
+        // Phase 1: SIGTERM each child. Some shells (notably the bash/zsh
+        // configurations that intercept SIGHUP) honour SIGTERM as a clean
+        // shutdown signal, so this gives the agent a chance to flush state.
+        // We send the signal directly via `libc::kill` rather than going
+        // through `portable_pty::Child::kill` because that helper sends
+        // SIGHUP which some shells ignore — same rationale as
+        // `force_kill_child_and_wait`.
+        for agent in &mut agents {
+            if let Some(pid) = agent.child.process_id() {
+                // SAFETY: `kill(2)` is async-signal-safe; the pid we just
+                // learned from `process_id()` belongs to a child this
+                // registry still owns.
+                let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    tracing::warn!(pid, error = %err, "SIGTERM failed in shutdown_all_graceful");
+                }
+            }
+        }
+
+        // Phase 2: poll each child's `try_wait` until all have exited or
+        // the grace window elapses. Polling avoids the obvious "sleep for
+        // grace then SIGKILL" alternative — agents that exit promptly
+        // don't have to wait around for the slowest sibling.
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            let all_exited = agents
+                .iter_mut()
+                .all(|a| matches!(a.child.try_wait(), Ok(Some(_))));
+            if all_exited {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Phase 3: SIGKILL any survivor and reap. `force_kill_child_and_wait`
+        // is no-op-safe on an already-exited child (ESRCH is logged-but-
+        // ignored and `wait` returns the cached status), so this loop is
+        // safe to run unconditionally.
+        for mut agent in agents {
+            force_kill_child_and_wait(&mut agent.child);
+        }
+
         self.change_notify.notify_one();
     }
 }

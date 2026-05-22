@@ -21,8 +21,8 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 pub use crate::agent_pty::{AgentRecord, TabMembership, validate_tab_membership};
 use crate::daemon_protocol::{
-    AttachRequest, AttachResponse, KIND_DETACH, KIND_EVENT, KIND_REQ, KIND_RESP, KIND_STREAM_END,
-    KIND_STREAM_OUT, read_frame, write_frame,
+    AttachRequest, AttachResponse, KIND_DETACH, KIND_EVENT, KIND_REQ, KIND_RESP, KIND_SHUTDOWN,
+    KIND_STREAM_END, KIND_STREAM_OUT, read_frame, write_frame,
 };
 use crate::event::{AgentType, BroadcastMsg};
 
@@ -361,6 +361,30 @@ impl DaemonClient {
         // EventSubscription drops means the daemon sees EOF exactly when
         // the client actually goes away.
         Ok(EventSubscription { rd, _wr: wr })
+    }
+
+    /// PRD #92 F1: send a `KIND_SHUTDOWN` header-only frame and wait
+    /// briefly for the daemon to close the socket as its implicit ack.
+    /// Used by the **Stop** option in the Ctrl+C dialog. Bounded by a
+    /// 1-second timeout — if the daemon hasn't closed the socket by then
+    /// we proceed with TUI exit anyway, since the user's gesture has
+    /// already committed. The daemon's `KIND_SHUTDOWN` handler is
+    /// idempotent, so a daemon that has already started shutting down on
+    /// its own (idle-shutdown, racing user, etc.) will simply ignore the
+    /// duplicate frame.
+    pub async fn send_shutdown(&self) -> Result<(), ClientError> {
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        write_frame(&mut wr, KIND_SHUTDOWN, &[]).await?;
+        // Wait for the daemon to close the socket (or for the 1s
+        // backstop). A daemon that's about to exit will hit `drop(stream)`
+        // on its side as `run_hook_loop` unwinds, which surfaces here as
+        // `read_frame` returning `Ok(None)` (clean EOF) or an `Err`. Either
+        // is fine — both confirm the daemon has acknowledged the request.
+        // A timeout means the daemon is wedged or the shutdown is taking
+        // longer than 1s; we proceed anyway rather than blocking the TUI.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), read_frame(&mut rd)).await;
+        Ok(())
     }
 
     /// Open an attach-stream connection. Returns once the daemon has

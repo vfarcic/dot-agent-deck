@@ -45,6 +45,7 @@
 //! | `KIND_DETACH`     | client → server | empty — detach, leave agent   |
 //! | `KIND_STREAM_END` | server → client | optional reason (e.g. lagged) |
 //! | `KIND_EVENT`      | server → client | JSON [`crate::event::BroadcastMsg`] (M2.17/M2.19, after a `SubscribeEvents` request) |
+//! | `KIND_SHUTDOWN`   | client → server | empty — shut the daemon down (PRD #92 F1) |
 //!
 //! # Per-connection state machine
 //!
@@ -105,6 +106,13 @@ pub const KIND_DETACH: u8 = 0x13;
 /// `AppState` is otherwise disconnected from the daemon's hook ingestion
 /// loop; this frame is the bridge.
 pub const KIND_EVENT: u8 = 0x14;
+/// PRD #92 F1: client → server header-only frame meaning "shut the daemon
+/// down now." Triggered by the **Stop** option in the Ctrl+C dialog. The
+/// daemon iterates its agent registry, SIGTERMs each child with a short
+/// grace before SIGKILL, then exits. No payload, no ack frame — the
+/// daemon's socket close is the ack. Idempotent on the daemon side
+/// (`AgentPtyRegistry::shutdown_all_graceful` guards via a latch).
+pub const KIND_SHUTDOWN: u8 = 0x15;
 
 /// PRD #76 M2.21: wire-format version for the attach socket. Bump every time
 /// the on-the-wire shape changes in a way an older client/daemon would
@@ -446,7 +454,7 @@ pub async fn serve_attach(
     use tokio::sync::RwLock;
     let dummy_count = Arc::new(AtomicUsize::new(0));
     let dummy_state: SharedState = Arc::new(RwLock::new(crate::state::AppState::default()));
-    serve_attach_with_counter(listener, registry, event_tx, dummy_count, dummy_state).await
+    serve_attach_with_counter(listener, registry, event_tx, dummy_count, dummy_state, None).await
 }
 
 /// PRD #93 M1.2 variant of [`serve_attach`] that maintains `client_count`
@@ -463,6 +471,7 @@ pub async fn serve_attach_with_counter(
     event_tx: broadcast::Sender<BroadcastMsg>,
     client_count: Arc<std::sync::atomic::AtomicUsize>,
     state: SharedState,
+    shutdown: Option<Arc<tokio::sync::Notify>>,
 ) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
@@ -482,6 +491,7 @@ pub async fn serve_attach_with_counter(
                 let counter = client_count.clone();
                 let state = state.clone();
                 let notify = change_notify.clone();
+                let shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
                     // so a `handle_connection` task that panics or is dropped
@@ -511,7 +521,9 @@ pub async fn serve_attach_with_counter(
                         counter: counter.clone(),
                         notify: notify.clone(),
                     };
-                    if let Err(e) = handle_connection(stream, registry, event_tx, state).await {
+                    if let Err(e) =
+                        handle_connection(stream, registry, event_tx, state, shutdown).await
+                    {
                         warn!("attach protocol connection error: {e}");
                     }
                 });
@@ -549,7 +561,7 @@ pub async fn run_attach_server_with_counter(
 ) -> io::Result<()> {
     let listener = bind_attach_listener(path)?;
     info!("Attach protocol listening on {}", path.display());
-    serve_attach_with_counter(listener, registry, event_tx, client_count, state).await
+    serve_attach_with_counter(listener, registry, event_tx, client_count, state, None).await
 }
 
 async fn handle_connection(
@@ -557,11 +569,43 @@ async fn handle_connection(
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
     state: SharedState,
+    shutdown: Option<Arc<tokio::sync::Notify>>,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
         None => return Ok(()),
     };
+    // PRD #92 F1: client → server `KIND_SHUTDOWN` is a header-only frame
+    // that means "shut the daemon down now." It comes before any
+    // `KIND_REQ`, so handle it before the usual request-decoding path.
+    // The handler terminates every managed agent (SIGTERM with a short
+    // grace before SIGKILL via the registry) then signals the daemon's
+    // shutdown notify so `run_hook_loop` exits. The socket is closed
+    // without sending an ack frame — the close itself is the ack.
+    if frame.0 == KIND_SHUTDOWN {
+        info!("KIND_SHUTDOWN received — beginning graceful daemon shutdown");
+        // Drop the registry's children with a 3-second grace window for
+        // SIGTERM to take effect; survivors get SIGKILL via the existing
+        // teardown.
+        let registry_for_shutdown = registry.clone();
+        tokio::task::spawn_blocking(move || {
+            registry_for_shutdown.shutdown_all_graceful(Duration::from_secs(3));
+        })
+        .await
+        .ok();
+        if let Some(s) = shutdown {
+            s.notify_one();
+        } else {
+            // `serve_attach` (test/harness path) doesn't pass a shutdown
+            // notify because tests don't run the production hook loop.
+            // The registry was still drained, so the test can assert on
+            // that side effect.
+            warn!(
+                "KIND_SHUTDOWN handled but no daemon-shutdown notify wired (likely a test harness)"
+            );
+        }
+        return Ok(());
+    }
     if frame.0 != KIND_REQ {
         let resp = AttachResponse::err(format!("expected REQ frame, got kind 0x{:02x}", frame.0));
         write_resp(&mut stream, &resp).await?;
@@ -1571,7 +1615,7 @@ mod tests {
         let state: SharedState =
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let server_task = tokio::spawn(async move {
-            handle_connection(server, registry, event_tx, state)
+            handle_connection(server, registry, event_tx, state, None)
                 .await
                 .unwrap();
         });
@@ -1615,7 +1659,7 @@ mod tests {
         let state: SharedState =
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let server_task = tokio::spawn(async move {
-            handle_connection(server, registry, event_tx, state)
+            handle_connection(server, registry, event_tx, state, None)
                 .await
                 .unwrap();
         });
