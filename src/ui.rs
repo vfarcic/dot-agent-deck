@@ -17,7 +17,6 @@ use crate::agent_pty::TabMembership;
 use crate::ascii_art::{AsciiArtResult, generate_ascii_art};
 use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
-use crate::config_validation::sanitize_role_name;
 use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
 use crate::event::{AgentType, EventType};
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
@@ -533,11 +532,8 @@ struct UiState {
     config_gen_target: Option<(String, String)>,
     /// Selected option index in the config-gen modal (0=Yes, 1=No, 2=Never).
     config_gen_selected: usize,
-    /// Selected option in quit confirm modal (0=action, 1=Cancel).
+    /// Selected option in quit confirm modal (0=Detach, 1=Cancel).
     quit_confirm_selected: usize,
-    /// PRD #76 M2.18: true when the TUI is attached to an external daemon,
-    /// so the quit dialog shows "Detach" instead of "Quit".
-    via_daemon: bool,
     /// Orchestration tab IDs whose start-role prompt has already been injected.
     orchestration_prompted: HashSet<TabId>,
     /// Tracks when orchestration tabs were created (for delayed prompt injection).
@@ -601,7 +597,6 @@ impl UiState {
             config_gen_target: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
-            via_daemon: false,
             orchestration_prompted: HashSet::new(),
             orchestration_created_at: HashMap::new(),
             pending_dispatches: Vec::new(),
@@ -1213,6 +1208,54 @@ pub(crate) struct HydrationPartition {
 /// orchestration buckets preserve the order in which their (cwd, name)
 /// pairing was first seen so the user's mental "which tab opened first"
 /// model survives reconnect (TabManager appends in iteration order).
+/// Key used by [`build_dedupe_budget`] / [`try_consume_dedupe_slot`] to
+/// match a saved pane against a daemon-hydrated pane. The tuple is
+/// `(dir, name, mode)`. `command` is intentionally excluded — daemon
+/// `list_agents` doesn't echo command, so hydration always stores
+/// `command = ""` and including it in the key would dedupe nothing for
+/// the common case.
+type SavedPaneDedupeKey = (String, String, Option<String>);
+
+/// Build the dedupe budget from the hydration metadata. The budget
+/// maps `(dir, name, mode)` keys to the COUNT of hydrated panes
+/// matching that key. The restore loop consumes slots via
+/// [`try_consume_dedupe_slot`] so it drops at most one saved pane per
+/// hydrated match — preserving distinct saved panes that happen to
+/// share a key (round-10 reviewer #2).
+fn build_dedupe_budget(
+    pane_metadata: &std::collections::HashMap<String, config::SavedPane>,
+) -> std::collections::HashMap<SavedPaneDedupeKey, usize> {
+    let mut budget: std::collections::HashMap<SavedPaneDedupeKey, usize> =
+        std::collections::HashMap::new();
+    for meta in pane_metadata.values() {
+        *budget
+            .entry((meta.dir.clone(), meta.name.clone(), meta.mode.clone()))
+            .or_insert(0) += 1;
+    }
+    budget
+}
+
+/// Returns true and decrements the budget if `saved_pane`'s
+/// `(dir, name, mode)` key has a free slot — the caller should then
+/// skip restoring it. Returns false otherwise.
+fn try_consume_dedupe_slot(
+    budget: &mut std::collections::HashMap<SavedPaneDedupeKey, usize>,
+    saved_pane: &config::SavedPane,
+) -> bool {
+    let key = (
+        saved_pane.dir.clone(),
+        saved_pane.name.clone(),
+        saved_pane.mode.clone(),
+    );
+    if let Some(slot) = budget.get_mut(&key)
+        && *slot > 0
+    {
+        *slot -= 1;
+        return true;
+    }
+    false
+}
+
 pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition {
     use std::collections::HashSet;
 
@@ -1252,8 +1295,41 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
                     agent_pane_id: h.pane_id.clone(),
                 });
             }
-            Some(TabMembership::Orchestration { name, role_index }) => {
-                let key = (cwd.clone(), name.clone());
+            Some(TabMembership::Orchestration {
+                name,
+                role_index,
+                orchestration_cwd,
+                ..
+            }) => {
+                // Round-12 reviewer #1: bucket by `(orchestration_cwd,
+                // name)` — the same identity tuple the daemon uses for
+                // `pane_orchestration_map`. Round-9 #2 made each role
+                // pane's own cwd independent (workers can live in
+                // sub-directories of the orchestration); using the
+                // per-pane cwd here would split a 3-role orchestration
+                // across 3 buckets on reattach. The orchestration_cwd
+                // field is shared across roles, so all three end up in
+                // one bucket.
+                //
+                // Older daemons/clients (pre-round-11) omit the field;
+                // fall back to per-pane cwd to keep the partition
+                // behaviour stable for that legacy data, but log a
+                // debug breadcrumb so a stale producer is visible.
+                let bucket_cwd = match orchestration_cwd {
+                    Some(c) => c.clone(),
+                    None => {
+                        tracing::debug!(
+                            agent_id = %h.agent_id,
+                            pane_id = %h.pane_id,
+                            pane_cwd = %cwd,
+                            orchestration_name = %name,
+                            "hydration: orchestration pane missing orchestration_cwd — \
+                             bucketing by per-pane cwd as a legacy fallback"
+                        );
+                        cwd.clone()
+                    }
+                };
+                let key = (bucket_cwd.clone(), name.clone());
                 let idx = match orch_index.get(&key) {
                     Some(i) => *i,
                     None => {
@@ -1261,7 +1337,7 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
                         orch_index.insert(key, i);
                         out.orchestration_buckets
                             .push(OrchestrationHydrationBucket {
-                                cwd,
+                                cwd: bucket_cwd,
                                 orchestration_name: name.clone(),
                                 role_slots: Vec::new(),
                             });
@@ -1279,322 +1355,25 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
 }
 
 // ---------------------------------------------------------------------------
-// M5: Delegation dispatch
+// M5 (PRD #93 round-5): delegation dispatch lives in the daemon now.
+//
+// Earlier rounds had the TUI drain `AppState.delegate_events` /
+// `AppState.work_done_events`, build a per-role prompt (file + one-liner),
+// optionally restart `clear=true` worker panes, and route the prompt
+// through the pane controller. The daemon's hook loop now writes that
+// prompt directly into the worker pane's PTY (see
+// [`crate::state::AppState::handle_delegate`] /
+// [`crate::state::AppState::handle_work_done`]), so the TUI is out of the
+// dispatch business.
+//
+// Two features that previously rode this path are deliberately not
+// reimplemented daemon-side and are surfaced here as a follow-up: per-role
+// `prompt_template` wrapping and `clear=true` pane restart on delegate.
+// They depended on the TUI's `OrchestrationConfig`; pulling that into the
+// daemon would re-introduce the cross-process config-load coupling the
+// PRD #93 redesign aims to remove. They can be re-added as opt-ins once
+// the new dispatch surface settles.
 // ---------------------------------------------------------------------------
-
-/// Construct the full worker prompt content (written to file).
-/// Includes the task, optional role instructions, and work-done signaling instructions.
-fn build_worker_prompt(prompt_template: Option<&str>, task: &str) -> String {
-    let base = match prompt_template {
-        Some(tpl) => format!("{tpl}\n\n## Task\n\n{task}"),
-        None => task.to_string(),
-    };
-    format!(
-        "{base}\n\n## When done\n\n\
-         Signal completion by running this command via Bash:\n\
-         ```bash\n\
-         dot-agent-deck work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
-         ```"
-    )
-}
-
-/// Write the worker task to a file and return a one-liner to inject.
-/// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
-fn prepare_worker_prompt(
-    role_name: &str,
-    prompt_template: Option<&str>,
-    task: &str,
-    cwd: &str,
-) -> Option<String> {
-    let safe_name = sanitize_role_name(role_name);
-    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-    std::fs::create_dir_all(&dir).ok()?;
-    let file_path = dir.join(format!("worker-task-{safe_name}.md"));
-    let content = build_worker_prompt(prompt_template, task);
-    std::fs::write(&file_path, &content).ok()?;
-    Some(format!(
-        "Read .dot-agent-deck/worker-task-{safe_name}.md for your task."
-    ))
-}
-
-/// Drain delegate signals and dispatch work to worker panes.
-///
-/// For each `DelegateSignal`, look up the target role(s), optionally restart
-/// their pane (`clear = true`), and inject the constructed prompt.  When a pane
-/// is restarted the prompt is deferred to `ui.pending_dispatches` because the
-/// agent needs time to initialise.
-fn dispatch_delegate_events(
-    state: &SharedState,
-    pane: &Arc<dyn PaneController>,
-    tab_manager: &mut TabManager,
-    ui: &mut UiState,
-    // PRD #76 M2.15: the current frame area is needed to compute spawn-time
-    // PTY dims for restarted role panes (`role.clear = true`). Without it
-    // the restart would open at 24×80, then immediately mismatch the
-    // viewport until the next user-triggered resize. Tests that don't care
-    // pass `Rect::new(0, 0, 80, 24)` and accept default dims.
-    frame_area: Rect,
-) {
-    // 1. Drain all pending delegate events under a short write-lock.
-    let events: Vec<_> = state.blocking_write().delegate_events.drain(..).collect();
-
-    for signal in events {
-        // 2. Find the orchestration tab that owns this pane.
-        let tab_idx = tab_manager
-            .tabs()
-            .iter()
-            .position(|t| matches!(t, Tab::Orchestration { role_pane_ids, .. } if role_pane_ids.contains(&signal.pane_id)));
-
-        let Some(tab_idx) = tab_idx else {
-            tracing::warn!(pane_id = %signal.pane_id, "dispatch: pane not in any orchestration tab");
-            continue;
-        };
-
-        // 3. Extract what we need from the tab (borrow-safely).
-        let (config, cwd) = match &mut tab_manager.tabs_mut()[tab_idx] {
-            Tab::Orchestration {
-                config,
-                cwd,
-                status,
-                ..
-            } => {
-                *status = OrchestrationStatus::Delegated;
-                (config.clone(), cwd.clone())
-            }
-            _ => unreachable!(),
-        };
-
-        // 4. Dispatch to each target role.
-        for target_role_name in &signal.to {
-            let Some(role_idx) = config
-                .roles
-                .iter()
-                .position(|r| &r.name == target_role_name)
-            else {
-                tracing::warn!(
-                    role = %target_role_name,
-                    "dispatch: delegation target role not found in config"
-                );
-                continue;
-            };
-
-            let role = &config.roles[role_idx];
-            let prompt = prepare_worker_prompt(
-                &role.name,
-                role.prompt_template.as_deref(),
-                &signal.task,
-                &cwd,
-            )
-            .unwrap_or_else(|| build_worker_prompt(role.prompt_template.as_deref(), &signal.task));
-
-            if role.clear {
-                // Restart pane: close old, create new, update all mappings.
-                let old_pane_id = match &tab_manager.tabs()[tab_idx] {
-                    Tab::Orchestration { role_pane_ids, .. } => role_pane_ids[role_idx].clone(),
-                    _ => unreachable!(),
-                };
-
-                let _ = pane.close_pane(&old_pane_id);
-
-                // M2.12 fixup reviewer #1: thread `tab_membership`
-                // through to `StartAgent` here, mirroring the
-                // orchestration-spawn site in
-                // `TabManager::open_orchestration_tab`. Without this,
-                // the daemon stores the restarted role with
-                // `tab_membership = None`, and a later remote
-                // reconnect would strand the role on the dashboard
-                // instead of rebuilding it into its orchestration
-                // tab.
-                // PRD #76 M2.15: pre-compute spawn dims using the shared
-                // orchestration-layout helper so the restarted role's PTY
-                // opens at the viewport size (right 66% column, matching
-                // the orchestration renderer's `[34%, 66%]` split — fixup
-                // F3), not the legacy 24×80. The next resize sweep
-                // reconciles per-role focus state.
-                // PRD #76 M2.15 fixup pass 2 G2 — `Tiled` is hardcoded
-                // here (role-restart geometry is per-role uniform under
-                // tiled layout), so `focused_role_index` doesn't affect
-                // the dims; pass `None` for symmetry with other
-                // Tiled-spawn callsites and to match the renderer's
-                // behavior when no role is focused on the just-restarted
-                // pane.
-                let (rows, cols) = orchestration_role_pane_dims(
-                    frame_area,
-                    config.roles.len(),
-                    role_idx,
-                    None,
-                    PaneLayout::Tiled,
-                    tab_manager.show_tab_bar(),
-                );
-                let (new_pane_id, _resolved) = match pane.create_pane_with_options(
-                    None,
-                    Some(&cwd),
-                    AgentSpawnOptions {
-                        display_name: Some(role.name.as_str()),
-                        tab_membership: Some(TabMembership::Orchestration {
-                            name: config.name.clone(),
-                            role_index: role_idx,
-                        }),
-                        rows,
-                        cols,
-                        // PRD #76 M2.13: tag the role's daemon-side
-                        // registry entry with the agent type inferred
-                        // from the role command so a reconnect can
-                        // hydrate the placeholder with the right type
-                        // instead of "No agent".
-                        agent_type: AgentType::from_command(Some(&role.command)),
-                    },
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(role = %role.name, error = %e, "dispatch: failed to create pane");
-                        continue;
-                    }
-                };
-
-                // Update Tab::Orchestration role_pane_ids.
-                if let Tab::Orchestration { role_pane_ids, .. } =
-                    &mut tab_manager.tabs_mut()[tab_idx]
-                {
-                    role_pane_ids[role_idx] = new_pane_id.clone();
-                }
-
-                // Update state mappings.
-                {
-                    let mut st = state.blocking_write();
-                    st.unregister_pane(&old_pane_id);
-                    // Remove the old pane's session so it doesn't leak to the dashboard.
-                    st.sessions
-                        .retain(|_, s| s.pane_id.as_deref() != Some(&old_pane_id));
-                    st.register_pane(new_pane_id.clone());
-                    st.pane_role_map
-                        .insert(new_pane_id.clone(), role.name.clone());
-                    st.pane_cwd_map.insert(new_pane_id.clone(), cwd.clone());
-                    if role.start {
-                        st.orchestrator_pane_ids.insert(new_pane_id.clone());
-                    }
-                    // PRD #76 M2.13: the daemon-bound spawn above tags the
-                    // registry entry via `AgentType::from_command(...)` so a
-                    // remote reconnect's hydration carries the right type.
-                    // The local placeholder, however, starts at `None`: the
-                    // next `SessionStart` hook fills `agent_type` in (per the
-                    // pre-M2.13 contract). Seeding the placeholder with the
-                    // inferred type here would trip the orchestration
-                    // readiness gate at `dispatch_orchestrator` and bypass
-                    // the 10-second fallback.
-                    st.insert_placeholder_session(new_pane_id.clone(), Some(cwd.clone()), None);
-                }
-
-                // Update UI display names.
-                ui.pane_display_names.remove(&old_pane_id);
-                ui.pane_display_names
-                    .insert(new_pane_id.clone(), role.name.clone());
-
-                // Launch the agent command in the new pane.
-                let _ = pane.write_to_pane(&new_pane_id, &role.command);
-
-                // Defer prompt injection until agent is ready.
-                ui.pending_dispatches.push(PendingDispatch {
-                    pane_id: new_pane_id,
-                    prompt,
-                    created_at: std::time::Instant::now(),
-                });
-            } else {
-                // Agent is already running — inject prompt directly.
-                let pane_id = match &tab_manager.tabs()[tab_idx] {
-                    Tab::Orchestration { role_pane_ids, .. } => role_pane_ids[role_idx].clone(),
-                    _ => unreachable!(),
-                };
-                let _ = pane.write_to_pane(&pane_id, &prompt);
-            }
-        }
-    }
-}
-
-/// Drain work-done signals from workers and inject their results into the
-/// orchestrator pane.  Each worker result is forwarded immediately — no
-/// batching or waiting for parallel completions.
-fn feedback_worker_results(
-    state: &SharedState,
-    pane: &Arc<dyn PaneController>,
-    tab_manager: &mut TabManager,
-    ui: &mut UiState,
-) {
-    let events: Vec<_> = state.blocking_write().work_done_events.drain(..).collect();
-
-    for signal in events {
-        // Find the orchestration tab that owns this pane.
-        let tab_idx = tab_manager.tabs().iter().position(|t| {
-            matches!(t, Tab::Orchestration { role_pane_ids, .. } if role_pane_ids.contains(&signal.pane_id))
-        });
-
-        let Some(tab_idx) = tab_idx else {
-            tracing::warn!(pane_id = %signal.pane_id, "feedback: pane not in any orchestration tab");
-            continue;
-        };
-
-        let (start_role_index, role_pane_ids, _cwd) = match &tab_manager.tabs()[tab_idx] {
-            Tab::Orchestration {
-                start_role_index,
-                role_pane_ids,
-                cwd,
-                ..
-            } => (*start_role_index, role_pane_ids.clone(), cwd.clone()),
-            _ => unreachable!(),
-        };
-
-        let orchestrator_pane_id = &role_pane_ids[start_role_index];
-
-        // If the signal came from the orchestrator itself (--done), handle completion.
-        if signal.pane_id == *orchestrator_pane_id {
-            if signal.done {
-                tracing::info!("Orchestration complete: {}", signal.task);
-                // Set the orchestration tab status to Completed.
-                if let Tab::Orchestration { status, .. } = &mut tab_manager.tabs_mut()[tab_idx] {
-                    *status = OrchestrationStatus::Completed;
-                }
-                ui.status_message = Some((
-                    format!("Orchestration complete: {}", signal.task),
-                    std::time::Instant::now(),
-                ));
-            }
-            continue;
-        }
-
-        // Resolve the worker's role name for the feedback message.
-        let role_name = state
-            .blocking_read()
-            .pane_role_map
-            .get(&signal.pane_id)
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
-
-        // Build feedback prompt: one-liner pointing to the work-done file.
-        let safe_name = sanitize_role_name(&role_name);
-        let feedback = format!(
-            "Worker {safe_name} has completed their task. Read .dot-agent-deck/work-done-{safe_name}.md for their full report."
-        );
-
-        // Check if orchestrator agent is ready; if not, queue for deferred injection.
-        let ready = {
-            let st = state.blocking_read();
-            st.sessions.values().any(|s| {
-                s.pane_id.as_deref() == Some(orchestrator_pane_id.as_str())
-                    && s.agent_type != AgentType::None
-            })
-        };
-
-        if ready {
-            let _ = pane.write_to_pane(orchestrator_pane_id, &feedback);
-        } else {
-            ui.pending_dispatches.push(PendingDispatch {
-                pane_id: orchestrator_pane_id.clone(),
-                prompt: feedback,
-                created_at: std::time::Instant::now(),
-            });
-        }
-    }
-}
 
 /// Process pending dispatches — inject prompt once the agent in the pane is ready.
 fn process_pending_dispatches(
@@ -1885,13 +1664,16 @@ fn handle_pane_input_key(key: KeyEvent) -> KeyResult {
 }
 
 fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
-    // PRD #76 M2.18: index 0 is the mode-dependent action (Quit locally,
-    // Detach in external-daemon mode); index 1 is Cancel.
+    // PRD #93 Phase 2 / M4.2: the dialog is now a single yes/no on detach
+    // — every pane is daemon-backed so quitting the TUI is always a
+    // detach, never a kill. Index 0 is Detach, index 1 is Cancel.
     const QUIT_OPTION_COUNT: usize = 2;
     match key.code {
-        // Ctrl+C again: legacy escape-hatch that always exits without
-        // KIND_DETACH. In external mode the daemon treats EOF as implicit
-        // detach so agents still survive.
+        // Ctrl+C from inside the dialog: skip the explicit KIND_DETACH
+        // frame and just exit. The daemon treats the socket close as
+        // implicit detach, so agents still survive — the difference vs
+        // DetachAndQuit is purely about the daemon-side log
+        // distinguishing voluntary detach from EOF.
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyResult::Quit,
         KeyCode::Up | KeyCode::Char('k') => {
             ui.quit_confirm_selected = ui.quit_confirm_selected.saturating_sub(1);
@@ -1904,13 +1686,7 @@ fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             KeyResult::Continue
         }
         KeyCode::Enter => match ui.quit_confirm_selected {
-            0 => {
-                if ui.via_daemon {
-                    KeyResult::DetachAndQuit
-                } else {
-                    KeyResult::Quit
-                }
-            }
+            0 => KeyResult::DetachAndQuit,
             _ => {
                 ui.mode = UiMode::Normal;
                 KeyResult::Continue
@@ -2463,52 +2239,6 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
 /// Tear down every non-dashboard tab (mode + orchestration) and unregister
 /// their pane IDs from `state`.
 ///
-/// PRD #76: gated on local-deck mode. In external-daemon mode the daemon
-/// owns the agent children and Quit/Detach must both leave them running.
-/// The Detach path explicitly calls `detach_all_streams` first (which
-/// removes the panes from the controller's local registry), so by the
-/// time this teardown ran on Detach the close_pane lookups missed and
-/// became no-ops — the daemon agents survived. The Quit path has no such
-/// pre-step, so the unconditional teardown was issuing `stop-agent`
-/// against the daemon for every orchestration role pane and killing the
-/// agents. Skipping the loop in external-daemon mode is correct: pane
-/// Drop closes the attach sockets, the daemon observes EOF, and the
-/// agents survive as the spec requires. In local-deck mode the loop
-/// stays — those panes are real PTY children that would leak past TUI
-/// exit otherwise.
-pub fn run_post_loop_teardown(
-    pane: &Arc<dyn PaneController>,
-    state: &SharedState,
-    tab_manager: &mut TabManager,
-) {
-    let external_daemon = pane
-        .as_any()
-        .downcast_ref::<EmbeddedPaneController>()
-        .is_some_and(|c| c.is_external_daemon());
-    if external_daemon {
-        // Quit in external-daemon mode must leave daemon agents running (spec).
-        // Detach removes stream panes from the controller's local registry
-        // before this helper runs, so `close_pane` would no-op for them
-        // anyway. Quit has no such pre-step, so without this gate
-        // `close_pane` → `client.stop_agent` would SIGKILL orchestration
-        // agents on the daemon.
-        return;
-    }
-    // PRD #76 M2.18: skip tab 0 (Dashboard) deliberately. `TabManager::close_tab(0)`
-    // returns `Err(CannotCloseDashboard)` by design, and the `Tab::Dashboard`
-    // variant carries no pane IDs anyway — dashboard PTY children are tracked
-    // through `state`/the pane controller directly and die with the TUI
-    // process on exit. Iterating from 1 here is the only correct range; a
-    // `0..tab_count()` bound would error on tab 0 and return nothing.
-    for i in (1..tab_manager.tab_count()).rev() {
-        if let Ok(ids) = tab_manager.close_tab(i) {
-            for id in ids {
-                state.blocking_write().unregister_pane(&id);
-            }
-        }
-    }
-}
-
 pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
@@ -2537,10 +2267,6 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, palette);
-    ui.via_daemon = pane
-        .as_any()
-        .downcast_ref::<EmbeddedPaneController>()
-        .is_some_and(|c| c.is_external_daemon());
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -2878,6 +2604,10 @@ pub fn run_tui(
         let _ = terminal.autoresize();
 
         let saved = config::SavedSession::load();
+        // CodeRabbit round-9 #4 / round-10 #2: dedupe against panes
+        // the daemon already hydrated. See `build_dedupe_budget` and
+        // `try_consume_dedupe_slot` below for the algorithm.
+        let mut remaining_dedupe_budget = build_dedupe_budget(&ui.pane_metadata);
         // Collect deferred mode pane restores — we need the terminal ready
         // before we can resize PTYs, so mode tabs are opened after the loop.
         let mut deferred_mode_panes: Vec<(config::SavedPane, ModeConfig)> = Vec::new();
@@ -2888,6 +2618,15 @@ pub fn run_tui(
                     "Warning: skipping pane '{}' — directory {} not found",
                     saved_pane.name, saved_pane.dir
                 ));
+                continue;
+            }
+            if try_consume_dedupe_slot(&mut remaining_dedupe_budget, saved_pane) {
+                tracing::debug!(
+                    dir = %saved_pane.dir,
+                    name = %saved_pane.name,
+                    mode = ?saved_pane.mode,
+                    "restore: skipping saved pane — already hydrated from daemon"
+                );
                 continue;
             }
             // If the pane belonged to a mode tab, defer it so we can open a
@@ -3477,19 +3216,14 @@ pub fn run_tui(
             }
         }
 
-        // M5: Dispatch delegation events from orchestrator to workers.
-        dispatch_delegate_events(
-            &state,
-            &pane,
-            &mut tab_manager,
-            &mut ui,
-            terminal.get_frame().area(),
-        );
-
-        // M5b: Forward worker results back to the orchestrator.
-        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
-
-        // Process pending dispatches (clear=true roles waiting for agent ready).
+        // PRD #93 round-5: dispatch_delegate_events / feedback_worker_results
+        // ran here in earlier rounds — they drained delegate/work-done
+        // signals from `AppState` and wrote prompts via the pane controller.
+        // That entire flow now lives daemon-side; the daemon writes the
+        // file-backed prompt and the one-liner directly into the target
+        // PTY, so the TUI just renders the bytes as they arrive in the
+        // pane scrollback. `process_pending_dispatches` still ferries the
+        // orchestrator's *initial* prompt across the agent-ready gate.
         process_pending_dispatches(&mut ui, &pane, &snapshot);
 
         // Drain all pending events before re-rendering. This avoids a full
@@ -4770,9 +4504,10 @@ pub fn run_tui(
         }
     }
 
-    // Tear down all mode/orchestration tabs (clean up their panes),
-    // gated on external-daemon mode — see `run_post_loop_teardown`.
-    run_post_loop_teardown(&pane, &state, &mut tab_manager);
+    // PRD #93 Phase 2: there's no local-deck teardown path anymore.
+    // Dropping `pane` closes the attach sockets, the daemon observes
+    // EOF, and the agents survive — same property the round-7 loop
+    // already guarded for the external-daemon case.
 
     let _ = crossterm::execute!(
         std::io::stdout(),
@@ -5170,7 +4905,7 @@ fn render_overlays(
         render_config_gen_prompt(frame, ui.config_gen_selected, palette);
     }
     if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame, ui.quit_confirm_selected, ui.via_daemon, palette);
+        render_quit_confirm(frame, ui.quit_confirm_selected, palette);
     }
 }
 
@@ -5579,12 +5314,7 @@ fn render_bottom_bar(
     }
 }
 
-fn render_quit_confirm(
-    frame: &mut Frame,
-    selected: usize,
-    via_daemon: bool,
-    palette: ColorPalette,
-) {
+fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 60u16.min(area.width.saturating_sub(4));
     let popup_height = 9u16.min(area.height.saturating_sub(4));
@@ -5594,35 +5324,19 @@ fn render_quit_confirm(
 
     frame.render_widget(Clear, popup_area);
 
-    // PRD #76 M2.18: in external-daemon mode the only meaningful exit is
-    // Detach (TUI exits, daemon-owned agents keep running, KIND_DETACH frame
-    // emitted so the daemon log distinguishes voluntary detach from EOF).
-    // In local mode there is no daemon to detach from, so the action is
-    // Quit (exit and reap local PTY children).
-    let (action_label, action_desc, title, prompt) = if via_daemon {
-        (
-            "Detach",
-            "leave agents running on the daemon",
-            " Detach ",
-            "  Detach from this TUI?",
-        )
-    } else {
-        (
-            "Quit",
-            "exit and reap local agents",
-            " Quit ",
-            "  Are you sure you want to quit?",
-        )
-    };
+    // PRD #93 Phase 2 / M4.2: every pane is daemon-backed, so the only
+    // meaningful exit is Detach — the TUI goes away, the daemon-owned
+    // agents keep running, and a KIND_DETACH frame is emitted so the
+    // daemon log distinguishes voluntary detach from EOF.
     let options = [
-        (action_label, action_desc),
+        ("Detach", "leave agents running on the daemon"),
         ("Cancel", "return to dashboard"),
     ];
 
     let mut text = vec![
         Line::from(""),
         Line::styled(
-            prompt,
+            "  Detach from this TUI?",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -5652,7 +5366,7 @@ fn render_quit_confirm(
     ));
 
     let block = Block::default()
-        .title(title)
+        .title(" Detach ")
         .title_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -6958,6 +6672,97 @@ mod tests {
         assert!(p.orchestration_buckets.is_empty());
     }
 
+    /// Round-10 reviewer #2: two saved panes that share
+    /// `(dir, name, mode)` must NOT both be dropped when only one was
+    /// hydrated. The pre-round-10 `HashSet` dedupe collapsed both;
+    /// the count-based budget drops at most one per match.
+    #[test]
+    fn dedupe_drops_only_count_matched_saved_panes() {
+        use config::SavedPane;
+        let mut metadata: HashMap<String, SavedPane> = HashMap::new();
+        // One hydrated dashboard pane with (dir=/w, name=foo, mode=None).
+        metadata.insert(
+            "pane-1".into(),
+            SavedPane {
+                dir: "/w".into(),
+                name: "foo".into(),
+                command: String::new(),
+                mode: None,
+            },
+        );
+        let mut budget = build_dedupe_budget(&metadata);
+
+        let saved_a = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: "vim".into(),
+            mode: None,
+        };
+        let saved_b = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: "tail -f log".into(),
+            mode: None,
+        };
+
+        // First saved pane matches the hydrated → consumed.
+        assert!(try_consume_dedupe_slot(&mut budget, &saved_a));
+        // Second saved pane shares the key but the budget is exhausted → restored.
+        assert!(!try_consume_dedupe_slot(&mut budget, &saved_b));
+    }
+
+    #[test]
+    fn dedupe_distinguishes_mode_panes_from_dashboard() {
+        use config::SavedPane;
+        let mut metadata: HashMap<String, SavedPane> = HashMap::new();
+        metadata.insert(
+            "pane-1".into(),
+            SavedPane {
+                dir: "/w".into(),
+                name: "foo".into(),
+                command: String::new(),
+                mode: Some("k8s-ops".into()),
+            },
+        );
+        let mut budget = build_dedupe_budget(&metadata);
+
+        // Same (dir, name) but different mode — must NOT dedupe.
+        let saved_dashboard = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: "vim".into(),
+            mode: None,
+        };
+        assert!(!try_consume_dedupe_slot(&mut budget, &saved_dashboard));
+
+        // Matching mode → DEDUPED.
+        let saved_mode = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: String::new(),
+            mode: Some("k8s-ops".into()),
+        };
+        assert!(try_consume_dedupe_slot(&mut budget, &saved_mode));
+    }
+
+    #[test]
+    fn dedupe_restores_saved_panes_when_daemon_empty() {
+        use config::SavedPane;
+        // No hydrated metadata (daemon restarted, hydration returned
+        // empty). The saved-session file is the only source of truth;
+        // every saved pane must restore.
+        let metadata: HashMap<String, SavedPane> = HashMap::new();
+        let mut budget = build_dedupe_budget(&metadata);
+
+        let saved = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: "vim".into(),
+            mode: None,
+        };
+        assert!(!try_consume_dedupe_slot(&mut budget, &saved));
+    }
+
     #[test]
     fn partition_groups_mode_membership_by_cwd_and_name() {
         let panes = vec![
@@ -7028,6 +6833,126 @@ mod tests {
         );
     }
 
+    /// Round-12 reviewer #1: a 3-role orchestration whose workers
+    /// have distinct per-pane cwds (round-9 #2 allows this) must
+    /// hydrate into ONE orchestration bucket, not three. The bucket
+    /// key is `(orchestration_cwd, name)` — shared across roles.
+    #[test]
+    fn partition_buckets_orchestration_by_orchestration_cwd_not_per_pane_cwd() {
+        let orch_cwd = "/proj".to_string();
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some(orch_cwd.clone()),
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/proj/sub-a"), // worker's own cwd diverges
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 1,
+                    role_name: "coder".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(orch_cwd.clone()),
+                }),
+            ),
+            hydrated(
+                "3",
+                "a-3",
+                Some("/proj/sub-b"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 2,
+                    role_name: "reviewer".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(orch_cwd.clone()),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(
+            p.orchestration_buckets.len(),
+            1,
+            "all three roles share the same orchestration_cwd → one bucket"
+        );
+        let bucket = &p.orchestration_buckets[0];
+        assert_eq!(bucket.cwd, orch_cwd);
+        assert_eq!(bucket.orchestration_name, "tdd-cycle");
+        assert_eq!(bucket.role_slots.len(), 3);
+    }
+
+    /// Negative-case mirror of the above: two panes with the same
+    /// orchestration name but distinct orchestration_cwds must end
+    /// up in DIFFERENT buckets — the round-11 #C collision-fix
+    /// invariant carried through the hydration partition.
+    #[test]
+    fn partition_separates_orchestrations_by_orchestration_cwd_not_pane_cwd() {
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/shared"), // same per-pane cwd
+                Some(TabMembership::Orchestration {
+                    name: "foo".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/home/u/project-a".into()),
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/shared"), // same per-pane cwd — would collide on old key
+                Some(TabMembership::Orchestration {
+                    name: "foo".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/home/u/project-b".into()),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(
+            p.orchestration_buckets.len(),
+            2,
+            "distinct orchestration_cwds must split into distinct buckets"
+        );
+    }
+
+    /// Legacy data path: a pre-round-11 daemon emits orchestration
+    /// panes with no `orchestration_cwd`. Partition must still
+    /// produce reasonable buckets (falls back to per-pane cwd) so
+    /// reattach against an older daemon doesn't strand panes.
+    #[test]
+    fn partition_falls_back_to_per_pane_cwd_when_orchestration_cwd_missing() {
+        let panes = vec![hydrated(
+            "1",
+            "a-1",
+            Some("/legacy-work"),
+            Some(TabMembership::Orchestration {
+                name: "tdd-cycle".into(),
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+                orchestration_cwd: None,
+            }),
+        )];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.orchestration_buckets.len(), 1);
+        assert_eq!(p.orchestration_buckets[0].cwd, "/legacy-work");
+    }
+
     #[test]
     fn partition_collects_orchestration_role_slots() {
         let panes = vec![
@@ -7038,6 +6963,9 @@ mod tests {
                 Some(TabMembership::Orchestration {
                     name: "tdd-cycle".into(),
                     role_index: 0,
+                    role_name: String::new(),
+                    is_start_role: false,
+                    orchestration_cwd: None,
                 }),
             ),
             hydrated(
@@ -7047,6 +6975,9 @@ mod tests {
                 Some(TabMembership::Orchestration {
                     name: "tdd-cycle".into(),
                     role_index: 2,
+                    role_name: String::new(),
+                    is_start_role: false,
+                    orchestration_cwd: None,
                 }),
             ),
         ];
@@ -7071,6 +7002,9 @@ mod tests {
                 Some(TabMembership::Orchestration {
                     name: "tdd-cycle".into(),
                     role_index: 0,
+                    role_name: String::new(),
+                    is_start_role: false,
+                    orchestration_cwd: None,
                 }),
             ),
             hydrated(
@@ -7080,6 +7014,9 @@ mod tests {
                 Some(TabMembership::Orchestration {
                     name: "tdd-cycle".into(),
                     role_index: 0,
+                    role_name: String::new(),
+                    is_start_role: false,
+                    orchestration_cwd: None,
                 }),
             ),
         ];
@@ -7105,6 +7042,9 @@ mod tests {
                 Some(TabMembership::Orchestration {
                     name: "o".into(),
                     role_index: 0,
+                    role_name: String::new(),
+                    is_start_role: false,
+                    orchestration_cwd: None,
                 }),
             ),
         ];
@@ -7157,7 +7097,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 render_frame(
                     frame,
                     &state,
@@ -7224,7 +7164,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 render_frame(
                     frame,
                     &state,
@@ -7339,7 +7279,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 render_frame(
                     frame,
                     &state,
@@ -7554,7 +7494,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 render_frame(
                     frame,
                     &state,
@@ -7631,7 +7571,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 render_frame(
                     frame,
                     &state,
@@ -7684,7 +7624,7 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         terminal
             .draw(|frame| {
-                let noop = crate::embedded_pane::EmbeddedPaneController::new();
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 render_frame(
                     frame,
                     &state,
@@ -9495,115 +9435,10 @@ mod tests {
         assert!(matches!(result, KeyResult::Continue));
     }
 
-    // -----------------------------------------------------------------------
-    // M5: Delegation dispatch tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn build_worker_prompt_with_template() {
-        let prompt = build_worker_prompt(Some("You are a code reviewer."), "Review auth module");
-        assert!(prompt.contains("You are a code reviewer."));
-        assert!(prompt.contains("## Task\n\nReview auth module"));
-        assert!(prompt.contains("dot-agent-deck work-done --task"));
-    }
-
-    #[test]
-    fn build_worker_prompt_without_template() {
-        let prompt = build_worker_prompt(None, "Implement login endpoint");
-        assert!(prompt.contains("Implement login endpoint"));
-        assert!(prompt.contains("dot-agent-deck work-done --task"));
-    }
-
-    #[test]
-    fn dispatch_drains_delegate_events() {
-        let state = Arc::new(tokio::sync::RwLock::new(AppState::default()));
-        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
-        let pane: Arc<dyn PaneController> = pane_ctrl;
-        let mut tab_manager = crate::tab::TabManager::new(Arc::clone(&pane));
-        let mut ui = default_ui();
-
-        // Push a delegate signal for a pane not in any tab — should drain and warn.
-        {
-            let mut st = state.blocking_write();
-            st.delegate_events.push(crate::event::DelegateSignal {
-                pane_id: "1".to_string(),
-                task: "Do work".to_string(),
-                to: vec!["coder".to_string()],
-                timestamp: Utc::now(),
-            });
-        }
-
-        dispatch_delegate_events(
-            &state,
-            &pane,
-            &mut tab_manager,
-            &mut ui,
-            Rect::new(0, 0, 80, 24),
-        );
-
-        assert!(ui.pending_dispatches.is_empty());
-        assert!(state.blocking_read().delegate_events.is_empty());
-    }
-
-    #[test]
-    fn dispatch_warns_on_unknown_role() {
-        let state = Arc::new(tokio::sync::RwLock::new(AppState::default()));
-        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
-        let pane: Arc<dyn PaneController> = Arc::clone(&pane_ctrl) as Arc<dyn PaneController>;
-
-        let config = OrchestrationConfig {
-            name: "test".to_string(),
-            roles: vec![OrchestrationRoleConfig {
-                name: "orchestrator".to_string(),
-                command: "echo hi".to_string(),
-                start: true,
-                description: None,
-                prompt_template: None,
-                clear: true,
-            }],
-        };
-
-        let mut tab_manager = crate::tab::TabManager::new(Arc::clone(&pane));
-        let dir = tempdir().unwrap();
-        let cwd = dir.path().to_str().unwrap();
-        let (_, role_pane_ids) = tab_manager
-            .open_orchestration_tab(&config, cwd, None, (24, 80))
-            .unwrap();
-
-        let orch_pane_id = role_pane_ids[0].clone();
-
-        // Register pane in state.
-        {
-            let mut st = state.blocking_write();
-            st.register_pane(orch_pane_id.clone());
-            st.pane_role_map
-                .insert(orch_pane_id.clone(), "orchestrator".to_string());
-            st.orchestrator_pane_ids.insert(orch_pane_id.clone());
-            // Delegate to a non-existent role.
-            st.delegate_events.push(crate::event::DelegateSignal {
-                pane_id: orch_pane_id,
-                task: "Do something".to_string(),
-                to: vec!["nonexistent-role".to_string()],
-                timestamp: Utc::now(),
-            });
-        }
-
-        let mut ui = default_ui();
-        dispatch_delegate_events(
-            &state,
-            &pane,
-            &mut tab_manager,
-            &mut ui,
-            Rect::new(0, 0, 80, 24),
-        );
-
-        // Should not panic or queue anything — just warn and skip.
-        assert!(ui.pending_dispatches.is_empty());
-    }
-
     #[test]
     fn pending_dispatch_timeout() {
-        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
+        let pane_ctrl =
+            Arc::new(crate::embedded_pane::EmbeddedPaneController::for_render_only_tests());
         let pane: Arc<dyn PaneController> = pane_ctrl;
         let snapshot = AppState::default();
         let mut ui = default_ui();
@@ -9623,7 +9458,8 @@ mod tests {
 
     #[test]
     fn pending_dispatch_waits_for_agent_ready() {
-        let pane_ctrl = Arc::new(crate::embedded_pane::EmbeddedPaneController::new());
+        let pane_ctrl =
+            Arc::new(crate::embedded_pane::EmbeddedPaneController::for_render_only_tests());
         let pane: Arc<dyn PaneController> = pane_ctrl;
         let snapshot = AppState::default(); // No sessions → agent not ready
         let mut ui = default_ui();
@@ -9640,792 +9476,14 @@ mod tests {
         assert_eq!(ui.pending_dispatches.len(), 1);
     }
 
-    // -----------------------------------------------------------------------
-    // Recording mock pane controller (for dispatch/feedback integration tests)
-    // -----------------------------------------------------------------------
-
-    struct RecordingPaneController {
-        next_id: std::sync::Mutex<u64>,
-        written: std::sync::Mutex<Vec<(String, String)>>,
-        closed: std::sync::Mutex<Vec<String>>,
-        renamed: std::sync::Mutex<Vec<(String, String)>>,
-        created: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl RecordingPaneController {
-        fn new() -> Self {
-            Self {
-                next_id: std::sync::Mutex::new(1),
-                written: std::sync::Mutex::new(Vec::new()),
-                closed: std::sync::Mutex::new(Vec::new()),
-                renamed: std::sync::Mutex::new(Vec::new()),
-                created: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl PaneController for RecordingPaneController {
-        fn create_pane(&self, _cmd: Option<&str>, _cwd: Option<&str>) -> Result<String, PaneError> {
-            let mut id = self.next_id.lock().unwrap();
-            let pane_id = format!("mock-{id}");
-            *id += 1;
-            self.created.lock().unwrap().push(pane_id.clone());
-            Ok(pane_id)
-        }
-
-        fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
-            self.written
-                .lock()
-                .unwrap()
-                .push((pane_id.to_string(), text.to_string()));
-            Ok(())
-        }
-
-        fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
-            self.closed.lock().unwrap().push(pane_id.to_string());
-            Ok(())
-        }
-
-        fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
-            self.renamed
-                .lock()
-                .unwrap()
-                .push((pane_id.to_string(), name.to_string()));
-            Ok(RenameOutcome::applied(name))
-        }
-
-        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
-            Ok(())
-        }
-
-        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
-            Ok(Vec::new())
-        }
-
-        fn resize_pane(
-            &self,
-            _pane_id: &str,
-            _direction: crate::pane::PaneDirection,
-            _amount: u16,
-        ) -> Result<(), PaneError> {
-            Ok(())
-        }
-
-        fn toggle_layout(&self) -> Result<(), PaneError> {
-            Ok(())
-        }
-
-        fn name(&self) -> &str {
-            "recording-mock"
-        }
-
-        fn is_available(&self) -> bool {
-            true
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // PRD #76 M2.11 — rename commit-intent helper.
-    //
-    // These tests exercise the helper the dashboard Enter handler now
-    // calls (`rename_commit_value`), not the daemon RPC. Together with
-    // the integration test in `tests/agent_metadata.rs` they pin the
-    // full path: handler decides what to commit → forwards to
-    // `PaneController::rename_pane` → controller maps empty/whitespace
-    // to a daemon-side `None` clear (reviewer P1 clear-rename case,
-    // P2.4 handler coverage).
-    // -----------------------------------------------------------------------
-
+    // PRD #93 Phase 2 / M4.2: the quit dialog collapsed from a
+    // mode-dependent (Quit-or-Detach) action to a single Detach
+    // confirmation. Pin that Enter on index 0 always returns
+    // `DetachAndQuit` so a future refactor can't silently reintroduce
+    // a local-mode "kill agents on exit" path.
     #[test]
-    fn rename_commit_value_returns_empty_string_on_enter_with_empty_text() {
-        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        // Empty text is still a commit: the controller will see "" and
-        // translate it to a daemon-side `None` clear. Returning `None`
-        // here would skip the daemon update entirely and leave the
-        // stale label on the daemon (the original P1 clear-rename bug).
-        assert_eq!(rename_commit_value(key, ""), Some(String::new()));
-    }
-
-    #[test]
-    fn rename_commit_value_returns_whitespace_on_enter_with_whitespace_text() {
-        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        // Whitespace passes through verbatim; the controller applies
-        // the trim. This keeps the helper purely about commit intent
-        // (Enter vs not Enter) and the trim policy in one place.
-        assert_eq!(rename_commit_value(key, "   "), Some("   ".to_string()));
-    }
-
-    #[test]
-    fn rename_commit_value_returns_text_on_enter() {
-        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(
-            rename_commit_value(key, "new-label"),
-            Some("new-label".to_string())
-        );
-    }
-
-    #[test]
-    fn rename_commit_value_returns_none_on_non_enter_keys() {
-        // Typing, navigation, backspace, escape — none of these are a
-        // commit. The handler must not ping the daemon on every
-        // keystroke (would amount to a per-keystroke `SetAgentLabel`
-        // RPC storm and break the "only commit on Enter" contract).
-        for code in [KeyCode::Char('a'), KeyCode::Esc, KeyCode::Backspace] {
-            let key = KeyEvent::new(code, KeyModifiers::NONE);
-            assert_eq!(rename_commit_value(key, "anything"), None);
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // PRD #76 M2.11 fixup 5 — `apply_rename_outcome` is the single
-    // place that mutates the dashboard's two display-name maps in
-    // response to a `PaneController::rename_pane` result. These
-    // tests pin the three outcome branches the dispatch loop now
-    // relies on. Together with the controller-side outcome tests
-    // in `src/embedded_pane.rs::rename_pane_*` and the daemon
-    // round-trip tests in `tests/agent_metadata.rs`, they cover
-    // the full path: raw rename text → controller-resolved label
-    // → UI map mirror.
-    // -----------------------------------------------------------------------
-
-    fn make_rename_maps(
-        sid: &str,
-        pane_id: &str,
-        label: &str,
-    ) -> (HashMap<String, String>, HashMap<String, String>) {
-        let mut display = HashMap::new();
-        let mut pane = HashMap::new();
-        display.insert(sid.to_string(), label.to_string());
-        pane.insert(pane_id.to_string(), label.to_string());
-        (display, pane)
-    }
-
-    /// Reviewer P2 / Auditor LOW: surround-whitespace input must
-    /// mirror the controller's trimmed label, not the raw text.
-    /// Before fixup 5 the dashboard mirror stored `"  newname  "`
-    /// while the controller (and the daemon) stored `"newname"`.
-    #[test]
-    fn apply_rename_outcome_applied_overwrites_both_maps_with_trimmed_name() {
-        let (mut display, mut pane) = make_rename_maps("s1", "p1", "old");
-        apply_rename_outcome(
-            &mut display,
-            &mut pane,
-            "s1",
-            "p1",
-            RenameOutcome::Applied("newname".to_string()),
-        );
-        assert_eq!(display.get("s1"), Some(&"newname".to_string()));
-        assert_eq!(pane.get("p1"), Some(&"newname".to_string()));
-    }
-
-    /// Reviewer P2 / Auditor LOW: a rename rejected by the
-    /// controller (control bytes after trim) must NOT touch the UI
-    /// maps. Before fixup 5 the raw `\x1b[31m` text landed in the
-    /// dashboard mirror and emitted terminal escapes into the card
-    /// title even though the controller correctly refused the
-    /// mutation locally and on the daemon.
-    #[test]
-    fn apply_rename_outcome_rejected_leaves_both_maps_unchanged() {
-        let (mut display, mut pane) = make_rename_maps("s1", "p1", "good-name");
-        apply_rename_outcome(&mut display, &mut pane, "s1", "p1", RenameOutcome::Rejected);
-        assert_eq!(
-            display.get("s1"),
-            Some(&"good-name".to_string()),
-            "Rejected outcome must NOT mutate display_names"
-        );
-        assert_eq!(
-            pane.get("p1"),
-            Some(&"good-name".to_string()),
-            "Rejected outcome must NOT mutate pane_display_names"
-        );
-    }
-
-    /// Reviewer P1 (extended): empty/whitespace rename text reaches
-    /// the controller as a "clear" → `RenameOutcome::Cleared`. The
-    /// UI mirror must remove the entries from BOTH maps so the
-    /// card falls back to the agent_id-based default label,
-    /// matching what hydrate would produce against the daemon's
-    /// `display_name: None`.
-    #[test]
-    fn apply_rename_outcome_cleared_removes_entries_from_both_maps() {
-        let (mut display, mut pane) = make_rename_maps("s1", "p1", "old");
-        apply_rename_outcome(&mut display, &mut pane, "s1", "p1", RenameOutcome::Cleared);
-        assert!(
-            !display.contains_key("s1"),
-            "Cleared must remove display_names entry"
-        );
-        assert!(
-            !pane.contains_key("p1"),
-            "Cleared must remove pane_display_names entry"
-        );
-    }
-
-    /// First-time rename (no prior label): Applied must still
-    /// populate both maps. Guards against a regression where the
-    /// helper only updates existing entries.
-    #[test]
-    fn apply_rename_outcome_applied_inserts_when_no_prior_label() {
-        let mut display: HashMap<String, String> = HashMap::new();
-        let mut pane: HashMap<String, String> = HashMap::new();
-        apply_rename_outcome(
-            &mut display,
-            &mut pane,
-            "s1",
-            "p1",
-            RenameOutcome::Applied("foo".to_string()),
-        );
-        assert_eq!(display.get("s1"), Some(&"foo".to_string()));
-        assert_eq!(pane.get("p1"), Some(&"foo".to_string()));
-    }
-
-    // -----------------------------------------------------------------------
-    // Orchestration integration test helpers
-    // -----------------------------------------------------------------------
-
-    fn make_fanout_config(clear: bool) -> OrchestrationConfig {
-        OrchestrationConfig {
-            name: "test-fanout".to_string(),
-            roles: vec![
-                OrchestrationRoleConfig {
-                    name: "orchestrator".to_string(),
-                    command: "echo orchestrator".to_string(),
-                    start: true,
-                    description: None,
-                    prompt_template: None,
-                    clear: false, // orchestrator is never restarted
-                },
-                OrchestrationRoleConfig {
-                    name: "coder".to_string(),
-                    command: "echo coder".to_string(),
-                    start: false,
-                    description: Some("Implements code".to_string()),
-                    prompt_template: Some("Always run tests.".to_string()),
-                    clear,
-                },
-                OrchestrationRoleConfig {
-                    name: "reviewer".to_string(),
-                    command: "echo reviewer".to_string(),
-                    start: false,
-                    description: Some("Reviews code".to_string()),
-                    prompt_template: Some("Check for bugs.".to_string()),
-                    clear,
-                },
-            ],
-        }
-    }
-
-    type OrchestrationFixture = (
-        SharedState,
-        Arc<RecordingPaneController>,
-        Arc<dyn PaneController>,
-        TabManager,
-        UiState,
-        Vec<String>, // role_pane_ids
-        tempfile::TempDir,
-    );
-
-    /// Set up an orchestration tab with a RecordingPaneController and register
-    /// all panes in state.  Returns the components needed for dispatch/feedback
-    /// tests plus the role_pane_ids for assertions.
-    fn setup_orchestration(config: &OrchestrationConfig) -> OrchestrationFixture {
-        let dir = tempdir().unwrap();
-        let cwd = dir.path().to_str().unwrap();
-
-        let mock = Arc::new(RecordingPaneController::new());
-        let pane: Arc<dyn PaneController> = Arc::clone(&mock) as Arc<dyn PaneController>;
-        let mut tab_manager = TabManager::new(Arc::clone(&pane));
-        let state = Arc::new(tokio::sync::RwLock::new(AppState::default()));
-
-        let (_, role_pane_ids) = tab_manager
-            .open_orchestration_tab(config, cwd, None, (24, 80))
-            .unwrap();
-
-        // Register all panes in state with role and cwd mappings.
-        {
-            let mut st = state.blocking_write();
-            for (i, role) in config.roles.iter().enumerate() {
-                let pane_id = &role_pane_ids[i];
-                st.register_pane(pane_id.clone());
-                st.pane_role_map.insert(pane_id.clone(), role.name.clone());
-                st.pane_cwd_map.insert(pane_id.clone(), cwd.to_string());
-                if role.start {
-                    st.orchestrator_pane_ids.insert(pane_id.clone());
-                }
-            }
-        }
-
-        // Clear setup-phase recordings so tests only see dispatch/feedback activity.
-        mock.written.lock().unwrap().clear();
-        mock.closed.lock().unwrap().clear();
-        mock.created.lock().unwrap().clear();
-        mock.renamed.lock().unwrap().clear();
-
-        let ui = default_ui();
-        (state, mock, pane, tab_manager, ui, role_pane_ids, dir)
-    }
-
-    // -----------------------------------------------------------------------
-    // Parallel fan-out integration tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn dispatch_parallel_fan_out_targets_multiple_workers() {
-        let config = make_fanout_config(false); // clear=false → direct injection
-        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
-            setup_orchestration(&config);
-
-        let orchestrator_pane = &role_pane_ids[0];
-        let coder_pane = &role_pane_ids[1];
-        let reviewer_pane = &role_pane_ids[2];
-
-        // Orchestrator delegates to both coder and reviewer simultaneously.
-        {
-            let mut st = state.blocking_write();
-            st.delegate_events.push(crate::event::DelegateSignal {
-                pane_id: orchestrator_pane.clone(),
-                task: "Implement and review the auth module".to_string(),
-                to: vec!["coder".to_string(), "reviewer".to_string()],
-                timestamp: Utc::now(),
-            });
-        }
-
-        dispatch_delegate_events(
-            &state,
-            &pane,
-            &mut tab_manager,
-            &mut ui,
-            Rect::new(0, 0, 80, 24),
-        );
-
-        // Both workers should have received prompts.
-        let written = mock.written.lock().unwrap();
-        let coder_writes: Vec<_> = written.iter().filter(|(id, _)| id == coder_pane).collect();
-        let reviewer_writes: Vec<_> = written
-            .iter()
-            .filter(|(id, _)| id == reviewer_pane)
-            .collect();
-
-        assert_eq!(
-            coder_writes.len(),
-            1,
-            "coder pane should receive exactly one prompt"
-        );
-        assert_eq!(
-            reviewer_writes.len(),
-            1,
-            "reviewer pane should receive exactly one prompt"
-        );
-
-        // Orchestration status should be Delegated.
-        if let Tab::Orchestration { status, .. } = &tab_manager.tabs()[1] {
-            assert_eq!(*status, OrchestrationStatus::Delegated);
-        } else {
-            panic!("expected Orchestration tab");
-        }
-
-        // Delegate events should be drained.
-        assert!(state.blocking_read().delegate_events.is_empty());
-    }
-
-    #[test]
-    fn dispatch_parallel_fan_out_with_clear_restarts_panes() {
-        let config = make_fanout_config(true); // clear=true → pane restart
-        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
-            setup_orchestration(&config);
-
-        let orchestrator_pane = &role_pane_ids[0];
-        let old_coder_pane = role_pane_ids[1].clone();
-        let old_reviewer_pane = role_pane_ids[2].clone();
-
-        // Orchestrator delegates to both workers.
-        {
-            let mut st = state.blocking_write();
-            st.delegate_events.push(crate::event::DelegateSignal {
-                pane_id: orchestrator_pane.clone(),
-                task: "Implement and review".to_string(),
-                to: vec!["coder".to_string(), "reviewer".to_string()],
-                timestamp: Utc::now(),
-            });
-        }
-
-        dispatch_delegate_events(
-            &state,
-            &pane,
-            &mut tab_manager,
-            &mut ui,
-            Rect::new(0, 0, 80, 24),
-        );
-
-        // Old panes should be closed.
-        let closed = mock.closed.lock().unwrap();
-        assert!(
-            closed.contains(&old_coder_pane),
-            "old coder pane should be closed"
-        );
-        assert!(
-            closed.contains(&old_reviewer_pane),
-            "old reviewer pane should be closed"
-        );
-
-        // New panes should be created (2 new panes for coder and reviewer).
-        let created = mock.created.lock().unwrap();
-        assert_eq!(created.len(), 2, "two new panes should be created");
-
-        // Prompts should be deferred (not directly written) because agent needs startup time.
-        assert_eq!(
-            ui.pending_dispatches.len(),
-            2,
-            "two pending dispatches for deferred prompt injection"
-        );
-
-        // State pane_role_map should have new pane IDs for coder and reviewer.
-        let st = state.blocking_read();
-        assert!(
-            !st.pane_role_map.contains_key(&old_coder_pane),
-            "old coder pane should be removed from role map"
-        );
-        assert!(
-            !st.pane_role_map.contains_key(&old_reviewer_pane),
-            "old reviewer pane should be removed from role map"
-        );
-        // New pane IDs should be mapped to the correct roles.
-        let new_coders: Vec<_> = st
-            .pane_role_map
-            .iter()
-            .filter(|(_, role)| *role == "coder")
-            .collect();
-        let new_reviewers: Vec<_> = st
-            .pane_role_map
-            .iter()
-            .filter(|(_, role)| *role == "reviewer")
-            .collect();
-        assert_eq!(new_coders.len(), 1, "exactly one coder mapping");
-        assert_eq!(new_reviewers.len(), 1, "exactly one reviewer mapping");
-    }
-
-    #[test]
-    fn dispatch_targets_only_specified_roles() {
-        let config = make_fanout_config(false); // clear=false
-        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
-            setup_orchestration(&config);
-
-        let orchestrator_pane = &role_pane_ids[0];
-        let coder_pane = &role_pane_ids[1];
-
-        // Delegate only to reviewer — coder should not receive anything.
-        {
-            let mut st = state.blocking_write();
-            st.delegate_events.push(crate::event::DelegateSignal {
-                pane_id: orchestrator_pane.clone(),
-                task: "Review the auth module".to_string(),
-                to: vec!["reviewer".to_string()],
-                timestamp: Utc::now(),
-            });
-        }
-
-        dispatch_delegate_events(
-            &state,
-            &pane,
-            &mut tab_manager,
-            &mut ui,
-            Rect::new(0, 0, 80, 24),
-        );
-
-        let written = mock.written.lock().unwrap();
-
-        // Coder should receive nothing.
-        let coder_writes: Vec<_> = written.iter().filter(|(id, _)| id == coder_pane).collect();
-        assert!(
-            coder_writes.is_empty(),
-            "coder pane should not receive a prompt when not targeted"
-        );
-
-        // Reviewer should receive exactly one prompt.
-        let reviewer_pane = &role_pane_ids[2];
-        let reviewer_writes: Vec<_> = written
-            .iter()
-            .filter(|(id, _)| id == reviewer_pane)
-            .collect();
-        assert_eq!(
-            reviewer_writes.len(),
-            1,
-            "reviewer pane should receive exactly one prompt"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Feedback loop integration tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn feedback_worker_result_injected_immediately() {
-        let config = make_fanout_config(false);
-        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
-            setup_orchestration(&config);
-
-        let orchestrator_pane = &role_pane_ids[0];
-        let coder_pane = &role_pane_ids[1];
-
-        // Make the orchestrator "ready" by inserting a session with agent_type != None.
-        {
-            let mut st = state.blocking_write();
-            let session_id = format!("session-{orchestrator_pane}");
-            st.sessions.insert(
-                session_id.clone(),
-                crate::state::SessionState {
-                    session_id,
-                    agent_type: AgentType::ClaudeCode,
-                    cwd: None,
-                    status: SessionStatus::Idle,
-                    active_tool: None,
-                    started_at: Utc::now(),
-                    last_activity: Utc::now(),
-                    recent_events: std::collections::VecDeque::new(),
-                    tool_count: 0,
-                    last_user_prompt: None,
-                    first_prompts: Vec::new(),
-                    pane_id: Some(orchestrator_pane.clone()),
-                },
-            );
-        }
-
-        // Worker coder signals work-done.
-        {
-            let mut st = state.blocking_write();
-            st.work_done_events.push(crate::event::WorkDoneSignal {
-                pane_id: coder_pane.clone(),
-                task: "Implemented auth module".to_string(),
-                done: false,
-                timestamp: Utc::now(),
-            });
-        }
-
-        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
-
-        // Feedback should be written directly to orchestrator pane.
-        let written = mock.written.lock().unwrap();
-        let orch_writes: Vec<_> = written
-            .iter()
-            .filter(|(id, _)| id == orchestrator_pane)
-            .collect();
-        assert_eq!(
-            orch_writes.len(),
-            1,
-            "orchestrator should receive one feedback message"
-        );
-        assert!(
-            orch_writes[0].1.contains("coder"),
-            "feedback should reference the coder role"
-        );
-
-        // No pending dispatches — message was injected immediately.
-        assert!(
-            ui.pending_dispatches.is_empty(),
-            "feedback should not be deferred when orchestrator is ready"
-        );
-
-        // Work-done events should be drained.
-        assert!(state.blocking_read().work_done_events.is_empty());
-    }
-
-    #[test]
-    fn feedback_multiple_workers_each_forwarded_independently() {
-        let config = make_fanout_config(false);
-        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
-            setup_orchestration(&config);
-
-        let orchestrator_pane = &role_pane_ids[0];
-        let coder_pane = &role_pane_ids[1];
-        let reviewer_pane = &role_pane_ids[2];
-
-        // Make orchestrator ready.
-        {
-            let mut st = state.blocking_write();
-            let session_id = format!("session-{orchestrator_pane}");
-            st.sessions.insert(
-                session_id.clone(),
-                crate::state::SessionState {
-                    session_id,
-                    agent_type: AgentType::ClaudeCode,
-                    cwd: None,
-                    status: SessionStatus::Idle,
-                    active_tool: None,
-                    started_at: Utc::now(),
-                    last_activity: Utc::now(),
-                    recent_events: std::collections::VecDeque::new(),
-                    tool_count: 0,
-                    last_user_prompt: None,
-                    first_prompts: Vec::new(),
-                    pane_id: Some(orchestrator_pane.clone()),
-                },
-            );
-        }
-
-        // Both workers signal work-done (simulating parallel completion).
-        {
-            let mut st = state.blocking_write();
-            st.work_done_events.push(crate::event::WorkDoneSignal {
-                pane_id: coder_pane.clone(),
-                task: "Implemented auth".to_string(),
-                done: false,
-                timestamp: Utc::now(),
-            });
-            st.work_done_events.push(crate::event::WorkDoneSignal {
-                pane_id: reviewer_pane.clone(),
-                task: "Reviewed auth".to_string(),
-                done: false,
-                timestamp: Utc::now(),
-            });
-        }
-
-        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
-
-        // Each worker result should be forwarded independently — two separate writes.
-        let written = mock.written.lock().unwrap();
-        let orch_writes: Vec<_> = written
-            .iter()
-            .filter(|(id, _)| id == orchestrator_pane)
-            .collect();
-        assert_eq!(
-            orch_writes.len(),
-            2,
-            "orchestrator should receive two feedback messages (one per worker)"
-        );
-
-        // One message should reference coder, the other reviewer.
-        let mentions_coder = orch_writes.iter().any(|(_, text)| text.contains("coder"));
-        let mentions_reviewer = orch_writes
-            .iter()
-            .any(|(_, text)| text.contains("reviewer"));
-        assert!(mentions_coder, "one feedback should reference coder");
-        assert!(mentions_reviewer, "one feedback should reference reviewer");
-
-        // No batching — no pending dispatches.
-        assert!(ui.pending_dispatches.is_empty());
-    }
-
-    #[test]
-    fn feedback_orchestrator_done_completes_orchestration() {
-        let config = make_fanout_config(false);
-        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
-            setup_orchestration(&config);
-
-        let orchestrator_pane = &role_pane_ids[0];
-
-        // Orchestrator signals done.
-        {
-            let mut st = state.blocking_write();
-            st.work_done_events.push(crate::event::WorkDoneSignal {
-                pane_id: orchestrator_pane.clone(),
-                task: "All tasks complete".to_string(),
-                done: true,
-                timestamp: Utc::now(),
-            });
-        }
-
-        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
-
-        // Orchestration should be marked Completed.
-        if let Tab::Orchestration { status, .. } = &tab_manager.tabs()[1] {
-            assert_eq!(
-                *status,
-                OrchestrationStatus::Completed,
-                "orchestration should be completed"
-            );
-        } else {
-            panic!("expected Orchestration tab");
-        }
-
-        // Status message should be set.
-        assert!(
-            ui.status_message.is_some(),
-            "completion should set a status message"
-        );
-        assert!(ui.status_message.as_ref().unwrap().0.contains("complete"));
-
-        // Done signal should NOT cause a write to the orchestrator pane.
-        let written = mock.written.lock().unwrap();
-        let orch_writes: Vec<_> = written
-            .iter()
-            .filter(|(id, _)| id == orchestrator_pane)
-            .collect();
-        assert!(
-            orch_writes.is_empty(),
-            "done signal should not echo back to orchestrator"
-        );
-    }
-
-    #[test]
-    fn feedback_deferred_when_orchestrator_not_ready() {
-        let config = make_fanout_config(false);
-        let (state, mock, pane, mut tab_manager, mut ui, role_pane_ids, _dir) =
-            setup_orchestration(&config);
-
-        let orchestrator_pane = &role_pane_ids[0];
-        let coder_pane = &role_pane_ids[1];
-
-        // Do NOT insert a session for the orchestrator — it's not ready.
-
-        // Worker signals work-done.
-        {
-            let mut st = state.blocking_write();
-            st.work_done_events.push(crate::event::WorkDoneSignal {
-                pane_id: coder_pane.clone(),
-                task: "Implemented feature".to_string(),
-                done: false,
-                timestamp: Utc::now(),
-            });
-        }
-
-        feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
-
-        // No direct write — orchestrator not ready.
-        let written = mock.written.lock().unwrap();
-        let orch_writes: Vec<_> = written
-            .iter()
-            .filter(|(id, _)| id == orchestrator_pane)
-            .collect();
-        assert!(
-            orch_writes.is_empty(),
-            "should not write when orchestrator is not ready"
-        );
-
-        // Feedback should be deferred to pending_dispatches.
-        assert_eq!(
-            ui.pending_dispatches.len(),
-            1,
-            "feedback should be queued as pending dispatch"
-        );
-        assert_eq!(ui.pending_dispatches[0].pane_id, *orchestrator_pane);
-        assert!(ui.pending_dispatches[0].prompt.contains("coder"));
-    }
-
-    // PRD #76 M2.18: the quit dialog collapsed from three options (Quit /
-    // Detach / Cancel) to two mode-dependent ones. Pin the dispatch so a
-    // future refactor can't silently drop the mode-awareness — local mode
-    // must yield `KeyResult::Quit` (reap local children) and external mode
-    // must yield `KeyResult::DetachAndQuit` (emit KIND_DETACH so the daemon
-    // log distinguishes voluntary detach from EOF).
-    #[test]
-    fn quit_confirm_enter_in_local_mode_returns_quit() {
+    fn quit_confirm_enter_returns_detach() {
         let mut ui = default_ui();
-        ui.via_daemon = false;
-        ui.mode = UiMode::QuitConfirm;
-        ui.quit_confirm_selected = 0;
-
-        let result =
-            handle_quit_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
-        assert!(matches!(result, KeyResult::Quit));
-    }
-
-    #[test]
-    fn quit_confirm_enter_in_external_daemon_mode_returns_detach() {
-        let mut ui = default_ui();
-        ui.via_daemon = true;
         ui.mode = UiMode::QuitConfirm;
         ui.quit_confirm_selected = 0;
 
@@ -10436,17 +9494,14 @@ mod tests {
 
     #[test]
     fn quit_confirm_cancel_returns_to_normal_mode() {
-        for via_daemon in [false, true] {
-            let mut ui = default_ui();
-            ui.via_daemon = via_daemon;
-            ui.mode = UiMode::QuitConfirm;
-            ui.quit_confirm_selected = 1;
+        let mut ui = default_ui();
+        ui.mode = UiMode::QuitConfirm;
+        ui.quit_confirm_selected = 1;
 
-            let result =
-                handle_quit_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
-            assert!(matches!(result, KeyResult::Continue));
-            assert_eq!(ui.mode, UiMode::Normal);
-        }
+        let result =
+            handle_quit_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+        assert!(matches!(result, KeyResult::Continue));
+        assert_eq!(ui.mode, UiMode::Normal);
     }
 
     #[test]

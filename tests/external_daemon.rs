@@ -24,6 +24,8 @@ use std::time::Duration;
 use dot_agent_deck::daemon_attach::{ensure_daemon_running, spawn_daemon_serve_detached_with_exe};
 use dot_agent_deck::daemon_client::DaemonClient;
 
+mod common;
+
 // Same umask-narrowing serialization as the other integration test
 // binaries — `bind_socket` flips the process-global umask while binding,
 // and a tempdir created inside that window inherits 0o600. Hold this
@@ -64,6 +66,7 @@ struct DaemonTestCleanup {
     prev_attach: Option<String>,
     prev_hook: Option<String>,
     prev_state: Option<String>,
+    prev_lock_dir: Option<String>,
 }
 
 impl Drop for DaemonTestCleanup {
@@ -87,12 +90,25 @@ impl Drop for DaemonTestCleanup {
                 Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
                 None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
             }
+            match &self.prev_lock_dir {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_LOCK_DIR", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_LOCK_DIR"),
+            }
         }
     }
 }
 
 #[tokio::test]
 async fn lazy_spawn_binds_trusted_socket_and_serves_list_agents() {
+    // Redirect the daemon's lock dir into a per-binary tempdir.
+    // Round-10 auditor #4: the in-process override (set inside
+    // init_test_env) is sufficient for tests that don't fork a child,
+    // but THIS test fork-execs a real `dot-agent-deck daemon serve`
+    // and the child can't see the parent's OnceLock — so we ALSO set
+    // the env var below, where the other test-only env vars are
+    // already mutated under the harness bind lock.
+    common::init_test_env();
+    let lock_dir = common::lock_dir_path().expect("init_test_env must have created the lock dir");
     let dir = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         tempfile::tempdir().unwrap()
@@ -116,6 +132,7 @@ async fn lazy_spawn_binds_trusted_socket_and_serves_list_agents() {
         prev_attach: std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok(),
         prev_hook: std::env::var("DOT_AGENT_DECK_SOCKET").ok(),
         prev_state: std::env::var("DOT_AGENT_DECK_STATE_DIR").ok(),
+        prev_lock_dir: std::env::var("DOT_AGENT_DECK_LOCK_DIR").ok(),
     };
     // SAFETY: tests in a single test binary share env; this whole test
     // binary serializes via the lock above for the bind-mode-sensitive
@@ -124,6 +141,7 @@ async fn lazy_spawn_binds_trusted_socket_and_serves_list_agents() {
         std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &attach_path);
         std::env::set_var("DOT_AGENT_DECK_SOCKET", &hook_path);
         std::env::set_var("DOT_AGENT_DECK_STATE_DIR", &state_dir);
+        std::env::set_var("DOT_AGENT_DECK_LOCK_DIR", &lock_dir);
     }
 
     let exe = dot_agent_deck_bin();

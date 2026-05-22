@@ -58,7 +58,13 @@ pub fn socket_path() -> PathBuf {
         return PathBuf::from(runtime_dir).join("dot-agent-deck.sock");
     }
 
-    PathBuf::from("/tmp/dot-agent-deck.sock")
+    // PRD #93 reviewer REV-2: the `/tmp` fallback must include the uid so
+    // two users on the same host can't collide on the same socket path
+    // (the daemon is per-user; the 0o600 mode is on the socket inode, but
+    // the *path* still has to be unique, otherwise the loser's `bind(2)`
+    // sees `EADDRINUSE` against the winner's inode). Same rationale as
+    // `attach_socket_path` below.
+    PathBuf::from(format!("/tmp/dot-agent-deck-{}.sock", current_uid()))
 }
 
 /// Path of the M1.2 streaming-attach Unix socket. Separate from the existing
@@ -76,7 +82,21 @@ pub fn attach_socket_path() -> PathBuf {
         return PathBuf::from(runtime_dir).join("dot-agent-deck-attach.sock");
     }
 
-    PathBuf::from("/tmp/dot-agent-deck-attach.sock")
+    // PRD #93 reviewer REV-2: include the uid in the `/tmp` fallback path so
+    // two users on the same host get disjoint sockets (each daemon's
+    // `bind(2)` would otherwise collide with the other user's inode), and
+    // so the path itself can't be observed by another user to figure out
+    // *which* deck process to target. The 0o600 mode on the inode is
+    // already enforced; the per-user path is the missing half.
+    PathBuf::from(format!("/tmp/dot-agent-deck-attach-{}.sock", current_uid()))
+}
+
+/// Current OS uid, used to namespace the `/tmp` fallback sockets per user.
+/// Wraps `libc::getuid` so the unsafe is centralized in one place.
+fn current_uid() -> u32 {
+    // SAFETY: `getuid(2)` is async-signal-safe and has no failure mode; it
+    // simply returns the calling process's real uid.
+    unsafe { libc::getuid() }
 }
 
 /// Per-user state directory. Used by lazy-spawn (PRD #76 M4.3) for the
@@ -950,6 +970,61 @@ timeout_secs = 600
     fn auto_config_prompt_deserialize_false() {
         let dc: DashboardConfig = toml::from_str("auto_config_prompt = false").unwrap();
         assert!(!dc.auto_config_prompt);
+    }
+
+    #[test]
+    fn attach_socket_fallback_is_per_user() {
+        // PRD #93 round-2 reviewer REV-2: when XDG_RUNTIME_DIR is unset
+        // *and* DOT_AGENT_DECK_ATTACH_SOCKET is unset, the fallback under
+        // /tmp must include the uid so two users on the same host don't
+        // collide. The old `/tmp/dot-agent-deck-attach.sock` would
+        // sandwich two daemons onto one path and let the first binder
+        // arbitrarily lock the rest of the host out.
+        let _g = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+        let prev_sock = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
+        let prev_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: state-dir lock held, restored on the way out.
+        unsafe {
+            std::env::remove_var("DOT_AGENT_DECK_ATTACH_SOCKET");
+            std::env::remove_var("DOT_AGENT_DECK_SOCKET");
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+
+        // SAFETY: getuid is async-signal-safe and infallible.
+        let uid = unsafe { libc::getuid() };
+        let attach = attach_socket_path();
+        let hook = socket_path();
+        let attach_str = attach.to_string_lossy();
+        let hook_str = hook.to_string_lossy();
+        assert!(
+            attach_str.contains(&format!("-{uid}.sock")),
+            "attach fallback must embed uid: got {attach_str}"
+        );
+        assert!(
+            hook_str.contains(&format!("-{uid}.sock")),
+            "hook fallback must embed uid: got {hook_str}"
+        );
+        assert!(
+            attach_str.starts_with("/tmp/"),
+            "attach fallback should live under /tmp when XDG is unset: got {attach_str}"
+        );
+
+        // SAFETY: same lock; restoring previous values.
+        unsafe {
+            match prev_attach {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_ATTACH_SOCKET"),
+            }
+            match prev_sock {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
     }
 
     #[test]

@@ -1,0 +1,60 @@
+//! Shared helpers for integration tests.
+//!
+//! ## Why this module exists
+//!
+//! `dot_agent_deck::daemon::run_daemon_with` acquires an exclusive
+//! `flock(2)` over a per-socket `.lock` file before binding. The lock
+//! file lives in a user-owned directory resolved by `lock_root` in this
+//! order:
+//!
+//! 1. `Daemon::lock_dir_override` (set by `with_lock_dir_override`)
+//! 2. `DOT_AGENT_DECK_LOCK_DIR` env var
+//! 3. `$XDG_RUNTIME_DIR/dot-agent-deck`
+//! 4. `$HOME/.cache/dot-agent-deck`
+//!
+//! On a CI runner whose `XDG_RUNTIME_DIR` points at a path the test
+//! process can't `mkdir` / `set_permissions` on — or whose
+//! `~/.cache/dot-agent-deck` was pre-created at restrictive perms by an
+//! earlier user — `ensure_lock_root` returns `PermissionDenied` and the
+//! daemon fails to start. Every test that spawns a daemon hits this.
+//!
+//! The fix: each test redirects `lock_root` to a per-binary tempdir by
+//! constructing its daemon with
+//! `Daemon::new(state).with_lock_dir_override(common::lock_dir_path())`
+//! (or the equivalent on `Daemon::with_attach`). The tempdir is shared
+//! by every test in the binary; lock files are suffixed with a stable
+//! hash of the full socket path, so distinct tests' locks don't
+//! collide.
+//!
+//! Round-11 reviewer #B: the override is a per-`Daemon` builder field,
+//! not a process-wide static. Production builds compile without any
+//! "set the lock dir from anywhere in the process" surface, and the
+//! daemon's lock root cannot be steered by code other than the
+//! constructor.
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
+use tempfile::TempDir;
+
+/// Holds the per-binary tempdir for the entire test run.
+static LOCK_DIR_GUARD: OnceLock<TempDir> = OnceLock::new();
+
+/// Idempotent setup hook. Call once before constructing a daemon in a
+/// test — typically at the start of a `spawn_daemon` helper. Creates
+/// the per-binary tempdir on first call; subsequent calls are no-ops.
+pub fn init_test_env() {
+    LOCK_DIR_GUARD.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("dot-agent-deck-test-lock-")
+            .tempdir()
+            .expect("create per-binary lock-dir tempdir")
+    });
+}
+
+/// Path to the per-binary lock-dir tempdir, for passing to
+/// [`dot_agent_deck::daemon::Daemon::with_lock_dir_override`] (in-process
+/// tests) or to `Command::env` for subprocess-based tests. Returns
+/// `None` if [`init_test_env`] was never called.
+pub fn lock_dir_path() -> Option<PathBuf> {
+    LOCK_DIR_GUARD.get().map(|d| d.path().to_path_buf())
+}

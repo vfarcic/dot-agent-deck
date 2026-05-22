@@ -88,15 +88,52 @@ fn default_clear() -> bool {
     true
 }
 
+/// Resolve an orchestration name with the cwd-basename fallback that
+/// the TUI applies when constructing `TabMembership::Orchestration` and
+/// when labelling the `Tab::Orchestration` record. Empty / whitespace
+/// config names — produced by `#[serde(default)]` on `OrchestrationConfig::name`
+/// or by the user not writing a `name = ...` line — resolve to the
+/// basename of `dir`; falls back to the path's `display()` form when the
+/// dir has no basename (e.g. `/`).
+///
+/// Centralized so the TUI's tab construction site, the TUI's hydration
+/// site, and the daemon's `handle_delegate` lookup all agree on the
+/// resolved-name string. Without this single-source contract, an
+/// unnamed orchestration's TabMembership carries the basename but the
+/// daemon's freshly-loaded config still has `name = ""`, and
+/// `handle_delegate`'s `orch.name == orchestration_name` lookup
+/// misses — silently dropping per-role `prompt_template` wrapping
+/// (round-10 reviewer #1).
+pub fn resolve_orchestration_name(config_name: &str, dir: &Path) -> String {
+    if !config_name.is_empty() {
+        return config_name.to_string();
+    }
+    dir.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| dir.display().to_string())
+}
+
 pub fn load_project_config(dir: &Path) -> Result<Option<ProjectConfig>, ProjectConfigError> {
     let path = dir.join(CONFIG_FILE_NAME);
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
-            let config: ProjectConfig =
+            let mut config: ProjectConfig =
                 toml::from_str(&contents).map_err(|source| ProjectConfigError::Parse {
                     path: path.display().to_string(),
                     source,
                 })?;
+            // Round-10 reviewer #1: normalize empty orchestration names
+            // to the cwd-basename fallback at load time, so the daemon's
+            // `handle_delegate` lookup-by-name matches what
+            // `tab.rs::open_orchestration_tab` stored in the
+            // `TabMembership` / `Tab::Orchestration::name`. Both sides
+            // call this loader; doing the normalization here is the one
+            // place that keeps the contract consistent.
+            for orch in &mut config.orchestrations {
+                if orch.name.is_empty() {
+                    orch.name = resolve_orchestration_name(&orch.name, dir);
+                }
+            }
             Ok(Some(config))
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),

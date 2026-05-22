@@ -215,7 +215,13 @@ impl Drop for SpawnLock {
 /// blocking, so we run the syscall on `spawn_blocking` to avoid stalling
 /// other tasks scheduled on the same tokio worker when contention is real
 /// (i.e., another caller on this host is mid-spawn).
-async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
+///
+/// `pub(crate)` so the daemon's `run_daemon_with` can reuse the same
+/// primitive to serialize its own probe-remove-bind sequence against
+/// concurrent `daemon serve` starts (PRD #93 auditor BLOCKER — two
+/// daemons probing a stale socket would otherwise both `remove_file` and
+/// both `bind`, clobbering each other's clients).
+pub(crate) async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let path = path.to_path_buf();
@@ -351,10 +357,13 @@ pub fn spawn_daemon_serve_detached_with_exe(state_dir: &Path, exe: &Path) -> std
 }
 
 /// Returns true if `DOT_AGENT_DECK_VIA_DAEMON` is set to a truthy value
-/// (`1`, `true`, `yes`, case-insensitive). The TUI bootstrap branches on this
-/// to decide between in-process daemon (false) and lazy-spawn-an-external
-/// one (true). Centralized here so the test that asserts the unset case
-/// doesn't duplicate the parsing rule that lives in production.
+/// (`1`, `true`, `yes`, case-insensitive). Pre-PRD-93 this controlled the
+/// in-process-vs-external decision directly; now (PRD #93 M1.1) the default
+/// is "external," and this helper exists only to recognize the historical
+/// opt-in spelling. Kept because `connect.rs` still injects
+/// `DOT_AGENT_DECK_VIA_DAEMON=1` over `ssh -t` for the remote bootstrap (a
+/// no-op against the new default but harmless), and a few tests still drive
+/// the parser directly.
 pub fn via_daemon_enabled() -> bool {
     std::env::var(DOT_AGENT_DECK_VIA_DAEMON)
         .ok()

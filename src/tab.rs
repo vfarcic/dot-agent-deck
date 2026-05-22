@@ -8,7 +8,7 @@ use crate::agent_pty::TabMembership;
 use crate::event::{AgentType, EventType};
 use crate::mode_manager::{ModeManager, ModeManagerError};
 use crate::pane::{AgentSpawnOptions, PaneController};
-use crate::project_config::{ModeConfig, OrchestrationConfig};
+use crate::project_config::{ModeConfig, OrchestrationConfig, resolve_orchestration_name};
 use crate::state::SessionState;
 
 // ---------------------------------------------------------------------------
@@ -243,6 +243,21 @@ impl TabManager {
         let mut role_pane_ids: Vec<String> = Vec::with_capacity(config.roles.len());
         let (spawn_rows, spawn_cols) = spawn_dims;
 
+        // CodeRabbit round-9 #7 / round-10 #1: `config.name` defaults
+        // to an empty string when the user didn't name their
+        // orchestration. We fall back to the cwd basename so the
+        // daemon-side `TabMembership` carries the same resolved label
+        // as the local `Tab::Orchestration` record AND the same label
+        // that `load_project_config` now writes into the parsed
+        // `OrchestrationConfig.name` on the daemon side. Without that
+        // three-way agreement, every Orchestration `TabMembership`
+        // would echo "" on reconnect (`partition_hydrated_panes` keys
+        // against `("", cwd)`, collapsing parallel unnamed
+        // orchestrations) AND the daemon's `handle_delegate` lookup
+        // would never match the role's `prompt_template` for
+        // unnamed orchestrations.
+        let resolved_name = resolve_orchestration_name(&config.name, std::path::Path::new(cwd));
+
         // PRD #76 M2.12: tag each role pane with its orchestration tab
         // membership so the daemon-side registry can echo it back via
         // `list_agents` and the TUI rebuilds the orchestration tab on
@@ -251,8 +266,15 @@ impl TabManager {
             let opts = AgentSpawnOptions {
                 display_name: Some(role.name.as_str()),
                 tab_membership: Some(TabMembership::Orchestration {
-                    name: config.name.clone(),
+                    name: resolved_name.clone(),
                     role_index,
+                    role_name: role.name.clone(),
+                    is_start_role: role.start,
+                    // Round-11 auditor #C: carry the orchestration's
+                    // cwd (shared across every role pane in this tab)
+                    // so the daemon can disambiguate two unnamed
+                    // orchestrations whose basenames collide.
+                    orchestration_cwd: Some(cwd.to_string()),
                 }),
                 rows: spawn_rows,
                 cols: spawn_cols,
@@ -286,18 +308,9 @@ impl TabManager {
 
         let start_role_index = config.roles.iter().position(|r| r.start).unwrap_or(0);
 
-        let name = if config.name.is_empty() {
-            std::path::Path::new(cwd)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| cwd.to_string())
-        } else {
-            config.name.clone()
-        };
-
         self.tabs.push(Tab::Orchestration {
             id,
-            name,
+            name: resolved_name,
             role_pane_ids: role_pane_ids.clone(),
             role_statuses: vec![OrchestrationRoleStatus::Waiting; config.roles.len()],
             cwd: cwd.to_string(),
@@ -402,14 +415,7 @@ impl TabManager {
 
         let start_role_index = config.roles.iter().position(|r| r.start).unwrap_or(0);
 
-        let name = if config.name.is_empty() {
-            std::path::Path::new(cwd)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| cwd.to_string())
-        } else {
-            config.name.clone()
-        };
+        let name = resolve_orchestration_name(&config.name, std::path::Path::new(cwd));
 
         self.tabs.push(Tab::Orchestration {
             id,

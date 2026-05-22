@@ -125,7 +125,7 @@ async fn hydrate_creates_panes_for_existing_agents() {
     // emitted its echo, and the parser assertion below would race.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -191,7 +191,7 @@ async fn hydrate_returns_empty_when_no_agents_exist() {
     // normal "No active sessions..." view. The hydrate call must not error
     // and must not create any panes.
     let server = start_real_server().await;
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -221,7 +221,7 @@ async fn hydrate_treats_list_agents_failure_as_empty() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("does-not-exist.sock");
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         missing,
         tokio::runtime::Handle::current(),
     ));
@@ -331,7 +331,7 @@ async fn hydrate_preserves_pane_id_from_agent_env() {
         .await
         .expect("start_agent should succeed");
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -426,7 +426,7 @@ async fn hydrate_falls_back_to_allocated_id_for_legacy_daemon() {
         run_legacy_list_server(listener).await;
     });
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         path,
         tokio::runtime::Handle::current(),
     ));
@@ -496,7 +496,7 @@ async fn hydrate_treats_list_agents_timeout_as_empty() {
         run_silent_list_server(listener).await;
     });
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         path,
         tokio::runtime::Handle::current(),
     ));
@@ -540,7 +540,7 @@ async fn hydrate_skips_agent_that_disappears_between_list_and_attach() {
         run_partial_attach_server(listener).await;
     });
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         path,
         tokio::runtime::Handle::current(),
     ));
@@ -613,7 +613,7 @@ async fn hydrate_drops_oversize_pane_id_env_at_capture() {
     );
 
     // Client-side: hydrate must produce a numeric (allocate_id) pane id.
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -672,7 +672,7 @@ async fn hydrate_drops_control_char_pane_id_env_at_capture() {
         record.pane_id_env
     );
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -698,13 +698,20 @@ async fn hydrate_drops_control_char_pane_id_env_at_capture() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hydrate_dedups_duplicate_pane_id_env() {
-    // Two agents spawned with the *same* DOT_AGENT_DECK_PANE_ID. Both pass
-    // the daemon's grammar check (so both records carry the value), but
-    // the client's hydration dedup must keep the first reuse and fall back
-    // to allocate_id() for the second — otherwise the second pane would
-    // HashMap::insert-overwrite the first in `wire_stream_pane`, silently
-    // hiding it after reconnect.
+async fn duplicate_pane_id_env_is_rejected_at_spawn_time() {
+    // CodeRabbit MAJOR (PRD #93 round-9): two agents must never share a
+    // `pane_id_env`. `write_to_pane` keys off that string when routing
+    // delegate/work-done writes, so a second spawn with the same id
+    // would silently misroute every write to whichever `values().find`
+    // entry the HashMap iterator happened to visit first.
+    //
+    // The pre-round-9 contract was looser: the daemon stored both, and
+    // the client's `hydrate_from_daemon` deduped by keeping the first
+    // reuse and falling the second back to `allocate_id()`. That
+    // protected only the hydration HashMap-collision case in
+    // `wire_stream_pane`; the delegate/work-done routing remained
+    // broken because the daemon had no consistent winner. The new
+    // contract: reject at spawn time, where the bad request originates.
     let server = start_real_server().await;
     let client = DaemonClient::new(server.path.clone());
 
@@ -720,7 +727,8 @@ async fn hydrate_dedups_duplicate_pane_id_env() {
         })
         .await
         .expect("start_agent A should succeed");
-    let agent_b = client
+
+    let err = client
         .start_agent(StartAgentOptions {
             command: Some("sh -c 'sleep 30'".into()),
             env: vec![(
@@ -730,60 +738,22 @@ async fn hydrate_dedups_duplicate_pane_id_env() {
             ..Default::default()
         })
         .await
-        .expect("start_agent B should succeed");
+        .expect_err("duplicate pane_id_env spawn must fail");
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("duplicate"),
+        "expected a duplicate-pane-id error, got: {msg}"
+    );
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
-        server.path.clone(),
-        tokio::runtime::Handle::current(),
-    ));
-    let hydrated = {
-        let ctrl = ctrl.clone();
-        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
-            .await
-            .unwrap()
-    };
-
+    // First agent must survive the rejected duplicate spawn.
+    let records = server.registry.agent_records();
     assert_eq!(
-        hydrated.len(),
-        2,
-        "both agents must hydrate as distinct panes — dedup must not drop one entirely"
+        records.iter().filter(|r| r.id == agent_a).count(),
+        1,
+        "first agent must survive the rejected duplicate spawn"
     );
 
-    let pane_ids: Vec<&str> = hydrated.iter().map(|h| h.pane_id.as_str()).collect();
-    assert_ne!(
-        pane_ids[0], pane_ids[1],
-        "duplicate pane_id_env must produce distinct pane ids — got {pane_ids:?}"
-    );
-
-    // Exactly one of the two panes should reuse the shared value; the
-    // other must fall back to a numeric allocate_id().
-    let reused = pane_ids.iter().filter(|id| **id == shared_pane_env).count();
-    assert_eq!(
-        reused, 1,
-        "exactly one pane should reuse the shared pane_id_env — got {pane_ids:?}"
-    );
-    let allocated = pane_ids
-        .iter()
-        .filter(|id| id.parse::<u64>().is_ok())
-        .count();
-    assert_eq!(
-        allocated, 1,
-        "exactly one pane should fall back to allocate_id() — got {pane_ids:?}"
-    );
-
-    // Both panes must end up registered in the controller's pane registry —
-    // i.e. neither one was silently overwritten by a HashMap::insert
-    // collision in `wire_stream_pane`.
-    let registered = ctrl.pane_ids();
-    assert_eq!(
-        registered.len(),
-        2,
-        "both panes must be registered after dedup; got {registered:?}"
-    );
-
-    drop(ctrl);
     let _ = server.registry.close_agent(&agent_a);
-    let _ = server.registry.close_agent(&agent_b);
 }
 
 // ---------------------------------------------------------------------------
@@ -814,7 +784,7 @@ async fn hydrate_preserves_agent_type_end_to_end() {
         .await
         .expect("start_agent should succeed");
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));
@@ -878,7 +848,7 @@ async fn hydrate_preserves_agent_type_end_to_end_opencode() {
         .await
         .expect("start_agent should succeed");
 
-    let ctrl = Arc::new(EmbeddedPaneController::with_remote_deck(
+    let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
     ));

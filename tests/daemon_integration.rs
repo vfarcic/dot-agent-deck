@@ -34,6 +34,8 @@ use dot_agent_deck::daemon_protocol::{
 };
 use dot_agent_deck::state::AppState;
 
+mod common;
+
 // Same umask-narrowing serialization as the other integration test
 // binaries — see comments in tests/daemon_protocol.rs.
 static HARNESS_BIND_LOCK: Mutex<()> = Mutex::new(());
@@ -51,6 +53,7 @@ impl Drop for DaemonHandle {
 }
 
 async fn spawn_daemon() -> DaemonHandle {
+    common::init_test_env();
     let (dir, hook_path, attach_path) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
@@ -61,8 +64,9 @@ async fn spawn_daemon() -> DaemonHandle {
 
     let state = Arc::new(RwLock::new(AppState::default()));
     let attach_for_daemon = attach_path.clone();
+    let lock_dir = common::lock_dir_path();
     let handle = tokio::spawn(async move {
-        let daemon = Daemon::with_attach(state, attach_for_daemon);
+        let daemon = Daemon::with_attach(state, attach_for_daemon).with_lock_dir_override(lock_dir);
         let _ = run_daemon_with(&hook_path, daemon).await;
     });
 

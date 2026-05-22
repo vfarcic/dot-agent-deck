@@ -5,8 +5,10 @@ use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use tracing::warn;
 
+use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
 use crate::event::{AgentEvent, AgentType, DelegateSignal, EventType, WorkDoneSignal};
+use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
 const MAX_RECENT_EVENTS: usize = 50;
 const MAX_FIRST_PROMPTS: usize = 3;
@@ -70,13 +72,83 @@ pub struct AppState {
     pub pane_cwd_map: HashMap<String, String>,
     /// Pane IDs that are orchestrator (start=true) roles — only these can delegate.
     pub orchestrator_pane_ids: HashSet<String>,
-    /// Delegate signals from the orchestrator, consumed by dispatch (M5).
-    pub delegate_events: Vec<DelegateSignal>,
-    /// Work-done signals from workers (or orchestrator --done), consumed by feedback (M5b).
-    pub work_done_events: Vec<WorkDoneSignal>,
+    /// Maps pane_id → (orchestration name, orchestration cwd). Lets the
+    /// daemon's dispatch (`handle_delegate` / `handle_work_done`) scope
+    /// target lookups to panes in the *same* orchestration tab when
+    /// several tabs run in parallel (PRD #93 round-5).
+    ///
+    /// Round-11 auditor #C: the identity is a `(name, cwd)` tuple, not
+    /// just name. Two unnamed orchestrations whose `name`s both fall
+    /// back to the same cwd-basename — e.g. `~/project-a/foo` and
+    /// `~/project-b/foo` — would otherwise collide here and a
+    /// `Delegate` from A's orchestrator could cross-route to B's
+    /// coder. The cwd disambiguator is the cwd the TUI passed at
+    /// StartAgent time; in practice all role panes in one orchestration
+    /// share that cwd, so within-orchestration scoping still finds all
+    /// the right panes.
+    pub pane_orchestration_map: HashMap<String, (String, String)>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
+
+/// Compose the prompt that the daemon writes into a worker pane on
+/// delegation: the caller-supplied `task_body` (typically a one-liner
+/// pointing at `.dot-agent-deck/worker-task-{role}.md`), a blank line,
+/// then the work-done footer that reminds the worker to signal
+/// completion via `dot-agent-deck work-done` once they finish.
+///
+/// The footer used to be appended per-role by the TUI's
+/// `OrchestrationConfig.roles[*].prompt_template` wrapping. PRD #93
+/// round-5 moved dispatch into the daemon but left
+/// `OrchestrationConfig` out of scope, so without this helper every
+/// delegated task lost the footer and workers stopped signaling back.
+pub fn compose_delegate_prompt(task_body: &str) -> String {
+    format!(
+        "{task_body}\n\n## When done\n\n\
+         Signal completion by running this command via Bash:\n\
+         ```bash\n\
+         dot-agent-deck work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
+         ```"
+    )
+}
+
+/// CodeRabbit (PRD #93 round-9): build the file contents written to
+/// `.dot-agent-deck/worker-task-{role}.md` for a delegation. When the
+/// role config supplies a `prompt_template`, wrap the task under a
+/// `## Task` header beneath the template — mirrors the pre-Round-5 TUI
+/// dispatch path that Round 5 lost when it moved orchestration onto
+/// the daemon side without bringing the per-role template wrapping
+/// along. With no template the file content is the raw task; the
+/// PTY-injected one-liner still appends the work-done footer in both
+/// shapes via [`compose_delegate_prompt`].
+pub fn compose_worker_task_file(prompt_template: Option<&str>, task: &str) -> String {
+    match prompt_template {
+        Some(tpl) if !tpl.trim().is_empty() => format!("{tpl}\n\n## Task\n\n{task}"),
+        _ => task.to_string(),
+    }
+}
+
+/// Look up the role config for `role_name` inside the orchestration
+/// named `orchestration_name`, by parsing the project config file at
+/// `cwd`. Returns `None` when any layer is missing (no project config,
+/// no matching orchestration, no matching role) — the caller treats
+/// "no config" as "no template, no clear" and falls through to the
+/// default behavior. Centralizing the lookup here keeps
+/// `handle_delegate` from juggling three layers of `Option` inline.
+fn lookup_orchestration_role(
+    cwd: &str,
+    orchestration_name: &str,
+    role_name: &str,
+) -> Option<OrchestrationRoleConfig> {
+    let cfg = load_project_config(std::path::Path::new(cwd))
+        .ok()
+        .flatten()?;
+    let orch = cfg
+        .orchestrations
+        .into_iter()
+        .find(|o| o.name == orchestration_name)?;
+    orch.roles.into_iter().find(|r| r.name == role_name)
+}
 
 impl AppState {
     pub fn aggregate_stats(&self) -> DashboardStats {
@@ -150,11 +222,33 @@ impl AppState {
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
+        self.pane_orchestration_map.remove(pane_id);
     }
 
-    /// Handle a delegate signal from the orchestrator.
-    /// Validates that the sender is an orchestrator (start=true) role before enqueuing.
-    pub fn handle_delegate(&mut self, signal: DelegateSignal) {
+    /// Handle an orchestrator's delegate signal: validate the sender, look
+    /// up each target role's pane, and write the task prompt into that
+    /// pane's PTY directly.
+    ///
+    /// PRD #93 round-5: this used to enqueue into `delegate_events` for the
+    /// TUI to drain. The TUI's `dispatch_delegate_events` did the role →
+    /// pane resolution, built the prompt, and wrote it via the pane
+    /// controller. That model required the daemon to broadcast the signal
+    /// across the attach socket — a hop that lost messages whenever the
+    /// deck was detached. Now the daemon owns the flow end to end: it has
+    /// the role map (populated at `StartAgent` time), the cwd map, and the
+    /// PTY registry, so it builds the file-backed prompt and writes the
+    /// one-liner directly into the target PTY. The bytes land in the
+    /// pane's scrollback like any other terminal output, surviving any
+    /// number of detach/reattach cycles via the standard pane snapshot
+    /// replay.
+    ///
+    /// The orchestrator pane that issued the delegate is identified by
+    /// presence in `orchestrator_pane_ids`; non-orchestrator senders are
+    /// rejected as anti-spoofing. Targets are restricted to panes in the
+    /// same orchestration (via `pane_orchestration_map`) so a parallel
+    /// orchestration tab's `coder` pane doesn't receive a sibling tab's
+    /// task.
+    pub async fn handle_delegate(&self, signal: DelegateSignal, registry: &AgentPtyRegistry) {
         if !self.pane_role_map.contains_key(&signal.pane_id) {
             warn!(pane_id = %signal.pane_id, "delegate from unknown pane");
             return;
@@ -168,13 +262,150 @@ impl AppState {
             warn!(pane_id = %signal.pane_id, role = %role, "delegate from non-orchestrator pane");
             return;
         }
-        self.delegate_events.push(signal);
+
+        let orchestration = self.pane_orchestration_map.get(&signal.pane_id);
+
+        for target_role in &signal.to {
+            // Find the worker pane(s) in the same orchestration with the
+            // matching role name. Skip the orchestrator itself (a role that
+            // names itself is almost certainly a misconfiguration; we
+            // don't want the orchestrator's pane to be fed its own
+            // delegate prompt).
+            let target_panes: Vec<String> = self
+                .pane_role_map
+                .iter()
+                .filter(|(pane_id, role)| {
+                    role.as_str() == target_role.as_str()
+                        && !self.orchestrator_pane_ids.contains(pane_id.as_str())
+                        && self.pane_orchestration_map.get(pane_id.as_str()) == orchestration
+                })
+                .map(|(pane_id, _)| pane_id.clone())
+                .collect();
+
+            if target_panes.is_empty() {
+                warn!(role = %target_role, "delegate: no worker pane found for role");
+                continue;
+            }
+
+            let safe_name = sanitize_role_name(target_role);
+            // CodeRabbit (PRD #93 round-9): the task file lands in the
+            // *worker's* cwd, not the orchestrator's. Earlier rounds
+            // captured `pane_cwd_map[&signal.pane_id]` once outside the
+            // loop and reused it for every worker — fine when every
+            // worker shared the orchestrator's directory, broken the
+            // moment two role panes were started in different cwds.
+            // Per-target lookup also means the per-worker file write
+            // happens once per pane and not once per role-name + reused.
+            for pane_id in target_panes {
+                let cwd = self.pane_cwd_map.get(&pane_id).cloned();
+                // CodeRabbit (PRD #93 round-9): look the role config up
+                // by `(worker cwd, orchestration name, target role)` so
+                // we can apply the per-role `prompt_template` wrapping
+                // that Round 5 lost. Approach (b) from the brief: load
+                // the project config from the worker's cwd rather than
+                // threading prompt_template/clear through
+                // `TabMembership` — no wire-format change, and a config
+                // edit between sessions takes effect on the next
+                // delegate without needing a pane respawn. `None` from
+                // the lookup means "no template, fall back to raw task"
+                // which matches the pre-round-9 behavior.
+                let role_config = match (cwd.as_deref(), orchestration) {
+                    (Some(c), Some((orch_name, _orch_cwd))) => {
+                        lookup_orchestration_role(c, orch_name, target_role)
+                    }
+                    _ => None,
+                };
+                let prompt_template = role_config
+                    .as_ref()
+                    .and_then(|r| r.prompt_template.as_deref());
+                let task_body = if let Some(cwd) = cwd.as_deref() {
+                    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
+                    if let Err(e) = std::fs::create_dir_all(&dir) {
+                        warn!(
+                            dir = %dir.display(),
+                            role = %target_role,
+                            pane_id = %pane_id,
+                            error = %e,
+                            "delegate: failed to create task directory"
+                        );
+                    }
+                    let file_path = dir.join(format!("worker-task-{safe_name}.md"));
+                    let file_content = compose_worker_task_file(prompt_template, &signal.task);
+                    if let Err(e) = std::fs::write(&file_path, &file_content) {
+                        warn!(
+                            path = %file_path.display(),
+                            role = %target_role,
+                            pane_id = %pane_id,
+                            error = %e,
+                            "delegate: failed to write worker task file"
+                        );
+                    }
+                    format!("Read .dot-agent-deck/worker-task-{safe_name}.md for your task.")
+                } else {
+                    // Defensive: the daemon's StartAgent handler always
+                    // records `pane_cwd_map` for orchestration panes (see
+                    // `daemon_protocol.rs`), so this branch should be
+                    // unreachable in production. Log and fall back to
+                    // inlining the task body so the worker still gets
+                    // *something* useful rather than a dangling reference.
+                    warn!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        "delegate: no cwd recorded for worker pane — inlining task body"
+                    );
+                    compose_worker_task_file(prompt_template, &signal.task)
+                };
+                // CodeRabbit (PRD #93 round-9): the per-role `clear`
+                // flag (pre-Round-5: kill the worker pane and respawn
+                // the role's command before injecting the new prompt)
+                // is not yet wired through on the daemon side. Restart
+                // requires the daemon to know the role's spawn command,
+                // re-issue the StartAgent / close+spawn dance from
+                // inside the hook loop, and defer the prompt-write
+                // until the fresh agent is ready — substantial new
+                // machinery that's deliberately out of scope for this
+                // commit (see commit message). Log the deferral here
+                // so a `clear = true` regression test or operator
+                // running with a `clear`-bearing config sees a clear
+                // signal rather than silent drift.
+                if let Some(role) = role_config.as_ref()
+                    && role.clear
+                {
+                    tracing::debug!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        "delegate: role.clear=true is not yet implemented on the daemon side; \
+                         injecting prompt into the existing pane without restart"
+                    );
+                }
+                let one_liner = compose_delegate_prompt(&task_body);
+                if let Err(e) = registry.write_to_pane(&pane_id, &one_liner).await {
+                    warn!(
+                        pane_id = %pane_id,
+                        role = %target_role,
+                        error = %e,
+                        "delegate: failed to write task prompt into target pane"
+                    );
+                }
+            }
+        }
     }
 
-    /// Handle a work-done signal from a worker (or orchestrator --done).
-    /// Resolves pane_id → role name, writes a per-role summary file, and
-    /// stores the signal for feedback to the orchestrator (M5b).
-    pub fn handle_work_done(&mut self, signal: WorkDoneSignal) {
+    /// Handle a worker's work-done signal: write the per-role summary file
+    /// and inject a one-liner pointing the orchestrator pane at it.
+    ///
+    /// PRD #93 round-5: the file write was already daemon-side (now that
+    /// the daemon owns `pane_cwd_map`); the new piece is that the daemon
+    /// also picks the orchestrator pane for the same orchestration and
+    /// writes the "Worker {role} has completed..." feedback directly into
+    /// its PTY via [`AgentPtyRegistry::write_to_pane`]. No broadcast hop —
+    /// the bytes sit in the orchestrator pane's scrollback, surviving any
+    /// number of detach/reattach cycles.
+    ///
+    /// `done: true` from the orchestrator pane itself signals the whole
+    /// orchestration is complete; we log and exit without writing back a
+    /// "completed" prompt to the orchestrator (it just issued it).
+    pub async fn handle_work_done(&self, signal: WorkDoneSignal, registry: &AgentPtyRegistry) {
         let role_name = match self.pane_role_map.get(&signal.pane_id) {
             Some(name) => name.clone(),
             None => {
@@ -183,9 +414,19 @@ impl AppState {
             }
         };
 
+        // Orchestrator's own `--done`: completion signal, no feedback to write.
+        if signal.done && self.orchestrator_pane_ids.contains(&signal.pane_id) {
+            tracing::info!(
+                pane_id = %signal.pane_id,
+                task = %signal.task,
+                "orchestration complete (orchestrator --done)"
+            );
+            return;
+        }
+
         // Write summary to .dot-agent-deck/work-done-{role}.md
+        let safe_name = sanitize_role_name(&role_name);
         if let Some(cwd) = self.pane_cwd_map.get(&signal.pane_id) {
-            let safe_name = sanitize_role_name(&role_name);
             let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 warn!(dir = %dir.display(), role = %role_name, error = %e, "failed to create work-done directory");
@@ -196,7 +437,45 @@ impl AppState {
             }
         }
 
-        self.work_done_events.push(signal);
+        // Find the orchestrator pane in the same orchestration as the
+        // worker. We scope by `pane_orchestration_map` so a parallel
+        // orchestration tab's orchestrator pane doesn't receive a sibling
+        // tab's worker feedback.
+        let orchestration = self.pane_orchestration_map.get(&signal.pane_id);
+        let orchestrator_pane_id = self
+            .orchestrator_pane_ids
+            .iter()
+            .find(|p| self.pane_orchestration_map.get(p.as_str()) == orchestration)
+            .cloned();
+
+        let Some(orch_pane_id) = orchestrator_pane_id else {
+            warn!(
+                pane_id = %signal.pane_id,
+                role = %role_name,
+                "work-done: no orchestrator pane found for this orchestration"
+            );
+            return;
+        };
+
+        // If the work-done came from the orchestrator itself (without
+        // --done), skip the feedback write — the orchestrator doesn't need
+        // to be reminded of its own work.
+        if signal.pane_id == orch_pane_id {
+            return;
+        }
+
+        let feedback = format!(
+            "Worker {safe_name} has completed their task. \
+             Read .dot-agent-deck/work-done-{safe_name}.md for their full report."
+        );
+        if let Err(e) = registry.write_to_pane(&orch_pane_id, &feedback).await {
+            warn!(
+                pane_id = %orch_pane_id,
+                role = %role_name,
+                error = %e,
+                "work-done: failed to write feedback into orchestrator pane"
+            );
+        }
     }
 
     pub fn apply_event(&mut self, mut event: AgentEvent) {
@@ -943,102 +1222,72 @@ mod tests {
         assert!(!state.managed_pane_ids.contains("42"));
     }
 
+    // PRD #93 round-5: per-pane unit tests for handle_delegate /
+    // handle_work_done used to assert against `delegate_events` /
+    // `work_done_events` vectors — those have been removed since the
+    // daemon now writes the prompts directly into the target PTYs. The
+    // remaining behavior (file write side-effect, anti-spoofing guard
+    // on non-orchestrator senders) is exercised by the
+    // `tests/orchestration_delegate.rs` integration tests against a
+    // real daemon + PTY pair.
+
     #[test]
-    fn handle_delegate_stores_event() {
-        let mut state = AppState::default();
-        state
-            .pane_role_map
-            .insert("pane-1".into(), "orchestrator".into());
-        state.orchestrator_pane_ids.insert("pane-1".into());
-
-        let signal = crate::event::DelegateSignal {
-            pane_id: "pane-1".into(),
-            task: "Implement login".into(),
-            to: vec!["coder".into()],
-            timestamp: Utc::now(),
-        };
-        state.handle_delegate(signal);
-
-        assert_eq!(state.delegate_events.len(), 1);
-        assert_eq!(state.delegate_events[0].task, "Implement login");
-        assert_eq!(state.delegate_events[0].to, vec!["coder"]);
+    fn compose_delegate_prompt_appends_work_done_footer() {
+        let prompt =
+            compose_delegate_prompt("Read .dot-agent-deck/worker-task-coder.md for your task.");
+        assert!(
+            prompt.starts_with("Read .dot-agent-deck/worker-task-coder.md for your task.\n\n"),
+            "task body must lead, then a blank line before the footer"
+        );
+        assert!(
+            prompt.contains("## When done"),
+            "footer must include the ## When done heading"
+        );
+        assert!(
+            prompt.contains("dot-agent-deck work-done --task"),
+            "footer must instruct the worker to call dot-agent-deck work-done"
+        );
     }
 
     #[test]
-    fn handle_delegate_unknown_pane_is_noop() {
+    fn work_done_writes_summary_file_in_isolation() {
+        // The summary-file side effect is unit-testable without a real
+        // PTY because it only touches the filesystem. Pin it here so a
+        // regression in the file-write path fails the build even when the
+        // PTY-write path is unreachable in a unit-test context.
         let mut state = AppState::default();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        state.pane_role_map.insert("worker".into(), "coder".into());
+        state.pane_cwd_map.insert("worker".into(), cwd.clone());
 
-        let signal = crate::event::DelegateSignal {
-            pane_id: "unknown-pane".into(),
-            task: "Do something".into(),
-            to: vec!["coder".into()],
-            timestamp: Utc::now(),
-        };
-        state.handle_delegate(signal);
-
-        assert!(state.delegate_events.is_empty());
-    }
-
-    #[test]
-    fn handle_work_done_resolves_role_and_stores_event() {
-        let mut state = AppState::default();
-        state.pane_role_map.insert("pane-1".into(), "coder".into());
-        state
-            .pane_cwd_map
-            .insert("pane-1".into(), "/tmp/test-wd".into());
-
+        // No orchestrator registered — the PTY-write branch is skipped
+        // (warn-and-return), but the file write must still land. Drive
+        // through the async fn against a fresh, empty registry: the
+        // lookup yields no orchestrator and we exit early before any
+        // write_to_pane call. The async runtime here is just a vehicle.
+        let registry = crate::agent_pty::AgentPtyRegistry::new();
         let signal = crate::event::WorkDoneSignal {
-            pane_id: "pane-1".into(),
+            pane_id: "worker".into(),
             task: "Implemented login".into(),
             done: false,
             timestamp: Utc::now(),
         };
-        state.handle_work_done(signal);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            state.handle_work_done(signal, &registry).await;
+        });
 
-        assert_eq!(state.work_done_events.len(), 1);
-        assert_eq!(state.work_done_events[0].task, "Implemented login");
-
-        // Verify summary file was written
-        let file = std::path::Path::new("/tmp/test-wd/.dot-agent-deck/work-done-coder.md");
-        assert!(file.exists());
-        let content = std::fs::read_to_string(file).unwrap();
+        let file = std::path::Path::new(&cwd)
+            .join(".dot-agent-deck")
+            .join("work-done-coder.md");
+        assert!(
+            file.exists(),
+            "work-done summary file must be written even when no orchestrator pane is attached"
+        );
+        let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "Implemented login");
-
-        // Clean up
-        let _ = std::fs::remove_dir_all("/tmp/test-wd/.dot-agent-deck");
-    }
-
-    #[test]
-    fn handle_work_done_unknown_pane_is_noop() {
-        let mut state = AppState::default();
-
-        let signal = crate::event::WorkDoneSignal {
-            pane_id: "unknown-pane".into(),
-            task: "Some work".into(),
-            done: false,
-            timestamp: Utc::now(),
-        };
-        state.handle_work_done(signal);
-
-        assert!(state.work_done_events.is_empty());
-    }
-
-    #[test]
-    fn handle_work_done_done_flag_stored() {
-        let mut state = AppState::default();
-        state
-            .pane_role_map
-            .insert("pane-1".into(), "orchestrator".into());
-
-        let signal = crate::event::WorkDoneSignal {
-            pane_id: "pane-1".into(),
-            task: "All complete".into(),
-            done: true,
-            timestamp: Utc::now(),
-        };
-        state.handle_work_done(signal);
-
-        assert_eq!(state.work_done_events.len(), 1);
-        assert!(state.work_done_events[0].done);
     }
 }

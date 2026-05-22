@@ -27,6 +27,8 @@ use dot_agent_deck::daemon_protocol::{bind_attach_listener, serve_attach};
 use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
 use dot_agent_deck::state::AppState;
 
+mod common;
+
 // Same umask-narrowing serialization as the other integration test binaries.
 static HARNESS_BIND_LOCK: Mutex<()> = Mutex::new(());
 
@@ -45,6 +47,7 @@ impl Drop for DaemonHandle {
 }
 
 async fn spawn_daemon() -> DaemonHandle {
+    common::init_test_env();
     let (dir, hook_path, attach_path) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
@@ -57,8 +60,10 @@ async fn spawn_daemon() -> DaemonHandle {
     let state_for_daemon = daemon_state.clone();
     let attach_for_daemon = attach_path.clone();
     let hook_for_daemon = hook_path.clone();
+    let lock_dir = common::lock_dir_path();
     let handle = tokio::spawn(async move {
-        let daemon = Daemon::with_attach(state_for_daemon, attach_for_daemon);
+        let daemon = Daemon::with_attach(state_for_daemon, attach_for_daemon)
+            .with_lock_dir_override(lock_dir);
         let _ = run_daemon_with(&hook_for_daemon, daemon).await;
     });
 
@@ -133,9 +138,8 @@ async fn hook_event_round_trips_to_attached_appstate() {
     let state_for_task = tui_state.clone();
     let forwarder = tokio::spawn(async move {
         while let Ok(Some(msg)) = sub.next_event().await {
-            if let BroadcastMsg::Event(event) = msg {
-                state_for_task.write().await.apply_event(event);
-            }
+            let BroadcastMsg::Event(event) = msg;
+            state_for_task.write().await.apply_event(event);
         }
     });
 

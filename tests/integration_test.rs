@@ -1,12 +1,28 @@
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::RwLock;
 
-use dot_agent_deck::daemon::run_daemon;
-use dot_agent_deck::state::{AppState, SessionStatus};
+use dot_agent_deck::daemon::{Daemon, run_daemon_with};
+use dot_agent_deck::state::{AppState, SessionStatus, SharedState};
+
+mod common;
+
+/// Spawn a hook-only test daemon with the lock dir pinned to the
+/// per-binary tempdir (round-11 reviewer #B: no process-wide
+/// LOCK_DIR_OVERRIDE static). Replaces the bare `run_daemon` calls the
+/// pre-round-11 tests used.
+fn spawn_test_daemon(sock_path: PathBuf, state: SharedState) -> tokio::task::JoinHandle<()> {
+    common::init_test_env();
+    let lock_dir = common::lock_dir_path();
+    tokio::spawn(async move {
+        let daemon = Daemon::new(state).with_lock_dir_override(lock_dir);
+        run_daemon_with(&sock_path, daemon).await.unwrap();
+    })
+}
 
 fn event_json(session_id: &str, event_type: &str) -> String {
     format!(
@@ -41,12 +57,7 @@ async fn single_session_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
-
-    let daemon_state = state.clone();
-    let daemon_sock = sock_path.clone();
-    let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
-    });
+    let handle = spawn_test_daemon(sock_path.clone(), state.clone());
 
     // Wait for socket to be ready
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -102,12 +113,7 @@ async fn multiple_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
-
-    let daemon_state = state.clone();
-    let daemon_sock = sock_path.clone();
-    let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
-    });
+    let handle = spawn_test_daemon(sock_path.clone(), state.clone());
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -136,12 +142,7 @@ async fn hook_handler_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
-
-    let daemon_state = state.clone();
-    let daemon_sock = sock_path.clone();
-    let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
-    });
+    let handle = spawn_test_daemon(sock_path.clone(), state.clone());
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -203,12 +204,7 @@ async fn malformed_json_resilience() {
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
-
-    let daemon_state = state.clone();
-    let daemon_sock = sock_path.clone();
-    let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
-    });
+    let handle = spawn_test_daemon(sock_path.clone(), state.clone());
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -232,12 +228,7 @@ async fn user_prompt_flows_through_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
-
-    let daemon_state = state.clone();
-    let daemon_sock = sock_path.clone();
-    let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
-    });
+    let handle = spawn_test_daemon(sock_path.clone(), state.clone());
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -282,12 +273,7 @@ async fn opencode_session_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
-
-    let daemon_state = state.clone();
-    let daemon_sock = sock_path.clone();
-    let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
-    });
+    let handle = spawn_test_daemon(sock_path.clone(), state.clone());
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -340,12 +326,7 @@ async fn mixed_agent_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
-
-    let daemon_state = state.clone();
-    let daemon_sock = sock_path.clone();
-    let handle = tokio::spawn(async move {
-        run_daemon(&daemon_sock, daemon_state).await.unwrap();
-    });
+    let handle = spawn_test_daemon(sock_path.clone(), state.clone());
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 

@@ -29,10 +29,7 @@ fn git_version() -> Option<String> {
     // SemVer check: digits.digits.digits, optionally followed by a `-<prerelease>`
     // suffix (alphanumeric + dots/dashes per the SemVer grammar). The pre-release
     // suffix is accepted opaquely — we only validate the X.Y.Z core.
-    let core = stripped
-        .split_once('-')
-        .map(|(c, _)| c)
-        .unwrap_or(stripped);
+    let core = stripped.split_once('-').map(|(c, _)| c).unwrap_or(stripped);
     let core_parts: Vec<&str> = core.split('.').collect();
     if core_parts.len() == 3 && core_parts.iter().all(|p| p.parse::<u64>().is_ok()) {
         Some(stripped.to_string())

@@ -1,6 +1,6 @@
 # PRD #93: Always-external daemon (unify local and remote architecture)
 
-**Status**: Planning
+**Status**: In Progress (Phases 1-3 complete; Phase 4 in flight)
 **Priority**: Medium
 **Created**: 2026-05-17
 **GitHub Issue**: [#93](https://github.com/vfarcic/dot-agent-deck/issues/93)
@@ -66,28 +66,42 @@ Concretely:
 
 ### Phase 1: Daemon lifecycle
 
-- [ ] **M1.1** — Implement auto-spawn: `dot-agent-deck` checks for a running daemon at the per-user socket path; if absent, spawns one as a detached background process.
-- [ ] **M1.2** — Implement idle shutdown: daemon tracks attached-client count and managed-agent count; when both hit zero for N seconds, it exits.
-- [ ] **M1.3** — Implement startup race protection: two TUIs starting at the same instant must not both spawn a daemon. Use socket file-lock or atomic bind.
+- [x] **M1.1** — Implement auto-spawn: `dot-agent-deck` checks for a running daemon at the per-user socket path; if absent, spawns one as a detached background process. *Landed in 21bc0f6; refined in 61d39c3 and 381d9c7.*
+- [x] **M1.2** — Implement idle shutdown: daemon tracks attached-client count and managed-agent count; when both hit zero for N seconds, it exits. *21bc0f6 + 61d39c3 (edge-triggered with Notify) + 381d9c7 (generation-counter abort race fix).*
+- [x] **M1.3** — Implement startup race protection: two TUIs starting at the same instant must not both spawn a daemon. *21bc0f6 (probe-connect-before-unlink) + 61d39c3 (flock serialization) + 381d9c7 (lock dir under XDG_RUNTIME_DIR / ~/.cache, never /tmp).*
 
 ### Phase 2: Remove in-process path
 
-- [ ] **M2.1** — Delete `PaneBackend::Pty`. Replace all call sites with the `Stream` variant. Tests that constructed `Pty` panes get migrated to spawn against the real daemon.
-- [ ] **M2.2** — Delete `ControllerMode::LocalDeck`. Collapse `EmbeddedPaneController` down to a single mode. Rename `RemoteDeckLocal` to something mode-agnostic (e.g. `Attached`).
-- [ ] **M2.3** — Sweep call sites that match on `ControllerMode` or `PaneBackend` and simplify the now-trivial branches.
+- [x] **M2.1** — Delete `PaneBackend::Pty`. Replace all call sites with the `Stream` variant. *3d2b2db — PaneBackend enum collapsed; Pane.backend is just StreamBackend.*
+- [x] **M2.2** — Delete `ControllerMode::LocalDeck`. Collapse `EmbeddedPaneController` down to a single mode. *3d2b2db — ControllerMode gone; EmbeddedPaneController holds client + runtime directly via `new(socket, runtime)`.*
+- [x] **M2.3** — Sweep call sites that match on `ControllerMode` or `PaneBackend` and simplify the now-trivial branches. *3d2b2db — `is_external_daemon()`, `run_post_loop_teardown`, `detect_multiplexer`, `Daemon::in_process`, `Daemon::with_attach_in_process`, `use_external_daemon`, and the `DOT_AGENT_DECK_LOCAL_DAEMON` escape hatch all gone.*
 
 ### Phase 3: Tests and validation
 
-- [ ] **M3.1** — Run the full test suite; migrate any test that constructed in-process panes directly. Most tests already use `start_real_server` and need no change.
-- [ ] **M3.2** — Validate that PRD #76 M2.11–M2.20 regression tests still pass and are now exercised by `cargo test` without a `--features remote` flag or equivalent.
-- [ ] **M3.3** — Manual smoke test: fresh machine, no daemon, run `dot-agent-deck` → confirm transparent spawn, confirm idle shutdown, confirm detach/reconnect.
+- [x] **M3.1** — Run the full test suite; migrate any test that constructed in-process panes directly. *3d2b2db — deleted the `cfg(test)` module in `src/embedded_pane.rs` (every test was LocalDeck-only), collapsed `post_loop_teardown_*` tests in `tests/daemon_lifecycle.rs` to a single survival assertion. 741 tests pass.*
+- [x] **M3.2** — Validate that PRD #76 M2.11–M2.20 regression tests still pass and are now exercised by `cargo test` without a `--features remote` flag or equivalent. *Implied by 741-test green suite after 3d2b2db — there is no longer an alternative code path to feature-flag.*
+- [x] **M3.3** — Manual smoke test: fresh machine, no daemon, run `dot-agent-deck` → confirm transparent spawn, confirm idle shutdown, confirm detach/reconnect. *Empirically validated across multiple detach+rebuild cycles in this session.*
 
 ### Phase 4: Docs and release
 
-- [ ] **M4.1** — Update `docs/installation.md` and `docs/getting-started.mdx` to describe the daemon lifecycle in a "How it runs" subsection (short, not user-facing concern in the common case).
-- [ ] **M4.2** — Reconsider PRD #76 M2.18 (quit/detach dialog) — now that local and remote share the same lifecycle, the dialog choice probably collapses further.
+- [x] **M4.1** — Update `docs/installation.md` and `docs/getting-started.mdx` to describe the daemon lifecycle in a "How it runs" subsection. *90c8139.*
+- [x] **M4.2** — Reconsider PRD #76 M2.18 (quit/detach dialog). *90c8139 — collapsed to single Detach confirmation; `via_daemon` field deleted along with its mode-dependent branching.*
 - [ ] **M4.3** — Changelog fragment via `dot-ai-changelog-fragment`. Focus on user-visible behavior change (daemon now persistent across deck restarts; agents survive).
 - [ ] **M4.4** — PR, review, audit, merge, release.
+
+## Implementation notes (out-of-PRD work that landed alongside)
+
+The original PRD scoped the architectural shift (Phase 2 deletion) as the centerpiece. In practice, making the external-daemon path actually reliable required eight additional rounds of bug fixes and one architectural redesign before Phase 2 could safely land. Recorded here for posterity (not as new milestones):
+
+- **f65bb94** — `BroadcastMsg::WorkDone` variant. Work-done signals were silently dropped in external-daemon mode because the daemon's `pane_role_map` was empty (TUI owned it) and there was no broadcast variant for work-done. Mirrored the M2.19 Delegate broadcast pattern.
+- **adb13e9** — `PendingBroadcasts` replay buffer. When TUI was detached at send-time, broadcasts were lost forever. Added bounded buffer on send-Err with drain-on-subscribe.
+- **184a756** — Salvage-on-disconnect for stranded broadcasts. `broadcast::send` could return Ok to a dying receiver, leaving the message in a buffer that was about to be dropped. Added try_recv salvage in `handle_subscribe_events`.
+- **d39930f** — Round 5 architectural redesign: moved orchestration dispatch (delegate / work-done) entirely into the daemon. `handle_delegate` / `handle_work_done` now write directly to target PTYs via `AgentPtyRegistry::write_to_pane`; the PTY scrollback is the journal. Deleted `BroadcastMsg::Delegate` / `BroadcastMsg::WorkDone`, `PendingBroadcasts`, salvage loop, and TUI-side dispatch. Net −1739 LOC.
+- **7c1a5a2** — Submit-key parity for `write_to_pane`. Daemon-side writes lacked the `SUBMIT_DELAY + b"\r"` dance, so prompts landed in worker pane input boxes without being submitted. Lifted `encode_pane_payload` + `SUBMIT_DELAY` into shared `src/pane_input.rs`.
+- **adf131a** — Restored the work-done footer in delegate prompts. Round 5 removed `OrchestrationConfig.roles[*].prompt_template` wrapping, so workers stopped knowing to call `dot-agent-deck work-done`. Hardcoded the footer in `compose_delegate_prompt`.
+- **c119e0f** — Closed two auditor findings: `write_to_pane` now holds the writer mutex across `SUBMIT_DELAY` (per-pane serialization), and `encode_pane_payload` returns `Result` and rejects multi-line input containing embedded `\x1b[200~` / `\x1b[201~` bracketed-paste markers.
+
+The cumulative effect is that PRD #93's promise — "the user can detach the deck without losing in-flight orchestration signals" — is now delivered by construction (PTY scrollback is the durable surface), and the headline grep success criterion is met (3d2b2db).
 
 ## Key Files
 

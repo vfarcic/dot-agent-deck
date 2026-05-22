@@ -86,7 +86,9 @@ use tracing::{error, info, warn};
 
 pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
+use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, is_valid_pane_id_env};
 use crate::event::{AgentType, BroadcastMsg};
+use crate::state::SharedState;
 
 // ---------------------------------------------------------------------------
 // Frame kinds
@@ -436,13 +438,80 @@ pub async fn serve_attach(
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> io::Result<()> {
+    // Discard counter and use an empty state so callers that don't care
+    // about idle shutdown or daemon-side orchestration don't need to
+    // construct either. The daemon's main path uses
+    // [`serve_attach_with_counter`] with its real state.
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::RwLock;
+    let dummy_count = Arc::new(AtomicUsize::new(0));
+    let dummy_state: SharedState = Arc::new(RwLock::new(crate::state::AppState::default()));
+    serve_attach_with_counter(listener, registry, event_tx, dummy_count, dummy_state).await
+}
+
+/// PRD #93 M1.2 variant of [`serve_attach`] that maintains `client_count`
+/// across the lifetime of each accepted connection. The daemon's idle
+/// monitor reads this count alongside the PTY registry size to decide when
+/// the daemon may exit (both must be zero for the configured idle window).
+///
+/// The counter is incremented immediately after `accept` returns and
+/// decremented in the per-connection task's exit branch (panic or not — the
+/// `tokio::spawn` future is wrapped so the decrement always runs).
+pub async fn serve_attach_with_counter(
+    listener: UnixListener,
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    client_count: Arc<std::sync::atomic::AtomicUsize>,
+    state: SharedState,
+) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    use tokio::sync::Notify;
+    // PRD #93 round-2 reviewer REV-1: the same Notify the registry uses for
+    // spawn/close/exit transitions also fires on every attach-counter
+    // transition. The daemon's edge-triggered idle monitor waits on it, so
+    // a brief detach+reconnect wakes the monitor before any timer can fire.
+    // Cloned once per accepted connection — `notify_one` is cheap and tokio
+    // Notify stores a permit if no waiter is registered, so a signal sent
+    // between the monitor's loop iterations isn't lost.
+    let change_notify: Arc<Notify> = registry.change_notify();
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let registry = registry.clone();
                 let event_tx = event_tx.clone();
+                let counter = client_count.clone();
+                let state = state.clone();
+                let notify = change_notify.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, registry, event_tx).await {
+                    // RAII guard: increments on creation, decrements on drop,
+                    // so a `handle_connection` task that panics or is dropped
+                    // still releases its slot in the client count. Without
+                    // the guard, an unwinding task would leak a slot and
+                    // keep the daemon alive past the idle threshold.
+                    //
+                    // The guard also signals `change_notify` on drop so the
+                    // edge-triggered idle monitor wakes immediately on
+                    // disconnect (PRD #93 round-2 reviewer REV-1).
+                    struct ClientGuard {
+                        counter: Arc<std::sync::atomic::AtomicUsize>,
+                        notify: Arc<Notify>,
+                    }
+                    impl Drop for ClientGuard {
+                        fn drop(&mut self) {
+                            self.counter.fetch_sub(1, Ordering::SeqCst);
+                            self.notify.notify_one();
+                        }
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    // Signal the increment too so the monitor cancels any
+                    // pending shutdown timer the moment a fresh client
+                    // connects, not after the next decrement.
+                    notify.notify_one();
+                    let _guard = ClientGuard {
+                        counter: counter.clone(),
+                        notify: notify.clone(),
+                    };
+                    if let Err(e) = handle_connection(stream, registry, event_tx, state).await {
                         warn!("attach protocol connection error: {e}");
                     }
                 });
@@ -468,10 +537,26 @@ pub async fn run_attach_server(
     serve_attach(listener, registry, event_tx).await
 }
 
+/// PRD #93 M1.2 counter-aware sibling of [`run_attach_server`]. The daemon
+/// loop uses this so the idle monitor sees attached-client transitions in
+/// real time.
+pub async fn run_attach_server_with_counter(
+    path: &Path,
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    client_count: Arc<std::sync::atomic::AtomicUsize>,
+    state: SharedState,
+) -> io::Result<()> {
+    let listener = bind_attach_listener(path)?;
+    info!("Attach protocol listening on {}", path.display());
+    serve_attach_with_counter(listener, registry, event_tx, client_count, state).await
+}
+
 async fn handle_connection(
     mut stream: UnixStream,
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
+    state: SharedState,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -524,6 +609,48 @@ async fn handle_connection(
                 .await?;
                 return Ok(());
             }
+
+            // PRD #93 round-5: capture the bits we need to populate the
+            // daemon's `AppState` role map BEFORE the spawn (we'll need
+            // the pane id from env and the orchestration metadata from
+            // tab_membership). The spawn moves `opts`, so we clone what
+            // we need first.
+            let pane_id_env: Option<String> = env
+                .iter()
+                .find(|(k, _)| k == DOT_AGENT_DECK_PANE_ID)
+                .map(|(_, v)| v.clone())
+                .and_then(|v| {
+                    if is_valid_pane_id_env(&v) {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                });
+            // Round-11 auditor #C: also pull `orchestration_cwd` out of
+            // the membership so the daemon can use it (not StartAgent.cwd)
+            // as the disambiguator in `pane_orchestration_map`. This keeps
+            // round-9 #2's "workers can have different per-pane cwds"
+            // contract intact — pane_cwd_map gets StartAgent.cwd
+            // per-pane, but pane_orchestration_map keys on the shared
+            // orchestration cwd from the TabMembership.
+            let orchestration_meta: Option<(String, String, bool, Option<String>)> =
+                tab_membership.as_ref().and_then(|tm| match tm {
+                    TabMembership::Orchestration {
+                        name,
+                        role_name,
+                        is_start_role,
+                        orchestration_cwd,
+                        ..
+                    } if !role_name.is_empty() => Some((
+                        name.clone(),
+                        role_name.clone(),
+                        *is_start_role,
+                        orchestration_cwd.clone(),
+                    )),
+                    _ => None,
+                });
+            let cwd_for_state = cwd.clone();
+
             let opts = SpawnOptions {
                 command: command.as_deref(),
                 cwd: cwd.as_deref(),
@@ -535,14 +662,77 @@ async fn handle_connection(
                 agent_type,
             };
             match registry.spawn_agent(opts) {
-                Ok(id) => write_resp(&mut stream, &AttachResponse::with_id(id)).await?,
+                Ok(id) => {
+                    // PRD #93 round-5: populate daemon-side role maps so
+                    // `handle_delegate` / `handle_work_done` can resolve
+                    // the worker pane and orchestrator pane purely from
+                    // daemon state — no TUI round-trip, no broadcast hop.
+                    // We do this only for orchestration panes; dashboard
+                    // and mode panes don't participate in delegate
+                    // dispatch.
+                    if let (
+                        Some(pane_id),
+                        Some((orch_name, role_name, is_start_role, orchestration_cwd)),
+                    ) = (pane_id_env.as_deref(), orchestration_meta)
+                    {
+                        // Round-11 auditor #C: scope the orchestration
+                        // identity by `(name, orchestration_cwd)` so
+                        // two unnamed orchestrations in different cwds
+                        // (`~/a/foo` and `~/b/foo`, both resolving
+                        // `name` to "foo") don't collide. The
+                        // `orchestration_cwd` is shared across every
+                        // role pane in one orchestration tab (round-9
+                        // #2: per-pane cwd may diverge, but the
+                        // orchestration's identity does not). Older
+                        // clients that don't carry the field fall back
+                        // to StartAgent.cwd — preserves backwards
+                        // compat at the cost of re-opening the
+                        // collision; `Some` vs `None` is detectable so
+                        // this is documented behavior, not a silent
+                        // misroute.
+                        let orch_cwd = orchestration_cwd
+                            .or_else(|| cwd_for_state.clone())
+                            .unwrap_or_default();
+                        let mut st = state.write().await;
+                        st.register_pane(pane_id.to_string());
+                        st.pane_role_map
+                            .insert(pane_id.to_string(), role_name.clone());
+                        st.pane_orchestration_map
+                            .insert(pane_id.to_string(), (orch_name, orch_cwd));
+                        if let Some(c) = cwd_for_state.clone() {
+                            st.pane_cwd_map.insert(pane_id.to_string(), c);
+                        }
+                        if is_start_role {
+                            st.orchestrator_pane_ids.insert(pane_id.to_string());
+                        }
+                    }
+                    write_resp(&mut stream, &AttachResponse::with_id(id)).await?
+                }
                 Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
             }
         }
-        AttachRequest::StopAgent { id } => match registry.close_agent(&id) {
-            Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
-            Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
-        },
+        AttachRequest::StopAgent { id } => {
+            // PRD #93 round-5: capture the agent's `pane_id_env` BEFORE
+            // close_agent removes the registry entry, so we can clean up
+            // the daemon's per-pane role-map entries after a successful
+            // close. Without this, a closed pane's role/cwd would linger
+            // in the maps and a subsequent `handle_delegate` aimed at
+            // that role would still resolve the dead pane.
+            let pane_id_env = registry
+                .agent_records()
+                .into_iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.pane_id_env);
+            match registry.close_agent(&id) {
+                Ok(()) => {
+                    if let Some(pane_id) = pane_id_env {
+                        state.write().await.unregister_pane(&pane_id);
+                    }
+                    write_resp(&mut stream, &AttachResponse::ok()).await?
+                }
+                Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+            }
+        }
         AttachRequest::SetAgentLabel {
             id,
             display_name,
@@ -616,13 +806,12 @@ pub async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse)
     }
 }
 
-/// Long-lived `SubscribeEvents` handler (PRD #76 M2.17, extended for
-/// delegate signals in M2.19). Confirms the subscription with an OK
-/// `RESP`, then forwards every `BroadcastMsg` from the daemon-wide
-/// broadcast as a `KIND_EVENT` frame (JSON-tagged variant — see
-/// [`BroadcastMsg`]). Each write is bounded by `CLIENT_WRITE_TIMEOUT`
-/// so a wedged client can't pin this task forever. A lagged receiver —
-/// the client fell further behind than the broadcast capacity — closes
+/// Long-lived `SubscribeEvents` handler (PRD #76 M2.17). Confirms the
+/// subscription with an OK `RESP`, then forwards every hook
+/// [`BroadcastMsg::Event`] from the daemon-wide broadcast as a
+/// `KIND_EVENT` frame. Each write is bounded by `CLIENT_WRITE_TIMEOUT`
+/// so a wedged client can't pin this task forever. A lagged receiver
+/// (the client fell further behind than the broadcast capacity) closes
 /// the connection with `KIND_STREAM_END` carrying `"lagged"`; the
 /// TUI's reconnect path drains a `list_agents` snapshot to recover.
 /// Client disconnect is detected by racing a one-byte read against
@@ -630,6 +819,15 @@ pub async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse)
 /// the client goes away between messages — otherwise the
 /// per-connection task and its receiver would leak for the lifetime
 /// of the daemon.
+///
+/// PRD #93 round-5: orchestration signals (delegate / work-done) used
+/// to ride this channel via `BroadcastMsg::Delegate` / `WorkDone`,
+/// guarded by a replay buffer (`PendingBroadcasts`), a salvage loop on
+/// detach, and a test gate to drive the salvage race. All of that is
+/// gone — orchestration prompts now flow directly into target PTYs
+/// (see [`AppState::handle_delegate`] /
+/// [`AppState::handle_work_done`]) and the surviving PTY scrollback
+/// makes a separate replay path unnecessary.
 async fn handle_subscribe_events(
     stream: UnixStream,
     event_tx: broadcast::Sender<BroadcastMsg>,
@@ -637,6 +835,7 @@ async fn handle_subscribe_events(
     let mut rx = event_tx.subscribe();
     let (mut rd, mut wr) = stream.into_split();
     write_resp(&mut wr, &AttachResponse::ok()).await?;
+
     loop {
         tokio::select! {
             recv = rx.recv() => {
@@ -984,6 +1183,9 @@ mod tests {
             tab_membership: Some(TabMembership::Orchestration {
                 name: "tdd-cycle".into(),
                 role_index: 2,
+                role_name: "coder".into(),
+                is_start_role: false,
+                orchestration_cwd: None,
             }),
             agent_type: None,
         };
@@ -992,6 +1194,8 @@ mod tests {
         assert_eq!(v["tab_membership"]["kind"], "orchestration");
         assert_eq!(v["tab_membership"]["name"], "tdd-cycle");
         assert_eq!(v["tab_membership"]["role_index"], 2);
+        assert_eq!(v["tab_membership"]["role_name"], "coder");
+        assert_eq!(v["tab_membership"]["is_start_role"], false);
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
         match back {
             AttachRequest::StartAgent { tab_membership, .. } => {
@@ -1000,6 +1204,9 @@ mod tests {
                     Some(TabMembership::Orchestration {
                         name: "tdd-cycle".into(),
                         role_index: 2,
+                        role_name: "coder".into(),
+                        is_start_role: false,
+                        orchestration_cwd: None,
                     })
                 );
             }
@@ -1020,6 +1227,9 @@ mod tests {
             tab_membership: Some(TabMembership::Orchestration {
                 name: "tdd-cycle".into(),
                 role_index: 1,
+                role_name: "coder".into(),
+                is_start_role: false,
+                orchestration_cwd: None,
             }),
             agent_type: None,
         };
@@ -1200,14 +1410,13 @@ mod tests {
 
     #[tokio::test]
     async fn kind_event_frame_round_trip() {
-        // The KIND_EVENT payload is a JSON-encoded BroadcastMsg
-        // (PRD #76 M2.17 / M2.19 — the Event variant wraps the
-        // legacy AgentEvent shape; the Delegate variant carries
-        // orchestrator delegate signals across the external-daemon
-        // hop). Pin the round-trip for both variants here so a future
-        // structural change doesn't silently break wire compatibility
-        // for remote-mode TUIs.
-        use crate::event::{AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType};
+        // The KIND_EVENT payload is a JSON-encoded BroadcastMsg.
+        // PRD #93 round-5: only the Event variant rides this channel
+        // now — Delegate / WorkDone are dispatched directly into PTYs
+        // by the daemon. Pin the on-wire shape so a future rename of
+        // the enum tag or the variant name trips the build instead of
+        // silently breaking remote-mode TUIs.
+        use crate::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
         use chrono::Utc;
         use std::collections::HashMap;
 
@@ -1253,48 +1462,11 @@ mod tests {
         let (kind, body) = read_frame(&mut cursor).await.unwrap().unwrap();
         assert_eq!(kind, KIND_EVENT);
         let back: BroadcastMsg = serde_json::from_slice(&body).unwrap();
-        match back {
-            BroadcastMsg::Event(e) => {
-                assert_eq!(e.session_id, "sess-1");
-                assert_eq!(e.event_type, EventType::ToolStart);
-                assert_eq!(e.tool_name.as_deref(), Some("Read"));
-                assert_eq!(e.pane_id.as_deref(), Some("7"));
-            }
-            BroadcastMsg::Delegate(_) => panic!("expected Event variant"),
-        }
-
-        let signal = DelegateSignal {
-            pane_id: "orch-7".into(),
-            task: "implement X".into(),
-            to: vec!["coder".into(), "reviewer".into()],
-            timestamp: Utc::now(),
-        };
-        let payload = serde_json::to_vec(&BroadcastMsg::Delegate(signal)).unwrap();
-
-        // Same wire-shape pin for the Delegate variant.
-        let wire: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(wire["kind"], "delegate");
-        assert_eq!(wire["pane_id"], "orch-7");
-        assert_eq!(wire["task"], "implement X");
-        assert_eq!(
-            wire["to"],
-            serde_json::json!(["coder".to_string(), "reviewer".to_string()])
-        );
-        assert!(wire["timestamp"].is_string());
-
-        let mut buf: Vec<u8> = Vec::new();
-        write_frame(&mut buf, KIND_EVENT, &payload).await.unwrap();
-        let mut cursor = std::io::Cursor::new(buf);
-        let (_, body) = read_frame(&mut cursor).await.unwrap().unwrap();
-        let back: BroadcastMsg = serde_json::from_slice(&body).unwrap();
-        match back {
-            BroadcastMsg::Delegate(s) => {
-                assert_eq!(s.pane_id, "orch-7");
-                assert_eq!(s.task, "implement X");
-                assert_eq!(s.to, vec!["coder".to_string(), "reviewer".to_string()]);
-            }
-            BroadcastMsg::Event(_) => panic!("expected Delegate variant"),
-        }
+        let BroadcastMsg::Event(e) = back;
+        assert_eq!(e.session_id, "sess-1");
+        assert_eq!(e.event_type, EventType::ToolStart);
+        assert_eq!(e.tool_name.as_deref(), Some("Read"));
+        assert_eq!(e.pane_id.as_deref(), Some("7"));
     }
 
     #[test]
@@ -1396,8 +1568,12 @@ mod tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let (event_tx, _event_rx) = broadcast::channel(16);
 
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let server_task = tokio::spawn(async move {
-            handle_connection(server, registry, event_tx).await.unwrap();
+            handle_connection(server, registry, event_tx, state)
+                .await
+                .unwrap();
         });
 
         let (mut rd, mut wr) = client.into_split();
@@ -1436,8 +1612,12 @@ mod tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let (event_tx, _event_rx) = broadcast::channel(16);
 
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let server_task = tokio::spawn(async move {
-            handle_connection(server, registry, event_tx).await.unwrap();
+            handle_connection(server, registry, event_tx, state)
+                .await
+                .unwrap();
         });
 
         let (mut rd, mut wr) = client.into_split();
