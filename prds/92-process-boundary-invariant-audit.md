@@ -1,100 +1,129 @@
-# PRD #92: Process-boundary invariant audit sweep
+# PRD #92: Pre-daemon parity audit
 
 **Status**: Planning
 **Priority**: Medium
 **Created**: 2026-05-17
+**Last updated**: 2026-05-22
 **GitHub Issue**: [#92](https://github.com/vfarcic/dot-agent-deck/issues/92)
-**Depends on**: PRD #76 M2.19 and M2.20 shipped first.
+**Depends on**: PRD #76 (shipped, `prds/done/76-remote-agent-environments.md`) and PRD #93 Phases 1–3 (shipped — commits `48b9180`, `3d2b2db`). Baseline for the audit is commit `2fc39c3` — the last commit before PRD #76 merged.
 
 ## Problem Statement
 
-The PRD #76 architectural pivot turned the daemon from an in-process subsystem into a separate process. The TUI now talks to it over a Unix socket using the attach protocol. Every place in the codebase that previously relied on shared-memory semantics — direct pane references, immediate `AppState` consistency, TUI-generated identifiers that happened to also be the daemon's identifiers — became a potential bug at that boundary.
+The deck went through two back-to-back architectural pivots:
 
-The pattern has been visible for months but was caught reactively. Each milestone since M2.11 maps to one such site:
+- **PRD #76** introduced the daemon as a separate process and remote environments as a first-class concept. The in-process arm stayed for local use, with the daemon-attach arm added alongside it for remote.
+- **PRD #93** deleted the in-process arm. The daemon is now always external, lazy-spawned per user; every `dot-agent-deck` invocation attaches to it.
 
-- **M2.11**: pane ids needed to be daemon-stable across reconnect; the TUI was generating fresh ids on hydration → `pane_id_env`, `display_name`, `cwd` added to the daemon registry.
-- **M2.12**: tab membership was reconstructed from the wrong source on reconnect → tab restoration milestone.
-- **M2.13**: `agent_type` was not in `AgentRecord` so post-reconnect placeholder rendering misclassified live agents → field added.
-- **M2.17**: hook events fired in the daemon's process never reached the attached TUI → `tokio::sync::broadcast` fanout + `KIND_EVENT` frames.
-- **M2.19** *(in flight)*: `DOT_AGENT_DECK_PANE_ID` env var on the orchestrator goes stale across reconnect, so `state.handle_delegate` silently drops the signal.
-- **M2.20** *(reported)*: intermittent need to press Enter after sending a prompt — likely another timing-or-identity boundary issue.
+Both pivots were tested by re-implementing the architecture — confirming the new path works, fixing bugs that surfaced under it, then moving on. Neither pivot was tested by enumerating the pre-pivot user-visible features and confirming each one survived intact. Bugs that did surface (PRD #76 M2.11–M2.20; PRD #93 round 5+ in its implementation notes) were caught reactively — a user hit the regression on a real session and reported it.
 
-Each of these was discovered the same way: a user tested on a real remote VM, a bug appeared, and we tracked it back to a shared-memory assumption that broke under IPC. **There is no reason to believe we have caught all of them.** The remaining ones are sitting in the codebase, waiting for a user flow to hit them.
+There is no reason to believe every regression has been caught. The features that were used during the pivots got covered; features the maintainers happen not to use day-to-day could be silently broken or silently changed. The first known example, carried over from earlier audit attempts, is the **force-shutdown gap**: at the baseline you quit the deck and the agents died with it; in current main the daemon persists across deck exits and there is no in-product command to stop it (`pkill` is the only option). PRD #93 line 39 explicitly anticipated needing one but never shipped the command. Neither `DaemonCmd::Stop` nor `RemoteCmd::Stop` exists in current code; `remote remove` only deregisters a local entry.
+
+The audit's job is to enumerate the rest of these. Baseline-versus-current. Each user-visible feature that existed at `2fc39c3` — is it still there, is it still doing the same thing, or did it quietly change shape? Anything missing, different, or silently regressed gets flagged. Anything that changed deliberately gets documented so future re-audits do not re-litigate it.
 
 ## Solution Overview
 
-Run an exploratory survey across the codebase looking for the structural patterns that produce this class of bug. The deliverable is a triaged checklist of suspect call sites, not a code change. Findings get scoped as follow-up milestones under PRD #76 (or a successor PRD) and fixed per-finding.
+A parity audit between the pre-daemon baseline (`2fc39c3`) and current main. Read baseline code, docs, and tests at that commit. Enumerate user-visible features and behaviors. For each, locate the current implementation and compare against the baseline. Triage into one of three buckets:
 
-The audit is *exploratory and pattern-driven*. It is not a diff review and not a bug fix. The goal is coverage — to enumerate the surface area so the project can stop reacting one user-reported bug at a time.
+- **Preserved** — feature works identically in current code. Evidence required: current code path plus at least one test that exercises it.
+- **Regressed** — feature is missing, incomplete, or behaves differently than baseline. File a follow-up milestone.
+- **Intentional change** — feature changed, but the change was a deliberate design decision. Cite the PRD or commit that justifies it so a future re-audit does not re-flag it.
+
+Output goes to `audit/pre-daemon-parity-audit.md` (new file).
+
+The audit is *baseline-versus-current parity*, not a forward-looking review of current code. Current-code-only issues — bugs that have no baseline equivalent — are out of scope.
 
 ## Scope
 
 ### In Scope
 
-- **Code patterns to grep for and inspect**:
-  - Sites that read or mutate `AppState` and assume the read reflects post-IPC state.
-  - Sites holding `&Pane` or `&Session` references across `.await` points.
-  - Identifier flows where the TUI generates an id that is then expected to match a daemon-side id (the M2.11 pattern).
-  - Event sources whose listeners assume in-process delivery (the M2.17 pattern).
-  - Env-var or per-process state that the orchestrator/agent reads once at spawn time but expects to remain valid across TUI reconnect (the M2.19 pattern).
-  - `unwrap()` / `expect()` on lookups that worked locally because state was always populated but can be empty on a fresh reconnect.
-  - Any `PaneBackend::Pty` vs `PaneBackend::Stream` divergence where the `Stream` arm is incomplete relative to the `Pty` arm.
-- **Triage each finding** into:
-  - **Likely broken**: there is a plausible user flow that would hit this. File a milestone.
-  - **Theoretically broken**: the pattern matches but no obvious user flow reaches it. Note for later.
-  - **Safe on inspection**: pattern matches superficially but the code is correct (e.g. the value is reconstructed elsewhere). Note why so the audit does not flag it again.
-- **Use M2.19 and M2.20 root causes as inputs**. The audit should explicitly check whether the same pattern that produced those bugs appears elsewhere.
-- **Output a single audit document** at `audit/process-boundary-invariants.md` (new file). Checklist format, one row per finding.
+- **Every user-visible feature or behavior that shipped at `2fc39c3`**. Read baseline `src/`, `tests/`, `docs/`, and any closed PRDs in `prds/done/` whose work landed before `2fc39c3`. Build the feature list from baseline, not from current main.
+- **For each feature, locate the current implementation** and compare against baseline:
+  - Same UX (commands, flags, output shapes, dialog prompts)?
+  - Same lifecycle (when it starts, when it stops, what survives a restart)?
+  - Same edge-case handling (failure modes, error messages, validation)?
+- **Triage** every row into Preserved / Regressed / Intentional change.
+- **Worked example — force-shutdown gap**: pre-daemon, quitting the deck killed every agent. Post-daemon the daemon persists across exits and there is no in-product stop command. PRD #93 line 39 anticipated one (`"dot-agent-deck remote stop (or equivalent local command) to force shutdown"`); neither form shipped. The audit must include this as a Regressed row anchored to PRD #93 line 39.
+- **Historical anchors**: M2.11 / M2.12 / M2.13 / M2.17 / M2.19 / M2.20 from PRD #76, plus the round 5+ rounds in PRD #93's implementation notes. Each was a regression caught reactively; confirm the corresponding feature is now Preserved in current main, and use the anchor as a spot-check on the methodology (if the audit's pre-existing list does not catch one of these, the methodology is too narrow).
+- **Follow-up milestones for every Regressed row**, drafted in the audit document under a "Follow-up milestones to file" section. The user reviews drafts before any GitHub issue is filed.
 
 ### Out of Scope
 
-- Fixing any of the findings. Fixes are scoped per-finding as follow-up milestones, not in this PRD.
-- Refactoring `PaneBackend` or `ControllerMode` to remove the local/remote divergence — that is PRD #93's territory, and doing it before the audit would erase the very patterns the audit is looking for.
-- Performance audit, security audit, or any other axis. Process-boundary invariants only.
-- Audits of code paths that already have integration test coverage on a real daemon (those are validated). Focus on code that only ran under in-process semantics.
+- **Hypothetical bugs in current code that have no baseline equivalent.** The v1 audit attempt drifted into this and surfaced findings (notably one about remote-network-attach assumptions) against an architecture this codebase does not have — TUI and daemon are always co-located, see `docs/remote-environments.md:8` and `:52–67`. Parity only.
+- **Performance, security, or any other axis.** Behavioral parity only.
+- **Pre-PRD-#76 bugs that the daemon transition incidentally fixed.** Those are improvements, not regressions.
+- **Features that genuinely did not exist at baseline** (the `remote add/list/remove/upgrade` family, daemon idle-shutdown, daemon log destination, lazy-spawn semantics, attach protocol Hello handshake, KIND_EVENT plumbing, etc.). These are post-baseline additions, not parity concerns. List them in an appendix to the audit doc so a future re-audit knows what was deliberately added.
+- **Fixing any of the findings.** Each Regressed row is filed as a follow-up milestone, scoped and fixed separately.
 
 ## Success Criteria
 
-- `audit/process-boundary-invariants.md` exists and lists every site the audit flagged, with a triage column.
-- At least three "likely broken" findings filed as PRD milestones (a lower count suggests the audit was too shallow; if the codebase really is clean, document the patterns checked and why each was safe).
-- The audit document includes a "patterns checked" section so a future re-audit can extend it rather than redo it.
-- A retrospective on M2.19 and M2.20: did the audit's pattern list catch them? If not, the patterns get extended before the audit closes.
+- `audit/pre-daemon-parity-audit.md` exists.
+- Every user-visible feature present at `2fc39c3` has a row in the document with a triage column (Preserved / Regressed / Intentional change), a one-sentence rationale, and an evidence pointer (file:line in current code plus a baseline reference where useful).
+- The force-shutdown gap appears as a Regressed row anchored to PRD #93 line 39.
+- Every Regressed row has a corresponding 2–3 sentence follow-up milestone draft in the deliverable's "Follow-up milestones to file" section.
+- The audit document opens with a coverage statement: which baseline feature categories were checked, which were deferred and why. A future re-audit can extend the statement rather than redo the work.
+- No numeric floor on findings. Count is not the goal; honest coverage is.
 
 ## Milestones
 
-### Phase 1: Setup
+### Phase 1: Baseline enumeration
 
-- [ ] **M1.1** — Read M2.19 and M2.20 post-mortems (commit messages + PRD entries). Extract the structural pattern of each.
-- [ ] **M1.2** — Draft the initial "patterns to check" list, seeded with the M2.11/M2.12/M2.13/M2.17/M2.19/M2.20 patterns.
+- [ ] **M1.1** — Read baseline state at `2fc39c3`. Use `git show 2fc39c3:<path>` for individual files or check out a temporary worktree at the baseline. Cover baseline `src/`, baseline `tests/`, baseline `docs/`, and any closed PRDs in `prds/done/` that shipped before `2fc39c3`. Build a feature/behavior list. The list comes from baseline, not from current code.
+- [ ] **M1.2** — Map each historical anchor (M2.11, M2.12, M2.13, M2.17, M2.19, M2.20, plus PRD #93 implementation-notes rounds) onto one or more rows in the list. Confirm the methodology would have caught each anchor if it had not already been fixed.
 
-### Phase 2: Survey
+### Phase 2: Current-state verification
 
-- [ ] **M2.1** — Grep + read pass across `src/` looking for each pattern. Spawn `Explore` agents per pattern if the scope is wide.
-- [ ] **M2.2** — For each hit, read enough surrounding code to triage. Record finding + triage + rationale in `audit/process-boundary-invariants.md`.
-- [ ] **M2.3** — Cross-check against `tests/` to see which findings already have integration coverage on a real daemon (those auto-downgrade to "safe").
+- [ ] **M2.1** — For each baseline feature, locate the current implementation in main and decide the triage bucket. Use `Explore` agents for breadth where the surface is wide (event delivery, daemon lifecycle, attach protocol, orchestration dispatch).
+- [ ] **M2.2** — For each Preserved candidate, require at least one current test that exercises the daemon path. If no test, demote to Regressed — untested parity is unverified parity.
+- [ ] **M2.3** — For each Intentional change, record the PRD or commit that justifies the change (so future re-audits do not re-flag).
 
-### Phase 3: Output and follow-up
+### Phase 3: Writeup and follow-up
 
-- [ ] **M3.1** — Finalize `audit/process-boundary-invariants.md` with a summary table and a "patterns checked" appendix.
-- [ ] **M3.2** — File each "likely broken" finding as a milestone under PRD #76 (or a successor PRD if #76 has already closed).
-- [ ] **M3.3** — Brief writeup in the PR description summarizing coverage and counts per triage bucket.
+- [ ] **M3.1** — Finalize `audit/pre-daemon-parity-audit.md` with: coverage statement, findings table, worked example (force-shutdown gap), historical-anchor appendix, post-baseline-additions appendix.
+- [ ] **M3.2** — Draft a 2–3 sentence follow-up milestone for each Regressed finding. Do **not** file GitHub issues — the user reviews drafts before any filing.
+- [ ] **M3.3** — Brief writeup in the PR description summarizing counts per triage bucket.
 
 ## Key Files
 
-- `audit/process-boundary-invariants.md` — new file, the audit deliverable.
-- `src/state.rs`, `src/embedded_pane.rs`, `src/ui.rs`, `src/daemon.rs`, `src/main.rs`, `src/hook.rs` — primary read targets.
-- `prds/76-remote-agent-environments.md` — where most likely-broken findings end up as milestones.
+Baseline reading targets (at `2fc39c3` — use `git show 2fc39c3:<path>` or a temporary worktree):
+
+- `src/main.rs` — baseline CLI surface, dashboard entry point.
+- `src/embedded_pane.rs` — baseline pane I/O and lifecycle.
+- `src/state.rs`, `src/ui.rs`, `src/tab.rs` — baseline `AppState` shape and TUI behaviors.
+- `src/hook.rs` — baseline hook ingestion.
+- `tests/` — baseline integration test coverage (every test that exists at baseline is a baseline-feature assertion worth checking against current main).
+- `docs/` — baseline user-facing documentation, especially `getting-started.mdx` and `installation.md`.
+
+Current-code read targets (for the parity check):
+
+- `src/state.rs` — `AppState`, target-pane resolution, session lifecycle.
+- `src/daemon.rs` — daemon startup and idle-shutdown.
+- `src/daemon_protocol.rs` — attach protocol wire format.
+- `src/daemon_client.rs` — TUI-side attach protocol client.
+- `src/agent_pty.rs` — `AgentPtyRegistry`, daemon-side PTY ownership, `write_to_pane`.
+- `src/pane_input.rs` — `encode_pane_payload`, `SUBMIT_DELAY`, bracketed-paste handling.
+- `src/embedded_pane.rs` — `EmbeddedPaneController`, pane read/write paths.
+- `src/main.rs` — auto-spawn, lock contention, CLI surface.
+- `src/ui.rs`, `src/hook.rs` — TUI-side event consumers.
+- `tests/rehydration.rs`, `tests/event_forwarding.rs`, `tests/daemon_integration.rs`, `tests/orchestration_delegate.rs`, `tests/local_attach.rs` — real-daemon integration coverage.
+
+Audit deliverable:
+
+- `audit/pre-daemon-parity-audit.md` — new file.
 
 ## Design Decisions
 
+### 2026-05-22: Parity audit framing
+
+The audit's axis is baseline-versus-current behavioral parity, not a forward-looking review of current code. The deck shipped two architectural pivots back-to-back (PRD #76 daemon-as-separate-process, PRD #93 daemon-as-only-process) and each was tested by re-implementing the architecture, not by enumerating pre-pivot features and confirming they survived. The "what changed silently" question is the right one to ask of the resulting code, and the answer requires looking at what was there before — hence the parity framing.
+
+The baseline is `2fc39c3`, the last commit before PRD #76 merged. That is "the deck as it was before the two pivots." Newer baselines drift into the architectures being audited.
+
+A v1 attempt at this PRD ran in a different direction — a forward-looking behavior audit of the current codebase. That attempt confirmed the force-shutdown gap is real (carried forward as the worked example in this PRD) and surfaced one other finding worth re-checking under parity framing — whether hook events that fire while no TUI is attached are correctly applied to the daemon's `AppState` so the dashboard rehydrates aggregate counts on reconnect (the v1 attempt flagged this as a gap; under parity framing the question becomes "did the baseline have an equivalent of this, and did it work?"). The v1 attempt's findings against a hypothetical remote-network-attach architecture (laptop-TUI ↔ remote-daemon over a network) are dropped because that architecture does not exist in this codebase.
+
+### 2026-05-22: Three-bucket taxonomy
+
+Preserved / Regressed / Intentional change. The v1 attempt had four buckets including "Local-attach assumption" — scoped against a network-attach architecture that the deck does not implement. `docs/remote-environments.md:52–67` is explicit: `connect` runs the TUI on the remote alongside the daemon, the laptop is just a terminal. Same host, same filesystem, same user, same process tree. The Local-attach bucket has no referent in this codebase and is dropped.
+
 ### 2026-05-17: Audit, not refactor
 
-The audit explicitly does not fix anything. Two reasons. First, mixing audit and fix work obscures the audit's scope — readers cannot tell whether a clean area was checked or simply not visited. Second, the right fix for some findings may be the unification work in PRD #93 (remove local-vs-remote divergence entirely), which is a bigger architectural decision than the audit should pre-commit to.
-
-### 2026-05-17: Run after M2.19 + M2.20
-
-Both milestones expose patterns the audit needs to look for. Running the audit before they ship risks producing a pattern list that misses their root-cause shape. The cost of waiting is one PRD-#76 cycle; the cost of an incomplete pattern list is that the audit gives false confidence.
-
-### 2026-05-17: Explore agent over reviewer agent
-
-The reviewer agent is wired for diff review against a specific change. This audit has no diff — it is a structural survey of existing code. `Explore` is the right tool: it can read broadly, follow references, and produce a structured report. The reviewer would be miscast.
+Retained from the original PRD. The audit explicitly does not fix anything. Mixing audit and fix work obscures the audit's scope — readers cannot tell whether a clean area was checked or simply not visited. Each Regressed row is filed as a follow-up milestone with its own scope.
