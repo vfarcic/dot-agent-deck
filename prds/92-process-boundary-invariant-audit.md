@@ -50,6 +50,8 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 - **Implement F1 — force-shutdown command for the daemon.** Pre-daemon the user could quit the deck and every agent died with it; post-daemon the daemon persists and no in-product gesture stops it. Implement an in-product command that restores an equivalent user gesture. **Design pending — see Design Decisions for current open questions.**
 - **Implement F2 — `y` / `n` permission key.** The TUI help overlay (in both baseline and current code) documents `y` / `n` as "Approve / deny permission" but no handler exists. Implement the handler so the documented contract holds; ties back to PRD #18 (permission prompt control).
 - **Implement F3 — fix stale socket-path doc.** `docs/configuration.md:22` still documents `/tmp/dot-agent-deck.sock` while current code uses `/tmp/dot-agent-deck-{uid}.sock`. Update the literal and add a one-sentence per-user-disambiguation note; cross-check `docs/installation.md` and `docs/remote-requirements.md` for the same staleness.
+- **Implement F4 — Ctrl+W respects `close_pane` errors.** Auditor-found regression introduced when PRD #76 turned agent kills into RPCs that can fail. The TUI currently does `let _ = pane.close_pane(...)` and unconditionally removes the dashboard card / session — so a failed `StopAgent` RPC leaves the agent alive in the daemon registry while the card vanishes from the dashboard. Fix the single-pane path (`src/ui.rs`) to inspect the `Result` and preserve the card on `Err`; fix the group-close paths (`TabManager::close_tab` in `src/tab.rs`, `ModeManager::deactivate_mode` in `src/mode_manager.rs`) to return per-pane results so partial failure does not silently destroy the whole tab.
+- **Implement F5 — process-group kill semantics.** Auditor-found defect (possibly pre-existing — baseline's `pane.child.kill()` had the same single-PID limitation, but the user-visible symptom is now sharper because the daemon outlives the TUI). Commands launched via `$SHELL -c <cmd>` (the spawn path in `src/agent_pty.rs`) register the shell's PID, not the actual agent's; on shutdown, only the shell dies and the agent + its descendants are orphaned to init. Fix the spawn path to `setpgid(0, 0)` (or `setsid`) the child into its own process group, and fix the kill paths (`force_kill_child_and_wait` + `shutdown_all_graceful`) to `killpg` instead of `kill`.
 
 ### Out of Scope
 
@@ -57,7 +59,7 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 - **Performance, security, or any other axis.** Behavioral parity only.
 - **Pre-PRD-#76 bugs that the daemon transition incidentally fixed.** Those are improvements, not regressions.
 - **Features that genuinely did not exist at baseline** (the `remote add/list/remove/upgrade` family, daemon idle-shutdown, daemon log destination, lazy-spawn semantics, attach protocol Hello handshake, KIND_EVENT plumbing, etc.). These are post-baseline additions, not parity concerns. List them in an appendix to the audit doc so a future re-audit knows what was deliberately added.
-- **Fixes for any finding *beyond* F1 / F2 / F3.** The audit produced only those three actionable rows; any future regressions surfaced by a re-audit are out of scope for this PRD and would be filed as a successor PRD.
+- **Fixes for any finding *beyond* F1 / F2 / F3 / F4 / F5.** The original audit produced three actionable rows; F4 and F5 were surfaced by the audit-of-the-audit (see Design Decisions, 2026-05-22 "Fold F4 + F5 into scope"). Any *further* regressions surfaced by a re-audit are out of scope for this PRD and would be filed as a successor PRD.
 
 ## Success Criteria
 
@@ -77,7 +79,7 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 - Selecting Stop with `managed_agents_count > 0`: shows a secondary `y / n` confirmation dialog. The dialog text names the count ("{N} managed agent(s) will be terminated and the daemon will shut down. Continue?"). Defaults to **No**. Pressing `y` or Enter on Yes confirms; pressing `n`, Esc, or Enter on No returns to the primary dialog.
 - On confirmed Stop, the TUI sends a `KIND_SHUTDOWN` attach-protocol message; the daemon stops accepting new clients, terminates every managed agent (SIGTERM, with a short grace before SIGKILL), and exits. The TUI's session state is saved per the normal exit path so `--continue` from the same cwd is not poisoned.
 - Existing daemon-lifecycle behaviors are unchanged: the Detach option still detaches without killing agents; idle shutdown still fires only when `clients == 0 AND agents == 0`; persist-when-agents-alive still holds for the implicit-quit path. Stop is purely additive.
-- **No CLI command this round.** `dot-agent-deck stop` and `dot-agent-deck remote stop <name>` are explicitly deferred to a successor PRD (filed as F4 in the audit doc).
+- **No CLI command this round.** `dot-agent-deck stop` and `dot-agent-deck remote stop <name>` are explicitly deferred to a successor PRD (filed as **F6** in the audit doc — renumbered from F4 when F4 / F5 took the next slots).
 
 **F2 fix — `y` / `n` permission key:**
 
@@ -89,6 +91,18 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 **F3 fix — stale socket-path doc:**
 
 - `docs/configuration.md:22` (plus any other stale references found in `docs/installation.md` and `docs/remote-requirements.md`) reflects the actual `/tmp/dot-agent-deck-{uid}.sock` path and includes a one-sentence note explaining the per-user disambiguation. The `$XDG_RUNTIME_DIR/dot-agent-deck.sock` default and the env-var override behavior are unchanged in the doc.
+
+**F4 fix — Ctrl+W respects `close_pane` errors:**
+
+- Pressing Ctrl+W on a single pane inspects the `Result` returned by `PaneController::close_pane`. On `Ok(())`, the card and session are removed exactly as before. On `Err`, the card / session / metadata are preserved (the controller has already restored the local pane state); the error is surfaced in `ui.status_message` so the user can retry.
+- Group-close paths (a mode-tab agent's Ctrl+W tears down the agent pane plus its side panes; an orchestration tab tears down every role) return per-pane results. Successfully-closed panes are removed; failed ones keep their cards and surface their errors via `ui.status_message`. The TUI does not silently drop cards while their underlying agents are still alive in the daemon registry.
+- Unit tests cover the single-pane Ok / Err paths and the group-close partial-failure case for both `TabManager::close_tab` and `ModeManager::deactivate_mode`.
+
+**F5 fix — process-group kill semantics:**
+
+- Each spawned agent runs in its own POSIX process group (set via `setpgid(0, 0)` in a `pre_exec` hook so the child becomes the group leader). The daemon records the process-group id alongside the child PID.
+- Every shutdown path that previously called `kill(pid, SIGKILL)` now calls `killpg(pgid, SIGKILL)` (or the SIGTERM-then-SIGKILL escalation for the graceful path) so shell-wrapped commands and the descendants they spawn are reaped together.
+- A new test launches a shell-wrapped agent (`sh -c 'sleep 30 & wait'` or equivalent), captures the descendant PID, calls `StopAgent`, and asserts both the shell PID and the descendant PID are dead within ~2 seconds.
 
 ## Milestones
 
@@ -122,15 +136,27 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 
 ### Phase 6: Design + implement F1 — Stop option in Ctrl+C dialog — shipped
 
-- [x] **M6.1** — Lock the F1 design. *Shipped: see the locked "F1 design" subsection in Design Decisions below. Stop is a third option in the existing Ctrl+C dialog (Detach default / Stop / Cancel). Secondary y/n confirmation only when agents are alive (defaults to No). `KIND_SHUTDOWN` is the wire signal; the daemon iterates the registry, SIGTERMs each agent with a short grace before SIGKILL, then exits. No CLI command this round — `dot-agent-deck stop` deferred to F4.*
+- [x] **M6.1** — Lock the F1 design. *Shipped: see the locked "F1 design" subsection in Design Decisions below. Stop is a third option in the existing Ctrl+C dialog (Detach default / Stop / Cancel). Secondary y/n confirmation only when agents are alive (defaults to No). `KIND_SHUTDOWN` is the wire signal; the daemon iterates the registry, SIGTERMs each agent with a short grace before SIGKILL, then exits. No CLI command this round — `dot-agent-deck stop` deferred to F6 (renumbered from F4 when the audit-of-the-audit surfaced F4 / F5 as in-scope for this PRD).*
 - [x] **M6.2** — Implement Stop per the locked design. *Shipped: 3-option primary dialog (`src/ui.rs::handle_quit_confirm_key` + `render_quit_confirm`) with Detach default / Stop (1) / Cancel (2). Secondary y/n confirmation (`src/ui.rs::handle_stop_confirm_key` + `render_stop_confirm`) with `UiMode::StopConfirm`, agent count cached at transition. `KeyResult::StopAndQuit` calls `EmbeddedPaneController::shutdown_daemon` (`src/embedded_pane.rs`), which sends `KIND_SHUTDOWN` (`0x15`) via `DaemonClient::send_shutdown` (`src/daemon_client.rs`). Daemon-side `handle_connection` (`src/daemon_protocol.rs`) short-circuits `KIND_SHUTDOWN` before the usual `KIND_REQ` decoding, calls `AgentPtyRegistry::shutdown_all_graceful(Duration::from_secs(3))` (`src/agent_pty.rs`), then signals the daemon's shutdown `Notify` so `run_hook_loop` exits. The registry's Drop calls `shutdown_all` (SIGKILL) as the backstop for survivors. Idempotency: `AgentPtyRegistry::shutting_down: AtomicBool` latches on first entry.*
 - [x] **M6.3** — Tests covering: primary dialog shows Detach / Stop / Cancel with Detach default; Stop with `agents_count == 0` skips the secondary dialog and triggers shutdown; Stop with `agents_count > 0` shows the secondary dialog with the agent count rendered in the text; secondary dialog defaults to No; Yes confirms (triggers shutdown), No returns to the primary dialog without shutting down; daemon receives `KIND_SHUTDOWN`, terminates managed agents, and exits within a bounded window; idempotency — two `KIND_SHUTDOWN` frames in quick succession do not crash the daemon; session save runs on the Stop path. *Shipped: 9 new unit tests in `src/ui.rs` (`quit_confirm_stop_with_no_agents_returns_stop_and_quit`, `::quit_confirm_stop_with_agents_prompts_secondary_dialog`, `::quit_confirm_down_clamps_to_three_options`, `::quit_confirm_cancel_returns_to_normal_mode` updated for new index, `::stop_confirm_defaults_to_no`, `::stop_confirm_yes_returns_stop_and_quit`, `::stop_confirm_y_shortcut_returns_stop_and_quit`, `::stop_confirm_no_returns_to_primary_dialog`, `::stop_confirm_down_clamps_to_two_options`) and 3 new integration tests in `tests/stop_dialog.rs` (`send_shutdown_returns_cleanly_with_no_agents`, `::send_shutdown_drains_registry_and_signals_notify`, `::double_shutdown_is_idempotent`). Session-save runs via the same `'outer` break the existing DetachAndQuit path uses; no new test required because the dispatcher branch shares the exit path verified by existing session-restore coverage.*
 
+### Phase 8: Implement F4 — Ctrl+W respects `close_pane` errors
+
+- [ ] **M8.1** — Single-pane Ctrl+W in `src/ui.rs` inspects the `Result` returned by `pane.close_pane(pane_id)`. On `Ok(())`, current behavior: remove session, card, pane metadata. On `Err(e)`, keep the session / card / metadata, surface `e` via `ui.status_message`. The user can retry — the controller's `close_pane` has already restored the local pane state on the error path (verified by `tests/daemon_attach_cleanup.rs::ctrl_w_stop_agent_timeout_restores_pane_and_returns_error`).
+- [ ] **M8.2** — Group-close paths: `TabManager::close_tab` (`src/tab.rs`) and `ModeManager::deactivate_mode` (`src/mode_manager.rs`) change shape from "Vec of pane IDs to remove" to a per-pane result list. Successfully-closed panes get removed by the caller; failed panes stay in the registry (controller-side) and on the dashboard (TUI-side), with a status-message line listing the failures. Tab-close partial-failure does not destroy the tab entirely if at least one pane closed — but the now-empty side of the tab is best-effort cleaned up so the surviving failed pane retains its card.
+- [ ] **M8.3** — Tests: UI-handler test (mock `close_pane` → `Err`) preserves the card / session and surfaces the error; UI-handler test (mock `close_pane` → `Ok`) removes them; orchestration group-close partial-failure preserves the failed pane and removes the rest; mode-deactivate partial-failure does the same.
+
+### Phase 9: Implement F5 — process-group kill semantics
+
+- [ ] **M9.1** — Spawn each agent in its own POSIX process group. After `fork` (in the child), call `setpgid(0, 0)` so the new child becomes the group leader. Standard pattern via `Command::pre_exec` from the `std::os::unix::process::CommandExt` extension trait — the spawn path in `src/agent_pty.rs` is the single edit site. Record the `pgid` (which equals the child's PID once `setpgid(0, 0)` runs) alongside the existing `RunningAgent.child` so the kill paths know what to target. If `portable-pty` doesn't expose `pre_exec` cleanly, bypass to a raw `Command` and adopt the PTY master/slave separately.
+- [ ] **M9.2** — Replace `kill(pid, SIGKILL)` with `killpg(pgid, SIGKILL)` in `force_kill_child_and_wait` (`src/agent_pty.rs`), and the SIGTERM-then-SIGKILL escalation in `shutdown_all_graceful` (`src/agent_pty.rs`) likewise targets the group. Use `nix::sys::signal::killpg` if the `nix` crate is already a dependency; otherwise raw `libc::killpg`.
+- [ ] **M9.3** — Tests: launch an agent via a shell wrapper that backgrounds a child (`sh -c 'sleep 30 & wait'`), capture the descendant `sleep` PID via `/proc/<pid>/task/<pid>/children` or equivalent, call `close_pane` (or the Stop path), and assert that both the shell PID and the descendant `sleep` PID are dead within ~2s. Liveness probed via `kill(pid, 0)` returning ESRCH.
+
 ### Phase 7: Pre-release
 
-- [ ] **M7.1** — Manual test pass covering F1, F2, F3 (orchestrator drives with the user). Confirm the quit dialog still behaves as the M4.2-collapsed Detach/Cancel; confirm idle shutdown still works for the no-agents case; confirm the new F1 command behaves per the locked design; confirm `y` / `n` approve/deny works on a real `WaitingForInput` session; confirm the doc updates read cleanly on the rendered docs site.
-- [ ] **M7.2** — Changelog fragment via `dot-ai-changelog-fragment`. The user-visible headlines are the new F1 command, the `y` / `n` keybindings going live, and the doc fix; the audit deliverable itself is internal and does not need a changelog entry.
-- [ ] **M7.3** — PR description includes (a) the audit findings summary (counts per bucket plus a pointer to `audit/pre-daemon-parity-audit.md`), (b) the F1 / F2 / F3 fix summary, (c) the manual-test-pass results from M7.1, and (d) links to any successor PRDs or follow-up issues if the audit surfaces additional work during implementation.
+- [ ] **M7.1** — Manual test pass covering F1, F2, F3, F4, F5 (orchestrator drives with the user). Confirm the quit dialog behaves as the M6.2 three-option Detach/Stop/Cancel; confirm idle shutdown still works for the no-agents case; confirm Stop terminates managed agents and exits the daemon; confirm `y` / `n` approve/deny works on a real `WaitingForInput` session; confirm the doc updates read cleanly on the rendered docs site; confirm Ctrl+W on an unhealthy agent surfaces an error instead of silently removing the card; confirm a shell-wrapped agent's descendants die when the pane is closed.
+- [ ] **M7.2** — Changelog fragment via `dot-ai-changelog-fragment`. The user-visible headlines are the new F1 Stop dialog option, the `y` / `n` keybindings going live, the F4 close-pane error surfacing, the F5 descendant-process cleanup, and the doc fix; the audit deliverable itself is internal and does not need a changelog entry.
+- [ ] **M7.3** — PR description includes (a) the audit findings summary (counts per bucket plus a pointer to `audit/pre-daemon-parity-audit.md`), (b) the F1 / F2 / F3 / F4 / F5 fix summary, (c) the manual-test-pass results from M7.1, and (d) links to any successor PRDs or follow-up issues if the audit surfaces additional work during implementation.
 
 ## Key Files
 
@@ -160,13 +186,32 @@ Audit deliverable:
 
 - `audit/pre-daemon-parity-audit.md` — new file.
 
-Fix targets (Phases 4–6):
+Fix targets (Phases 4–9):
 
 - **F3** (doc fix): `docs/configuration.md` (line 22 plus surrounding env-var table), `docs/installation.md`, `docs/remote-requirements.md`.
 - **F2** (`y` / `n` permission key): `src/ui.rs` (`handle_normal_key`, `WaitingForInput` gating, plus any approve/deny wiring); `src/state.rs` if approve / deny needs to mutate session state. Unit tests inline in `src/ui.rs` next to the existing `test_mode_transitions` cluster.
 - **F1** (Stop option in Ctrl+C dialog): `src/ui.rs` (primary and secondary dialog rendering + key handlers + `KeyResult::Stop` variant), `src/daemon_protocol.rs` (`KIND_SHUTDOWN` frame), `src/daemon_client.rs` (TUI-side `send_shutdown` helper), `src/daemon.rs` (handler that triggers the existing shutdown path immediately on `KIND_SHUTDOWN`), `src/agent_pty.rs` (terminate-all path with SIGTERM→SIGKILL escalation). Tests under `tests/` — a new `tests/stop_dialog.rs` for the dialog flow plus `KIND_SHUTDOWN` round-trip tests added to `tests/daemon_protocol.rs` and `tests/daemon_lifecycle.rs`. No CLI command this round, so `src/main.rs` is untouched.
+- **F4** (Ctrl+W error handling): `src/ui.rs` (Ctrl+W handler around line 3736 and the group-close fan-out), `src/tab.rs` (`TabManager::close_tab` signature widens to return per-pane results), `src/mode_manager.rs` (`ModeManager::deactivate_mode` similarly). Tests in a new `tests/close_pane_errors.rs` (or extending `tests/orchestration_delegate.rs`) using a mock `PaneController` that returns `Err` from `close_pane`.
+- **F5** (process-group kill semantics): `src/agent_pty.rs` is the single edit site — spawn path uses `pre_exec` for `setpgid(0, 0)`; `force_kill_child_and_wait` and `shutdown_all_graceful` switch from `kill(pid, ...)` to `killpg(pgid, ...)`. Tests in a new `tests/process_group_kill.rs` or as an extension to `tests/local_attach.rs` — launch a shell-wrapped agent, capture the descendant PID, close the pane, assert both PIDs are dead.
 
 ## Design Decisions
+
+### 2026-05-22: Fold F4 + F5 into scope (audit-of-the-audit findings)
+
+While the F1 / F2 / F3 fixes were landing, the audit picked up its own audit pass and surfaced two additional issues that fit the same pattern of "daemon pivot left behind something the parity audit missed":
+
+- **F4 — Ctrl+W respects `close_pane` errors.** Post-PRD-#76 regression: when agent kills became RPCs that can fail, the TUI's Ctrl+W handler did `let _ = pane.close_pane(...)` and unconditionally removed the dashboard card. A failed `StopAgent` RPC leaves the agent alive in the daemon registry while the card vanishes from the dashboard. Did not exist at baseline (where the kill was an in-process call that couldn't fail in the same way). Auditor classified as blocker.
+- **F5 — process-group kill semantics.** Possibly pre-existing defect: commands launched via `$SHELL -c <cmd>` register the shell's PID; on shutdown only the shell is signalled and its descendants (the actual agent, language servers, file watchers) are orphaned to init. Baseline had the same shape (`pane.child.kill()` was a single-PID call), but the user-visible symptom is now sharper because the daemon outlives the TUI so orphaned descendants persist across deck restarts. Auditor classified as suggestion; user confirmed fold-in to fix the visible symptom ("agents still running after Ctrl+W").
+
+User confirmed both fold-ins: "Yes" (F4) and "Confirm F5 fold-in" (F5). Ordering F1 → F4 → F5, strictly sequential.
+
+The "audit excludes fixes" decision (2026-05-17) is now superseded for these two findings as well; same trade-off as F1 / F2 / F3 — bundling is cheaper than spinning up two more follow-up PRDs. The original "Audit, not refactor" principle still applies to *future* audits run after this PRD closes.
+
+This also forces a renumbering: the original **F4 — Scripted shutdown via `dot-agent-deck stop`** (drafted in the audit's Follow-up section when F1 shipped) is renumbered to **F6** so the in-scope fixes occupy contiguous slots F1–F5. Cross-references in F1's locked design and in row 14 of the findings table are updated accordingly.
+
+**F4 design choice — group-close partial-failure handling.** When Ctrl+W tears down a mode tab or orchestration tab, multiple `close_pane` calls fan out. The handler must choose between three behaviors when *some* of those calls fail: (a) abort the entire tab-close and surface the first error, (b) close all the successful ones and leave the failed ones present as orphan cards, or (c) close all the successful ones and tear down the now-empty side of the tab anyway. The orchestrator chose (b) — close successful panes, list failed ones in `ui.status_message`, keep their cards present for retry. User confirmed. (b) is preferred because (a) is too coarse — the user has to retry every healthy pane just to retry the unhealthy one — and (c) loses the failed cards' visibility, defeating the whole point of the fix.
+
+**F5 design choice — `setpgid` vs `setsid`.** Both work; `setpgid(0, 0)` creates a new process group within the existing session (cleaner — does not detach from the controlling tty), and the resulting `pgid` equals the child's PID so the daemon doesn't need to record a separate field. `setsid` creates a new session with its own controlling tty, which is more isolation than F5 needs and would interact awkwardly with the PTY master/slave the agent already has. Going with `setpgid` per the F4/F5 context recommendation.
 
 ### 2026-05-22: Expand scope to include F1 / F2 / F3 fixes
 
@@ -224,7 +269,7 @@ The "return to primary" behavior on No is chosen over "dismiss" because it is mo
 2. ~~Force-shutdown semantics with managed agents alive~~ → user confirms via secondary dialog; on confirm, agents are SIGTERM'd (then SIGKILL after a short grace) and the daemon exits.
 3. ~~Confirmation prompt~~ → primary dialog is the confirmation when no agents; secondary y/n dialog when agents alive. No `--force` flag.
 4. ~~Multi-agent handling under force~~ → daemon iterates the registry and terminates each PTY in order.
-5. ~~Local vs remote scope~~ → local only this round; remote-stop deferred to F4.
+5. ~~Local vs remote scope~~ → local only this round; remote-stop deferred to F6 (renumbered from F4 when the audit-of-the-audit surfaced F4 / F5 as in-scope for this PRD).
 6. ~~Wire-level signal~~ → new `KIND_SHUTDOWN` protocol frame; SIGTERM to the daemon PID as last-resort fallback if the frame cannot be delivered.
 7. ~~Idempotency / missing-daemon cases~~ → second signal is a no-op (guarded by a `shutting_down` flag in the daemon); no-daemon case is unreachable from the dialog.
 
@@ -244,4 +289,4 @@ Preserved / Regressed / Intentional change. The v1 attempt had four buckets incl
 
 Retained from the original PRD. The audit explicitly does not fix anything. Mixing audit and fix work obscures the audit's scope — readers cannot tell whether a clean area was checked or simply not visited. Each Regressed row is drafted as a follow-up milestone in the audit document; not filed as a GitHub issue until the user reviews and authorizes, and fixes are scoped separately.
 
-*Partially superseded by the 2026-05-22 scope-expansion decision above. The "audit excludes fixes" guidance no longer applies to F1 / F2 / F3 specifically — those land on this PRD's branch. The broader principle (that future audits should not interleave fix work with their findings discovery) is unchanged.*
+*Partially superseded by the two 2026-05-22 scope-expansion decisions above. The "audit excludes fixes" guidance no longer applies to F1 / F2 / F3 / F4 / F5 specifically — all five land on this PRD's branch. The broader principle (that future audits should not interleave fix work with their findings discovery) is unchanged.*
