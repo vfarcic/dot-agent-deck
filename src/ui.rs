@@ -1208,6 +1208,54 @@ pub(crate) struct HydrationPartition {
 /// orchestration buckets preserve the order in which their (cwd, name)
 /// pairing was first seen so the user's mental "which tab opened first"
 /// model survives reconnect (TabManager appends in iteration order).
+/// Key used by [`build_dedupe_budget`] / [`try_consume_dedupe_slot`] to
+/// match a saved pane against a daemon-hydrated pane. The tuple is
+/// `(dir, name, mode)`. `command` is intentionally excluded — daemon
+/// `list_agents` doesn't echo command, so hydration always stores
+/// `command = ""` and including it in the key would dedupe nothing for
+/// the common case.
+type SavedPaneDedupeKey = (String, String, Option<String>);
+
+/// Build the dedupe budget from the hydration metadata. The budget
+/// maps `(dir, name, mode)` keys to the COUNT of hydrated panes
+/// matching that key. The restore loop consumes slots via
+/// [`try_consume_dedupe_slot`] so it drops at most one saved pane per
+/// hydrated match — preserving distinct saved panes that happen to
+/// share a key (round-10 reviewer #2).
+fn build_dedupe_budget(
+    pane_metadata: &std::collections::HashMap<String, config::SavedPane>,
+) -> std::collections::HashMap<SavedPaneDedupeKey, usize> {
+    let mut budget: std::collections::HashMap<SavedPaneDedupeKey, usize> =
+        std::collections::HashMap::new();
+    for meta in pane_metadata.values() {
+        *budget
+            .entry((meta.dir.clone(), meta.name.clone(), meta.mode.clone()))
+            .or_insert(0) += 1;
+    }
+    budget
+}
+
+/// Returns true and decrements the budget if `saved_pane`'s
+/// `(dir, name, mode)` key has a free slot — the caller should then
+/// skip restoring it. Returns false otherwise.
+fn try_consume_dedupe_slot(
+    budget: &mut std::collections::HashMap<SavedPaneDedupeKey, usize>,
+    saved_pane: &config::SavedPane,
+) -> bool {
+    let key = (
+        saved_pane.dir.clone(),
+        saved_pane.name.clone(),
+        saved_pane.mode.clone(),
+    );
+    if let Some(slot) = budget.get_mut(&key)
+        && *slot > 0
+    {
+        *slot -= 1;
+        return true;
+    }
+    false
+}
+
 pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition {
     use std::collections::HashSet;
 
@@ -2525,26 +2573,10 @@ pub fn run_tui(
         let _ = terminal.autoresize();
 
         let saved = config::SavedSession::load();
-        // CodeRabbit (PRD #93 round-9): dedupe against panes the daemon
-        // already hydrated. The hydration loop above populated
-        // `ui.pane_metadata` with a `SavedPane`-shaped entry for every
-        // daemon agent that carried a cwd, keyed by the daemon pane id.
-        // The saved-session file is independent of that path — if the
-        // user's previous TUI process saved its panes and the daemon
-        // still owns them, both code paths recreate the same logical
-        // pane and the user ends up with duplicate ghost cards. Match
-        // by the `(dir, name, mode)` triple — pane ids are
-        // daemon-allocated and shift every spawn, so they're useless
-        // here; the user-visible identity of a pane is its directory +
-        // label + tab membership. Saved panes that *don't* match any
-        // hydrated pane are still restored (covers the case where the
-        // daemon was restarted between sessions and hydration returned
-        // empty).
-        let hydrated_keys: std::collections::HashSet<(String, String, Option<String>)> = ui
-            .pane_metadata
-            .values()
-            .map(|p| (p.dir.clone(), p.name.clone(), p.mode.clone()))
-            .collect();
+        // CodeRabbit round-9 #4 / round-10 #2: dedupe against panes
+        // the daemon already hydrated. See `build_dedupe_budget` and
+        // `try_consume_dedupe_slot` below for the algorithm.
+        let mut remaining_dedupe_budget = build_dedupe_budget(&ui.pane_metadata);
         // Collect deferred mode pane restores — we need the terminal ready
         // before we can resize PTYs, so mode tabs are opened after the loop.
         let mut deferred_mode_panes: Vec<(config::SavedPane, ModeConfig)> = Vec::new();
@@ -2557,12 +2589,7 @@ pub fn run_tui(
                 ));
                 continue;
             }
-            let dedupe_key = (
-                saved_pane.dir.clone(),
-                saved_pane.name.clone(),
-                saved_pane.mode.clone(),
-            );
-            if hydrated_keys.contains(&dedupe_key) {
+            if try_consume_dedupe_slot(&mut remaining_dedupe_budget, saved_pane) {
                 tracing::debug!(
                     dir = %saved_pane.dir,
                     name = %saved_pane.name,
@@ -6612,6 +6639,97 @@ mod tests {
         assert_eq!(p.dashboard_pane_ids, vec!["1".to_string(), "2".to_string()]);
         assert!(p.mode_buckets.is_empty());
         assert!(p.orchestration_buckets.is_empty());
+    }
+
+    /// Round-10 reviewer #2: two saved panes that share
+    /// `(dir, name, mode)` must NOT both be dropped when only one was
+    /// hydrated. The pre-round-10 `HashSet` dedupe collapsed both;
+    /// the count-based budget drops at most one per match.
+    #[test]
+    fn dedupe_drops_only_count_matched_saved_panes() {
+        use config::SavedPane;
+        let mut metadata: HashMap<String, SavedPane> = HashMap::new();
+        // One hydrated dashboard pane with (dir=/w, name=foo, mode=None).
+        metadata.insert(
+            "pane-1".into(),
+            SavedPane {
+                dir: "/w".into(),
+                name: "foo".into(),
+                command: String::new(),
+                mode: None,
+            },
+        );
+        let mut budget = build_dedupe_budget(&metadata);
+
+        let saved_a = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: "vim".into(),
+            mode: None,
+        };
+        let saved_b = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: "tail -f log".into(),
+            mode: None,
+        };
+
+        // First saved pane matches the hydrated → consumed.
+        assert!(try_consume_dedupe_slot(&mut budget, &saved_a));
+        // Second saved pane shares the key but the budget is exhausted → restored.
+        assert!(!try_consume_dedupe_slot(&mut budget, &saved_b));
+    }
+
+    #[test]
+    fn dedupe_distinguishes_mode_panes_from_dashboard() {
+        use config::SavedPane;
+        let mut metadata: HashMap<String, SavedPane> = HashMap::new();
+        metadata.insert(
+            "pane-1".into(),
+            SavedPane {
+                dir: "/w".into(),
+                name: "foo".into(),
+                command: String::new(),
+                mode: Some("k8s-ops".into()),
+            },
+        );
+        let mut budget = build_dedupe_budget(&metadata);
+
+        // Same (dir, name) but different mode — must NOT dedupe.
+        let saved_dashboard = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: "vim".into(),
+            mode: None,
+        };
+        assert!(!try_consume_dedupe_slot(&mut budget, &saved_dashboard));
+
+        // Matching mode → DEDUPED.
+        let saved_mode = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: String::new(),
+            mode: Some("k8s-ops".into()),
+        };
+        assert!(try_consume_dedupe_slot(&mut budget, &saved_mode));
+    }
+
+    #[test]
+    fn dedupe_restores_saved_panes_when_daemon_empty() {
+        use config::SavedPane;
+        // No hydrated metadata (daemon restarted, hydration returned
+        // empty). The saved-session file is the only source of truth;
+        // every saved pane must restore.
+        let metadata: HashMap<String, SavedPane> = HashMap::new();
+        let mut budget = build_dedupe_budget(&metadata);
+
+        let saved = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: "vim".into(),
+            mode: None,
+        };
+        assert!(!try_consume_dedupe_slot(&mut budget, &saved));
     }
 
     #[test]

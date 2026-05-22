@@ -108,8 +108,13 @@ fn lock_path_for(socket_path: &Path) -> PathBuf {
 ///
 /// Tests can pin a deterministic root via `DOT_AGENT_DECK_LOCK_DIR` so
 /// they don't pollute `$HOME/.cache` or contend with the user's real
-/// daemon.
+/// daemon. In-process tests should prefer [`LOCK_DIR_OVERRIDE`] —
+/// setting a `OnceLock<PathBuf>` is race-free, while `set_var` races
+/// against any thread doing `getenv` concurrently (round-10 auditor #4).
 fn lock_root() -> PathBuf {
+    if let Some(p) = LOCK_DIR_OVERRIDE.get() {
+        return p.clone();
+    }
     if let Ok(explicit) = std::env::var("DOT_AGENT_DECK_LOCK_DIR") {
         return PathBuf::from(explicit);
     }
@@ -122,6 +127,24 @@ fn lock_root() -> PathBuf {
         .join(".cache")
         .join("dot-agent-deck")
 }
+
+/// In-process test override for [`lock_root`]. A `OnceLock<PathBuf>`
+/// that, when set, replaces both env-var and HOME-based resolution.
+/// Tests use this in preference to mutating `DOT_AGENT_DECK_LOCK_DIR`
+/// via `std::env::set_var` — the latter is `unsafe` precisely because
+/// it races with any concurrent `getenv` (including libc-internal
+/// reads of unrelated variables that walk the same `environ` array
+/// libc rewrites on update). `OnceLock::set` has well-defined memory
+/// ordering and never touches process-wide env state.
+///
+/// Production never writes to this — it's an unset `OnceLock` at
+/// runtime, costing one extra atomic load per `lock_root()` call.
+/// Subprocess-based tests (`tests/external_daemon.rs`) can't see the
+/// in-memory `OnceLock` of the spawning process, so they additionally
+/// set the env var on the child's `Command::env`; that mutation lives
+/// in the test code that already accepts the race for other vars,
+/// not in the shared `init_test_env` helper.
+pub static LOCK_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Create `dir` (recursively) with mode 0o700 and re-apply the mode to
 /// pre-existing directories — same defense-in-depth pattern as

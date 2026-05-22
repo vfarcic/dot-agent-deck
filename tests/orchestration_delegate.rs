@@ -497,6 +497,100 @@ prompt_template = "You are the coder. Always run tests before finishing."
     );
 }
 
+/// CodeRabbit round-10 #1: an UNNAMED orchestration (no `name` field
+/// or `name = ""` in `.dot-agent-deck.toml`) must still pick up
+/// `prompt_template` wrapping. The TUI's tab construction uses the
+/// cwd basename as the orchestration name; the daemon's
+/// `load_project_config` must apply the SAME fallback so its
+/// `orchestrations.iter().find(|o| o.name == ...)` matches.
+///
+/// Pre-round-10 the loader returned `OrchestrationConfig.name = ""`
+/// verbatim, and `handle_delegate` looked up against the
+/// basename-resolved name carried in `TabMembership` — a mismatch
+/// that silently dropped prompt_template wrapping for the unnamed
+/// case.
+#[tokio::test]
+async fn delegate_applies_prompt_template_for_unnamed_orchestration() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+    // The daemon's loader resolves an empty/missing config name to the
+    // cwd basename — same fallback the TUI applies when building
+    // `TabMembership::Orchestration.name`. Both ends key on this
+    // resolved value.
+    let resolved_name = std::path::Path::new(&cwd)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .expect("tempdir must have a basename");
+
+    // No `name = ...` line — relies on the loader's fallback.
+    let config_toml = r#"
+[[orchestrations]]
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "cat -u"
+prompt_template = "You are the coder for an unnamed orchestration."
+"#;
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_agent_id = start_role_pane(
+        &daemon,
+        &resolved_name,
+        "orchestrator",
+        true,
+        0,
+        "orch-pane-2",
+        &cwd,
+    )
+    .await;
+    let coder_agent_id = start_role_pane(
+        &daemon,
+        &resolved_name,
+        "coder",
+        false,
+        1,
+        "coder-pane-2",
+        &cwd,
+    )
+    .await;
+
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane-2".into(),
+            task: "Implement the parser".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    let _ = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &coder_agent_id,
+        "Read .dot-agent-deck/worker-task-coder.md",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let task_file = std::path::Path::new(&cwd).join(".dot-agent-deck/worker-task-coder.md");
+    let body = std::fs::read_to_string(&task_file).unwrap();
+    assert!(
+        body.contains("You are the coder for an unnamed orchestration."),
+        "unnamed orchestration must still pick up prompt_template wrapping; got:\n{body}"
+    );
+}
+
 /// Anti-spoofing: a delegate from a worker pane (or any non-orchestrator
 /// pane) must be dropped daemon-side and produce no PTY write.
 #[tokio::test]

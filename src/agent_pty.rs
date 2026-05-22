@@ -943,11 +943,20 @@ impl AgentPtyRegistry {
         // pane id can't squeeze between a pre-spawn check and the
         // insert. On Err the `guard` Drop kills the child we just
         // spawned, so the rejection doesn't leak a PTY.
+        //
+        // Round-10 LOW (auditor): skip exited agents — `live_count`'s
+        // contract is "an exited entry is reaped only when something
+        // else (an explicit close or close_all) actually removes it,"
+        // so a dead-but-not-yet-reaped entry would otherwise block
+        // reuse of its pane_id_env forever. Mirror the same
+        // `exited.load(...)` filter that `live_count` uses so this
+        // routing-uniqueness check and the idle-shutdown gate
+        // disagree on nothing.
         if let Some(ref candidate) = pane_id_env
-            && inner
-                .agents
-                .values()
-                .any(|a| a.pane_id_env.as_deref() == Some(candidate.as_str()))
+            && inner.agents.values().any(|a| {
+                a.pane_id_env.as_deref() == Some(candidate.as_str())
+                    && !a.exited.load(Ordering::SeqCst)
+            })
         {
             return Err(AgentPtyError::DuplicatePaneId(candidate.clone()));
         }
@@ -1492,6 +1501,58 @@ mod tests {
         // can't have leaked the spawned child.
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.agent_ids(), vec![id1]);
+        registry.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn registry_allows_pane_id_reuse_when_prior_agent_has_exited() {
+        // Round-10 auditor #3: the duplicate-pane-id check must mirror
+        // `live_count`'s contract — a dead-but-not-yet-reaped registry
+        // entry doesn't block reuse of its `pane_id_env`. Without the
+        // `!exited.load(...)` filter, a previously-crashed worker's
+        // entry would hold its pane id hostage until something else
+        // explicitly removed it.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id1 = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/true"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-recycle".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("first spawn should succeed");
+
+        // Wait for the reader thread to observe EOF and set `exited`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if registry.live_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "test prerequisite: /bin/true must have exited"
+        );
+        assert_eq!(registry.len(), 1, "exited entry must still be in registry");
+
+        // Now: reuse the same pane_id_env. The exited agent shouldn't
+        // block this — only a live agent would.
+        let id2 = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-recycle".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("reuse of an exited agent's pane_id_env must succeed");
+        assert_ne!(id1, id2);
+
         registry.shutdown_all();
     }
 
