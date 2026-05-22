@@ -24,6 +24,8 @@ use std::time::Duration;
 use dot_agent_deck::daemon_attach::{ensure_daemon_running, spawn_daemon_serve_detached_with_exe};
 use dot_agent_deck::daemon_client::DaemonClient;
 
+mod common;
+
 // Same umask-narrowing serialization as the other integration test
 // binaries — `bind_socket` flips the process-global umask while binding,
 // and a tempdir created inside that window inherits 0o600. Hold this
@@ -93,6 +95,9 @@ impl Drop for DaemonTestCleanup {
 
 #[tokio::test]
 async fn lazy_spawn_binds_trusted_socket_and_serves_list_agents() {
+    // Redirect the daemon's lock dir into a per-binary tempdir; the
+    // subprocess we spawn below inherits this env var via `Command`.
+    common::init_test_env();
     let dir = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         tempfile::tempdir().unwrap()

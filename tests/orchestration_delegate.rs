@@ -40,6 +40,8 @@ use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::event::{DaemonMessage, DelegateSignal, WorkDoneSignal};
 use dot_agent_deck::state::{AppState, SharedState};
 
+mod common;
+
 static HARNESS_BIND_LOCK: Mutex<()> = Mutex::new(());
 
 /// Owns the spawned daemon coroutine plus the live clones of the daemon's
@@ -63,6 +65,7 @@ impl Drop for DaemonHandle {
 }
 
 async fn spawn_daemon() -> DaemonHandle {
+    common::init_test_env();
     let (dir, hook_path, attach_path) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();

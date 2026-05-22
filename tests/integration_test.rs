@@ -8,6 +8,8 @@ use tokio::sync::RwLock;
 use dot_agent_deck::daemon::run_daemon;
 use dot_agent_deck::state::{AppState, SessionStatus};
 
+mod common;
+
 fn event_json(session_id: &str, event_type: &str) -> String {
     format!(
         r#"{{"session_id":"{}","agent_type":"claude_code","event_type":"{}","timestamp":"2026-03-22T10:00:00Z"}}"#,
@@ -38,6 +40,7 @@ fn tool_event_json(session_id: &str, tool_name: &str) -> String {
 
 #[tokio::test]
 async fn single_session_lifecycle() {
+    common::init_test_env();
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
@@ -99,6 +102,7 @@ async fn single_session_lifecycle() {
 
 #[tokio::test]
 async fn multiple_sessions() {
+    common::init_test_env();
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
@@ -133,6 +137,7 @@ async fn multiple_sessions() {
 
 #[tokio::test]
 async fn hook_handler_end_to_end() {
+    common::init_test_env();
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
@@ -200,6 +205,7 @@ async fn hook_handler_end_to_end() {
 
 #[tokio::test]
 async fn malformed_json_resilience() {
+    common::init_test_env();
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
@@ -229,6 +235,7 @@ async fn malformed_json_resilience() {
 
 #[tokio::test]
 async fn user_prompt_flows_through_daemon() {
+    common::init_test_env();
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
@@ -279,6 +286,7 @@ async fn user_prompt_flows_through_daemon() {
 
 #[tokio::test]
 async fn opencode_session_lifecycle() {
+    common::init_test_env();
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
@@ -337,6 +345,7 @@ async fn opencode_session_lifecycle() {
 
 #[tokio::test]
 async fn mixed_agent_sessions() {
+    common::init_test_env();
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("test.sock");
     let state = Arc::new(RwLock::new(AppState::default()));
