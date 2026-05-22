@@ -374,25 +374,38 @@ pub struct AgentPty {
     pub reader: Box<dyn std::io::Read + Send>,
 }
 
-/// Forcefully terminate the child and reap it. SIGKILL is preferred over
+/// Forcefully terminate the child *and every descendant in its process
+/// group* and reap it. SIGKILL is preferred over
 /// `portable_pty::Child::kill()` (which sends SIGHUP) because a shell can
 /// ignore SIGHUP — some distros' bash/zsh configurations do exactly that —
 /// leaving the subsequent `wait()` to block forever. SIGKILL cannot be
 /// caught or ignored, so the kernel tears the process down and `wait()`
 /// returns promptly. Callers should drop the master/writer/reader handles
 /// before invoking this so any I/O blocked on the PTY unblocks first.
+///
+/// PRD #92 F5: this used to call `kill(pid, SIGKILL)` — single-PID semantics
+/// — which killed the shell wrapper but orphaned every descendant the shell
+/// had spawned (the actual agent process plus anything it spawned itself —
+/// language servers, file watchers, etc.). Those orphans were re-parented
+/// to init and survived. The fix is `killpg(pgid, SIGKILL)`: every spawned
+/// PTY child is already a session leader (portable-pty calls `setsid()` in
+/// its `pre_exec` — see portable-pty's unix.rs line 220), so the child's PID
+/// equals its session ID and process-group ID, and `killpg(pid)` signals the
+/// entire group atomically. This closes the F5 descendant-leak gap.
 fn force_kill_child_and_wait(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
     if let Some(pid) = child.process_id() {
-        // SAFETY: `kill(2)` is async-signal-safe; sending SIGKILL to a pid we
-        // just learned from `process_id()` cannot affect any other process
-        // until the kernel reaps the child below.
-        let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        // SAFETY: `killpg(2)` is async-signal-safe; the pgid we just learned
+        // from `process_id()` is the child's own PID (portable-pty `setsid`'d
+        // it, making it the group leader). Signalling that group cannot
+        // affect any other agent's group, and the kernel reaps the child
+        // below.
+        let rc = unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
         if rc != 0 {
             // Log so a weakened cleanup guarantee is observable. ESRCH on an
-            // already-reaped child is benign; anything else means the child
+            // already-reaped group is benign; anything else means the child
             // may outlive us.
             let err = std::io::Error::last_os_error();
-            tracing::warn!(pid, error = %err, "SIGKILL failed in force_kill_child_and_wait");
+            tracing::warn!(pid, error = %err, "killpg SIGKILL failed in force_kill_child_and_wait");
         }
     } else {
         // No PID exposed — fall back to portable-pty's signaller.
@@ -1382,22 +1395,27 @@ impl AgentPtyRegistry {
             inner.agents.drain().map(|(_, a)| a).collect()
         };
 
-        // Phase 1: SIGTERM each child. Some shells (notably the bash/zsh
-        // configurations that intercept SIGHUP) honour SIGTERM as a clean
-        // shutdown signal, so this gives the agent a chance to flush state.
-        // We send the signal directly via `libc::kill` rather than going
+        // Phase 1: SIGTERM each child's process group. Some shells
+        // (notably the bash/zsh configurations that intercept SIGHUP)
+        // honour SIGTERM as a clean shutdown signal, so this gives the
+        // agent a chance to flush state. We use `killpg` rather than
+        // `kill` so descendants of shell-wrapped commands (the actual
+        // agent plus anything it spawned) get the signal too — see the
+        // PRD #92 F5 rationale on `force_kill_child_and_wait`. We send
+        // the signal directly via `libc::killpg` rather than going
         // through `portable_pty::Child::kill` because that helper sends
-        // SIGHUP which some shells ignore — same rationale as
-        // `force_kill_child_and_wait`.
+        // SIGHUP which some shells ignore.
         for agent in &mut agents {
             if let Some(pid) = agent.child.process_id() {
-                // SAFETY: `kill(2)` is async-signal-safe; the pid we just
-                // learned from `process_id()` belongs to a child this
-                // registry still owns.
-                let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                // SAFETY: `killpg(2)` is async-signal-safe; the pgid we
+                // just learned from `process_id()` is the child's own PID
+                // (portable-pty makes the child a session leader via
+                // `setsid`), so signalling that group cannot affect any
+                // other agent's group.
+                let rc = unsafe { libc::killpg(pid as i32, libc::SIGTERM) };
                 if rc != 0 {
                     let err = std::io::Error::last_os_error();
-                    tracing::warn!(pid, error = %err, "SIGTERM failed in shutdown_all_graceful");
+                    tracing::warn!(pid, error = %err, "killpg SIGTERM failed in shutdown_all_graceful");
                 }
             }
         }
