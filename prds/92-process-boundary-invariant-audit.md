@@ -25,7 +25,7 @@ The audit's job is to enumerate the rest of these. Baseline-versus-current. Each
 A parity audit between the pre-daemon baseline (`2fc39c3`) and current main. Read baseline code, docs, and tests at that commit. Enumerate user-visible features and behaviors. For each, locate the current implementation and compare against the baseline. Triage into one of three buckets:
 
 - **Preserved** — feature works identically in current code. Evidence required: current code path plus at least one test that exercises it.
-- **Regressed** — feature is missing, incomplete, or behaves differently than baseline. File a follow-up milestone.
+- **Regressed** — feature is missing, incomplete, or behaves differently than baseline. Drafted as a follow-up milestone in the audit document; not filed as a GitHub issue until the user reviews and authorizes.
 - **Intentional change** — feature changed, but the change was a deliberate design decision. Cite the PRD or commit that justifies it so a future re-audit does not re-flag it.
 
 Output goes to `audit/pre-daemon-parity-audit.md` (new file).
@@ -52,7 +52,7 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 - **Performance, security, or any other axis.** Behavioral parity only.
 - **Pre-PRD-#76 bugs that the daemon transition incidentally fixed.** Those are improvements, not regressions.
 - **Features that genuinely did not exist at baseline** (the `remote add/list/remove/upgrade` family, daemon idle-shutdown, daemon log destination, lazy-spawn semantics, attach protocol Hello handshake, KIND_EVENT plumbing, etc.). These are post-baseline additions, not parity concerns. List them in an appendix to the audit doc so a future re-audit knows what was deliberately added.
-- **Fixing any of the findings.** Each Regressed row is filed as a follow-up milestone, scoped and fixed separately.
+- **Fixing any of the findings.** Each Regressed row is drafted as a follow-up milestone in the audit document; nothing is filed as a GitHub issue until the user reviews and authorizes, and fixes are scoped separately.
 
 ## Success Criteria
 
@@ -118,7 +118,7 @@ The audit's axis is baseline-versus-current behavioral parity, not a forward-loo
 
 The baseline is `2fc39c3`, the last commit before PRD #76 merged. That is "the deck as it was before the two pivots." Newer baselines drift into the architectures being audited.
 
-A v1 attempt at this PRD ran in a different direction — a forward-looking behavior audit of the current codebase. That attempt confirmed the force-shutdown gap is real (carried forward as the worked example in this PRD) and surfaced one other finding worth re-checking under parity framing — whether hook events that fire while no TUI is attached are correctly applied to the daemon's `AppState` so the dashboard rehydrates aggregate counts on reconnect (the v1 attempt flagged this as a gap; under parity framing the question becomes "did the baseline have an equivalent of this, and did it work?"). The v1 attempt's findings against a hypothetical remote-network-attach architecture (laptop-TUI ↔ remote-daemon over a network) are dropped because that architecture does not exist in this codebase.
+A v1 attempt at this PRD ran in a different direction — a forward-looking behavior audit of the current codebase. That attempt confirmed the force-shutdown gap is real (carried forward as the worked example in this PRD). The v1 attempt's other findings do not carry forward: they either target a hypothetical remote-network-attach architecture (laptop-TUI ↔ remote-daemon over a network) that this codebase does not implement, or they concern post-baseline behavior (detach windows, daemon-side event application during disconnect) that has no parity analog because the baseline had no daemon. Those questions belong to a separate post-baseline behavior audit, not this one.
 
 ### 2026-05-22: Three-bucket taxonomy
 
@@ -126,4 +126,4 @@ Preserved / Regressed / Intentional change. The v1 attempt had four buckets incl
 
 ### 2026-05-17: Audit, not refactor
 
-Retained from the original PRD. The audit explicitly does not fix anything. Mixing audit and fix work obscures the audit's scope — readers cannot tell whether a clean area was checked or simply not visited. Each Regressed row is filed as a follow-up milestone with its own scope.
+Retained from the original PRD. The audit explicitly does not fix anything. Mixing audit and fix work obscures the audit's scope — readers cannot tell whether a clean area was checked or simply not visited. Each Regressed row is drafted as a follow-up milestone in the audit document; not filed as a GitHub issue until the user reviews and authorizes, and fixes are scoped separately.
