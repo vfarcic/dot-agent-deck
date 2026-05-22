@@ -1296,9 +1296,40 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
                 });
             }
             Some(TabMembership::Orchestration {
-                name, role_index, ..
+                name,
+                role_index,
+                orchestration_cwd,
+                ..
             }) => {
-                let key = (cwd.clone(), name.clone());
+                // Round-12 reviewer #1: bucket by `(orchestration_cwd,
+                // name)` — the same identity tuple the daemon uses for
+                // `pane_orchestration_map`. Round-9 #2 made each role
+                // pane's own cwd independent (workers can live in
+                // sub-directories of the orchestration); using the
+                // per-pane cwd here would split a 3-role orchestration
+                // across 3 buckets on reattach. The orchestration_cwd
+                // field is shared across roles, so all three end up in
+                // one bucket.
+                //
+                // Older daemons/clients (pre-round-11) omit the field;
+                // fall back to per-pane cwd to keep the partition
+                // behaviour stable for that legacy data, but log a
+                // debug breadcrumb so a stale producer is visible.
+                let bucket_cwd = match orchestration_cwd {
+                    Some(c) => c.clone(),
+                    None => {
+                        tracing::debug!(
+                            agent_id = %h.agent_id,
+                            pane_id = %h.pane_id,
+                            pane_cwd = %cwd,
+                            orchestration_name = %name,
+                            "hydration: orchestration pane missing orchestration_cwd — \
+                             bucketing by per-pane cwd as a legacy fallback"
+                        );
+                        cwd.clone()
+                    }
+                };
+                let key = (bucket_cwd.clone(), name.clone());
                 let idx = match orch_index.get(&key) {
                     Some(i) => *i,
                     None => {
@@ -1306,7 +1337,7 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
                         orch_index.insert(key, i);
                         out.orchestration_buckets
                             .push(OrchestrationHydrationBucket {
-                                cwd,
+                                cwd: bucket_cwd,
                                 orchestration_name: name.clone(),
                                 role_slots: Vec::new(),
                             });
@@ -6800,6 +6831,126 @@ mod tests {
                 pane_id: "2".into(),
             }]
         );
+    }
+
+    /// Round-12 reviewer #1: a 3-role orchestration whose workers
+    /// have distinct per-pane cwds (round-9 #2 allows this) must
+    /// hydrate into ONE orchestration bucket, not three. The bucket
+    /// key is `(orchestration_cwd, name)` — shared across roles.
+    #[test]
+    fn partition_buckets_orchestration_by_orchestration_cwd_not_per_pane_cwd() {
+        let orch_cwd = "/proj".to_string();
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some(orch_cwd.clone()),
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/proj/sub-a"), // worker's own cwd diverges
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 1,
+                    role_name: "coder".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(orch_cwd.clone()),
+                }),
+            ),
+            hydrated(
+                "3",
+                "a-3",
+                Some("/proj/sub-b"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 2,
+                    role_name: "reviewer".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(orch_cwd.clone()),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(
+            p.orchestration_buckets.len(),
+            1,
+            "all three roles share the same orchestration_cwd → one bucket"
+        );
+        let bucket = &p.orchestration_buckets[0];
+        assert_eq!(bucket.cwd, orch_cwd);
+        assert_eq!(bucket.orchestration_name, "tdd-cycle");
+        assert_eq!(bucket.role_slots.len(), 3);
+    }
+
+    /// Negative-case mirror of the above: two panes with the same
+    /// orchestration name but distinct orchestration_cwds must end
+    /// up in DIFFERENT buckets — the round-11 #C collision-fix
+    /// invariant carried through the hydration partition.
+    #[test]
+    fn partition_separates_orchestrations_by_orchestration_cwd_not_pane_cwd() {
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/shared"), // same per-pane cwd
+                Some(TabMembership::Orchestration {
+                    name: "foo".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/home/u/project-a".into()),
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/shared"), // same per-pane cwd — would collide on old key
+                Some(TabMembership::Orchestration {
+                    name: "foo".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/home/u/project-b".into()),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(
+            p.orchestration_buckets.len(),
+            2,
+            "distinct orchestration_cwds must split into distinct buckets"
+        );
+    }
+
+    /// Legacy data path: a pre-round-11 daemon emits orchestration
+    /// panes with no `orchestration_cwd`. Partition must still
+    /// produce reasonable buckets (falls back to per-pane cwd) so
+    /// reattach against an older daemon doesn't strand panes.
+    #[test]
+    fn partition_falls_back_to_per_pane_cwd_when_orchestration_cwd_missing() {
+        let panes = vec![hydrated(
+            "1",
+            "a-1",
+            Some("/legacy-work"),
+            Some(TabMembership::Orchestration {
+                name: "tdd-cycle".into(),
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+                orchestration_cwd: None,
+            }),
+        )];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.orchestration_buckets.len(), 1);
+        assert_eq!(p.orchestration_buckets[0].cwd, "/legacy-work");
     }
 
     #[test]

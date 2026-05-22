@@ -237,6 +237,53 @@ async fn start_agent_with_mode_membership_round_trip() {
     server.registry.shutdown_all();
 }
 
+/// Round-12 auditor #2: StartAgent must reject a TabMembership
+/// whose `orchestration_cwd` carries hostile bytes — control chars,
+/// NUL, oversized strings, relative paths. End-to-end guard at the
+/// wire boundary; the agent_pty unit tests already pin
+/// `validate_tab_membership`'s axes individually.
+#[tokio::test]
+async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
+    let server = start_server().await;
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut s,
+        &AttachRequest::StartAgent {
+            command: Some("sh -c 'sleep 30'".into()),
+            cwd: Some("/tmp".into()),
+            display_name: Some("auditor".into()),
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "tdd-cycle".into(),
+                role_index: 0,
+                role_name: "coder".into(),
+                is_start_role: false,
+                orchestration_cwd: Some("/proj/\x1b[31m".into()),
+            }),
+            agent_type: None,
+        },
+    )
+    .await;
+    let resp = read_response(&mut s).await;
+    assert!(
+        !resp.ok,
+        "start-agent must reject a tab_membership with a control-byte orchestration_cwd"
+    );
+    let err = resp.error.unwrap_or_default();
+    assert!(
+        err.to_lowercase().contains("tab_membership"),
+        "expected the rejection to mention tab_membership; got: {err}"
+    );
+    // No agent should have been created.
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "rejected spawn must not leave a daemon-side agent behind"
+    );
+    server.registry.shutdown_all();
+}
+
 #[tokio::test]
 async fn start_agent_with_orchestration_membership_round_trip() {
     let server = start_server().await;

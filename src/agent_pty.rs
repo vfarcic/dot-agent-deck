@@ -233,12 +233,39 @@ impl TabMembership {
 /// same sanitization to incoming `AgentRecord.tab_membership` — defense
 /// in depth against a malformed or older daemon (M2.12 fixup auditor
 /// #1).
+///
+/// Round-12 auditor #2: the new `orchestration_cwd` field also goes
+/// through validation. A same-user attach client (or a buggy TUI) can
+/// otherwise smuggle oversized strings, NUL bytes, or escape sequences
+/// in there, and the daemon echoes them back via `agent_records`
+/// where downstream parsing/display can misbehave.
 pub fn validate_tab_membership(tm: TabMembership) -> Option<TabMembership> {
-    if is_valid_display_name(tm.name()) {
-        Some(tm)
-    } else {
-        None
+    if !is_valid_display_name(tm.name()) {
+        return None;
     }
+    if let TabMembership::Orchestration {
+        orchestration_cwd: Some(c),
+        ..
+    } = &tm
+        && !is_valid_orchestration_cwd(c)
+    {
+        return None;
+    }
+    Some(tm)
+}
+
+/// Returns `true` if `value` is acceptable as an orchestration's
+/// identity cwd: non-empty, ≤ [`CWD_MAX_LEN`] bytes, free of ASCII
+/// control characters, AND an absolute path (starts with `/`).
+///
+/// Round-12 auditor #2: the orchestration_cwd field is treated as
+/// the project root, so being absolute is part of the contract — a
+/// relative or empty value would either fail the daemon's later
+/// filesystem operations or quietly collide with sibling
+/// orchestrations whose own resolved cwd happens to match. Reject up
+/// front instead.
+pub fn is_valid_orchestration_cwd(value: &str) -> bool {
+    is_valid_cwd(value) && value.starts_with('/')
 }
 
 #[derive(Debug, Error)]
@@ -918,12 +945,26 @@ impl AgentPtyRegistry {
         // the struct so we don't fight the borrow checker.
         let tab_membership = match opts.tab_membership.take() {
             Some(tm) => {
+                // Capture diagnostic info BEFORE moving `tm` into the
+                // validator: name length and the optional
+                // orchestration_cwd length are surfaced in the
+                // rejection error so a buggy client sees which axis
+                // failed without exposing the (possibly hostile)
+                // bytes themselves.
                 let name_len = tm.name().len();
+                let orch_cwd_len = match &tm {
+                    TabMembership::Orchestration {
+                        orchestration_cwd: Some(c),
+                        ..
+                    } => Some(c.len()),
+                    _ => None,
+                };
                 match validate_tab_membership(tm) {
                     Some(v) => Some(v),
                     None => {
                         return Err(AgentPtyError::Validation(format!(
-                            "tab_membership.name fails is_valid_display_name (len={name_len})"
+                            "tab_membership fails validation (name_len={name_len}, \
+                             orchestration_cwd_len={orch_cwd_len:?})"
                         )));
                     }
                 }
@@ -1379,6 +1420,76 @@ mod tests {
             "control-byte command must fall through to shell, not be stored verbatim"
         );
         assert_eq!(resolve_display_name(None, Some(evil_cmd)), "shell");
+    }
+
+    /// Round-12 auditor #2: orchestration_cwd must be validated.
+    /// Hostile inputs (NUL bytes, control chars, oversized strings,
+    /// relative paths) should make validate_tab_membership return
+    /// None so spawn_agent surfaces an `AgentPtyError::Validation`
+    /// instead of echoing the bad bytes back via agent_records.
+    #[test]
+    fn validate_tab_membership_rejects_orchestration_cwd_with_nul_byte() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: Some("/proj/\0evil".into()),
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_rejects_orchestration_cwd_with_control_char() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: Some("/proj/\x1b[31m".into()),
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_rejects_relative_orchestration_cwd() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            // Not absolute — orchestration_cwd is the project root,
+            // relative paths would either fail filesystem ops later
+            // or quietly collide with other orchs whose resolved
+            // cwd happens to match.
+            orchestration_cwd: Some("relative/proj".into()),
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_rejects_oversized_orchestration_cwd() {
+        let oversized = "/".to_string() + &"a".repeat(CWD_MAX_LEN);
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: Some(oversized),
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_accepts_well_formed_orchestration_cwd() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: Some("/home/user/project-a".into()),
+        };
+        assert!(validate_tab_membership(tm).is_some());
     }
 
     #[test]
