@@ -1029,6 +1029,19 @@ const CREATE_PANE_ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 /// that errored).
 const CREATE_PANE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// PRD #92 F8 — bounded wait for the Ctrl+W `stop-agent` RPC. The
+/// daemon's `close_agent` path now does a SIGTERM-with-grace before
+/// SIGKILL (`AGENT_TERMINATE_GRACE = 3 s` in `src/agent_pty.rs`), so
+/// the RPC can take up to ~3 s in the worst case (uncooperative agent
+/// that ignores SIGTERM). Pre-F8 the Ctrl+W path reused
+/// `CREATE_PANE_STOP_TIMEOUT` (2 s); that's now too tight — a SIGTERM-
+/// ignoring agent would trip the controller timeout before the
+/// daemon-side SIGKILL fallback fired. 5 s = 3 s F8 grace + 2 s
+/// buffer for SIGKILL delivery, child reap, and RPC round-trip on a
+/// loaded system. Anything longer is a real daemon hang and the user
+/// gets the "stop-agent timed out" error message with a retry hint.
+const CTRL_W_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Per-pane resize worker (PRD #76 M2.10 audit follow-up). Reads the most
 /// recent `(rows, cols)` from the watch receiver and dispatches it to the
 /// daemon with [`RESIZE_DAEMON_TIMEOUT`]. While a dispatch is in flight,
@@ -1255,11 +1268,16 @@ impl PaneController for EmbeddedPaneController {
         // indefinitely (Ctrl+W happens on the render thread via
         // `block_on`) while the pane has already been removed from the
         // registry — the UI would freeze on a phantom-closed pane.
-        // Reusing `CREATE_PANE_STOP_TIMEOUT` (2s): same semantics —
-        // "how long do we wait on a daemon stop-agent call?" — and same
-        // cap as the attach-failure cleanup.
+        //
+        // PRD #92 F8: the daemon's `close_agent` path is now SIGTERM-
+        // with-grace before SIGKILL (`AGENT_TERMINATE_GRACE = 3 s`),
+        // so the worst-case RPC duration grew from "well under a
+        // millisecond" to "up to ~3 s" for an uncooperative agent.
+        // The Ctrl+W path therefore needs a generous budget —
+        // `CTRL_W_STOP_TIMEOUT` (5 s = grace + 2 s buffer) — rather
+        // than the 2 s `CREATE_PANE_STOP_TIMEOUT` it used to reuse.
         let stop_result = s.runtime.block_on(async {
-            tokio::time::timeout(CREATE_PANE_STOP_TIMEOUT, client.stop_agent(&agent_id)).await
+            tokio::time::timeout(CTRL_W_STOP_TIMEOUT, client.stop_agent(&agent_id)).await
         });
         match stop_result {
             Ok(Ok(())) => {
@@ -1305,7 +1323,7 @@ impl PaneController for EmbeddedPaneController {
                 // against rather than a phantom-closed one.
                 tracing::error!(
                     agent_id = %agent_id,
-                    timeout_ms = CREATE_PANE_STOP_TIMEOUT.as_millis() as u64,
+                    timeout_ms = CTRL_W_STOP_TIMEOUT.as_millis() as u64,
                     "stop-agent timed out during Ctrl+W close — pane retained for retry"
                 );
                 let restored = Pane {

@@ -217,6 +217,159 @@ async fn close_pane_reaps_shell_descendants() {
     );
 }
 
+/// PRD #92 F8: closing a well-behaved agent must deliver SIGTERM and
+/// give the agent a window to run its own cleanup. Pre-F8 the Ctrl+W
+/// path sent SIGKILL directly (uncatchable), so even an agent that
+/// wanted to clean up its `setsid`'d sub-shells had no opportunity to
+/// do so. Post-F8 the agent gets SIGTERM with a 3-second grace
+/// before SIGKILL.
+///
+/// The well-behaved shape we test: a shell that traps SIGTERM, writes
+/// a sentinel file, and exits. After the close we assert the sentinel
+/// exists on disk — proof that SIGTERM was delivered and the trap ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_pane_well_behaved_agent_runs_sigterm_trap() {
+    let server = start_server().await;
+    let ctrl = Arc::new(EmbeddedPaneController::new(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    // The sentinel lives in a shared tempdir so the test can probe it
+    // after the close. The shell traps TERM, writes the sentinel, and
+    // exits 0 — well-behaved agent behavior.
+    let sentinel_dir = tempfile::tempdir().unwrap();
+    let sentinel_path = sentinel_dir.path().join("trap.flag");
+
+    // `sh -c 'trap "echo trapped > FILE; exit 0" TERM; sleep 60'`
+    //
+    // The trailing `sleep 60` keeps the shell alive long enough that
+    // the test's close hits while the shell is parked in `sleep` —
+    // i.e. SIGTERM lands while the trap is armed and runs before the
+    // shell exits. Without the sleep, the shell exits immediately
+    // after `trap ...` runs (no command to wait on) and the test
+    // would race the close.
+    let cmd = format!(
+        "trap 'echo trapped > {} ; exit 0' TERM; sleep 60",
+        sentinel_path.display()
+    );
+    let cmd_for_pane = cmd.clone();
+    let pane_id = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.create_pane(Some(&cmd_for_pane), None).unwrap())
+            .await
+            .unwrap()
+    };
+
+    // Wait for the shell to install the trap (i.e. reach `sleep 60`).
+    // 500 ms is generous — the trap command is sub-millisecond.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !sentinel_path.exists(),
+        "sentinel must not exist before the close — the trap hasn't fired yet"
+    );
+
+    // Trigger the close path (Ctrl+W → EmbeddedPaneController::close_pane
+    // → daemon StopAgent → AgentPtyRegistry::close_agent → F8
+    // terminate_child_with_grace_and_wait, which sends SIGTERM first).
+    let ctrl_for_close = ctrl.clone();
+    let pane_id_for_close = pane_id.clone();
+    tokio::task::spawn_blocking(move || ctrl_for_close.close_pane(&pane_id_for_close).unwrap())
+        .await
+        .unwrap();
+
+    // The trap should have fired and written the sentinel. Poll up to
+    // 2 s so a slightly-busy scheduler doesn't make the test flaky;
+    // the trap itself is well under 100 ms on any reasonable host.
+    let sentinel_appeared = wait_for(Duration::from_secs(2), Duration::from_millis(20), || {
+        sentinel_path.exists()
+    })
+    .await;
+    assert!(
+        sentinel_appeared,
+        "sentinel at {} must exist after close — SIGTERM trap did not run within the 3 s F8 grace window",
+        sentinel_path.display()
+    );
+
+    let contents = std::fs::read_to_string(&sentinel_path).expect("read sentinel");
+    assert!(
+        contents.contains("trapped"),
+        "sentinel must contain the trap's payload, got {contents:?}"
+    );
+}
+
+/// PRD #92 F8: an uncooperative agent that ignores SIGTERM must still
+/// be reaped after the grace window via the SIGKILL backstop. Pre-F8
+/// this would happen instantly (raw SIGKILL); post-F8 it happens after
+/// the 3-second grace + a few hundred milliseconds of SIGKILL
+/// delivery + reap. We assert a 3.5 s upper bound — tight enough to
+/// catch a regression where the SIGKILL backstop disappears entirely
+/// (which would let the shell's 60-second `sleep` keep it alive), and
+/// loose enough to absorb scheduler jitter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_pane_uncooperative_agent_killed_after_grace() {
+    let server = start_server().await;
+    let ctrl = Arc::new(EmbeddedPaneController::new(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    // `sh -c 'trap "" TERM; sleep 60'` — the empty trap explicitly
+    // tells the shell to ignore SIGTERM. The 60-second sleep keeps
+    // the shell alive past any reasonable test timeout, so if the
+    // SIGKILL backstop disappears (regression), the test catches it.
+    let pane_id = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane(Some("trap '' TERM; sleep 60"), None)
+                .unwrap()
+        })
+        .await
+        .unwrap()
+    };
+
+    // Capture the daemon-registered (shell) PID via the registry.
+    let agent_ids = server.registry.agent_ids();
+    assert_eq!(agent_ids.len(), 1);
+    let shell_pid = server
+        .registry
+        .child_pid(&agent_ids[0])
+        .expect("daemon-side child should expose a pid") as i32;
+
+    // Sanity-check the shell is alive before the close.
+    assert!(
+        pid_is_alive(shell_pid),
+        "shell pid {shell_pid} should be alive before close"
+    );
+
+    // Time the close so we can assert the upper bound. The deadline is
+    // 3.5 s — comfortably above the F8 grace (3 s) plus SIGKILL
+    // delivery latency, and well below the shell's 60 s `sleep` so a
+    // regression that drops the SIGKILL fallback is unmissable.
+    let start = std::time::Instant::now();
+    let ctrl_for_close = ctrl.clone();
+    let pane_id_for_close = pane_id.clone();
+    tokio::task::spawn_blocking(move || ctrl_for_close.close_pane(&pane_id_for_close).unwrap())
+        .await
+        .unwrap();
+    let close_elapsed = start.elapsed();
+
+    let shell_dead = wait_for(
+        Duration::from_millis(500),
+        Duration::from_millis(20),
+        || !pid_is_alive(shell_pid),
+    )
+    .await;
+    assert!(
+        shell_dead,
+        "shell pid {shell_pid} should be dead after close + 500 ms — SIGKILL fallback failed?"
+    );
+    assert!(
+        close_elapsed < Duration::from_millis(3500),
+        "F8 close path took {close_elapsed:?} for an uncooperative agent — exceeds the 3.5 s upper bound (grace was 3 s)"
+    );
+}
+
 /// PRD #92 F1 followup (auditor #5): closing an agent must signal the
 /// agent's process group, not the daemon's. This regression would have
 /// shown up if a bad `pid_to_pgid` (e.g. accepting `0`) reached

@@ -400,8 +400,64 @@ pub(crate) fn pid_to_pgid(pid: u32) -> Option<libc::pid_t> {
     }
 }
 
+/// PRD #92 F8: hardcoded grace window between SIGTERM and the SIGKILL
+/// fallback used by the single-pane Ctrl+W path
+/// ([`terminate_child_with_grace_and_wait`]) and as the poll budget in
+/// the daemon-wide [`AgentPtyRegistry::shutdown_all_graceful`].
+/// 3 s matches the F1 graceful-shutdown grace, which is the natural
+/// sibling. Hardcoded as a constant for now (one symbol to find) rather
+/// than lifted to `DashboardConfig` until a real user need surfaces.
+pub(crate) const AGENT_TERMINATE_GRACE: Duration = Duration::from_secs(3);
+
+/// PRD #92 F8: low-level shared helper. Send `signal` to the child's
+/// process group, falling back to `portable_pty::Child::kill` when
+/// `pid_to_pgid` rejects the raw pid (F1-followup defensive boundary
+/// check). `phase` is included in `tracing::warn!` payloads so a wedged
+/// child can be traced back to whichever phase issued the kill.
+/// Returns `true` if the `killpg` syscall actually fired (or the
+/// `child.kill` fallback was used), `false` if the syscall reported an
+/// error other than ESRCH.
+///
+/// Used by both [`force_kill_child_and_wait`] (single-shot SIGKILL,
+/// for Drop / RAII / shutdown_all paths) and
+/// [`terminate_child_with_grace_and_wait`] (single-pane Ctrl+W, SIGTERM
+/// then SIGKILL), as well as by the SIGTERM phase inside
+/// [`AgentPtyRegistry::shutdown_all_graceful`] (daemon-wide Stop).
+/// Centralising the killpg + fallback logic prevents the three call
+/// sites from drifting.
+fn signal_child_pgroup_or_fallback(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    signal: libc::c_int,
+    phase: &'static str,
+) -> bool {
+    let pgid = child.process_id().and_then(pid_to_pgid);
+    let Some(pgid) = pgid else {
+        // No PID, or the pid did not survive the `pid_to_pgid` sanity
+        // check (the F1-followup defensive boundary check). Fall back
+        // to portable-pty's own signaller. `portable_pty::Child::kill`
+        // sends SIGHUP regardless of `signal`, but that's the best
+        // we can do without a valid pgid.
+        let _ = child.kill();
+        return true;
+    };
+    // SAFETY: `killpg(2)` is async-signal-safe; the pgid we just
+    // validated via `pid_to_pgid` is the child's own PID (portable-pty
+    // `setsid`'d it, making it the group leader), so this cannot
+    // affect any other agent's group.
+    let rc = unsafe { libc::killpg(pgid, signal) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        let benign = err.raw_os_error() == Some(libc::ESRCH);
+        if !benign {
+            tracing::warn!(pgid, signal, phase = %phase, error = %err, "killpg failed");
+        }
+        return benign;
+    }
+    true
+}
+
 /// Forcefully terminate the child *and every descendant in its process
-/// group* and reap it. SIGKILL is preferred over
+/// group* with SIGKILL and reap it. SIGKILL is preferred over
 /// `portable_pty::Child::kill()` (which sends SIGHUP) because a shell can
 /// ignore SIGHUP — some distros' bash/zsh configurations do exactly that —
 /// leaving the subsequent `wait()` to block forever. SIGKILL cannot be
@@ -409,44 +465,71 @@ pub(crate) fn pid_to_pgid(pid: u32) -> Option<libc::pid_t> {
 /// returns promptly. Callers should drop the master/writer/reader handles
 /// before invoking this so any I/O blocked on the PTY unblocks first.
 ///
-/// PRD #92 F5: this used to call `kill(pid, SIGKILL)` — single-PID semantics
-/// — which killed the shell wrapper but orphaned every descendant the shell
-/// had spawned (the actual agent process plus anything it spawned itself —
-/// language servers, file watchers, etc.). Those orphans were re-parented
-/// to init and survived. The fix is `killpg(pgid, SIGKILL)`: every spawned
-/// PTY child is already a session leader (portable-pty calls `setsid()` in
-/// its `pre_exec` — see portable-pty's unix.rs line 220), so the child's PID
-/// equals its session ID and process-group ID, and `killpg(pid)` signals the
-/// entire group atomically. This closes the F5 descendant-leak gap.
+/// PRD #92 F5: switched from `kill(pid)` to `killpg(pgid)` so descendants
+/// of shell-wrapped commands are reaped together with the shell. PRD #92 F1
+/// followup: the raw `pid as i32` cast went through a `pid_to_pgid` guard.
+/// Both behaviours now live in the shared
+/// [`signal_child_pgroup_or_fallback`] helper.
 ///
-/// PRD #92 F1 followup: the raw `pid as i32` cast is replaced by a
-/// `pid_to_pgid` guard so `pgid == 0` (which would signal the daemon's
-/// own group) and `pid > i32::MAX` (overflow on the `u32 → i32` cast)
-/// can't reach `killpg`. On `None` we fall through to
-/// `portable_pty::Child::kill` so the agent still terminates, just
-/// without the group semantics.
+/// PRD #92 F8: callers that want the user's agent to have a catchable
+/// signal (single-pane Ctrl+W) now use
+/// [`terminate_child_with_grace_and_wait`] instead. This function
+/// retains the SIGKILL-only semantics for the contexts where a grace
+/// window is wrong or unnecessary: the registry's `Drop` impl, the
+/// `PtyGuard` / `AgentPty` cleanup paths, and the third phase of
+/// `shutdown_all_graceful` (after the SIGTERM phase has already run
+/// daemon-wide).
 fn force_kill_child_and_wait(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
-    if let Some(pid) = child.process_id()
-        && let Some(pgid) = pid_to_pgid(pid)
-    {
-        // SAFETY: `killpg(2)` is async-signal-safe; the pgid we just learned
-        // from `process_id()` (and validated via `pid_to_pgid`) is the
-        // child's own PID (portable-pty `setsid`'d it, making it the
-        // group leader). Signalling that group cannot affect any other
-        // agent's group, and the kernel reaps the child below.
-        let rc = unsafe { libc::killpg(pgid, libc::SIGKILL) };
-        if rc != 0 {
-            // Log so a weakened cleanup guarantee is observable. ESRCH on an
-            // already-reaped group is benign; anything else means the child
-            // may outlive us.
-            let err = std::io::Error::last_os_error();
-            tracing::warn!(pid, error = %err, "killpg SIGKILL failed in force_kill_child_and_wait");
+    signal_child_pgroup_or_fallback(child, libc::SIGKILL, "force-kill");
+    let _ = child.wait();
+}
+
+/// PRD #92 F8: SIGTERM-then-SIGKILL escalation used by the single-pane
+/// Ctrl+W path. Sends `SIGTERM` to the child's process group, polls
+/// `try_wait` until the child exits or `grace` elapses, then sends
+/// `SIGKILL` as the backstop and reaps the child.
+///
+/// Why this lives separately from [`force_kill_child_and_wait`]: the
+/// daemon-wide `shutdown_all_graceful` path issues SIGTERM to every
+/// agent in parallel and polls them all together, so a per-agent
+/// graceful helper would serialise the grace windows and slow daemon
+/// shutdown to `O(grace × N)`. The single-pane Ctrl+W path closes one
+/// agent at a time, so the simpler per-agent shape is appropriate
+/// here. Both paths share [`signal_child_pgroup_or_fallback`] for the
+/// low-level killpg behaviour.
+///
+/// Why F8 exists at all: pre-F8, Ctrl+W sent SIGKILL directly, which
+/// is uncatchable. Even a well-behaved agent that wanted to clean up
+/// its descendants — Claude Code's internal `setsid`'d sub-shells that
+/// the F5 manual-test pass surfaced — had no opportunity to do so.
+/// The graceful escalation gives the agent a 3-second window during
+/// which a SIGTERM trap can run.
+fn terminate_child_with_grace_and_wait(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    grace: Duration,
+) {
+    // Phase 1: SIGTERM the process group.
+    signal_child_pgroup_or_fallback(child, libc::SIGTERM, "graceful-close-sigterm");
+
+    // Phase 2: poll `try_wait` until the child exits or the grace
+    // elapses. Polling avoids the obvious "sleep for grace then
+    // SIGKILL" alternative — a child that exits promptly after
+    // SIGTERM doesn't have to wait around for the deadline. 50 ms
+    // polling cadence is small enough to feel responsive in the UI
+    // and large enough to keep CPU cost negligible (~60 polls over 3 s).
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(_) => break,
         }
-    } else {
-        // No PID exposed, or the pid did not survive the `pid_to_pgid`
-        // sanity check — fall back to portable-pty's signaller.
-        let _ = child.kill();
+        std::thread::sleep(Duration::from_millis(50));
     }
+
+    // Phase 3: SIGKILL backstop. Reaches survivors regardless of
+    // SIGTERM-trapping state.
+    signal_child_pgroup_or_fallback(child, libc::SIGKILL, "graceful-close-sigkill");
     let _ = child.wait();
 }
 
@@ -1195,6 +1278,13 @@ impl AgentPtyRegistry {
     /// streaming subscribers will observe their broadcast receiver close
     /// shortly after (once the reader thread sees EOF and drops its bus
     /// reference).
+    ///
+    /// PRD #92 F8: the kill path now uses
+    /// [`terminate_child_with_grace_and_wait`] — SIGTERM with a
+    /// 3-second grace before SIGKILL — so a well-behaved agent can
+    /// trap SIGTERM and clean up its own descendants (e.g. the
+    /// `setsid`'d sub-shells Claude Code creates internally).
+    /// Misbehaving agents are still reaped after the grace window.
     pub fn close_agent(&self, id: &str) -> Result<(), AgentPtyError> {
         let mut agent = {
             let mut inner = self.inner.lock().unwrap();
@@ -1203,7 +1293,7 @@ impl AgentPtyRegistry {
                 .remove(id)
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?
         };
-        force_kill_child_and_wait(&mut agent.child);
+        terminate_child_with_grace_and_wait(&mut agent.child, AGENT_TERMINATE_GRACE);
         // Notify the idle monitor so it observes the registry shrink
         // immediately. The pump_reader thread will *also* signal once it
         // sees EOF from the kill, but doing it here makes the
@@ -1447,33 +1537,19 @@ impl AgentPtyRegistry {
         // agent a chance to flush state. We use `killpg` rather than
         // `kill` so descendants of shell-wrapped commands (the actual
         // agent plus anything it spawned) get the signal too — see the
-        // PRD #92 F5 rationale on `force_kill_child_and_wait`. We send
-        // the signal directly via `libc::killpg` rather than going
-        // through `portable_pty::Child::kill` because that helper sends
-        // SIGHUP which some shells ignore.
+        // PRD #92 F5 rationale on `force_kill_child_and_wait`.
         //
-        // PRD #92 F1 followup: the raw `pid as i32` cast is replaced by
-        // a `pid_to_pgid` guard so `pgid == 0` (signals the daemon's
-        // own group) and `pid > i32::MAX` (overflow on the cast) can't
-        // reach `killpg`. If the guard rejects a pid, we skip the
-        // SIGTERM and rely on the SIGKILL backstop via
-        // `force_kill_child_and_wait` below.
+        // PRD #92 F8: the killpg logic + `pid_to_pgid` boundary check is
+        // shared with the single-pane Ctrl+W path via
+        // `signal_child_pgroup_or_fallback`, so the two paths can't
+        // drift on what counts as a valid pgid or how a failed killpg
+        // is logged.
         for agent in &mut agents {
-            if let Some(pid) = agent.child.process_id()
-                && let Some(pgid) = pid_to_pgid(pid)
-            {
-                // SAFETY: `killpg(2)` is async-signal-safe; the pgid we
-                // just learned from `process_id()` (and validated via
-                // `pid_to_pgid`) is the child's own PID (portable-pty
-                // makes the child a session leader via `setsid`), so
-                // signalling that group cannot affect any other agent's
-                // group.
-                let rc = unsafe { libc::killpg(pgid, libc::SIGTERM) };
-                if rc != 0 {
-                    let err = std::io::Error::last_os_error();
-                    tracing::warn!(pid, error = %err, "killpg SIGTERM failed in shutdown_all_graceful");
-                }
-            }
+            signal_child_pgroup_or_fallback(
+                &mut agent.child,
+                libc::SIGTERM,
+                "shutdown-all-graceful-sigterm",
+            );
         }
 
         // Phase 2: poll each child's `try_wait` until all have exited or
