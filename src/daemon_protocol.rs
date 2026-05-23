@@ -46,6 +46,7 @@
 //! | `KIND_STREAM_END` | server → client | optional reason (e.g. lagged) |
 //! | `KIND_EVENT`      | server → client | JSON [`crate::event::BroadcastMsg`] (M2.17/M2.19, after a `SubscribeEvents` request) |
 //! | `KIND_SHUTDOWN`   | client → server | empty — shut the daemon down (PRD #92 F1) |
+//! | `KIND_SHUTDOWN_ACK` | server → client | empty — acknowledges `KIND_SHUTDOWN` before teardown begins (PRD #92 F1 followup) |
 //!
 //! # Per-connection state machine
 //!
@@ -108,11 +109,26 @@ pub const KIND_DETACH: u8 = 0x13;
 pub const KIND_EVENT: u8 = 0x14;
 /// PRD #92 F1: client → server header-only frame meaning "shut the daemon
 /// down now." Triggered by the **Stop** option in the Ctrl+C dialog. The
-/// daemon iterates its agent registry, SIGTERMs each child with a short
-/// grace before SIGKILL, then exits. No payload, no ack frame — the
-/// daemon's socket close is the ack. Idempotent on the daemon side
+/// daemon validates the frame is header-only (rejects any non-empty
+/// payload — see followup hardening at the handler), sends back a
+/// [`KIND_SHUTDOWN_ACK`] **before** beginning teardown, then iterates
+/// its agent registry, SIGTERMs each child with a short grace before
+/// SIGKILL, then exits. Idempotent on the daemon side
 /// (`AgentPtyRegistry::shutdown_all_graceful` guards via a latch).
 pub const KIND_SHUTDOWN: u8 = 0x15;
+/// PRD #92 F1 followup: server → client header-only frame acknowledging
+/// receipt of a well-formed [`KIND_SHUTDOWN`]. Sent **before** the daemon
+/// begins teardown so the TUI can distinguish "daemon acknowledged"
+/// from "old daemon closed the connection on an unknown frame" — the
+/// original F1 wire used socket-close as the implicit ack, which was
+/// indistinguishable from the upgrade-mismatch case (a daemon predating
+/// `PROTOCOL_VERSION = 2` would close the connection on an unknown
+/// frame kind). With the explicit ack the client treats
+/// EOF-without-ack, an unrecognised frame, and the 1-second timeout
+/// alike as errors, surfaces them via `ui.status_message`, and does
+/// not exit the TUI — the user can retry, Detach, or `pkill` from a
+/// shell.
+pub const KIND_SHUTDOWN_ACK: u8 = 0x16;
 
 /// PRD #76 M2.21: wire-format version for the attach socket. Bump every time
 /// the on-the-wire shape changes in a way an older client/daemon would
@@ -126,7 +142,7 @@ pub const KIND_SHUTDOWN: u8 = 0x15;
 /// Additive `#[serde(default, skip_serializing_if = "Option::is_none")]`
 /// fields do NOT require a bump — they're forward-compatible by design. See
 /// the module-level "Protocol versioning" section for the full bump policy.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -578,12 +594,35 @@ async fn handle_connection(
     // PRD #92 F1: client → server `KIND_SHUTDOWN` is a header-only frame
     // that means "shut the daemon down now." It comes before any
     // `KIND_REQ`, so handle it before the usual request-decoding path.
-    // The handler terminates every managed agent (SIGTERM with a short
-    // grace before SIGKILL via the registry) then signals the daemon's
-    // shutdown notify so `run_hook_loop` exits. The socket is closed
-    // without sending an ack frame — the close itself is the ack.
+    //
+    // PRD #92 F1 followup hardening:
+    //   (a) Reject any non-empty payload — `KIND_SHUTDOWN` is contractually
+    //       header-only, and an attacker (or an upgrade-mismatch peer)
+    //       smuggling bytes alongside the kind byte must not be able to
+    //       trigger daemon teardown by mistake. Drop the frame silently
+    //       (close the connection, do not initiate shutdown).
+    //   (b) Send a `KIND_SHUTDOWN_ACK` **before** initiating teardown so
+    //       the client can distinguish "daemon acknowledged" from
+    //       "old daemon closed the connection on an unknown frame."
+    //       Teardown can take ≥3 seconds (SIGTERM grace + SIGKILL), so
+    //       the ack must be on the wire first.
     if frame.0 == KIND_SHUTDOWN {
-        info!("KIND_SHUTDOWN received — beginning graceful daemon shutdown");
+        if !frame.1.is_empty() {
+            warn!(
+                payload_len = frame.1.len(),
+                "KIND_SHUTDOWN rejected — frame is contractually header-only"
+            );
+            return Ok(());
+        }
+        info!("KIND_SHUTDOWN received — sending ack and beginning graceful daemon shutdown");
+        // Ack first: the client's `send_shutdown` waits up to 1s for this
+        // frame and treats absence as a hard error. Writing the ack
+        // before kicking off the registry drain keeps the wire ordering
+        // honest even if the teardown itself takes the full 3-second
+        // SIGTERM grace.
+        if let Err(e) = write_frame(&mut stream, KIND_SHUTDOWN_ACK, &[]).await {
+            warn!(error = %e, "failed to write KIND_SHUTDOWN_ACK before shutdown — proceeding anyway");
+        }
         // Drop the registry's children with a 3-second grace window for
         // SIGTERM to take effect; survivors get SIGKILL via the existing
         // teardown.
@@ -635,6 +674,21 @@ async fn handle_connection(
             tab_membership,
             agent_type,
         } => {
+            // PRD #92 F1 followup hardening: refuse to start a new agent
+            // while the registry's `shutting_down` latch is set. The
+            // latch is flipped at the start of `shutdown_all_graceful`
+            // so a race between an in-flight `StartAgent` and a
+            // `KIND_SHUTDOWN` cannot spawn a new child the teardown is
+            // about to miss. Reply with a clean error rather than
+            // letting the spawn race the drain.
+            if registry.is_shutting_down() {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err("start-agent: daemon is shutting down"),
+                )
+                .await?;
+                return Ok(());
+            }
             // Trust boundary: same OS user, same exec capability — see the
             // `AttachRequest::StartAgent` docs. We forward `command`/`cwd`/
             // `env` to the spawn path verbatim. The only check here is a

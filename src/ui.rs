@@ -4274,15 +4274,51 @@ pub fn run_tui(
                     // Session save happens via the normal exit path
                     // (the `'outer` break unwinds into the existing
                     // session-save site so `--continue` is not poisoned).
-                    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                        && let Err(e) = embedded.shutdown_daemon()
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            "shutdown_daemon reported an error during Stop — proceeding to TUI exit"
-                        );
+                    //
+                    // PRD #92 F1 followup: `shutdown_daemon` now waits
+                    // for an explicit `KIND_SHUTDOWN_ACK` from the
+                    // daemon. The original wire used socket-close as
+                    // the implicit ack, which an old daemon (predating
+                    // `PROTOCOL_VERSION = 2`) would also satisfy by
+                    // closing the connection on an unknown frame —
+                    // making the upgrade-mismatch case look like a
+                    // successful shutdown. On `Err` we now do NOT exit
+                    // the TUI; we dismiss the dialogs, surface the
+                    // error via `ui.status_message`, and return to
+                    // Normal mode so the user can retry, Detach, or
+                    // `pkill` from a shell.
+                    let shutdown_result = pane
+                        .as_any()
+                        .downcast_ref::<EmbeddedPaneController>()
+                        .map(|embedded| embedded.shutdown_daemon());
+                    match shutdown_result {
+                        Some(Ok(())) | None => {
+                            // Ack received (or non-stream backend, which
+                            // can't actually shut down anything). Proceed
+                            // to TUI exit via the existing `'outer`
+                            // break.
+                            break 'outer;
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                "shutdown_daemon failed — staying in the TUI so the user can retry or Detach"
+                            );
+                            ui.status_message = Some((
+                                format!(
+                                    "Stop failed: {e} — daemon may be incompatible or unresponsive. Try Detach or restart the daemon manually."
+                                ),
+                                std::time::Instant::now(),
+                            ));
+                            // Dismiss dialogs and return to Normal mode.
+                            // Reset the primary-dialog selection to
+                            // Detach so a hammer-Enter recovery picks
+                            // the safe option, not Stop again.
+                            ui.mode = UiMode::Normal;
+                            ui.stop_confirm_selected = 0;
+                            ui.quit_confirm_selected = 0;
+                        }
                     }
-                    break 'outer;
                 }
                 KeyResult::Focus => {
                     // Dismiss idle art on the focused card

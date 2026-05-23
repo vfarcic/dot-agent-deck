@@ -30,10 +30,14 @@ use tokio::task::JoinHandle;
 
 use dot_agent_deck::agent_pty::AgentPtyRegistry;
 use dot_agent_deck::daemon_client::DaemonClient;
-use dot_agent_deck::daemon_protocol::{bind_attach_listener, serve_attach_with_counter};
+use dot_agent_deck::daemon_protocol::{
+    KIND_EVENT, KIND_SHUTDOWN, bind_attach_listener, read_frame, serve_attach_with_counter,
+    write_frame,
+};
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::pane::PaneController;
 use dot_agent_deck::state::{AppState, SharedState};
+use tokio::net::UnixListener;
 
 static HARNESS_BIND_LOCK: Mutex<()> = Mutex::new(());
 
@@ -201,5 +205,258 @@ async fn double_shutdown_is_idempotent() {
     assert!(
         server.registry.is_empty(),
         "registry must remain empty after double shutdown"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PRD #92 F1 followup — KIND_SHUTDOWN_ACK protocol hardening
+//
+// The original F1 wire used "socket close == ack" semantics. The
+// reviewer flagged this as a blocker: a daemon predating PROTOCOL_VERSION
+// 2 would close the connection on the unknown KIND_SHUTDOWN frame, and
+// the client would interpret the close as a successful ack. The followup
+// introduces an explicit KIND_SHUTDOWN_ACK frame the daemon writes
+// BEFORE beginning teardown; the client waits up to 1s for it and treats
+// timeout / EOF / unexpected-frame as errors.
+//
+// The next three tests use ad-hoc stub servers (raw UnixListener loops
+// rather than the real `serve_attach_with_counter`) so they can simulate
+// the three failure modes deterministically. The stubs sit in the
+// `stub_server` module below to keep their oddities (e.g. holding the
+// connection open silently for a timeout test) out of the production
+// codebase.
+// ---------------------------------------------------------------------------
+
+mod stub_server {
+    use super::*;
+
+    /// Spawn a stub Unix-socket server that accepts ONE connection, runs
+    /// the supplied callback over that connection, then exits. Returns
+    /// the socket path; the temp dir is leaked into the JoinHandle's
+    /// closure so it lives for the duration of the test.
+    pub(super) async fn spawn<F, Fut>(handler: F) -> (PathBuf, JoinHandle<()>, TempDir)
+    where
+        F: FnOnce(tokio::net::UnixStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stub.sock");
+        let listener = {
+            let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            UnixListener::bind(&path).expect("bind stub listener")
+        };
+        let handle = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                handler(stream).await;
+            }
+        });
+        (path, handle, dir)
+    }
+}
+
+/// Stub server that reads the `KIND_SHUTDOWN` frame and then sits
+/// silently. The client must time out after 1s and return Err.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_shutdown_times_out_without_ack() {
+    let (path, _server_handle, _dir) = stub_server::spawn(|mut stream| async move {
+        // Consume the inbound KIND_SHUTDOWN so the client's `write_frame`
+        // completes cleanly, then deliberately do nothing — the client
+        // must hit its 1-second timeout.
+        let _ = read_frame(&mut stream).await;
+        // Hold the connection open past the client's timeout. 2.5s is
+        // comfortably more than the client's 1s budget without making
+        // the test flaky.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+    })
+    .await;
+
+    let client = DaemonClient::new(path);
+    let result = client.send_shutdown().await;
+    assert!(
+        result.is_err(),
+        "send_shutdown must Err on ack timeout, got {result:?}"
+    );
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("timed out") || msg.contains("timed-out"),
+        "error must mention timeout, got: {msg}"
+    );
+}
+
+/// Stub server that reads the `KIND_SHUTDOWN` frame then closes the
+/// socket without sending any ack. This is the upgrade-mismatch case
+/// (an old daemon that didn't recognise the frame just hangs up).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_shutdown_errors_on_eof_without_ack() {
+    let (path, _server_handle, _dir) = stub_server::spawn(|mut stream| async move {
+        let _ = read_frame(&mut stream).await;
+        // Drop the stream → daemon-side socket close. The client's
+        // `read_frame` returns `Ok(None)` and `send_shutdown` Errs.
+        drop(stream);
+    })
+    .await;
+
+    let client = DaemonClient::new(path);
+    let result = client.send_shutdown().await;
+    assert!(
+        result.is_err(),
+        "send_shutdown must Err on EOF without ack, got {result:?}"
+    );
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("predating") || msg.contains("PROTOCOL_VERSION"),
+        "error must hint at the version-mismatch cause, got: {msg}"
+    );
+}
+
+/// Stub server that reads the `KIND_SHUTDOWN` frame then sends a frame
+/// of the wrong kind (`KIND_EVENT`) instead of `KIND_SHUTDOWN_ACK`. The
+/// client must reject the response and return Err.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_shutdown_errors_on_unexpected_frame() {
+    let (path, _server_handle, _dir) = stub_server::spawn(|mut stream| async move {
+        let _ = read_frame(&mut stream).await;
+        // Respond with KIND_EVENT — a valid frame kind that's never
+        // legal in response to KIND_SHUTDOWN.
+        let _ = write_frame(&mut stream, KIND_EVENT, &[]).await;
+        // Hold the connection open so the client gets a clean
+        // unexpected-frame error rather than racing into an EOF.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    })
+    .await;
+
+    let client = DaemonClient::new(path);
+    let result = client.send_shutdown().await;
+    assert!(
+        result.is_err(),
+        "send_shutdown must Err on unexpected frame kind, got {result:?}"
+    );
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("expected KIND_SHUTDOWN_ACK") && msg.contains("0x14"),
+        "error must report the unexpected kind, got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Auditor #1 — KIND_SHUTDOWN with non-empty payload must be rejected
+// ---------------------------------------------------------------------------
+
+/// Build a connection that sends `KIND_SHUTDOWN` with a 4-byte garbage
+/// payload. The daemon must NOT drain the registry, must NOT signal the
+/// shutdown notify, and must close the connection without sending an
+/// ack. We talk to the real daemon harness so the test exercises the
+/// production handler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kind_shutdown_with_payload_is_rejected_by_daemon() {
+    let server = start_server_with_shutdown().await;
+
+    // Spawn an agent so we can later assert it survives the malformed
+    // frame. A `sleep 30` agent that exits cleanly on SIGTERM is the
+    // realistic shape — if it gets terminated, that's the regression.
+    let ctrl = Arc::new(EmbeddedPaneController::new(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane(Some("sh -c 'sleep 30'"), None).unwrap()
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(server.registry.len(), 1);
+
+    // Hand-craft a KIND_SHUTDOWN frame with a non-empty payload and send
+    // it directly to the daemon socket.
+    let mut stream = tokio::net::UnixStream::connect(&server.path)
+        .await
+        .expect("connect to daemon");
+    write_frame(&mut stream, KIND_SHUTDOWN, b"junk")
+        .await
+        .expect("send malformed KIND_SHUTDOWN");
+    // Give the daemon a moment to process and close.
+    let _ = tokio::time::timeout(Duration::from_millis(500), read_frame(&mut stream)).await;
+    drop(stream);
+
+    // Sanity: the agent survives (the registry still has it) — the
+    // daemon refused to enter its teardown path.
+    assert_eq!(
+        server.registry.len(),
+        1,
+        "agent must survive a malformed KIND_SHUTDOWN frame"
+    );
+
+    // The shutdown Notify must NOT have been signalled. Use a short
+    // timeout — if no signal arrives in 500ms, the daemon correctly
+    // refused the malformed frame.
+    let signalled = tokio::time::timeout(Duration::from_millis(500), server.shutdown.notified())
+        .await
+        .is_ok();
+    assert!(
+        !signalled,
+        "shutdown Notify must NOT fire for a malformed KIND_SHUTDOWN frame"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Auditor #2 — StartAgent during shutdown must be refused
+// ---------------------------------------------------------------------------
+
+/// After the registry enters its shutdown path (latch flipped), a
+/// `StartAgent` request must return a server error rather than spawning
+/// a new agent the teardown is about to miss. We exercise this by
+/// flipping the latch directly (via the public `shutdown_all_graceful`
+/// entry point with a zero-grace shortcut would also work, but calling
+/// `shutdown_all_graceful` on an empty registry is the cleanest way
+/// to set the flag) and then issuing a `StartAgent` via the daemon
+/// client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_agent_during_shutdown_is_refused() {
+    use dot_agent_deck::daemon_client::StartAgentOptions;
+
+    let server = start_server_with_shutdown().await;
+
+    // Flip the shutting_down latch by triggering a real shutdown on an
+    // empty registry. Returns synchronously (no agents to terminate).
+    let registry_for_shutdown = server.registry.clone();
+    tokio::task::spawn_blocking(move || {
+        registry_for_shutdown.shutdown_all_graceful(Duration::from_millis(0));
+    })
+    .await
+    .unwrap();
+    assert!(
+        server.registry.is_shutting_down(),
+        "registry must be in shutting_down state after the priming call"
+    );
+
+    let client = DaemonClient::new(server.path.clone());
+    let opts = StartAgentOptions {
+        command: Some("sh".to_string()),
+        cwd: None,
+        display_name: None,
+        rows: 24,
+        cols: 80,
+        env: Vec::new(),
+        tab_membership: None,
+        agent_type: None,
+    };
+    let result = client.start_agent(opts).await;
+    assert!(
+        result.is_err(),
+        "start_agent must Err while daemon is shutting down, got {result:?}"
+    );
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("shutting down"),
+        "error must mention shutting down, got: {msg}"
+    );
+
+    // Sanity: the registry stays empty — the refused request did NOT
+    // spawn a child.
+    assert!(
+        server.registry.is_empty(),
+        "no agent should have been spawned after the refusal"
     );
 }

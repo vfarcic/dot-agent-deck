@@ -154,10 +154,21 @@ The user reviews and authorizes filing separately. Drafts (2–3 sentences each)
 - Daemon-side: `handle_connection` in `src/daemon_protocol.rs` short-circuits `KIND_SHUTDOWN` before the usual `KIND_REQ` decoding, calls `AgentPtyRegistry::shutdown_all_graceful(Duration::from_secs(3))` (`src/agent_pty.rs::shutdown_all_graceful` — SIGTERM each child, poll `try_wait` up to 3s, then SIGKILL survivors via the existing teardown), and signals the daemon's shutdown `Notify`. The hook loop exits, `run_daemon_with` returns, and the registry's Drop calls `shutdown_all` as the backstop.
 - Idempotency: `AgentPtyRegistry::shutting_down: AtomicBool` latches on first entry so a second `KIND_SHUTDOWN` (or a SIGTERM-triggered drop racing the protocol handler) is a no-op.
 
+**Followup hardening (2026-05-23) — reviewer + auditor pass:**
+
+- `KIND_SHUTDOWN_ACK = 0x16` frame added (`src/daemon_protocol.rs`); daemon writes it before beginning teardown. `PROTOCOL_VERSION` bumped to 2. Closes a reviewer-blocker upgrade-mismatch silent-failure where the original "socket close == ack" wire was indistinguishable from an old daemon closing the connection on an unknown frame.
+- `DaemonClient::send_shutdown` waits up to 1s for the ack; timeout / EOF / unexpected-frame all return `Err`. The TUI's `KeyResult::StopAndQuit` arm now stays in Normal mode on Err, surfaces the error via `ui.status_message` ("Stop failed: ... — daemon may be incompatible or unresponsive. Try Detach or restart the daemon manually."), and lets the user retry, Detach, or `pkill`.
+- Malformed `KIND_SHUTDOWN` (non-empty payload) rejected daemon-side (auditor #1).
+- `StartAgent` during shutdown refused daemon-side via new `AgentPtyRegistry::is_shutting_down()` getter (auditor #2).
+- `pid_to_pgid` helper guards both `killpg` call sites against `pid == 0` (would signal the daemon's own group) and `pid > i32::MAX` (would overflow the `u32 → i32` cast); falls back to `child.kill()` on `None` (auditor #3).
+- `tests/stop_dialog.rs::close_pane_does_not_signal_daemon_process_group` (in `tests/process_group_kill.rs`) probes the daemon's pgid before / after a close to verify `killpg` targets the child group, not the daemon's (auditor #5).
+
 Tests:
 
 - Unit (in `src/ui.rs`): `quit_confirm_stop_with_no_agents_returns_stop_and_quit`, `quit_confirm_stop_with_agents_prompts_secondary_dialog`, `quit_confirm_down_clamps_to_three_options` (updated from the 2-option version), `quit_confirm_cancel_returns_to_normal_mode` (updated for index 2), `stop_confirm_defaults_to_no`, `stop_confirm_yes_returns_stop_and_quit`, `stop_confirm_y_shortcut_returns_stop_and_quit`, `stop_confirm_no_returns_to_primary_dialog`, `stop_confirm_down_clamps_to_two_options`.
-- Integration (`tests/stop_dialog.rs`): `send_shutdown_returns_cleanly_with_no_agents`, `send_shutdown_drains_registry_and_signals_notify`, `double_shutdown_is_idempotent`.
+- Unit (in `src/agent_pty.rs`, followup): `pid_to_pgid_accepts_positive_normal_pid`, `pid_to_pgid_rejects_zero_pid`, `pid_to_pgid_accepts_max_i32_pid`, `pid_to_pgid_rejects_overflowing_u32_pid`.
+- Integration (`tests/stop_dialog.rs`): `send_shutdown_returns_cleanly_with_no_agents`, `send_shutdown_drains_registry_and_signals_notify`, `double_shutdown_is_idempotent`; followup: `send_shutdown_times_out_without_ack`, `send_shutdown_errors_on_eof_without_ack`, `send_shutdown_errors_on_unexpected_frame`, `kind_shutdown_with_payload_is_rejected_by_daemon`, `start_agent_during_shutdown_is_refused`.
+- Integration (`tests/process_group_kill.rs`, followup): `close_pane_does_not_signal_daemon_process_group`.
 
 Scope notes intentionally deferred — filed as **F6** below (renumbered from F4 when the audit-of-the-audit surfaced F4 / F5 as in-scope for this PRD):
 

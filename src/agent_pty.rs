@@ -374,6 +374,32 @@ pub struct AgentPty {
     pub reader: Box<dyn std::io::Read + Send>,
 }
 
+/// PRD #92 F1 followup (defensive): convert a portable-pty `process_id()`
+/// (a `u32`) into a positive `libc::pid_t` suitable for `killpg`, or
+/// `None` if the raw value can't legally name a process group.
+///
+/// `killpg(pgid, sig)` has two dangerous degenerate cases for non-positive
+/// `pgid`:
+///   - `pgid == 0` is documented as "signal every process in *the caller's*
+///     process group" — which for the daemon would mean signalling the
+///     daemon itself plus every connected attach-client.
+///   - `pgid < 0` is undefined behavior in POSIX and a likely overflow
+///     indicator (a `u32` PID that didn't fit in `i32`).
+///
+/// Both should be impossible from a well-behaved `portable-pty` spawn
+/// (Linux PIDs are positive `i32` values up to `i32::MAX`), but
+/// defensively checking is one `if` and one unit test, which is much
+/// cheaper than the unbounded blast radius of getting it wrong. On
+/// `None` the caller falls back to `child.kill()` (single-PID).
+pub(crate) fn pid_to_pgid(pid: u32) -> Option<libc::pid_t> {
+    let signed = pid as i64;
+    if signed > 0 && signed <= libc::pid_t::MAX as i64 {
+        Some(signed as libc::pid_t)
+    } else {
+        None
+    }
+}
+
 /// Forcefully terminate the child *and every descendant in its process
 /// group* and reap it. SIGKILL is preferred over
 /// `portable_pty::Child::kill()` (which sends SIGHUP) because a shell can
@@ -392,14 +418,23 @@ pub struct AgentPty {
 /// its `pre_exec` — see portable-pty's unix.rs line 220), so the child's PID
 /// equals its session ID and process-group ID, and `killpg(pid)` signals the
 /// entire group atomically. This closes the F5 descendant-leak gap.
+///
+/// PRD #92 F1 followup: the raw `pid as i32` cast is replaced by a
+/// `pid_to_pgid` guard so `pgid == 0` (which would signal the daemon's
+/// own group) and `pid > i32::MAX` (overflow on the `u32 → i32` cast)
+/// can't reach `killpg`. On `None` we fall through to
+/// `portable_pty::Child::kill` so the agent still terminates, just
+/// without the group semantics.
 fn force_kill_child_and_wait(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
-    if let Some(pid) = child.process_id() {
+    if let Some(pid) = child.process_id()
+        && let Some(pgid) = pid_to_pgid(pid)
+    {
         // SAFETY: `killpg(2)` is async-signal-safe; the pgid we just learned
-        // from `process_id()` is the child's own PID (portable-pty `setsid`'d
-        // it, making it the group leader). Signalling that group cannot
-        // affect any other agent's group, and the kernel reaps the child
-        // below.
-        let rc = unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+        // from `process_id()` (and validated via `pid_to_pgid`) is the
+        // child's own PID (portable-pty `setsid`'d it, making it the
+        // group leader). Signalling that group cannot affect any other
+        // agent's group, and the kernel reaps the child below.
+        let rc = unsafe { libc::killpg(pgid, libc::SIGKILL) };
         if rc != 0 {
             // Log so a weakened cleanup guarantee is observable. ESRCH on an
             // already-reaped group is benign; anything else means the child
@@ -408,7 +443,8 @@ fn force_kill_child_and_wait(child: &mut Box<dyn portable_pty::Child + Send + Sy
             tracing::warn!(pid, error = %err, "killpg SIGKILL failed in force_kill_child_and_wait");
         }
     } else {
-        // No PID exposed — fall back to portable-pty's signaller.
+        // No PID exposed, or the pid did not survive the `pid_to_pgid`
+        // sanity check — fall back to portable-pty's signaller.
         let _ = child.kill();
     }
     let _ = child.wait();
@@ -1357,6 +1393,16 @@ impl AgentPtyRegistry {
             .count()
     }
 
+    /// PRD #92 F1 followup: true once the registry has entered its
+    /// shutdown path (`shutdown_all_graceful` flipped the latch).
+    /// Consulted by `AttachRequest::StartAgent` in `daemon_protocol.rs`
+    /// to refuse new agent spawns while the daemon is tearing down,
+    /// closing the race window between an in-flight `StartAgent` and a
+    /// `KIND_SHUTDOWN` arrival.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
     /// SIGKILL every agent and drain the registry. Idempotent.
     pub fn shutdown_all(&self) {
         let agents: Vec<RunningAgent> = {
@@ -1405,14 +1451,24 @@ impl AgentPtyRegistry {
         // the signal directly via `libc::killpg` rather than going
         // through `portable_pty::Child::kill` because that helper sends
         // SIGHUP which some shells ignore.
+        //
+        // PRD #92 F1 followup: the raw `pid as i32` cast is replaced by
+        // a `pid_to_pgid` guard so `pgid == 0` (signals the daemon's
+        // own group) and `pid > i32::MAX` (overflow on the cast) can't
+        // reach `killpg`. If the guard rejects a pid, we skip the
+        // SIGTERM and rely on the SIGKILL backstop via
+        // `force_kill_child_and_wait` below.
         for agent in &mut agents {
-            if let Some(pid) = agent.child.process_id() {
+            if let Some(pid) = agent.child.process_id()
+                && let Some(pgid) = pid_to_pgid(pid)
+            {
                 // SAFETY: `killpg(2)` is async-signal-safe; the pgid we
-                // just learned from `process_id()` is the child's own PID
-                // (portable-pty makes the child a session leader via
-                // `setsid`), so signalling that group cannot affect any
-                // other agent's group.
-                let rc = unsafe { libc::killpg(pid as i32, libc::SIGTERM) };
+                // just learned from `process_id()` (and validated via
+                // `pid_to_pgid`) is the child's own PID (portable-pty
+                // makes the child a session leader via `setsid`), so
+                // signalling that group cannot affect any other agent's
+                // group.
+                let rc = unsafe { libc::killpg(pgid, libc::SIGTERM) };
                 if rc != 0 {
                     let err = std::io::Error::last_os_error();
                     tracing::warn!(pid, error = %err, "killpg SIGTERM failed in shutdown_all_graceful");
@@ -1460,6 +1516,46 @@ impl Drop for AgentPtyRegistry {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // PRD #92 F1 followup (auditor #3) — defensive boundary check on the
+    // `u32` PID → `libc::pid_t` PGID conversion used by the `killpg`
+    // call sites. The pre-followup code did `pid as i32` directly, which
+    // silently wrapped overflowing `u32` values into negative `i32`s
+    // (undefined behavior for `killpg`) and never guarded against
+    // `pgid == 0` (which `killpg(2)` documents as "signal every process
+    // in the *caller's* process group" — for the daemon that would
+    // signal itself plus every attach client). Real-world Linux PIDs
+    // are positive `i32` values, so this is defense-in-depth; the unit
+    // test pins the boundary semantics.
+
+    #[test]
+    fn pid_to_pgid_accepts_positive_normal_pid() {
+        assert_eq!(pid_to_pgid(1), Some(1));
+        assert_eq!(pid_to_pgid(12345), Some(12345));
+    }
+
+    #[test]
+    fn pid_to_pgid_rejects_zero_pid() {
+        // `killpg(0, ...)` would signal the caller's own group — for
+        // the daemon that's a fatal self-target. Must be filtered out.
+        assert_eq!(pid_to_pgid(0), None);
+    }
+
+    #[test]
+    fn pid_to_pgid_accepts_max_i32_pid() {
+        let max = i32::MAX as u32;
+        assert_eq!(pid_to_pgid(max), Some(i32::MAX));
+    }
+
+    #[test]
+    fn pid_to_pgid_rejects_overflowing_u32_pid() {
+        // Anything above i32::MAX would overflow the `as i32` cast in
+        // the pre-followup code into a negative pgid. The guard
+        // converts those to `None` so the kill path falls back to the
+        // single-PID `child.kill()` path.
+        assert_eq!(pid_to_pgid(i32::MAX as u32 + 1), None);
+        assert_eq!(pid_to_pgid(u32::MAX), None);
+    }
 
     // PRD #76 M2.11 fixup 4 — pin the canonical name resolver so the UI
     // helper, the controller's new-pane path, and the rename path all

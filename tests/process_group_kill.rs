@@ -216,3 +216,58 @@ async fn close_pane_reaps_shell_descendants() {
         "descendant pid {descendant_pid} should be dead within 3s after close — PRD #92 F5 regression: killpg is not signalling the whole process group"
     );
 }
+
+/// PRD #92 F1 followup (auditor #5): closing an agent must signal the
+/// agent's process group, not the daemon's. This regression would have
+/// shown up if a bad `pid_to_pgid` (e.g. accepting `0`) reached
+/// `killpg(0, SIGKILL)`, which the kernel interprets as "signal every
+/// process in the caller's process group" — the daemon itself plus
+/// every attach client. Probes the daemon's own pgid before and after
+/// the close to make sure `killpg` is hitting the right group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_pane_does_not_signal_daemon_process_group() {
+    // SAFETY: getpgrp(2) reads the caller's pgid and is async-signal-safe.
+    let daemon_pgid = unsafe { libc::getpgrp() };
+    assert!(
+        daemon_pgid > 0,
+        "test runner must have a valid process group, got {daemon_pgid}"
+    );
+
+    let server = start_server().await;
+    let ctrl = Arc::new(EmbeddedPaneController::new(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let pane_id = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || {
+            ctrl.create_pane(Some("sh -c 'sleep 30'"), None).unwrap()
+        })
+        .await
+        .unwrap()
+    };
+
+    // Trigger the close path — internally this goes through
+    // force_kill_child_and_wait → killpg.
+    let ctrl_for_close = ctrl.clone();
+    let pane_id_for_close = pane_id.clone();
+    tokio::task::spawn_blocking(move || ctrl_for_close.close_pane(&pane_id_for_close).unwrap())
+        .await
+        .unwrap();
+
+    // The daemon's process group MUST still be alive. If `killpg` had
+    // hit pgid=0 (the bug pid_to_pgid guards against), the daemon
+    // itself would have died and `kill(daemon_pgid, 0)` would return
+    // ESRCH. `kill(-pgid, 0)` is the canonical "is this process group
+    // alive" probe; we pass `-daemon_pgid` to invoke the "every
+    // process in the group" semantic.
+    //
+    // SAFETY: `kill(pid, 0)` does not signal — it only probes.
+    let rc = unsafe { libc::kill(-daemon_pgid, 0) };
+    assert!(
+        rc == 0,
+        "daemon's own process group {daemon_pgid} must still be alive after closing an agent — killpg targeted the wrong group? (kill returned rc={rc}, errno={:?})",
+        std::io::Error::last_os_error().raw_os_error()
+    );
+}
