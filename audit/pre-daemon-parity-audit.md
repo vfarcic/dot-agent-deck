@@ -195,6 +195,21 @@ Scope notes intentionally deferred — filed as **F6** below (renumbered from F4
 - **M9.2 kill-side update**: `force_kill_child_and_wait` (used for single-pane Ctrl+W via StopAgent, and indirectly by `shutdown_all` from Drop) now calls `libc::killpg(pid as i32, SIGKILL)` instead of `libc::kill(pid as i32, SIGKILL)`. The SIGTERM phase inside `shutdown_all_graceful` (used by the F1 KIND_SHUTDOWN path) likewise calls `libc::killpg(pid, SIGTERM)`. Both signal the entire process group rather than just the direct child. Used `libc::killpg` directly rather than pulling `nix` in for one wrapper.
 - **M9.3 tests (`tests/process_group_kill.rs`)**: `close_pane_reaps_shell_descendants` launches `sh -c 'sleep 30 & echo $! > FILE; wait $!'` so the shell writes its background `sleep`'s PID to a relay file. The test reads that PID, asserts both the shell and the descendant are alive (so a descendant that died on its own can't make the test pass for the wrong reason), calls `close_pane`, and probes both PIDs with `libc::kill(pid, 0)` returning ESRCH within 3s. The 3s bound is well under the descendant's 30s sleep, so a pre-F5 regression would leave the sleep alive past the bound and fail the assertion. 1 test, passes.
 
+**Limitation (surfaced during F5 manual-test pass, 2026-05-23)**: `killpg` reaches the agent's session but does NOT cross `setsid` boundaries that the agent itself creates. Claude Code internally `setsid`s its sub-shells, placing them in fresh process groups that escape the outer `killpg`. Those orphaned sub-shells survive Ctrl+W as init-parented processes. Mitigation: **F8** (graceful single-pane close — SIGTERM with 3 s grace before SIGKILL) gives the agent a catchable signal so it can reap its own descendants during the grace window. See F8 below for details. If the agent ignores SIGTERM or doesn't clean up, the descendants survive — that's an agent bug, not a deck bug.
+
+### F8 — Graceful single-pane close (SIGTERM-then-SIGKILL)
+
+**Problem**: F5's `killpg(pgid, SIGKILL)` kills the agent's immediate process group but cannot reach sub-sessions the agent itself creates via `setsid` (real-world example: Claude Code's internal sub-shells). The pre-F8 Ctrl+W path also sent SIGKILL directly, which is uncatchable — so even a well-behaved agent that *wanted* to clean up its own descendants had no opportunity to do so.
+
+**Status**: **In progress (this PRD — Phase 10)**. Design summary:
+
+- Refactor `force_kill_child_and_wait` (`src/agent_pty.rs`) to send `killpg(pgid, SIGTERM)` first, poll `try_wait` for up to 3 seconds, then escalate to `killpg(pgid, SIGKILL)`. Mirrors the pattern `shutdown_all_graceful` already uses for the daemon-wide Stop path.
+- Extract a shared helper so the two paths (single-pane Ctrl+W and daemon-wide Stop) converge on identical grace-window semantics.
+- 3-second grace hardcoded as `AGENT_TERMINATE_GRACE: Duration`. Configurability deferred until a real need surfaces.
+- Tests in `tests/process_group_kill.rs`: (a) well-behaved agent that traps SIGTERM and writes a sentinel before exiting — close the pane, assert the sentinel exists so we know SIGTERM was delivered and the trap ran; (b) uncooperative agent (`sh -c 'trap "" TERM; sleep 60'`) — close the pane, assert the shell process is dead within ~3.5 seconds (3-second grace + SIGKILL).
+
+The deck's contract is "the agent gets a catchable signal and a bounded grace window." The agent's contract is "use that signal to reap your own descendants if you spawned any." Agents that don't honour the contract still leak descendants — visible via `pgrep` after Ctrl+W — but the deck has no way to chase arbitrary descendant trees safely without crossing `setsid` boundaries that exist for good reasons.
+
 ### F6 — Scripted shutdown via `dot-agent-deck stop` (and `remote stop <name>`)
 
 **Problem**: F1 shipped the in-product Stop gesture (Ctrl+C dialog), but PRD #93 line 39 also anticipated a CLI command for scripted shutdown — e.g. a deploy script that wants to ensure no stale daemon is holding a socket before installing a new binary. There is currently no headless way to stop the daemon; you have to attach a TUI just to hit the dialog.

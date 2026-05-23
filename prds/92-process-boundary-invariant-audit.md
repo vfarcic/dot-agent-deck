@@ -59,7 +59,7 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 - **Performance, security, or any other axis.** Behavioral parity only.
 - **Pre-PRD-#76 bugs that the daemon transition incidentally fixed.** Those are improvements, not regressions.
 - **Features that genuinely did not exist at baseline** (the `remote add/list/remove/upgrade` family, daemon idle-shutdown, daemon log destination, lazy-spawn semantics, attach protocol Hello handshake, KIND_EVENT plumbing, etc.). These are post-baseline additions, not parity concerns. List them in an appendix to the audit doc so a future re-audit knows what was deliberately added.
-- **Fixes for any finding *beyond* F1 / F2 / F3 / F4 / F5.** The original audit produced three actionable rows; F4 and F5 were surfaced by the audit-of-the-audit (see Design Decisions, 2026-05-22 "Fold F4 + F5 into scope"). Any *further* regressions surfaced by a re-audit are out of scope for this PRD and would be filed as a successor PRD.
+- **Fixes for any finding *beyond* F1 / F2 / F3 / F4 / F5 / F8.** The original audit produced three actionable rows; F4 and F5 were surfaced by the audit-of-the-audit (see Design Decisions, 2026-05-22 "Fold F4 + F5 into scope"); F8 was surfaced by F5's manual-testing pass against Claude Code (see Design Decisions, 2026-05-23 "Fold F8 into scope"). Any *further* regressions surfaced by a re-audit are out of scope for this PRD and would be filed as a successor PRD.
 
 ## Success Criteria
 
@@ -103,6 +103,12 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 - Each spawned agent runs in its own POSIX process group (set via `setpgid(0, 0)` in a `pre_exec` hook so the child becomes the group leader). The daemon records the process-group id alongside the child PID.
 - Every shutdown path that previously called `kill(pid, SIGKILL)` now calls `killpg(pgid, SIGKILL)` (or the SIGTERM-then-SIGKILL escalation for the graceful path) so shell-wrapped commands and the descendants they spawn are reaped together.
 - A new test launches a shell-wrapped agent (`sh -c 'sleep 30 & wait'` or equivalent), captures the descendant PID, calls `StopAgent`, and asserts both the shell PID and the descendant PID are dead within ~2 seconds.
+
+**F8 fix — graceful single-pane close (SIGTERM-then-SIGKILL on Ctrl+W):**
+
+- Single-pane Ctrl+W now sends `SIGTERM` to the agent's process group first, waits up to 3 seconds for the child to exit, and only then escalates to `SIGKILL`. Pre-F8 it went straight to `SIGKILL`, leaving even well-behaved agents no opportunity to run their own cleanup hooks.
+- Daemon-shutdown (Ctrl+C → Stop) already had the graceful pattern via `shutdown_all_graceful` (PRD #92 F1); F8 brings the single-pane path to parity.
+- A well-behaved agent that traps `SIGTERM` and writes a sentinel before exiting sees its sentinel land on disk after Ctrl+W. An uncooperative agent (`sh -c 'trap "" TERM; sleep 60'`) is still reaped, just after the 3-second grace window.
 
 ## Milestones
 
@@ -161,11 +167,17 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 - [x] **M9.2** — Replace `kill(pid, SIGKILL)` with `killpg(pgid, SIGKILL)` in `force_kill_child_and_wait` (`src/agent_pty.rs`), and the SIGTERM-then-SIGKILL escalation in `shutdown_all_graceful` (`src/agent_pty.rs`) likewise targets the group. *Shipped: both `force_kill_child_and_wait` (SIGKILL final) and the SIGTERM phase inside `shutdown_all_graceful` now call `libc::killpg(pid as i32, sig)` instead of `libc::kill(pid as i32, sig)`. Used `libc::killpg` directly rather than `nix` because `libc` is already a direct dependency (`Cargo.toml:21`) and the call site is two lines; pulling `nix` in just for one wrapper would add a dependency cost the project doesn't otherwise need. The Drop path (`shutdown_all`) reuses `force_kill_child_and_wait`, so it benefits automatically.*
 - [x] **M9.3** — Tests: launch an agent via a shell wrapper that backgrounds a child (`sh -c 'sleep 30 & wait'`), capture the descendant `sleep` PID, call `close_pane`, and assert both the shell PID and the descendant `sleep` PID are dead within ~2s. *Shipped: `tests/process_group_kill.rs::close_pane_reaps_shell_descendants`. The shell writes its background `sleep`'s PID to a tempdir relay file via `echo $! > FILE` so the test can capture it without relying on `/proc/<pid>/task/children` or `pgrep -P` (both Linux-only and brittle under CI). The test asserts both PIDs are alive before the close (so a descendant that died on its own can't make the test pass for the wrong reason) and both are dead within 3s after `close_pane`. Liveness probed via `libc::kill(pid, 0)` returning ESRCH. The 3s timeout is well under the descendant's 30s `sleep`, so a pre-F5 `kill(pid)` regression would leave the descendant alive past the bound and fail the assertion.*
 
+### Phase 10: Implement F8 — graceful single-pane close
+
+- [ ] **M10.1** — Refactor `src/agent_pty.rs::force_kill_child_and_wait` (the single-pane Ctrl+W kill path) to do `killpg(pgid, SIGTERM)` first, wait up to 3 seconds for the child to exit (polling `try_wait`), and only then escalate to `killpg(pgid, SIGKILL)`. Mirror the pattern `shutdown_all_graceful` already uses for the all-agents-at-once path. Extract a shared helper so the two paths converge on the same grace-window logic rather than duplicating it.
+- [ ] **M10.2** — Tests: (a) a well-behaved agent that traps `SIGTERM` and writes a sentinel before exiting — close the pane, assert the sentinel exists on disk so we know `SIGTERM` was delivered and the trap ran; (b) an uncooperative agent (`sh -c 'trap "" TERM; sleep 60'`) — close the pane, assert the shell process is dead within ~3.5 seconds (3-second SIGTERM grace + SIGKILL).
+- [ ] **M10.3** — Manual verification (orchestrator drives with the user): close a real Claude Code pane via Ctrl+W and confirm the agent's own cleanup runs (any cleanup hooks the user has wired up); verify no regression in the existing Ctrl+W coverage (`tests/local_attach.rs::close_pane_stops_agent_in_daemon`, `tests/daemon_lifecycle.rs::close_pane_removes_agent_from_registry`).
+
 ### Phase 7: Pre-release
 
-- [ ] **M7.1** — Manual test pass covering F1, F2, F3, F4, F5 (orchestrator drives with the user). Confirm the quit dialog behaves as the M6.2 three-option Detach/Stop/Cancel; confirm idle shutdown still works for the no-agents case; confirm Stop terminates managed agents and exits the daemon; confirm `y` / `n` approve/deny works on a real `WaitingForInput` session; confirm the doc updates read cleanly on the rendered docs site; confirm Ctrl+W on an unhealthy agent surfaces an error instead of silently removing the card; confirm a shell-wrapped agent's descendants die when the pane is closed.
-- [ ] **M7.2** — Changelog fragment via `dot-ai-changelog-fragment`. The user-visible headlines are the new F1 Stop dialog option, the `y` / `n` keybindings going live, the F4 close-pane error surfacing, the F5 descendant-process cleanup, and the doc fix; the audit deliverable itself is internal and does not need a changelog entry.
-- [ ] **M7.3** — PR description includes (a) the audit findings summary (counts per bucket plus a pointer to `audit/pre-daemon-parity-audit.md`), (b) the F1 / F2 / F3 / F4 / F5 fix summary, (c) the manual-test-pass results from M7.1, and (d) links to any successor PRDs or follow-up issues if the audit surfaces additional work during implementation.
+- [ ] **M7.1** — Manual test pass covering F1, F2, F3, F4, F5, F8 (orchestrator drives with the user). Confirm the quit dialog behaves as the M6.2 three-option Detach/Stop/Cancel; confirm idle shutdown still works for the no-agents case; confirm Stop terminates managed agents and exits the daemon; confirm `y` / `n` approve/deny works on a real `WaitingForInput` session; confirm the doc updates read cleanly on the rendered docs site; confirm Ctrl+W on an unhealthy agent surfaces an error instead of silently removing the card; confirm a shell-wrapped agent's descendants die when the pane is closed; confirm Ctrl+W on a well-behaved agent delivers SIGTERM (visible via the agent's own cleanup-hook output) before the 3-second grace closes with SIGKILL.
+- [ ] **M7.2** — Changelog fragment via `dot-ai-changelog-fragment`. The user-visible headlines are the new F1 Stop dialog option, the `y` / `n` keybindings going live, the F4 close-pane error surfacing, the F5 descendant-process cleanup, the F8 SIGTERM grace on single-pane close, and the doc fix; the audit deliverable itself is internal and does not need a changelog entry.
+- [ ] **M7.3** — PR description includes (a) the audit findings summary (counts per bucket plus a pointer to `audit/pre-daemon-parity-audit.md`), (b) the F1 / F2 / F3 / F4 / F5 / F8 fix summary, (c) the manual-test-pass results from M7.1, and (d) links to any successor PRDs or follow-up issues if the audit surfaces additional work during implementation.
 
 ## Key Files
 
@@ -195,15 +207,32 @@ Audit deliverable:
 
 - `audit/pre-daemon-parity-audit.md` — new file.
 
-Fix targets (Phases 4–9):
+Fix targets (Phases 4–10):
 
 - **F3** (doc fix): `docs/configuration.md` (line 22 plus surrounding env-var table), `docs/installation.md`, `docs/remote-requirements.md`.
 - **F2** (`y` / `n` permission key): `src/ui.rs` (`handle_normal_key`, `WaitingForInput` gating, plus any approve/deny wiring); `src/state.rs` if approve / deny needs to mutate session state. Unit tests inline in `src/ui.rs` next to the existing `test_mode_transitions` cluster.
 - **F1** (Stop option in Ctrl+C dialog): `src/ui.rs` (primary and secondary dialog rendering + key handlers + `KeyResult::Stop` variant), `src/daemon_protocol.rs` (`KIND_SHUTDOWN` frame), `src/daemon_client.rs` (TUI-side `send_shutdown` helper), `src/daemon.rs` (handler that triggers the existing shutdown path immediately on `KIND_SHUTDOWN`), `src/agent_pty.rs` (terminate-all path with SIGTERM→SIGKILL escalation). Tests under `tests/` — a new `tests/stop_dialog.rs` for the dialog flow plus `KIND_SHUTDOWN` round-trip tests added to `tests/daemon_protocol.rs` and `tests/daemon_lifecycle.rs`. No CLI command this round, so `src/main.rs` is untouched.
 - **F4** (Ctrl+W error handling): `src/ui.rs` (Ctrl+W handler around line 3736 and the group-close fan-out), `src/tab.rs` (`TabManager::close_tab` signature widens to return per-pane results), `src/mode_manager.rs` (`ModeManager::deactivate_mode` similarly). Tests in a new `tests/close_pane_errors.rs` (or extending `tests/orchestration_delegate.rs`) using a mock `PaneController` that returns `Err` from `close_pane`.
 - **F5** (process-group kill semantics): `src/agent_pty.rs` is the single edit site — spawn path uses `pre_exec` for `setpgid(0, 0)`; `force_kill_child_and_wait` and `shutdown_all_graceful` switch from `kill(pid, ...)` to `killpg(pgid, ...)`. Tests in a new `tests/process_group_kill.rs` or as an extension to `tests/local_attach.rs` — launch a shell-wrapped agent, capture the descendant PID, close the pane, assert both PIDs are dead.
+- **F8** (graceful single-pane close): `src/agent_pty.rs` is again the single production edit site — `force_kill_child_and_wait` switches from "SIGKILL only" to "SIGTERM, poll `try_wait` up to 3 s, then SIGKILL," sharing the escalation helper with `shutdown_all_graceful`. Tests extend `tests/process_group_kill.rs` (well-behaved-trap-runs + uncooperative-SIGKILL-after-grace).
 
 ## Design Decisions
+
+### 2026-05-23: Fold F8 into scope (graceful single-pane close)
+
+Manual testing of F5 against a real Claude Code agent surfaced a limitation in the F5 fix: `killpg` reaches every direct descendant of the agent's own session, but Claude Code internally `setsid`s its sub-shells, placing those sub-shells (and *their* descendants) in fresh process groups that escape the outer `killpg`. The orphaned sub-shells then survive Ctrl+W as init-parented zombies.
+
+User's framing — which we accept — is: *"If we ensure that agents are killed, the agent is responsible for the processes it spawns."* That is the right boundary; the daemon shouldn't try to chase arbitrary descendant trees the agent itself created. But the pre-F8 Ctrl+W path used raw `SIGKILL` (uncatchable), so even a well-behaved agent that *wanted* to clean up its descendants couldn't — it received no signal it could trap.
+
+F8 closes the gap by giving the single-pane Ctrl+W path the same SIGTERM-with-grace shape F1's `shutdown_all_graceful` already uses for daemon-wide Stop. Well-behaved agents now have a 3-second window during which a `SIGTERM` handler can run; misbehaving agents are still SIGKILL'd after the grace, with whatever descendants the agent left behind continuing to leak (and that's an agent bug, not a deck bug).
+
+Choice points and trade-offs:
+
+- **Shared helper vs. duplicated logic.** Shared. `force_kill_child_and_wait` (single-pane) and `shutdown_all_graceful` (daemon-wide) now both delegate to a small `terminate_with_grace` helper that takes the child + a grace duration and runs the SIGTERM-poll-SIGKILL sequence. Reduces drift risk.
+- **3-second grace constant.** Hardcoded for now (`AGENT_TERMINATE_GRACE: Duration`). Matches the F1 graceful-shutdown grace, which is the natural sibling. Can be lifted to a `DashboardConfig` field if a future user genuinely needs to tune it — the constant is one symbol to find, and the production code reads it from a single named site.
+- **Scope guarantee.** F8 covers Ctrl+W only. Daemon-shutdown Stop (Ctrl+C → Stop) was already graceful via the F1 pathway; F8 is the parity fix, not new behavior.
+
+Acknowledged limitation that F8 does *not* fix: agents that internally `setsid` their sub-shells (Claude Code does this) still leak the sub-session if the agent itself doesn't reap them during the SIGTERM grace. That's the agent's responsibility now that it gets a catchable signal. If the agent ignores SIGTERM or doesn't clean up, the descendants survive as orphans — visible via `pgrep` after Ctrl+W. The deck's job is to deliver SIGTERM and wait; the agent's job is to use it.
 
 ### 2026-05-22: Fold F4 + F5 into scope (audit-of-the-audit findings)
 
@@ -298,4 +327,4 @@ Preserved / Regressed / Intentional change. The v1 attempt had four buckets incl
 
 Retained from the original PRD. The audit explicitly does not fix anything. Mixing audit and fix work obscures the audit's scope — readers cannot tell whether a clean area was checked or simply not visited. Each Regressed row is drafted as a follow-up milestone in the audit document; not filed as a GitHub issue until the user reviews and authorizes, and fixes are scoped separately.
 
-*Partially superseded by the two 2026-05-22 scope-expansion decisions above. The "audit excludes fixes" guidance no longer applies to F1 / F2 / F3 / F4 / F5 specifically — all five land on this PRD's branch. The broader principle (that future audits should not interleave fix work with their findings discovery) is unchanged.*
+*Partially superseded by the three 2026-05-22 / 2026-05-23 scope-expansion decisions above. The "audit excludes fixes" guidance no longer applies to F1 / F2 / F3 / F4 / F5 / F8 specifically — all six land on this PRD's branch. The broader principle (that future audits should not interleave fix work with their findings discovery) is unchanged.*
