@@ -3,7 +3,7 @@
 **Status**: Planning
 **Priority**: Medium
 **Created**: 2026-05-17
-**Last updated**: 2026-05-22
+**Last updated**: 2026-05-23
 **GitHub Issue**: [#92](https://github.com/vfarcic/dot-agent-deck/issues/92)
 **Depends on**: PRD #76 (shipped, `prds/done/76-remote-agent-environments.md`) and PRD #93 Phases 1–3 (shipped — commits `48b9180`, `3d2b2db`). Baseline for the audit is commit `2fc39c3` — the last commit before PRD #76 merged.
 
@@ -52,6 +52,8 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 - **Implement F3 — fix stale socket-path doc.** `docs/configuration.md:22` still documents `/tmp/dot-agent-deck.sock` while current code uses `/tmp/dot-agent-deck-{uid}.sock`. Update the literal and add a one-sentence per-user-disambiguation note; cross-check `docs/installation.md` and `docs/remote-requirements.md` for the same staleness.
 - **Implement F4 — Ctrl+W respects `close_pane` errors.** Auditor-found regression introduced when PRD #76 turned agent kills into RPCs that can fail. The TUI currently does `let _ = pane.close_pane(...)` and unconditionally removes the dashboard card / session — so a failed `StopAgent` RPC leaves the agent alive in the daemon registry while the card vanishes from the dashboard. Fix the single-pane path (`src/ui.rs`) to inspect the `Result` and preserve the card on `Err`; fix the group-close paths (`TabManager::close_tab` in `src/tab.rs`, `ModeManager::deactivate_mode` in `src/mode_manager.rs`) to return per-pane results so partial failure does not silently destroy the whole tab.
 - **Implement F5 — process-group kill semantics.** Auditor-found defect (possibly pre-existing — baseline's `pane.child.kill()` had the same single-PID limitation, but the user-visible symptom is now sharper because the daemon outlives the TUI). Commands launched via `$SHELL -c <cmd>` (the spawn path in `src/agent_pty.rs`) register the shell's PID, not the actual agent's; on shutdown, only the shell dies and the agent + its descendants are orphaned to init. Fix the spawn path to `setpgid(0, 0)` (or `setsid`) the child into its own process group, and fix the kill paths (`force_kill_child_and_wait` + `shutdown_all_graceful`) to `killpg` instead of `kill`.
+- **Implement F9 — restore worker context cleanup per `.dot-agent-deck.toml` `clear` setting.** Pre-daemon, the orchestrator cleared a worker's pane before each delegation when the role's `clear` field was true (the default; the `release` role explicitly opts out with `clear = false`). Post-daemon (current main), this is lost — workers retain previous pane content across delegations, which is visually messy and can be confusing for the orchestrator reading worker output. Likely lost in PRD #93 round 5 (commit `d39930f`) when delegate / work-done dispatch moved into the daemon: either the `clear` field was dropped from `OrchestrationConfig.roles[*]` parsing, or its honoring code in the delegate dispatch path was removed. Fix the parse, fix the honoring, restore pre-baseline behavior.
+- **Implement F10 — dedupe double work-done notifications.** Pre-daemon, a worker's `work-done` signal produced exactly one orchestrator notification. Post-daemon, the orchestrator frequently receives the same "Worker X completed" notification twice for a single commit (visible in this very PRD #92 implementation conversation across F2 / F5 / F8 work-done messages). Likely lost in the same PRD #93 round-5 refactor (`d39930f`) that moved work-done dispatch into the daemon — either dedup was removed or two code paths now both notify. Find the duplicate source, restore exactly-once delivery.
 
 ### Out of Scope
 
@@ -59,7 +61,7 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 - **Performance, security, or any other axis.** Behavioral parity only.
 - **Pre-PRD-#76 bugs that the daemon transition incidentally fixed.** Those are improvements, not regressions.
 - **Features that genuinely did not exist at baseline** (the `remote add/list/remove/upgrade` family, daemon idle-shutdown, daemon log destination, lazy-spawn semantics, attach protocol Hello handshake, KIND_EVENT plumbing, etc.). These are post-baseline additions, not parity concerns. List them in an appendix to the audit doc so a future re-audit knows what was deliberately added.
-- **Fixes for any finding *beyond* F1 / F2 / F3 / F4 / F5 / F8.** The original audit produced three actionable rows; F4 and F5 were surfaced by the audit-of-the-audit (see Design Decisions, 2026-05-22 "Fold F4 + F5 into scope"); F8 was surfaced by F5's manual-testing pass against Claude Code (see Design Decisions, 2026-05-23 "Fold F8 into scope"). Any *further* regressions surfaced by a re-audit are out of scope for this PRD and would be filed as a successor PRD.
+- **Fixes for any finding *beyond* F1 / F2 / F3 / F4 / F5 / F8 / F9 / F10.** The original audit produced three actionable rows; F4 and F5 were surfaced by the audit-of-the-audit (see Design Decisions, 2026-05-22 "Fold F4 + F5 into scope"); F8 was surfaced by F5's manual-testing pass against Claude Code (see Design Decisions, 2026-05-23 "Fold F8 into scope"); F9 and F10 were surfaced during F8 manual testing as two more daemon-rewrite regressions (see Design Decisions, 2026-05-23 "Fold F9 + F10 into scope"). Any *further* regressions surfaced by a re-audit are out of scope for this PRD and would be filed as a successor PRD.
 
 ## Success Criteria
 
@@ -109,6 +111,17 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 - Single-pane Ctrl+W now sends `SIGTERM` to the agent's process group first, waits up to 3 seconds for the child to exit, and only then escalates to `SIGKILL`. Pre-F8 it went straight to `SIGKILL`, leaving even well-behaved agents no opportunity to run their own cleanup hooks.
 - Daemon-shutdown (Ctrl+C → Stop) already had the graceful pattern via `shutdown_all_graceful` (PRD #92 F1); F8 brings the single-pane path to parity.
 - A well-behaved agent that traps `SIGTERM` and writes a sentinel before exiting sees its sentinel land on disk after Ctrl+W. An uncooperative agent (`sh -c 'trap "" TERM; sleep 60'`) is still reaped, just after the 3-second grace window.
+
+**F9 fix — restore worker context cleanup:**
+
+- The `clear` field on each `[[orchestrations.roles]]` entry in `.dot-agent-deck.toml` is parsed correctly into the in-memory orchestration-role representation. Default is `true` (matches baseline); the `release` role's explicit `clear = false` continues to opt out of clearing for its scrollback walkthrough.
+- Before writing the new task prompt to a worker's pane on delegate, the orchestrator clears the worker's pane content if and only if the role's effective `clear == true`.
+- Unit tests cover: `clear` field default, parse correctness for explicit `true` / `false`, and the dispatch path's honoring of the setting (clear emitted when `true`, not emitted when `false`).
+
+**F10 fix — dedupe double work-done notifications:**
+
+- Each `work-done` signal a worker emits produces exactly one orchestrator notification. Verified by a test that subscribes to the work-done event stream, fires one `work-done`, and asserts exactly one notification arrives.
+- The existing broadcast semantics are preserved — `work-done` still reaches all attached TUIs subscribed to the broadcast stream, just exactly once per signal.
 
 ## Milestones
 
@@ -173,11 +186,23 @@ The audit is *baseline-versus-current parity*, not a forward-looking review of c
 - [x] **M10.2** — Tests: (a) a well-behaved agent that traps `SIGTERM` and writes a sentinel before exiting — close the pane, assert the sentinel exists on disk so we know `SIGTERM` was delivered and the trap ran; (b) an uncooperative agent (`sh -c 'trap "" TERM; sleep 60'`) — close the pane, assert the shell process is dead within ~3.5 seconds (3-second SIGTERM grace + SIGKILL). *Shipped: `tests/process_group_kill.rs::close_pane_well_behaved_agent_runs_sigterm_trap` and `::close_pane_uncooperative_agent_killed_after_grace`. The well-behaved test traps SIGTERM, writes a sentinel, and exits 0; the test polls for the sentinel to appear within 2 s after the close. The uncooperative test installs an empty SIGTERM trap (`trap '' TERM`) so the shell ignores the signal, then asserts the close completes in under 3.5 s (3 s grace + SIGKILL delivery) and the shell PID is dead within another 500 ms. Existing `daemon_attach_cleanup::ctrl_w_stop_agent_timeout_restores_pane_and_returns_error` adjusted: outer deadline 4 s → 7 s to match the new `CTRL_W_STOP_TIMEOUT`.*
 - [ ] **M10.3** — Manual verification (orchestrator drives with the user): close a real Claude Code pane via Ctrl+W and confirm the agent's own cleanup runs (any cleanup hooks the user has wired up); verify no regression in the existing Ctrl+W coverage (`tests/local_attach.rs::close_pane_stops_agent_in_daemon`, `tests/daemon_lifecycle.rs::close_pane_removes_agent_from_registry`). *Pending manual test pass per M7.1.*
 
+### Phase 11: Implement F9 — restore worker context cleanup per `.dot-agent-deck.toml` clear setting
+
+- [ ] **M11.1** — Verify the `clear` field on `[[orchestrations.roles]]` is parsed into the in-memory orchestration-role representation (whatever shape the post-PRD-#93 daemon now uses — likely an `OrchestrationConfig.roles[*]` or equivalent). If parsing was silently dropped during the round-5 refactor at commit `d39930f`, restore it. Default to `true` so existing configs without a `clear` field continue to match baseline behavior.
+- [ ] **M11.2** — Wire the pane-clear into the daemon-side delegate dispatch path (the `handle_delegate` flow in `src/state.rs`, plus any equivalent in `src/agent_pty.rs`'s `write_to_pane` if cleaner there). Before writing the new task prompt to the worker's pane, clear the pane if the role's `clear` field is true. Skip the clear when `clear = false` (release role keeps its scrollback).
+- [ ] **M11.3** — Tests: parse-level test for default (no field → true) and explicit `clear = true` / `clear = false` values; dispatch-level test that the orchestrator emits a clear-screen sequence (or equivalent) to the worker's pane when `clear == true` and does not when `clear == false`.
+
+### Phase 12: Implement F10 — dedupe double work-done notifications
+
+- [ ] **M12.1** — Identify the duplicate source. Likely candidates: the daemon's `handle_work_done` path (`src/state.rs`) firing the notification once directly while a broadcast subscriber elsewhere also fires it; or a hook-event subscriber firing on every `KIND_EVENT` carrying a `work-done` payload alongside the direct dispatch. Use `Explore` agents to map the work-done delivery graph if the surface is wide.
+- [ ] **M12.2** — Fix the duplicate. Likely a single-emit point or a guard flag preventing double notification.
+- [ ] **M12.3** — Tests: subscribe a fake orchestrator-side listener, fire one `work-done` signal, assert exactly one notification arrives. Add a regression test that the broadcast machinery still delivers `work-done` to all attached TUIs (so the dedup did not accidentally break broadcast).
+
 ### Phase 7: Pre-release
 
-- [ ] **M7.1** — Manual test pass covering F1, F2, F3, F4, F5, F8 (orchestrator drives with the user). Confirm the quit dialog behaves as the M6.2 three-option Detach/Stop/Cancel; confirm idle shutdown still works for the no-agents case; confirm Stop terminates managed agents and exits the daemon; confirm `y` / `n` approve/deny works on a real `WaitingForInput` session; confirm the doc updates read cleanly on the rendered docs site; confirm Ctrl+W on an unhealthy agent surfaces an error instead of silently removing the card; confirm a shell-wrapped agent's descendants die when the pane is closed; confirm Ctrl+W on a well-behaved agent delivers SIGTERM (visible via the agent's own cleanup-hook output) before the 3-second grace closes with SIGKILL.
-- [ ] **M7.2** — Changelog fragment via `dot-ai-changelog-fragment`. The user-visible headlines are the new F1 Stop dialog option, the `y` / `n` keybindings going live, the F4 close-pane error surfacing, the F5 descendant-process cleanup, the F8 SIGTERM grace on single-pane close, and the doc fix; the audit deliverable itself is internal and does not need a changelog entry.
-- [ ] **M7.3** — PR description includes (a) the audit findings summary (counts per bucket plus a pointer to `audit/pre-daemon-parity-audit.md`), (b) the F1 / F2 / F3 / F4 / F5 / F8 fix summary, (c) the manual-test-pass results from M7.1, and (d) links to any successor PRDs or follow-up issues if the audit surfaces additional work during implementation.
+- [ ] **M7.1** — Manual test pass covering F1, F2, F3, F4, F5, F8, F9, F10 (orchestrator drives with the user). Confirm the quit dialog behaves as the M6.2 three-option Detach/Stop/Cancel; confirm idle shutdown still works for the no-agents case; confirm Stop terminates managed agents and exits the daemon; confirm `y` / `n` approve/deny works on a real `WaitingForInput` session; confirm the doc updates read cleanly on the rendered docs site; confirm Ctrl+W on an unhealthy agent surfaces an error instead of silently removing the card; confirm a shell-wrapped agent's descendants die when the pane is closed; confirm Ctrl+W on a well-behaved agent delivers SIGTERM (visible via the agent's own cleanup-hook output) before the 3-second grace closes with SIGKILL; confirm a worker's pane is cleared before each delegation when its role's `clear == true` (default) and is not cleared when `clear == false` (release role); confirm a single `work-done` signal produces exactly one orchestrator notification.
+- [ ] **M7.2** — Changelog fragment via `dot-ai-changelog-fragment`. The user-visible headlines are the new F1 Stop dialog option, the `y` / `n` keybindings going live, the F4 close-pane error surfacing, the F5 descendant-process cleanup, the F8 SIGTERM grace on single-pane close, the F9 worker-context cleanup restored, the F10 work-done deduplication, and the doc fix; the audit deliverable itself is internal and does not need a changelog entry.
+- [ ] **M7.3** — PR description includes (a) the audit findings summary (counts per bucket plus a pointer to `audit/pre-daemon-parity-audit.md`), (b) the F1 / F2 / F3 / F4 / F5 / F8 / F9 / F10 fix summary, (c) the manual-test-pass results from M7.1, and (d) links to any successor PRDs or follow-up issues if the audit surfaces additional work during implementation.
 
 ## Key Files
 
@@ -215,8 +240,30 @@ Fix targets (Phases 4–10):
 - **F4** (Ctrl+W error handling): `src/ui.rs` (Ctrl+W handler around line 3736 and the group-close fan-out), `src/tab.rs` (`TabManager::close_tab` signature widens to return per-pane results), `src/mode_manager.rs` (`ModeManager::deactivate_mode` similarly). Tests in a new `tests/close_pane_errors.rs` (or extending `tests/orchestration_delegate.rs`) using a mock `PaneController` that returns `Err` from `close_pane`.
 - **F5** (process-group kill semantics): `src/agent_pty.rs` is the single edit site — spawn path uses `pre_exec` for `setpgid(0, 0)`; `force_kill_child_and_wait` and `shutdown_all_graceful` switch from `kill(pid, ...)` to `killpg(pgid, ...)`. Tests in a new `tests/process_group_kill.rs` or as an extension to `tests/local_attach.rs` — launch a shell-wrapped agent, capture the descendant PID, close the pane, assert both PIDs are dead.
 - **F8** (graceful single-pane close): `src/agent_pty.rs` is again the single production edit site — `force_kill_child_and_wait` switches from "SIGKILL only" to "SIGTERM, poll `try_wait` up to 3 s, then SIGKILL," sharing the escalation helper with `shutdown_all_graceful`. Tests extend `tests/process_group_kill.rs` (well-behaved-trap-runs + uncooperative-SIGKILL-after-grace).
+- **F9** (worker context cleanup): `.dot-agent-deck.toml` parsing — wherever the orchestration-role config is deserialized (likely `src/state.rs` or a dedicated config module in current code); plus the daemon-side delegate dispatch path (`src/state.rs::handle_delegate` and/or `src/agent_pty.rs::write_to_pane`). Tests for both the parse and the dispatch.
+- **F10** (dedupe work-done notifications): the daemon's work-done delivery graph — `src/state.rs::handle_work_done`, the broadcast subscribers in `src/daemon.rs` / `src/daemon_protocol.rs`, and any hook-event handler that forwards `work-done` payloads. Tests assert exactly-once notification delivery and broadcast preservation.
 
 ## Design Decisions
+
+### 2026-05-23: Fold F9 + F10 into scope (rewrite regressions found during F8 manual testing)
+
+During the F8 manual-test pass, the user surfaced two more daemon-rewrite regressions that the parity audit's row-by-row enumeration did not catch (the audit focused on user-visible features expressed through user-facing commands and UI; F9 and F10 are user-visible but expressed through orchestrator behavior, which the v2 audit pass did not extensively enumerate):
+
+- **F9 — worker context cleanup.** Each `[[orchestrations.roles]]` entry in `.dot-agent-deck.toml` supports a `clear` field (default `true`; the `release` role explicitly sets `clear = false` to keep its scrollback for the release-flow walkthrough). Pre-daemon (baseline `2fc39c3`), the orchestrator honored this setting and cleared a worker's pane before each delegation when `clear == true`. Post-daemon (current main), this honoring is lost — workers retain previous pane content across delegations. Likely lost in the PRD #93 round-5 refactor (commit `d39930f`) when delegate / work-done dispatch moved into the daemon: either the field was silently dropped from the in-memory config representation, or its honoring code was removed during the dispatch rewrite.
+- **F10 — double work-done notifications.** Pre-daemon, a worker's `work-done` signal produced exactly one orchestrator notification. Post-daemon, the orchestrator frequently receives the same "Worker X completed" notification twice for a single commit. This is reproducible — it manifested in this very PRD #92 implementation conversation across F2 / F5 / F8 work-done messages. Likely lost in the same PRD #93 round-5 refactor (`d39930f`) that moved work-done dispatch into the daemon. Either dedup logic was removed, or two parallel code paths now both notify.
+
+Both are exactly the parity-class regressions PRD #92 was created to surface. User confirmed fold-in:
+
+> *"Change @devbox.json..."* — testing reaction surfacing the issues
+> *"We should add those two to the list of fixes and tackle them after we finish working on the one we're working on now."*
+
+Same precedent as F4 / F5 (audit-of-the-audit findings) and F8 (manual-test finding). The "audit excludes fixes" line from 2026-05-17 is partially superseded again for F9 / F10 specifically. Bundling is cheaper than spinning up two more follow-up PRDs (same calculus as before — issue files, branch overhead, separate review threads).
+
+Ordering: F9 and F10 land *after* F1 / F2 / F3 / F4 / F5 / F8 are all proven (i.e., after the M7.1 manual test pass validates the prior fixes). Strictly sequential within F9 / F10 — F9 first because the parse / dispatch surface is narrower; F10 second because the work-done delivery graph requires Explore-agent breadth.
+
+F9 implementation note: when fixing the field's honoring, also confirm the default (no `clear` field present in TOML) resolves to `true`. The release role's `clear = false` must remain functional — verify by spot-checking the resulting `release` worker pane retains scrollback across delegations after F9 ships.
+
+F10 implementation note: be careful not to break the broadcast semantics. `work-done` is delivered both to the orchestrator (as a notification) and broadcast to attached TUIs (for status display). Exactly-once is the orchestrator-notification contract; the broadcast can still fan out to all subscribers, but each subscriber receives the signal once.
 
 ### 2026-05-23: Fold F8 into scope (graceful single-pane close)
 
@@ -327,4 +374,4 @@ Preserved / Regressed / Intentional change. The v1 attempt had four buckets incl
 
 Retained from the original PRD. The audit explicitly does not fix anything. Mixing audit and fix work obscures the audit's scope — readers cannot tell whether a clean area was checked or simply not visited. Each Regressed row is drafted as a follow-up milestone in the audit document; not filed as a GitHub issue until the user reviews and authorizes, and fixes are scoped separately.
 
-*Partially superseded by the three 2026-05-22 / 2026-05-23 scope-expansion decisions above. The "audit excludes fixes" guidance no longer applies to F1 / F2 / F3 / F4 / F5 / F8 specifically — all six land on this PRD's branch. The broader principle (that future audits should not interleave fix work with their findings discovery) is unchanged.*
+*Partially superseded by the four 2026-05-22 / 2026-05-23 scope-expansion decisions above. The "audit excludes fixes" guidance no longer applies to F1 / F2 / F3 / F4 / F5 / F8 / F9 / F10 specifically — all eight land on this PRD's branch. The broader principle (that future audits should not interleave fix work with their findings discovery) is unchanged.*

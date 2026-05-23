@@ -235,6 +235,26 @@ The deck's contract: "the agent gets a catchable signal and a bounded grace wind
 
 **Likely PRD home**: docs-only change; can land as a small standalone commit or be folded into the next docs-touching PR.
 
+### F9 — Restore worker context cleanup per `.dot-agent-deck.toml` `clear` setting
+
+**Status**: Queued (this PRD, Phase 11).
+
+**Problem**: Each `[[orchestrations.roles]]` entry in `.dot-agent-deck.toml` supports a `clear` field (default `true`; the `release` role explicitly sets `clear = false` to keep its scrollback for the release-flow walkthrough). Pre-daemon (baseline `2fc39c3`), the orchestrator honored this setting and cleared a worker's pane before each delegation when `clear == true`. Post-daemon (current main), this honoring is lost — workers retain previous pane content across delegations. Surfaced by user during F8 manual testing. Likely lost in PRD #93 round 5 (commit `d39930f`) when delegate / work-done dispatch moved into the daemon — either the field was dropped from the in-memory orchestration-role representation, or its honoring code in the delegate dispatch path was removed during the refactor.
+
+**Suggested approach**: Verify the `clear` field is parsed into the in-memory orchestration-role config (restore the parse if it was dropped). Wire the pane-clear into the daemon-side delegate dispatch path (`src/state.rs::handle_delegate` and/or `src/agent_pty.rs::write_to_pane` — choose whichever site is cleaner). Before writing the new task prompt to the worker's pane, emit a clear-screen sequence (or equivalent) when the role's `clear == true`. Skip the clear when `clear == false` (release role keeps its scrollback). Tests: parse-level for default and explicit values; dispatch-level for honoring of the setting.
+
+**Likely PRD home**: PRD #92 Phase 11 (this audit's remediation scope).
+
+### F10 — Dedupe double work-done notifications
+
+**Status**: Queued (this PRD, Phase 12).
+
+**Problem**: Pre-daemon, a worker's `work-done` signal produced exactly one orchestrator notification. Post-daemon, the orchestrator frequently receives the same "Worker X completed" notification twice for a single commit. Reproducible — manifested in this very PRD #92 implementation conversation across F2 / F5 / F8 work-done messages. Likely lost in the same PRD #93 round-5 refactor (`d39930f`) that moved work-done dispatch into the daemon. Either dedup logic was removed, or two parallel code paths now both notify (e.g., the direct dispatch in `handle_work_done` plus a broadcast subscriber both firing on the same signal).
+
+**Suggested approach**: Map the work-done delivery graph (`src/state.rs::handle_work_done` + broadcast subscribers in `src/daemon.rs` / `src/daemon_protocol.rs` + any hook-event handler forwarding `work-done` payloads) — use `Explore` agents for breadth if needed. Identify the dup source. Fix with a single-emit guard or by collapsing the parallel paths. Tests: subscribe a fake orchestrator-side listener, fire one `work-done`, assert exactly one notification arrives. Regression test that the broadcast machinery still delivers `work-done` to all attached TUIs (so the dedup did not break broadcast).
+
+**Likely PRD home**: PRD #92 Phase 12 (this audit's remediation scope).
+
 ## Intentional changes appendix
 
 Behaviors that changed between baseline and current, where the change is a deliberate design decision with citation. Recording so a future re-audit does not re-flag.
