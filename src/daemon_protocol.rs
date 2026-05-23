@@ -821,14 +821,43 @@ async fn handle_connection(
                 .into_iter()
                 .find(|r| r.id == id)
                 .and_then(|r| r.pane_id_env);
-            match registry.close_agent(&id) {
+            // PRD #92 F8 followup (auditor #1): `close_agent` runs the
+            // synchronous SIGTERM-with-grace loop in
+            // `terminate_child_with_grace_and_wait`, which calls
+            // `std::thread::sleep` for up to 3 s while polling the
+            // child's `try_wait`. Calling that from inside the async
+            // attach-connection task would block a Tokio worker thread
+            // for the duration of the grace window — under load this
+            // can starve other connections. Mirror the
+            // `KIND_SHUTDOWN` handler's pattern: hop the blocking work
+            // onto a `spawn_blocking` pool task, await the
+            // `JoinHandle`, and surface a join error as a failed
+            // close.
+            let registry_for_close = registry.clone();
+            let id_for_close = id.clone();
+            let close_result =
+                tokio::task::spawn_blocking(move || registry_for_close.close_agent(&id_for_close))
+                    .await;
+            let close_outcome: Result<(), String> = match close_result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(join_err) => {
+                    tracing::warn!(
+                        error = %join_err,
+                        agent_id = %id,
+                        "spawn_blocking for close_agent panicked or was cancelled"
+                    );
+                    Err(format!("close_agent task failed: {join_err}"))
+                }
+            };
+            match close_outcome {
                 Ok(()) => {
                     if let Some(pane_id) = pane_id_env {
                         state.write().await.unregister_pane(&pane_id);
                     }
                     write_resp(&mut stream, &AttachResponse::ok()).await?
                 }
-                Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+                Err(msg) => write_resp(&mut stream, &AttachResponse::err(msg)).await?,
             }
         }
         AttachRequest::SetAgentLabel {

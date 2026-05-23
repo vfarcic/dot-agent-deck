@@ -430,13 +430,38 @@ fn signal_child_pgroup_or_fallback(
     signal: libc::c_int,
     phase: &'static str,
 ) -> bool {
-    let pgid = child.process_id().and_then(pid_to_pgid);
+    let raw_pid = child.process_id();
+    let pgid = raw_pid.and_then(pid_to_pgid);
     let Some(pgid) = pgid else {
-        // No PID, or the pid did not survive the `pid_to_pgid` sanity
-        // check (the F1-followup defensive boundary check). Fall back
-        // to portable-pty's own signaller. `portable_pty::Child::kill`
-        // sends SIGHUP regardless of `signal`, but that's the best
-        // we can do without a valid pgid.
+        // PRD #92 F8 followup (auditor #2 — option b documented):
+        // pid_to_pgid rejected the raw pid (either `process_id()`
+        // returned `None` or the pid was outside the safe `(0, i32::MAX]`
+        // range). The portable-pty `Child` trait allows `None` here,
+        // but the Unix backend used by this codebase (the only backend
+        // we ship — PRD #93 is Unix-only and Windows support is
+        // PRD #42's territory) always returns `Some` in practice. The
+        // `(0, i32::MAX]` boundary check is defense-in-depth against a
+        // future portable-pty bug; on real Linux/macOS PIDs it never
+        // fails. The fallback below uses `portable_pty::Child::kill`,
+        // which sends SIGHUP — strictly weaker than the requested
+        // `signal` (typically SIGTERM or SIGKILL) and limited to the
+        // direct child (no process-group semantics, so descendants
+        // leak). The caller's subsequent `child.wait()` is unbounded
+        // — that's acceptable for the same "this branch is practically
+        // unreachable" reason; if it ever fires, we'd rather see the
+        // log and accept a hang than complicate every call site with a
+        // bounded-wait wrapper for a path that doesn't exist in
+        // practice.
+        //
+        // Auditor #5: emit a warn-level event so a descendant leak
+        // surfaced via this fallback is at least observable.
+        tracing::warn!(
+            ?raw_pid,
+            signal,
+            phase = %phase,
+            reason = if raw_pid.is_none() { "process_id-returned-none" } else { "pid_to_pgid-rejected" },
+            "signal_child_pgroup_or_fallback: pgid unavailable — falling back to portable_pty::Child::kill (SIGHUP, single-PID; descendants will leak)"
+        );
         let _ = child.kill();
         return true;
     };
