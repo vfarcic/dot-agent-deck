@@ -1413,6 +1413,21 @@ impl PaneController for EmbeddedPaneController {
         Ok(())
     }
 
+    /// PRD #110 followup: snapshot the daemon-side `agent_id` currently
+    /// bound to a pane. Brand-new pane creation sites call this right
+    /// after `create_pane_with_options` returns so the local placeholder
+    /// can be born with the correct `agent_id` and the strict-equality
+    /// reuse guard in `AppState::apply_event` accepts the agent's first
+    /// `SessionStart` event. The id is held under a `Mutex` because PRD
+    /// #92 F12 rotates it on F9 clear=true respawns; we clone the latest
+    /// value while the lock is held and never await across it.
+    fn pane_agent_id(&self, pane_id: &str) -> Option<String> {
+        let panes = self.panes.lock().unwrap();
+        panes
+            .get(pane_id)
+            .map(|p| p.backend.agent_id.lock().unwrap().clone())
+    }
+
     fn create_pane_with_options(
         &self,
         command: Option<&str>,
