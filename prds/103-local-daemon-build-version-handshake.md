@@ -177,11 +177,31 @@ pub struct AttachResponse {
 
 ### Phase 2: TUI local-attach check
 
-- [ ] **M2.1** — In `run_tui_session` (`src/main.rs`), after `ensure_external_daemon_or_die` succeeds, open a fresh client connection and send `Hello { client_version: PROTOCOL_VERSION, client_build_version: Some(env!("DAD_BUILD_ID").into()) }`. Parse `AttachResponse`. If `build_version` is `None` (older daemon) or differs from `env!("DAD_BUILD_ID")`, write a clear stderr message and exit non-zero. Message format:
+- [ ] **M2.1** — In `run_tui_session` (`src/main.rs`), after `ensure_external_daemon_or_die` succeeds, open a fresh client connection and send `Hello { client_version: PROTOCOL_VERSION, client_build_version: Some(env!("DAD_BUILD_ID").into()) }`. Parse `AttachResponse`. If `build_version` is `None` (older daemon) or differs from `env!("DAD_BUILD_ID")`, present an **interactive terminal prompt** (raw-mode, no TUI stack required — the TUI hasn't rendered yet at this point). The prompt names both build-ids, lists live managed agents if any are running (from a `ListAgents` round-trip), and offers keyboard choices:
   ```
-  error: local daemon is build <daemon-build-id> but this TUI is build <tui-build-id>
-  recover with: dot-agent-deck daemon stop
+  ⚠  Daemon version mismatch
+     running daemon:  <daemon-build-id>
+     this binary:     <tui-build-id>
+
+     [S] stop daemon and continue   [Q] quit
   ```
+  - **S** (or **s**) — invoke the same logic as `daemon stop` inline (SIGTERM the daemon PID obtained via `peer_pid()`, wait for socket disappearance, then fall through to normal TUI startup). If live agents are present, upgrade the prompt to name them and ask for confirmation first:
+    ```
+    ⚠  Daemon version mismatch  (N managed agent(s) running)
+       <agent-ids listed>
+
+       Stopping the daemon will end these agents.
+
+       [S] stop daemon and continue   [Q] quit
+    ```
+    This preserves the data-loss guard without requiring the user to manually run a separate command.
+  - **Q**, **Ctrl+C**, or **Ctrl+D** — abort without touching the daemon; exit non-zero.
+  - **Non-interactive / CI fallback**: if `stdout` is not a TTY (`!std::io::stdout().is_terminal()`), skip the prompt and fall back to the plain stderr message + non-zero exit:
+    ```
+    error: local daemon is build <daemon-build-id> but this TUI is build <tui-build-id>
+    recover with: dot-agent-deck daemon stop
+    ```
+  `daemon stop` remains the documented manual recovery command (for scripts, docs, and cases where the user aborts the prompt); the interactive prompt is a convenience layer on top, not a replacement.
 - [ ] **M2.2** — Make the check `RUST_LOG=debug`-traceable: log the round-trip on success too, so users debugging unrelated startup issues can see the handshake fired. Keep the success path silent on stderr.
 - [ ] **M2.3** — Decide and document: what happens if the daemon was just spawned by `ensure_external_daemon_or_die` itself (i.e. it's necessarily our build)? Either skip the check (small optimization) or run it anyway (defense in depth, catches bugs in `ensure_external_daemon_or_die`). Recommend running it anyway — the cost is one extra round-trip on cold start, the upside is a smoke test of the handshake on every launch.
 
@@ -194,7 +214,13 @@ pub struct AttachResponse {
 ### Phase 4: Tests
 
 - [ ] **M4.1** — Unit tests in `daemon_protocol.rs`: `AttachResponse::hello` populates both fields; serde round-trip preserves them; older-shape JSON (no `build_version`) deserializes to `None`; older-shape `Hello` JSON (no `client_build_version`) deserializes successfully on the daemon side.
-- [ ] **M4.2** — Integration test: spawn a daemon, attach with a TUI built against a synthetic `DAD_BUILD_ID` (use a test helper that injects the comparison value rather than rebuilding the binary). Assert mismatch → exit-non-zero + expected stderr message; match → normal startup. Cover the same-tag-different-commit case explicitly (two synthetic build-ids sharing a tag prefix but differing in the `-g<sha>` suffix).
+- [ ] **M4.2** — Integration test: spawn a daemon, attach with a TUI built against a synthetic `DAD_BUILD_ID` (use a test helper that injects the comparison value rather than rebuilding the binary). Cover:
+  - **TTY path, no live agents, user presses S** → daemon stops, TUI proceeds normally.
+  - **TTY path, no live agents, user presses Q / Ctrl+C** → daemon untouched, process exits non-zero.
+  - **TTY path, live agent(s) present, user presses S** → confirmation prompt shown naming the agents; on second S, daemon stops.
+  - **Non-TTY / CI path (stdout not a terminal)** → plain stderr message + non-zero exit, no prompt rendered.
+  - **Match** → normal startup, no prompt, no stderr.
+  Cover the same-tag-different-commit case explicitly (two synthetic build-ids sharing a tag prefix but differing in the `-g<sha>` suffix).
 - [ ] **M4.3** — Integration test for `daemon stop`: spawn daemon with no agents → `daemon stop` succeeds, socket gone within 5s. Spawn daemon, start an agent, attempt `daemon stop` → refuses with informative error. Same scenario with `--force` → succeeds, agent dies. With no daemon running → idempotent exit 0.
 - [ ] **M4.4** — Integration test for `daemon restart`: spawn daemon, run `daemon restart`, confirm the original daemon PID is gone and the next TUI lazy-spawn produces a fresh daemon at the current build.
 - [ ] **M4.5** — Fake-ssh-executor test in `connect.rs` for the remote build-version mismatch path (M1.4): assert the resulting error message names `remote upgrade` (not `daemon stop`) and includes both build-ids.
