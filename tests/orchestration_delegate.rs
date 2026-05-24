@@ -37,9 +37,11 @@ use dot_agent_deck::agent_pty::{
 };
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
+use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::event::{
     AgentEvent, AgentType, DaemonMessage, DelegateSignal, EventType, WorkDoneSignal,
 };
+use dot_agent_deck::pane::{AgentSpawnOptions, PaneController};
 use dot_agent_deck::state::{AppState, SharedState};
 
 mod common;
@@ -2721,4 +2723,283 @@ start = true
         pid_initial, pid_after,
         "missing role_config must NOT respawn (the warn fired and we fell through)"
     );
+}
+
+/// PRD #92 F12 followup-3 — end-to-end regression for the F12 reattach
+/// budget. The unit-level F12 tests in
+/// `tests/pane_auto_renew_on_respawn.rs` exercise the controller's
+/// `resolve_and_reattach` loop in isolation: they drive
+/// [`AgentPtyRegistry::close_agent`] + [`AgentPtyRegistry::spawn_agent`]
+/// directly, with a tens-of-millisecond gap between close and spawn.
+/// That window fits inside even a regressed retry budget, so the unit
+/// tests passed at tip `7c6356f` (200 ms F12 budget) — the bug was
+/// invisible until the production respawn path with a SIGTERM-trapping
+/// worker manifested it manually.
+///
+/// This test exercises the real path:
+///   - the daemon's [`AppState::handle_delegate`] dispatches against
+///     a `clear = true` role, triggering
+///     [`AgentPtyRegistry::respawn_agent_for_pane`];
+///   - `respawn_agent_for_pane` drops the master immediately (firing
+///     STREAM_END to the attached [`EmbeddedPaneController`]) and only
+///     THEN waits inside `terminate_child_with_grace_and_wait` for the
+///     SIGTERM-trapping worker to finish its 2 s `sleep` before
+///     spawning the replacement;
+///   - the controller's io_task therefore observes STREAM_END ~2 s
+///     before the new agent is registered, and its
+///     `resolve_and_reattach` budget must be wide enough to cover
+///     that gap.
+///
+/// ## Worker recipe
+///
+/// `sh -c "trap 'sleep 2; exit' TERM; echo OLD_BANNER; sleep 30"`
+///
+/// - The `trap` clause forces the SIGTERM-to-exit gap to ~2 s, which
+///   is what stretches `respawn_agent_for_pane` past the regressed F12
+///   budget.
+/// - `echo OLD_BANNER` proves the OLD subscription is alive before we
+///   trigger the respawn (so the failure can only be "lost the NEW
+///   subscription", not "never had one in the first place").
+/// - `sleep 30` keeps the OLD shell alive past the daemon's master
+///   drop. Earlier sketches used `exec cat -u` here, but `exec`
+///   replaces the shell process — and once the shell is gone the
+///   SIGTERM trap is gone too, so the respawn gap collapses to ~ms
+///   and the bug becomes invisible. A bare `sleep` doesn't read
+///   stdin (immune to master close) and the shell stays alive to
+///   run the trap when SIGTERM arrives via `killpg`.
+/// - The daemon's post-respawn prompt write reaches the controller's
+///   vt100 parser via PTY ECHO: bytes written to the master are
+///   echoed back on the master's read side by the kernel's TTY
+///   driver, so no in-pane reader (e.g. `cat -u`) is required.
+///
+/// ## Expected failure mode if the budget regresses
+///
+/// At tip `7c6356f` (`REATTACH_LOOKUP_TOTAL_BUDGET = 200 ms`):
+///   1. `respawn_agent_for_pane` drops the master at t≈0.
+///   2. The controller's io_task observes Closed and enters
+///      `resolve_and_reattach`, which polls `list_agents` ~3 times
+///      over ~300 ms and gives up — the NEW agent does not register
+///      until terminate_with_grace returns (~2 s in).
+///   3. The io_task exits. The pane's vt100 parser has no live
+///      subscription.
+///   4. The daemon completes the respawn, then `write_to_pane_and_submit`
+///      flushes the worker-task one-liner into the NEW agent's PTY.
+///      Cat echoes it; the bytes reach the daemon's per-agent bus, but
+///      nothing is subscribed on the controller side. The parser's
+///      visible screen never contains the one-liner.
+///   5. The polling assertion below times out with `saw_prompt = false`.
+///
+/// At tip `96762b3` (10 s exponential-backoff budget):
+///   - The reattach loop polls until ~2 s in, finds the NEW agent,
+///     re-attaches, and the new bytes flow into the vt100 parser
+///     within the assertion window.
+///
+/// ## Marker strategy
+///
+/// The daemon's prompt write produces a fixed one-liner
+/// (`Read .dot-agent-deck/worker-task-coder.md for your task.`) — the
+/// caller-supplied task body is written to the per-role `.md` file,
+/// NOT to the worker's stdin, so DelegateSignal.task itself never
+/// reaches the PTY scrollback. The one-liner is therefore the marker
+/// that proves the post-respawn bytes were observed: it does not
+/// appear in the screen until the daemon's respawn + reattach cycle
+/// completes, so its presence is unambiguous evidence that the F12
+/// reattach won the race.
+///
+/// ## Wall-clock budget
+///
+/// - ~2 s for the SIGTERM trap.
+/// - ~ms for the fresh PTY spawn.
+/// - up to 10 s for the daemon's `SessionStart` fallback wait (this
+///   test's `cat -u` worker never emits one, so the prompt write
+///   always lands on the timeout path — same as
+///   `delegate_respawns_worker_agent_when_role_clear_is_true`).
+///
+/// Total: ~12–13 s on a quiet box. The 30 s assertion budget below
+/// absorbs CI jitter without letting a true regression slip through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f12_e2e_pane_renders_new_agent_after_sigterm_trap_respawn() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    // SIGTERM-trapping shell. The diagnostic recipe used
+    // `exec cat -u` here, but `exec` replaces the shell — the trap
+    // belongs to the shell, so after exec there's no trap left to
+    // delay anything. We instead run a long `sleep` and rely on the
+    // PTY's ECHO behavior to surface the daemon's prompt write in
+    // the vt100 parser (no stdin reader is required: bytes written
+    // to the master are echoed back on the master's read side, and
+    // the per-agent broadcast forwards them to the controller).
+    //
+    // Shape: shell sets the trap, echoes OLD_BANNER, then forks
+    // `sleep 30` and waits. When the daemon's respawn:
+    //   1. drops the master — the PTY closes from the daemon side,
+    //      but `sleep` doesn't read stdin so it's unaffected;
+    //   2. invokes `terminate_child_with_grace_and_wait`, which
+    //      `killpg`s SIGTERM to the shell's process group. `sleep`
+    //      receives SIGTERM and dies (no trap); the shell receives
+    //      SIGTERM, returns from `wait`, and runs its trap
+    //      (`sleep 2; exit`). 2 s later the shell exits and the
+    //      grace helper's `try_wait` returns.
+    //
+    // The OLD agent's exit therefore takes ~2 s after the master
+    // drop — exactly the gap F12's reattach budget must cover.
+    //
+    // TOML quoting: the value is a basic string, so embedded `"` are
+    // escaped with `\"`. Single quotes inside the shell argument
+    // group the trap action without needing further escapes.
+    let sigterm_trap_shell = r#"sh -c "trap 'sleep 2; exit' TERM; echo OLD_BANNER; sleep 30""#;
+    let sigterm_trap_shell_toml = sigterm_trap_shell.replace('"', "\\\"");
+
+    let config_toml = format!(
+        r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "{sigterm_trap_shell_toml}"
+"#
+    );
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+
+    // The TUI-side controller owns the subscription whose loss is the
+    // F12 bug. Point it at the daemon's already-bound attach socket
+    // (no second listener) and create the coder pane through it so
+    // the StartAgent → attach handshake mirrors the production path.
+    let ctrl = Arc::new(EmbeddedPaneController::new(
+        daemon.attach_path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let coder_pane_id = {
+        let ctrl = ctrl.clone();
+        let cwd_for_create = cwd.clone();
+        let shell = sigterm_trap_shell.to_string();
+        tokio::task::spawn_blocking(move || {
+            let opts = AgentSpawnOptions {
+                display_name: Some("coder"),
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".to_string(),
+                    role_index: 1,
+                    role_name: "coder".to_string(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(cwd_for_create.clone()),
+                }),
+                rows: 24,
+                cols: 80,
+                agent_type: None,
+            };
+            ctrl.create_pane_with_options(Some(&shell), Some(&cwd_for_create), opts)
+                .expect("create_pane_with_options should succeed")
+                .0
+        })
+        .await
+        .expect("spawn_blocking for create_pane")
+    };
+
+    // Helper: check the controller's vt100 parser for `needle`.
+    // Visible-screen contents only — same surface
+    // `tests/pane_auto_renew_on_respawn.rs::screen_contains` uses.
+    fn screen_contains(ctrl: &EmbeddedPaneController, pane_id: &str, needle: &str) -> bool {
+        let Some(screen) = ctrl.get_screen(pane_id) else {
+            return false;
+        };
+        let parser = screen.lock().unwrap();
+        parser.screen().contents().contains(needle)
+    }
+
+    async fn wait_screen<F>(timeout: Duration, mut pred: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            if pred() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        pred()
+    }
+
+    // Baseline: the OLD subscription must be alive before we trigger
+    // the respawn. Without this assertion a "saw_prompt = false"
+    // failure later could mean either "lost the NEW subscription"
+    // (the F12 bug) or "never had the OLD subscription"
+    // (an unrelated wiring break).
+    let ctrl_for_wait = ctrl.clone();
+    let pane_for_wait = coder_pane_id.clone();
+    let saw_old = wait_screen(Duration::from_secs(5), move || {
+        screen_contains(&ctrl_for_wait, &pane_for_wait, "OLD_BANNER")
+    })
+    .await;
+    assert!(
+        saw_old,
+        "OLD agent banner never reached the vt100 parser — the controller's \
+         initial subscription is broken (this is a precondition for the F12 \
+         assertion below)"
+    );
+
+    // Fire one delegate. The coder role defaults to `clear = true`,
+    // so the daemon respawns the worker before writing the prompt.
+    // With the SIGTERM-trapping shell the respawn opens a ~2 s gap
+    // between master-drop (STREAM_END) and the new agent's
+    // registration — exactly the gap the F12 budget must absorb.
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "F12 e2e regression task body".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    // The prompt one-liner is the marker of "post-respawn bytes
+    // reached the vt100 parser". At tip 7c6356f the controller's
+    // io_task gives up inside the 200 ms budget and never re-attaches
+    // — `cat -u`'s echo of the prompt reaches the daemon's per-agent
+    // bus but has no subscriber on the controller side, and this
+    // assertion times out.
+    let ctrl_for_wait = ctrl.clone();
+    let pane_for_wait = coder_pane_id.clone();
+    let saw_prompt = wait_screen(Duration::from_secs(30), move || {
+        screen_contains(
+            &ctrl_for_wait,
+            &pane_for_wait,
+            "Read .dot-agent-deck/worker-task-coder.md",
+        )
+    })
+    .await;
+    assert!(
+        saw_prompt,
+        "post-respawn prompt one-liner never reached the vt100 parser — \
+         F12 reattach budget couldn't absorb the SIGTERM-trap respawn gap; \
+         see test doc comment for the failure mode at tip 7c6356f"
+    );
+
+    drop(ctrl);
 }
