@@ -970,6 +970,7 @@ mod tests {
             user_prompt: None,
             metadata,
             pane_id: None,
+            agent_id: None,
         };
         let mut recent_events = VecDeque::new();
         recent_events.push_back(event);
@@ -1031,6 +1032,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         };
         let mut recent_events = VecDeque::new();
         recent_events.push_back(event);

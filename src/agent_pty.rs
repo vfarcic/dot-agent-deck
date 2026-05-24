@@ -39,6 +39,21 @@ pub const DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS: &str = "DOT_AGENT_DECK_IDLE_SHUTDOW
 /// scrub site below can reference it by name.
 pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
 
+/// PRD #92 F9 followup-7: per-spawn daemon-side agent id the daemon
+/// injects into every spawned agent's environment. The agent's hook
+/// script reads this and attaches it to each emitted `AgentEvent` as
+/// `agent_id`, letting the post-respawn dispatch task scope its
+/// `SessionStart` wait to the NEW agent — a late `SessionStart` from
+/// the OLD agent firing within the subscribe→kill window carries the
+/// OLD id and is rejected.
+///
+/// Same drift-safety pattern as [`DOT_AGENT_DECK_PANE_ID`]: define
+/// the constant once and let the spawn-side injector, the env-scrub
+/// site in [`spawn`], and the hook-script reader in
+/// [`crate::hook`] all reference the same symbol so two string
+/// literals can't drift apart.
+pub const DOT_AGENT_DECK_AGENT_ID: &str = "DOT_AGENT_DECK_AGENT_ID";
+
 /// Hard upper bound on PTY rows/cols accepted by the daemon. Larger values
 /// are clamped down before reaching `MasterPty::resize`. The cap defends
 /// against a same-uid attach-socket peer perturbing an existing agent's
@@ -677,6 +692,12 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     //     pane-id would tag every spawned agent with the wrong pane.
     cmd.env_remove(DOT_AGENT_DECK_VIA_DAEMON);
     cmd.env_remove(DOT_AGENT_DECK_PANE_ID);
+    // PRD #92 F9 followup-7: same scrub-then-overlay rule for the
+    // daemon-injected agent_id. If the daemon itself was launched
+    // from inside another deck pane that already had this set, an
+    // unfiltered inherit would tag every spawned agent with the
+    // parent deck's id and the hook script would misroute events.
+    cmd.env_remove(DOT_AGENT_DECK_AGENT_ID);
     // PRD #93 tuning env var: same scrub rationale — a deck launched
     // with this set would otherwise leak it into every child it spawns,
     // where it's meaningless to the child's environment.
@@ -1215,6 +1236,36 @@ impl AgentPtyRegistry {
         // outside the variant set at deserialization.
         let agent_type = opts.agent_type.take();
 
+        // PRD #92 F9 followup-7: pre-allocate the registry id *before*
+        // `spawn` so we can inject `DOT_AGENT_DECK_AGENT_ID = <id>` into
+        // the spawned child's environment. The agent's hook script reads
+        // this env var and attaches the id to each emitted `AgentEvent`
+        // as `agent_id`, which lets the post-respawn dispatch task scope
+        // its `SessionStart` wait to the NEW agent — closing the
+        // stale-OLD-agent race that the followup-6 broadcast filter
+        // (pane_id only) couldn't distinguish.
+        //
+        // Two lock acquisitions (here + the post-spawn insert) are cheap
+        // and uncontended for the common single-spawn path; a failed
+        // spawn or duplicate-pane-id rejection just wastes the
+        // pre-allocated id (`next_id` is monotonic and not required to
+        // be contiguous).
+        //
+        // Caller-supplied `DOT_AGENT_DECK_AGENT_ID` values are stripped
+        // before our injection wins: `respawn_agent_for_pane` replays
+        // the OLD agent's `spawn_env` (which carries its id), and an
+        // untrimmed replay would tag the NEW agent's hooks with the
+        // OLD id — defeating the whole point of the filter.
+        let preallocated_id = {
+            let mut inner = self.inner.lock().unwrap();
+            let id = inner.next_id.to_string();
+            inner.next_id += 1;
+            id
+        };
+        opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
+        opts.env
+            .push((DOT_AGENT_DECK_AGENT_ID.to_string(), preallocated_id.clone()));
+
         // Capture the full env vec and the requested PTY size BEFORE
         // `spawn(opts)` consumes the options. Stored on `RunningAgent`
         // so [`respawn_agent_for_pane`] can re-apply them to the fresh
@@ -1301,8 +1352,12 @@ impl AgentPtyRegistry {
             exited,
         };
 
-        let id = inner.next_id.to_string();
-        inner.next_id += 1;
+        // Use the id we pre-allocated above (before spawn) and injected
+        // as `DOT_AGENT_DECK_AGENT_ID` into the child's env. Keeping
+        // the inserted-into-registry id identical to the env-injected
+        // id is the invariant the agent-id-scoped SessionStart filter
+        // depends on.
+        let id = preallocated_id;
         inner.agents.insert(id.clone(), agent);
         // Signal *after* releasing the lock would be cleaner, but we still
         // hold `inner` here. Notify is cheap and a spurious wake-up is

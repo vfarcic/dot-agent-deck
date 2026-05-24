@@ -111,6 +111,7 @@ fn make_tool_start_event(session_id: &str, pane_id: &str) -> AgentEvent {
         user_prompt: None,
         metadata: std::collections::HashMap::new(),
         pane_id: Some(pane_id.into()),
+        agent_id: None,
     }
 }
 

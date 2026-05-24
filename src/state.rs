@@ -175,6 +175,18 @@ fn lookup_orchestration_role(
 /// agent's `SessionStart` could land on the broadcast channel and be
 /// missed by a receiver that attached too late.
 ///
+/// PRD #92 F9 followup-7: also filter on `agent_id` — the daemon-side
+/// registry id of the freshly-spawned agent. The followup-6 filter
+/// matched on `pane_id` alone, which is reused verbatim across a
+/// clear=true respawn — so a late `SessionStart` from the OLD agent
+/// firing within the subscribe→kill window (e.g. its initial boot
+/// was slow) would have unblocked the wait and let the dispatch task
+/// write the prompt while the NEW agent was still booting. With the
+/// `agent_id` discriminator, OLD-agent events carry the OLD id and
+/// are rejected; the NEW agent's first `SessionStart` carries the
+/// NEW id (injected via `DOT_AGENT_DECK_AGENT_ID` on spawn and
+/// forwarded by the agent's hook script) and matches.
+///
 /// `Lagged` is treated as "keep polling" rather than fatal: a slow
 /// dispatch task that fell behind the daemon's event volume still
 /// wakes up on the next event in the ring, and a SessionStart that
@@ -193,6 +205,7 @@ fn lookup_orchestration_role(
 async fn wait_for_session_start(
     rx: &mut broadcast::Receiver<BroadcastMsg>,
     pane_id: &str,
+    agent_id: &str,
     timeout: std::time::Duration,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -204,6 +217,7 @@ async fn wait_for_session_start(
             Ok(Ok(BroadcastMsg::Event(event))) => {
                 if event.event_type == EventType::SessionStart
                     && event.pane_id.as_deref() == Some(pane_id)
+                    && event.agent_id.as_deref() == Some(agent_id)
                 {
                     return true;
                 }
@@ -364,17 +378,28 @@ async fn dispatch_one_owned(
             .respawn_agent_for_pane(&pane_id, &role.command)
             .await
         {
-            Ok(_new_id) => {
+            Ok(new_agent_id) => {
                 tracing::debug!(
                     role = %target_role,
                     pane_id = %pane_id,
+                    new_agent_id = %new_agent_id,
                     timeout_secs = SESSION_START_WAIT_TIMEOUT.as_secs(),
                     "delegate: respawned worker agent for clear=true; \
                      waiting for SessionStart on hook broadcast"
                 );
-                let observed =
-                    wait_for_session_start(&mut event_rx, &pane_id, SESSION_START_WAIT_TIMEOUT)
-                        .await;
+                // PRD #92 F9 followup-7: scope the wait to the NEW
+                // agent's id so a late `SessionStart` from the OLD
+                // agent (which carried the OLD id, injected via
+                // `DOT_AGENT_DECK_AGENT_ID` at its own spawn time)
+                // can't be mis-accepted as the NEW agent's
+                // readiness signal.
+                let observed = wait_for_session_start(
+                    &mut event_rx,
+                    &pane_id,
+                    &new_agent_id,
+                    SESSION_START_WAIT_TIMEOUT,
+                )
+                .await;
                 if !observed {
                     tracing::debug!(
                         role = %target_role,
@@ -900,6 +925,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         }
     }
 
@@ -1543,5 +1569,75 @@ mod tests {
         );
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "Implemented login");
+    }
+
+    /// PRD #92 F9 followup-7: pin `wait_for_session_start`'s
+    /// `(pane_id, agent_id)` filter directly. The integration tests
+    /// in `tests/orchestration_delegate.rs` exercise the same
+    /// contract through the full daemon path; this unit test
+    /// reproduces the OLD-vs-NEW agent_id discriminator
+    /// deterministically against a bare broadcast channel — no
+    /// daemon, no PTY, no race window — so a regression in the
+    /// filter is caught regardless of CI scheduling.
+    #[tokio::test]
+    async fn wait_for_session_start_rejects_old_agent_id_accepts_new() {
+        let (tx, _) = tokio::sync::broadcast::channel::<BroadcastMsg>(16);
+
+        let mk = |pane: &str, agent_id: Option<&str>| AgentEvent {
+            session_id: format!("synthetic-{pane}-{}", agent_id.unwrap_or("none")),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some(pane.to_string()),
+            agent_id: agent_id.map(str::to_string),
+        };
+
+        // Subscribe BEFORE sending so the receiver picks up every event
+        // (the broadcast channel only forwards to receivers that
+        // existed at send time).
+        let mut rx = tx.subscribe();
+
+        // OLD-agent SessionStart for the right pane but wrong id — must
+        // be rejected and the wait must time out.
+        tx.send(BroadcastMsg::Event(mk("coder-pane", Some("old-id"))))
+            .unwrap();
+        // Also send a SessionStart with no agent_id at all — the
+        // followup-6 filter would have accepted this; followup-7's
+        // filter must reject because `None != Some(new-id)`.
+        tx.send(BroadcastMsg::Event(mk("coder-pane", None)))
+            .unwrap();
+
+        let observed = wait_for_session_start(
+            &mut rx,
+            "coder-pane",
+            "new-id",
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            !observed,
+            "wait_for_session_start must reject SessionStart with OLD agent_id or no agent_id"
+        );
+
+        // Now NEW-agent SessionStart with matching id — must unblock.
+        let mut rx = tx.subscribe();
+        tx.send(BroadcastMsg::Event(mk("coder-pane", Some("new-id"))))
+            .unwrap();
+        let observed = wait_for_session_start(
+            &mut rx,
+            "coder-pane",
+            "new-id",
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            observed,
+            "wait_for_session_start must accept SessionStart with matching (pane_id, agent_id)"
+        );
     }
 }

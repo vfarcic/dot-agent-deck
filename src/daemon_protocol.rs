@@ -1558,6 +1558,7 @@ mod tests {
             user_prompt: Some("fix the login bug".into()),
             metadata: HashMap::new(),
             pane_id: Some("7".into()),
+            agent_id: None,
         };
         let payload = serde_json::to_vec(&BroadcastMsg::Event(event)).unwrap();
 

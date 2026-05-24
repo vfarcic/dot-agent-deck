@@ -7565,6 +7565,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         };
         state.apply_event(event1.clone());
 
@@ -7584,6 +7585,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         };
         state.apply_event(event2);
 
@@ -7641,6 +7643,7 @@ mod tests {
                 user_prompt: None,
                 metadata: HashMap::new(),
                 pane_id: None,
+                agent_id: None,
             });
         }
 
@@ -7690,6 +7693,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         };
         state.apply_event(event.clone());
 
@@ -7914,6 +7918,7 @@ mod tests {
                 user_prompt: None,
                 metadata: HashMap::new(),
                 pane_id: None,
+                agent_id: None,
             });
         }
 
@@ -8357,6 +8362,7 @@ mod tests {
                 user_prompt: None,
                 metadata: HashMap::new(),
                 pane_id: None,
+                agent_id: None,
             });
         }
 
@@ -8380,6 +8386,7 @@ mod tests {
                 user_prompt: None,
                 metadata: HashMap::new(),
                 pane_id: None,
+                agent_id: None,
             });
         }
 
@@ -8404,6 +8411,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -8416,6 +8424,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         });
 
         let mut ui = default_ui();
@@ -8439,6 +8448,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -8451,6 +8461,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         });
 
         let mut ui = default_ui();
@@ -8476,6 +8487,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         });
 
         let mut ui = default_ui();
@@ -8965,6 +8977,7 @@ mod tests {
                 user_prompt: Some(prompt.to_string()),
                 metadata: HashMap::new(),
                 pane_id: None,
+                agent_id: None,
             });
         }
 
@@ -9819,6 +9832,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         });
         let output = build_art_output(&s);
         assert!(output.contains("Bash"));

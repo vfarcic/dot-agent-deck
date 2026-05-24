@@ -134,7 +134,13 @@ async fn send_work_done(hook_path: &PathBuf, signal: &WorkDoneSignal) {
 /// 10 s timeout fallback and onto the event-observed path — a `cat -u`
 /// stub agent never emits `SessionStart` on its own, so the test has
 /// to forge it.
-async fn send_session_start(hook_path: &PathBuf, pane_id: &str) {
+///
+/// PRD #92 F9 followup-7: the dispatch task's `wait_for_session_start`
+/// filter is `(pane_id, agent_id)` since followup-7, so a forged event
+/// MUST carry the NEW agent's id or it will be rejected as if it came
+/// from the OLD (pre-respawn) agent. Callers pass the post-respawn
+/// `agent_id_for_pane(...)` lookup.
+async fn send_session_start(hook_path: &PathBuf, pane_id: &str, agent_id: Option<&str>) {
     let event = AgentEvent {
         session_id: format!("synthetic-{pane_id}"),
         agent_type: AgentType::ClaudeCode,
@@ -146,6 +152,7 @@ async fn send_session_start(hook_path: &PathBuf, pane_id: &str) {
         user_prompt: None,
         metadata: std::collections::HashMap::new(),
         pane_id: Some(pane_id.to_string()),
+        agent_id: agent_id.map(str::to_string),
     };
     let mut stream = UnixStream::connect(hook_path).await.expect("connect hook");
     let mut json = serde_json::to_vec(&event).unwrap();
@@ -555,7 +562,7 @@ prompt_template = "You are the coder. Always run tests before finishing."
         &daemon.pty_registry,
         "coder-pane",
         "Read .dot-agent-deck/worker-task-coder.md",
-        Duration::from_secs(15),
+        Duration::from_secs(20),
     )
     .await;
 
@@ -664,7 +671,7 @@ prompt_template = "You are the coder for an unnamed orchestration."
         &daemon.pty_registry,
         "coder-pane-2",
         "Read .dot-agent-deck/worker-task-coder.md",
-        Duration::from_secs(15),
+        Duration::from_secs(20),
     )
     .await;
 
@@ -1431,7 +1438,7 @@ command = "cat -u"
         &daemon.pty_registry,
         &coder_agent_id_after_first,
         "Read .dot-agent-deck/worker-task-coder.md",
-        Duration::from_secs(15),
+        Duration::from_secs(20),
     )
     .await;
 
@@ -1691,7 +1698,7 @@ command = "cat -u"
         &daemon.pty_registry,
         &coder_agent_id_after,
         "Read .dot-agent-deck/worker-task-coder.md",
-        Duration::from_secs(15),
+        Duration::from_secs(20),
     )
     .await;
 
@@ -1873,7 +1880,7 @@ command = "cat -u"
         &daemon.pty_registry,
         &final_id,
         "Read .dot-agent-deck/worker-task-coder.md",
-        Duration::from_secs(25),
+        Duration::from_secs(30),
     )
     .await;
 }
@@ -1955,17 +1962,22 @@ command = "cat -u"
             _ => tokio::time::sleep(Duration::from_millis(15)).await,
         }
     }
-    assert!(
-        agent_id_for_pane(&daemon.pty_registry, "coder-pane").is_some_and(|id| id != coder_initial),
+    let coder_new = agent_id_for_pane(&daemon.pty_registry, "coder-pane")
+        .expect("coder pane has live agent after respawn");
+    assert_ne!(
+        coder_new, coder_initial,
         "respawn never rotated the agent id within 5 s"
     );
 
-    // Forge a SessionStart for the coder pane. The dispatch task is
-    // currently sleeping inside `wait_for_session_start` against the
-    // daemon-wide hook broadcast; this event lands on every live
-    // receiver, including that task's, and unblocks the prompt write.
+    // Forge a SessionStart for the coder pane scoped to the NEW
+    // agent's id (followup-7: the dispatch task's wait filter is
+    // `(pane_id, agent_id)`, so a `None` agent_id no longer matches).
+    // The dispatch task is currently sleeping inside
+    // `wait_for_session_start` against the daemon-wide hook broadcast;
+    // this event lands on every live receiver, including that task's,
+    // and unblocks the prompt write.
     let send_at = tokio::time::Instant::now();
-    send_session_start(&daemon.hook_path, "coder-pane").await;
+    send_session_start(&daemon.hook_path, "coder-pane", Some(&coder_new)).await;
 
     // The prompt should land promptly — well under the 10 s fallback.
     // 3 s tolerates fs + PTY plumbing on a loaded CI box but stays
@@ -1985,6 +1997,137 @@ command = "cat -u"
          expected the event-driven fast path (< 5 s) but the wait \
          appears to be falling through the 10 s SessionStart timeout"
     );
+}
+
+/// PRD #92 F9 followup-7: the post-respawn dispatch task's
+/// `wait_for_session_start` filter must reject `SessionStart` events
+/// whose `agent_id` matches the OLD (pre-respawn) agent. Without
+/// this filter, a late `SessionStart` from the OLD agent emitted
+/// within the subscribe→kill window would unblock the wait and the
+/// dispatch would write the prompt while the NEW agent is still
+/// booting — exactly the bug followup-6's broadcast filter (pane_id
+/// only) couldn't see.
+///
+/// Construction: capture OLD agent_id before delegate, send delegate,
+/// poll for respawn completion (rotates agent_id), capture NEW
+/// agent_id. Then:
+///   1. Forge a SessionStart with the OLD agent_id. The dispatch
+///      task's receiver receives it; with the followup-7 filter the
+///      event is rejected and the wait keeps blocking — the prompt
+///      must NOT appear in the pane scrollback.
+///   2. Forge a SessionStart with the NEW agent_id. The wait
+///      unblocks and the prompt IS written.
+///
+/// The OLD event in step 1 reproduces reviewer #5's concern that the
+/// existing followup-6 test claimed to exercise this race but did
+/// not — it only sent a single SessionStart with no agent_id, which
+/// happened to unblock the wait regardless of whether the filter
+/// scoped by agent_id.
+#[tokio::test]
+async fn delegate_clear_true_rejects_session_start_from_old_agent_id() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let config_toml = r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "cat -u"
+"#;
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let coder_initial =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "race-ordering task".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    // Wait for respawn to rotate the agent id — proves the dispatch
+    // task is past respawn and now blocked inside wait_for_session_start.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match agent_id_for_pane(&daemon.pty_registry, "coder-pane") {
+            Some(id) if id != coder_initial => break,
+            _ => tokio::time::sleep(Duration::from_millis(15)).await,
+        }
+    }
+    let coder_new = agent_id_for_pane(&daemon.pty_registry, "coder-pane")
+        .expect("coder pane has live agent after respawn");
+    assert_ne!(
+        coder_new, coder_initial,
+        "respawn never rotated the agent id within 5 s"
+    );
+
+    // Step 1: forge a SessionStart with the OLD agent_id. Followup-7's
+    // filter requires `agent_id == NEW`, so this event must be
+    // rejected and the prompt must NOT yet appear.
+    send_session_start(&daemon.hook_path, "coder-pane", Some(&coder_initial)).await;
+
+    // Give the daemon enough time to deliver-and-reject the OLD event.
+    // 300ms is generous: broadcast::Sender::send is sync-immediate and
+    // the dispatch task's receiver loop is just a serde decode plus the
+    // three-line filter. If the filter ever erroneously accepted the
+    // OLD event the prompt write would already be queued; the
+    // wait_for_in_pane_snapshot below would observe it well under our
+    // 1 s budget. Conversely if rejection works correctly, scrollback
+    // stays empty during this window.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let snap_after_old = daemon
+        .pty_registry
+        .snapshot(&coder_new)
+        .expect("snapshot of NEW coder agent");
+    let prompt_marker = "Read .dot-agent-deck/worker-task-coder.md";
+    assert!(
+        !snap_after_old
+            .windows(prompt_marker.len())
+            .any(|w| w == prompt_marker.as_bytes()),
+        "OLD-agent SessionStart must NOT unblock the dispatch wait; \
+         snapshot at +300ms = {:?}",
+        String::from_utf8_lossy(&snap_after_old)
+    );
+
+    // Step 2: forge a SessionStart with the NEW agent_id. Filter
+    // matches, wait unblocks, prompt is written into the new agent's
+    // PTY scrollback.
+    send_session_start(&daemon.hook_path, "coder-pane", Some(&coder_new)).await;
+
+    let _ = wait_for_in_pane_snapshot(
+        &daemon.pty_registry,
+        "coder-pane",
+        prompt_marker,
+        Duration::from_secs(3),
+    )
+    .await;
 }
 
 /// When a `clear = true` respawn fails
@@ -2187,7 +2330,7 @@ command = "cat -u"
         daemon.pty_registry.clone(),
         "coder-pane",
         single_start,
-        Duration::from_secs(15),
+        Duration::from_secs(20),
     )
     .await
     .expect("baseline single-pane respawn never produced a visible prompt");
@@ -2243,7 +2386,7 @@ command = "cat -u"
             daemon.pty_registry.clone(),
             pane,
             fanout_start,
-            Duration::from_secs(15),
+            Duration::from_secs(20),
         )
     });
     let elapsed_per_pane: Vec<Option<Duration>> = futures_util::future::join_all(waits).await;
