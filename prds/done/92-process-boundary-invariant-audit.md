@@ -1,6 +1,7 @@
 # PRD #92: Pre-daemon parity audit + remediation
 
-**Status**: Planning
+**Status**: Complete
+**Completed**: 2026-05-24
 **Priority**: Medium
 **Created**: 2026-05-17
 **Last updated**: 2026-05-24
@@ -239,7 +240,7 @@ Phase 12 milestones are deferred pending reproduction. See the 2026-05-24 Design
   - *F8 (SIGTERM-then-SIGKILL graceful close): **confirmed working** — Claude Code's SIGTERM trap had room to run and reap its sub-shell before SIGKILL would have hit it.*
   - *F12 (TUI auto-renew per-pane subscription on respawn): **confirmed working** post followup-2 (exponential-backoff budget fix) — a `clear = true` second delegation to the coder pane shows the NEW Claude Code session immediately, no manual detach required.*
 - [x] **M7.2** — Changelog fragment via `dot-ai-changelog-fragment`. *Shipped: `changelog.d/92.bugfix.md` at commit `15857f9`. Single bugfix-typed fragment titled "Pre-daemon parity restoration" covering all eight user-visible fixes (F1 Stop dialog, F2 y/n keys, F3 doc fix, F4 close-pane error surfacing, F5 descendant-reap, F8 SIGTERM grace, F9 clear-semantics restored, F12 live pane view across respawns). F10 deferred; F11 / F13 / F7 deferred to successor PRDs — not included.*
-- [ ] **M7.3** — PR description includes (a) the audit findings summary (counts per bucket plus a pointer to `audit/pre-daemon-parity-audit.md`), (b) the F1 / F2 / F3 / F4 / F5 / F8 / F9 / F12 fix summary, (c) the manual-test-pass results from M7.1, and (d) links to any successor PRDs or follow-up issues if the audit surfaces additional work during implementation.
+- [x] **M7.3** — PR description includes (a) the audit findings summary (counts per bucket plus a pointer to `audit/pre-daemon-parity-audit.md`), (b) the F1 / F2 / F3 / F4 / F5 / F8 / F9 / F12 fix summary, (c) the manual-test-pass results from M7.1, and (d) links to any successor PRDs or follow-up issues if the audit surfaces additional work during implementation. *Shipped: PR created with pre-drafted description covering all four requirements.*
 
 ## Key Files
 
