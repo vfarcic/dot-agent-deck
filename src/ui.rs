@@ -2486,6 +2486,16 @@ pub fn run_tui(
         ui.mode = UiMode::StarPrompt;
     }
 
+    // PRD #111: preferred landing tab after both the hydration block and the
+    // `--continue` reconnect block have run. Defaults to dashboard (0); the
+    // hydration block overwrites this to the first rebuilt orchestration tab
+    // when one exists. Hoisted out of the embedded-pane scope so the
+    // `continue_session` block below can honour it instead of unconditionally
+    // snapping back to the dashboard — without the hoist, the second
+    // `switch_to(0)` in the reconnect path would undo the orchestration
+    // landing on every `--continue` reconnect.
+    let mut preferred_start_tab: usize = 0;
+
     // PRD #76 M2.x / M2.11: in external-daemon mode the daemon may already
     // own live agents from a previous TUI session (the user ssh-disconnected
     // and reconnected via `dot-agent-deck connect`). Ask the daemon for its
@@ -2796,12 +2806,12 @@ pub fn run_tui(
         // the user back in their work. Otherwise — pure dashboard
         // session, mode-only session, or every orchestration rebuild
         // failed — fall back to the dashboard so the user gets the
-        // overview first (pre-PRD-111 behaviour).
-        if let Some(idx) = first_orchestration_tab_index {
-            tab_manager.switch_to(idx);
-        } else {
-            tab_manager.switch_to(0);
-        }
+        // overview first (pre-PRD-111 behaviour). The chosen index is
+        // also recorded in `preferred_start_tab` so the
+        // `continue_session` block below doesn't snap back to the
+        // dashboard on `--continue` reconnects (CodeRabbit PR #114).
+        preferred_start_tab = first_orchestration_tab_index.unwrap_or(0);
+        tab_manager.switch_to(preferred_start_tab);
 
         // PRD #76 M2.15: push the real viewport dims to every hydrated
         // pane's daemon-side PTY. `hydrate_from_daemon` rebuilt panes from
@@ -3185,8 +3195,15 @@ pub fn run_tui(
                 }
             }
         }
-        // Always start on the dashboard so the user gets an overview first.
-        tab_manager.switch_to(0);
+        // PRD #111 / CodeRabbit PR #114: land on the orchestration tab
+        // chosen by the hydration block above (if any) instead of always
+        // snapping back to the dashboard. Without the hoist, an
+        // unconditional `switch_to(0)` here would undo the M3 fix for
+        // users who reconnect with `--continue`. `preferred_start_tab`
+        // defaults to 0 (dashboard) when the hydration block didn't run
+        // or didn't rebuild any orchestration tab, preserving the prior
+        // overview-first behaviour for non-orchestration sessions.
+        tab_manager.switch_to(preferred_start_tab);
 
         // Resize all restored panes to match the terminal layout, focus the first,
         // and enter PaneInput mode so the user can type immediately.
