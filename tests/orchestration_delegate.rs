@@ -2774,7 +2774,9 @@ start = true
 ///
 /// ## Expected failure mode if the budget regresses
 ///
-/// At tip `7c6356f` (`REATTACH_LOOKUP_TOTAL_BUDGET = 200 ms`):
+/// At tip `7c6356f` (3 × 100 ms backoff = ~300 ms total budget; the
+/// renamed `REATTACH_LOOKUP_TOTAL_BUDGET` constant didn't exist yet —
+/// followup-2's 96762b3 introduced it):
 ///   1. `respawn_agent_for_pane` drops the master at t≈0.
 ///   2. The controller's io_task observes Closed and enters
 ///      `resolve_and_reattach`, which polls `list_agents` ~3 times
@@ -2784,7 +2786,7 @@ start = true
 ///      subscription.
 ///   4. The daemon completes the respawn, then `write_to_pane_and_submit`
 ///      flushes the worker-task one-liner into the NEW agent's PTY.
-///      Cat echoes it; the bytes reach the daemon's per-agent bus, but
+///      PTY ECHO surfaces the bytes on the daemon's per-agent bus, but
 ///      nothing is subscribed on the controller side. The parser's
 ///      visible screen never contains the one-liner.
 ///   5. The polling assertion below times out with `saw_prompt = false`.
@@ -2811,14 +2813,14 @@ start = true
 /// - ~2 s for the SIGTERM trap.
 /// - ~ms for the fresh PTY spawn.
 /// - up to 10 s for the daemon's `SessionStart` fallback wait (this
-///   test's `cat -u` worker never emits one, so the prompt write
-///   always lands on the timeout path — same as
+///   test's SIGTERM-trap shell worker never emits one, so the prompt
+///   write always lands on the timeout path — same as
 ///   `delegate_respawns_worker_agent_when_role_clear_is_true`).
 ///
 /// Total: ~12–13 s on a quiet box. The 30 s assertion budget below
 /// absorbs CI jitter without letting a true regression slip through.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn f12_e2e_pane_renders_new_agent_after_sigterm_trap_respawn() {
+async fn e2e_pane_renders_new_agent_after_sigterm_trap_respawn() {
     let daemon = spawn_daemon().await;
     let cwd_dir = tempfile::tempdir().unwrap();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
