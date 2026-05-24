@@ -70,6 +70,81 @@ pub struct OrchestrationConfig {
     pub roles: Vec<OrchestrationRoleConfig>,
 }
 
+/// PRD #111: minimal description of one occupied role slot, as seen by
+/// the TUI hydration path when rebuilding orchestration tabs after a
+/// reconnect. `role_index` is the slot's position in the daemon's
+/// `OrchestrationConfig.roles`; `role_name` and `is_start_role` come
+/// from the daemon's `TabMembership::Orchestration` payload. Defined
+/// here (rather than in `ui.rs`) so the synthesise helper can stay
+/// next to `OrchestrationConfig` without a back-edge import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynthesisRoleSlot {
+    pub role_index: usize,
+    pub role_name: String,
+    pub is_start_role: bool,
+}
+
+impl OrchestrationConfig {
+    /// PRD #111: synthesise a minimal `OrchestrationConfig` from
+    /// daemon-supplied bucket metadata when the local
+    /// `.dot-agent-deck.toml` cannot be loaded (laptop TUI reconnecting
+    /// to a VM daemon whose `bucket.cwd` doesn't resolve locally).
+    ///
+    /// The resulting config is structurally correct — `name` matches
+    /// the daemon's resolved orchestration name and `roles.len()` is
+    /// `max(role_index) + 1` so
+    /// `open_orchestration_tab_with_existing_role_panes`'s length check
+    /// passes — but the display-only fields (`command`, `description`,
+    /// `prompt_template`) are left as defaults. Tab rendering, status
+    /// tracking, and daemon-side delegation still work; only the
+    /// pre-rendered orchestrator-context.md enrichment is missing.
+    ///
+    /// Roles whose `role_index` had no surviving pane keep a synthetic
+    /// `name = "role-{i}"` placeholder so the rendered sidebar doesn't
+    /// show an empty label.
+    pub fn synthesize_from_bucket_metadata(name: &str, slots: &[SynthesisRoleSlot]) -> Self {
+        let max_index = slots.iter().map(|s| s.role_index).max().unwrap_or(0);
+        let role_count = if slots.is_empty() { 0 } else { max_index + 1 };
+        let mut roles: Vec<OrchestrationRoleConfig> = (0..role_count)
+            .map(|i| OrchestrationRoleConfig {
+                name: format!("role-{i}"),
+                command: String::new(),
+                start: false,
+                description: None,
+                prompt_template: None,
+                clear: true,
+            })
+            .collect();
+        // PRD #111 reviewer S2: first-wins on duplicate `role_index`,
+        // matching the hydration loop's duplicate-pane handling at
+        // `src/ui.rs::hydration` (`role_pane_ids[role_index].is_some()` →
+        // keep the first slot, drop the rest). Without this guard the
+        // two paths drifted: hydration kept the first pane_id while
+        // synthesis kept the *last* role_name, producing a tab whose
+        // role label and live pane came from different bucket entries.
+        // The daemon is not supposed to emit duplicates, but if it does
+        // the two paths must at least agree on which slot wins.
+        let mut claimed = vec![false; role_count];
+        for slot in slots {
+            if let Some(role) = roles.get_mut(slot.role_index)
+                && !claimed[slot.role_index]
+            {
+                claimed[slot.role_index] = true;
+                if !slot.role_name.is_empty() {
+                    role.name = slot.role_name.clone();
+                }
+                if slot.is_start_role {
+                    role.start = true;
+                }
+            }
+        }
+        OrchestrationConfig {
+            name: name.to_string(),
+            roles,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrchestrationRoleConfig {
     pub name: String,
@@ -434,6 +509,137 @@ start = true
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
         assert!(config.orchestrations[0].roles[0].prompt_template.is_none());
+    }
+
+    // ------------------------------------------------------------
+    // PRD #111: synthesize_from_bucket_metadata
+    // ------------------------------------------------------------
+
+    #[test]
+    fn synthesize_uses_provided_orchestration_name() {
+        let slots = vec![SynthesisRoleSlot {
+            role_index: 0,
+            role_name: "orchestrator".into(),
+            is_start_role: true,
+        }];
+        let cfg = OrchestrationConfig::synthesize_from_bucket_metadata("code-review", &slots);
+        assert_eq!(cfg.name, "code-review");
+    }
+
+    #[test]
+    fn synthesize_role_count_matches_max_index_plus_one() {
+        // role_index 2 → roles.len() must be 3 so the open-tab length
+        // check passes even when role 1 is a dead slot.
+        let slots = vec![
+            SynthesisRoleSlot {
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+            },
+            SynthesisRoleSlot {
+                role_index: 2,
+                role_name: "reviewer".into(),
+                is_start_role: false,
+            },
+        ];
+        let cfg = OrchestrationConfig::synthesize_from_bucket_metadata("review", &slots);
+        assert_eq!(cfg.roles.len(), 3);
+        assert_eq!(cfg.roles[0].name, "orchestrator");
+        // Missing slot at index 1 → placeholder name.
+        assert_eq!(cfg.roles[1].name, "role-1");
+        assert_eq!(cfg.roles[2].name, "reviewer");
+    }
+
+    #[test]
+    fn synthesize_marks_start_role_from_metadata() {
+        let slots = vec![
+            SynthesisRoleSlot {
+                role_index: 0,
+                role_name: "worker".into(),
+                is_start_role: false,
+            },
+            SynthesisRoleSlot {
+                role_index: 1,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+            },
+        ];
+        let cfg = OrchestrationConfig::synthesize_from_bucket_metadata("o", &slots);
+        assert!(!cfg.roles[0].start);
+        assert!(cfg.roles[1].start);
+        // `roles.iter().position(|r| r.start)` should resolve to 1.
+        assert_eq!(cfg.roles.iter().position(|r| r.start), Some(1));
+    }
+
+    #[test]
+    fn synthesize_leaves_display_fields_at_defaults() {
+        let slots = vec![SynthesisRoleSlot {
+            role_index: 0,
+            role_name: "orchestrator".into(),
+            is_start_role: true,
+        }];
+        let cfg = OrchestrationConfig::synthesize_from_bucket_metadata("o", &slots);
+        let role = &cfg.roles[0];
+        assert_eq!(role.command, "");
+        assert!(role.description.is_none());
+        assert!(role.prompt_template.is_none());
+        // `clear` default mirrors the toml loader's default (true).
+        assert!(role.clear);
+    }
+
+    #[test]
+    fn synthesize_handles_empty_role_name_via_placeholder() {
+        // Older daemons predating the inline role_name field may emit an
+        // empty role_name; synthesize must still produce a usable label.
+        let slots = vec![SynthesisRoleSlot {
+            role_index: 0,
+            role_name: String::new(),
+            is_start_role: true,
+        }];
+        let cfg = OrchestrationConfig::synthesize_from_bucket_metadata("o", &slots);
+        assert_eq!(cfg.roles[0].name, "role-0");
+        assert!(cfg.roles[0].start);
+    }
+
+    #[test]
+    fn synthesize_empty_slots_yields_empty_roles() {
+        let cfg = OrchestrationConfig::synthesize_from_bucket_metadata("o", &[]);
+        assert!(cfg.roles.is_empty());
+        assert_eq!(cfg.name, "o");
+    }
+
+    #[test]
+    fn synthesize_first_wins_on_duplicate_role_index() {
+        // PRD #111 reviewer S2: synthesis must agree with the
+        // hydration loop's first-wins tie-break for duplicate
+        // role_index. The daemon is not supposed to emit duplicates,
+        // but if it does, the synthesised config's role.name and
+        // role.start must come from the same slot whose pane survives
+        // the hydration de-dup (`src/ui.rs::hydration`) — otherwise the
+        // tab label and the live pane come from different bucket
+        // entries.
+        let slots = vec![
+            SynthesisRoleSlot {
+                role_index: 0,
+                role_name: "first".into(),
+                is_start_role: true,
+            },
+            SynthesisRoleSlot {
+                role_index: 0,
+                role_name: "second".into(),
+                is_start_role: false,
+            },
+        ];
+        let cfg = OrchestrationConfig::synthesize_from_bucket_metadata("o", &slots);
+        assert_eq!(cfg.roles.len(), 1);
+        assert_eq!(
+            cfg.roles[0].name, "first",
+            "first slot must win the role_name tie-break"
+        );
+        assert!(
+            cfg.roles[0].start,
+            "first slot must win the is_start_role tie-break"
+        );
     }
 
     #[test]

@@ -1153,15 +1153,74 @@ pub(crate) struct ModeHydrationBucket {
 
 /// One orchestration bucket from [`partition_hydrated_panes`]:
 /// the role slots for a single `(cwd, orchestration_name)` pairing. Each
-/// entry is `(role_index, pane_id)`. The hydration glue then expands this
-/// to a `Vec<Option<String>>` of length `config.roles.len()`, treating
-/// any missing index as a dead slot (design decision 4) and any
-/// out-of-range index as config drift (design decision 5).
+/// entry carries the role's index, pane id, and the role identity
+/// metadata (`role_name`, `is_start_role`) the daemon echoed back via
+/// `TabMembership::Orchestration`. The hydration glue expands this to a
+/// `Vec<Option<String>>` of length `config.roles.len()`, treating any
+/// missing index as a dead slot (design decision 4) and any
+/// out-of-range index as config drift (design decision 5). PRD #111:
+/// the role identity fields let the hydration site synthesise a
+/// minimal `OrchestrationConfig` when the local project config file is
+/// absent (laptop TUI reconnecting to a remote daemon).
 #[derive(Debug, Clone)]
 pub(crate) struct OrchestrationHydrationBucket {
     pub cwd: String,
     pub orchestration_name: String,
-    pub role_slots: Vec<(usize, String)>,
+    pub role_slots: Vec<OrchestrationRoleSlot>,
+}
+
+/// One occupied role slot inside an [`OrchestrationHydrationBucket`].
+/// `role_name` and `is_start_role` come directly from the daemon's
+/// `TabMembership::Orchestration` payload so the TUI can synthesise a
+/// minimal `OrchestrationConfig` even when the local project config
+/// file is missing (PRD #111).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrchestrationRoleSlot {
+    pub role_index: usize,
+    pub pane_id: String,
+    pub role_name: String,
+    pub is_start_role: bool,
+}
+
+/// PRD #111: pick the `OrchestrationConfig` the hydration site uses
+/// when rebuilding an orchestration tab. Extracted from the hydration
+/// loop so the `local-wins / synthesise-otherwise` selection has a
+/// directly-testable seam (reviewer S1 — the in-loop `match` is hard
+/// to drive from a unit test without standing up a full hydration
+/// fixture).
+///
+/// Contract:
+/// - `Some(local)` → return `local` verbatim. Display-only fields
+///   (`description`, `prompt_template`, non-default `clear`) survive,
+///   which is the whole point of the local branch.
+/// - `None` → synthesise a minimal config from `bucket`'s role-slot
+///   metadata. Structurally correct (same name, same role count,
+///   same role names, same start role) but enrichment fields are
+///   defaulted.
+///
+/// The hydration call site decides which `tracing::info!` line to
+/// emit *before* calling this helper so the "config absent" vs
+/// "config drift" distinction (auditor nit) stays observable.
+pub(crate) fn resolve_orch_config_for_hydration(
+    local: Option<crate::project_config::OrchestrationConfig>,
+    bucket: &OrchestrationHydrationBucket,
+) -> crate::project_config::OrchestrationConfig {
+    if let Some(c) = local {
+        return c;
+    }
+    let synthesis_slots: Vec<crate::project_config::SynthesisRoleSlot> = bucket
+        .role_slots
+        .iter()
+        .map(|s| crate::project_config::SynthesisRoleSlot {
+            role_index: s.role_index,
+            role_name: s.role_name.clone(),
+            is_start_role: s.is_start_role,
+        })
+        .collect();
+    crate::project_config::OrchestrationConfig::synthesize_from_bucket_metadata(
+        &bucket.orchestration_name,
+        &synthesis_slots,
+    )
 }
 
 /// Diagnostic info for a hydrated pane the partition couldn't bucket
@@ -1320,8 +1379,9 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
             Some(TabMembership::Orchestration {
                 name,
                 role_index,
+                role_name,
+                is_start_role,
                 orchestration_cwd,
-                ..
             }) => {
                 // Round-12 reviewer #1: bucket by `(orchestration_cwd,
                 // name)` — the same identity tuple the daemon uses for
@@ -1368,7 +1428,12 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
                 };
                 out.orchestration_buckets[idx]
                     .role_slots
-                    .push((*role_index, h.pane_id.clone()));
+                    .push(OrchestrationRoleSlot {
+                        role_index: *role_index,
+                        pane_id: h.pane_id.clone(),
+                        role_name: role_name.clone(),
+                        is_start_role: *is_start_role,
+                    });
             }
         }
     }
@@ -2588,30 +2653,66 @@ pub fn run_tui(
             }
         }
 
+        // PRD #111: remember the first successfully-rebuilt orchestration
+        // tab so the post-loop active-tab snap-back can land on it
+        // instead of the dashboard for remote reconnects (where the
+        // dashboard would otherwise be the only tab the user sees,
+        // hiding their work).
+        let mut first_orchestration_tab_index: Option<usize> = None;
         for bucket in &partition.orchestration_buckets {
             let cfg = lookup_config(&mut config_cache, &bucket.cwd);
-            let orch_config = cfg.as_ref().and_then(|c| {
+            let local_orch_config = cfg.as_ref().and_then(|c| {
                 c.orchestrations
                     .iter()
                     .find(|o| o.name == bucket.orchestration_name)
                     .cloned()
             });
-            let Some(orch_config) = orch_config else {
-                tracing::error!(
-                    cwd = %bucket.cwd,
-                    orchestration = %bucket.orchestration_name,
-                    role_count = bucket.role_slots.len(),
-                    "hydration: hydrated agents claim orchestration that is not in project config; dropping to dashboard"
-                );
-                continue;
-            };
+            // PRD #111: when the local project config file can't be
+            // resolved (laptop TUI reconnecting to a VM daemon whose
+            // `bucket.cwd` doesn't exist locally) or the local file
+            // doesn't carry an orchestration with this name (drift),
+            // synthesise a minimal `OrchestrationConfig` from the
+            // daemon-supplied bucket metadata. The synthesised config
+            // is structurally correct (same name, same role count,
+            // same role names, same start role) — only display-only
+            // enrichment fields (description, prompt_template) are
+            // missing. Without this fallback, every remote-reconnect
+            // user would see their orchestration panes dumped into the
+            // dashboard.
+            if local_orch_config.is_none() {
+                // PRD #111 auditor nit: distinguish the two
+                // "synthesise" cases so operators can tell whether
+                // the file is genuinely absent (legitimate remote
+                // reconnect — `cfg.is_none()`) or present but
+                // missing this orchestration (config drift —
+                // `cfg.is_some()`). Same level (info) for both;
+                // distinct messages so log search picks them apart.
+                if cfg.is_none() {
+                    tracing::info!(
+                        cwd = %bucket.cwd,
+                        orchestration = %bucket.orchestration_name,
+                        role_count = bucket.role_slots.len(),
+                        "hydration: rebuilding orchestration tab from synthesised config (local .dot-agent-deck.toml absent — remote daemon path)"
+                    );
+                } else {
+                    tracing::info!(
+                        cwd = %bucket.cwd,
+                        orchestration = %bucket.orchestration_name,
+                        role_count = bucket.role_slots.len(),
+                        "hydration: rebuilding orchestration tab from synthesised config (local config exists but does not list this orchestration — config drift or stale)"
+                    );
+                }
+            }
+            let orch_config = resolve_orch_config_for_hydration(local_orch_config, bucket);
             // Build a Vec<Option<String>> of length config.roles.len()
-            // from the (role_index, pane_id) entries. Out-of-range
-            // indices are config drift (design decision 5): log loudly
-            // and leave the pane on the dashboard.
+            // from the role-slot entries. Out-of-range indices are
+            // config drift (design decision 5): log loudly and leave
+            // the pane on the dashboard.
             let mut role_pane_ids: Vec<Option<String>> = vec![None; orch_config.roles.len()];
-            for (role_index, pane_id) in &bucket.role_slots {
-                if *role_index >= orch_config.roles.len() {
+            for slot in &bucket.role_slots {
+                let role_index = slot.role_index;
+                let pane_id = &slot.pane_id;
+                if role_index >= orch_config.roles.len() {
                     tracing::error!(
                         cwd = %bucket.cwd,
                         orchestration = %bucket.orchestration_name,
@@ -2622,7 +2723,7 @@ pub fn run_tui(
                     );
                     continue;
                 }
-                if role_pane_ids[*role_index].is_some() {
+                if role_pane_ids[role_index].is_some() {
                     tracing::error!(
                         cwd = %bucket.cwd,
                         orchestration = %bucket.orchestration_name,
@@ -2632,7 +2733,7 @@ pub fn run_tui(
                     );
                     continue;
                 }
-                role_pane_ids[*role_index] = Some(pane_id.clone());
+                role_pane_ids[role_index] = Some(pane_id.clone());
             }
             // M2.12 fixup auditor #2: if every claimed role slot was
             // rejected above (out-of-range / duplicate), don't rebuild
@@ -2659,7 +2760,10 @@ pub fn run_tui(
                 &bucket.cwd,
                 role_pane_ids.clone(),
             ) {
-                Ok(_) => {
+                Ok((tab_index, _)) => {
+                    if first_orchestration_tab_index.is_none() {
+                        first_orchestration_tab_index = Some(tab_index);
+                    }
                     let mut st = state.blocking_write();
                     for (i, role) in orch_config.roles.iter().enumerate() {
                         if let Some(Some(pane_id)) = role_pane_ids.get(i) {
@@ -2685,12 +2789,19 @@ pub fn run_tui(
                 }
             }
         }
-        // After hydration, snap back to the dashboard so the user gets
-        // the overview first. open_mode_tab / open_orchestration_tab
-        // change active_index to the new tab; without this reset, a
-        // multi-tab reconnect would land on whichever tab was built
-        // last.
-        tab_manager.switch_to(0);
+        // PRD #111: after hydration, decide the landing tab. If at
+        // least one orchestration tab was rebuilt, land on the first
+        // one so a reconnect (especially the remote-config case where
+        // the dashboard would otherwise show nothing relevant) lands
+        // the user back in their work. Otherwise — pure dashboard
+        // session, mode-only session, or every orchestration rebuild
+        // failed — fall back to the dashboard so the user gets the
+        // overview first (pre-PRD-111 behaviour).
+        if let Some(idx) = first_orchestration_tab_index {
+            tab_manager.switch_to(idx);
+        } else {
+            tab_manager.switch_to(0);
+        }
 
         // PRD #76 M2.15: push the real viewport dims to every hydrated
         // pane's daemon-side PTY. `hydrate_from_daemon` rebuilt panes from
@@ -7420,8 +7531,14 @@ mod tests {
         assert_eq!(bucket.cwd, "/work");
         assert_eq!(bucket.orchestration_name, "tdd-cycle");
         assert_eq!(bucket.role_slots.len(), 2);
-        assert!(bucket.role_slots.contains(&(0, "10".to_string())));
-        assert!(bucket.role_slots.contains(&(2, "11".to_string())));
+        assert!(bucket.role_slots.iter().any(|s| s.role_index == 0
+            && s.pane_id == "10"
+            && s.role_name.is_empty()
+            && !s.is_start_role));
+        assert!(bucket.role_slots.iter().any(|s| s.role_index == 2
+            && s.pane_id == "11"
+            && s.role_name.is_empty()
+            && !s.is_start_role));
     }
 
     #[test]
@@ -7486,7 +7603,381 @@ mod tests {
         assert_eq!(p.mode_buckets.len(), 1);
         assert_eq!(p.mode_buckets[0].agent_pane_id, "2");
         assert_eq!(p.orchestration_buckets.len(), 1);
-        assert_eq!(p.orchestration_buckets[0].role_slots, vec![(0, "3".into())]);
+        assert_eq!(p.orchestration_buckets[0].role_slots.len(), 1);
+        let slot = &p.orchestration_buckets[0].role_slots[0];
+        assert_eq!(slot.role_index, 0);
+        assert_eq!(slot.pane_id, "3");
+    }
+
+    // ------------------------------------------------------------
+    // PRD #111: orchestration tab hydration with synthesised config
+    // (remote-reconnect path: laptop TUI connects to VM daemon whose
+    // bucket.cwd doesn't exist locally → no local project config).
+    // ------------------------------------------------------------
+
+    #[test]
+    fn partition_propagates_role_name_and_is_start_role() {
+        // PRD #111: the partition must echo the daemon's role_name +
+        // is_start_role into the bucket so the hydration site can
+        // synthesise a config when the local TOML is absent.
+        let panes = vec![
+            hydrated(
+                "p0",
+                "a-0",
+                Some("/remote/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "review".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/remote/proj".into()),
+                }),
+            ),
+            hydrated(
+                "p1",
+                "a-1",
+                Some("/remote/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "review".into(),
+                    role_index: 1,
+                    role_name: "reviewer".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some("/remote/proj".into()),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.orchestration_buckets.len(), 1);
+        let bucket = &p.orchestration_buckets[0];
+        let slot_0 = bucket
+            .role_slots
+            .iter()
+            .find(|s| s.role_index == 0)
+            .expect("slot 0");
+        assert_eq!(slot_0.role_name, "orchestrator");
+        assert!(slot_0.is_start_role);
+        let slot_1 = bucket
+            .role_slots
+            .iter()
+            .find(|s| s.role_index == 1)
+            .expect("slot 1");
+        assert_eq!(slot_1.role_name, "reviewer");
+        assert!(!slot_1.is_start_role);
+    }
+
+    /// PRD #111 happy path: daemon reports orchestration panes whose
+    /// `cwd` doesn't resolve to a local project config file (laptop TUI
+    /// → VM daemon). The hydration logic synthesises an
+    /// `OrchestrationConfig` from the bucket metadata; opening the
+    /// tab with that config must succeed and produce a `Tab::Orchestration`
+    /// with the right name, role count, and `start_role_index`.
+    /// Crucially, no role pane lands on the dashboard.
+    #[test]
+    fn synthesised_orchestration_tab_rebuilds_without_local_config() {
+        use crate::project_config::{OrchestrationConfig, SynthesisRoleSlot};
+
+        let panes = vec![
+            hydrated(
+                "p0",
+                "a-0",
+                Some("/remote/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "review".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/remote/proj".into()),
+                }),
+            ),
+            hydrated(
+                "p1",
+                "a-1",
+                Some("/remote/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "review".into(),
+                    role_index: 2,
+                    role_name: "reviewer".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some("/remote/proj".into()),
+                }),
+            ),
+        ];
+        let partition = partition_hydrated_panes(&panes);
+        assert_eq!(partition.dashboard_pane_ids.len(), 0);
+        let bucket = &partition.orchestration_buckets[0];
+
+        let synthesis_slots: Vec<SynthesisRoleSlot> = bucket
+            .role_slots
+            .iter()
+            .map(|s| SynthesisRoleSlot {
+                role_index: s.role_index,
+                role_name: s.role_name.clone(),
+                is_start_role: s.is_start_role,
+            })
+            .collect();
+        let cfg = OrchestrationConfig::synthesize_from_bucket_metadata(
+            &bucket.orchestration_name,
+            &synthesis_slots,
+        );
+        assert_eq!(cfg.name, "review");
+        assert_eq!(cfg.roles.len(), 3);
+        assert_eq!(cfg.roles[0].name, "orchestrator");
+        assert_eq!(cfg.roles[1].name, "role-1"); // dead slot placeholder
+        assert_eq!(cfg.roles[2].name, "reviewer");
+        assert!(cfg.roles[0].start);
+        assert!(!cfg.roles[1].start);
+        assert!(!cfg.roles[2].start);
+
+        // Build the role_pane_ids vec the way the hydration site does.
+        let mut role_pane_ids: Vec<Option<String>> = vec![None; cfg.roles.len()];
+        for slot in &bucket.role_slots {
+            role_pane_ids[slot.role_index] = Some(slot.pane_id.clone());
+        }
+        assert_eq!(role_pane_ids[0], Some("p0".into()));
+        assert_eq!(role_pane_ids[1], None);
+        assert_eq!(role_pane_ids[2], Some("p1".into()));
+
+        // Finally drive the tab open through the real TabManager+mock
+        // pane controller. This is the same call the hydration loop
+        // makes; if it succeeds with a synthesised config we're done.
+        struct NoopPC;
+        impl crate::pane::PaneController for NoopPC {
+            fn create_pane(
+                &self,
+                _cmd: Option<&str>,
+                _cwd: Option<&str>,
+            ) -> Result<String, crate::pane::PaneError> {
+                Ok(String::new())
+            }
+            fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn rename_pane(
+                &self,
+                _id: &str,
+                name: &str,
+            ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+                Ok(crate::pane::RenameOutcome::applied(name))
+            }
+            fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+                Ok(Vec::new())
+            }
+            fn resize_pane(
+                &self,
+                _id: &str,
+                _direction: crate::pane::PaneDirection,
+                _amount: u16,
+            ) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let mut tm = crate::tab::TabManager::new(Arc::new(NoopPC));
+        let (tab_index, _flat) = tm
+            .open_orchestration_tab_with_existing_role_panes(&cfg, &bucket.cwd, role_pane_ids)
+            .expect("synthesised-config hydration must succeed");
+        assert_eq!(tab_index, 1, "first non-dashboard tab is at index 1");
+        let labels = tm.tab_labels();
+        assert_eq!(labels[0], "Dashboard");
+        assert_eq!(labels[1], "review");
+    }
+
+    /// PRD #111 reviewer S2: with a duplicate `role_index` in the
+    /// hydrated bucket the two consumers must agree on which slot
+    /// wins. The hydration loop keeps the *first* pane_id at that
+    /// index (`if role_pane_ids[role_index].is_some() { continue; }`)
+    /// and the synthesis path keeps the *first* role_name / start
+    /// flag (project_config first-wins guard). Without that
+    /// alignment the rendered tab carries the second slot's role
+    /// label but the first slot's live pane — a confusing mismatch.
+    #[test]
+    fn duplicate_role_index_first_wins_through_full_hydration_path() {
+        use crate::project_config::SynthesisRoleSlot;
+
+        let panes = vec![
+            hydrated(
+                "first-pane",
+                "a-0",
+                Some("/remote/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "review".into(),
+                    role_index: 0,
+                    role_name: "first".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/remote/proj".into()),
+                }),
+            ),
+            hydrated(
+                "second-pane",
+                "a-1",
+                Some("/remote/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "review".into(),
+                    role_index: 0,
+                    role_name: "second".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some("/remote/proj".into()),
+                }),
+            ),
+        ];
+        let partition = partition_hydrated_panes(&panes);
+        assert_eq!(partition.orchestration_buckets.len(), 1);
+        let bucket = &partition.orchestration_buckets[0];
+        assert_eq!(
+            bucket.role_slots.len(),
+            2,
+            "partition must preserve both duplicates so the hydration loop can decide"
+        );
+
+        // Synthesis path: first slot's role_name and start flag win.
+        let synthesis_slots: Vec<SynthesisRoleSlot> = bucket
+            .role_slots
+            .iter()
+            .map(|s| SynthesisRoleSlot {
+                role_index: s.role_index,
+                role_name: s.role_name.clone(),
+                is_start_role: s.is_start_role,
+            })
+            .collect();
+        let cfg = crate::project_config::OrchestrationConfig::synthesize_from_bucket_metadata(
+            &bucket.orchestration_name,
+            &synthesis_slots,
+        );
+        assert_eq!(cfg.roles.len(), 1);
+        assert_eq!(
+            cfg.roles[0].name, "first",
+            "synthesis must keep the first slot's role_name on duplicate role_index"
+        );
+        assert!(
+            cfg.roles[0].start,
+            "synthesis must keep the first slot's is_start_role on duplicate role_index"
+        );
+
+        // Hydration de-dup loop: first slot's pane_id wins. Replicates
+        // the `if role_pane_ids[role_index].is_some() { continue; }`
+        // guard at the hydration call site.
+        let mut role_pane_ids: Vec<Option<String>> = vec![None; cfg.roles.len()];
+        for slot in &bucket.role_slots {
+            if role_pane_ids[slot.role_index].is_some() {
+                continue;
+            }
+            role_pane_ids[slot.role_index] = Some(slot.pane_id.clone());
+        }
+        assert_eq!(
+            role_pane_ids[0].as_deref(),
+            Some("first-pane"),
+            "hydration loop must keep the first slot's pane_id on duplicate role_index"
+        );
+    }
+
+    /// PRD #111 regression: local config path still wins when the
+    /// project config file is found AND carries this orchestration
+    /// name. The synthesis fallback must NOT shadow display-only
+    /// enrichment (description, prompt_template) that only the local
+    /// TOML carries.
+    ///
+    /// Reviewer S1: this test drives `resolve_orch_config_for_hydration`
+    /// — the exact helper the hydration loop calls — so a future
+    /// refactor that accidentally flipped the precedence (or always
+    /// synthesised, dropping `local`) would fail here. The prior
+    /// version only asserted properties of two independently-built
+    /// configs without driving the selection seam.
+    #[test]
+    fn local_config_enrichment_preserved_when_available() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        let local = OrchestrationConfig {
+            name: "review".into(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".into(),
+                    command: "claude".into(),
+                    start: true,
+                    description: Some("Coordinates".into()),
+                    prompt_template: Some("You coordinate.".into()),
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "reviewer".into(),
+                    command: "claude --model sonnet".into(),
+                    start: false,
+                    description: Some("Reviews code".into()),
+                    prompt_template: Some("Run tests.".into()),
+                    clear: false,
+                },
+            ],
+        };
+        // Build a bucket that *would* synthesise to a config with no
+        // description / prompt_template / clear=true defaults if the
+        // helper picked the synthesis branch. The test asserts the
+        // local config's enrichment fields round-trip through the
+        // helper instead.
+        let bucket = OrchestrationHydrationBucket {
+            cwd: "/remote/proj".into(),
+            orchestration_name: "review".into(),
+            role_slots: vec![
+                OrchestrationRoleSlot {
+                    role_index: 0,
+                    pane_id: "p0".into(),
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                },
+                OrchestrationRoleSlot {
+                    role_index: 1,
+                    pane_id: "p1".into(),
+                    role_name: "reviewer".into(),
+                    is_start_role: false,
+                },
+            ],
+        };
+        let chosen = resolve_orch_config_for_hydration(Some(local.clone()), &bucket);
+        assert_eq!(
+            chosen.roles[0].description.as_deref(),
+            Some("Coordinates"),
+            "local config's description must survive selection"
+        );
+        assert_eq!(
+            chosen.roles[1].prompt_template.as_deref(),
+            Some("Run tests."),
+            "local config's prompt_template must survive selection"
+        );
+        assert!(
+            !chosen.roles[1].clear,
+            "local config's non-default `clear=false` must survive selection"
+        );
+        assert_eq!(chosen.roles[0].command, "claude");
+        assert_eq!(chosen.roles[1].command, "claude --model sonnet");
+
+        // And the sibling case: when local is None, the helper falls
+        // back to synthesis whose enrichment fields are defaults.
+        let synthesised = resolve_orch_config_for_hydration(None, &bucket);
+        assert_eq!(synthesised.name, "review");
+        assert!(synthesised.roles[0].description.is_none());
+        assert!(synthesised.roles[1].prompt_template.is_none());
+        assert!(
+            synthesised.roles[1].clear,
+            "synthesis defaults `clear` to true (mirrors loader default)"
+        );
+        // Synthesis carries the role identity, just not the enrichment.
+        assert_eq!(synthesised.roles[0].name, "orchestrator");
+        assert!(synthesised.roles[0].start);
+        assert_eq!(synthesised.roles[1].name, "reviewer");
     }
 
     #[test]
