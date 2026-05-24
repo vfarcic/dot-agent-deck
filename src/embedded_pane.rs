@@ -991,26 +991,34 @@ const CREATE_PANE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// gets the "stop-agent timed out" error message with a retry hint.
 const CTRL_W_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// PRD #92 F12: wait between consecutive `list_agents` lookups when the
+/// PRD #92 F12: initial wait between `list_agents` lookups when the
 /// per-pane attach stream has ended and we're trying to find the
 /// freshly-respawned agent for `pane_id_env`. The F9 clear=true delegate
 /// path kills the OLD agent before spawning the NEW one; the daemon's
 /// event-driven respawn dispatch (F9 followup-6) closes the timing window
-/// between the OLD agent's death and the NEW agent's registration to a
-/// few milliseconds in the happy case, but a loaded host can stretch it
-/// out. Linear 100 ms backoff is well within the user's tolerance for the
-/// pane-view to refresh on the second delegate.
-const REATTACH_LOOKUP_BACKOFF: Duration = Duration::from_millis(100);
+/// in the happy case but real-world respawns can take much longer
+/// (Claude Code via devbox: 0.5-3 s SIGTERM-to-exit + new-process
+/// startup, up to ~5 s pathological when SIGTERM is trapped). The
+/// exponential backoff below trades a few extra `list_agents` calls for
+/// budget that actually covers the production gap.
+const REATTACH_LOOKUP_INITIAL_DELAY: Duration = Duration::from_millis(200);
 
-/// PRD #92 F12: max `list_agents` lookups per re-attach attempt before the
-/// per-pane subscriber gives up and exits. Total wall-clock budget is
-/// roughly `REATTACH_MAX_LOOKUP_ATTEMPTS * REATTACH_LOOKUP_BACKOFF`
-/// (~300 ms here), which bounds the "permanently-closed pane" path and
-/// also covers the respawn-in-flight race where the lookup races the
-/// NEW agent's registration. On give-up the io_task exits cleanly; the
-/// pane keeps its last-rendered screen and the user can close it
-/// manually.
-const REATTACH_MAX_LOOKUP_ATTEMPTS: u32 = 3;
+/// PRD #92 F12: cap on the per-iteration sleep. Backoff doubles each
+/// miss until it hits this ceiling, then stays flat — keeps the retry
+/// cadence under one lookup per second for the slow-respawn tail.
+const REATTACH_LOOKUP_MAX_DELAY: Duration = Duration::from_millis(1000);
+
+/// PRD #92 F12: total wall-clock budget for finding the respawned agent
+/// before [`resolve_and_reattach`] gives up. Covers the SIGTERM grace
+/// (up to [`AGENT_TERMINATE_GRACE`](crate::agent_pty) = 3 s) plus
+/// new-process startup plus margin. With the 200 ms initial doubling to
+/// a 1 s cap, the actual schedule is approximately
+/// 200, 400, 800, 1000, 1000, 1000, 1000, 1000, 1000, 1000 (cumulative
+/// ~9.4 s) — fast respawns succeed on the first one or two attempts;
+/// slow ones get caught within the budget. On give-up the io_task
+/// exits cleanly; the pane keeps its last-rendered screen and the user
+/// can close it manually.
+const REATTACH_LOOKUP_TOTAL_BUDGET: Duration = Duration::from_secs(10);
 
 /// PRD #92 F12: bounds NEW agents that produce zero NEW bytes after the
 /// initial snapshot replay before terminating. Reader-side any
@@ -1018,25 +1026,23 @@ const REATTACH_MAX_LOOKUP_ATTEMPTS: u32 = 3;
 /// on every attach — resets this counter, so a crash-on-start agent
 /// whose snapshot replays before each crash is not caught by this bound
 /// alone. The no-live-agent path via [`resolve_and_reattach`] is the
-/// primary protection, giving up after [`REATTACH_MAX_LOOKUP_ATTEMPTS`]
-/// × [`REATTACH_LOOKUP_BACKOFF`] (~300 ms) when `pane_id_env` has no
-/// matching live agent.
+/// primary protection, giving up after [`REATTACH_LOOKUP_TOTAL_BUDGET`]
+/// when `pane_id_env` has no matching live agent.
 ///
 /// Assumes the daemon keeps the attach stream open while the agent is
 /// alive but idle — i.e. the stream doesn't close just because the
 /// agent isn't emitting bytes. A daemon change that closes idle
 /// streams aggressively would cause healthy agents to be classified
-/// as dead by this bound. See `pane_dispatch_lock` in
-/// [`crate::agent_pty`] for the daemon-side respawn-serialization
-/// contract this retry loop pairs with.
+/// as dead by this bound. See [`crate::agent_pty`] for the related
+/// daemon-side respawn coordination this retry loop pairs with.
 const REATTACH_MAX_EMPTY_SESSIONS: u32 = 3;
 
 /// PRD #92 F12: per-pane I/O task body. Drives the attach-stream
 /// reader/writer pair for a single pane; on STREAM_END from the daemon
 /// (typically: OLD agent died as part of F9's clear=true respawn), look
 /// up the pane's NEW agent via `list_agents` filtered by `pane_id_env`
-/// and re-`attach` to it, with [`REATTACH_LOOKUP_BACKOFF`] backoff and a
-/// [`REATTACH_MAX_LOOKUP_ATTEMPTS`] cap. Updates `agent_id` under the
+/// and re-`attach` to it, with exponential backoff capped by
+/// [`REATTACH_LOOKUP_TOTAL_BUDGET`]. Updates `agent_id` under the
 /// shared mutex so a concurrent `close_pane` / `resize_pane_pty` targets
 /// the NEW agent's id. Returns when:
 /// - the input channel is closed or `KIND_DETACH` was sent (pane teardown
@@ -1118,8 +1124,11 @@ async fn run_pane_io_task(
                             {
                                 // Park the writer branch so the reader's STREAM_END/EOF
                                 // branch wins the surrounding `select!` and drives the
-                                // reattach decision; buffered `Input` items in `input_rx`
-                                // will be drained on the next iteration's writer.
+                                // reattach decision. The `Input` we just dequeued is
+                                // lost (its bytes never made it onto the wire), but
+                                // any subsequent items still buffered in `input_rx`
+                                // remain in the channel and are drained on the next
+                                // iteration's writer.
                                 std::future::pending::<()>().await;
                                 unreachable!();
                             }
@@ -1197,49 +1206,50 @@ async fn run_pane_io_task(
 }
 
 /// PRD #92 F12: resolve `pane_id_env` → current agent_id via `list_agents`
-/// and open a fresh `AttachConnection`. Retries up to
-/// [`REATTACH_MAX_LOOKUP_ATTEMPTS`] times with
-/// [`REATTACH_LOOKUP_BACKOFF`] between attempts so that the brief window
-/// where the OLD agent has died but the NEW one isn't registered yet
-/// resolves naturally (F9 respawn-in-flight race). Returns `None` if no
-/// live agent matches the pane after the retry window, or if every
-/// `attach` attempt fails.
+/// and open a fresh `AttachConnection`. Polls with exponential backoff
+/// — [`REATTACH_LOOKUP_INITIAL_DELAY`] doubling up to
+/// [`REATTACH_LOOKUP_MAX_DELAY`] — until the elapsed time exceeds
+/// [`REATTACH_LOOKUP_TOTAL_BUDGET`]. This covers the F9 respawn-in-flight
+/// gap, which spans from a few milliseconds (sh-based test agents) to
+/// several seconds (Claude Code via devbox, especially when SIGTERM is
+/// trapped). Returns `None` if no live agent matches the pane within
+/// the budget, or if every `attach` attempt fails.
 async fn resolve_and_reattach(
     client: &DaemonClient,
     pane_id_env: &str,
 ) -> Option<(String, AttachConnection)> {
-    for attempt in 0..REATTACH_MAX_LOOKUP_ATTEMPTS {
-        if attempt > 0 {
-            tokio::time::sleep(REATTACH_LOOKUP_BACKOFF).await;
-        }
-        let records = match client.list_agents().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "auto-reattach: list_agents failed; retrying after backoff"
-                );
-                continue;
+    let start = tokio::time::Instant::now();
+    let mut delay = REATTACH_LOOKUP_INITIAL_DELAY;
+    loop {
+        match client.list_agents().await {
+            Ok(records) => {
+                let new_id_opt = records
+                    .into_iter()
+                    .find(|r| r.pane_id_env.as_deref() == Some(pane_id_env))
+                    .map(|r| r.id);
+                if let Some(new_id) = new_id_opt {
+                    match client.attach(&new_id).await {
+                        Ok(conn) => return Some((new_id, conn)),
+                        Err(e) => tracing::debug!(
+                            agent_id = %new_id,
+                            error = %e,
+                            "auto-reattach: attach to new agent failed; retrying after backoff"
+                        ),
+                    }
+                }
             }
-        };
-        let new_id_opt = records
-            .into_iter()
-            .find(|r| r.pane_id_env.as_deref() == Some(pane_id_env))
-            .map(|r| r.id);
-        let Some(new_id) = new_id_opt else { continue };
-        match client.attach(&new_id).await {
-            Ok(conn) => return Some((new_id, conn)),
-            Err(e) => {
-                tracing::debug!(
-                    agent_id = %new_id,
-                    error = %e,
-                    "auto-reattach: attach to new agent failed; retrying after backoff"
-                );
-                continue;
-            }
+            Err(e) => tracing::debug!(
+                error = %e,
+                "auto-reattach: list_agents failed; retrying after backoff"
+            ),
         }
+
+        if start.elapsed() >= REATTACH_LOOKUP_TOTAL_BUDGET {
+            return None;
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(REATTACH_LOOKUP_MAX_DELAY);
     }
-    None
 }
 
 /// Per-pane resize worker (PRD #76 M2.10 audit follow-up). Reads the most

@@ -197,8 +197,9 @@ async fn auto_reattaches_after_daemon_respawn() {
 
 /// F12 give-up path. After the OLD agent dies and no NEW agent is ever
 /// spawned for the pane, the io_task must exit cleanly within the
-/// retry window (~300 ms) rather than loop forever or pin a wedged
-/// socket. Externally observable signal: the input channel goes dead.
+/// retry window (REATTACH_LOOKUP_TOTAL_BUDGET ~10 s) rather than loop
+/// forever or pin a wedged socket. Externally observable signal: the
+/// input channel goes dead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gives_up_when_no_live_agent_remains_for_pane() {
     let server = start_server().await;
@@ -242,16 +243,16 @@ async fn gives_up_when_no_live_agent_remains_for_pane() {
         .close_agent(&old_id)
         .expect("close OLD agent");
 
-    // The io_task must observe STREAM_END, attempt list_agents
-    // REATTACH_MAX_LOOKUP_ATTEMPTS times (~300 ms total) with no
-    // matching record, and then exit. After it exits, `input_rx` drops
-    // and `write_raw_bytes` returns `CommandFailed` because the
-    // unbounded channel reports a closed receiver.
+    // The io_task must observe STREAM_END, poll list_agents with
+    // exponential backoff until REATTACH_LOOKUP_TOTAL_BUDGET (~10 s)
+    // elapses with no matching record, and then exit. After it exits,
+    // `input_rx` drops and `write_raw_bytes` returns `CommandFailed`
+    // because the unbounded channel reports a closed receiver.
     let ctrl_probe = ctrl.clone();
     let pane_for_probe = pane_id.clone();
     let exited = wait_for(
-        Duration::from_secs(2),
-        Duration::from_millis(20),
+        Duration::from_secs(15),
+        Duration::from_millis(50),
         move || ctrl_probe.write_raw_bytes(&pane_for_probe, b"").is_err(),
     )
     .await;
@@ -266,8 +267,8 @@ async fn gives_up_when_no_live_agent_remains_for_pane() {
 /// F12 respawn-in-flight race. The OLD agent's death and the NEW
 /// agent's registration aren't simultaneous: between them is a brief
 /// window where `list_agents` returns nothing for this pane. The
-/// io_task's REATTACH_LOOKUP_BACKOFF (100 ms × 3 attempts) must absorb
-/// that gap.
+/// io_task's exponential-backoff retry loop (200 ms initial, doubling
+/// to a 1 s cap, ~10 s total budget) must absorb that gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backoff_absorbs_respawn_in_flight_race() {
     let server = start_server().await;
@@ -298,15 +299,15 @@ async fn backoff_absorbs_respawn_in_flight_race() {
 
     // Kill the OLD agent. The io_task will immediately fire its first
     // `list_agents` lookup and find no match for this pane. Sleep
-    // enough to land between attempt 0 (immediate) and attempt 1 (after
-    // REATTACH_LOOKUP_BACKOFF = 100 ms), then spawn the NEW agent so
-    // attempt 1 or 2 picks it up.
+    // enough to land between the first attempt (immediate) and the
+    // second (after REATTACH_LOOKUP_INITIAL_DELAY = 200 ms), then
+    // spawn the NEW agent so a subsequent attempt picks it up.
     let old_id = server.registry.agent_ids().pop().expect("one agent");
     server
         .registry
         .close_agent(&old_id)
         .expect("close OLD agent");
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let _new_id = respawn_under_pane_id(
         &server.registry,
         &pane_id,
