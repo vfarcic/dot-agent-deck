@@ -5,7 +5,7 @@
 //!
 //! * The local TUI's `EmbeddedPaneController::write_to_pane` (the
 //!   user-typed-Enter path).
-//! * The daemon's `AgentPtyRegistry::write_to_pane` (the orchestration
+//! * The daemon's `AgentPtyRegistry::write_to_pane_and_submit` (the orchestration
 //!   dispatch path — PRD #93 round-5 moved delegate/work-done feedback
 //!   into a direct PTY write from the daemon's async hook loop).
 //!

@@ -1427,7 +1427,7 @@ mod tests {
         // (warn-and-return), but the file write must still land. Drive
         // through the async fn against a fresh, empty registry: the
         // lookup yields no orchestrator and we exit early before any
-        // write_to_pane call. The async runtime here is just a vehicle.
+        // write_to_pane_and_submit call. The async runtime here is just a vehicle.
         let registry = crate::agent_pty::AgentPtyRegistry::new();
         let signal = crate::event::WorkDoneSignal {
             pane_id: "worker".into(),

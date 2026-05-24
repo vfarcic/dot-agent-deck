@@ -1236,7 +1236,7 @@ impl AgentPtyRegistry {
 
         // CodeRabbit MAJOR (PRD #93 round-9): reject the spawn if
         // another live agent already claims this `pane_id_env`.
-        // `write_to_pane` routes by `pane_id_env`, so two agents sharing
+        // `write_to_pane_and_submit` routes by `pane_id_env`, so two agents sharing
         // one id silently misroute every delegate/work-done write to
         // whichever entry `values().find(...)` happened to visit first.
         // The check sits INSIDE the post-spawn lock acquisition so the
@@ -1251,7 +1251,7 @@ impl AgentPtyRegistry {
         // so a dead-but-not-yet-reaped entry would otherwise block
         // reuse of its pane_id_env forever. The same `exited.load`
         // filter is applied across every operational lookup —
-        // `write_to_pane`, `agent_records`, and this dup check —
+        // `write_to_pane_and_submit`, `agent_records`, and this dup check —
         // so the live/dead boundary stays consistent
         // (round-11 reviewer #A). Cleanup paths (`close_agent`,
         // `shutdown_all`) deliberately still touch exited entries.
@@ -1365,8 +1365,9 @@ impl AgentPtyRegistry {
     ///
     /// KNOWN LIMITATIONS — agent-side behavior the daemon cannot control:
     /// - If an agent's TUI interprets LF (\n) as Enter, the notice will be
-    ///   submitted as a prompt anyway. Observed safe: (populate via M7.1
-    ///   manual test). Observed unsafe: (none confirmed).
+    ///   submitted as a prompt anyway. Observed safe: TODO(M7.1) — populate
+    ///   after manual test against each supported agent. Observed unsafe:
+    ///   (none confirmed).
     /// - Subsequent [`AgentPtyRegistry::write_to_pane_and_submit`] calls on
     ///   the same pane will submit "{notice text}\n{user prompt}" together —
     ///   the notice bytes accumulate in the agent's stdin line buffer.
@@ -1528,10 +1529,10 @@ impl AgentPtyRegistry {
     ) -> Result<String, AgentPtyError> {
         // Step 1: atomically lift the existing entry out of the
         // registry. Holding the sync lock across the find+remove keeps
-        // a concurrent `write_to_pane` from racing in and writing to a
-        // PTY whose child we're about to terminate (the writer mutex
-        // is per-agent so concurrent writes against the same
-        // `pane_id_env` are still serialized, but a write that arrived
+        // a concurrent `write_to_pane_and_submit` from racing in and
+        // writing to a PTY whose child we're about to terminate (the
+        // writer mutex is per-agent so concurrent writes against the
+        // same `pane_id_env` are still serialized, but a write that arrived
         // BEFORE we removed the entry could already be flushing).
         //
         // The `exited` filter is deliberately omitted: a dead-but-not-
@@ -1576,8 +1577,8 @@ impl AgentPtyRegistry {
         // when the last reference is dropped (typically immediately,
         // unless a concurrent write is in flight against the old
         // `pane_id_env`). The writer is an `Arc<AsyncMutex<...>>` and
-        // `write_to_pane` clones the Arc before awaiting the inner
-        // lock, so a write that started before the respawn's atomic
+        // `write_to_pane_internal` clones the Arc before awaiting the
+        // inner lock, so a write that started before the respawn's atomic
         // remove still holds a clone and delays the slave-close until
         // it finishes its CR write and drops the clone. The terminate
         // helper still escalates to SIGKILL if the child hangs on
@@ -2246,8 +2247,8 @@ mod tests {
     #[test]
     fn registry_rejects_duplicate_pane_id_env() {
         // CodeRabbit MAJOR (PRD #93 round-9): two agents must never
-        // share a `pane_id_env`. `write_to_pane` keys off that string,
-        // so a second spawn with the same id would silently misroute
+        // share a `pane_id_env`. `write_to_pane_and_submit` keys off
+        // that string, so a second spawn with the same id would silently misroute
         // every subsequent delegate/work-done write to whichever entry
         // `values().find(...)` happened to hand back first.
         let registry = AgentPtyRegistry::new();
@@ -2366,12 +2367,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_to_pane_skips_exited_agent_and_routes_to_live_reuser() {
+    async fn write_to_pane_and_submit_skips_exited_agent_and_routes_to_live_reuser() {
         // Round-11 reviewer #A: the symmetric guard for the spawn-side
         // exited filter added in round 10. Without filtering on the
-        // WRITE side, `write_to_pane(pane_id_env=X)` could still find
-        // the dead entry first and route delegate/work-done bytes
-        // into a closed PTY whose pump thread already saw EOF.
+        // WRITE side, `write_to_pane_and_submit(pane_id_env=X)` could
+        // still find the dead entry first and route delegate/work-done
+        // bytes into a closed PTY whose pump thread already saw EOF.
         let registry = Arc::new(AgentPtyRegistry::new());
         let _dead = registry
             .spawn_agent(SpawnOptions {
@@ -2491,6 +2492,95 @@ mod tests {
         registry.shutdown_all();
     }
 
+    /// PRD #92 F9 followup-4 (auditor S2): freeze the KNOWN LIMITATION
+    /// documented on `write_to_pane_notice` — that calling notice then
+    /// submit on the same pane leaves the notice bytes uncommitted in
+    /// the agent's stdin, so the next submit's CR submits them fused
+    /// to the new prompt. The contract is doc-only otherwise; this
+    /// test pins the daemon-side half (bytes land in order with no
+    /// intervening CR) so a future change that accidentally inserts
+    /// a separator — or, conversely, "fixes" the accumulation — gets
+    /// caught.
+    ///
+    /// Stub: a raw-mode `cat` (`stty -echo -icanon -icrnl -opost`)
+    /// that pumps stdin bytes verbatim to stdout. With default
+    /// canonical mode, `/bin/cat` would close the canonical line on
+    /// the notice's `\n` and emit two separate echo lines, hiding
+    /// whether the daemon emitted a fusing CR between the writes —
+    /// raw mode strips that line discipline so the assertion is
+    /// unambiguous.
+    ///
+    /// TEST-SIDE LIMITATION: the downstream agent-TUI behavior
+    /// (claude / codex buffering visible input until CR, then
+    /// submitting the entire accumulated buffer as one prompt) lives
+    /// in the agent process, not the daemon — we can't exercise it
+    /// without a real agent. The assertion below pins the daemon-side
+    /// guarantee that makes that downstream accumulation possible:
+    /// notice bytes reach the slave before the submit's CR, in order,
+    /// with no intervening submit signal.
+    #[tokio::test]
+    async fn write_to_pane_notice_bytes_accumulate_into_next_submit() {
+        let registry = AgentPtyRegistry::new();
+        let _id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("stty -echo -icanon -icrnl -opost min 1 time 0 && exec cat -u"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "accumulate".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn raw-mode cat shell");
+        let agent_id = registry.agent_ids()[0].clone();
+
+        // Give the shell time to apply `stty` and `exec` into cat
+        // before writes hit the slave — otherwise the first bytes
+        // would traverse the default termios (ICANON + ICRNL + OPOST)
+        // and the order/contents of the scrollback would be ambiguous.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        registry
+            .write_to_pane_notice("accumulate", "NOTICE-MARKER")
+            .await
+            .expect("write_to_pane_notice");
+        registry
+            .write_to_pane_and_submit("accumulate", "USER-PROMPT")
+            .await
+            .expect("write_to_pane_and_submit");
+
+        // Master scrollback should contain the exact byte sequence
+        // the daemon wrote: `NOTICE-MARKER\nUSER-PROMPT\r` (raw cat
+        // echoes each input byte verbatim). The substring check is
+        // tolerant of any startup banner the shell emitted before
+        // stty took effect; the ORDER check is what pins the contract.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        let mut last = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            last = registry.snapshot(&agent_id).unwrap_or_default();
+            let notice_at = last
+                .windows(b"NOTICE-MARKER".len())
+                .position(|w| w == b"NOTICE-MARKER");
+            let prompt_at = last
+                .windows(b"USER-PROMPT".len())
+                .position(|w| w == b"USER-PROMPT");
+            if let (Some(n), Some(p)) = (notice_at, prompt_at)
+                && n < p
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            found,
+            "scrollback must contain NOTICE-MARKER followed by USER-PROMPT — \
+             proves the daemon delivered notice + submit bytes to the agent's \
+             stdin in order with no intervening CR (the prerequisite for the \
+             documented accumulation behavior). Last snapshot: {:?}",
+            String::from_utf8_lossy(&last)
+        );
+
+        registry.shutdown_all();
+    }
+
     /// PRD #92 F9 followup-3: `close_agent` must NOT prune the
     /// `dispatch_mutexes` entry for the closed agent's `pane_id_env`.
     /// Pruning was tried in followup-2 and reverted because it
@@ -2547,10 +2637,10 @@ mod tests {
     }
 
     #[test]
-    fn registry_write_to_pane_routes_to_correct_agent_by_pane_id() {
+    fn registry_write_to_pane_and_submit_routes_to_correct_agent_by_pane_id() {
         // CodeRabbit MAJOR (PRD #93 round-9) regression guard: with
-        // distinct pane_id_envs, `write_to_pane(pane_id, bytes)` must
-        // land in *that* agent's PTY and not leak into a sibling.
+        // distinct pane_id_envs, `write_to_pane_and_submit(pane_id,
+        // bytes)` must land in *that* agent's PTY and not leak into a sibling.
         // Mirrors the production routing path delegate/work-done uses.
         // We can't easily read PTY bytes from a `/bin/sh` so we
         // confirm structurally: the registry must contain both agents

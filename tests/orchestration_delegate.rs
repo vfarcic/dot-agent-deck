@@ -4,7 +4,7 @@
 //! When a worker's hook socket receives a `Delegate` signal from an
 //! orchestrator pane, the daemon resolves the target role's pane, builds
 //! a file-backed task prompt, and writes the one-liner directly into the
-//! target pane's PTY via [`AgentPtyRegistry::write_to_pane`]. The PTY
+//! target pane's PTY via [`AgentPtyRegistry::write_to_pane_and_submit`]. The PTY
 //! scrollback is the "journal" surface — the bytes survive any number of
 //! detach/reattach cycles via the standard pane snapshot replay.
 //!
@@ -909,8 +909,8 @@ async fn wait_for_bytes_in_snapshot(
     );
 }
 
-/// PRD #93 round-6: the daemon's `write_to_pane` must follow the same
-/// submit contract as the TUI's `EmbeddedPaneController::write_to_pane`
+/// PRD #93 round-6: the daemon's `write_to_pane_and_submit` must follow
+/// the same submit contract as the TUI's `EmbeddedPaneController::write_to_pane`
 /// — write the encoded prompt, wait `SUBMIT_DELAY`, then write a carriage
 /// return. Without the trailing CR the agent TUI sees the prompt sitting
 /// in its input box and never starts processing.
@@ -926,7 +926,7 @@ async fn wait_for_bytes_in_snapshot(
 /// daemon never writes the CR, the line never closes, and cat's stdout
 /// stays empty — so the test fails at exactly the layer round-6 broke.
 #[tokio::test]
-async fn write_to_pane_emits_submit_cr_after_single_line_prompt() {
+async fn write_to_pane_and_submit_emits_cr_after_single_line_prompt() {
     let daemon = spawn_daemon().await;
     let cwd_dir = tempfile::tempdir().unwrap();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
@@ -974,7 +974,7 @@ async fn write_to_pane_emits_submit_cr_after_single_line_prompt() {
 /// the raw markers reach the master is the stdout path, and only after
 /// the round-6 submit CR closes the line and lets `cat` flush.
 #[tokio::test]
-async fn write_to_pane_wraps_multiline_in_bracketed_paste() {
+async fn write_to_pane_and_submit_wraps_multiline_in_bracketed_paste() {
     let daemon = spawn_daemon().await;
     let cwd_dir = tempfile::tempdir().unwrap();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
@@ -1036,7 +1036,7 @@ async fn write_to_pane_wraps_multiline_in_bracketed_paste() {
 /// and only the fused `AAAA…BBBB…\r\n` reaches the master — neither
 /// individual `payload\r\n` substring is present.
 #[tokio::test]
-async fn write_to_pane_serializes_concurrent_writes_per_pane() {
+async fn write_to_pane_and_submit_serializes_concurrent_writes_per_pane() {
     let daemon = spawn_daemon().await;
     let cwd_dir = tempfile::tempdir().unwrap();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
@@ -1126,8 +1126,8 @@ async fn write_to_pane_serializes_concurrent_writes_per_pane() {
 
 /// PRD #93 round-8: the per-pane lock must not serialize writes across
 /// *different* panes. Each agent owns its own `writer` mutex, so two
-/// concurrent `write_to_pane` calls to different panes should run in
-/// parallel — about one `SUBMIT_DELAY` of wall clock, not two.
+/// concurrent `write_to_pane_and_submit` calls to different panes
+/// should run in parallel — about one `SUBMIT_DELAY` of wall clock, not two.
 ///
 /// We allow a generous slack on the upper bound because the daemon
 /// background work (spawn threads, broadcast push) can add jitter; the
@@ -1135,7 +1135,7 @@ async fn write_to_pane_serializes_concurrent_writes_per_pane() {
 /// (e.g. a global writer lock), which would push the total to roughly
 /// 2× `SUBMIT_DELAY` and well past the threshold below.
 #[tokio::test]
-async fn write_to_pane_concurrent_writes_to_different_panes_run_in_parallel() {
+async fn write_to_pane_and_submit_concurrent_writes_to_different_panes_run_in_parallel() {
     let daemon = spawn_daemon().await;
     let cwd_dir = tempfile::tempdir().unwrap();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
@@ -1380,8 +1380,8 @@ command = "cat -u"
     );
 
     // The first delegation's prompt must land in the NEW agent's
-    // scrollback (write_to_pane routes by pane_id_env which the
-    // respawn preserved). Use the new agent_id for the snapshot.
+    // scrollback (write_to_pane_and_submit routes by pane_id_env
+    // which the respawn preserved). Use the new agent_id for the snapshot.
     let _ = wait_for_in_snapshot(
         &daemon.pty_registry,
         &coder_agent_id_after_first,
@@ -2392,8 +2392,8 @@ start = true
     )
     .await;
 
-    // Prompt still lands — the no-respawn path runs write_to_pane
-    // against the existing (unchanged) coder agent.
+    // Prompt still lands — the no-respawn path runs
+    // write_to_pane_and_submit against the existing (unchanged) coder agent.
     let _ = wait_for_in_snapshot(
         &daemon.pty_registry,
         &coder_initial,
