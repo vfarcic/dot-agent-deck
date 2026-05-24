@@ -77,8 +77,14 @@ enum StreamCmd {
 /// deck locally or over `dot-agent-deck connect`. `Pane.backend` is
 /// just a `StreamBackend`.
 struct StreamBackend {
-    /// Daemon-side agent id used for `stop-agent` on close.
-    agent_id: String,
+    /// Daemon-side agent id used for `stop-agent` on close and
+    /// `resize-agent` from the per-pane resize worker. Shared with the
+    /// per-pane I/O task so that PRD #92 F12's auto-renew-on-respawn path
+    /// can swap in the NEW agent's id after the daemon respawns the agent
+    /// behind this pane (clear=true delegate flow). All readers take a
+    /// brief lock + clone before issuing the RPC — never held across
+    /// `.await`.
+    agent_id: Arc<Mutex<String>>,
     /// Channel drained by the per-pane I/O task. `Input` becomes one
     /// `KIND_STREAM_IN` frame on the wire; `Detach` becomes one
     /// `KIND_DETACH` frame and ends the writer. Unbounded because the TUI
@@ -568,8 +574,16 @@ impl EmbeddedPaneController {
         let mouse_mode = Arc::new(AtomicBool::new(false));
         let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
 
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCmd>();
+        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCmd>();
         let (resize_tx, resize_rx) = tokio::sync::watch::channel::<Option<(u16, u16)>>(None);
+
+        // PRD #92 F12: the per-pane subscriber and the resize worker both
+        // need to follow `agent_id` across daemon-side respawns (F9
+        // clear=true delegate flow kills + replaces the agent under the
+        // same pane_id_env). Share one `Arc<Mutex<String>>` between them
+        // and `StreamBackend` so a single update in the io_task is visible
+        // to the next `stop-agent` / `resize-agent` call without rewiring.
+        let shared_agent_id = Arc::new(Mutex::new(agent_id));
 
         // Per-pane resize worker: at-most-one in-flight daemon Resize per
         // pane, with intermediate values coalesced via the watch channel.
@@ -579,95 +593,30 @@ impl EmbeddedPaneController {
         let resize_task = runtime.spawn(resize_worker(
             resize_rx,
             daemon_path.clone(),
-            agent_id.clone(),
+            Arc::clone(&shared_agent_id),
         ));
 
         let parser_for_task = Arc::clone(&parser);
         let mouse_mode_for_task = Arc::clone(&mouse_mode);
         let hyperlinks_for_task = Arc::clone(&hyperlinks);
+        let agent_id_for_task = Arc::clone(&shared_agent_id);
+        let client_for_task = self.client.clone();
+        let pane_id_for_task = pane_id.clone();
 
-        let io_task = runtime.spawn(async move {
-            let (mut rd, mut wr) = conn.into_split();
-
-            // Reader half: STREAM_OUT → process pipeline.
-            let reader = async {
-                let mut osc8 = Osc8Filter::new();
-                loop {
-                    match crate::daemon_protocol::read_frame(&mut rd).await {
-                        Ok(None) => break,
-                        Ok(Some((kind, bytes))) => match kind {
-                            crate::daemon_protocol::KIND_STREAM_OUT => {
-                                process_agent_output_chunk(
-                                    &bytes,
-                                    &mut osc8,
-                                    &parser_for_task,
-                                    &mouse_mode_for_task,
-                                    &hyperlinks_for_task,
-                                );
-                            }
-                            crate::daemon_protocol::KIND_STREAM_END => break,
-                            _ => break,
-                        },
-                        Err(_) => break,
-                    }
-                }
-            };
-
-            // Input forwarder: drain the keystroke channel and emit frames.
-            // `Input` becomes one `KIND_STREAM_IN`; `Detach` (M2.5) becomes
-            // one `KIND_DETACH` and ends the writer so the daemon observes
-            // an explicit detach before the socket closes. A failed write
-            // or a closed channel also ends the task — the daemon treats
-            // the resulting EOF as implicit detach (the agent keeps
-            // running).
-            let writer = async {
-                while let Some(cmd) = input_rx.recv().await {
-                    match cmd {
-                        StreamCmd::Input(bytes) => {
-                            if crate::daemon_protocol::write_frame(
-                                &mut wr,
-                                crate::daemon_protocol::KIND_STREAM_IN,
-                                &bytes,
-                            )
-                            .await
-                            .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        StreamCmd::Detach => {
-                            // Best-effort: even if the write errors, exiting
-                            // here closes the socket and the daemon will
-                            // observe EOF — the agent still survives.
-                            let _ = crate::daemon_protocol::write_frame(
-                                &mut wr,
-                                crate::daemon_protocol::KIND_DETACH,
-                                &[],
-                            )
-                            .await;
-                            break;
-                        }
-                    }
-                }
-            };
-
-            // `select!` ensures whichever half completes first takes the
-            // other down with it: the inactive future is cancelled and
-            // both `rd` and `wr` go out of scope here, releasing the
-            // socket FD deterministically. Without this, a STREAM_END
-            // from the daemon would end the reader but leave the writer
-            // parked on `input_rx.recv()` indefinitely, holding the
-            // socket open until the StreamBackend itself was dropped.
-            tokio::pin!(reader, writer);
-            tokio::select! {
-                _ = &mut reader => {},
-                _ = &mut writer => {},
-            }
-        });
+        let io_task = runtime.spawn(run_pane_io_task(
+            pane_id_for_task,
+            client_for_task,
+            conn,
+            agent_id_for_task,
+            input_rx,
+            parser_for_task,
+            mouse_mode_for_task,
+            hyperlinks_for_task,
+        ));
 
         let pane = Pane {
             backend: StreamBackend {
-                agent_id,
+                agent_id: shared_agent_id,
                 input_tx,
                 io_task: Some(io_task),
                 runtime,
@@ -1042,6 +991,242 @@ const CREATE_PANE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// gets the "stop-agent timed out" error message with a retry hint.
 const CTRL_W_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// PRD #92 F12: wait between consecutive `list_agents` lookups when the
+/// per-pane attach stream has ended and we're trying to find the
+/// freshly-respawned agent for `pane_id_env`. The F9 clear=true delegate
+/// path kills the OLD agent before spawning the NEW one; the daemon's
+/// event-driven respawn dispatch (F9 followup-6) closes the timing window
+/// between the OLD agent's death and the NEW agent's registration to a
+/// few milliseconds in the happy case, but a loaded host can stretch it
+/// out. Linear 100 ms backoff is well within the user's tolerance for the
+/// pane-view to refresh on the second delegate.
+const REATTACH_LOOKUP_BACKOFF: Duration = Duration::from_millis(100);
+
+/// PRD #92 F12: max `list_agents` lookups per re-attach attempt before the
+/// per-pane subscriber gives up and exits. Total wall-clock budget is
+/// roughly `REATTACH_MAX_LOOKUP_ATTEMPTS * REATTACH_LOOKUP_BACKOFF`
+/// (~300 ms here), which bounds the "permanently-closed pane" path and
+/// also covers the respawn-in-flight race where the lookup races the
+/// NEW agent's registration. On give-up the io_task exits cleanly; the
+/// pane keeps its last-rendered screen and the user can close it
+/// manually.
+const REATTACH_MAX_LOOKUP_ATTEMPTS: u32 = 3;
+
+/// PRD #92 F12: bound on consecutive zero-byte attach sessions. If the
+/// daemon answers `attach` successfully but the freshly-attached stream
+/// returns STREAM_END before any STREAM_OUT bytes arrive (the NEW agent
+/// died before producing output, or a permanently-broken agent loops
+/// crash-on-start), the io_task must not re-attach indefinitely. After
+/// this many consecutive empty sessions, give up.
+const REATTACH_MAX_EMPTY_SESSIONS: u32 = 3;
+
+/// PRD #92 F12: per-pane I/O task body. Drives the attach-stream
+/// reader/writer pair for a single pane; on STREAM_END from the daemon
+/// (typically: OLD agent died as part of F9's clear=true respawn), look
+/// up the pane's NEW agent via `list_agents` filtered by `pane_id_env`
+/// and re-`attach` to it, with [`REATTACH_LOOKUP_BACKOFF`] backoff and a
+/// [`REATTACH_MAX_LOOKUP_ATTEMPTS`] cap. Updates `agent_id` under the
+/// shared mutex so a concurrent `close_pane` / `resize_pane_pty` targets
+/// the NEW agent's id. Returns when:
+/// - the input channel is closed or `KIND_DETACH` was sent (pane teardown
+///   or explicit M2.5 detach — never re-attach),
+/// - no live agent is found for `pane_id_env` within the retry window
+///   (the pane was permanently closed on the daemon side),
+/// - or [`REATTACH_MAX_EMPTY_SESSIONS`] consecutive re-attaches yield
+///   zero bytes (the NEW agent crashes on every spawn).
+#[allow(clippy::too_many_arguments)]
+async fn run_pane_io_task(
+    pane_id: String,
+    client: DaemonClient,
+    initial_conn: AttachConnection,
+    agent_id: Arc<Mutex<String>>,
+    mut input_rx: tokio::sync::mpsc::UnboundedReceiver<StreamCmd>,
+    parser: Arc<Mutex<vt100::Parser>>,
+    mouse_mode: Arc<AtomicBool>,
+    hyperlinks: Arc<Mutex<HyperlinkMap>>,
+) {
+    let mut conn_opt: Option<AttachConnection> = Some(initial_conn);
+    let mut consecutive_empty_sessions: u32 = 0;
+
+    'outer: loop {
+        let conn = match conn_opt.take() {
+            Some(c) => c,
+            None => break 'outer,
+        };
+        let (mut rd, mut wr) = conn.into_split();
+        let mut bytes_received_this_session = false;
+        let writer_won;
+        {
+            // Reader half: STREAM_OUT → process pipeline. Tracks whether
+            // any STREAM_OUT frames arrived so the outer loop can detect
+            // an "immediately Closed" session (Failure mode #1 in PRD #92
+            // F12 context) and cap retries.
+            let reader = async {
+                let mut osc8 = Osc8Filter::new();
+                loop {
+                    match crate::daemon_protocol::read_frame(&mut rd).await {
+                        Ok(None) => break,
+                        Ok(Some((kind, bytes))) => match kind {
+                            crate::daemon_protocol::KIND_STREAM_OUT => {
+                                bytes_received_this_session = true;
+                                process_agent_output_chunk(
+                                    &bytes,
+                                    &mut osc8,
+                                    &parser,
+                                    &mouse_mode,
+                                    &hyperlinks,
+                                );
+                            }
+                            crate::daemon_protocol::KIND_STREAM_END => break,
+                            _ => break,
+                        },
+                        Err(_) => break,
+                    }
+                }
+            };
+
+            // Input forwarder: drain the keystroke channel and emit frames.
+            // `Input` becomes one `KIND_STREAM_IN`; `Detach` (M2.5) becomes
+            // one `KIND_DETACH` and ends the writer so the daemon observes
+            // an explicit detach before the socket closes. On write
+            // failure we park forever so the reader's branch wins the
+            // select! — write failure usually means the socket is gone,
+            // and the reader's end-of-stream is what determines whether
+            // to auto-reattach (F12).
+            let writer = async {
+                while let Some(cmd) = input_rx.recv().await {
+                    match cmd {
+                        StreamCmd::Input(bytes) => {
+                            if crate::daemon_protocol::write_frame(
+                                &mut wr,
+                                crate::daemon_protocol::KIND_STREAM_IN,
+                                &bytes,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                std::future::pending::<()>().await;
+                                unreachable!();
+                            }
+                        }
+                        StreamCmd::Detach => {
+                            // Best-effort: even if the write errors,
+                            // exiting here closes the socket and the
+                            // daemon will observe EOF — the agent
+                            // still survives.
+                            let _ = crate::daemon_protocol::write_frame(
+                                &mut wr,
+                                crate::daemon_protocol::KIND_DETACH,
+                                &[],
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                }
+            };
+
+            // `select!` lets us tell apart "reader exited" (STREAM_END /
+            // EOF from the daemon — candidate for auto-reattach) from
+            // "writer exited" (explicit detach, or `input_tx` dropped on
+            // pane teardown — never reattach). The losing future is
+            // dropped here, releasing its borrow of `rd` / `wr` so the
+            // outer loop can rebind them on the next iteration.
+            tokio::pin!(reader, writer);
+            writer_won = tokio::select! {
+                _ = &mut reader => false,
+                _ = &mut writer => true,
+            };
+        }
+
+        if writer_won {
+            break 'outer;
+        }
+
+        // Reader exited. Decide: re-attach to the (likely-respawned)
+        // agent for this pane, or give up. Zero-byte sessions guard
+        // against an immediately-closing agent looping the io_task
+        // forever; non-empty sessions reset the counter.
+        if bytes_received_this_session {
+            consecutive_empty_sessions = 0;
+        } else {
+            consecutive_empty_sessions += 1;
+            if consecutive_empty_sessions >= REATTACH_MAX_EMPTY_SESSIONS {
+                tracing::debug!(
+                    pane_id = %pane_id,
+                    "auto-reattach: too many consecutive empty sessions; giving up"
+                );
+                break 'outer;
+            }
+        }
+
+        match resolve_and_reattach(&client, &pane_id).await {
+            Some((new_agent_id, new_conn)) => {
+                tracing::debug!(
+                    pane_id = %pane_id,
+                    new_agent_id = %new_agent_id,
+                    "auto-reattach: subscribed to new agent for pane"
+                );
+                *agent_id.lock().unwrap() = new_agent_id;
+                conn_opt = Some(new_conn);
+            }
+            None => {
+                tracing::debug!(
+                    pane_id = %pane_id,
+                    "auto-reattach: no live agent for pane within retry window; giving up"
+                );
+                break 'outer;
+            }
+        }
+    }
+}
+
+/// PRD #92 F12: resolve `pane_id_env` → current agent_id via `list_agents`
+/// and open a fresh `AttachConnection`. Retries up to
+/// [`REATTACH_MAX_LOOKUP_ATTEMPTS`] times with
+/// [`REATTACH_LOOKUP_BACKOFF`] between attempts so that the brief window
+/// where the OLD agent has died but the NEW one isn't registered yet
+/// resolves naturally (F9 respawn-in-flight race). Returns `None` if no
+/// live agent matches the pane after the retry window, or if every
+/// `attach` attempt fails.
+async fn resolve_and_reattach(
+    client: &DaemonClient,
+    pane_id_env: &str,
+) -> Option<(String, AttachConnection)> {
+    for attempt in 0..REATTACH_MAX_LOOKUP_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(REATTACH_LOOKUP_BACKOFF).await;
+        }
+        let records = match client.list_agents().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "auto-reattach: list_agents failed; retrying after backoff"
+                );
+                continue;
+            }
+        };
+        let new_id_opt = records
+            .into_iter()
+            .find(|r| r.pane_id_env.as_deref() == Some(pane_id_env))
+            .map(|r| r.id);
+        let Some(new_id) = new_id_opt else { continue };
+        match client.attach(&new_id).await {
+            Ok(conn) => return Some((new_id, conn)),
+            Err(e) => {
+                tracing::debug!(
+                    agent_id = %new_id,
+                    error = %e,
+                    "auto-reattach: attach to new agent failed; retrying after backoff"
+                );
+                continue;
+            }
+        }
+    }
+    None
+}
+
 /// Per-pane resize worker (PRD #76 M2.10 audit follow-up). Reads the most
 /// recent `(rows, cols)` from the watch receiver and dispatches it to the
 /// daemon with [`RESIZE_DAEMON_TIMEOUT`]. While a dispatch is in flight,
@@ -1053,7 +1238,7 @@ const CTRL_W_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 async fn resize_worker(
     mut rx: tokio::sync::watch::Receiver<Option<(u16, u16)>>,
     daemon_path: PathBuf,
-    agent_id: String,
+    agent_id: Arc<Mutex<String>>,
 ) {
     // Mark the initial `None` value as seen so the first `changed()` call
     // waits for an actual resize, not the channel's seed value.
@@ -1062,17 +1247,21 @@ async fn resize_worker(
         let dims = *rx.borrow_and_update();
         let Some((rows, cols)) = dims else { continue };
 
+        // Snapshot the current agent id under the std::sync mutex (brief,
+        // not held across `.await`). PRD #92 F12: this can change between
+        // resize ops when the io_task auto-renews the per-pane subscription
+        // to a freshly-respawned agent; the next resize naturally targets
+        // the new agent.
+        let id = agent_id.lock().unwrap().clone();
+
         let client = DaemonClient::new(daemon_path.clone());
-        match tokio::time::timeout(
-            RESIZE_DAEMON_TIMEOUT,
-            client.resize_agent(&agent_id, rows, cols),
-        )
-        .await
+        match tokio::time::timeout(RESIZE_DAEMON_TIMEOUT, client.resize_agent(&id, rows, cols))
+            .await
         {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 tracing::debug!(
-                    agent_id = %agent_id,
+                    agent_id = %id,
                     rows, cols,
                     error = %e,
                     "resize-agent failed (transient — next resize will reconcile)"
@@ -1080,7 +1269,7 @@ async fn resize_worker(
             }
             Err(_) => {
                 tracing::debug!(
-                    agent_id = %agent_id,
+                    agent_id = %id,
                     rows, cols,
                     timeout_ms = RESIZE_DAEMON_TIMEOUT.as_millis() as u64,
                     "resize-agent timed out (transient — next resize will reconcile)"
@@ -1262,7 +1451,11 @@ impl PaneController for EmbeddedPaneController {
         // dropped attach connection as a detach and the agent would
         // survive.
         let client = DaemonClient::new(s.daemon_path.clone());
-        let agent_id = s.agent_id.clone();
+        // Snapshot the latest agent id under the shared mutex; PRD #92 F12
+        // can swap this to the respawned id while the pane is alive, and
+        // Ctrl+W must target the currently-bound agent, not the one we
+        // first attached to.
+        let agent_id = s.agent_id.lock().unwrap().clone();
         // CodeRabbit Fix E: bound the stop-agent RPC. Without this
         // timeout a wedged daemon would pin the TUI renderer
         // indefinitely (Ctrl+W happens on the render thread via
@@ -1440,7 +1633,12 @@ impl PaneController for EmbeddedPaneController {
                 .get_mut(pane_id)
                 .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
             pane.name = local_name;
-            (pane.backend.agent_id.clone(), pane.cwd.clone())
+            // Snapshot the currently-bound agent id (PRD #92 F12 can
+            // swap this to a respawned id over the life of the pane).
+            (
+                pane.backend.agent_id.lock().unwrap().clone(),
+                pane.cwd.clone(),
+            )
         };
         // Daemon RPC is fire-and-forget on the controller's runtime.
         // The TUI thread must never block on `set_agent_label`:
