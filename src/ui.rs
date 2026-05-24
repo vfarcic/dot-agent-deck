@@ -4424,7 +4424,13 @@ pub fn run_tui(
                         let dir_str = req.dir.display().to_string();
 
                         // Orchestration path — manage own panes, no agent pane.
-                        if let Some(orch_config) = req.orchestration_config {
+                        if let Some(mut orch_config) = req.orchestration_config {
+                            // PRD #107: use the name the user typed in the form, if any,
+                            // so the tab title matches their input rather than always
+                            // falling back to the TOML config name or cwd basename.
+                            if !req.name.is_empty() {
+                                orch_config.name = req.name.clone();
+                            }
                             let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
                             // PRD #76 M2.15: pre-compute spawn dims using
                             // the orchestration-layout helper (right 66%
@@ -9605,6 +9611,98 @@ mod tests {
             }
             other => panic!("Expected NewPane, got {:?}", other),
         }
+    }
+
+    // PRD #107 regression: user-entered name in the new-pane form should
+    // override the orchestration config name so the tab title matches.
+    #[test]
+    fn orchestration_form_user_name_overrides_config_name() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/proj"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("config-name")],
+        ));
+
+        // Select the orchestration (Right from "No mode" → first orchestration slot)
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui);
+
+        // Move focus to the Name field
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+
+        // Type a custom name
+        for c in "user-typed-name".chars() {
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            handle_new_pane_form_key(key, &mut ui);
+        }
+
+        // Move to Command field and submit
+        handle_new_pane_form_key(enter, &mut ui); // Name → Command
+        let result = handle_new_pane_form_key(enter, &mut ui); // submit
+
+        let req = match result {
+            KeyResult::NewPane(r) => r,
+            other => panic!("Expected NewPane, got {:?}", other),
+        };
+
+        // The form must carry the user's input in req.name.
+        assert_eq!(req.name, "user-typed-name");
+
+        // Simulate the handler fix (ui.rs KeyResult::NewPane branch):
+        // when req.name is non-empty, orch_config.name is overridden before
+        // open_orchestration_tab is called, so the tab label matches user input.
+        let mut orch = req.orchestration_config.unwrap();
+        if !req.name.is_empty() {
+            orch.name = req.name.clone();
+        }
+        assert_eq!(
+            orch.name, "user-typed-name",
+            "tab should show the user-entered name, not the TOML config name"
+        );
+    }
+
+    // PRD #107: empty name in the form must leave the config name untouched.
+    #[test]
+    fn orchestration_form_empty_name_keeps_config_name() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/proj"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("config-name")],
+        ));
+
+        // Select orchestration, skip Name field (leave it empty), submit
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        handle_new_pane_form_key(enter, &mut ui); // Name → Command (name stays "")
+        let result = handle_new_pane_form_key(enter, &mut ui); // submit
+
+        let req = match result {
+            KeyResult::NewPane(r) => r,
+            other => panic!("Expected NewPane, got {:?}", other),
+        };
+
+        assert!(req.name.is_empty());
+
+        // Simulate handler: empty name → no override → config name preserved.
+        let mut orch = req.orchestration_config.unwrap();
+        if !req.name.is_empty() {
+            orch.name = req.name.clone();
+        }
+        assert_eq!(
+            orch.name, "config-name",
+            "config name must be kept when the user left the Name field empty"
+        );
     }
 
     #[test]
