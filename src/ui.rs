@@ -7666,6 +7666,7 @@ mod tests {
             last_user_prompt: None,
             first_prompts: Vec::new(),
             pane_id: None,
+            agent_id: None,
         };
 
         let palette = ColorPalette::dark();
@@ -8809,6 +8810,7 @@ mod tests {
             last_user_prompt: None,
             first_prompts: Vec::new(),
             pane_id: None,
+            agent_id: None,
         }
     }
 
@@ -9000,6 +9002,7 @@ mod tests {
             last_user_prompt: Some("third prompt".to_string()),
             first_prompts: Vec::new(),
             pane_id: None,
+            agent_id: None,
         };
 
         // Spacious: get all 3
@@ -9032,6 +9035,7 @@ mod tests {
             last_user_prompt: Some("old prompt".to_string()),
             first_prompts: Vec::new(),
             pane_id: None,
+            agent_id: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -9055,6 +9059,7 @@ mod tests {
             last_user_prompt: None,
             first_prompts: Vec::new(),
             pane_id: None,
+            agent_id: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);

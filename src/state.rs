@@ -73,6 +73,12 @@ pub struct SessionState {
     pub last_user_prompt: Option<String>,
     pub first_prompts: Vec<String>,
     pub pane_id: Option<String>,
+    /// PRD #110: the daemon-side registry id of the agent process that
+    /// produced this session. Lets the same-pane reuse guard in
+    /// `apply_event` distinguish "same agent restarting in place"
+    /// (opencode crash/reload — reuse) from "different agent entirely"
+    /// (PRD #92 F9 clear=true respawn — new session card).
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -539,6 +545,7 @@ impl AppState {
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
                 pane_id: Some(pane_id),
+                agent_id: None,
             },
         );
     }
@@ -775,9 +782,17 @@ impl AppState {
         } else if !self.managed_pane_ids.is_empty() {
             return;
         }
+        // PRD #110: reuse the existing session card for the same pane
+        // ONLY when the agent_id matches (or both sides are absent for
+        // pre-F9 backward-compat). A different agent_id means the agent
+        // process was intentionally respawned (clear=true delegate);
+        // we let that event create a fresh session card instead of
+        // remapping it onto the dead session.
         if let Some(ref pane_id) = event.pane_id
             && let Some(existing_id) = self.sessions.iter().find_map(|(id, session)| {
-                (session.pane_id.as_ref().is_some_and(|p| p == pane_id) && id != &event.session_id)
+                (session.pane_id.as_ref().is_some_and(|p| p == pane_id)
+                    && id != &event.session_id
+                    && session.agent_id == event.agent_id)
                     .then(|| id.clone())
             })
         {
@@ -831,6 +846,7 @@ impl AppState {
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
                 pane_id: event.pane_id.clone(),
+                agent_id: event.agent_id.clone(),
             });
 
         session.last_activity = event.timestamp;
@@ -986,6 +1002,88 @@ mod tests {
         assert!(state.sessions.contains_key("s1"));
         assert!(!state.sessions.contains_key("s2"));
         assert_eq!(state.sessions["s1"].pane_id.as_deref(), Some("pane-1"));
+    }
+
+    // PRD #110: the session-reuse guard now also checks agent_id so the
+    // F9 clear=true respawn (which swaps the agent process behind the
+    // same pane) creates a fresh session card rather than getting
+    // remapped onto the dead session.
+    #[test]
+    fn reuse_session_when_same_pane_and_same_agent_id() {
+        let mut state = AppState::default();
+        state.register_pane("pane-1".to_string());
+
+        let mut first = make_event("s1", EventType::SessionStart);
+        first.pane_id = Some("pane-1".to_string());
+        first.agent_id = Some("agent-A".to_string());
+        state.apply_event(first);
+
+        // Same agent process emits SessionStart again (opencode crash
+        // or reload). New session_id, but agent_id matches → reuse.
+        let mut restart = make_event("s2", EventType::SessionStart);
+        restart.pane_id = Some("pane-1".to_string());
+        restart.agent_id = Some("agent-A".to_string());
+        state.apply_event(restart);
+
+        assert!(state.sessions.contains_key("s1"));
+        assert!(!state.sessions.contains_key("s2"));
+        assert_eq!(state.sessions["s1"].pane_id.as_deref(), Some("pane-1"));
+        assert_eq!(state.sessions["s1"].agent_id.as_deref(), Some("agent-A"));
+    }
+
+    #[test]
+    fn new_session_when_same_pane_but_different_agent_id() {
+        let mut state = AppState::default();
+        state.register_pane("pane-1".to_string());
+
+        let mut first = make_event("s1", EventType::SessionStart);
+        first.pane_id = Some("pane-1".to_string());
+        first.agent_id = Some("agent-A".to_string());
+        state.apply_event(first);
+
+        // F9 clear=true respawn — different agent process, same pane.
+        // The reuse guard must skip and create a fresh session card.
+        let mut respawn = make_event("s2", EventType::SessionStart);
+        respawn.pane_id = Some("pane-1".to_string());
+        respawn.agent_id = Some("agent-B".to_string());
+        state.apply_event(respawn);
+
+        assert!(
+            state.sessions.contains_key("s2"),
+            "respawn with new agent_id must create a fresh session card"
+        );
+        assert_eq!(state.sessions["s2"].pane_id.as_deref(), Some("pane-1"));
+        assert_eq!(state.sessions["s2"].agent_id.as_deref(), Some("agent-B"));
+        // The old session card is preserved (no remap), so the new
+        // agent's card is additive rather than replacing the old one.
+        assert!(
+            state.sessions.contains_key("s1"),
+            "old session card must remain when reuse is skipped"
+        );
+    }
+
+    #[test]
+    fn reuse_session_when_same_pane_and_both_agent_ids_absent() {
+        // Backward-compat: hook scripts predating F9 followup-7 don't
+        // emit `agent_id`. Both sides are None, so the guard treats
+        // them as the same agent — reuse, just like before PRD #110.
+        let mut state = AppState::default();
+        state.register_pane("pane-1".to_string());
+
+        let mut first = make_event("s1", EventType::SessionStart);
+        first.pane_id = Some("pane-1".to_string());
+        assert!(first.agent_id.is_none());
+        state.apply_event(first);
+
+        let mut restart = make_event("s2", EventType::SessionStart);
+        restart.pane_id = Some("pane-1".to_string());
+        assert!(restart.agent_id.is_none());
+        state.apply_event(restart);
+
+        assert!(state.sessions.contains_key("s1"));
+        assert!(!state.sessions.contains_key("s2"));
+        assert_eq!(state.sessions["s1"].pane_id.as_deref(), Some("pane-1"));
+        assert!(state.sessions["s1"].agent_id.is_none());
     }
 
     #[test]

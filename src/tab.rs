@@ -989,6 +989,7 @@ mod tests {
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
                 pane_id: None,
+                agent_id: None,
             },
         )
     }
@@ -1051,6 +1052,7 @@ mod tests {
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
                 pane_id: None,
+                agent_id: None,
             },
         );
         let mut last_routed = HashMap::new();
