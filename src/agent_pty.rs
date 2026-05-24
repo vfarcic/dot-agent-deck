@@ -900,6 +900,22 @@ pub struct RunningAgent {
     /// rationale as `display_name` / `tab_membership` — older clients
     /// that omit the field round-trip as `None`.
     pub agent_type: Option<AgentType>,
+    /// PRD #92 F9 followup #3: the full env vec passed to
+    /// [`AgentPtyRegistry::spawn_agent`] at the original spawn, captured
+    /// so [`AgentPtyRegistry::respawn_agent_for_pane`] can re-apply it on
+    /// the fresh child. Includes `DOT_AGENT_DECK_PANE_ID` and any extra
+    /// vars the caller (a role config, the orchestration setup) injected;
+    /// without this capture the respawn ran with a leaner env than the
+    /// original and silently dropped role-supplied vars.
+    pub spawn_env: Vec<(String, String)>,
+    /// PRD #92 F9 followup #4: the last-known PTY size (rows, cols),
+    /// captured at spawn and refreshed by [`AgentPtyRegistry::resize`].
+    /// Replayed on respawn so the fresh PTY comes up at the same
+    /// geometry instead of the default 24×80 — without this, the new
+    /// agent's first output briefly wraps or truncates until the TUI's
+    /// next resize call lands.
+    pub pty_rows: u16,
+    pub pty_cols: u16,
     /// PRD #93 round-2 reviewer REV-3: set to `true` by the reader thread
     /// once the PTY returns EOF (the child died or was killed). The daemon's
     /// idle monitor consults this via [`AgentPtyRegistry::live_count`] so an
@@ -962,6 +978,23 @@ pub struct AgentRecord {
 /// [`AgentBus`] and [`AttachHandle`].
 pub struct AgentPtyRegistry {
     inner: Mutex<RegistryInner>,
+    /// PRD #92 F9 followup #1: per-pane dispatch mutex held by
+    /// `AppState::handle_delegate` across the entire respawn+write
+    /// window for a `clear = true` delegate. Two concurrent
+    /// connections submitting `Delegate` signals to the same worker
+    /// pane would otherwise race the `registry.remove` + `spawn_agent`
+    /// gap inside [`AgentPtyRegistry::respawn_agent_for_pane`]: the
+    /// second call would observe `NotFound` and its prompt would be
+    /// silently dropped. The mutex map is keyed by `pane_id_env` so
+    /// writes to different panes still proceed in parallel; the
+    /// existing per-agent `writer` mutex serializes byte-level writes
+    /// to one PTY, but the respawn's remove+spawn window needs a
+    /// higher-level lock because the agent identity itself rolls over.
+    /// Cleanup is deliberately omitted: the map grows by the number of
+    /// distinct `pane_id_env` values the daemon has seen over its
+    /// lifetime, which is bounded in practice (panes are not created
+    /// at high rates).
+    dispatch_mutexes: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     /// Total number of explicit `KIND_DETACH` frames the daemon has observed
     /// across all attach-stream connections. Plain socket close (implicit
     /// detach) does *not* increment this — only the M2.5 explicit-detach
@@ -1004,10 +1037,24 @@ impl AgentPtyRegistry {
                 next_id: 1,
                 agents: HashMap::new(),
             }),
+            dispatch_mutexes: Mutex::new(HashMap::new()),
             detach_count: AtomicU64::new(0),
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
         }
+    }
+
+    /// PRD #92 F9 followup #1: borrow (or lazily create) the per-pane
+    /// dispatch mutex for a given `pane_id_env`. Callers hold this lock
+    /// across the entire respawn+write window of a `clear = true`
+    /// delegate so two concurrent same-pane delegates can't race the
+    /// `registry.remove` + `spawn_agent` gap inside
+    /// [`AgentPtyRegistry::respawn_agent_for_pane`].
+    pub fn pane_dispatch_lock(&self, pane_id_env: &str) -> Arc<AsyncMutex<()>> {
+        let mut map = self.dispatch_mutexes.lock().unwrap();
+        map.entry(pane_id_env.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 
     /// PRD #93 round-2 reviewer REV-1: borrow the change-notify the daemon's
@@ -1143,6 +1190,15 @@ impl AgentPtyRegistry {
         // outside the variant set at deserialization.
         let agent_type = opts.agent_type.take();
 
+        // PRD #92 F9 followup #3 + #4: capture the full env vec and the
+        // requested PTY size BEFORE `spawn(opts)` consumes the options.
+        // Stored on `RunningAgent` so [`respawn_agent_for_pane`] can
+        // re-apply them to the fresh child instead of resetting to a
+        // leaner env and the 24×80 default geometry.
+        let captured_env = opts.env.clone();
+        let captured_rows = opts.rows;
+        let captured_cols = opts.cols;
+
         // Defense in depth: `spawn` already protects the child internally
         // via its own `ChildGuard`, so any failure or panic *inside* spawn
         // cannot orphan the child. This outer `PtyGuard` covers the
@@ -1214,6 +1270,9 @@ impl AgentPtyRegistry {
             cwd: cwd_stored,
             tab_membership,
             agent_type,
+            spawn_env: captured_env,
+            pty_rows: captured_rows,
+            pty_cols: captured_cols,
             exited,
         };
 
@@ -1406,19 +1465,31 @@ impl AgentPtyRegistry {
             master,
             writer,
             bus: _,
-            pane_id_env: captured_pane_id_env,
+            // The `pane_id_env` lives inside `spawn_env` already (the
+            // initial `spawn_agent` call placed it there), so we don't
+            // re-inject it explicitly on respawn — see step 3 below.
+            pane_id_env: _captured_pane_id_env,
             display_name,
             cwd,
             tab_membership,
             agent_type,
+            spawn_env,
+            pty_rows,
+            pty_cols,
             exited: _,
         } = removed;
 
-        // Drop the master + writer first so the slave half closes on
-        // its own (cat / shells / most agents exit cleanly on slave
-        // EOF). The terminate helper still escalates to SIGKILL if the
-        // child doesn't honor that — so a buggy agent that hangs on
-        // slave EOF is still reaped within the grace window.
+        // Drop this reference to the writer Arc; the slave half closes
+        // when the last reference is dropped (typically immediately,
+        // unless a concurrent write is in flight against the old
+        // `pane_id_env`). PRD #92 F9 followup #9: the writer is an
+        // `Arc<AsyncMutex<...>>` and `write_to_pane` clones the Arc
+        // before awaiting the inner lock, so a write that started
+        // before the respawn's atomic remove still holds a clone and
+        // delays the slave-close until it finishes its CR write and
+        // drops the clone. The terminate helper still escalates to
+        // SIGKILL if the child hangs on slave EOF, so a buggy agent
+        // is still reaped within the grace window.
         drop(writer);
         drop(master);
 
@@ -1434,31 +1505,41 @@ impl AgentPtyRegistry {
         })
         .await;
         if let Err(join_err) = join {
+            // PRD #92 F9 followup #8: the spawn_blocking task ran the
+            // SIGTERM → poll → SIGKILL sequence in
+            // `terminate_child_with_grace_and_wait`. A `JoinError` here
+            // means the closure panicked or was cancelled before
+            // returning; the SIGKILL backstop inside the helper only
+            // fires if the closure reached that line. The helper is
+            // panic-free in practice (no panic-prone calls in its
+            // body), so this branch is a defensive log — the child
+            // may or may not have been reaped depending on where the
+            // panic landed.
             tracing::warn!(
                 pane_id = %pane_id_env,
                 error = %join_err,
                 "respawn: spawn_blocking for terminate panicked or was cancelled; \
-                 proceeding with fresh spawn anyway (the SIGKILL backstop inside the \
-                 helper still fired if the join was a panic on the SIGTERM phase)"
+                 proceeding with fresh spawn anyway"
             );
         }
 
-        // Step 3: spawn a fresh agent with the captured identity. The
-        // `DOT_AGENT_DECK_PANE_ID` env carries the same value the old
-        // child had, so `write_to_pane(pane_id_env)` keeps routing to
-        // this pane after the respawn — and the TUI's pane card
-        // stays bound to the same display id.
-        let mut env = Vec::new();
-        if let Some(ref id) = captured_pane_id_env {
-            env.push((DOT_AGENT_DECK_PANE_ID.to_string(), id.clone()));
-        }
+        // Step 3: spawn a fresh agent with the captured identity. PRD
+        // #92 F9 followup #3 + #4: replay the full env from the
+        // original spawn (including `DOT_AGENT_DECK_PANE_ID` and any
+        // role-supplied extras) and the last-known PTY size so the
+        // fresh child comes up with the same environment + geometry
+        // as its predecessor. Earlier versions reconstructed a minimal
+        // env containing only `DOT_AGENT_DECK_PANE_ID` and pinned the
+        // size to the 24×80 default, silently dropping role-supplied
+        // env vars and briefly mis-wrapping the new agent's first
+        // output until the TUI's next resize landed.
         let opts = SpawnOptions {
             command: Some(command),
             cwd: cwd.as_deref(),
             display_name: display_name.as_deref(),
-            rows: 24,
-            cols: 80,
-            env,
+            rows: pty_rows,
+            cols: pty_cols,
+            env: spawn_env,
             tab_membership,
             agent_type,
         };
@@ -1495,10 +1576,10 @@ impl AgentPtyRegistry {
         }
         let rows = rows.min(PTY_RESIZE_DIM_MAX);
         let cols = cols.min(PTY_RESIZE_DIM_MAX);
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let agent = inner
             .agents
-            .get(id)
+            .get_mut(id)
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
         agent
             .master
@@ -1508,7 +1589,28 @@ impl AgentPtyRegistry {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| AgentPtyError::Resize(e.to_string()))
+            .map_err(|e| AgentPtyError::Resize(e.to_string()))?;
+        // PRD #92 F9 followup #4: refresh the captured size so a
+        // subsequent respawn replays the latest geometry, not the
+        // spawn-time default.
+        agent.pty_rows = rows;
+        agent.pty_cols = cols;
+        Ok(())
+    }
+
+    /// PRD #92 F9 followup #4: last-known PTY size for the agent
+    /// attached to `pane_id_env`, captured at spawn and refreshed by
+    /// [`resize`]. Returns `None` if no live agent matches the
+    /// pane id. Used by tests; production callers don't need this.
+    pub fn pty_size_for_pane(&self, pane_id_env: &str) -> Option<(u16, u16)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .values()
+            .find(|a| {
+                a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+            })
+            .map(|a| (a.pty_rows, a.pty_cols))
     }
 
     /// Take just the current scrollback snapshot for an agent.

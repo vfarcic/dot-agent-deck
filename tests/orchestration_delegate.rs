@@ -1340,6 +1340,16 @@ command = "cat -u"
     // try_wait for up to AGENT_TERMINATE_GRACE (3 s) so the kernel
     // has definitively reaped the old child by the time the respawn
     // returns.
+    //
+    // PRD #92 F9 followup #6: theoretical PID-reuse race. After
+    // `wait()` reaps the old PID, the kernel could in principle
+    // reassign that integer to an unrelated process before
+    // `pid_is_alive` polls it, in which case the assertion would
+    // observe "alive" and the test would falsely fail. Stable in
+    // practice — the test machine's PID space rolls slowly enough
+    // that reuse within the same test tick is improbable — but if
+    // this ever flakes, switch to capturing the exit status via a
+    // child-tracking test hook rather than `kill(pid, 0)`.
     assert!(
         !pid_is_alive(pid_initial),
         "old child pid {pid_initial} is still alive after respawn — \
@@ -1517,17 +1527,27 @@ clear = false
     );
 }
 
-/// PRD #92 F9 context sanity check: after a `clear = true` respawn,
-/// the new agent has NO memory of bytes written to the previous
-/// agent. With `cat -u` as the test agent, "memory" surfaces as
-/// scrollback — the old agent echoed everything it received to its
-/// stdout, and that scrollback was tied to the old agent's bus.
-/// When the respawn rotates the agent id, the new bus is empty —
-/// proving the daemon-side broadcast scrollback follows the agent
-/// process lifetime (not the pane id). A real Claude / opencode
-/// agent would lose conversation history the same way.
+/// PRD #92 F9 bus-rotation sanity check: after a `clear = true`
+/// respawn, the new agent gets a fresh broadcast bus that doesn't
+/// inherit the previous agent's scrollback. With `cat -u` as the
+/// test agent, "memory" is just bytes the old agent echoed back to
+/// its stdout — those bytes were captured by the old bus and the
+/// new bus is empty. This is a useful regression guard against
+/// refactors that would key the bus off `pane_id_env` (which the
+/// respawn preserves) instead of the agent process itself.
+///
+/// PRD #92 F9 followup #7: renamed from
+/// `delegate_respawn_clears_agent_scrollback_when_role_clear_is_true`.
+/// The old name implied this test proved an LLM's conversation
+/// history clears across `clear = true`, which it does NOT — the
+/// `cat -u` stub has no concept of context, and real LLM agents
+/// (claude with `--continue`, opencode with session autoload) may
+/// reload their previous session on startup, defeating the
+/// agent-process-reset semantics of `clear = true`. The audit doc
+/// covers that limitation; this test is purely the bus-rotation
+/// invariant.
 #[tokio::test]
-async fn delegate_respawn_clears_agent_scrollback_when_role_clear_is_true() {
+async fn delegate_respawn_rotates_agent_bus_when_role_clear_is_true() {
     let daemon = spawn_daemon().await;
     let cwd_dir = tempfile::tempdir().unwrap();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
@@ -1619,11 +1639,572 @@ command = "cat -u"
     .await;
 
     // The new agent's scrollback must NOT contain the pre-respawn
-    // marker — its bus was fresh-allocated by the respawn.
+    // marker — its bus was fresh-allocated by the respawn. This is
+    // bus-rotation, not LLM-context-clear: the bytes the previous
+    // process echoed into the old bus stay there until that
+    // RunningAgent is dropped, and the new RunningAgent gets its
+    // own empty AgentBus. See the test-level doc comment for why a
+    // real LLM agent's behavior is out of scope here.
     assert!(
         !String::from_utf8_lossy(&new_snap).contains("PRE_RESPAWN_SCROLLBACK_MARKER"),
         "fresh agent must not inherit the previous agent's scrollback; \
          got snapshot = {:?}",
         String::from_utf8_lossy(&new_snap)
+    );
+}
+
+/// PRD #92 F9 followup #1: two concurrent `clear = true` delegate
+/// signals targeting the same worker pane must both reach the
+/// worker. Pre-fix, the hook loop spawned a fresh tokio task per
+/// accepted connection and `handle_delegate` only took
+/// `state.read()` — so two parallel connections could race the
+/// `registry.remove` + `spawn_agent` window inside
+/// `respawn_agent_for_pane`: the second call observed `NotFound`,
+/// logged a warn, and silently dropped its task prompt.
+///
+/// The fix adds a per-pane dispatch mutex acquired at the entry of
+/// the worker-loop in `handle_delegate`. With the mutex, the two
+/// delegates serialize: both respawns succeed sequentially, both
+/// task file writes land, and the second delegate's content
+/// reaches the final fresh agent's scrollback.
+#[tokio::test]
+async fn concurrent_clear_true_delegates_both_reach_worker() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let config_toml = r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "cat -u"
+"#;
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let coder_initial =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+    let pid_initial = daemon
+        .pty_registry
+        .child_pid(&coder_initial)
+        .expect("freshly-spawned coder has a pid");
+
+    // Fire two delegates in parallel via independent connections.
+    // Each `send_delegate` opens its own UnixStream, which is the
+    // multi-connection shape the daemon's per-connection task model
+    // races on (run_hook_loop spawns a fresh tokio task per accept).
+    let hook_a = daemon.hook_path.clone();
+    let hook_b = daemon.hook_path.clone();
+    let send_a = tokio::spawn(async move {
+        send_delegate(
+            &hook_a,
+            &DelegateSignal {
+                pane_id: "orch-pane".into(),
+                task: "task ALPHA".into(),
+                to: vec!["coder".into()],
+                timestamp: Utc::now(),
+            },
+        )
+        .await;
+    });
+    let send_b = tokio::spawn(async move {
+        send_delegate(
+            &hook_b,
+            &DelegateSignal {
+                pane_id: "orch-pane".into(),
+                task: "task BRAVO".into(),
+                to: vec!["coder".into()],
+                timestamp: Utc::now(),
+            },
+        )
+        .await;
+    });
+    let (a, b) = tokio::join!(send_a, send_b);
+    a.unwrap();
+    b.unwrap();
+
+    // Both delegates serialize behind the per-pane mutex. The first
+    // respawn rolls the PID, the second respawn rolls it again. We
+    // assert by waiting for the PID to differ from `pid_initial`
+    // AND from the next observed value — i.e. two distinct rolls.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut pid_after_first: u32 = 0;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(id) = agent_id_for_pane(&daemon.pty_registry, "coder-pane")
+            && let Some(pid) = daemon.pty_registry.child_pid(&id)
+            && pid != pid_initial
+        {
+            pid_after_first = pid;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert_ne!(
+        pid_after_first, 0,
+        "first respawn never rolled the coder pid past {pid_initial}"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut pid_after_second: u32 = 0;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(id) = agent_id_for_pane(&daemon.pty_registry, "coder-pane")
+            && let Some(pid) = daemon.pty_registry.child_pid(&id)
+            && pid != pid_after_first
+            && pid != pid_initial
+        {
+            pid_after_second = pid;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert_ne!(
+        pid_after_second, 0,
+        "second respawn never rolled the coder pid past {pid_after_first} — \
+         the second concurrent delegate's respawn was silently dropped (race \
+         in handle_delegate, mutex regression?)"
+    );
+
+    // Both task file writes ran; the file's content reflects the
+    // second-to-run delegate. We don't pin which of A / B that was
+    // — connection scheduling is arbitrary. The point is that
+    // BOTH bodies were written at some point; the surviving content
+    // is the one written last.
+    let task_file = std::path::Path::new(&cwd).join(".dot-agent-deck/worker-task-coder.md");
+    let body = std::fs::read_to_string(&task_file).unwrap();
+    assert!(
+        body == "task ALPHA" || body == "task BRAVO",
+        "task file must contain one of the two delegated bodies; got: {body}"
+    );
+
+    // The post-second-respawn agent's scrollback must contain the
+    // worker-task one-liner — proving the second delegate's prompt
+    // write actually reached the new agent (the bug pre-fix was
+    // that the second delegate's write fell through with NotFound).
+    let final_id =
+        agent_id_for_pane(&daemon.pty_registry, "coder-pane").expect("coder pane has live agent");
+    let _ = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &final_id,
+        "Read .dot-agent-deck/worker-task-coder.md",
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+/// PRD #92 F9 followup #2: when a `clear = true` respawn fails
+/// AFTER the terminate phase already disposed of the previous
+/// child (the most-likely cause: a role config whose `command`
+/// no longer resolves), the operator must see a visible error in
+/// the orchestrator pane scrollback — not just two log lines
+/// somewhere off-screen.
+///
+/// We stub the failure by writing a role config whose `coder`
+/// command points at a non-existent path. The initial coder pane
+/// is spawned via the test harness with `cat -u`, so it comes up
+/// successfully; the first delegate then triggers a respawn whose
+/// `spawn_agent` step fails because the new command can't be
+/// exec'd. The error must surface in the orchestrator's scrollback.
+#[tokio::test]
+async fn respawn_failure_surfaces_visible_error_in_orchestrator_pane() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    // The coder role's command points at a path that doesn't exist
+    // on disk — `portable_pty::spawn_command` returns Err on
+    // `execvp`, which propagates as `AgentPtyError::Spawn` out of
+    // `respawn_agent_for_pane`.
+    let config_toml = r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "/nonexistent/dot-agent-deck-test-bin-12345"
+"#;
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let orch_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    // Initial coder still spawns successfully (test harness uses
+    // `cat -u`, not the role config's bogus command).
+    let _coder_initial =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "task that will trigger a doomed respawn".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    // The orchestrator pane's scrollback must contain the visible
+    // notice. `cat -u` echoes whatever lands on its stdin back to
+    // stdout, so the notice arrives in the bus via the standard
+    // echo path.
+    let snap = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &orch_id,
+        "respawn failed for role 'coder'",
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&snap).contains("respawn failed for role 'coder'"),
+        "orchestrator pane scrollback must include the respawn-failure notice; \
+         snapshot = {:?}",
+        String::from_utf8_lossy(&snap)
+    );
+}
+
+/// PRD #92 F9 followup #3: a `clear = true` respawn must preserve
+/// the full env vec that was passed to the original `spawn_agent`,
+/// not just `DOT_AGENT_DECK_PANE_ID`. Without the capture, any
+/// role-supplied extra env var (or anything the orchestrator
+/// passed through at StartAgent time) silently disappeared on
+/// respawn — the new agent ran with a leaner env than the
+/// original.
+///
+/// The test agent is `sh -c 'echo MARKER=$MY_RESPAWN_VAR; cat -u'`
+/// — on each spawn it prints the value of `MY_RESPAWN_VAR` and
+/// then becomes a passthrough echo (so the rest of the dispatch
+/// flow still works). We pass `MY_RESPAWN_VAR=preserve-me-please`
+/// at the initial spawn; after the respawn, the new agent's
+/// scrollback must show `MARKER=preserve-me-please`.
+#[tokio::test]
+async fn respawn_preserves_original_spawn_env() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let marker_value = "preserve-me-please";
+    let role_command = "sh -c 'echo MARKER=$MY_RESPAWN_VAR; exec cat -u'";
+
+    // Role config: coder's command is the env-printing shell. The
+    // initial spawn uses the same command, so the marker appears on
+    // both generations.
+    let config_toml = format!(
+        r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "{role_command}"
+"#
+    );
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    // Spawn the coder directly via DaemonClient so we can inject
+    // the extra env var. `start_role_pane` only passes
+    // DOT_AGENT_DECK_PANE_ID; we want both.
+    let client = DaemonClient::new(daemon.attach_path.clone());
+    let coder_initial = client
+        .start_agent(StartAgentOptions {
+            command: Some(role_command.to_string()),
+            cwd: Some(cwd.clone()),
+            display_name: Some("coder".to_string()),
+            rows: 24,
+            cols: 80,
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), "coder-pane".to_string()),
+                ("MY_RESPAWN_VAR".to_string(), marker_value.to_string()),
+            ],
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "tdd-cycle".to_string(),
+                role_index: 1,
+                role_name: "coder".to_string(),
+                is_start_role: false,
+                orchestration_cwd: Some(cwd.clone()),
+            }),
+            agent_type: None,
+        })
+        .await
+        .expect("start_agent for env-capture coder");
+
+    // Initial spawn observed the marker.
+    let _ = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &coder_initial,
+        &format!("MARKER={marker_value}"),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Delegate triggers a respawn; the new agent must see the same
+    // marker — i.e. the captured env was replayed.
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "task".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut coder_after = String::new();
+    while tokio::time::Instant::now() < deadline {
+        if let Some(id) = agent_id_for_pane(&daemon.pty_registry, "coder-pane")
+            && id != coder_initial
+        {
+            coder_after = id;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        !coder_after.is_empty(),
+        "respawn never rotated the agent id"
+    );
+
+    let snap = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &coder_after,
+        &format!("MARKER={marker_value}"),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&snap).contains(&format!("MARKER={marker_value}")),
+        "respawned agent must see the same env as the initial spawn; \
+         snapshot = {:?}",
+        String::from_utf8_lossy(&snap)
+    );
+}
+
+/// PRD #92 F9 followup #4: a `clear = true` respawn must replay
+/// the last-known PTY size, not reset to the 24×80 default.
+/// Without the capture, the new agent's first output briefly
+/// wrapped or truncated until the TUI's next resize call landed.
+#[tokio::test]
+async fn respawn_preserves_last_known_pty_size() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let config_toml = r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "cat -u"
+"#;
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let coder_initial =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    // Resize the coder pane to a non-default geometry.
+    daemon
+        .pty_registry
+        .resize(&coder_initial, 40, 100)
+        .expect("resize should succeed");
+    assert_eq!(
+        daemon.pty_registry.pty_size_for_pane("coder-pane"),
+        Some((40, 100)),
+        "resize should update the captured size"
+    );
+
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "task that triggers respawn".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    // Wait for the respawn to land.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut coder_after = String::new();
+    while tokio::time::Instant::now() < deadline {
+        if let Some(id) = agent_id_for_pane(&daemon.pty_registry, "coder-pane")
+            && id != coder_initial
+        {
+            coder_after = id;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        !coder_after.is_empty(),
+        "respawn never rotated the agent id"
+    );
+
+    // The new agent must come up at the captured size, not 24×80.
+    assert_eq!(
+        daemon.pty_registry.pty_size_for_pane("coder-pane"),
+        Some((40, 100)),
+        "respawned PTY must come up at the captured size (40×100), not the default"
+    );
+}
+
+/// PRD #92 F9 followup #5: when the role config lookup returns
+/// None for a `clear = true` delegate target (typically because
+/// the user edited `.dot-agent-deck.toml` mid-orchestration and
+/// the role name diverged), the operator's intended respawn is
+/// silently dropped. The fix is observability: a `tracing::warn!`
+/// so the cause is at least discoverable in the daemon log. This
+/// test exercises the BEHAVIOR (no respawn happens, prompt still
+/// lands) — the warn itself is covered by `cargo test -- --nocapture`
+/// inspection or a tracing-test layer in a future suite, since
+/// adding a tracing-test dev-dep just for this test would
+/// overweight the dependency footprint.
+#[tokio::test]
+async fn delegate_with_missing_role_config_skips_respawn_and_still_delivers_prompt() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    // Config: only the orchestrator role is listed. The coder pane
+    // is spawned manually via the test harness (which doesn't
+    // require a config), so pane_role_map has "coder" but
+    // lookup_orchestration_role("coder") returns None.
+    let config_toml = r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+"#;
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let coder_initial =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+    let pid_initial = daemon
+        .pty_registry
+        .child_pid(&coder_initial)
+        .expect("coder has a pid");
+
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "task with missing role config".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    // Prompt still lands — the no-respawn path runs write_to_pane
+    // against the existing (unchanged) coder agent.
+    let _ = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &coder_initial,
+        "Read .dot-agent-deck/worker-task-coder.md",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // No respawn happened — the PID is unchanged.
+    let pid_after = daemon
+        .pty_registry
+        .child_pid(&coder_initial)
+        .expect("coder still alive");
+    assert_eq!(
+        pid_initial, pid_after,
+        "missing role_config must NOT respawn (the warn fired and we fell through)"
     );
 }

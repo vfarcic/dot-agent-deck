@@ -309,6 +309,7 @@ impl AppState {
             }
 
             let safe_name = sanitize_role_name(target_role);
+            let orchestrator_pane_id = signal.pane_id.clone();
             // CodeRabbit (PRD #93 round-9): the task file lands in the
             // *worker's* cwd, not the orchestrator's. Earlier rounds
             // captured `pane_cwd_map[&signal.pane_id]` once outside the
@@ -318,6 +319,22 @@ impl AppState {
             // Per-target lookup also means the per-worker file write
             // happens once per pane and not once per role-name + reused.
             for pane_id in target_panes {
+                // PRD #92 F9 followup #1: hold the per-pane dispatch
+                // mutex across the entire respawn+write window so two
+                // concurrent same-pane delegates (which the hook
+                // loop's per-connection serialization does NOT
+                // prevent — each accepted connection spawns its own
+                // task) can't race the `registry.remove` +
+                // `spawn_agent` gap inside `respawn_agent_for_pane`.
+                // We acquire unconditionally (not just on
+                // `clear == true`) because it's cheap and removes the
+                // race entirely: even a `clear = false` delegate that
+                // overlaps with a `clear = true` one on the same
+                // pane gets sequenced rather than mixing with the
+                // respawn.
+                let dispatch_mutex = registry.pane_dispatch_lock(&pane_id);
+                let _dispatch_guard = dispatch_mutex.lock().await;
+
                 let cwd = self.pane_cwd_map.get(&pane_id).cloned();
                 // CodeRabbit (PRD #93 round-9): look the role config up
                 // by `(worker cwd, orchestration name, target role)` so
@@ -336,6 +353,25 @@ impl AppState {
                     }
                     _ => None,
                 };
+                // PRD #92 F9 followup #5: when we have an
+                // orchestration context (cwd + orchestration name) but
+                // the role lookup returned None, the operator's
+                // intended `clear = true` is silently dropped — the
+                // role config no longer exists, almost always because
+                // the user edited `.dot-agent-deck.toml` mid-session
+                // and the role name diverged. Emit a warn so the cause
+                // is at least discoverable in the daemon log; the
+                // fall-through to the no-respawn path is preserved
+                // because we have no `command` to spawn anyway.
+                if role_config.is_none() && cwd.is_some() && orchestration.is_some() {
+                    warn!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        "delegate: role_config not found for role; \
+                         clear=true respawn intent dropped — \
+                         did the role name change in .dot-agent-deck.toml?"
+                    );
+                }
                 let prompt_template = role_config
                     .as_ref()
                     .and_then(|r| r.prompt_template.as_deref());
@@ -408,31 +444,72 @@ impl AppState {
                         .await
                     {
                         Ok(_new_id) => {
+                            // PRD #92 F9 followup #11: log the wait
+                            // up front so users correlating a "first
+                            // prompt landed inside the agent's
+                            // pre-render banner" report to the
+                            // daemon log can see the
+                            // RESPAWN_READY_DELAY in flight. The 250
+                            // ms constant is fine for most agents
+                            // (claude, codex, opencode); a slow
+                            // banner may still be racing when the
+                            // prompt write lands, but the visual
+                            // glitch is cosmetic — the prompt
+                            // itself gets through.
                             tracing::debug!(
                                 role = %target_role,
                                 pane_id = %pane_id,
+                                delay_ms = RESPAWN_READY_DELAY.as_millis() as u64,
                                 "delegate: respawned worker agent for clear=true; \
-                                 waiting RESPAWN_READY_DELAY before prompt write"
+                                 sleeping RESPAWN_READY_DELAY before prompt write"
                             );
                             tokio::time::sleep(RESPAWN_READY_DELAY).await;
                         }
                         Err(e) => {
-                            // The most likely failure mode is "no
-                            // agent registered for this pane_id" —
-                            // e.g. the worker crashed and was reaped
-                            // before this delegate arrived. Falling
-                            // through to write_to_pane in that state
-                            // will fail too and the warn there is
-                            // the user-facing error; logging here
-                            // adds context about WHY the respawn
-                            // path didn't run.
+                            // PRD #92 F9 followup #2: the respawn
+                            // failed AFTER the terminate phase
+                            // already disposed of the previous
+                            // child. Without surfacing the error to
+                            // the operator, the worker pane is left
+                            // with no live agent, the subsequent
+                            // `write_to_pane` also fails with
+                            // `NotFound`, and the user sees nothing
+                            // in the TUI — just two log lines
+                            // somewhere off-screen. Write a visible
+                            // notice into the orchestrator pane's
+                            // scrollback so the operator can act on
+                            // it. Failure to write the notice (e.g.
+                            // because the orchestrator pane itself
+                            // is gone) is itself logged but cannot
+                            // be surfaced any louder than that.
                             warn!(
                                 pane_id = %pane_id,
                                 role = %target_role,
                                 error = %e,
                                 "delegate: respawn for clear=true failed; \
-                                 falling back to direct prompt write"
+                                 surfacing error in orchestrator pane and \
+                                 skipping the subsequent prompt write"
                             );
+                            let notice = format!(
+                                "⚠ respawn failed for role '{target_role}' \
+                                 on pane {pane_id}: {e}"
+                            );
+                            if let Err(write_err) =
+                                registry.write_to_pane(&orchestrator_pane_id, &notice).await
+                            {
+                                warn!(
+                                    pane_id = %orchestrator_pane_id,
+                                    role = %target_role,
+                                    error = %write_err,
+                                    "delegate: failed to surface respawn error in \
+                                     orchestrator pane scrollback"
+                                );
+                            }
+                            // Skip the post-respawn prompt write —
+                            // there is no live worker agent on this
+                            // pane to receive it, and write_to_pane
+                            // would just log a second `NotFound`.
+                            continue;
                         }
                     }
                 }
