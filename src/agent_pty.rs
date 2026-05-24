@@ -1517,11 +1517,14 @@ impl AgentPtyRegistry {
     ///
     /// The new agent comes up at a default 24×80 PTY size; the TUI's
     /// next `resize` call (sent on attach / render) corrects it to
-    /// the client's actual geometry. A brief delay before writing
-    /// the post-respawn prompt is the caller's responsibility — the
-    /// daemon doesn't peek into the new agent's stdout, so it can't
-    /// observe "ready" any better than a fixed wait. See
-    /// [`crate::state::RESPAWN_READY_DELAY`].
+    /// the client's actual geometry. Deferring the post-respawn prompt
+    /// write until the freshly-spawned agent signals readiness is the
+    /// caller's responsibility — the daemon doesn't peek into the new
+    /// agent's stdout, so it can't observe "ready" directly here. The
+    /// dispatch path subscribes to the daemon-wide hook broadcast
+    /// before this call and waits for the new agent's `SessionStart`
+    /// event (10 s timeout fallback) — see
+    /// [`crate::state::SESSION_START_WAIT_TIMEOUT`].
     pub async fn respawn_agent_for_pane(
         &self,
         pane_id_env: &str,

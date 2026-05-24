@@ -37,7 +37,9 @@ use dot_agent_deck::agent_pty::{
 };
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
-use dot_agent_deck::event::{DaemonMessage, DelegateSignal, WorkDoneSignal};
+use dot_agent_deck::event::{
+    AgentEvent, AgentType, DaemonMessage, DelegateSignal, EventType, WorkDoneSignal,
+};
 use dot_agent_deck::state::{AppState, SharedState};
 
 mod common;
@@ -120,6 +122,33 @@ async fn send_work_done(hook_path: &PathBuf, signal: &WorkDoneSignal) {
     let mut stream = UnixStream::connect(hook_path).await.expect("connect hook");
     let msg = DaemonMessage::WorkDone(signal.clone());
     let mut json = serde_json::to_vec(&msg).unwrap();
+    json.push(b'\n');
+    stream.write_all(&json).await.unwrap();
+    stream.shutdown().await.unwrap();
+}
+
+/// PRD #92 F9 followup-6: inject a synthetic `SessionStart`
+/// `AgentEvent` for `pane_id` over the daemon's hook socket. Mirrors
+/// the wire shape a real agent's hook script would send. Used by the
+/// fast-path dispatch test to drive the post-respawn write off the
+/// 10 s timeout fallback and onto the event-observed path — a `cat -u`
+/// stub agent never emits `SessionStart` on its own, so the test has
+/// to forge it.
+async fn send_session_start(hook_path: &PathBuf, pane_id: &str) {
+    let event = AgentEvent {
+        session_id: format!("synthetic-{pane_id}"),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id: Some(pane_id.to_string()),
+    };
+    let mut stream = UnixStream::connect(hook_path).await.expect("connect hook");
+    let mut json = serde_json::to_vec(&event).unwrap();
     json.push(b'\n');
     stream.write_all(&json).await.unwrap();
     stream.shutdown().await.unwrap();
@@ -516,11 +545,17 @@ prompt_template = "You are the coder. Always run tests before finishing."
     // delegate triggers a respawn of the coder agent. The pre-respawn
     // agent id is stale by the time the prompt lands — key the wait
     // on the stable `pane_id_env` instead.
+    //
+    // PRD #92 F9 followup-6: the post-respawn write now waits for the
+    // new agent's `SessionStart` event (10 s timeout fallback).
+    // `cat -u` never emits `SessionStart`, so this test always lands
+    // on the fallback path — budget is 15 s (10 s wait + spawn / write
+    // latency + jitter).
     let _ = wait_for_in_pane_snapshot(
         &daemon.pty_registry,
         "coder-pane",
         "Read .dot-agent-deck/worker-task-coder.md",
-        Duration::from_secs(5),
+        Duration::from_secs(15),
     )
     .await;
 
@@ -621,11 +656,15 @@ prompt_template = "You are the coder for an unnamed orchestration."
     // PRD #92 F9: coder role defaults to `clear = true` so this
     // delegate respawns the agent. Use the pane-keyed wait so the
     // post-respawn rotation doesn't strand the assertion on a stale id.
+    //
+    // PRD #92 F9 followup-6: post-respawn write waits up to 10 s for
+    // the new agent's `SessionStart`; `cat -u` never emits one so we
+    // budget for the fallback path.
     let _ = wait_for_in_pane_snapshot(
         &daemon.pty_registry,
         "coder-pane-2",
         "Read .dot-agent-deck/worker-task-coder.md",
-        Duration::from_secs(5),
+        Duration::from_secs(15),
     )
     .await;
 
@@ -1317,8 +1356,10 @@ command = "cat -u"
     // Wait for the second-generation agent to come up. After respawn
     // the new agent id is rotated but the pane_id_env stays the
     // same, so we look up by pane_id_env. The 5 s budget covers
-    // SIGTERM grace (up to 3 s in pathological cases) plus the
-    // RESPAWN_READY_DELAY (250 ms) plus the spawn latency.
+    // SIGTERM grace (up to 3 s in pathological cases) plus the spawn
+    // latency; PRD #92 F9 followup-6 made dispatch async, so we also
+    // absorb the tokio::spawn boundary between `send_delegate` and
+    // the dispatch task starting.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut coder_agent_id_after_first = String::new();
     while tokio::time::Instant::now() < deadline {
@@ -1382,11 +1423,15 @@ command = "cat -u"
     // The first delegation's prompt must land in the NEW agent's
     // scrollback (write_to_pane_and_submit routes by pane_id_env
     // which the respawn preserved). Use the new agent_id for the snapshot.
+    //
+    // PRD #92 F9 followup-6: the prompt write follows a 10 s
+    // `SessionStart` wait that `cat -u` never satisfies, so allow for
+    // the fallback path (10 s + spawn / write latency + jitter).
     let _ = wait_for_in_snapshot(
         &daemon.pty_registry,
         &coder_agent_id_after_first,
         "Read .dot-agent-deck/worker-task-coder.md",
-        Duration::from_secs(5),
+        Duration::from_secs(15),
     )
     .await;
 
@@ -1638,11 +1683,15 @@ command = "cat -u"
 
     // Wait for the new prompt to land so we know the new agent is up
     // and dispatch has flushed.
+    //
+    // PRD #92 F9 followup-6: the post-respawn write waits up to 10 s
+    // for `SessionStart`; `cat -u` never emits one, so allow for the
+    // fallback path here.
     let new_snap = wait_for_in_snapshot(
         &daemon.pty_registry,
         &coder_agent_id_after,
         "Read .dot-agent-deck/worker-task-coder.md",
-        Duration::from_secs(5),
+        Duration::from_secs(15),
     )
     .await;
 
@@ -1811,15 +1860,131 @@ command = "cat -u"
     // worker-task one-liner — proving the second delegate's prompt
     // write actually reached the new agent (the bug pre-fix was
     // that the second delegate's write fell through with NotFound).
+    //
+    // PRD #92 F9 followup-6: dispatch is now async and the prompt
+    // write waits up to 10 s for `SessionStart` on each respawn. Two
+    // serialized clear=true delegates against `cat -u` therefore land
+    // through the fallback path twice, so the wait budget must cover
+    // 2 × 10 s plus the spawn / write latency. The exact landing time
+    // of the second prompt is the metric under test.
     let final_id =
         agent_id_for_pane(&daemon.pty_registry, "coder-pane").expect("coder pane has live agent");
     let _ = wait_for_in_snapshot(
         &daemon.pty_registry,
         &final_id,
         "Read .dot-agent-deck/worker-task-coder.md",
-        Duration::from_secs(5),
+        Duration::from_secs(25),
     )
     .await;
+}
+
+/// PRD #92 F9 followup-6: post-respawn dispatch is event-driven —
+/// the daemon defers the task-prompt write until the freshly-spawned
+/// agent emits a `SessionStart` hook event (10 s timeout fallback).
+/// This test pins the fast path: once `SessionStart` arrives, the
+/// prompt write happens promptly (well under the 10 s fallback).
+///
+/// A regression that re-introduces a fixed delay, or that wires the
+/// dispatch task to a stale receiver that misses the event, would
+/// have the prompt stuck behind the 10 s wait — easy to spot below.
+///
+/// The race avoidance under test: the dispatch task must subscribe
+/// to the hook-event broadcast BEFORE the respawn forks the new
+/// process. Otherwise a SessionStart sent immediately after respawn
+/// could land before the receiver attaches and the task would still
+/// hit the 10 s fallback. We drive that by waiting for the new
+/// agent_id to roll (which proves the respawn returned, which
+/// proves subscribe-before-spawn already ran) and only THEN
+/// injecting SessionStart.
+#[tokio::test]
+async fn delegate_clear_true_writes_prompt_promptly_after_session_start() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let config_toml = r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "cat -u"
+"#;
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let coder_initial =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "fast-path task".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    // Wait for the respawn to have happened. The dispatch task
+    // subscribed BEFORE this respawn returned, so injecting
+    // SessionStart any time after this point is safe.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match agent_id_for_pane(&daemon.pty_registry, "coder-pane") {
+            Some(id) if id != coder_initial => break,
+            _ => tokio::time::sleep(Duration::from_millis(15)).await,
+        }
+    }
+    assert!(
+        agent_id_for_pane(&daemon.pty_registry, "coder-pane").is_some_and(|id| id != coder_initial),
+        "respawn never rotated the agent id within 5 s"
+    );
+
+    // Forge a SessionStart for the coder pane. The dispatch task is
+    // currently sleeping inside `wait_for_session_start` against the
+    // daemon-wide hook broadcast; this event lands on every live
+    // receiver, including that task's, and unblocks the prompt write.
+    let send_at = tokio::time::Instant::now();
+    send_session_start(&daemon.hook_path, "coder-pane").await;
+
+    // The prompt should land promptly — well under the 10 s fallback.
+    // 3 s tolerates fs + PTY plumbing on a loaded CI box but stays
+    // sharply below the 10 s timeout, so a regression to the fallback
+    // path is unambiguous.
+    let _ = wait_for_in_pane_snapshot(
+        &daemon.pty_registry,
+        "coder-pane",
+        "Read .dot-agent-deck/worker-task-coder.md",
+        Duration::from_secs(3),
+    )
+    .await;
+    let elapsed = send_at.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "prompt landed at {elapsed:?} after SessionStart — \
+         expected the event-driven fast path (< 5 s) but the wait \
+         appears to be falling through the 10 s SessionStart timeout"
+    );
 }
 
 /// When a `clear = true` respawn fails
@@ -1912,19 +2077,21 @@ command = "/nonexistent/dot-agent-deck-test-bin-12345"
 /// A single delegate that fans out to N workers must respawn them
 /// concurrently, not sequentially. Pre-F9-followup-2, the per-target
 /// loop in `handle_delegate` was `.await`-sequential — an N-worker
-/// fan-out paid `(respawn + RESPAWN_READY_DELAY) × N` wall-clock. The
-/// fix replaces the loop with `futures_util::future::join_all` over
-/// per-pane futures so different panes' respawn+wait windows overlap.
-/// Per-pane work still serializes against itself via the per-pane
-/// dispatch mutex (see `concurrent_clear_true_delegates_both_reach_worker`).
+/// fan-out paid `(respawn + ready-wait) × N` wall-clock. The fix
+/// gives every target its own `tokio::spawn` (PRD #92 F9 followup-6)
+/// so different panes' respawn+wait windows overlap. Per-pane work
+/// still serializes against itself via the per-pane dispatch mutex
+/// (see `concurrent_clear_true_delegates_both_reach_worker`).
 ///
 /// The wall-clock signal is end-to-end "time until the prompt
 /// landed in every worker's new bus" rather than just "PID rolled":
-/// the PID rolls before the 250ms `RESPAWN_READY_DELAY` sleep, so a
-/// PID-roll race below ~30ms is too noisy to bound usefully on a
-/// fast machine. Each worker's full per-pane cost is therefore
-/// `respawn + RESPAWN_READY_DELAY (~250ms) + prompt write`, and a
-/// 3-pane sequential dispatch would pay ~750ms+ while concurrent
+/// the PID rolls early in dispatch (inside `respawn_agent_for_pane`),
+/// so a PID-roll race is too noisy to bound usefully on a fast
+/// machine. Each worker's full per-pane cost is therefore
+/// `respawn + SessionStart wait + prompt write`. With `cat -u`
+/// agents that never emit `SessionStart`, that wait always lands on
+/// the [`crate::state::SESSION_START_WAIT_TIMEOUT`] (10 s) fallback,
+/// so a 3-pane sequential regression would pay ~30 s while concurrent
 /// dispatch completes in roughly one pane's worth of that. We
 /// measure the 1-pane baseline first to set the upper bound;
 /// concurrent 3-pane must finish within 1.5 × baseline. A
@@ -2089,7 +2256,7 @@ command = "cat -u"
     }
 
     // Concurrent 3-pane fan-out completes in ~1 × the single-pane
-    // baseline (each pane's RESPAWN_READY_DELAY + write overlaps).
+    // baseline (each pane's SessionStart wait + write overlaps).
     // Sequential 3-pane would be ~3 × baseline. 1.5 × is a tight
     // bound that catches a regression to sequential dispatch while
     // tolerating some CI scheduling jitter.

@@ -2,37 +2,34 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use tracing::warn;
 
 use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
-use crate::event::{AgentEvent, AgentType, DelegateSignal, EventType, WorkDoneSignal};
+use crate::event::{
+    AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType, WorkDoneSignal,
+};
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
 const MAX_RECENT_EVENTS: usize = 50;
 const MAX_FIRST_PROMPTS: usize = 3;
 
-/// PRD #92 F9: fixed delay between a `clear = true` respawn and the
-/// post-respawn prompt write. The freshly-spawned agent's TUI may
-/// still be initializing (drawing its banner, opening its session
-/// store, hooking SIGWINCH); writing the prompt the moment
-/// `spawn_agent` returns can land bytes before the agent is reading
-/// from stdin, in which case the prompt is dropped on the floor or
-/// landed inside an unrendered prompt box.
+/// PRD #92 F9 followup-6: how long the post-respawn dispatch task
+/// waits for the freshly-spawned agent to emit a `SessionStart` hook
+/// event before falling back to writing the prompt anyway.
 ///
-/// We can't peek into the new agent's stdout from the daemon to
-/// observe "ready" (the bus is consumed by the TUI subscriber, not
-/// us). 250 ms is a conservative empirical floor: most CLI agents
-/// (claude, codex, gemini, opencode, a plain `cat -u`) finish their
-/// startup faster than that, and the cost to dispatch latency is
-/// trivial against a typical task that runs for minutes. The
-/// baseline TUI dispatch path (`2fc39c3:src/ui.rs::process_pending_dispatches`)
-/// used a richer scheme — wait for `SessionStart` then fall back to
-/// 10 s — but that relied on the TUI seeing hook events directly,
-/// machinery the daemon-side flow doesn't have here. A fixed delay
-/// trades the SessionStart fast-path for simplicity.
-const RESPAWN_READY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+/// Restores the pre-daemon baseline (`2fc39c3:src/ui.rs::process_pending_dispatches`)
+/// which deferred the task-prompt write until `SessionStart` arrived
+/// (10 s timeout fallback). The F9 fixed-delay shortcut
+/// (`RESPAWN_READY_DELAY = 250 ms`) was empirically too short for
+/// Claude Code's TUI boot sequence — bytes landed mid-init and got
+/// dropped on the floor.
+///
+/// Agents that never emit `SessionStart` (e.g. `cat -u` in tests, or
+/// agent runtimes without dot-agent-deck's hooks installed) still get
+/// their prompt — just delayed by `SESSION_START_WAIT_TIMEOUT`.
+const SESSION_START_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -171,6 +168,290 @@ fn lookup_orchestration_role(
     orch.roles.into_iter().find(|r| r.name == role_name)
 }
 
+/// PRD #92 F9 followup-6: block until the daemon's hook broadcast
+/// surfaces a `SessionStart` event for `pane_id`, or `timeout`
+/// elapses. The caller is expected to have called `event_tx.subscribe()`
+/// **before** spawning the new process — otherwise a fast-booting
+/// agent's `SessionStart` could land on the broadcast channel and be
+/// missed by a receiver that attached too late.
+///
+/// `Lagged` is treated as "keep polling" rather than fatal: a slow
+/// dispatch task that fell behind the daemon's event volume still
+/// wakes up on the next event in the ring, and a SessionStart that
+/// happened to fall off the back of the ring is functionally
+/// equivalent to "we missed it" — the timeout path covers that.
+/// `Closed` only fires when the daemon-wide sender is dropped (i.e.
+/// the daemon itself is shutting down), in which case there's nothing
+/// to wait for.
+///
+/// Returns `true` when SessionStart was observed, `false` on timeout
+/// or sender closure. The boolean isn't currently consulted at the
+/// call site — the dispatch path writes the prompt regardless, matching
+/// the baseline `process_pending_dispatches` semantics — but it's
+/// returned so future telemetry / tracing can distinguish "fast path"
+/// from "fallback".
+async fn wait_for_session_start(
+    rx: &mut broadcast::Receiver<BroadcastMsg>,
+    pane_id: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+            return false;
+        };
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(BroadcastMsg::Event(event))) => {
+                if event.event_type == EventType::SessionStart
+                    && event.pane_id.as_deref() == Some(pane_id)
+                {
+                    return true;
+                }
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => return false,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Per-target body of [`AppState::handle_delegate`], factored out so
+/// each target runs in its own `tokio::spawn`. Owns all the inputs it
+/// needs (no `&self` / `&AppState` borrows) so the spawn future is
+/// `'static`.
+///
+/// Holds the per-pane dispatch mutex across the entire respawn +
+/// post-respawn prompt write, writes the worker task file to the
+/// worker's cwd, optionally respawns the worker agent (per the role's
+/// `clear` flag) and then writes the prompt one-liner.
+///
+/// On `clear = true`, this function subscribes to the daemon-wide
+/// hook-event broadcast BEFORE calling
+/// [`AgentPtyRegistry::respawn_agent_for_pane`] — the receiver
+/// attaches to `event_tx` before the new process is forked, so a
+/// fast-booting agent's `SessionStart` lands in the receiver's queue.
+/// Then it waits up to [`SESSION_START_WAIT_TIMEOUT`] for that event;
+/// on timeout, the prompt is written anyway (mirroring the pre-daemon
+/// TUI baseline `2fc39c3:src/ui.rs::process_pending_dispatches`,
+/// which fell back at 10 s for agents that don't emit
+/// `SessionStart`).
+///
+/// The per-pane dispatch mutex (acquired unconditionally — see
+/// [`AgentPtyRegistry::pane_dispatch_lock`]) closes the
+/// `registry.remove` + `spawn_agent` race window inside
+/// [`AgentPtyRegistry::respawn_agent_for_pane`]: two concurrent
+/// connections submitting `Delegate` signals to the same worker pane
+/// no longer race the respawn — they serialize behind the mutex. We
+/// acquire unconditionally even when `clear = false` because it's
+/// cheap and removes the subtler "concurrent clear=true vs
+/// clear=false" interleave.
+///
+/// Errors are logged and dropped; the caller spawns each target
+/// independently so a single pane's failure (a missing role config,
+/// a respawn that couldn't exec the command, a write that hit a
+/// closed PTY) doesn't poison the other panes' dispatches.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_one_owned(
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    orchestration: Option<(String, String)>,
+    orchestrator_pane_id: String,
+    target_role: String,
+    pane_id: String,
+    task: String,
+    cwd: Option<String>,
+) {
+    let dispatch_mutex = registry.pane_dispatch_lock(&pane_id);
+    let _dispatch_guard = dispatch_mutex.lock().await;
+
+    // Look the role config up by `(worker cwd, orchestration name,
+    // target role)` so the per-role `prompt_template` wrapping is
+    // applied to the task body. Loading the config from disk on
+    // every delegate means a config edit between sessions takes
+    // effect on the next delegate without a pane respawn. `None`
+    // means "no template, fall back to the raw task".
+    let role_config = match (cwd.as_deref(), orchestration.as_ref()) {
+        (Some(c), Some((orch_name, _orch_cwd))) => {
+            lookup_orchestration_role(c, orch_name, &target_role)
+        }
+        _ => None,
+    };
+    // When we have an orchestration context (cwd + orchestration
+    // name) but the role lookup returned None, the operator's
+    // intended `clear = true` is silently dropped — the role
+    // config no longer exists, almost always because the user
+    // edited `.dot-agent-deck.toml` mid-session and the role name
+    // diverged. Emit a warn so the cause is at least discoverable
+    // in the daemon log; the fall-through to the no-respawn path
+    // is preserved because we have no `command` to spawn anyway.
+    if role_config.is_none() && cwd.is_some() && orchestration.is_some() {
+        warn!(
+            role = %target_role,
+            pane_id = %pane_id,
+            "delegate: role_config not found for role; \
+             clear=true respawn intent dropped — \
+             did the role name change in .dot-agent-deck.toml?"
+        );
+    }
+    let prompt_template = role_config
+        .as_ref()
+        .and_then(|r| r.prompt_template.as_deref());
+    let safe_name = sanitize_role_name(&target_role);
+    // The task file lands in the *worker's* cwd, not the
+    // orchestrator's — earlier rounds reused a single cwd capture
+    // across every worker and broke the moment two role panes
+    // were started in different cwds.
+    let task_body = if let Some(cwd) = cwd.as_deref() {
+        let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!(
+                dir = %dir.display(),
+                role = %target_role,
+                pane_id = %pane_id,
+                error = %e,
+                "delegate: failed to create task directory"
+            );
+        }
+        let file_path = dir.join(format!("worker-task-{safe_name}.md"));
+        let file_content = compose_worker_task_file(prompt_template, &task);
+        if let Err(e) = std::fs::write(&file_path, &file_content) {
+            warn!(
+                path = %file_path.display(),
+                role = %target_role,
+                pane_id = %pane_id,
+                error = %e,
+                "delegate: failed to write worker task file"
+            );
+        }
+        format!("Read .dot-agent-deck/worker-task-{safe_name}.md for your task.")
+    } else {
+        // Defensive: the daemon's StartAgent handler always
+        // records `pane_cwd_map` for orchestration panes (see
+        // `daemon_protocol.rs`), so this branch should be
+        // unreachable in production. Log and fall back to
+        // inlining the task body so the worker still gets
+        // *something* useful rather than a dangling reference.
+        warn!(
+            role = %target_role,
+            pane_id = %pane_id,
+            "delegate: no cwd recorded for worker pane — inlining task body"
+        );
+        compose_worker_task_file(prompt_template, &task)
+    };
+    // Honor the per-role `clear` flag from `.dot-agent-deck.toml`.
+    // `clear = true` terminates the existing worker child (SIGTERM
+    // with grace, then SIGKILL via
+    // `terminate_child_with_grace_and_wait`) and spawns a fresh
+    // one with the same `pane_id_env` and identity — the dashboard
+    // card stays put, the PID rolls over, and the agent's
+    // conversation history is gone. `clear = false` preserves the
+    // agent across delegations — no respawn, just the prompt
+    // write below. Missing role config defaults to no respawn:
+    // we have no `command` to spawn even if `clear` were `true`.
+    if let Some(role) = role_config.as_ref()
+        && role.clear
+    {
+        // CRITICAL race-avoidance (PRD #92 F9 followup-6): subscribe
+        // BEFORE the new process is forked. `broadcast::Receiver`
+        // attaches to future sends; creating it after `respawn_agent_for_pane`
+        // returns would race a fast-booting agent that emits
+        // `SessionStart` before our `subscribe()` call lands. With
+        // the order below the receiver is guaranteed to see every
+        // event sent after `event_tx.subscribe()` — including the
+        // new agent's first `SessionStart`.
+        let mut event_rx = event_tx.subscribe();
+        match registry
+            .respawn_agent_for_pane(&pane_id, &role.command)
+            .await
+        {
+            Ok(_new_id) => {
+                tracing::debug!(
+                    role = %target_role,
+                    pane_id = %pane_id,
+                    timeout_secs = SESSION_START_WAIT_TIMEOUT.as_secs(),
+                    "delegate: respawned worker agent for clear=true; \
+                     waiting for SessionStart on hook broadcast"
+                );
+                let observed =
+                    wait_for_session_start(&mut event_rx, &pane_id, SESSION_START_WAIT_TIMEOUT)
+                        .await;
+                if !observed {
+                    tracing::debug!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        timeout_secs = SESSION_START_WAIT_TIMEOUT.as_secs(),
+                        "delegate: SessionStart wait timed out; \
+                         writing prompt via fallback path"
+                    );
+                }
+            }
+            Err(e) => {
+                // The respawn failed AFTER the terminate phase
+                // already disposed of the previous child.
+                // Without surfacing the error to the operator,
+                // the worker pane is left with no live agent,
+                // the subsequent prompt write also fails
+                // with `NotFound`, and the user sees nothing in
+                // the TUI — just two log lines somewhere
+                // off-screen. The full error stays in the
+                // daemon log via the `tracing::warn!` below;
+                // the notice written into the orchestrator
+                // pane's scrollback is a high-level message so
+                // a stray filesystem path (or other detail
+                // from `AgentPtyError::Spawn`) doesn't leak
+                // into the orchestrator LLM's view. Using
+                // `write_to_pane_notice` (no SUBMIT_DELAY, LF
+                // tail instead of CR) means the notice forms a
+                // visible line in scrollback without an Enter
+                // — the orchestrator's LLM sees it as
+                // scrollback noise, not a user prompt to
+                // respond to.
+                warn!(
+                    pane_id = %pane_id,
+                    role = %target_role,
+                    error = %e,
+                    "delegate: respawn for clear=true failed; \
+                     surfacing high-level notice in orchestrator \
+                     pane and skipping the subsequent prompt write"
+                );
+                let notice = format!(
+                    "⚠ respawn failed for role '{target_role}' on pane \
+                     {pane_id} (see daemon log for details)"
+                );
+                if let Err(write_err) = registry
+                    .write_to_pane_notice(&orchestrator_pane_id, &notice)
+                    .await
+                {
+                    warn!(
+                        pane_id = %orchestrator_pane_id,
+                        role = %target_role,
+                        error = %write_err,
+                        "delegate: failed to surface respawn error in \
+                         orchestrator pane scrollback"
+                    );
+                }
+                // Skip the post-respawn prompt write — there is
+                // no live worker agent on this pane to receive
+                // it, and the submit-write would just log a
+                // second `NotFound`.
+                return;
+            }
+        }
+    }
+    let one_liner = compose_delegate_prompt(&task_body);
+    if let Err(e) = registry
+        .write_to_pane_and_submit(&pane_id, &one_liner)
+        .await
+    {
+        warn!(
+            pane_id = %pane_id,
+            role = %target_role,
+            error = %e,
+            "delegate: failed to write task prompt into target pane"
+        );
+    }
+}
+
 impl AppState {
     pub fn aggregate_stats(&self) -> DashboardStats {
         let mut stats = DashboardStats::default();
@@ -269,7 +550,12 @@ impl AppState {
     /// same orchestration (via `pane_orchestration_map`) so a parallel
     /// orchestration tab's `coder` pane doesn't receive a sibling tab's
     /// task.
-    pub async fn handle_delegate(&self, signal: DelegateSignal, registry: &AgentPtyRegistry) {
+    pub async fn handle_delegate(
+        &self,
+        signal: DelegateSignal,
+        registry: &Arc<AgentPtyRegistry>,
+        event_tx: &broadcast::Sender<BroadcastMsg>,
+    ) {
         if !self.pane_role_map.contains_key(&signal.pane_id) {
             warn!(pane_id = %signal.pane_id, "delegate from unknown pane");
             return;
@@ -284,7 +570,7 @@ impl AppState {
             return;
         }
 
-        let orchestration = self.pane_orchestration_map.get(&signal.pane_id);
+        let orchestration = self.pane_orchestration_map.get(&signal.pane_id).cloned();
 
         // Collect every (target_role, pane_id) the delegate fans out to.
         // Per-role filtering: same orchestration; never the orchestrator's
@@ -299,7 +585,8 @@ impl AppState {
                 .filter(|(pane_id, role)| {
                     role.as_str() == target_role.as_str()
                         && !self.orchestrator_pane_ids.contains(pane_id.as_str())
-                        && self.pane_orchestration_map.get(pane_id.as_str()) == orchestration
+                        && self.pane_orchestration_map.get(pane_id.as_str()).cloned()
+                            == orchestration
                 })
                 .map(|(pane_id, _)| pane_id.clone())
                 .collect();
@@ -312,241 +599,46 @@ impl AppState {
             }
         }
 
-        // Cross-pane fan-out runs concurrently via `join_all` instead of
-        // a `.await`-sequential for-loop. With the per-role `clear =
-        // true` respawn step (terminate grace + RESPAWN_READY_DELAY),
-        // an N-worker delegate would otherwise pay N × respawn-time
-        // wall-clock. Per-pane work is still serialized against itself
-        // by the per-pane dispatch mutex acquired inside each future
-        // (see [`AgentPtyRegistry::pane_dispatch_lock`]) — only
-        // *different* panes' dispatches overlap, which is the
-        // pre-clear-respawn norm. `&self` and `&registry` borrows are
-        // held through the outer `.await`, so the inner futures can
-        // share them without `'static` bounds.
-        let orchestrator_pane_id = signal.pane_id.clone();
-        let futs = targets.into_iter().map(|(target_role, pane_id)| {
-            let orchestrator_pane_id = orchestrator_pane_id.clone();
+        // PRD #92 F9 followup-6: async-dispatch. Each per-target future
+        // runs in its own `tokio::spawn` so `handle_delegate` (and the
+        // delegate CLI on the other end of the hook socket) returns
+        // immediately once the dispatches are queued. The freshly-spawned
+        // agent's `SessionStart` event arrives over the daemon-wide hook
+        // broadcast some time after `respawn_agent_for_pane` returns —
+        // blocking the hook-loop reply on that wait was unnecessary and
+        // made the CLI feel synchronous to a multi-second boot.
+        //
+        // Critical race-avoidance: the subscribe-before-spawn ordering
+        // lives inside `dispatch_one_owned`. The receiver attaches to
+        // `event_tx` *before* `respawn_agent_for_pane` forks the new
+        // process, so a fast-booting agent that fires `SessionStart`
+        // immediately after exec can't race the dispatch task's
+        // subscription.
+        //
+        // Cross-pane fan-out remains concurrent (different panes' tasks
+        // overlap); per-pane work still serializes against itself via
+        // the per-pane dispatch mutex acquired inside the task body —
+        // see [`AgentPtyRegistry::pane_dispatch_lock`].
+        for (target_role, pane_id) in targets {
+            let registry = Arc::clone(registry);
+            let event_tx = event_tx.clone();
+            let orchestration = orchestration.clone();
+            let orchestrator_pane_id = signal.pane_id.clone();
             let task = signal.task.clone();
-            async move {
-                self.dispatch_one(
+            let cwd = self.pane_cwd_map.get(&pane_id).cloned();
+            tokio::spawn(async move {
+                dispatch_one_owned(
                     registry,
+                    event_tx,
                     orchestration,
-                    &orchestrator_pane_id,
-                    &target_role,
-                    &pane_id,
-                    &task,
+                    orchestrator_pane_id,
+                    target_role,
+                    pane_id,
+                    task,
+                    cwd,
                 )
                 .await;
-            }
-        });
-        futures_util::future::join_all(futs).await;
-    }
-
-    /// Per-target body of [`AppState::handle_delegate`], factored out so
-    /// the multi-target dispatch can fan out via `join_all`. Holds the
-    /// per-pane dispatch mutex across the entire respawn + post-respawn
-    /// prompt write, writes the worker task file to the worker's cwd,
-    /// optionally respawns the worker agent (per the role's `clear`
-    /// flag) and then writes the prompt one-liner.
-    ///
-    /// On `clear = true` the per-pane dispatch mutex (acquired
-    /// unconditionally — see [`AgentPtyRegistry::pane_dispatch_lock`])
-    /// closes the `registry.remove` + `spawn_agent` race window inside
-    /// [`AgentPtyRegistry::respawn_agent_for_pane`]: two concurrent
-    /// connections submitting `Delegate` signals to the same worker
-    /// pane no longer race the respawn — they serialize behind the
-    /// mutex. We acquire unconditionally even when `clear = false`
-    /// because it's cheap and removes the subtler "concurrent
-    /// clear=true vs clear=false" interleave.
-    ///
-    /// Errors are logged and dropped; the caller's `join_all` aggregates
-    /// independently so a single pane's failure (a missing role config,
-    /// a respawn that couldn't exec the command, a write that hit a
-    /// closed PTY) doesn't poison the other panes' dispatches.
-    async fn dispatch_one(
-        &self,
-        registry: &AgentPtyRegistry,
-        orchestration: Option<&(String, String)>,
-        orchestrator_pane_id: &str,
-        target_role: &str,
-        pane_id: &str,
-        task: &str,
-    ) {
-        let dispatch_mutex = registry.pane_dispatch_lock(pane_id);
-        let _dispatch_guard = dispatch_mutex.lock().await;
-
-        let cwd = self.pane_cwd_map.get(pane_id).cloned();
-        // Look the role config up by `(worker cwd, orchestration name,
-        // target role)` so the per-role `prompt_template` wrapping is
-        // applied to the task body. Loading the config from disk on
-        // every delegate means a config edit between sessions takes
-        // effect on the next delegate without a pane respawn. `None`
-        // means "no template, fall back to the raw task".
-        let role_config = match (cwd.as_deref(), orchestration) {
-            (Some(c), Some((orch_name, _orch_cwd))) => {
-                lookup_orchestration_role(c, orch_name, target_role)
-            }
-            _ => None,
-        };
-        // When we have an orchestration context (cwd + orchestration
-        // name) but the role lookup returned None, the operator's
-        // intended `clear = true` is silently dropped — the role
-        // config no longer exists, almost always because the user
-        // edited `.dot-agent-deck.toml` mid-session and the role name
-        // diverged. Emit a warn so the cause is at least discoverable
-        // in the daemon log; the fall-through to the no-respawn path
-        // is preserved because we have no `command` to spawn anyway.
-        if role_config.is_none() && cwd.is_some() && orchestration.is_some() {
-            warn!(
-                role = %target_role,
-                pane_id = %pane_id,
-                "delegate: role_config not found for role; \
-                 clear=true respawn intent dropped — \
-                 did the role name change in .dot-agent-deck.toml?"
-            );
-        }
-        let prompt_template = role_config
-            .as_ref()
-            .and_then(|r| r.prompt_template.as_deref());
-        let safe_name = sanitize_role_name(target_role);
-        // The task file lands in the *worker's* cwd, not the
-        // orchestrator's — earlier rounds reused a single cwd capture
-        // across every worker and broke the moment two role panes
-        // were started in different cwds.
-        let task_body = if let Some(cwd) = cwd.as_deref() {
-            let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                warn!(
-                    dir = %dir.display(),
-                    role = %target_role,
-                    pane_id = %pane_id,
-                    error = %e,
-                    "delegate: failed to create task directory"
-                );
-            }
-            let file_path = dir.join(format!("worker-task-{safe_name}.md"));
-            let file_content = compose_worker_task_file(prompt_template, task);
-            if let Err(e) = std::fs::write(&file_path, &file_content) {
-                warn!(
-                    path = %file_path.display(),
-                    role = %target_role,
-                    pane_id = %pane_id,
-                    error = %e,
-                    "delegate: failed to write worker task file"
-                );
-            }
-            format!("Read .dot-agent-deck/worker-task-{safe_name}.md for your task.")
-        } else {
-            // Defensive: the daemon's StartAgent handler always
-            // records `pane_cwd_map` for orchestration panes (see
-            // `daemon_protocol.rs`), so this branch should be
-            // unreachable in production. Log and fall back to
-            // inlining the task body so the worker still gets
-            // *something* useful rather than a dangling reference.
-            warn!(
-                role = %target_role,
-                pane_id = %pane_id,
-                "delegate: no cwd recorded for worker pane — inlining task body"
-            );
-            compose_worker_task_file(prompt_template, task)
-        };
-        // Honor the per-role `clear` flag from `.dot-agent-deck.toml`.
-        // `clear = true` terminates the existing worker child (SIGTERM
-        // with grace, then SIGKILL via
-        // `terminate_child_with_grace_and_wait`) and spawns a fresh
-        // one with the same `pane_id_env` and identity — the dashboard
-        // card stays put, the PID rolls over, and the agent's
-        // conversation history is gone. `clear = false` preserves the
-        // agent across delegations — no respawn, just the prompt
-        // write below. Missing role config defaults to no respawn:
-        // we have no `command` to spawn even if `clear` were `true`.
-        if let Some(role) = role_config.as_ref()
-            && role.clear
-        {
-            match registry
-                .respawn_agent_for_pane(pane_id, &role.command)
-                .await
-            {
-                Ok(_new_id) => {
-                    // Log the wait up front so users correlating a
-                    // "first prompt landed inside the agent's
-                    // pre-render banner" report to the daemon log
-                    // can see the RESPAWN_READY_DELAY in flight.
-                    // The 250ms constant is fine for most agents
-                    // (claude, codex, opencode); a slow banner may
-                    // still be racing when the prompt write lands,
-                    // but the visual glitch is cosmetic — the
-                    // prompt itself gets through.
-                    tracing::debug!(
-                        role = %target_role,
-                        pane_id = %pane_id,
-                        delay_ms = RESPAWN_READY_DELAY.as_millis() as u64,
-                        "delegate: respawned worker agent for clear=true; \
-                         sleeping RESPAWN_READY_DELAY before prompt write"
-                    );
-                    tokio::time::sleep(RESPAWN_READY_DELAY).await;
-                }
-                Err(e) => {
-                    // The respawn failed AFTER the terminate phase
-                    // already disposed of the previous child.
-                    // Without surfacing the error to the operator,
-                    // the worker pane is left with no live agent,
-                    // the subsequent prompt write also fails
-                    // with `NotFound`, and the user sees nothing in
-                    // the TUI — just two log lines somewhere
-                    // off-screen. The full error stays in the
-                    // daemon log via the `tracing::warn!` below;
-                    // the notice written into the orchestrator
-                    // pane's scrollback is a high-level message so
-                    // a stray filesystem path (or other detail
-                    // from `AgentPtyError::Spawn`) doesn't leak
-                    // into the orchestrator LLM's view. Using
-                    // `write_to_pane_notice` (no SUBMIT_DELAY, LF
-                    // tail instead of CR) means the notice forms a
-                    // visible line in scrollback without an Enter
-                    // — the orchestrator's LLM sees it as
-                    // scrollback noise, not a user prompt to
-                    // respond to.
-                    warn!(
-                        pane_id = %pane_id,
-                        role = %target_role,
-                        error = %e,
-                        "delegate: respawn for clear=true failed; \
-                         surfacing high-level notice in orchestrator \
-                         pane and skipping the subsequent prompt write"
-                    );
-                    let notice = format!(
-                        "⚠ respawn failed for role '{target_role}' on pane \
-                         {pane_id} (see daemon log for details)"
-                    );
-                    if let Err(write_err) = registry
-                        .write_to_pane_notice(orchestrator_pane_id, &notice)
-                        .await
-                    {
-                        warn!(
-                            pane_id = %orchestrator_pane_id,
-                            role = %target_role,
-                            error = %write_err,
-                            "delegate: failed to surface respawn error in \
-                             orchestrator pane scrollback"
-                        );
-                    }
-                    // Skip the post-respawn prompt write — there is
-                    // no live worker agent on this pane to receive
-                    // it, and the submit-write would just log a
-                    // second `NotFound`.
-                    return;
-                }
-            }
-        }
-        let one_liner = compose_delegate_prompt(&task_body);
-        if let Err(e) = registry.write_to_pane_and_submit(pane_id, &one_liner).await {
-            warn!(
-                pane_id = %pane_id,
-                role = %target_role,
-                error = %e,
-                "delegate: failed to write task prompt into target pane"
-            );
+            });
         }
     }
 

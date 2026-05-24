@@ -599,7 +599,19 @@ async fn run_hook_loop(
                                     // the prompt directly into the worker
                                     // pane's PTY — no broadcast hop, no
                                     // detach-window loss surface.
-                                    state.read().await.handle_delegate(signal, &pty_registry).await;
+                                    //
+                                    // PRD #92 F9 followup-6: pass the
+                                    // daemon-wide hook-event sender too so
+                                    // per-target dispatch tasks can wait
+                                    // for the freshly-spawned agent's
+                                    // `SessionStart` event before writing
+                                    // the prompt (event-driven readiness,
+                                    // replacing the F9 250ms fixed delay).
+                                    state
+                                        .read()
+                                        .await
+                                        .handle_delegate(signal, &pty_registry, &event_tx)
+                                        .await;
                                 }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
