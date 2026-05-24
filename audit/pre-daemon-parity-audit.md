@@ -280,6 +280,19 @@ The deck's contract: "the agent gets a catchable signal and a bounded grace wind
 
 **Likely PRD home**: A successor PRD focused on attach-protocol observability. Out of scope for PRD #92 since it adds new wire-protocol surface and TUI UI machinery beyond the parity restoration this PRD is about.
 
+### F13 — Remote-attach SSH-wedge on laptop sleep
+
+**Status**: Deferred (2026-05-24). Filed during PRD #92 work but not derived from the audit — this is post-baseline behavior (`dot-agent-deck connect <name>` was introduced in PRD #76 and doesn't exist at the parity baseline).
+
+**Problem**: When a user is connected to a remote daemon via `dot-agent-deck connect <name>` and the laptop sleeps, the SSH connection enters a half-open state. The local terminal blocks on I/O — cannot send input, cannot render output, cannot exit the TUI through any keyboard gesture. The only workaround is to close the terminal tab and start a fresh `dot-agent-deck connect`. Surfaced empirically by the user during PRD #92's F9 / F12 manual-test sessions.
+
+**Suggested approach**: Likely an SSH-keepalive issue more than a deck issue (TCP keepalive is slow; SSH `ServerAliveInterval` / `ServerAliveCountMax` defaults are absent or long). Possible fixes:
+- Set sensible `ServerAliveInterval` + `ServerAliveCountMax` in the spawn args used by `dot-agent-deck connect`.
+- Add a client-side liveness probe in whatever wraps the SSH session on the laptop, so a dead connection drops fast and the TUI can exit gracefully.
+- Document the gotcha + recommended SSH config for users who run `connect` long-term.
+
+**Likely PRD home**: A successor PRD on remote-attach resilience, or a focused SSH-config tweak. Out of scope for PRD #92 since it's post-baseline behavior and not a parity finding.
+
 ## Intentional changes appendix
 
 Behaviors that changed between baseline and current, where the change is a deliberate design decision with citation. Recording so a future re-audit does not re-flag.
