@@ -247,6 +247,16 @@ The deck's contract: "the agent gets a catchable signal and a bounded grace wind
 
 **Likely PRD home**: PRD #92 Phase 11 (this audit's remediation scope).
 
+### F12 — TUI auto-renew per-pane subscription on respawn
+
+**Status**: Queued (this PRD, Phase 13). Folded into scope 2026-05-24 after manual testing of F9 followup-7 confirmed the daemon side is fully working but the TUI side does not auto-renew its `broadcast::Receiver` subscription when an agent is respawned.
+
+**Problem**: When the daemon respawns an agent (F9 `clear = true` path), the TUI's per-pane stream subscriber is bound to the OLD agent's `broadcast::Sender`. The OLD agent dies, the sender is dropped, the receiver returns `Closed`. The TUI does not re-resolve the pane to the NEW agent's sender. The pane view freezes showing only stale output (typically just the devbox bootstrap line); the user must manually detach and re-attach to see the new agent's output. Verified empirically by the user: detach + re-attach immediately reveals the running new agent. The F9 coder's claim that *"the TUI's existing reconnect machinery handles this"* is incorrect — that machinery handles whole-daemon reconnect, not per-pane agent-respawn.
+
+**Suggested approach**: TUI-side fix. On `broadcast::error::RecvError::Closed`, the per-pane stream subscriber re-resolves `pane_id_env` via the attach protocol's `list_agents`, finds the NEW agent's id, and re-subscribes. Small backoff (e.g. 100 ms initial) for the case where Closed fires before the new agent has registered. Cap total retries so a permanently-closed pane doesn't spin.
+
+**Likely PRD home**: PRD #92 Phase 13 (this audit's remediation scope).
+
 ### F10 — Dedupe double work-done notifications
 
 **Status**: Deferred (2026-05-24) — not reproducible after the reviewer/auditor migration off `opencode --model openrouter/openai/gpt-5.5` to `claude --model opus` on 2026-05-23. The duplication that motivated F10 may have been agent-binary-specific (opencode signaling `work-done` on exit, or OpenRouter network-latency-induced retries). Orchestrator continues to count notifications per worker completion; F10 reopens if duplicates recur. See PRD #92 Design Decisions 2026-05-24 entry.
