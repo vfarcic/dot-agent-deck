@@ -9,6 +9,23 @@
 //! result visible end-to-end. Pre-fix the controller's vt100 parser
 //! never sees the NEW agent's bytes — only a manual detach + re-attach
 //! revealed them.
+//!
+//! ## Scope (auditor #10)
+//!
+//! These tests deliberately bypass the F9 delegate path and drive
+//! [`AgentPtyRegistry`] directly. They verify the TUI-side
+//! controller behavior in isolation: STREAM_END on the OLD agent →
+//! lookup by `pane_id_env` → re-attach to the NEW agent → vt100
+//! parser sees the NEW agent's bytes → shared `agent_id` swapped so
+//! the next `stop-agent` / `resize-agent` targets the NEW id.
+//!
+//! They do NOT exercise the full F9 delegate → respawn → reattach
+//! end-to-end chain. The daemon-side coverage lives in
+//! `tests/orchestration_delegate.rs` (for example
+//! `delegate_respawns_worker_agent_when_role_clear_is_true` and
+//! `respawn_failure_surfaces_visible_error_in_orchestrator_pane`).
+//! The F9 tests + the F12 tests together are the end-to-end story;
+//! neither file alone proves it.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

@@ -1012,12 +1012,23 @@ const REATTACH_LOOKUP_BACKOFF: Duration = Duration::from_millis(100);
 /// manually.
 const REATTACH_MAX_LOOKUP_ATTEMPTS: u32 = 3;
 
-/// PRD #92 F12: bound on consecutive zero-byte attach sessions. If the
-/// daemon answers `attach` successfully but the freshly-attached stream
-/// returns STREAM_END before any STREAM_OUT bytes arrive (the NEW agent
-/// died before producing output, or a permanently-broken agent loops
-/// crash-on-start), the io_task must not re-attach indefinitely. After
-/// this many consecutive empty sessions, give up.
+/// PRD #92 F12: bounds NEW agents that produce zero NEW bytes after the
+/// initial snapshot replay before terminating. Reader-side any
+/// `KIND_STREAM_OUT` byte — including the daemon's snapshot replay sent
+/// on every attach — resets this counter, so a crash-on-start agent
+/// whose snapshot replays before each crash is not caught by this bound
+/// alone. The no-live-agent path via [`resolve_and_reattach`] is the
+/// primary protection, giving up after [`REATTACH_MAX_LOOKUP_ATTEMPTS`]
+/// × [`REATTACH_LOOKUP_BACKOFF`] (~300 ms) when `pane_id_env` has no
+/// matching live agent.
+///
+/// Assumes the daemon keeps the attach stream open while the agent is
+/// alive but idle — i.e. the stream doesn't close just because the
+/// agent isn't emitting bytes. A daemon change that closes idle
+/// streams aggressively would cause healthy agents to be classified
+/// as dead by this bound. See `pane_dispatch_lock` in
+/// [`crate::agent_pty`] for the daemon-side respawn-serialization
+/// contract this retry loop pairs with.
 const REATTACH_MAX_EMPTY_SESSIONS: u32 = 3;
 
 /// PRD #92 F12: per-pane I/O task body. Drives the attach-stream
@@ -1105,6 +1116,10 @@ async fn run_pane_io_task(
                             .await
                             .is_err()
                             {
+                                // Park the writer branch so the reader's STREAM_END/EOF
+                                // branch wins the surrounding `select!` and drives the
+                                // reattach decision; buffered `Input` items in `input_rx`
+                                // will be drained on the next iteration's writer.
                                 std::future::pending::<()>().await;
                                 unreachable!();
                             }
@@ -1454,8 +1469,10 @@ impl PaneController for EmbeddedPaneController {
         // Snapshot the latest agent id under the shared mutex; PRD #92 F12
         // can swap this to the respawned id while the pane is alive, and
         // Ctrl+W must target the currently-bound agent, not the one we
-        // first attached to.
-        let agent_id = s.agent_id.lock().unwrap().clone();
+        // first attached to. Keep the Arc around so the retry below can
+        // re-read the id after a mid-reattach swap.
+        let shared_agent_id = Arc::clone(&s.agent_id);
+        let initial_agent_id = shared_agent_id.lock().unwrap().clone();
         // CodeRabbit Fix E: bound the stop-agent RPC. Without this
         // timeout a wedged daemon would pin the TUI renderer
         // indefinitely (Ctrl+W happens on the render thread via
@@ -1469,8 +1486,38 @@ impl PaneController for EmbeddedPaneController {
         // The Ctrl+W path therefore needs a generous budget —
         // `CTRL_W_STOP_TIMEOUT` (5 s = grace + 2 s buffer) — rather
         // than the 2 s `CREATE_PANE_STOP_TIMEOUT` it used to reuse.
-        let stop_result = s.runtime.block_on(async {
-            tokio::time::timeout(CTRL_W_STOP_TIMEOUT, client.stop_agent(&agent_id)).await
+        //
+        // PRD #92 F12 followup (auditor #1): if Ctrl+W lands inside the
+        // ~300 ms reattach window, `initial_agent_id` is the OLD
+        // (just-killed) agent — the daemon answers stop-agent with an
+        // "Agent <id> not found" error. Re-read the shared agent id once
+        // and retry: the io_task may have already swapped in the NEW id
+        // from the F9 respawn. If the retry also fails we fall through
+        // to the existing log+restore path; we don't loop further.
+        let (agent_id, stop_result) = s.runtime.block_on(async move {
+            use crate::daemon_client::ClientError;
+            let first = tokio::time::timeout(
+                CTRL_W_STOP_TIMEOUT,
+                client.stop_agent(&initial_agent_id),
+            )
+            .await;
+            match first {
+                Ok(Err(ClientError::Server(ref msg)))
+                    if msg.to_lowercase().contains("not found") =>
+                {
+                    let retry_id = shared_agent_id.lock().unwrap().clone();
+                    tracing::debug!(
+                        first_agent_id = %initial_agent_id,
+                        retry_agent_id = %retry_id,
+                        "close_pane: stop-agent returned 'not found'; retrying once with currently-bound agent id"
+                    );
+                    let second =
+                        tokio::time::timeout(CTRL_W_STOP_TIMEOUT, client.stop_agent(&retry_id))
+                            .await;
+                    (retry_id, second)
+                }
+                other => (initial_agent_id, other),
+            }
         });
         match stop_result {
             Ok(Ok(())) => {
