@@ -47,7 +47,7 @@ Delegation signals travel through the daemon: no messages are lost if you detach
 
 ## Quick setup
 
-<img src="./img/orchestration-generate-dialog.png" align="right" width="420" style="margin-left: 1.5rem; margin-bottom: 1rem;" alt="The Generate .dot-agent-deck.toml dialog with Yes / No / Never options" />
+<img src="./img/orchestration-generate-dialog.png" align="right" width="420" style={{marginLeft: '1.5rem', marginBottom: '1rem'}} alt="The Generate .dot-agent-deck.toml dialog with Yes / No / Never options" />
 
 The fastest way to get an orchestration config is to let an agent generate it from your project.
 
@@ -57,7 +57,7 @@ The fastest way to get an orchestration config is to let an agent generate it fr
 4. Review the proposal. The agent will list each role and explain why it chose it.
 5. Tell the agent what to drop or change — or confirm as-is — and it writes `.dot-agent-deck.toml` to your project root.
 
-<div style="clear: both"></div>
+<div style={{clear: 'both'}}></div>
 
 The generated file includes both `[[modes]]` and `[[orchestrations]]`. You can remove either section if you only need one.
 
