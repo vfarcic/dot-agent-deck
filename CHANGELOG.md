@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.25.2] - 2026-05-24
+
+### Fixed
+
+- **Orchestration Tab Name Now Reflects User Input**
+  Typing a custom name in the new-pane form when launching an orchestration now correctly appears as the tab title. Previously the tab always showed the name from the TOML config (or the working-directory basename fallback), silently discarding whatever was typed in the Name field.
+  Leaving the Name field empty continues to use the config name, with the existing cwd-basename fallback for unnamed orchestrations.
+
+
+
 ## [0.25.1] - 2026-05-24
 
 ### Fixed
