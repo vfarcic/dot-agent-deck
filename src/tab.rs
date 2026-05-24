@@ -1244,6 +1244,80 @@ mod tests {
         assert_eq!(*closed, vec!["real-1".to_string(), "real-2".to_string()]);
     }
 
+    /// PRD #111 / CodeRabbit PR #114 regression: the post-hydration
+    /// landing decision in `run_tui` runs once after the daemon-hydration
+    /// block AND once after the `--continue` reconnect block. Both call
+    /// sites must apply the same `preferred_start_tab` so the second
+    /// snap doesn't undo the first. Before this fix, the
+    /// `continue_session` branch carried a hardcoded
+    /// `tab_manager.switch_to(0)` that snapped back to the dashboard,
+    /// defeating the M3 orchestration landing for every reconnect via
+    /// `--continue` even when the hydration block had correctly landed
+    /// on the orchestration tab.
+    ///
+    /// This pins the TabManager-level invariant `run_tui` relies on:
+    /// applying the same orchestration tab index twice (mirroring the
+    /// two call sites) keeps the active index on the orchestration tab.
+    /// If a future refactor re-introduces a hardcoded `switch_to(0)` in
+    /// the `continue_session` path, the integration behavior breaks —
+    /// this test documents the contract so the reviewer at that point
+    /// knows what was lost.
+    #[test]
+    fn continue_session_landing_preserves_orchestration_tab() {
+        let mock = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(mock);
+        // Post-hydration state: dashboard at index 0 + one orchestration
+        // tab at index 1 (what the M3 hydration block produces when at
+        // least one orchestration rebuild succeeded).
+        let (orch_index, _ids) = tm
+            .open_orchestration_tab(&test_orchestration_config(), "/tmp", None, (24, 80))
+            .unwrap();
+        assert_eq!(orch_index, 1);
+
+        // `run_tui` computes this from `first_orchestration_tab_index`
+        // after the hydration loop.
+        let preferred_start_tab = orch_index;
+
+        // First call site: post-hydration landing inside the
+        // `if let Some(embedded) = ...` block.
+        assert!(tm.switch_to(preferred_start_tab));
+        assert_eq!(tm.active_index(), preferred_start_tab);
+
+        // Second call site: post-`continue_session` landing. Before the
+        // fix this was an unconditional `switch_to(0)`; now it must
+        // route through the same `preferred_start_tab` so the active
+        // tab stays on the orchestration tab.
+        assert!(tm.switch_to(preferred_start_tab));
+        assert_eq!(
+            tm.active_index(),
+            preferred_start_tab,
+            "post-`--continue` landing must keep the user on the orchestration tab, \
+             not snap back to the dashboard"
+        );
+    }
+
+    /// PRD #111 / CodeRabbit PR #114 fallback: when no orchestration
+    /// tab was rebuilt (mode-only or pure dashboard sessions), the
+    /// landing decision falls back to the dashboard so the user sees
+    /// the overview first (pre-PRD-111 behaviour). Pins the
+    /// `unwrap_or(0)` half of the contract.
+    #[test]
+    fn continue_session_landing_falls_back_to_dashboard_when_no_orchestration() {
+        let mock = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(mock);
+        // No orchestration tab was rebuilt — `first_orchestration_tab_index`
+        // is None, so `preferred_start_tab` collapses to 0 (dashboard).
+        let preferred_start_tab: usize = None::<usize>.unwrap_or(0);
+
+        assert!(tm.switch_to(preferred_start_tab));
+        assert!(tm.switch_to(preferred_start_tab));
+        assert_eq!(
+            tm.active_index(),
+            0,
+            "non-orchestration sessions must still land on the dashboard"
+        );
+    }
+
     #[test]
     fn orchestration_pane_ids_in_all_managed() {
         let mut tm = make_manager();

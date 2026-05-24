@@ -239,6 +239,16 @@ impl TabMembership {
     }
 }
 
+/// PRD #111 auditor BLOCKER: hard ceiling on `TabMembership::Orchestration::role_index`
+/// enforced at the wire boundary. The TUI hydration path
+/// (`OrchestrationConfig::synthesize_from_bucket_metadata`) sizes a
+/// `Vec<OrchestrationRoleConfig>` to `max(role_index) + 1`, so a hostile
+/// or buggy daemon sending `role_index: u64::MAX` would push the TUI
+/// into an OOM allocation. 256 is well above any realistic orchestration
+/// role count (the largest configs we ship are single digits) and small
+/// enough that the worst-case vector stays trivial.
+pub const ORCHESTRATION_ROLE_INDEX_MAX: usize = 256;
+
 /// Validate a [`TabMembership`] in the same way display_name is validated.
 /// Returns the input on accept, `None` on reject. Mirrors the spawn-time
 /// drop semantics for display_name/cwd: invalid → stored as `None`, so
@@ -255,17 +265,41 @@ impl TabMembership {
 /// otherwise smuggle oversized strings, NUL bytes, or escape sequences
 /// in there, and the daemon echoes them back via `agent_records`
 /// where downstream parsing/display can misbehave.
+///
+/// PRD #111 auditor BLOCKER + suggestion: also validate
+/// `role_name` (echoed into tab labels — ANSI escapes here perturb the
+/// TUI render path the same way they do for display_name) and cap
+/// `role_index` at [`ORCHESTRATION_ROLE_INDEX_MAX`] (a hostile daemon
+/// sending a huge index would otherwise OOM the TUI when
+/// `synthesize_from_bucket_metadata` allocates a placeholder vec of
+/// `max_index + 1` length). Both are wire-boundary checks so every
+/// downstream consumer is protected without per-call-site validation.
 pub fn validate_tab_membership(tm: TabMembership) -> Option<TabMembership> {
     if !is_valid_display_name(tm.name()) {
         return None;
     }
     if let TabMembership::Orchestration {
-        orchestration_cwd: Some(c),
+        role_index,
+        role_name,
+        orchestration_cwd,
         ..
     } = &tm
-        && !is_valid_orchestration_cwd(c)
     {
-        return None;
+        if *role_index > ORCHESTRATION_ROLE_INDEX_MAX {
+            return None;
+        }
+        // role_name is `#[serde(default)]`, so an empty value from an
+        // older daemon is legitimate (the synthesis path falls back to
+        // a `role-{i}` placeholder). Only reject non-empty values that
+        // would smuggle control bytes into the tab label.
+        if !role_name.is_empty() && !is_valid_display_name(role_name) {
+            return None;
+        }
+        if let Some(c) = orchestration_cwd
+            && !is_valid_orchestration_cwd(c)
+        {
+            return None;
+        }
     }
     Some(tm)
 }
@@ -2201,6 +2235,77 @@ mod tests {
             role_name: "coder".into(),
             is_start_role: false,
             orchestration_cwd: Some("/home/user/project-a".into()),
+        };
+        assert!(validate_tab_membership(tm).is_some());
+    }
+
+    // PRD #111 auditor BLOCKER: a hostile / buggy daemon sending an
+    // absurd role_index would push the TUI synthesis path into an OOM
+    // allocation. Reject at the wire boundary so every downstream
+    // consumer is protected.
+    #[test]
+    fn validate_tab_membership_rejects_oversized_role_index() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: ORCHESTRATION_ROLE_INDEX_MAX + 1,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_accepts_role_index_at_ceiling() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: ORCHESTRATION_ROLE_INDEX_MAX,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+        };
+        assert!(validate_tab_membership(tm).is_some());
+    }
+
+    // PRD #111 auditor suggestion: role_name flows to tab labels, so
+    // ANSI / control bytes must be rejected the same way display_name
+    // is. Empty role_name stays accepted — it's the older-daemon
+    // wire shape, handled by the synthesis placeholder fallback.
+    #[test]
+    fn validate_tab_membership_rejects_role_name_with_ansi_escape() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "\x1b[31mpwn".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_rejects_role_name_with_nul_byte() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "co\0der".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_accepts_empty_role_name() {
+        // Older daemons predating the inline role_name field omit it,
+        // so #[serde(default)] produces an empty string. Synthesis
+        // falls back to `role-{i}`; validation must let it through.
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: String::new(),
+            is_start_role: false,
+            orchestration_cwd: None,
         };
         assert!(validate_tab_membership(tm).is_some());
     }

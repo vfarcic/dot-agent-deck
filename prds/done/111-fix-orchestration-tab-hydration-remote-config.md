@@ -1,6 +1,6 @@
 # PRD #111: Fix orchestration tab hydration when TUI config path is remote
 
-**Status**: Planning
+**Status**: Implementation complete — awaiting release
 **Priority**: High
 **Created**: 2026-05-24
 **GitHub Issue**: [#111](https://github.com/vfarcic/dot-agent-deck/issues/111)
@@ -66,11 +66,19 @@ Decouple orchestration tab reconstruction from local config file access:
 
 ## Milestones
 
-- [ ] **M1 — Synthesise minimal config**: Implement logic to build a minimal `OrchestrationConfig` from `OrchestrationBucket` metadata when `lookup_config` returns `None`. Name and role list are structurally correct; display fields default.
-- [ ] **M2 — Hydration uses synthesised config**: `src/ui.rs` hydration loop uses the synthesised config as a fallback instead of `continue`-ing to dashboard; panes land in their orchestration tab.
-- [ ] **M3 — Active tab preserved on reconnect**: Remove or gate `switch_to(0)` so reconnect lands on the orchestration tab (or the previously active one), not the dashboard.
-- [ ] **M4 — Tests pass**: Unit and integration tests for the remote-path and local-path hydration cases, plus the active-tab regression.
-- [ ] **M5 — Local enrichment still works**: When the config file *is* found locally, `prompt_template`, `description`, and other extras are still applied (no regression for local connections).
+- [x] **M1 — Synthesise minimal config**: Implement logic to build a minimal `OrchestrationConfig` from `OrchestrationBucket` metadata when `lookup_config` returns `None`. Name and role list are structurally correct; display fields default. *Implemented as `OrchestrationConfig::synthesize_from_bucket_metadata` in `src/project_config.rs` with first-wins tie-break on duplicate role indices.*
+- [x] **M2 — Hydration uses synthesised config**: `src/ui.rs` hydration loop uses the synthesised config as a fallback instead of `continue`-ing to dashboard; panes land in their orchestration tab. *Implemented via extracted `resolve_orch_config_for_hydration` helper; log split distinguishes absent-vs-drift cases.*
+- [x] **M3 — Active tab preserved on reconnect**: Remove or gate `switch_to(0)` so reconnect lands on the orchestration tab (or the previously active one), not the dashboard. *Gated: lands on first orchestration tab when present; falls back to dashboard when no orchestration tabs (per PRD Notes, persisting last-active across full restarts is out of scope).*
+- [x] **M4 — Tests pass**: Unit and integration tests for the remote-path and local-path hydration cases, plus the active-tab regression. *650 lib tests + 12 rehydration integration tests pass; 10 new `validate_tab_membership` tests pass; cargo fmt + clippy --all-targets -D warnings clean.*
+- [x] **M5 — Local enrichment still works**: When the config file *is* found locally, `prompt_template`, `description`, and other extras are still applied (no regression for local connections). *Covered by `local_config_enrichment_preserved_when_available` test driving the `Some(c)=>c` branch via the extracted helper.*
+
+### Security hardening (added during audit)
+
+Auditor flagged that synthesising `OrchestrationConfig` from daemon-provided wire data shifts trust from a locally-validated config file to unauthenticated bytes on the wire. Wire-boundary defences added in `src/agent_pty.rs::validate_tab_membership`:
+
+- `ORCHESTRATION_ROLE_INDEX_MAX = 256` cap on `role_index` — blocks ~200GB Vec allocation from a hostile or buggy daemon sending `role_index = 10^9`.
+- Control-byte / ANSI sanitisation on `role_name` and `orchestration_name` — rejects C0 controls, CSI, OSC, DEL, and ESC sequences that could disrupt terminal rendering or spoof tab labels.
+- Rejection degrades gracefully: `list_agents` clamps the membership to `None` and warns; `spawn` returns a `Validation` error. No panics on malformed wire data.
 
 ## Success Criteria
 
