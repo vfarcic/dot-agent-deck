@@ -2497,10 +2497,10 @@ mod tests {
     /// submit on the same pane leaves the notice bytes uncommitted in
     /// the agent's stdin, so the next submit's CR submits them fused
     /// to the new prompt. The contract is doc-only otherwise; this
-    /// test pins the daemon-side half (bytes land in order with no
-    /// intervening CR) so a future change that accidentally inserts
-    /// a separator — or, conversely, "fixes" the accumulation — gets
-    /// caught.
+    /// test pins the daemon-side half (bytes land in order with only
+    /// `\n` — never `\r` — between them) so a future change that
+    /// accidentally swaps the notice terminator, inserts a separator,
+    /// or "fixes" the accumulation gets caught.
     ///
     /// Stub: a raw-mode `cat` (`stty -echo -icanon -icrnl -opost`)
     /// that pumps stdin bytes verbatim to stdout. With default
@@ -2514,12 +2514,13 @@ mod tests {
     /// (claude / codex buffering visible input until CR, then
     /// submitting the entire accumulated buffer as one prompt) lives
     /// in the agent process, not the daemon — we can't exercise it
-    /// without a real agent. The assertion below pins the daemon-side
-    /// guarantee that makes that downstream accumulation possible:
-    /// notice bytes reach the slave before the submit's CR, in order,
-    /// with no intervening submit signal.
+    /// without a real agent. The assertion below pins the two
+    /// daemon-side guarantees that make that downstream accumulation
+    /// possible: notice bytes precede the submit bytes in the PTY
+    /// scrollback, and the bytes between them contain only `\n`
+    /// (no `\r`, so no early submit signal is emitted between them).
     #[tokio::test]
-    async fn write_to_pane_notice_bytes_accumulate_into_next_submit() {
+    async fn write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between() {
         let registry = AgentPtyRegistry::new();
         let _id = registry
             .spawn_agent(SpawnOptions {
@@ -2553,6 +2554,8 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut found = false;
         let mut last = Vec::new();
+        let mut between_start = 0usize;
+        let mut between_end = 0usize;
         while tokio::time::Instant::now() < deadline {
             last = registry.snapshot(&agent_id).unwrap_or_default();
             let notice_at = last
@@ -2564,6 +2567,8 @@ mod tests {
             if let (Some(n), Some(p)) = (notice_at, prompt_at)
                 && n < p
             {
+                between_start = n + b"NOTICE-MARKER".len();
+                between_end = p;
                 found = true;
                 break;
             }
@@ -2573,9 +2578,24 @@ mod tests {
             found,
             "scrollback must contain NOTICE-MARKER followed by USER-PROMPT — \
              proves the daemon delivered notice + submit bytes to the agent's \
-             stdin in order with no intervening CR (the prerequisite for the \
-             documented accumulation behavior). Last snapshot: {:?}",
+             stdin in order (the prerequisite for the documented accumulation \
+             behavior). Last snapshot: {:?}",
             String::from_utf8_lossy(&last)
+        );
+
+        // Tighter check: the slice between the end of NOTICE-MARKER and the
+        // start of USER-PROMPT must contain no `\r` byte. Without this, a
+        // regression that swapped `write_to_pane_notice`'s terminator from
+        // `\n` to `\r` would leave both substrings intact and ordered, so
+        // the order check alone would silently pass while the bug existed.
+        let between = &last[between_start..between_end];
+        assert!(
+            !between.contains(&b'\r'),
+            "between NOTICE-MARKER and USER-PROMPT the daemon must only \
+             emit `\\n` (the notice terminator), never `\\r` — a `\\r` here \
+             would be an early submit signal that breaks the accumulation \
+             contract. Bytes between: {:?}",
+            String::from_utf8_lossy(between)
         );
 
         registry.shutdown_all();
