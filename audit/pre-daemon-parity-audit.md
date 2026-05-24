@@ -257,6 +257,19 @@ The deck's contract: "the agent gets a catchable signal and a bounded grace wind
 
 **Likely PRD home**: PRD #92 Phase 12 (this audit's remediation scope).
 
+### F11 — Bus-push status delivery (daemon → TUI events for status messages)
+
+**Status**: Deferred (2026-05-24). Filed as the long-term fix for the submit=false LF risk identified during F9 followup-2 audit.
+
+**Problem**: The current implementation writes spawn-failure notices (and any future status messages) via the orchestrator pane's PTY using a submit=false byte sequence. This depends on agent-side behavior — if the agent's TUI interprets LF as Enter, the notice is submitted to the LLM as a user prompt. Even on agents that treat LF as literal-newline, the notice bytes accumulate in the agent's stdin buffer and contaminate the next submitted user prompt.
+
+**Suggested approach**: Add a daemon → TUI event channel for status messages, parallel to but separate from the PTY byte stream. The TUI subscribes to status events and displays them in the dashboard (e.g., toast notification or pane status indicator). The agent's PTY only carries user-input bytes — never daemon-internal status. Requires:
+- New KIND_STATUS attach-protocol message (header + role + pane_id + message text).
+- Daemon-side emit when respawn fails (and any future status events).
+- TUI-side subscriber that renders status into the dashboard.
+
+**Likely PRD home**: A successor PRD focused on attach-protocol observability. Out of scope for PRD #92 since it adds new wire-protocol surface and TUI UI machinery beyond the parity restoration this PRD is about.
+
 ## Intentional changes appendix
 
 Behaviors that changed between baseline and current, where the change is a deliberate design decision with citation. Recording so a future re-audit does not re-flag.

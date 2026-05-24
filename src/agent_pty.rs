@@ -290,16 +290,16 @@ pub enum AgentPtyError {
     /// reclassify the pane as dashboard).
     #[error("Invalid spawn options: {0}")]
     Validation(String),
-    /// The text handed to [`AgentPtyRegistry::write_to_pane`] could not be
-    /// encoded into a safe pane payload (PRD #93 round-8). Today this
+    /// The text handed to one of the `write_to_pane_*` entrypoints could not
+    /// be encoded into a safe pane payload (PRD #93 round-8). Today this
     /// fires when a multi-line input contains an embedded bracketed-paste
     /// marker (`ESC[200~` / `ESC[201~`) that would terminate the outer
     /// wrapper and leak the tail as raw keystrokes inside the agent TUI.
     #[error("Invalid pane payload: {0}")]
     InvalidPayload(#[from] PaneInputError),
     /// A spawn carried a `DOT_AGENT_DECK_PANE_ID` env value that already
-    /// names another live agent in this registry. `write_to_pane` keys
-    /// off `pane_id_env`, so accepting a second agent with the same id
+    /// names another live agent in this registry. The `write_to_pane_*`
+    /// entrypoints key off `pane_id_env`, so accepting a second agent with the same id
     /// would silently route delegate/work-done writes to whichever entry
     /// `HashMap::values().find(...)` returns first — i.e., the wrong PTY.
     /// Reject the spawn loudly instead.
@@ -991,13 +991,17 @@ pub struct AgentPtyRegistry {
     /// PTY, but the respawn's remove+spawn window needs a higher-level
     /// lock because the agent identity itself rolls over.
     ///
-    /// Entries are pruned in [`AgentPtyRegistry::close_agent`] so the
-    /// map doesn't grow monotonically across the daemon's lifetime
-    /// (panes are not created at high rates, but explicit cleanup
-    /// keeps the map size bounded by current live panes). A concurrent
-    /// `pane_dispatch_lock` clone that's still in flight keeps its
-    /// own `Arc<AsyncMutex<()>>` alive across the close — the entry
-    /// removal just detaches the map from that arc.
+    /// Entries are NEVER pruned. The map grows monotonically by every
+    /// `pane_id_env` ever seen, ~64 B/entry, bounded by pane creation
+    /// rate — negligible in practice. Pruning was tried in F9
+    /// followup-2 and reverted in F9 followup-3 because it re-opened
+    /// the F9 followup-1 race: after a close+respawn for the same
+    /// `pane_id_env`, an in-flight dispatcher holds an `Arc<AsyncMutex>`
+    /// that's no longer in the map, so a fresh dispatcher gets a
+    /// *different* `AsyncMutex` instance for the same `pane_id_env`.
+    /// The two dispatchers then don't serialize against each other,
+    /// re-introducing the registry remove+spawn race the lock exists
+    /// to prevent.
     dispatch_mutexes: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     /// Total number of explicit `KIND_DETACH` frames the daemon has observed
     /// across all attach-stream connections. Plain socket close (implicit
@@ -1028,6 +1032,17 @@ struct RegistryInner {
     agents: HashMap<String, RunningAgent>,
 }
 
+/// Internal selector for the two public byte-write entrypoints.
+/// `Submit` is the prompt path (payload + `SUBMIT_DELAY` + `\r`);
+/// `Notice` is the visibility path (payload + `\n`, no submit). Kept
+/// private because the public API exposes the two named methods
+/// directly — see [`AgentPtyRegistry::write_to_pane_and_submit`] and
+/// [`AgentPtyRegistry::write_to_pane_notice`].
+enum SubmitMode {
+    Submit,
+    Notice,
+}
+
 impl Default for AgentPtyRegistry {
     fn default() -> Self {
         Self::new()
@@ -1053,6 +1068,13 @@ impl AgentPtyRegistry {
     /// respawn+write window of a `clear = true` delegate so two
     /// concurrent same-pane delegates can't race the `registry.remove`
     /// + `spawn_agent` gap inside [`AgentPtyRegistry::respawn_agent_for_pane`].
+    ///
+    /// PRD #92 F9 followup-3: entries are never pruned. The map grows
+    /// by `pane_id_env` ever seen, which is small in practice; pruning
+    /// would re-open the followup-1 race where two dispatchers for the
+    /// same `pane_id_env` across a close+respawn end up holding
+    /// different `AsyncMutex` instances and stop serializing against
+    /// each other.
     pub fn pane_dispatch_lock(&self, pane_id_env: &str) -> Arc<AsyncMutex<()>> {
         let mut map = self.dispatch_mutexes.lock().unwrap();
         map.entry(pane_id_env.to_string())
@@ -1323,23 +1345,48 @@ impl AgentPtyRegistry {
     /// other writer mutexes, so holding for the ~150ms `SUBMIT_DELAY`
     /// affects only the offending pane and the deck dispatches at most
     /// one delegate or work-done per pane at a time in practice.
-    ///
-    /// PRD #92 F9 followup-2: `submit` selects between two semantics.
-    /// `submit = true` is the normal prompt path — payload, then
-    /// `SUBMIT_DELAY`, then `\r` (the CR an agent TUI interprets as
-    /// Enter). `submit = false` is the notice path — payload followed
-    /// by a single `\n` (newline, NOT carriage-return). The notice
-    /// terminates a visible line in the orchestrator pane's scrollback
-    /// without an agent's input handler treating it as a completed
-    /// user prompt (claude / codex etc. submit on CR, not LF). Used
-    /// by [`AppState::handle_delegate`] for the respawn-failure notice
-    /// so the orchestrator LLM doesn't try to "respond" to a diagnostic
-    /// the deck wrote into its own scrollback.
-    pub async fn write_to_pane(
+    pub async fn write_to_pane_and_submit(
         &self,
         pane_id: &str,
         text: &str,
-        submit: bool,
+    ) -> Result<(), AgentPtyError> {
+        self.write_to_pane_internal(pane_id, text, SubmitMode::Submit)
+            .await
+    }
+
+    /// Writes bytes to the pane's PTY without triggering submission semantics
+    /// (no SUBMIT_DELAY, no CR). Used for visible status notices (e.g., respawn
+    /// failures) that must appear in the orchestrator pane's scrollback but
+    /// should not be processed by the agent's LLM as a user prompt.
+    ///
+    /// The notice is terminated with a single `\n` (LF, NOT CR) — agents
+    /// like claude / codex submit on CR, so LF leaves the bytes as a
+    /// visible-but-unsubmitted line in the pane's scrollback.
+    ///
+    /// KNOWN LIMITATIONS — agent-side behavior the daemon cannot control:
+    /// - If an agent's TUI interprets LF (\n) as Enter, the notice will be
+    ///   submitted as a prompt anyway. Observed safe: (populate via M7.1
+    ///   manual test). Observed unsafe: (none confirmed).
+    /// - Subsequent [`AgentPtyRegistry::write_to_pane_and_submit`] calls on
+    ///   the same pane will submit "{notice text}\n{user prompt}" together —
+    ///   the notice bytes accumulate in the agent's stdin line buffer.
+    ///
+    /// Both limitations point to F11 (bus-push status delivery) as the proper
+    /// long-term fix — see `audit/pre-daemon-parity-audit.md`.
+    pub async fn write_to_pane_notice(
+        &self,
+        pane_id: &str,
+        text: &str,
+    ) -> Result<(), AgentPtyError> {
+        self.write_to_pane_internal(pane_id, text, SubmitMode::Notice)
+            .await
+    }
+
+    async fn write_to_pane_internal(
+        &self,
+        pane_id: &str,
+        text: &str,
+        mode: SubmitMode,
     ) -> Result<(), AgentPtyError> {
         // Resolve writer under the sync lock, then drop the lock before
         // awaiting the async writer mutex — otherwise we'd hold the
@@ -1371,22 +1418,25 @@ impl AgentPtyRegistry {
         w.write_all(&payload)
             .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
         let _ = w.flush();
-        if submit {
-            tokio::time::sleep(SUBMIT_DELAY).await;
-            w.write_all(b"\r")
-                .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
-            let _ = w.flush();
-        } else {
-            // PRD #92 F9 followup-2: terminate the notice on a `\n`
-            // so it forms a visible line in the orchestrator pane's
-            // scrollback without an agent TUI treating it as a
-            // submitted prompt (claude / codex submit on CR).
-            // `encode_pane_payload` strips trailing whitespace so a
-            // caller-provided `\n` would have been swallowed; the
-            // single byte is written here unambiguously.
-            w.write_all(b"\n")
-                .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
-            let _ = w.flush();
+        match mode {
+            SubmitMode::Submit => {
+                tokio::time::sleep(SUBMIT_DELAY).await;
+                w.write_all(b"\r")
+                    .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
+                let _ = w.flush();
+            }
+            SubmitMode::Notice => {
+                // PRD #92 F9 followup-2: terminate the notice on a `\n`
+                // so it forms a visible line in the orchestrator pane's
+                // scrollback without an agent TUI treating it as a
+                // submitted prompt (claude / codex submit on CR).
+                // `encode_pane_payload` strips trailing whitespace so a
+                // caller-provided `\n` would have been swallowed; the
+                // single byte is written here unambiguously.
+                w.write_all(b"\n")
+                    .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
+                let _ = w.flush();
+            }
         }
         Ok(())
     }
@@ -1403,15 +1453,15 @@ impl AgentPtyRegistry {
     /// `setsid`'d sub-shells Claude Code creates internally).
     /// Misbehaving agents are still reaped after the grace window.
     ///
-    /// PRD #92 F9 followup-2: also drop the `dispatch_mutexes` entry
-    /// keyed by this agent's `pane_id_env` so the map doesn't grow
-    /// monotonically across the daemon's lifetime. A concurrent
-    /// `pane_dispatch_lock` clone that's still in flight keeps its
-    /// own `Arc<AsyncMutex<()>>` alive — the entry removal just
-    /// detaches the map from that arc, so the next dispatch for the
-    /// same `pane_id_env` gets a fresh mutex (acceptable: by the
-    /// time the new agent's pane_id_env is reused there is no
-    /// in-flight respawn for the old one).
+    /// PRD #92 F9 followup-3: this path used to prune the
+    /// `dispatch_mutexes` entry for `agent.pane_id_env`. Pruning was
+    /// reverted because it re-opened the followup-1 race: an
+    /// in-flight dispatcher holds an `Arc<AsyncMutex>` already cloned
+    /// out of the map; after the close+respawn a fresh dispatcher
+    /// would `or_insert_with(...)` a *different* `AsyncMutex` for the
+    /// same `pane_id_env`, and the two dispatchers stop serializing.
+    /// The map's monotonic growth is bounded by pane creation rate
+    /// (~64 B/entry) — accepted as negligible.
     pub fn close_agent(&self, id: &str) -> Result<(), AgentPtyError> {
         let mut agent = {
             let mut inner = self.inner.lock().unwrap();
@@ -1420,9 +1470,6 @@ impl AgentPtyRegistry {
                 .remove(id)
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?
         };
-        if let Some(pane_id_env) = agent.pane_id_env.as_deref() {
-            self.dispatch_mutexes.lock().unwrap().remove(pane_id_env);
-        }
         terminate_child_with_grace_and_wait(&mut agent.child, AGENT_TERMINATE_GRACE);
         // Notify the idle monitor so it observes the registry shrink
         // immediately. The pump_reader thread will *also* signal once it
@@ -2365,9 +2412,9 @@ mod tests {
         // live one did receive something. The dead agent's writer
         // would error out anyway, so a misroute would surface as Err.
         registry
-            .write_to_pane("reuse-me", "echo round11-routing-marker", true)
+            .write_to_pane_and_submit("reuse-me", "echo round11-routing-marker")
             .await
-            .expect("write_to_pane to a live reuser must succeed");
+            .expect("write_to_pane_and_submit to a live reuser must succeed");
 
         // Allow the PTY to echo the input back into scrollback.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -2386,28 +2433,28 @@ mod tests {
         }
         assert!(
             found,
-            "write_to_pane must have landed bytes in the LIVE reuser's scrollback, not the exited entry's"
+            "write_to_pane_and_submit must have landed bytes in the LIVE reuser's scrollback, not the exited entry's"
         );
 
         registry.shutdown_all();
     }
 
-    /// `write_to_pane(.., submit = false)` must skip both the
-    /// `SUBMIT_DELAY` sleep and the trailing CR — the byte sequence
-    /// an agent TUI treats as "Enter". Used by the
-    /// `handle_delegate`-side spawn-failure notice so the orchestrator
-    /// LLM doesn't process the diagnostic as a user prompt.
+    /// `write_to_pane_notice` must skip both the `SUBMIT_DELAY` sleep
+    /// and the trailing CR — the byte sequence an agent TUI treats as
+    /// "Enter". Used by the `handle_delegate`-side spawn-failure
+    /// notice so the orchestrator LLM doesn't process the diagnostic
+    /// as a user prompt.
     ///
-    /// Timing is the test signal: `submit = true` waits the full
-    /// `SUBMIT_DELAY` (150 ms) between payload and CR, so the call
-    /// can't return in less than that. `submit = false` writes
-    /// payload + `\n` and returns immediately. PTY line discipline
-    /// normalizes CR/LF in the program-visible input stream, so we
-    /// can't distinguish the two writes by what `cat -u` echoes back
-    /// — but the SUBMIT_DELAY gate is observable from the caller's
-    /// wall clock.
+    /// Timing is the test signal: `write_to_pane_and_submit` waits
+    /// the full `SUBMIT_DELAY` (150 ms) between payload and CR, so
+    /// the call can't return in less than that. `write_to_pane_notice`
+    /// writes payload + `\n` and returns immediately. PTY line
+    /// discipline normalizes CR/LF in the program-visible input
+    /// stream, so we can't distinguish the two writes by what
+    /// `cat -u` echoes back — but the SUBMIT_DELAY gate is
+    /// observable from the caller's wall clock.
     #[tokio::test]
-    async fn write_to_pane_skips_submit_delay_when_submit_false() {
+    async fn write_to_pane_notice_skips_submit_delay() {
         let registry = AgentPtyRegistry::new();
         let _id = registry
             .spawn_agent(SpawnOptions {
@@ -2419,52 +2466,55 @@ mod tests {
 
         let start = tokio::time::Instant::now();
         registry
-            .write_to_pane("no-submit", "notice", false)
+            .write_to_pane_notice("no-submit", "notice")
             .await
-            .expect("write_to_pane with submit=false");
+            .expect("write_to_pane_notice");
         let no_submit_elapsed = start.elapsed();
         assert!(
             no_submit_elapsed < SUBMIT_DELAY,
-            "submit=false must skip the SUBMIT_DELAY sleep; took {no_submit_elapsed:?} \
+            "write_to_pane_notice must skip the SUBMIT_DELAY sleep; took {no_submit_elapsed:?} \
              (>= {SUBMIT_DELAY:?})"
         );
 
         let start = tokio::time::Instant::now();
         registry
-            .write_to_pane("no-submit", "prompt", true)
+            .write_to_pane_and_submit("no-submit", "prompt")
             .await
-            .expect("write_to_pane with submit=true");
+            .expect("write_to_pane_and_submit");
         let submit_elapsed = start.elapsed();
         assert!(
             submit_elapsed >= SUBMIT_DELAY,
-            "submit=true must wait at least SUBMIT_DELAY before the CR; \
+            "write_to_pane_and_submit must wait at least SUBMIT_DELAY before the CR; \
              took {submit_elapsed:?} (< {SUBMIT_DELAY:?})"
         );
 
         registry.shutdown_all();
     }
 
-    /// `close_agent` must remove the entry for the closed agent's
-    /// `pane_id_env` from `dispatch_mutexes` so the map doesn't grow
-    /// monotonically across the daemon's lifetime. Acquires the
-    /// dispatch lock first (causing the map to populate), closes the
-    /// agent, then re-acquires for a fresh `pane_id_env` to confirm
-    /// the closed-agent entry is gone via map size.
+    /// PRD #92 F9 followup-3: `close_agent` must NOT prune the
+    /// `dispatch_mutexes` entry for the closed agent's `pane_id_env`.
+    /// Pruning was tried in followup-2 and reverted because it
+    /// re-opened the followup-1 race: an in-flight dispatcher holds
+    /// an `Arc<AsyncMutex>` already cloned out of the map, so a fresh
+    /// dispatcher after the close would `or_insert_with` a *different*
+    /// `AsyncMutex` for the same `pane_id_env` and the two would stop
+    /// serializing against each other. This regression test guards
+    /// against a future re-introduction of pruning.
     #[tokio::test]
-    async fn close_agent_prunes_dispatch_mutex_entry() {
+    async fn close_agent_does_not_prune_dispatch_mutex_entry() {
         let registry = AgentPtyRegistry::new();
         let id = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/sh"),
                 env: vec![(
                     DOT_AGENT_DECK_PANE_ID.to_string(),
-                    "to-be-pruned".to_string(),
+                    "must-not-be-pruned".to_string(),
                 )],
                 ..SpawnOptions::default()
             })
             .expect("spawn sh");
         // Populate the dispatch_mutexes entry by borrowing the lock.
-        let _arc = registry.pane_dispatch_lock("to-be-pruned");
+        let arc_before = registry.pane_dispatch_lock("must-not-be-pruned");
         assert_eq!(
             registry.dispatch_mutexes.lock().unwrap().len(),
             1,
@@ -2474,8 +2524,23 @@ mod tests {
         registry.close_agent(&id).expect("close should succeed");
         assert_eq!(
             registry.dispatch_mutexes.lock().unwrap().len(),
-            0,
-            "close_agent must prune the dispatch_mutexes entry"
+            1,
+            "close_agent must NOT prune the dispatch_mutexes entry — \
+             pruning re-opens the followup-1 race where two dispatchers \
+             across a close+respawn end up with different AsyncMutex \
+             instances for the same pane_id_env"
+        );
+
+        // The post-close lookup must return the *same* AsyncMutex
+        // instance the in-flight dispatcher already holds — that's
+        // the whole point of not pruning. Two dispatchers across a
+        // close+respawn must serialize against the same mutex.
+        let arc_after = registry.pane_dispatch_lock("must-not-be-pruned");
+        assert!(
+            Arc::ptr_eq(&arc_before, &arc_after),
+            "post-close pane_dispatch_lock must return the same Arc \
+             so an in-flight dispatcher and a fresh dispatcher hold \
+             the same AsyncMutex instance"
         );
 
         registry.shutdown_all();

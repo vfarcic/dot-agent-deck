@@ -936,9 +936,9 @@ async fn write_to_pane_emits_submit_cr_after_single_line_prompt() {
 
     daemon
         .pty_registry
-        .write_to_pane("coder-pane", "hello world", true)
+        .write_to_pane_and_submit("coder-pane", "hello world")
         .await
-        .expect("write_to_pane should succeed for a known pane");
+        .expect("write_to_pane_and_submit should succeed for a known pane");
 
     // Look for cat -u's stdout output: "hello world\r\n" (the slave
     // termios processed the submitted line — ICRNL on input made it a
@@ -984,9 +984,9 @@ async fn write_to_pane_wraps_multiline_in_bracketed_paste() {
 
     daemon
         .pty_registry
-        .write_to_pane("coder-pane", "line1\nline2\nline3", true)
+        .write_to_pane_and_submit("coder-pane", "line1\nline2\nline3")
         .await
-        .expect("write_to_pane should succeed for a known pane");
+        .expect("write_to_pane_and_submit should succeed for a known pane");
 
     // Wait for the END marker in cat's stdout (raw ESC form) — that's
     // the last byte of the encoded payload, so its presence implies the
@@ -1053,13 +1053,13 @@ async fn write_to_pane_serializes_concurrent_writes_per_pane() {
     let payload_b_for_task = payload_b.clone();
     let write_a = tokio::spawn(async move {
         registry_a
-            .write_to_pane("coder-pane", &payload_a_for_task, true)
+            .write_to_pane_and_submit("coder-pane", &payload_a_for_task)
             .await
             .expect("write A");
     });
     let write_b = tokio::spawn(async move {
         registry_b
-            .write_to_pane("coder-pane", &payload_b_for_task, true)
+            .write_to_pane_and_submit("coder-pane", &payload_b_for_task)
             .await
             .expect("write B");
     });
@@ -1156,10 +1156,16 @@ async fn write_to_pane_concurrent_writes_to_different_panes_run_in_parallel() {
     let registry_a = daemon.pty_registry.clone();
     let registry_b = daemon.pty_registry.clone();
     let start = std::time::Instant::now();
-    let write_a =
-        tokio::spawn(async move { registry_a.write_to_pane("orch-pane", "alpha", true).await });
-    let write_b =
-        tokio::spawn(async move { registry_b.write_to_pane("coder-pane", "beta", true).await });
+    let write_a = tokio::spawn(async move {
+        registry_a
+            .write_to_pane_and_submit("orch-pane", "alpha")
+            .await
+    });
+    let write_b = tokio::spawn(async move {
+        registry_b
+            .write_to_pane_and_submit("coder-pane", "beta")
+            .await
+    });
     let (a, b) = tokio::join!(write_a, write_b);
     a.unwrap().expect("write to orch-pane");
     b.unwrap().expect("write to coder-pane");
@@ -1590,7 +1596,7 @@ command = "cat -u"
     // `cat -u` echoes it back, so it lands in the bus history.
     daemon
         .pty_registry
-        .write_to_pane("coder-pane", "PRE_RESPAWN_SCROLLBACK_MARKER", true)
+        .write_to_pane_and_submit("coder-pane", "PRE_RESPAWN_SCROLLBACK_MARKER")
         .await
         .expect("seed write should succeed");
     let _ = wait_for_in_snapshot(
@@ -1907,7 +1913,7 @@ command = "/nonexistent/dot-agent-deck-test-bin-12345"
 /// concurrently, not sequentially. Pre-F9-followup-2, the per-target
 /// loop in `handle_delegate` was `.await`-sequential — an N-worker
 /// fan-out paid `(respawn + RESPAWN_READY_DELAY) × N` wall-clock. The
-/// fix replaces the loop with `futures::future::join_all` over
+/// fix replaces the loop with `futures_util::future::join_all` over
 /// per-pane futures so different panes' respawn+wait windows overlap.
 /// Per-pane work still serializes against itself via the per-pane
 /// dispatch mutex (see `concurrent_clear_true_delegates_both_reach_worker`).
@@ -2073,7 +2079,7 @@ command = "cat -u"
             Duration::from_secs(15),
         )
     });
-    let elapsed_per_pane: Vec<Option<Duration>> = futures::future::join_all(waits).await;
+    let elapsed_per_pane: Vec<Option<Duration>> = futures_util::future::join_all(waits).await;
     let fanout_elapsed = fanout_start.elapsed();
     for (pane, el) in panes.iter().zip(elapsed_per_pane.iter()) {
         assert!(

@@ -339,7 +339,7 @@ impl AppState {
                 .await;
             }
         });
-        futures::future::join_all(futs).await;
+        futures_util::future::join_all(futs).await;
     }
 
     /// Per-target body of [`AppState::handle_delegate`], factored out so
@@ -491,7 +491,7 @@ impl AppState {
                     // already disposed of the previous child.
                     // Without surfacing the error to the operator,
                     // the worker pane is left with no live agent,
-                    // the subsequent `write_to_pane` also fails
+                    // the subsequent prompt write also fails
                     // with `NotFound`, and the user sees nothing in
                     // the TUI — just two log lines somewhere
                     // off-screen. The full error stays in the
@@ -500,12 +500,13 @@ impl AppState {
                     // pane's scrollback is a high-level message so
                     // a stray filesystem path (or other detail
                     // from `AgentPtyError::Spawn`) doesn't leak
-                    // into the orchestrator LLM's view. `submit =
-                    // false` on the `write_to_pane` call means the
-                    // notice forms a visible line in scrollback
-                    // without an Enter — the orchestrator's LLM
-                    // sees it as scrollback noise, not a user
-                    // prompt to respond to.
+                    // into the orchestrator LLM's view. Using
+                    // `write_to_pane_notice` (no SUBMIT_DELAY, LF
+                    // tail instead of CR) means the notice forms a
+                    // visible line in scrollback without an Enter
+                    // — the orchestrator's LLM sees it as
+                    // scrollback noise, not a user prompt to
+                    // respond to.
                     warn!(
                         pane_id = %pane_id,
                         role = %target_role,
@@ -519,7 +520,7 @@ impl AppState {
                          {pane_id} (see daemon log for details)"
                     );
                     if let Err(write_err) = registry
-                        .write_to_pane(orchestrator_pane_id, &notice, false)
+                        .write_to_pane_notice(orchestrator_pane_id, &notice)
                         .await
                     {
                         warn!(
@@ -532,14 +533,14 @@ impl AppState {
                     }
                     // Skip the post-respawn prompt write — there is
                     // no live worker agent on this pane to receive
-                    // it, and write_to_pane would just log a
+                    // it, and the submit-write would just log a
                     // second `NotFound`.
                     return;
                 }
             }
         }
         let one_liner = compose_delegate_prompt(&task_body);
-        if let Err(e) = registry.write_to_pane(pane_id, &one_liner, true).await {
+        if let Err(e) = registry.write_to_pane_and_submit(pane_id, &one_liner).await {
             warn!(
                 pane_id = %pane_id,
                 role = %target_role,
@@ -556,7 +557,7 @@ impl AppState {
     /// the daemon owns `pane_cwd_map`); the new piece is that the daemon
     /// also picks the orchestrator pane for the same orchestration and
     /// writes the "Worker {role} has completed..." feedback directly into
-    /// its PTY via [`AgentPtyRegistry::write_to_pane`]. No broadcast hop —
+    /// its PTY via [`AgentPtyRegistry::write_to_pane_and_submit`]. No broadcast hop —
     /// the bytes sit in the orchestrator pane's scrollback, surviving any
     /// number of detach/reattach cycles.
     ///
@@ -626,7 +627,10 @@ impl AppState {
             "Worker {safe_name} has completed their task. \
              Read .dot-agent-deck/work-done-{safe_name}.md for their full report."
         );
-        if let Err(e) = registry.write_to_pane(&orch_pane_id, &feedback, true).await {
+        if let Err(e) = registry
+            .write_to_pane_and_submit(&orch_pane_id, &feedback)
+            .await
+        {
             warn!(
                 pane_id = %orch_pane_id,
                 role = %role_name,
