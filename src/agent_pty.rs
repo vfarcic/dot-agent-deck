@@ -1328,6 +1328,143 @@ impl AgentPtyRegistry {
         Ok(())
     }
 
+    /// Respawn the agent attached to a given `pane_id_env`: gracefully
+    /// terminate the current child, then spawn a fresh one running
+    /// `command` and rebind it to the same `pane_id_env`. Returns the
+    /// new registry id.
+    ///
+    /// PRD #92 F9: the per-role `clear` flag pre-baseline meant "kill
+    /// the worker agent and spawn a fresh one before the next task
+    /// lands so the new task starts with empty context." Pre-PRD-#76
+    /// this was implemented TUI-side via close-then-create on the
+    /// pane controller (see `git show 2fc39c3:src/ui.rs::dispatch_delegate_events`).
+    /// Post-PRD-#93 the daemon owns the PTYs, so the equivalent has
+    /// to happen daemon-side — this method.
+    ///
+    /// Identity-preserving fields on [`RunningAgent`] (`pane_id_env`,
+    /// `display_name`, `cwd`, `tab_membership`, `agent_type`) are
+    /// captured from the existing entry and re-applied to the new
+    /// spawn. The TUI's pane card therefore stays put across the
+    /// respawn: the daemon's `agent_records()` snapshot still lists
+    /// the same `pane_id_env` and `tab_membership`, so a TUI that
+    /// reattaches mid-respawn rebinds to the new agent cleanly.
+    /// Registry ids (`id`) are sequential and DO change — callers
+    /// that key off the old id (e.g. a subscriber holding an
+    /// `AttachHandle`) will see their broadcast receiver close once
+    /// the old child's reader thread reaches EOF; the standard
+    /// reattach path (`subscribe` by `pane_id_env` lookup) brings
+    /// them onto the new agent's bus.
+    ///
+    /// The blocking termination work (up to
+    /// [`AGENT_TERMINATE_GRACE`] of `try_wait` polling, mirroring
+    /// `close_agent`'s contract) runs on a `spawn_blocking` pool task
+    /// so the daemon's async runtime threads stay responsive. Mirrors
+    /// the pattern `daemon_protocol.rs::handle_close_agent` uses for
+    /// the Ctrl+W close path (PRD #92 F8 followup auditor #1).
+    ///
+    /// The new agent comes up at a default 24×80 PTY size; the TUI's
+    /// next `resize` call (sent on attach / render) corrects it to
+    /// the client's actual geometry. A brief delay before writing
+    /// the post-respawn prompt is the caller's responsibility — the
+    /// daemon doesn't peek into the new agent's stdout, so it can't
+    /// observe "ready" any better than a fixed wait. See
+    /// [`crate::state::RESPAWN_READY_DELAY`].
+    pub async fn respawn_agent_for_pane(
+        &self,
+        pane_id_env: &str,
+        command: &str,
+    ) -> Result<String, AgentPtyError> {
+        // Step 1: atomically lift the existing entry out of the
+        // registry. Holding the sync lock across the find+remove keeps
+        // a concurrent `write_to_pane` from racing in and writing to a
+        // PTY whose child we're about to terminate (the writer mutex
+        // is per-agent so concurrent writes against the same
+        // `pane_id_env` are still serialized, but a write that arrived
+        // BEFORE we removed the entry could already be flushing).
+        //
+        // The `exited` filter is deliberately omitted: a dead-but-not-
+        // yet-reaped agent should also be replaced — its registry
+        // entry is the place the new agent's identity (display_name,
+        // tab_membership, etc.) lives, and `clear = true` on a
+        // crashed agent should still produce a fresh worker.
+        let removed = {
+            let mut inner = self.inner.lock().unwrap();
+            let agent_id = inner
+                .agents
+                .iter()
+                .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env))
+                .map(|(id, _)| id.clone())
+                .ok_or_else(|| AgentPtyError::NotFound(pane_id_env.to_string()))?;
+            inner
+                .agents
+                .remove(&agent_id)
+                .expect("agent_id was just located inside the same lock hold")
+        };
+
+        let RunningAgent {
+            child,
+            master,
+            writer,
+            bus: _,
+            pane_id_env: captured_pane_id_env,
+            display_name,
+            cwd,
+            tab_membership,
+            agent_type,
+            exited: _,
+        } = removed;
+
+        // Drop the master + writer first so the slave half closes on
+        // its own (cat / shells / most agents exit cleanly on slave
+        // EOF). The terminate helper still escalates to SIGKILL if the
+        // child doesn't honor that — so a buggy agent that hangs on
+        // slave EOF is still reaped within the grace window.
+        drop(writer);
+        drop(master);
+
+        // Step 2: terminate the previous child on the blocking pool.
+        // `terminate_child_with_grace_and_wait` polls `try_wait`
+        // synchronously for up to `AGENT_TERMINATE_GRACE` (3 s); running
+        // that on a tokio worker thread would block other futures on
+        // the same worker. Same shape `daemon_protocol.rs` uses for
+        // `close_agent`.
+        let mut child = child;
+        let join = tokio::task::spawn_blocking(move || {
+            terminate_child_with_grace_and_wait(&mut child, AGENT_TERMINATE_GRACE);
+        })
+        .await;
+        if let Err(join_err) = join {
+            tracing::warn!(
+                pane_id = %pane_id_env,
+                error = %join_err,
+                "respawn: spawn_blocking for terminate panicked or was cancelled; \
+                 proceeding with fresh spawn anyway (the SIGKILL backstop inside the \
+                 helper still fired if the join was a panic on the SIGTERM phase)"
+            );
+        }
+
+        // Step 3: spawn a fresh agent with the captured identity. The
+        // `DOT_AGENT_DECK_PANE_ID` env carries the same value the old
+        // child had, so `write_to_pane(pane_id_env)` keeps routing to
+        // this pane after the respawn — and the TUI's pane card
+        // stays bound to the same display id.
+        let mut env = Vec::new();
+        if let Some(ref id) = captured_pane_id_env {
+            env.push((DOT_AGENT_DECK_PANE_ID.to_string(), id.clone()));
+        }
+        let opts = SpawnOptions {
+            command: Some(command),
+            cwd: cwd.as_deref(),
+            display_name: display_name.as_deref(),
+            rows: 24,
+            cols: 80,
+            env,
+            tab_membership,
+            agent_type,
+        };
+        self.spawn_agent(opts)
+    }
+
     /// Subscribe to an agent's live output and take its scrollback snapshot
     /// in one atomic step. Used by the attach protocol handler.
     pub fn subscribe(&self, id: &str) -> Result<AttachHandle, AgentPtyError> {

@@ -13,6 +13,27 @@ use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 const MAX_RECENT_EVENTS: usize = 50;
 const MAX_FIRST_PROMPTS: usize = 3;
 
+/// PRD #92 F9: fixed delay between a `clear = true` respawn and the
+/// post-respawn prompt write. The freshly-spawned agent's TUI may
+/// still be initializing (drawing its banner, opening its session
+/// store, hooking SIGWINCH); writing the prompt the moment
+/// `spawn_agent` returns can land bytes before the agent is reading
+/// from stdin, in which case the prompt is dropped on the floor or
+/// landed inside an unrendered prompt box.
+///
+/// We can't peek into the new agent's stdout from the daemon to
+/// observe "ready" (the bus is consumed by the TUI subscriber, not
+/// us). 250 ms is a conservative empirical floor: most CLI agents
+/// (claude, codex, gemini, opencode, a plain `cat -u`) finish their
+/// startup faster than that, and the cost to dispatch latency is
+/// trivial against a typical task that runs for minutes. The
+/// baseline TUI dispatch path (`2fc39c3:src/ui.rs::process_pending_dispatches`)
+/// used a richer scheme — wait for `SessionStart` then fall back to
+/// 10 s — but that relied on the TUI seeing hook events directly,
+/// machinery the daemon-side flow doesn't have here. A fixed delay
+/// trades the SessionStart fast-path for simplicity.
+const RESPAWN_READY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
     Thinking,
@@ -355,28 +376,65 @@ impl AppState {
                     );
                     compose_worker_task_file(prompt_template, &signal.task)
                 };
-                // CodeRabbit (PRD #93 round-9): the per-role `clear`
-                // flag (pre-Round-5: kill the worker pane and respawn
-                // the role's command before injecting the new prompt)
-                // is not yet wired through on the daemon side. Restart
-                // requires the daemon to know the role's spawn command,
-                // re-issue the StartAgent / close+spawn dance from
-                // inside the hook loop, and defer the prompt-write
-                // until the fresh agent is ready — substantial new
-                // machinery that's deliberately out of scope for this
-                // commit (see commit message). Log the deferral here
-                // so a `clear = true` regression test or operator
-                // running with a `clear`-bearing config sees a clear
-                // signal rather than silent drift.
+                // PRD #92 F9: honor the per-role `clear` flag from
+                // `.dot-agent-deck.toml`. Baseline (`2fc39c3:src/ui.rs::dispatch_delegate_events`)
+                // implemented `clear = true` by closing the worker
+                // pane and spawning a fresh one running the role's
+                // command before injecting the new task — so the new
+                // task starts with empty context, not just a
+                // visually-cleared screen. The daemon-side equivalent
+                // here calls [`AgentPtyRegistry::respawn_agent_for_pane`]
+                // which terminates the existing child (SIGTERM with a
+                // 3 s grace then SIGKILL via `terminate_child_with_grace_and_wait`)
+                // and spawns a fresh one with the same `pane_id_env`
+                // and identity — the dashboard card stays put, the
+                // PID rolls over, and the agent's conversation
+                // history is gone.
+                //
+                // `clear = false` (used by the `release` role)
+                // preserves the agent and its scrollback / context
+                // across delegations — no respawn, just the prompt
+                // write below. Missing role config defaults to
+                // `clear = true` matching the parse default in
+                // [`OrchestrationRoleConfig`]; the rare case of "no
+                // role config AND clear was requested" is treated as
+                // "no respawn" since we don't have a spawn command
+                // to use anyway.
                 if let Some(role) = role_config.as_ref()
                     && role.clear
                 {
-                    tracing::debug!(
-                        role = %target_role,
-                        pane_id = %pane_id,
-                        "delegate: role.clear=true is not yet implemented on the daemon side; \
-                         injecting prompt into the existing pane without restart"
-                    );
+                    match registry
+                        .respawn_agent_for_pane(&pane_id, &role.command)
+                        .await
+                    {
+                        Ok(_new_id) => {
+                            tracing::debug!(
+                                role = %target_role,
+                                pane_id = %pane_id,
+                                "delegate: respawned worker agent for clear=true; \
+                                 waiting RESPAWN_READY_DELAY before prompt write"
+                            );
+                            tokio::time::sleep(RESPAWN_READY_DELAY).await;
+                        }
+                        Err(e) => {
+                            // The most likely failure mode is "no
+                            // agent registered for this pane_id" —
+                            // e.g. the worker crashed and was reaped
+                            // before this delegate arrived. Falling
+                            // through to write_to_pane in that state
+                            // will fail too and the warn there is
+                            // the user-facing error; logging here
+                            // adds context about WHY the respawn
+                            // path didn't run.
+                            warn!(
+                                pane_id = %pane_id,
+                                role = %target_role,
+                                error = %e,
+                                "delegate: respawn for clear=true failed; \
+                                 falling back to direct prompt write"
+                            );
+                        }
+                    }
                 }
                 let one_liner = compose_delegate_prompt(&task_body);
                 if let Err(e) = registry.write_to_pane(&pane_id, &one_liner).await {

@@ -237,7 +237,7 @@ The deck's contract: "the agent gets a catchable signal and a bounded grace wind
 
 ### F9 — Restore worker context cleanup per `.dot-agent-deck.toml` `clear` setting
 
-**Status**: Queued (this PRD, Phase 11).
+**Status**: Shipped (respawn-based). Implementation matches baseline `2fc39c3:src/ui.rs::dispatch_delegate_events` semantics: on a `clear = true` delegate the daemon terminates the worker's existing child (SIGTERM with the F8 3 s grace then SIGKILL) and spawns a fresh agent reusing the same `pane_id_env` before writing the new prompt. `clear = false` skips the respawn. ANSI-clear-only shims were considered and rejected — they wipe the visible screen but leave the agent's in-memory context intact, which is not what the baseline contract delivered.
 
 **Problem**: Each `[[orchestrations.roles]]` entry in `.dot-agent-deck.toml` supports a `clear` field (default `true`; the `release` role explicitly sets `clear = false` to keep its scrollback for the release-flow walkthrough). Pre-daemon (baseline `2fc39c3`), the orchestrator honored this setting and cleared a worker's pane before each delegation when `clear == true`. Post-daemon (current main), this honoring is lost — workers retain previous pane content across delegations. Surfaced by user during F8 manual testing. Likely lost in PRD #93 round 5 (commit `d39930f`) when delegate / work-done dispatch moved into the daemon — either the field was dropped from the in-memory orchestration-role representation, or its honoring code in the delegate dispatch path was removed during the refactor.
 

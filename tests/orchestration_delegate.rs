@@ -498,7 +498,7 @@ prompt_template = "You are the coder. Always run tests before finishing."
         &cwd,
     )
     .await;
-    let coder_agent_id =
+    let _coder_agent_id_initial =
         start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
 
     send_delegate(
@@ -512,9 +512,13 @@ prompt_template = "You are the coder. Always run tests before finishing."
     )
     .await;
 
-    let _ = wait_for_in_snapshot(
+    // PRD #92 F9: the coder role defaults to `clear = true`, so this
+    // delegate triggers a respawn of the coder agent. The pre-respawn
+    // agent id is stale by the time the prompt lands — key the wait
+    // on the stable `pane_id_env` instead.
+    let _ = wait_for_in_pane_snapshot(
         &daemon.pty_registry,
-        &coder_agent_id,
+        "coder-pane",
         "Read .dot-agent-deck/worker-task-coder.md",
         Duration::from_secs(5),
     )
@@ -592,7 +596,7 @@ prompt_template = "You are the coder for an unnamed orchestration."
         &cwd,
     )
     .await;
-    let coder_agent_id = start_role_pane(
+    let _coder_agent_id_initial = start_role_pane(
         &daemon,
         &resolved_name,
         "coder",
@@ -614,9 +618,12 @@ prompt_template = "You are the coder for an unnamed orchestration."
     )
     .await;
 
-    let _ = wait_for_in_snapshot(
+    // PRD #92 F9: coder role defaults to `clear = true` so this
+    // delegate respawns the agent. Use the pane-keyed wait so the
+    // post-respawn rotation doesn't strand the assertion on a stale id.
+    let _ = wait_for_in_pane_snapshot(
         &daemon.pty_registry,
-        &coder_agent_id,
+        "coder-pane-2",
         "Read .dot-agent-deck/worker-task-coder.md",
         Duration::from_secs(5),
     )
@@ -1164,5 +1171,459 @@ async fn write_to_pane_concurrent_writes_to_different_panes_run_in_parallel() {
         "two concurrent writes to different panes took {:?} — expected ~SUBMIT_DELAY \
          (~150ms), suggesting the per-pane lock is over-serializing",
         elapsed
+    );
+}
+
+/// `kill(pid, 0)` is a non-destructive liveness probe: returns 0 if the
+/// process exists, `-1`/ESRCH if it has been reaped. Used by the F9
+/// tests to confirm the old worker child is actually dead after a
+/// respawn, not just removed from the registry. Same shape as
+/// `tests/process_group_kill.rs::pid_is_alive`.
+fn pid_is_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 probes existence without delivering anything.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Look up a registry agent id by `pane_id_env`. The F9 respawn path
+/// rotates the registry id but keeps the pane_id_env, so tests that
+/// want the CURRENT agent's id after a respawn key off pane_id_env
+/// (the stable identity the TUI keeps on its pane card).
+fn agent_id_for_pane(registry: &AgentPtyRegistry, pane_id_env: &str) -> Option<String> {
+    registry
+        .agent_records()
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(pane_id_env))
+        .map(|r| r.id)
+}
+
+/// Same as [`wait_for_in_snapshot`] but keys by `pane_id_env` and
+/// re-resolves the agent id on every poll. Tests that exercise a
+/// `clear = true` delegate need this: the F9 respawn rotates the
+/// registry agent id between the test's `start_role_pane` call (which
+/// captured the pre-respawn id) and the prompt-arrival check. A
+/// pane-keyed wait survives the rotation.
+async fn wait_for_in_pane_snapshot(
+    registry: &AgentPtyRegistry,
+    pane_id_env: &str,
+    needle: &str,
+    timeout: Duration,
+) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(agent_id) = agent_id_for_pane(registry, pane_id_env)
+            && let Ok(snap) = registry.snapshot(&agent_id)
+            && snap.windows(needle.len()).any(|w| w == needle.as_bytes())
+        {
+            return snap;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let last = agent_id_for_pane(registry, pane_id_env)
+        .and_then(|id| registry.snapshot(&id).ok())
+        .unwrap_or_default();
+    panic!(
+        "needle {:?} not found in pane {} scrollback within {:?}; last snapshot: {:?}",
+        needle,
+        pane_id_env,
+        timeout,
+        String::from_utf8_lossy(&last)
+    );
+}
+
+/// PRD #92 F9: `clear = true` (the parse default) means the worker
+/// agent's CONTEXT is cleared between delegations, not just its
+/// screen. Implemented daemon-side as a kill-the-old-child + spawn-a-
+/// fresh-one dance (`AgentPtyRegistry::respawn_agent_for_pane`)
+/// before the new task's prompt write. The test pins the contract
+/// at four layers:
+///
+///   1. The old child process is dead after the second delegation
+///      (`kill(pid, 0)` returns ESRCH).
+///   2. A new child is spawned with a different PID.
+///   3. The pane_id_env stays the same across the respawn so the
+///      dashboard card / write-to-pane routing keeps working.
+///   4. The new agent receives the second delegation's prompt — i.e.
+///      the respawn isn't tearing things down without rebuilding.
+#[tokio::test]
+async fn delegate_respawns_worker_agent_when_role_clear_is_true() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    // No `clear` line means default `true` per
+    // `OrchestrationRoleConfig::clear` serde default — pinned by
+    // `project_config::tests::orchestration_clear_defaults_to_true`.
+    let config_toml = r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "cat -u"
+"#;
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let coder_agent_id_initial =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+    let pid_initial = daemon
+        .pty_registry
+        .child_pid(&coder_agent_id_initial)
+        .expect("freshly-spawned coder agent must expose a pid") as i32;
+
+    // First delegation. With clear=true defaulting on the coder role,
+    // the daemon respawns the coder agent before writing the prompt.
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "task ALPHA".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    // Wait for the second-generation agent to come up. After respawn
+    // the new agent id is rotated but the pane_id_env stays the
+    // same, so we look up by pane_id_env. The 5 s budget covers
+    // SIGTERM grace (up to 3 s in pathological cases) plus the
+    // RESPAWN_READY_DELAY (250 ms) plus the spawn latency.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut coder_agent_id_after_first = String::new();
+    while tokio::time::Instant::now() < deadline {
+        if let Some(id) = agent_id_for_pane(&daemon.pty_registry, "coder-pane")
+            && id != coder_agent_id_initial
+        {
+            coder_agent_id_after_first = id;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        !coder_agent_id_after_first.is_empty(),
+        "registry never produced a new agent id for coder-pane after respawn"
+    );
+
+    let pid_after_first = daemon
+        .pty_registry
+        .child_pid(&coder_agent_id_after_first)
+        .expect("respawned coder agent must expose a new pid") as i32;
+    assert_ne!(
+        pid_initial, pid_after_first,
+        "respawn must replace the child process; got the same pid on both sides"
+    );
+
+    // The original child must be dead. The terminate helper polls
+    // try_wait for up to AGENT_TERMINATE_GRACE (3 s) so the kernel
+    // has definitively reaped the old child by the time the respawn
+    // returns.
+    assert!(
+        !pid_is_alive(pid_initial),
+        "old child pid {pid_initial} is still alive after respawn — \
+         the terminate-with-grace helper didn't reach SIGKILL or wait()"
+    );
+
+    // The pane_id_env stays. agent_records on the registry must
+    // still show exactly one live entry for coder-pane.
+    let live_records: Vec<_> = daemon
+        .pty_registry
+        .agent_records()
+        .into_iter()
+        .filter(|r| r.pane_id_env.as_deref() == Some("coder-pane"))
+        .collect();
+    assert_eq!(
+        live_records.len(),
+        1,
+        "after respawn there must be exactly one live agent bound to \
+         coder-pane; got {live_records:?}"
+    );
+
+    // The first delegation's prompt must land in the NEW agent's
+    // scrollback (write_to_pane routes by pane_id_env which the
+    // respawn preserved). Use the new agent_id for the snapshot.
+    let _ = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &coder_agent_id_after_first,
+        "Read .dot-agent-deck/worker-task-coder.md",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Fire a second delegation to prove the respawn loop is idempotent
+    // (not a one-shot path). Capture another pid roll-over.
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "task BRAVO".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut coder_agent_id_after_second = String::new();
+    while tokio::time::Instant::now() < deadline {
+        if let Some(id) = agent_id_for_pane(&daemon.pty_registry, "coder-pane")
+            && id != coder_agent_id_after_first
+        {
+            coder_agent_id_after_second = id;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        !coder_agent_id_after_second.is_empty(),
+        "second delegation should produce a second respawn — registry agent id never rotated"
+    );
+    let pid_after_second = daemon
+        .pty_registry
+        .child_pid(&coder_agent_id_after_second)
+        .expect("post-second-respawn agent must expose a pid") as i32;
+    assert_ne!(
+        pid_after_first, pid_after_second,
+        "second delegation must respawn again; pid didn't change"
+    );
+    assert!(
+        !pid_is_alive(pid_after_first),
+        "second-respawn must kill the first-respawn child"
+    );
+
+    // The second task file content reflects the most-recent delegation.
+    let task_file = std::path::Path::new(&cwd).join(".dot-agent-deck/worker-task-coder.md");
+    let body = std::fs::read_to_string(&task_file).unwrap();
+    assert_eq!(
+        body, "task BRAVO",
+        "task file should reflect the second delegation's task body"
+    );
+}
+
+/// PRD #92 F9: the inverse — `clear = false` (the `release` role's
+/// opt-out) must NOT respawn the worker agent. The agent process
+/// stays alive across delegations and accumulates scrollback /
+/// context. Pre-baseline contract for the release role's
+/// walkthrough-style flow.
+#[tokio::test]
+async fn delegate_does_not_respawn_worker_when_role_clear_is_false() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let config_toml = r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "cat -u"
+clear = false
+"#;
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let coder_agent_id =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+    let pid_initial = daemon
+        .pty_registry
+        .child_pid(&coder_agent_id)
+        .expect("coder agent must expose a pid") as i32;
+
+    // Fire two delegations back-to-back. With clear=false the daemon
+    // should skip the respawn path entirely and just write the prompt
+    // into the existing PTY — the agent's pid stays put across both.
+    for label in ["task ALPHA", "task BRAVO"] {
+        send_delegate(
+            &daemon.hook_path,
+            &DelegateSignal {
+                pane_id: "orch-pane".into(),
+                task: label.into(),
+                to: vec!["coder".into()],
+                timestamp: Utc::now(),
+            },
+        )
+        .await;
+        // Wait for each prompt to land before firing the next, so
+        // an out-of-order observation doesn't flake the test.
+        let _ = wait_for_in_snapshot(
+            &daemon.pty_registry,
+            &coder_agent_id,
+            "Read .dot-agent-deck/worker-task-coder.md",
+            Duration::from_secs(5),
+        )
+        .await;
+    }
+
+    // The registry still shows the same agent id — no respawn rotated it.
+    let current_id = agent_id_for_pane(&daemon.pty_registry, "coder-pane")
+        .expect("coder-pane should still have a live agent");
+    assert_eq!(
+        current_id, coder_agent_id,
+        "clear=false must NOT rotate the registry agent id"
+    );
+
+    // The pid is the same — same process, just written to twice.
+    let pid_after = daemon
+        .pty_registry
+        .child_pid(&coder_agent_id)
+        .expect("coder agent must still expose a pid") as i32;
+    assert_eq!(
+        pid_initial, pid_after,
+        "clear=false must NOT replace the child process; pid changed"
+    );
+    assert!(
+        pid_is_alive(pid_initial),
+        "clear=false worker process should still be alive after delegations"
+    );
+}
+
+/// PRD #92 F9 context sanity check: after a `clear = true` respawn,
+/// the new agent has NO memory of bytes written to the previous
+/// agent. With `cat -u` as the test agent, "memory" surfaces as
+/// scrollback — the old agent echoed everything it received to its
+/// stdout, and that scrollback was tied to the old agent's bus.
+/// When the respawn rotates the agent id, the new bus is empty —
+/// proving the daemon-side broadcast scrollback follows the agent
+/// process lifetime (not the pane id). A real Claude / opencode
+/// agent would lose conversation history the same way.
+#[tokio::test]
+async fn delegate_respawn_clears_agent_scrollback_when_role_clear_is_true() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let config_toml = r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "cat -u"
+"#;
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let coder_agent_id_initial =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    // Seed the old agent's scrollback with a recognizable marker.
+    // `cat -u` echoes it back, so it lands in the bus history.
+    daemon
+        .pty_registry
+        .write_to_pane("coder-pane", "PRE_RESPAWN_SCROLLBACK_MARKER")
+        .await
+        .expect("seed write should succeed");
+    let _ = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &coder_agent_id_initial,
+        "PRE_RESPAWN_SCROLLBACK_MARKER",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Trigger respawn via a delegation.
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "POST_RESPAWN_TASK".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    // Wait for the rotated agent id.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut coder_agent_id_after = String::new();
+    while tokio::time::Instant::now() < deadline {
+        if let Some(id) = agent_id_for_pane(&daemon.pty_registry, "coder-pane")
+            && id != coder_agent_id_initial
+        {
+            coder_agent_id_after = id;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        !coder_agent_id_after.is_empty(),
+        "respawn must rotate the agent id"
+    );
+
+    // Wait for the new prompt to land so we know the new agent is up
+    // and dispatch has flushed.
+    let new_snap = wait_for_in_snapshot(
+        &daemon.pty_registry,
+        &coder_agent_id_after,
+        "Read .dot-agent-deck/worker-task-coder.md",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // The new agent's scrollback must NOT contain the pre-respawn
+    // marker — its bus was fresh-allocated by the respawn.
+    assert!(
+        !String::from_utf8_lossy(&new_snap).contains("PRE_RESPAWN_SCROLLBACK_MARKER"),
+        "fresh agent must not inherit the previous agent's scrollback; \
+         got snapshot = {:?}",
+        String::from_utf8_lossy(&new_snap)
     );
 }
