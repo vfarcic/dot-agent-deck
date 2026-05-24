@@ -2453,7 +2453,20 @@ pub fn run_tui(
             // command wasn't recognized or an older daemon predated the
             // field, in which case the placeholder shows "No agent" until
             // the next `SessionStart` event — same legacy behavior.
-            st.insert_placeholder_session(h.pane_id.clone(), h.cwd.clone(), h.agent_type.clone());
+            // PRD #110 followup: hydration mints the placeholder with the
+            // daemon-recorded `agent_id` (carried via `HydratedPane.agent_id`)
+            // so the strict-equality reuse guard in `apply_event` lets a
+            // post-reconnect `SessionStart` from the same agent remap onto
+            // the placeholder. Without this, the placeholder would carry
+            // `agent_id=None` and a `SessionStart` with `Some(daemon-id)`
+            // would not match → a second card would appear beside the
+            // hydrated one.
+            st.insert_placeholder_session(
+                h.pane_id.clone(),
+                h.cwd.clone(),
+                h.agent_type.clone(),
+                Some(h.agent_id.clone()),
+            );
             drop(st);
             let display_name = h.display_name.clone().unwrap_or_else(|| h.agent_id.clone());
             ui.pane_display_names
@@ -2833,6 +2846,14 @@ pub fn run_tui(
                 },
             ) {
                 Ok((new_id, _resolved)) => {
+                    // PRD #110 followup: snapshot the daemon-assigned
+                    // `agent_id` so the placeholder is born with it and
+                    // the strict-equality reuse guard accepts the
+                    // freshly-spawned agent's first `SessionStart`. The
+                    // lookup happens outside the `state` write lock —
+                    // `pane_agent_id` only touches the controller's panes
+                    // mutex.
+                    let new_agent_id = pane.pane_agent_id(&new_id);
                     {
                         let mut st = state.blocking_write();
                         st.register_pane(new_id.clone());
@@ -2845,6 +2866,7 @@ pub fn run_tui(
                             new_id.clone(),
                             Some(saved_pane.dir.clone()),
                             None,
+                            new_agent_id,
                         );
                     }
                     if !saved_pane.name.is_empty() {
@@ -2986,6 +3008,10 @@ pub fn run_tui(
                                 },
                             ) {
                                 Ok((fb_id, _resolved)) => {
+                                    // PRD #110 followup: see other create-
+                                    // pane sites — placeholder needs the
+                                    // daemon agent_id.
+                                    let fb_agent_id = pane.pane_agent_id(&fb_id);
                                     {
                                         let mut st = state.blocking_write();
                                         st.register_pane(fb_id.clone());
@@ -2993,6 +3019,7 @@ pub fn run_tui(
                                             fb_id.clone(),
                                             Some(saved_pane.dir.clone()),
                                             None,
+                                            fb_agent_id,
                                         );
                                     }
                                     if !saved_pane.name.is_empty() {
@@ -3047,6 +3074,9 @@ pub fn run_tui(
                         },
                     ) {
                         Ok((fb_id, _resolved)) => {
+                            // PRD #110 followup: outer-error fallback —
+                            // same agent_id plumbing as the inner fallback.
+                            let fb_agent_id = pane.pane_agent_id(&fb_id);
                             {
                                 let mut st = state.blocking_write();
                                 st.register_pane(fb_id.clone());
@@ -3054,6 +3084,7 @@ pub fn run_tui(
                                     fb_id.clone(),
                                     Some(saved_pane.dir.clone()),
                                     None,
+                                    fb_agent_id,
                                 );
                             }
                             if !saved_pane.name.is_empty() {
@@ -4468,6 +4499,15 @@ pub fn run_tui(
                                 spawn_dims,
                             ) {
                                 Ok((_tab_idx, role_pane_ids)) => {
+                                    // PRD #110 followup: snapshot each role
+                                    // pane's daemon agent_id before the
+                                    // placeholder insert so the strict-
+                                    // equality reuse guard accepts each
+                                    // role agent's first `SessionStart`.
+                                    let role_agent_ids: Vec<Option<String>> = role_pane_ids
+                                        .iter()
+                                        .map(|id| pane.pane_agent_id(id))
+                                        .collect();
                                     {
                                         let mut st = state.blocking_write();
                                         // PRD #76 M2.13: `open_orchestration_tab`
@@ -4479,12 +4519,15 @@ pub fn run_tui(
                                         // `SessionStart` hook fires — preserving
                                         // the orchestration readiness gate's
                                         // 10-second fallback (pre-M2.13 contract).
-                                        for id in &role_pane_ids {
+                                        for (id, agent_id) in
+                                            role_pane_ids.iter().zip(role_agent_ids.iter())
+                                        {
                                             st.register_pane(id.clone());
                                             st.insert_placeholder_session(
                                                 id.clone(),
                                                 Some(dir_str.clone()),
                                                 None,
+                                                agent_id.clone(),
                                             );
                                         }
                                         // Register pane-to-role and pane-to-cwd mappings for work-done resolution.
@@ -4634,6 +4677,13 @@ pub fn run_tui(
                                 Ok((new_id, resolved_name)) => {
                                     // Register so only events from our panes are accepted,
                                     // and create a placeholder session for an immediate dashboard card.
+                                    //
+                                    // PRD #110 followup: snapshot the daemon
+                                    // agent_id so the placeholder survives the
+                                    // strict-equality reuse guard on the
+                                    // freshly-spawned agent's first
+                                    // `SessionStart`.
+                                    let new_agent_id = pane.pane_agent_id(&new_id);
                                     {
                                         let mut st = state.blocking_write();
                                         st.register_pane(new_id.clone());
@@ -4641,6 +4691,7 @@ pub fn run_tui(
                                             new_id.clone(),
                                             Some(dir_str.clone()),
                                             None,
+                                            new_agent_id,
                                         );
                                     }
                                     ui.pane_display_names
@@ -7666,6 +7717,7 @@ mod tests {
             last_user_prompt: None,
             first_prompts: Vec::new(),
             pane_id: None,
+            agent_id: None,
         };
 
         let palette = ColorPalette::dark();
@@ -8003,6 +8055,7 @@ mod tests {
             "1".to_string(),
             Some("/tmp".to_string()),
             Some(AgentType::ClaudeCode),
+            None,
         );
 
         let mut ui = default_ui();
@@ -8056,7 +8109,7 @@ mod tests {
 
         let mut state = AppState::default();
         state.register_pane("1".to_string());
-        state.insert_placeholder_session("1".to_string(), Some("/tmp".to_string()), None);
+        state.insert_placeholder_session("1".to_string(), Some("/tmp".to_string()), None, None);
 
         let mut ui = default_ui();
         let filtered = filter_sessions(&state, &ui);
@@ -8809,6 +8862,7 @@ mod tests {
             last_user_prompt: None,
             first_prompts: Vec::new(),
             pane_id: None,
+            agent_id: None,
         }
     }
 
@@ -9000,6 +9054,7 @@ mod tests {
             last_user_prompt: Some("third prompt".to_string()),
             first_prompts: Vec::new(),
             pane_id: None,
+            agent_id: None,
         };
 
         // Spacious: get all 3
@@ -9032,6 +9087,7 @@ mod tests {
             last_user_prompt: Some("old prompt".to_string()),
             first_prompts: Vec::new(),
             pane_id: None,
+            agent_id: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -9055,6 +9111,7 @@ mod tests {
             last_user_prompt: None,
             first_prompts: Vec::new(),
             pane_id: None,
+            agent_id: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);

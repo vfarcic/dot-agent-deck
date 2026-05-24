@@ -304,6 +304,17 @@ pub trait PaneController: Send + Sync {
         self.rename_pane(&id, &resolved)?;
         Ok((id, resolved))
     }
+    /// PRD #110 followup: look up the daemon-side `agent_id` bound to a
+    /// pane. Used by brand-new-pane creation sites so the placeholder
+    /// session card is born with the correct `agent_id` and survives the
+    /// strict-equality reuse guard in [`crate::state::AppState::apply_event`]
+    /// when the agent's first `SessionStart` arrives. Returns `None` for
+    /// controllers without a daemon-side registry (local-PTY mocks /
+    /// pre-spawn lookups); the stream-backed `EmbeddedPaneController`
+    /// overrides this to read its `StreamBackend.agent_id`.
+    fn pane_agent_id(&self, _pane_id: &str) -> Option<String> {
+        None
+    }
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError>;
     fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError>;
     fn resize_pane(

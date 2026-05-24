@@ -810,7 +810,12 @@ async fn hydrate_preserves_agent_type_end_to_end() {
     // with `h.agent_type`. Without M2.13 wiring this collapses to None.
     let mut state = AppState::default();
     state.register_pane(h.pane_id.clone());
-    state.insert_placeholder_session(h.pane_id.clone(), h.cwd.clone(), h.agent_type.clone());
+    state.insert_placeholder_session(
+        h.pane_id.clone(),
+        h.cwd.clone(),
+        h.agent_type.clone(),
+        Some(h.agent_id.clone()),
+    );
 
     let session = state
         .sessions
@@ -871,7 +876,12 @@ async fn hydrate_preserves_agent_type_end_to_end_opencode() {
 
     let mut state = AppState::default();
     state.register_pane(h.pane_id.clone());
-    state.insert_placeholder_session(h.pane_id.clone(), h.cwd.clone(), h.agent_type.clone());
+    state.insert_placeholder_session(
+        h.pane_id.clone(),
+        h.cwd.clone(),
+        h.agent_type.clone(),
+        Some(h.agent_id.clone()),
+    );
 
     let session = state
         .sessions

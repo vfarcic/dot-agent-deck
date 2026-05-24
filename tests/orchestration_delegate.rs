@@ -3005,3 +3005,179 @@ command = "{sigterm_trap_shell_toml}"
 
     drop(ctrl);
 }
+
+/// PRD #110: a `clear = true` delegate respawns the worker behind the
+/// same pane, so the new agent emits `SessionStart` with a fresh
+/// `session_id` AND a fresh `agent_id`. The same-pane reuse guard in
+/// `apply_event` (added by commit 781c2aa for opencode crash/reload)
+/// used to silently remap the new session_id back onto the dead one,
+/// which hid the new session card on the TUI dashboard. The fix is to
+/// also key the guard on `agent_id`: same pane + same agent → reuse,
+/// same pane + different agent → fresh card. This integration test
+/// pins that contract end-to-end: drive a clear=true respawn, forge
+/// the OLD-agent SessionStart followed by the NEW-agent SessionStart,
+/// and assert that `AppState.sessions` ends up with a fresh card for
+/// the new agent_id rather than collapsing onto the old one.
+#[tokio::test]
+async fn delegate_clear_true_creates_new_session_card_for_respawned_agent() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    // Default `clear` is `true` for the coder role (see
+    // `delegate_respawns_worker_agent_when_role_clear_is_true`).
+    let config_toml = r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "cat -u"
+"#;
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+    let coder_initial =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    // Plant the OLD agent's session card on the daemon-side AppState
+    // by forging the SessionStart that a real hook script would emit
+    // when the first coder process came up. After this, sessions
+    // contains exactly one entry keyed `synthetic-coder-pane` and
+    // bound to the OLD agent_id.
+    send_session_start(&daemon.hook_path, "coder-pane", Some(&coder_initial)).await;
+    let initial_session_id = "synthetic-coder-pane".to_string();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let st = daemon.state.read().await;
+        if let Some(s) = st.sessions.get(&initial_session_id)
+            && s.agent_id.as_deref() == Some(&coder_initial)
+        {
+            break;
+        }
+        drop(st);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    {
+        let st = daemon.state.read().await;
+        let session = st
+            .sessions
+            .get(&initial_session_id)
+            .expect("OLD agent's SessionStart should have populated state");
+        assert_eq!(
+            session.agent_id.as_deref(),
+            Some(coder_initial.as_str()),
+            "initial session card must carry the OLD agent_id so the \
+             reuse guard can compare against the post-respawn id"
+        );
+    }
+
+    // Fire the delegate. With clear=true the daemon respawns the
+    // coder agent before writing the prompt; the registry rotates
+    // the agent_id behind the same pane.
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "task ALPHA".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut coder_new = String::new();
+    while tokio::time::Instant::now() < deadline {
+        if let Some(id) = agent_id_for_pane(&daemon.pty_registry, "coder-pane")
+            && id != coder_initial
+        {
+            coder_new = id;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        !coder_new.is_empty(),
+        "respawn never rotated the registry agent_id for coder-pane"
+    );
+
+    // Forge the NEW agent's SessionStart event. The session_id field
+    // is *fresh* (the helper appends "-{agent_id}-style" only via
+    // `send_session_start`'s `synthetic-{pane_id}` shape — and that
+    // string still collides with the OLD entry's session_id, so this
+    // is exactly the worst-case for the reuse guard. Pre-fix this
+    // would silently remap onto the OLD card. Post-fix the agent_id
+    // mismatch defeats reuse and lets us either create a fresh card
+    // OR update the existing one in place. Use a forged event with a
+    // distinct session_id to disambiguate the two outcomes.
+    let new_session_id = format!("respawn-session-{coder_new}");
+    let new_event = AgentEvent {
+        session_id: new_session_id.clone(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id: Some("coder-pane".into()),
+        agent_id: Some(coder_new.clone()),
+    };
+    let mut stream = UnixStream::connect(&daemon.hook_path)
+        .await
+        .expect("connect hook");
+    let mut json = serde_json::to_vec(&new_event).unwrap();
+    json.push(b'\n');
+    stream.write_all(&json).await.unwrap();
+    stream.shutdown().await.unwrap();
+
+    // Wait for the daemon to drain the event onto AppState.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let st = daemon.state.read().await;
+        if st.sessions.contains_key(&new_session_id) {
+            break;
+        }
+        drop(st);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let st = daemon.state.read().await;
+    let new_session = st.sessions.get(&new_session_id).unwrap_or_else(|| {
+        panic!(
+            "post-respawn SessionStart with NEW agent_id must create a fresh \
+             session card (key {new_session_id}); current sessions: {:?}",
+            st.sessions.keys().collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(
+        new_session.pane_id.as_deref(),
+        Some("coder-pane"),
+        "new session card must be bound to coder-pane"
+    );
+    assert_eq!(
+        new_session.agent_id.as_deref(),
+        Some(coder_new.as_str()),
+        "new session card must carry the NEW (post-respawn) agent_id"
+    );
+}

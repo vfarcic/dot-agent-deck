@@ -73,6 +73,12 @@ pub struct SessionState {
     pub last_user_prompt: Option<String>,
     pub first_prompts: Vec<String>,
     pub pane_id: Option<String>,
+    /// PRD #110: the daemon-side registry id of the agent process that
+    /// produced this session. Lets the same-pane reuse guard in
+    /// `apply_event` distinguish "same agent restarting in place"
+    /// (opencode crash/reload — reuse) from "different agent entirely"
+    /// (PRD #92 F9 clear=true respawn — new session card).
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -515,11 +521,24 @@ impl AppState {
     /// Local-mode callers and session-end restorers pass `None`; their
     /// `agent_type` gets filled in later from the next hook event via
     /// [`AppState::apply_event`].
+    ///
+    /// PRD #110 followup: `agent_id` is the daemon-side registry id of
+    /// the agent that owns this pane. The strict-equality reuse guard in
+    /// [`AppState::apply_event`] requires the placeholder's `agent_id` to
+    /// match the next `SessionStart` event's `agent_id`, otherwise a
+    /// duplicate card appears beside the placeholder. Three callers know
+    /// the correct id at mint time and must pass it: brand-new pane
+    /// creation (daemon returns the id from `start_agent`), reconnect
+    /// hydration (`HydratedPane.agent_id`), and `SessionEnd` restoration
+    /// in `apply_event` (the dying session's `agent_id`). Pass `None`
+    /// only for backward-compat callers / pre-F9 hook scripts that don't
+    /// emit `agent_id`.
     pub fn insert_placeholder_session(
         &mut self,
         pane_id: String,
         cwd: Option<String>,
         agent_type: Option<AgentType>,
+        agent_id: Option<String>,
     ) {
         let session_id = format!("pane-{}", pane_id);
         let now = Utc::now();
@@ -539,6 +558,7 @@ impl AppState {
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
                 pane_id: Some(pane_id),
+                agent_id,
             },
         );
     }
@@ -775,9 +795,17 @@ impl AppState {
         } else if !self.managed_pane_ids.is_empty() {
             return;
         }
+        // PRD #110: reuse the existing session card for the same pane
+        // ONLY when the agent_id matches (or both sides are absent for
+        // pre-F9 backward-compat). A different agent_id means the agent
+        // process was intentionally respawned (clear=true delegate);
+        // we let that event create a fresh session card instead of
+        // remapping it onto the dead session.
         if let Some(ref pane_id) = event.pane_id
             && let Some(existing_id) = self.sessions.iter().find_map(|(id, session)| {
-                (session.pane_id.as_ref().is_some_and(|p| p == pane_id) && id != &event.session_id)
+                (session.pane_id.as_ref().is_some_and(|p| p == pane_id)
+                    && id != &event.session_id
+                    && session.agent_id == event.agent_id)
                     .then(|| id.clone())
             })
         {
@@ -789,22 +817,33 @@ impl AppState {
 
         if event.event_type == EventType::SessionEnd {
             // Preserve started_at for the pane so a restarted session keeps its position.
-            let pane_id_and_cwd = self.sessions.get(&event.session_id).and_then(|session| {
-                session.pane_id.as_ref().map(|pid| {
-                    self.pane_started_at.insert(pid.clone(), session.started_at);
-                    (pid.clone(), session.cwd.clone())
-                })
-            });
+            //
+            // PRD #110 followup: also capture the dying session's `agent_id`
+            // so the restored placeholder carries it forward. Without this,
+            // a placeholder born with `agent_id=None` would not satisfy the
+            // strict-equality reuse guard when the SAME agent fires its
+            // next `SessionStart` (e.g. Claude `/clear`, opencode
+            // `session.deleted`) — the natural reload would orphan the
+            // placeholder next to a fresh card. A DIFFERENT agent
+            // (F9 clear=true respawn) still produces a fresh card because
+            // the agent_ids no longer match.
+            let pane_id_cwd_and_agent_id =
+                self.sessions.get(&event.session_id).and_then(|session| {
+                    session.pane_id.as_ref().map(|pid| {
+                        self.pane_started_at.insert(pid.clone(), session.started_at);
+                        (pid.clone(), session.cwd.clone(), session.agent_id.clone())
+                    })
+                });
             self.sessions.remove(&event.session_id);
             // Restore a placeholder card so the pane remains visible on the dashboard.
-            if let Some((pane_id, cwd)) = pane_id_and_cwd
+            if let Some((pane_id, cwd, agent_id)) = pane_id_cwd_and_agent_id
                 && self.managed_pane_ids.contains(&pane_id)
             {
                 // M2.13: a SessionEnd restoration creates a fresh
                 // placeholder; `agent_type` is unknown post-end and gets
                 // re-populated when the next `SessionStart` hook arrives
                 // for this pane. Same default behavior as before M2.13.
-                self.insert_placeholder_session(pane_id, cwd, None);
+                self.insert_placeholder_session(pane_id, cwd, None, agent_id);
             }
             return;
         }
@@ -831,6 +870,7 @@ impl AppState {
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
                 pane_id: event.pane_id.clone(),
+                agent_id: event.agent_id.clone(),
             });
 
         session.last_activity = event.timestamp;
@@ -986,6 +1026,88 @@ mod tests {
         assert!(state.sessions.contains_key("s1"));
         assert!(!state.sessions.contains_key("s2"));
         assert_eq!(state.sessions["s1"].pane_id.as_deref(), Some("pane-1"));
+    }
+
+    // PRD #110: the session-reuse guard now also checks agent_id so the
+    // F9 clear=true respawn (which swaps the agent process behind the
+    // same pane) creates a fresh session card rather than getting
+    // remapped onto the dead session.
+    #[test]
+    fn reuse_session_when_same_pane_and_same_agent_id() {
+        let mut state = AppState::default();
+        state.register_pane("pane-1".to_string());
+
+        let mut first = make_event("s1", EventType::SessionStart);
+        first.pane_id = Some("pane-1".to_string());
+        first.agent_id = Some("agent-A".to_string());
+        state.apply_event(first);
+
+        // Same agent process emits SessionStart again (opencode crash
+        // or reload). New session_id, but agent_id matches → reuse.
+        let mut restart = make_event("s2", EventType::SessionStart);
+        restart.pane_id = Some("pane-1".to_string());
+        restart.agent_id = Some("agent-A".to_string());
+        state.apply_event(restart);
+
+        assert!(state.sessions.contains_key("s1"));
+        assert!(!state.sessions.contains_key("s2"));
+        assert_eq!(state.sessions["s1"].pane_id.as_deref(), Some("pane-1"));
+        assert_eq!(state.sessions["s1"].agent_id.as_deref(), Some("agent-A"));
+    }
+
+    #[test]
+    fn new_session_when_same_pane_but_different_agent_id() {
+        let mut state = AppState::default();
+        state.register_pane("pane-1".to_string());
+
+        let mut first = make_event("s1", EventType::SessionStart);
+        first.pane_id = Some("pane-1".to_string());
+        first.agent_id = Some("agent-A".to_string());
+        state.apply_event(first);
+
+        // F9 clear=true respawn — different agent process, same pane.
+        // The reuse guard must skip and create a fresh session card.
+        let mut respawn = make_event("s2", EventType::SessionStart);
+        respawn.pane_id = Some("pane-1".to_string());
+        respawn.agent_id = Some("agent-B".to_string());
+        state.apply_event(respawn);
+
+        assert!(
+            state.sessions.contains_key("s2"),
+            "respawn with new agent_id must create a fresh session card"
+        );
+        assert_eq!(state.sessions["s2"].pane_id.as_deref(), Some("pane-1"));
+        assert_eq!(state.sessions["s2"].agent_id.as_deref(), Some("agent-B"));
+        // The old session card is preserved (no remap), so the new
+        // agent's card is additive rather than replacing the old one.
+        assert!(
+            state.sessions.contains_key("s1"),
+            "old session card must remain when reuse is skipped"
+        );
+    }
+
+    #[test]
+    fn reuse_session_when_same_pane_and_both_agent_ids_absent() {
+        // Backward-compat: hook scripts predating F9 followup-7 don't
+        // emit `agent_id`. Both sides are None, so the guard treats
+        // them as the same agent — reuse, just like before PRD #110.
+        let mut state = AppState::default();
+        state.register_pane("pane-1".to_string());
+
+        let mut first = make_event("s1", EventType::SessionStart);
+        first.pane_id = Some("pane-1".to_string());
+        assert!(first.agent_id.is_none());
+        state.apply_event(first);
+
+        let mut restart = make_event("s2", EventType::SessionStart);
+        restart.pane_id = Some("pane-1".to_string());
+        assert!(restart.agent_id.is_none());
+        state.apply_event(restart);
+
+        assert!(state.sessions.contains_key("s1"));
+        assert!(!state.sessions.contains_key("s2"));
+        assert_eq!(state.sessions["s1"].pane_id.as_deref(), Some("pane-1"));
+        assert!(state.sessions["s1"].agent_id.is_none());
     }
 
     #[test]
@@ -1359,7 +1481,7 @@ mod tests {
     fn placeholder_session_created() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None);
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None, None);
 
         assert!(state.sessions.contains_key("pane-42"));
         let session = &state.sessions["pane-42"];
@@ -1383,6 +1505,7 @@ mod tests {
             "42".to_string(),
             Some("/tmp".to_string()),
             Some(AgentType::ClaudeCode),
+            None,
         );
         let session = &state.sessions["pane-42"];
         assert_eq!(
@@ -1401,7 +1524,7 @@ mod tests {
     fn placeholder_session_defaults_to_none_when_agent_type_unknown() {
         let mut state = AppState::default();
         state.register_pane("99".to_string());
-        state.insert_placeholder_session("99".to_string(), Some("/tmp".to_string()), None);
+        state.insert_placeholder_session("99".to_string(), Some("/tmp".to_string()), None, None);
         let session = &state.sessions["pane-99"];
         assert_eq!(
             session.agent_type,
@@ -1414,7 +1537,7 @@ mod tests {
     fn placeholder_transitions_to_real_session() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None);
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None, None);
 
         let mut start = make_event("real-uuid-123", EventType::SessionStart);
         start.pane_id = Some("42".to_string());
@@ -1430,11 +1553,147 @@ mod tests {
         assert_eq!(session.pane_id.as_deref(), Some("42"));
     }
 
+    // PRD #110 followup: brand-new pane creation in production today —
+    // placeholder is born with `agent_id=None` (we don't know the daemon-
+    // assigned id locally), then the agent's first SessionStart arrives
+    // with `agent_id=Some(X)`. Pre-followup the strict equality guard
+    // rejects reuse → two cards. This probe documents the requirement
+    // that brand-new pane creation must mint the placeholder with the
+    // daemon's agent_id (plumbed back from `create_pane_with_options`).
+    #[test]
+    fn placeholder_reused_on_first_session_start_for_brand_new_pane() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+        // Simulate the post-fix flow: placeholder is born with the
+        // daemon-assigned agent_id (returned from create_pane_with_options).
+        state.insert_placeholder_session(
+            "42".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("agent-A".to_string()),
+        );
+
+        // First SessionStart from that agent.
+        let mut start = make_event("real-uuid", EventType::SessionStart);
+        start.pane_id = Some("42".to_string());
+        start.agent_id = Some("agent-A".to_string());
+        state.apply_event(start);
+
+        // Exactly one card for the pane, keyed on the placeholder id.
+        let cards: Vec<&str> = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some("42"))
+            .map(|s| s.session_id.as_str())
+            .collect();
+        assert_eq!(
+            cards.len(),
+            1,
+            "brand-new pane first SessionStart must adopt the placeholder; got {cards:?}"
+        );
+    }
+
+    // PRD #110 followup: probe the bug from the reviewer + auditor —
+    // SessionEnd→SessionStart from the SAME agent must reuse the placeholder
+    // restored at SessionEnd time, not orphan it next to a fresh card.
+    // Verifies the natural reload path (Claude Code /clear, opencode
+    // session.deleted) emits SessionStart with a stable agent_id.
+    #[test]
+    fn placeholder_reused_when_same_agent_reloads_after_session_end() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+
+        // First SessionStart from agent A.
+        let mut start1 = make_event("real-uuid-1", EventType::SessionStart);
+        start1.pane_id = Some("42".to_string());
+        start1.agent_id = Some("agent-A".to_string());
+        state.apply_event(start1);
+        assert_eq!(
+            state.sessions["real-uuid-1"].agent_id.as_deref(),
+            Some("agent-A")
+        );
+
+        // SessionEnd: agent A's session ends. A placeholder is restored.
+        let mut end = make_event("real-uuid-1", EventType::SessionEnd);
+        end.pane_id = Some("42".to_string());
+        end.agent_id = Some("agent-A".to_string());
+        state.apply_event(end);
+        assert!(
+            state.sessions.contains_key("pane-42"),
+            "SessionEnd must restore a placeholder for the same pane"
+        );
+
+        // Agent A emits a fresh SessionStart (natural reload).
+        let mut start2 = make_event("real-uuid-2", EventType::SessionStart);
+        start2.pane_id = Some("42".to_string());
+        start2.agent_id = Some("agent-A".to_string());
+        state.apply_event(start2);
+
+        // Exactly one card for the pane, bound to agent-A.
+        let cards: Vec<&str> = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some("42"))
+            .map(|s| s.session_id.as_str())
+            .collect();
+        assert_eq!(
+            cards.len(),
+            1,
+            "natural reload must produce exactly one card; got {cards:?} (sessions: {:?})",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            state.sessions[cards[0]].agent_id.as_deref(),
+            Some("agent-A")
+        );
+    }
+
+    // PRD #110 followup: SessionEnd from agent A, then a DIFFERENT agent
+    // (F9 clear=true respawn) emits SessionStart. The placeholder must NOT
+    // be remapped onto the new agent — it represents the dead agent A, and
+    // adopting it would silently rebrand the new agent's card.
+    #[test]
+    fn placeholder_not_reused_when_different_agent_starts_after_session_end() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+
+        let mut start1 = make_event("real-uuid-1", EventType::SessionStart);
+        start1.pane_id = Some("42".to_string());
+        start1.agent_id = Some("agent-A".to_string());
+        state.apply_event(start1);
+
+        let mut end = make_event("real-uuid-1", EventType::SessionEnd);
+        end.pane_id = Some("42".to_string());
+        end.agent_id = Some("agent-A".to_string());
+        state.apply_event(end);
+
+        // Different agent (B) emits SessionStart for the same pane.
+        let mut start2 = make_event("real-uuid-2", EventType::SessionStart);
+        start2.pane_id = Some("42".to_string());
+        start2.agent_id = Some("agent-B".to_string());
+        state.apply_event(start2);
+
+        // Two cards expected: the placeholder bound to agent-A (the dead
+        // session's restoration card), and a fresh card for agent-B.
+        let mut cards: Vec<(&str, Option<&str>)> = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some("42"))
+            .map(|s| (s.session_id.as_str(), s.agent_id.as_deref()))
+            .collect();
+        cards.sort();
+        assert_eq!(
+            cards.len(),
+            2,
+            "F9-style respawn must NOT remap onto the dead agent's placeholder; got {cards:?}"
+        );
+    }
+
     #[test]
     fn placeholder_restored_after_session_end() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None);
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None, None);
 
         // Transition to real session
         let mut start = make_event("real-uuid", EventType::SessionStart);
@@ -1456,7 +1715,7 @@ mod tests {
     fn placeholder_not_restored_after_close() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None);
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None, None);
 
         // Transition to real session
         let mut start = make_event("real-uuid", EventType::SessionStart);
@@ -1475,7 +1734,7 @@ mod tests {
     fn placeholder_excluded_from_stats() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None);
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None, None);
 
         // Add a real session on a different registered pane
         state.register_pane("99".to_string());
@@ -1492,7 +1751,7 @@ mod tests {
     fn close_placeholder_session() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None);
+        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()), None, None);
 
         // Simulate Ctrl+w on the placeholder
         state.sessions.remove("pane-42");

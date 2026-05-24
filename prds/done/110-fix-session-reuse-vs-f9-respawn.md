@@ -1,6 +1,6 @@
 # PRD #110: Fix session reuse conflicting with F9 clear=true respawn
 
-**Status**: Planning
+**Status**: Complete (2026-05-25)
 **Priority**: High
 **Created**: 2026-05-24
 **GitHub Issue**: [#110](https://github.com/vfarcic/dot-agent-deck/issues/110)
@@ -56,11 +56,11 @@ Track `agent_id` inside `SessionState`. Update the session-reuse logic in `apply
 
 ## Milestones
 
-- [ ] **M1 — SessionState carries agent_id**: Add `agent_id: Option<String>` to `SessionState`; populate it on session creation/update from `SessionStart` events.
-- [ ] **M2 — Reuse guard updated**: `apply_event` skips session reuse when `agent_id` differs; existing same-agent reuse path unchanged.
-- [ ] **M3 — Unit tests pass**: Tests for same-agent reuse, different-agent new-session, and absent-agent-id backward-compat cases all pass.
-- [ ] **M4 — Integration test**: `orchestration_delegate.rs` verifies a new session card appears in TUI state after clear=true delegate.
-- [ ] **M5 — Regression verified**: Existing opencode deck tests still pass (no orphaned-card regression).
+- [x] **M1 — SessionState carries agent_id**: Add `agent_id: Option<String>` to `SessionState`; populate it on session creation/update from `SessionStart` events. _(commit 11ddecf)_
+- [x] **M2 — Reuse guard updated**: `apply_event` skips session reuse when `agent_id` differs; existing same-agent reuse path unchanged. _(commit 11ddecf)_
+- [x] **M3 — Unit tests pass**: Tests for same-agent reuse, different-agent new-session, and absent-agent-id backward-compat cases all pass. _(commit 11ddecf; placeholder regression tests added in be2160b)_
+- [x] **M4 — Integration test**: `orchestration_delegate.rs` verifies a new session card appears in TUI state after clear=true delegate. _(commit 11ddecf)_
+- [x] **M5 — Regression verified**: Existing opencode deck tests still pass (no orphaned-card regression). _(blocker found in re-review: placeholder cards regressed because `insert_placeholder_session` minted with `agent_id=None`; fixed in be2160b by propagating the dying session's agent_id and adding `PaneController::pane_agent_id` for brand-new pane creation; 53/53 state tests + 25/25 orchestration_delegate tests pass)_
 
 ## Success Criteria
 
