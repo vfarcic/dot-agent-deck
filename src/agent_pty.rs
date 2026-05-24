@@ -1129,6 +1129,19 @@ impl AgentPtyRegistry {
 
     /// Spawn a new agent and return its registry id.
     pub fn spawn_agent(&self, mut opts: SpawnOptions<'_>) -> Result<String, AgentPtyError> {
+        // CodeRabbit MAJOR (PRD #92 PR #105): Guard A — reject the spawn
+        // immediately if the registry has already entered its shutdown
+        // path. `daemon_protocol::handle_attach` already rejects an
+        // in-flight `StartAgent` once the latch flips, but `spawn_agent`
+        // is also reachable from other callers (e.g. respawn, tests),
+        // and the early return keeps every entry point uniform without
+        // having to plumb the check through each one. Guard B below
+        // closes the TOCTOU window between this check and the
+        // `inner.agents.insert` that publishes the new agent.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(AgentPtyError::Spawn("registry is shutting down".into()));
+        }
+
         // Capture the caller-supplied `DOT_AGENT_DECK_PANE_ID` *before*
         // moving `opts` into `spawn`, so the registry retains a copy for
         // M2.x rehydration. The agent's child process gets tagged with
@@ -1284,6 +1297,22 @@ impl AgentPtyRegistry {
         // (`AgentPty` has no `Drop`).
         let guard = PtyGuard::new(spawn(opts)?);
         let mut inner = self.inner.lock().unwrap();
+
+        // CodeRabbit MAJOR (PRD #92 PR #105): Guard B — re-check the
+        // shutdown latch *inside* the inner lock, so the check + insert
+        // are atomic against `shutdown_all_graceful`'s `inner.lock()` +
+        // drain. Without this, the race is:
+        //   T0 daemon_protocol checks is_shutting_down() — false
+        //   T1 shutdown flips the latch and drains `inner.agents`
+        //   T2 spawn_agent reaches the insert below and adds an agent
+        //      the drain already iterated past — orphaned child.
+        // Guard A at the top of `spawn_agent` covers the common case;
+        // this re-check closes the narrow window between Guard A and
+        // the insert. On Err the `guard` Drop kills the child we just
+        // spawned, so the rejection doesn't leak a PTY.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(AgentPtyError::Spawn("registry is shutting down".into()));
+        }
 
         // CodeRabbit MAJOR (PRD #93 round-9): reject the spawn if
         // another live agent already claims this `pane_id_env`.

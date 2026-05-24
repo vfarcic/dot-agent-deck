@@ -1,6 +1,6 @@
 # Pre-daemon parity audit
 
-**PRD**: [#92 — Pre-daemon parity audit](../prds/92-process-boundary-invariant-audit.md)
+**PRD**: [#92 — Pre-daemon parity audit](../prds/done/92-process-boundary-invariant-audit.md)
 **Branch**: `prd-92-process-boundary-invariant-audit`
 **Audited**: 2026-05-22
 **Baseline**: `2fc39c3` — *"chore: update docs chart to v0.24.7 [skip ci]"*, the last commit before PRD #76 (`4b81c06`) merged. Pre-daemon state.
