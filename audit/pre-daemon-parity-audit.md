@@ -286,6 +286,16 @@ The deck's contract: "the agent gets a catchable signal and a bounded grace wind
 
 **Likely PRD home**: A successor PRD focused on attach-protocol observability. Out of scope for PRD #92 since it adds new wire-protocol surface and TUI UI machinery beyond the parity restoration this PRD is about.
 
+### F7 — Protocol version mismatch detection at attach handshake
+
+**Status**: Covered by PRD #90 (Remote daemon upgrade flow) — Planning. Filed during PRD #92 work but not implemented here.
+
+**Problem**: During F9 manual testing, the user hit a "stale daemon" scenario — `cargo run` produced a new TUI binary but the existing daemon process was from an earlier build. The new TUI silently attached to the old daemon and used its (older) behavior. F1 followup added `PROTOCOL_VERSION = 2` checking specifically for `KIND_SHUTDOWN` (via the `KIND_SHUTDOWN_ACK` contract), but normal-path attach operations (Ctrl+W, StartAgent, write_to_pane, list_agents) don't get version-protected — a newer TUI binary attached to an older daemon silently uses degraded behavior.
+
+**Suggested approach**: at the Hello handshake (`src/daemon_protocol.rs`), reject an attach when the client and daemon `PROTOCOL_VERSION` values diverge. The TUI surfaces a clear error and refuses to attach. Forces the upgrade-mismatch case to fail fast with a visible error instead of silently degrading.
+
+**Likely PRD home**: PRD #90 — Remote daemon upgrade flow. PRD #90's problem statement explicitly calls out "No version compatibility check" as one of four upgrade-flow pain points. Implementation of this audit's F7 lands as part of PRD #90's solution.
+
 ### F13 — Remote-attach SSH-wedge on laptop sleep
 
 **Status**: Deferred (2026-05-24). Filed during PRD #92 work but not derived from the audit — this is post-baseline behavior (`dot-agent-deck connect <name>` was introduced in PRD #76 and doesn't exist at the parity baseline).
