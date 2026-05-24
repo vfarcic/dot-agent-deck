@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serial_test::serial;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
@@ -112,6 +113,7 @@ async fn wait_for<F: FnMut() -> bool>(timeout: Duration, interval: Duration, mut
 /// orphan re-parented to init. Post-F5 it sends `killpg(shell_pid,
 /// SIGKILL)`, taking the whole group down together.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(process_group_kill)]
 async fn close_pane_reaps_shell_descendants() {
     let server = start_server().await;
     let ctrl = Arc::new(EmbeddedPaneController::new(
@@ -233,6 +235,7 @@ async fn close_pane_reaps_shell_descendants() {
 /// a sentinel file, and exits. After the close we assert the sentinel
 /// exists on disk — proof that SIGTERM was delivered and the trap ran.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(process_group_kill)]
 async fn close_pane_well_behaved_agent_runs_sigterm_trap() {
     let server = start_server().await;
     let ctrl = Arc::new(EmbeddedPaneController::new(
@@ -277,11 +280,15 @@ async fn close_pane_well_behaved_agent_runs_sigterm_trap() {
     };
 
     // Wait for the `ready` sentinel — proves the trap is installed.
-    // 5 s upper bound is generous for any reasonable CI host; the
-    // shell's `trap` + `echo ready` runs in well under 100 ms even
-    // under load. Without this gate the test had a fixed 500 ms
-    // sleep that races against slow scheduling.
-    let ready_appeared = wait_for(Duration::from_secs(5), Duration::from_millis(20), || {
+    // The shell's `trap` + `echo ready` runs in well under 100 ms on a
+    // quiet host; budget is generous because loaded CI runners have
+    // been observed to take seconds to schedule fork+exec+shell-init
+    // (PRD #92 PR #105 — the 5 s budget here was hit deterministically
+    // on a CI run even though the shell was fine). Combined with
+    // `#[serial(process_group_kill)]` above, contention from sibling
+    // PTY-heavy tests in this file is removed; the budget is the
+    // last line of defense against runner-wide load.
+    let ready_appeared = wait_for(Duration::from_secs(10), Duration::from_millis(20), || {
         ready_path.exists()
             && std::fs::metadata(&ready_path)
                 .map(|m| m.len() > 0)
@@ -352,6 +359,7 @@ async fn close_pane_well_behaved_agent_runs_sigterm_trap() {
 /// The combined shape proves both that the grace was waited out AND
 /// that the SIGKILL backstop was actually needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(process_group_kill)]
 async fn close_pane_uncooperative_agent_killed_after_grace() {
     let server = start_server().await;
     let ctrl = Arc::new(EmbeddedPaneController::new(
@@ -467,6 +475,7 @@ async fn close_pane_uncooperative_agent_killed_after_grace() {
 /// every attach client. Probes the daemon's own pgid before and after
 /// the close to make sure `killpg` is hitting the right group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(process_group_kill)]
 async fn close_pane_does_not_signal_daemon_process_group() {
     // SAFETY: getpgrp(2) reads the caller's pgid and is async-signal-safe.
     let daemon_pgid = unsafe { libc::getpgrp() };
