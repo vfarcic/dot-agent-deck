@@ -247,7 +247,7 @@ The deck's contract: "the agent gets a catchable signal and a bounded grace wind
 
 ### F10 — Dedupe double work-done notifications
 
-**Status**: Queued (this PRD, Phase 12).
+**Status**: Deferred (2026-05-24) — not reproducible after the reviewer/auditor migration off `opencode --model openrouter/openai/gpt-5.5` to `claude --model opus` on 2026-05-23. The duplication that motivated F10 may have been agent-binary-specific (opencode signaling `work-done` on exit, or OpenRouter network-latency-induced retries). Orchestrator continues to count notifications per worker completion; F10 reopens if duplicates recur. See PRD #92 Design Decisions 2026-05-24 entry.
 
 **Problem**: Pre-daemon, a worker's `work-done` signal produced exactly one orchestrator notification. Post-daemon, the orchestrator frequently receives the same "Worker X completed" notification twice for a single commit. Reproducible — manifested in this very PRD #92 implementation conversation across F2 / F5 / F8 work-done messages. Likely lost in the same PRD #93 round-5 refactor (`d39930f`) that moved work-done dispatch into the daemon. Either dedup logic was removed, or two parallel code paths now both notify (e.g., the direct dispatch in `handle_work_done` plus a broadcast subscriber both firing on the same signal).
 
