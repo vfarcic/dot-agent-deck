@@ -481,7 +481,13 @@ async fn ctrl_w_stop_agent_timeout_restores_pane_and_returns_error() {
     // Now call close_pane. The mock daemon will never answer stop_agent.
     // Without the timeout this future would block_on forever; the outer
     // deadline catches that regression by panicking.
-    let outer_deadline = Duration::from_secs(4);
+    //
+    // PRD #92 F8: bumped from 4 s to 7 s. The Ctrl+W path's internal
+    // `CTRL_W_STOP_TIMEOUT` is now 5 s (3 s F8 grace + 2 s buffer), so
+    // the outer test deadline has to comfortably outlast the inner one
+    // for the timeout-path assertions to fire. 7 s = 5 s inner + 2 s
+    // slack for the blocking-thread / runtime hops.
+    let outer_deadline = Duration::from_secs(7);
     let started = tokio::time::Instant::now();
 
     let result = {
@@ -507,9 +513,9 @@ async fn ctrl_w_stop_agent_timeout_restores_pane_and_returns_error() {
         other => panic!("expected PaneError::CommandFailed, got {other:?}"),
     }
 
-    // Bound: should complete within CREATE_PANE_STOP_TIMEOUT (2s) plus
-    // generous slack for the blocking-thread + runtime hop. If this
-    // fails the timeout is probably missing or too loose.
+    // Bound: should complete within CTRL_W_STOP_TIMEOUT (5 s post-F8)
+    // plus generous slack for the blocking-thread + runtime hop. If
+    // this fails the timeout is probably missing or too loose.
     assert!(
         elapsed < outer_deadline,
         "close_pane took {elapsed:?} — expected < {outer_deadline:?}"

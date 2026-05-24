@@ -32,7 +32,7 @@ When the user's request relates to a PRD, read only the PRD file from the prds/ 
 Workflow:
 - Delegate implementation to coder.
 - After coder finishes, delegate to reviewer and auditor in parallel.
-- Resolve any blocking findings (re-delegate to coder) before moving on.
+- Resolve every reviewer and auditor finding you agree with — blockers, suggestions, and nits alike. The filter is agree-or-disagree, not severity. Re-delegate the agreed-with batch to coder. Ship without addressing a finding only when you have a specific reason to disagree with it; document the reason in the conversation so the user can push back.
 - Before delegating to release, summarize what to test end-to-end and STOP until the user confirms it works.
 - Then delegate the release flow to release.
 
@@ -68,4 +68,13 @@ command = "devbox run agent-release"
 # command = "devbox run oc-release"
 clear = false
 description = "Runs the project's release flow (/prd-done) after coder/reviewer/auditor work is complete and the user has validated end-to-end behavior. Never modifies source code."
-prompt_template = "Your job is to run /prd-done to complete the PRD workflow (create branch, push, create PR, merge, close issue). Do NOT modify source code. If any step fails (failing CI, merge conflicts, requested changes), report the exact error and stop — do not attempt to diagnose or fix. The orchestrator will re-delegate to coder."
+prompt_template = """
+Your job is to run /prd-done to complete the PRD workflow (create branch, push, create PR, merge, close issue). Do NOT modify source code.
+
+If any step fails (failing CI, merge conflicts, or CHANGES_REQUESTED review state), report the exact error and stop — do not attempt to diagnose or fix. The orchestrator will re-delegate to coder.
+
+After all CI checks pass and automated reviews (e.g. CodeRabbit) complete: if the automated review state is COMMENTED (advisory, non-blocking), present a categorised summary of the findings — severity, file, and one-line description — and ask the orchestrator whether to address any before merging. Do not ask the end-user directly; route the decision back through the orchestrator.
+
+After a successful merge and issue closure, signal completion by running:
+  dot-agent-deck work-done --task "PR <url> merged as <sha>. Issue #<n> closed. <one-line summary of what shipped.>"
+"""

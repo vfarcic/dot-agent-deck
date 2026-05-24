@@ -21,8 +21,8 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 pub use crate::agent_pty::{AgentRecord, TabMembership, validate_tab_membership};
 use crate::daemon_protocol::{
-    AttachRequest, AttachResponse, KIND_DETACH, KIND_EVENT, KIND_REQ, KIND_RESP, KIND_STREAM_END,
-    KIND_STREAM_OUT, read_frame, write_frame,
+    AttachRequest, AttachResponse, KIND_DETACH, KIND_EVENT, KIND_REQ, KIND_RESP, KIND_SHUTDOWN,
+    KIND_SHUTDOWN_ACK, KIND_STREAM_END, KIND_STREAM_OUT, read_frame, write_frame,
 };
 use crate::event::{AgentType, BroadcastMsg};
 
@@ -361,6 +361,60 @@ impl DaemonClient {
         // EventSubscription drops means the daemon sees EOF exactly when
         // the client actually goes away.
         Ok(EventSubscription { rd, _wr: wr })
+    }
+
+    /// PRD #92 F1: send a `KIND_SHUTDOWN` header-only frame and wait
+    /// for the daemon's explicit `KIND_SHUTDOWN_ACK` reply. Used by
+    /// the **Stop** option in the Ctrl+C dialog.
+    ///
+    /// PRD #92 F1 followup (reviewer-blocker fix): the original wire
+    /// used "socket close == ack" semantics, which a daemon running
+    /// the previous binary (predating `PROTOCOL_VERSION = 2`) would
+    /// also satisfy by closing the connection on an unknown frame
+    /// kind. The TUI then thought shutdown had succeeded and exited
+    /// while the daemon was still running — a silent-failure during
+    /// the inevitable upgrade-mismatch window. The explicit
+    /// `KIND_SHUTDOWN_ACK` lets the client distinguish the two cases
+    /// and surface a real error.
+    ///
+    /// Three failure modes — all surface as `Err`:
+    ///   - Timeout (1s elapsed without any frame on the wire).
+    ///   - EOF (daemon closed the socket without sending an ack —
+    ///     typically the upgrade-mismatch case).
+    ///   - Any frame received whose kind is not `KIND_SHUTDOWN_ACK`.
+    ///
+    /// Success: a single `KIND_SHUTDOWN_ACK` frame arrives. We return
+    /// `Ok(())` and let the caller exit; the daemon's actual teardown
+    /// is asynchronous from that point (SIGTERM grace + SIGKILL) but
+    /// the user's commit has been acknowledged.
+    pub async fn send_shutdown(&self) -> Result<(), ClientError> {
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        write_frame(&mut wr, KIND_SHUTDOWN, &[]).await?;
+        // Bound the wait at 1s — the daemon writes the ack BEFORE
+        // beginning teardown (so the wire ordering is honest even when
+        // the registry drain takes the full 3-second SIGTERM grace),
+        // so a daemon that recognised the frame should respond in
+        // sub-millisecond. 1s is comfortable headroom for unusual
+        // scheduler stalls.
+        let read_result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), read_frame(&mut rd)).await;
+        match read_result {
+            Ok(Ok(Some((kind, _payload)))) if kind == KIND_SHUTDOWN_ACK => Ok(()),
+            Ok(Ok(Some((kind, _)))) => Err(ClientError::Server(format!(
+                "expected KIND_SHUTDOWN_ACK (0x{:02x}), got kind 0x{:02x} — daemon may predate PROTOCOL_VERSION 2",
+                KIND_SHUTDOWN_ACK, kind
+            ))),
+            Ok(Ok(None)) => Err(ClientError::Server(
+                "daemon closed connection without acknowledging KIND_SHUTDOWN — possibly a binary predating PROTOCOL_VERSION 2"
+                    .to_string(),
+            )),
+            Ok(Err(e)) => Err(ClientError::Io(e)),
+            Err(_) => Err(ClientError::Server(
+                "timed out waiting for KIND_SHUTDOWN_ACK after 1 second — daemon is unresponsive"
+                    .to_string(),
+            )),
+        }
     }
 
     /// Open an attach-stream connection. Returns once the daemon has

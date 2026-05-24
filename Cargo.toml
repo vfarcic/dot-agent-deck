@@ -20,6 +20,7 @@ semver = "1"
 portable-pty = "0.8"
 libc = "0.2"
 vt100 = "0.16"
+futures-util = "=0.3.32"
 regex = "1"
 open = "5"
 terminal-colorsaurus = "1"
@@ -27,6 +28,7 @@ terminal-colorsaurus = "1"
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
+serial_test = "3"
 
 [[example]]
 name = "send_event"

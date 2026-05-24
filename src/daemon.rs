@@ -406,6 +406,12 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         let attach_event_tx = event_tx.clone();
         let attach_counter = client_count.clone();
         let attach_state = state.clone();
+        // PRD #92 F1: hand the same `shutdown` Notify the idle monitor and
+        // hook loop use to the attach server. The KIND_SHUTDOWN frame
+        // handler signals it after the registry's graceful drain so the
+        // hook loop exits, run_daemon_with returns, and the registry's
+        // Drop impl kills any survivors.
+        let attach_shutdown = shutdown.clone();
         Some(tokio::spawn(async move {
             if let Err(e) = crate::daemon_protocol::serve_attach_with_counter(
                 listener,
@@ -413,6 +419,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 attach_event_tx,
                 attach_counter,
                 attach_state,
+                Some(attach_shutdown),
             )
             .await
             {
@@ -592,7 +599,19 @@ async fn run_hook_loop(
                                     // the prompt directly into the worker
                                     // pane's PTY — no broadcast hop, no
                                     // detach-window loss surface.
-                                    state.read().await.handle_delegate(signal, &pty_registry).await;
+                                    //
+                                    // PRD #92 F9 followup-6: pass the
+                                    // daemon-wide hook-event sender too so
+                                    // per-target dispatch tasks can wait
+                                    // for the freshly-spawned agent's
+                                    // `SessionStart` event before writing
+                                    // the prompt (event-driven readiness,
+                                    // replacing the F9 250ms fixed delay).
+                                    state
+                                        .read()
+                                        .await
+                                        .handle_delegate(signal, &pty_registry, &event_tx)
+                                        .await;
                                 }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(

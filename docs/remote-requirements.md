@@ -101,7 +101,7 @@ The daemon resolves its socket and config paths at startup from environment vari
 
 1. `$DOT_AGENT_DECK_SOCKET` if set (explicit override)
 2. `$XDG_RUNTIME_DIR/dot-agent-deck.sock` if `XDG_RUNTIME_DIR` is set (the case on systemd hosts with `logind`, which is the typical case)
-3. `/tmp/dot-agent-deck.sock` as a last-resort fallback
+3. `/tmp/dot-agent-deck-{uid}.sock` as a last-resort fallback (where `{uid}` is the user's POSIX uid, included so two users on the same host get disjoint sockets — the XDG path at step 2 is already per-user)
 
 The `/tmp` fallback is **not safe on multi-user hosts** — see [Daemon socket security](#daemon-socket-security) under Recommended for the override and directory-permission guidance.
 
@@ -141,7 +141,7 @@ Root has its own PATH and typically doesn't need this step.
 
 ### Daemon socket security
 
-The `/tmp/dot-agent-deck.sock` fallback is intended for hosts that do not set `XDG_RUNTIME_DIR` and is **not safe on multi-user hosts** — `/tmp` is world-writable, and another local user could pre-create the path or attach to the socket. v1 assumes a single-user host (the PRD's stated scope: "no multi-user access controls beyond Linux user separation"). If the host is shared, set `$DOT_AGENT_DECK_SOCKET` to a path inside the user's home, for example `~/.local/state/dot-agent-deck/daemon.sock`, and ensure the parent directory is mode `0700`. The socket file itself is created at mode `0600` directly by the daemon — `bind(2)` runs with a narrowed umask of `0o177` so the socket inode is never world-readable for any window, and a defense-in-depth `chmod 0600` follows. The user's process umask does not affect the socket mode, but it still affects other files the daemon and its agents create, so a restrictive umask (e.g. `umask 077`) in the unit file or login profile remains a sound default on a shared host.
+The `/tmp/dot-agent-deck-{uid}.sock` fallback is intended for hosts that do not set `XDG_RUNTIME_DIR`. The `{uid}` suffix means two users on the same host get disjoint paths so neither can pre-create the other's socket path; the underlying directory is still world-writable, so the fallback remains **not safe on multi-user hosts** in the broader sense — another local user can still observe socket-path activity in `/tmp` and could attempt to connect. v1 assumes a single-user host (the PRD's stated scope: "no multi-user access controls beyond Linux user separation"). If the host is shared, set `$DOT_AGENT_DECK_SOCKET` to a path inside the user's home, for example `~/.local/state/dot-agent-deck/daemon.sock`, and ensure the parent directory is mode `0700`. The socket file itself is created at mode `0600` directly by the daemon — `bind(2)` runs with a narrowed umask of `0o177` so the socket inode is never world-readable for any window, and a defense-in-depth `chmod 0600` follows. The user's process umask does not affect the socket mode, but it still affects other files the daemon and its agents create, so a restrictive umask (e.g. `umask 077`) in the unit file or login profile remains a sound default on a shared host.
 
 ### Project filesystem layout
 

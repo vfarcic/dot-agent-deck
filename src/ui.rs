@@ -116,6 +116,14 @@ enum UiMode {
     StarPrompt,
     ConfigGenPrompt,
     QuitConfirm,
+    /// PRD #92 F1: secondary y/n confirmation that appears only when the
+    /// user has selected **Stop** in the primary QuitConfirm dialog AND
+    /// there is at least one managed agent that would be terminated.
+    /// Defaults to No (index 0). Pressing y / Enter on Yes confirms the
+    /// shutdown; pressing n / Esc / Enter on No returns to QuitConfirm
+    /// with Stop still selected so the user can pick a different option
+    /// without restarting the Ctrl+C sequence.
+    StopConfirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,8 +540,20 @@ struct UiState {
     config_gen_target: Option<(String, String)>,
     /// Selected option index in the config-gen modal (0=Yes, 1=No, 2=Never).
     config_gen_selected: usize,
-    /// Selected option in quit confirm modal (0=Detach, 1=Cancel).
+    /// Selected option in quit confirm modal (0=Detach, 1=Stop, 2=Cancel).
+    /// PRD #92 F1 widened this from 2 to 3 options; Detach remains the
+    /// default so the existing muscle memory does not become destructive.
     quit_confirm_selected: usize,
+    /// PRD #92 F1: selected option in the secondary Stop-confirmation
+    /// dialog (0=No, 1=Yes). Defaults to No — the safer default for the
+    /// destructive choice. Only meaningful when `mode == StopConfirm`.
+    stop_confirm_selected: usize,
+    /// PRD #92 F1: cached managed-agent count captured at the moment the
+    /// user picks Stop in the QuitConfirm dialog with at least one agent
+    /// alive. Used purely to render the secondary dialog's text ("{N}
+    /// managed agent(s) will be terminated..."); the daemon's own
+    /// registry is authoritative for the actual termination.
+    stop_confirm_agent_count: usize,
     /// Orchestration tab IDs whose start-role prompt has already been injected.
     orchestration_prompted: HashSet<TabId>,
     /// Tracks when orchestration tabs were created (for delayed prompt injection).
@@ -597,6 +617,8 @@ impl UiState {
             config_gen_target: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
+            stop_confirm_selected: 0,
+            stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
             orchestration_created_at: HashMap::new(),
             pending_dispatches: Vec::new(),
@@ -1458,6 +1480,32 @@ enum KeyResult {
         cwd: String,
     },
     RequestConfigGen,
+    /// PRD #92 F2 (PRD #18 follow-through): the user pressed `y` or `n` on a
+    /// dashboard card whose status is `WaitingForInput`. The bool is the
+    /// approve/deny choice (true = approve). The dispatcher forwards a single
+    /// `y` or `n` character to the selected pane's PTY via `write_to_pane`,
+    /// which handles the submit-key parity dance (encode → wait `SUBMIT_DELAY`
+    /// → CR), so the agent sees the same input it would have seen if the user
+    /// had switched into the pane and typed it directly. The status-gating
+    /// happens in `handle_normal_key` so this variant is only emitted when
+    /// the response is actually warranted.
+    SendPermissionResponse(bool),
+    /// PRD #92 F1: the user picked **Stop** in the QuitConfirm dialog AND
+    /// at least one managed agent is alive. The dispatcher must not
+    /// terminate yet — it transitions the TUI into the secondary y/n
+    /// confirmation dialog (`UiMode::StopConfirm`), seeded with the
+    /// `agent_count` captured at the dialog-open moment so the secondary
+    /// dialog's text can name a stable number even if the registry
+    /// changes mid-dialog.
+    StopConfirmPrompt {
+        agent_count: usize,
+    },
+    /// PRD #92 F1: the user has finalised Stop — either the primary dialog
+    /// confirmed it directly (no agents to warn about) or the secondary
+    /// y/n dialog selected Yes. The dispatcher saves session state, sends
+    /// `KIND_SHUTDOWN` to the daemon (which terminates every managed
+    /// agent and exits), and breaks the TUI's main loop.
+    StopAndQuit,
     ForwardToPane(Vec<u8>),
 }
 
@@ -1663,11 +1711,17 @@ fn handle_pane_input_key(key: KeyEvent) -> KeyResult {
     }
 }
 
-fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
-    // PRD #93 Phase 2 / M4.2: the dialog is now a single yes/no on detach
-    // — every pane is daemon-backed so quitting the TUI is always a
-    // detach, never a kill. Index 0 is Detach, index 1 is Cancel.
-    const QUIT_OPTION_COUNT: usize = 2;
+fn handle_quit_confirm_key(
+    key: KeyEvent,
+    ui: &mut UiState,
+    managed_agents_count: usize,
+) -> KeyResult {
+    // PRD #93 Phase 2 / M4.2: dialog was Detach/Cancel — every pane is
+    // daemon-backed so quitting the TUI was always a detach, never a kill.
+    // PRD #92 F1: Stop joins the dialog as a third option. Order is
+    // Detach (0, default) / Stop (1) / Cancel (2). Detach stays the
+    // default so the existing muscle memory does not become destructive.
+    const QUIT_OPTION_COUNT: usize = 3;
     match key.code {
         // Ctrl+C from inside the dialog: skip the explicit KIND_DETACH
         // frame and just exit. The daemon treats the socket close as
@@ -1687,6 +1741,18 @@ fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         }
         KeyCode::Enter => match ui.quit_confirm_selected {
             0 => KeyResult::DetachAndQuit,
+            1 => {
+                // PRD #92 F1 Stop: if no managed agents, proceed directly;
+                // otherwise step through the secondary y/n dialog so the
+                // user has to confirm the destructive action explicitly.
+                if managed_agents_count == 0 {
+                    KeyResult::StopAndQuit
+                } else {
+                    KeyResult::StopConfirmPrompt {
+                        agent_count: managed_agents_count,
+                    }
+                }
+            }
             _ => {
                 ui.mode = UiMode::Normal;
                 KeyResult::Continue
@@ -1694,6 +1760,60 @@ fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         },
         KeyCode::Esc => {
             ui.mode = UiMode::Normal;
+            KeyResult::Continue
+        }
+        _ => KeyResult::Continue,
+    }
+}
+
+/// PRD #92 F1: secondary y/n confirmation when the user picks Stop in
+/// the QuitConfirm dialog AND there is at least one managed agent that
+/// would be terminated. Default selection is No (the safer option for a
+/// destructive choice). On Yes the dispatcher proceeds to
+/// `StopAndQuit`; on No the dialog returns to the primary QuitConfirm
+/// with Stop still highlighted so the user can pick a different option
+/// without restarting the Ctrl+C sequence. Layout: index 0 = No,
+/// index 1 = Yes.
+fn handle_stop_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    const STOP_OPTION_COUNT: usize = 2;
+    match key.code {
+        // Ctrl+C inside the secondary dialog: same hard-quit semantic as
+        // the primary dialog. Daemon sees the implicit detach.
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyResult::Quit,
+        KeyCode::Up | KeyCode::Char('k') => {
+            ui.stop_confirm_selected = ui.stop_confirm_selected.saturating_sub(1);
+            KeyResult::Continue
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if ui.stop_confirm_selected + 1 < STOP_OPTION_COUNT {
+                ui.stop_confirm_selected += 1;
+            }
+            KeyResult::Continue
+        }
+        // `y` is a shortcut for Yes regardless of which option is
+        // highlighted — matches the convention from similar dialogs.
+        KeyCode::Char('y') | KeyCode::Char('Y') => KeyResult::StopAndQuit,
+        // `n` is a shortcut for No: return to the primary dialog with
+        // Stop selected, so the user can pick Detach or Cancel without
+        // re-opening anything.
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            ui.stop_confirm_selected = 0;
+            ui.mode = UiMode::QuitConfirm;
+            KeyResult::Continue
+        }
+        KeyCode::Enter => match ui.stop_confirm_selected {
+            // Index 1 == Yes
+            1 => KeyResult::StopAndQuit,
+            // Index 0 == No: return to primary dialog (Stop still highlighted).
+            _ => {
+                ui.stop_confirm_selected = 0;
+                ui.mode = UiMode::QuitConfirm;
+                KeyResult::Continue
+            }
+        },
+        KeyCode::Esc => {
+            ui.stop_confirm_selected = 0;
+            ui.mode = UiMode::QuitConfirm;
             KeyResult::Continue
         }
         _ => KeyResult::Continue,
@@ -1850,7 +1970,12 @@ fn focus_deck(
     true
 }
 
-fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult {
+fn handle_normal_key(
+    key: KeyEvent,
+    ui: &mut UiState,
+    total: usize,
+    selected_status: Option<SessionStatus>,
+) -> KeyResult {
     // Ctrl+C from dashboard: show quit confirmation
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
@@ -1888,6 +2013,26 @@ fn handle_normal_key(key: KeyEvent, ui: &mut UiState, total: usize) -> KeyResult
         }
         KeyCode::Enter if total > 0 => KeyResult::Focus,
         KeyCode::Char('g') if total > 0 => KeyResult::RequestConfigGen,
+        // PRD #92 F2 (PRD #18 follow-through): y / n approve / deny permission.
+        // Only fires when the selected card is in `WaitingForInput` — any
+        // other status, or no card selected, no-ops silently so y / n don't
+        // accidentally clobber some future keybinding. `KeyModifiers::NONE`
+        // is required so Ctrl+n (new pane, handled in the outer dispatch
+        // loop) still wins.
+        KeyCode::Char('y')
+            if total > 0
+                && key.modifiers == KeyModifiers::NONE
+                && selected_status == Some(SessionStatus::WaitingForInput) =>
+        {
+            KeyResult::SendPermissionResponse(true)
+        }
+        KeyCode::Char('n')
+            if total > 0
+                && key.modifiers == KeyModifiers::NONE
+                && selected_status == Some(SessionStatus::WaitingForInput) =>
+        {
+            KeyResult::SendPermissionResponse(false)
+        }
         KeyCode::Esc => {
             if !ui.filter_text.is_empty() {
                 ui.filter_text.clear();
@@ -3699,6 +3844,20 @@ pub fn run_tui(
                         shortcut_handled = true;
                     }
                     // Ctrl+w: close selected pane (or entire mode tab if it's the agent pane)
+                    //
+                    // PRD #92 F4: previously the result of `close_pane` was
+                    // discarded with `let _ =` and the card / session was
+                    // removed unconditionally. A failed `StopAgent` RPC then
+                    // left the underlying agent alive in the daemon
+                    // registry while the dashboard card vanished — the user
+                    // had no visibility and no retry. We now inspect each
+                    // close result and preserve the card / session on
+                    // failure so the user can see the error in
+                    // `ui.status_message` and try again. For group-close
+                    // (mode-tab teardown / orchestration tab teardown) we
+                    // consume `CloseTabOutcome::closed` to remove
+                    // successfully-closed cards and `CloseTabOutcome::failed`
+                    // to keep failed cards with a status-bar summary.
                     KeyCode::Char('w') => {
                         if let Some(sid) =
                             filtered.get(ui.selected_index).map(|(id, _)| (*id).clone())
@@ -3712,49 +3871,118 @@ pub fn run_tui(
                                 .or_else(|| tab_manager.tab_index_for_pane(pane_id));
                             if let Some(tab_idx) = mode_tab_idx {
                                 // Close the entire tab (agent + side panes, or all role panes).
-                                // close_tab already calls close_pane on orchestration role panes.
-                                if let Ok(all_ids) = tab_manager.close_tab(tab_idx) {
-                                    let mut st = state.blocking_write();
-                                    // Collect all pane IDs to clean up (returned + selected).
-                                    let mut pane_ids_to_remove: Vec<String> = all_ids;
-                                    if !pane_ids_to_remove.contains(&closed_pane_id) {
-                                        pane_ids_to_remove.push(closed_pane_id.clone());
+                                // close_tab returns a per-pane outcome — successful closes
+                                // get their cards removed, failed closes keep theirs.
+                                match tab_manager.close_tab(tab_idx) {
+                                    Ok(outcome) => {
+                                        let mut st = state.blocking_write();
+                                        for id in &outcome.closed {
+                                            st.unregister_pane(id);
+                                        }
+                                        // Remove sessions whose pane_id is in the closed set ONLY.
+                                        // Failed panes retain their sessions so the user can retry.
+                                        let closed_set: std::collections::HashSet<&str> =
+                                            outcome.closed.iter().map(String::as_str).collect();
+                                        st.sessions.retain(|_, s| {
+                                            s.pane_id.as_ref().is_none_or(|pid| {
+                                                !closed_set.contains(pid.as_str())
+                                            })
+                                        });
+                                        drop(st);
+                                        // Clean pane_metadata only for the successfully-closed panes.
+                                        for id in &outcome.closed {
+                                            ui.pane_metadata.remove(id);
+                                        }
+                                        if outcome.is_clean() {
+                                            ui.status_message = Some((
+                                                format!(
+                                                    "Closed tab containing pane {closed_pane_id}"
+                                                ),
+                                                std::time::Instant::now(),
+                                            ));
+                                        } else {
+                                            // List which panes failed plus the first error so the
+                                            // status bar stays readable (single-line). Full per-pane
+                                            // errors are tracing-logged for the daemon log.
+                                            let failed_ids: Vec<&str> = outcome
+                                                .failed
+                                                .iter()
+                                                .map(|(id, _)| id.as_str())
+                                                .collect();
+                                            let first_err = outcome
+                                                .failed
+                                                .first()
+                                                .map(|(_, e)| e.as_str())
+                                                .unwrap_or("");
+                                            for (id, e) in &outcome.failed {
+                                                tracing::warn!(
+                                                    pane_id = %id,
+                                                    error = %e,
+                                                    "F4: close_pane failed during tab teardown — card preserved"
+                                                );
+                                            }
+                                            ui.status_message = Some((
+                                                format!(
+                                                    "Close partially failed for {} pane(s) — first error: {first_err}",
+                                                    failed_ids.len()
+                                                ),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
+                                        let area = terminal.get_frame().area();
+                                        resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
                                     }
-                                    for id in &pane_ids_to_remove {
-                                        st.unregister_pane(id);
+                                    Err(e) => {
+                                        ui.status_message = Some((
+                                            format!("Failed to close tab: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
                                     }
-                                    // Remove all sessions whose pane_id is in the closed set.
-                                    st.sessions.retain(|_, s| {
-                                        s.pane_id
-                                            .as_ref()
-                                            .is_none_or(|pid| !pane_ids_to_remove.contains(pid))
-                                    });
-                                    drop(st);
                                 }
-                                ui.pane_metadata.remove(&closed_pane_id);
-                                let area = terminal.get_frame().area();
-                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
                             } else {
-                                // Plain dashboard pane — close just this one.
-                                let _ = pane.close_pane(pane_id);
-                                let mut st = state.blocking_write();
-                                st.sessions.remove(&sid);
-                                st.unregister_pane(&closed_pane_id);
-                                drop(st);
-                                ui.pane_metadata.remove(&closed_pane_id);
+                                // Plain dashboard pane — close just this one and inspect
+                                // the result. On Err the controller has already restored
+                                // the local pane state (see EmbeddedPaneController::close_pane),
+                                // so we leave the card / session in place for retry.
+                                match pane.close_pane(pane_id) {
+                                    Ok(()) => {
+                                        let mut st = state.blocking_write();
+                                        st.sessions.remove(&sid);
+                                        st.unregister_pane(&closed_pane_id);
+                                        drop(st);
+                                        ui.pane_metadata.remove(&closed_pane_id);
+                                        ui.status_message = Some((
+                                            format!("Closed pane {closed_pane_id}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            pane_id = %closed_pane_id,
+                                            error = %e,
+                                            "F4: close_pane failed — card preserved for retry"
+                                        );
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Failed to close pane {closed_pane_id}: {e} — press Ctrl+W to retry"
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
                             }
                             if ui.mode == UiMode::PaneInput {
                                 ui.mode = UiMode::Normal;
                             }
                             // Clamp selected_index so it doesn't point past
-                            // the now-shorter card list.
+                            // the now-shorter card list. (Only meaningful if
+                            // at least one pane was actually removed; on a
+                            // pure-failure close the card count is unchanged
+                            // and this is a no-op since selected_index
+                            // already points at the (preserved) card.)
                             if ui.selected_index > 0 {
                                 ui.selected_index = ui.selected_index.saturating_sub(1);
                             }
-                            ui.status_message = Some((
-                                format!("Closed pane {closed_pane_id}"),
-                                std::time::Instant::now(),
-                            ));
                         }
                         shortcut_handled = true;
                     }
@@ -3928,7 +4156,13 @@ pub fn run_tui(
                 KeyResult::Continue
             } else {
                 match ui.mode {
-                    UiMode::Normal => handle_normal_key(key, &mut ui, total),
+                    UiMode::Normal => {
+                        let selected_status = selected_id
+                            .as_ref()
+                            .and_then(|sid| snapshot.sessions.get(sid))
+                            .map(|session| session.status.clone());
+                        handle_normal_key(key, &mut ui, total, selected_status)
+                    }
                     UiMode::Filter => handle_filter_key(key, &mut ui),
                     UiMode::Help => handle_help_key(key, &mut ui),
                     UiMode::Rename => {
@@ -3980,7 +4214,25 @@ pub fn run_tui(
                     UiMode::PaneInput => handle_pane_input_key(key),
                     UiMode::StarPrompt => handle_star_prompt_key(key, &mut ui),
                     UiMode::ConfigGenPrompt => handle_config_gen_prompt_key(key, &mut ui),
-                    UiMode::QuitConfirm => handle_quit_confirm_key(key, &mut ui),
+                    UiMode::QuitConfirm => {
+                        // PRD #92 F1: the dialog needs to know the
+                        // managed-agent count to decide whether picking
+                        // Stop should go straight to shutdown or step
+                        // through the secondary y/n confirmation. We
+                        // count pane-backed sessions in the current
+                        // snapshot (every dashboard card is a pane, so
+                        // this is also "how many cards would lose their
+                        // PTY"). Filter is irrelevant here — the user is
+                        // about to terminate every agent on the daemon,
+                        // not just the visible ones.
+                        let managed_agents_count = snapshot
+                            .sessions
+                            .values()
+                            .filter(|s| s.pane_id.is_some())
+                            .count();
+                        handle_quit_confirm_key(key, &mut ui, managed_agents_count)
+                    }
+                    UiMode::StopConfirm => handle_stop_confirm_key(key, &mut ui),
                 }
             };
 
@@ -4002,6 +4254,71 @@ pub fn run_tui(
                         }
                     }
                     break 'outer;
+                }
+                KeyResult::StopConfirmPrompt { agent_count } => {
+                    // PRD #92 F1: transition to the secondary y/n dialog
+                    // with the cached agent count rendered in the prompt.
+                    // Default to No (safer default for a destructive
+                    // action). Stay in this loop iteration; the next
+                    // pass will render `StopConfirm` and route keys to
+                    // `handle_stop_confirm_key`.
+                    ui.stop_confirm_agent_count = agent_count;
+                    ui.stop_confirm_selected = 0;
+                    ui.mode = UiMode::StopConfirm;
+                }
+                KeyResult::StopAndQuit => {
+                    // PRD #92 F1: user confirmed Stop (either via the
+                    // primary dialog with 0 agents or via the secondary
+                    // y/n with Yes). Tell the daemon to terminate every
+                    // managed agent and exit, then break the TUI loop.
+                    // Session save happens via the normal exit path
+                    // (the `'outer` break unwinds into the existing
+                    // session-save site so `--continue` is not poisoned).
+                    //
+                    // PRD #92 F1 followup: `shutdown_daemon` now waits
+                    // for an explicit `KIND_SHUTDOWN_ACK` from the
+                    // daemon. The original wire used socket-close as
+                    // the implicit ack, which an old daemon (predating
+                    // `PROTOCOL_VERSION = 2`) would also satisfy by
+                    // closing the connection on an unknown frame —
+                    // making the upgrade-mismatch case look like a
+                    // successful shutdown. On `Err` we now do NOT exit
+                    // the TUI; we dismiss the dialogs, surface the
+                    // error via `ui.status_message`, and return to
+                    // Normal mode so the user can retry, Detach, or
+                    // `pkill` from a shell.
+                    let shutdown_result = pane
+                        .as_any()
+                        .downcast_ref::<EmbeddedPaneController>()
+                        .map(|embedded| embedded.shutdown_daemon());
+                    match shutdown_result {
+                        Some(Ok(())) | None => {
+                            // Ack received (or non-stream backend, which
+                            // can't actually shut down anything). Proceed
+                            // to TUI exit via the existing `'outer`
+                            // break.
+                            break 'outer;
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                "shutdown_daemon failed — staying in the TUI so the user can retry or Detach"
+                            );
+                            ui.status_message = Some((
+                                format!(
+                                    "Stop failed: {e} — daemon may be incompatible or unresponsive. Try Detach or restart the daemon manually."
+                                ),
+                                std::time::Instant::now(),
+                            ));
+                            // Dismiss dialogs and return to Normal mode.
+                            // Reset the primary-dialog selection to
+                            // Detach so a hammer-Enter recovery picks
+                            // the safe option, not Stop again.
+                            ui.mode = UiMode::Normal;
+                            ui.stop_confirm_selected = 0;
+                            ui.quit_confirm_selected = 0;
+                        }
+                    }
                 }
                 KeyResult::Focus => {
                     // Dismiss idle art on the focused card
@@ -4070,6 +4387,36 @@ pub fn run_tui(
                             "No active agent session to send prompt to.".to_string(),
                             std::time::Instant::now(),
                         ));
+                    }
+                }
+                KeyResult::SendPermissionResponse(approve) => {
+                    // The handler already gated on `WaitingForInput` plus a
+                    // non-empty selection; re-resolve the pane here so the
+                    // PTY write goes to the right place. If `pane_id` is
+                    // missing (placeholder session with no agent yet), this
+                    // silently no-ops — same shape as RequestConfigGen.
+                    if let Some(ref sid) = selected_id
+                        && let Some(session) = snapshot.sessions.get(sid)
+                        && let Some(ref pane_id) = session.pane_id
+                    {
+                        let key_char = if approve { "y" } else { "n" };
+                        match pane.write_to_pane(pane_id, key_char) {
+                            Ok(()) => {
+                                ui.status_message = Some((
+                                    format!(
+                                        "Permission {}.",
+                                        if approve { "approved" } else { "denied" }
+                                    ),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                            Err(e) => {
+                                ui.status_message = Some((
+                                    format!("Permission response failed: {e}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
                     }
                 }
                 KeyResult::NewPane(req) => {
@@ -4907,6 +5254,14 @@ fn render_overlays(
     if ui.mode == UiMode::QuitConfirm {
         render_quit_confirm(frame, ui.quit_confirm_selected, palette);
     }
+    if ui.mode == UiMode::StopConfirm {
+        render_stop_confirm(
+            frame,
+            ui.stop_confirm_selected,
+            ui.stop_confirm_agent_count,
+            palette,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5316,27 +5671,29 @@ fn render_bottom_bar(
 
 fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette) {
     let area = frame.area();
-    let popup_width = 60u16.min(area.width.saturating_sub(4));
-    let popup_height = 9u16.min(area.height.saturating_sub(4));
+    let popup_width = 64u16.min(area.width.saturating_sub(4));
+    let popup_height = 10u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
-    // PRD #93 Phase 2 / M4.2: every pane is daemon-backed, so the only
-    // meaningful exit is Detach — the TUI goes away, the daemon-owned
-    // agents keep running, and a KIND_DETACH frame is emitted so the
-    // daemon log distinguishes voluntary detach from EOF.
+    // PRD #93 Phase 2 / M4.2: dialog was Detach/Cancel — every pane is
+    // daemon-backed so quitting the TUI was always a detach, never a kill.
+    // PRD #92 F1: Stop joins as a third option (index 1) to restore the
+    // pre-daemon "user gesture that takes everything down". Detach stays
+    // the default so existing muscle memory does not become destructive.
     let options = [
         ("Detach", "leave agents running on the daemon"),
+        ("Stop", "shut down agents and daemon"),
         ("Cancel", "return to dashboard"),
     ];
 
     let mut text = vec![
         Line::from(""),
         Line::styled(
-            "  Detach from this TUI?",
+            "  Quit dot-agent-deck?",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -5366,7 +5723,7 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
     ));
 
     let block = Block::default()
-        .title(" Detach ")
+        .title(" Quit ")
         .title_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -5374,6 +5731,76 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
         )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(palette.terminal_bg));
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+/// PRD #92 F1: secondary y/n confirmation dialog when the user picked
+/// Stop with at least one managed agent alive. Renders the count
+/// explicitly so the user sees exactly how many agents are about to be
+/// terminated. Default selection is No (index 0).
+fn render_stop_confirm(
+    frame: &mut Frame,
+    selected: usize,
+    agent_count: usize,
+    palette: ColorPalette,
+) {
+    let area = frame.area();
+    let popup_width = 68u16.min(area.width.saturating_sub(4));
+    let popup_height = 10u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let header = if agent_count == 1 {
+        "  1 managed agent will be terminated and the daemon will shut down.".to_string()
+    } else {
+        format!("  {agent_count} managed agents will be terminated and the daemon will shut down.")
+    };
+
+    let options = [("No", "return to the previous dialog"), ("Yes", "confirm")];
+
+    let mut text = vec![
+        Line::from(""),
+        Line::styled(
+            header,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::from("  Continue?"),
+        Line::from(""),
+    ];
+
+    for (i, (label, desc)) in options.iter().enumerate() {
+        let cursor = if i == selected { ">" } else { " " };
+        let style = if i == selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        text.push(Line::styled(
+            format!("  {cursor} {label:<5} \u{2014} {desc}"),
+            style,
+        ));
+    }
+
+    text.push(Line::from(""));
+    text.push(Line::styled(
+        "  y / Enter on Yes confirms  ·  n / Esc / Enter on No returns to Quit dialog",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let block = Block::default()
+        .title(" Stop ")
+        .title_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
         .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
@@ -7138,6 +7565,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         };
         state.apply_event(event1.clone());
 
@@ -7157,6 +7585,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         };
         state.apply_event(event2);
 
@@ -7214,6 +7643,7 @@ mod tests {
                 user_prompt: None,
                 metadata: HashMap::new(),
                 pane_id: None,
+                agent_id: None,
             });
         }
 
@@ -7263,6 +7693,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         };
         state.apply_event(event.clone());
 
@@ -7487,6 +7918,7 @@ mod tests {
                 user_prompt: None,
                 metadata: HashMap::new(),
                 pane_id: None,
+                agent_id: None,
             });
         }
 
@@ -7930,6 +8362,7 @@ mod tests {
                 user_prompt: None,
                 metadata: HashMap::new(),
                 pane_id: None,
+                agent_id: None,
             });
         }
 
@@ -7953,6 +8386,7 @@ mod tests {
                 user_prompt: None,
                 metadata: HashMap::new(),
                 pane_id: None,
+                agent_id: None,
             });
         }
 
@@ -7977,6 +8411,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -7989,6 +8424,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         });
 
         let mut ui = default_ui();
@@ -8012,6 +8448,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -8024,6 +8461,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         });
 
         let mut ui = default_ui();
@@ -8049,6 +8487,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         });
 
         let mut ui = default_ui();
@@ -8071,6 +8510,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
             &mut ui,
             3,
+            None,
         );
         assert_eq!(ui.mode, UiMode::Filter);
 
@@ -8083,6 +8523,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
             &mut ui,
             3,
+            None,
         );
         assert_eq!(ui.mode, UiMode::Help);
 
@@ -8095,6 +8536,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             3,
+            None,
         );
         assert_eq!(ui.mode, UiMode::Rename);
 
@@ -8211,7 +8653,12 @@ mod tests {
         let mut ui = default_ui();
         ui.filter_text = "active-filter".to_string();
 
-        handle_normal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui, 5);
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+            5,
+            None,
+        );
         assert!(ui.filter_text.is_empty());
     }
 
@@ -8223,8 +8670,119 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             0,
+            None,
         );
         assert_eq!(ui.mode, UiMode::Normal);
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #92 F2 — y / n permission key tests
+    //
+    // Behavior: pressing `y` on a dashboard card whose selected session is in
+    // `WaitingForInput` returns `KeyResult::SendPermissionResponse(true)` so
+    // the dispatcher forwards `y` to the agent's PTY. Pressing `n` returns
+    // `SendPermissionResponse(false)`. Any other status, or `total == 0`,
+    // falls through to `KeyResult::Continue`. PRD #18 documented these keys
+    // on the help overlay since baseline but no handler existed until now.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn permission_y_on_waiting_for_input_returns_approve() {
+        let mut ui = default_ui();
+        let result = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut ui,
+            1,
+            Some(SessionStatus::WaitingForInput),
+        );
+        assert!(
+            matches!(result, KeyResult::SendPermissionResponse(true)),
+            "y on a WaitingForInput card must approve, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn permission_n_on_waiting_for_input_returns_deny() {
+        let mut ui = default_ui();
+        let result = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut ui,
+            1,
+            Some(SessionStatus::WaitingForInput),
+        );
+        assert!(
+            matches!(result, KeyResult::SendPermissionResponse(false)),
+            "n on a WaitingForInput card must deny, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn permission_y_n_on_non_waiting_status_is_no_op() {
+        // Any non-WaitingForInput status: keys must NOT trigger the permission
+        // response. They fall through to `Continue` so future keybindings or
+        // ignored input remain unaffected. Cover a representative sample of
+        // statuses (Working, Idle, Thinking, Error) to pin the gate.
+        for status in [
+            SessionStatus::Working,
+            SessionStatus::Idle,
+            SessionStatus::Thinking,
+            SessionStatus::Error,
+            SessionStatus::Compacting,
+        ] {
+            let mut ui = default_ui();
+            let result_y = handle_normal_key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                &mut ui,
+                1,
+                Some(status.clone()),
+            );
+            assert!(
+                matches!(result_y, KeyResult::Continue),
+                "y on status {status:?} must no-op, got {result_y:?}"
+            );
+            let result_n = handle_normal_key(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                &mut ui,
+                1,
+                Some(status.clone()),
+            );
+            assert!(
+                matches!(result_n, KeyResult::Continue),
+                "n on status {status:?} must no-op, got {result_n:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_y_n_with_no_card_selected_is_no_op() {
+        // No card selected (total == 0, status None): both keys must
+        // no-op. Belt-and-braces — the handler gates on `total > 0` AND on
+        // status, so either guard alone is sufficient, but tests pin both.
+        let mut ui = default_ui();
+        let result_y = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut ui,
+            0,
+            None,
+        );
+        assert!(matches!(result_y, KeyResult::Continue));
+        let result_n = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut ui,
+            0,
+            None,
+        );
+        assert!(matches!(result_n, KeyResult::Continue));
+        // Also exercise the case where `total > 0` but `selected_status` is
+        // None (the selected session is missing from the snapshot — a race we
+        // tolerate gracefully).
+        let result_y_no_status = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut ui,
+            1,
+            None,
+        );
+        assert!(matches!(result_y_no_status, KeyResult::Continue));
     }
 
     // -----------------------------------------------------------------------
@@ -8419,6 +8977,7 @@ mod tests {
                 user_prompt: Some(prompt.to_string()),
                 metadata: HashMap::new(),
                 pane_id: None,
+                agent_id: None,
             });
         }
 
@@ -9273,6 +9832,7 @@ mod tests {
             user_prompt: None,
             metadata: HashMap::new(),
             pane_id: None,
+            agent_id: None,
         });
         let output = build_art_output(&s);
         assert!(output.contains("Bash"));
@@ -9487,8 +10047,11 @@ mod tests {
         ui.mode = UiMode::QuitConfirm;
         ui.quit_confirm_selected = 0;
 
-        let result =
-            handle_quit_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+        let result = handle_quit_confirm_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            0,
+        );
         assert!(matches!(result, KeyResult::DetachAndQuit));
     }
 
@@ -9496,25 +10059,169 @@ mod tests {
     fn quit_confirm_cancel_returns_to_normal_mode() {
         let mut ui = default_ui();
         ui.mode = UiMode::QuitConfirm;
-        ui.quit_confirm_selected = 1;
+        // PRD #92 F1: Cancel moved from index 1 to index 2 to make room
+        // for Stop in the middle.
+        ui.quit_confirm_selected = 2;
 
-        let result =
-            handle_quit_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+        let result = handle_quit_confirm_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            0,
+        );
         assert!(matches!(result, KeyResult::Continue));
         assert_eq!(ui.mode, UiMode::Normal);
     }
 
     #[test]
-    fn quit_confirm_down_clamps_to_two_options() {
+    fn quit_confirm_down_clamps_to_three_options() {
         let mut ui = default_ui();
         ui.mode = UiMode::QuitConfirm;
         ui.quit_confirm_selected = 0;
 
-        // Two presses on Down — selection must stop at index 1 (Cancel),
-        // proving QUIT_OPTION_COUNT == 2.
-        handle_quit_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui);
+        // Three presses on Down — selection must stop at index 2 (Cancel),
+        // proving QUIT_OPTION_COUNT == 3 after the PRD #92 F1 expansion.
+        handle_quit_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui, 0);
         assert_eq!(ui.quit_confirm_selected, 1);
-        handle_quit_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui);
-        assert_eq!(ui.quit_confirm_selected, 1);
+        handle_quit_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui, 0);
+        assert_eq!(ui.quit_confirm_selected, 2);
+        handle_quit_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui, 0);
+        assert_eq!(ui.quit_confirm_selected, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #92 F1 — Stop option in the Ctrl+C dialog
+    //
+    // Primary dialog gains a Stop option at index 1 (Detach default / Stop
+    // / Cancel). Picking Stop with no agents proceeds directly; with
+    // agents alive the secondary y/n dialog confirms first. The secondary
+    // dialog defaults to No; No returns to the primary dialog; Yes is
+    // KeyResult::StopAndQuit. KIND_SHUTDOWN side effects and registry
+    // teardown are exercised by tests/stop_dialog.rs.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quit_confirm_stop_with_no_agents_returns_stop_and_quit() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::QuitConfirm;
+        ui.quit_confirm_selected = 1; // Stop
+
+        let result = handle_quit_confirm_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            0, // no agents
+        );
+        assert!(
+            matches!(result, KeyResult::StopAndQuit),
+            "Stop with 0 agents must skip the secondary dialog, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_stop_with_agents_prompts_secondary_dialog() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::QuitConfirm;
+        ui.quit_confirm_selected = 1; // Stop
+
+        let result = handle_quit_confirm_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            3, // three agents alive
+        );
+        assert!(
+            matches!(result, KeyResult::StopConfirmPrompt { agent_count: 3 }),
+            "Stop with N>0 agents must request secondary confirmation with N rendered, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn stop_confirm_defaults_to_no() {
+        // Default selection on entry must be No (index 0). The dispatcher
+        // sets this when transitioning into StopConfirm; the test
+        // re-asserts the contract from the handler's perspective.
+        let ui = default_ui();
+        assert_eq!(
+            ui.stop_confirm_selected, 0,
+            "secondary dialog must default to No (index 0)"
+        );
+    }
+
+    #[test]
+    fn stop_confirm_yes_returns_stop_and_quit() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::StopConfirm;
+        ui.stop_confirm_selected = 1; // Yes
+        ui.stop_confirm_agent_count = 2;
+
+        let result =
+            handle_stop_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+        assert!(
+            matches!(result, KeyResult::StopAndQuit),
+            "Enter on Yes must confirm Stop, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn stop_confirm_y_shortcut_returns_stop_and_quit() {
+        // `y` is a shortcut for Yes regardless of which option is
+        // currently highlighted — matches conventional y/n dialogs.
+        let mut ui = default_ui();
+        ui.mode = UiMode::StopConfirm;
+        ui.stop_confirm_selected = 0; // No is highlighted
+        ui.stop_confirm_agent_count = 2;
+
+        let result = handle_stop_confirm_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert!(
+            matches!(result, KeyResult::StopAndQuit),
+            "y must confirm Stop even when No is highlighted, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn stop_confirm_no_returns_to_primary_dialog() {
+        // Selecting No (or pressing Esc / n) must return to the primary
+        // QuitConfirm dialog with Stop still selected, so the user can
+        // pick Detach or Cancel without re-opening the Ctrl+C dialog.
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        ] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::StopConfirm;
+            ui.stop_confirm_selected = 0; // No
+            ui.stop_confirm_agent_count = 1;
+
+            let result = handle_stop_confirm_key(key, &mut ui);
+            assert!(
+                matches!(result, KeyResult::Continue),
+                "{key:?} on No path must Continue, got {result:?}"
+            );
+            assert_eq!(
+                ui.mode,
+                UiMode::QuitConfirm,
+                "{key:?} on No path must return to QuitConfirm"
+            );
+            assert_eq!(
+                ui.stop_confirm_selected, 0,
+                "{key:?} on No path must reset stop_confirm_selected to default (No)"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_confirm_down_clamps_to_two_options() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::StopConfirm;
+        ui.stop_confirm_selected = 0;
+
+        // Two presses on Down — selection must stop at index 1 (Yes),
+        // proving STOP_OPTION_COUNT == 2.
+        handle_stop_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui);
+        assert_eq!(ui.stop_confirm_selected, 1);
+        handle_stop_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui);
+        assert_eq!(ui.stop_confirm_selected, 1);
     }
 }

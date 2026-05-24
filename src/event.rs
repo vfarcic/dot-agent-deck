@@ -69,6 +69,20 @@ pub struct AgentEvent {
     pub metadata: HashMap<String, String>,
     #[serde(default)]
     pub pane_id: Option<String>,
+    /// PRD #92 F9 followup-7: daemon-side registry id of the agent
+    /// that produced this hook event. Populated by the agent's hook
+    /// script from the `DOT_AGENT_DECK_AGENT_ID` env var the daemon
+    /// injects at spawn time (same pattern as
+    /// [`crate::agent_pty::DOT_AGENT_DECK_PANE_ID`]). Lets the
+    /// post-respawn dispatch task scope its `SessionStart` wait to
+    /// the NEW agent's id, so a late `SessionStart` from the OLD
+    /// agent — emitted in the subscribe→kill window — can't be
+    /// mis-accepted as the NEW agent's readiness signal. Optional
+    /// because hook payloads from external agents (or test forgers)
+    /// may omit it; events with `None` simply won't match
+    /// agent-id-scoped filters.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// Envelope for messages sent to the daemon over the Unix socket.

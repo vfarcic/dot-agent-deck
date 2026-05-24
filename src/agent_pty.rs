@@ -10,6 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use thiserror::Error;
@@ -37,6 +38,21 @@ pub const DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS: &str = "DOT_AGENT_DECK_IDLE_SHUTDOW
 /// drift-safety reason as [`DOT_AGENT_DECK_VIA_DAEMON`], and so the daemon
 /// scrub site below can reference it by name.
 pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
+
+/// PRD #92 F9 followup-7: per-spawn daemon-side agent id the daemon
+/// injects into every spawned agent's environment. The agent's hook
+/// script reads this and attaches it to each emitted `AgentEvent` as
+/// `agent_id`, letting the post-respawn dispatch task scope its
+/// `SessionStart` wait to the NEW agent — a late `SessionStart` from
+/// the OLD agent firing within the subscribe→kill window carries the
+/// OLD id and is rejected.
+///
+/// Same drift-safety pattern as [`DOT_AGENT_DECK_PANE_ID`]: define
+/// the constant once and let the spawn-side injector, the env-scrub
+/// site in [`spawn`], and the hook-script reader in
+/// [`crate::hook`] all reference the same symbol so two string
+/// literals can't drift apart.
+pub const DOT_AGENT_DECK_AGENT_ID: &str = "DOT_AGENT_DECK_AGENT_ID";
 
 /// Hard upper bound on PTY rows/cols accepted by the daemon. Larger values
 /// are clamped down before reaching `MasterPty::resize`. The cap defends
@@ -289,16 +305,16 @@ pub enum AgentPtyError {
     /// reclassify the pane as dashboard).
     #[error("Invalid spawn options: {0}")]
     Validation(String),
-    /// The text handed to [`AgentPtyRegistry::write_to_pane`] could not be
-    /// encoded into a safe pane payload (PRD #93 round-8). Today this
+    /// The text handed to one of the `write_to_pane_*` entrypoints could not
+    /// be encoded into a safe pane payload (PRD #93 round-8). Today this
     /// fires when a multi-line input contains an embedded bracketed-paste
     /// marker (`ESC[200~` / `ESC[201~`) that would terminate the outer
     /// wrapper and leak the tail as raw keystrokes inside the agent TUI.
     #[error("Invalid pane payload: {0}")]
     InvalidPayload(#[from] PaneInputError),
     /// A spawn carried a `DOT_AGENT_DECK_PANE_ID` env value that already
-    /// names another live agent in this registry. `write_to_pane` keys
-    /// off `pane_id_env`, so accepting a second agent with the same id
+    /// names another live agent in this registry. The `write_to_pane_*`
+    /// entrypoints key off `pane_id_env`, so accepting a second agent with the same id
     /// would silently route delegate/work-done writes to whichever entry
     /// `HashMap::values().find(...)` returns first — i.e., the wrong PTY.
     /// Reject the spawn loudly instead.
@@ -373,30 +389,187 @@ pub struct AgentPty {
     pub reader: Box<dyn std::io::Read + Send>,
 }
 
-/// Forcefully terminate the child and reap it. SIGKILL is preferred over
+/// PRD #92 F1 followup (defensive): convert a portable-pty `process_id()`
+/// (a `u32`) into a positive `libc::pid_t` suitable for `killpg`, or
+/// `None` if the raw value can't legally name a process group.
+///
+/// `killpg(pgid, sig)` has two dangerous degenerate cases for non-positive
+/// `pgid`:
+///   - `pgid == 0` is documented as "signal every process in *the caller's*
+///     process group" — which for the daemon would mean signalling the
+///     daemon itself plus every connected attach-client.
+///   - `pgid < 0` is undefined behavior in POSIX and a likely overflow
+///     indicator (a `u32` PID that didn't fit in `i32`).
+///
+/// Both should be impossible from a well-behaved `portable-pty` spawn
+/// (Linux PIDs are positive `i32` values up to `i32::MAX`), but
+/// defensively checking is one `if` and one unit test, which is much
+/// cheaper than the unbounded blast radius of getting it wrong. On
+/// `None` the caller falls back to `child.kill()` (single-PID).
+pub(crate) fn pid_to_pgid(pid: u32) -> Option<libc::pid_t> {
+    let signed = pid as i64;
+    if signed > 0 && signed <= libc::pid_t::MAX as i64 {
+        Some(signed as libc::pid_t)
+    } else {
+        None
+    }
+}
+
+/// PRD #92 F8: hardcoded grace window between SIGTERM and the SIGKILL
+/// fallback used by the single-pane Ctrl+W path
+/// ([`terminate_child_with_grace_and_wait`]) and as the poll budget in
+/// the daemon-wide [`AgentPtyRegistry::shutdown_all_graceful`].
+/// 3 s matches the F1 graceful-shutdown grace, which is the natural
+/// sibling. Hardcoded as a constant for now (one symbol to find) rather
+/// than lifted to `DashboardConfig` until a real user need surfaces.
+pub(crate) const AGENT_TERMINATE_GRACE: Duration = Duration::from_secs(3);
+
+/// PRD #92 F8: low-level shared helper. Send `signal` to the child's
+/// process group, falling back to `portable_pty::Child::kill` when
+/// `pid_to_pgid` rejects the raw pid (F1-followup defensive boundary
+/// check). `phase` is included in `tracing::warn!` payloads so a wedged
+/// child can be traced back to whichever phase issued the kill.
+/// Returns `true` if the `killpg` syscall actually fired (or the
+/// `child.kill` fallback was used), `false` if the syscall reported an
+/// error other than ESRCH.
+///
+/// Used by both [`force_kill_child_and_wait`] (single-shot SIGKILL,
+/// for Drop / RAII / shutdown_all paths) and
+/// [`terminate_child_with_grace_and_wait`] (single-pane Ctrl+W, SIGTERM
+/// then SIGKILL), as well as by the SIGTERM phase inside
+/// [`AgentPtyRegistry::shutdown_all_graceful`] (daemon-wide Stop).
+/// Centralising the killpg + fallback logic prevents the three call
+/// sites from drifting.
+fn signal_child_pgroup_or_fallback(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    signal: libc::c_int,
+    phase: &'static str,
+) -> bool {
+    let raw_pid = child.process_id();
+    let pgid = raw_pid.and_then(pid_to_pgid);
+    let Some(pgid) = pgid else {
+        // PRD #92 F8 followup (auditor #2 — option b documented):
+        // pid_to_pgid rejected the raw pid (either `process_id()`
+        // returned `None` or the pid was outside the safe `(0, i32::MAX]`
+        // range). The portable-pty `Child` trait allows `None` here,
+        // but the Unix backend used by this codebase (the only backend
+        // we ship — PRD #93 is Unix-only and Windows support is
+        // PRD #42's territory) always returns `Some` in practice. The
+        // `(0, i32::MAX]` boundary check is defense-in-depth against a
+        // future portable-pty bug; on real Linux/macOS PIDs it never
+        // fails. The fallback below uses `portable_pty::Child::kill`,
+        // which sends SIGHUP — strictly weaker than the requested
+        // `signal` (typically SIGTERM or SIGKILL) and limited to the
+        // direct child (no process-group semantics, so descendants
+        // leak). The caller's subsequent `child.wait()` is unbounded
+        // — that's acceptable for the same "this branch is practically
+        // unreachable" reason; if it ever fires, we'd rather see the
+        // log and accept a hang than complicate every call site with a
+        // bounded-wait wrapper for a path that doesn't exist in
+        // practice.
+        //
+        // Auditor #5: emit a warn-level event so a descendant leak
+        // surfaced via this fallback is at least observable.
+        tracing::warn!(
+            ?raw_pid,
+            signal,
+            phase = %phase,
+            reason = if raw_pid.is_none() { "process_id-returned-none" } else { "pid_to_pgid-rejected" },
+            "signal_child_pgroup_or_fallback: pgid unavailable — falling back to portable_pty::Child::kill (SIGHUP, single-PID; descendants will leak)"
+        );
+        let _ = child.kill();
+        return true;
+    };
+    // SAFETY: `killpg(2)` is async-signal-safe; the pgid we just
+    // validated via `pid_to_pgid` is the child's own PID (portable-pty
+    // `setsid`'d it, making it the group leader), so this cannot
+    // affect any other agent's group.
+    let rc = unsafe { libc::killpg(pgid, signal) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        let benign = err.raw_os_error() == Some(libc::ESRCH);
+        if !benign {
+            tracing::warn!(pgid, signal, phase = %phase, error = %err, "killpg failed");
+        }
+        return benign;
+    }
+    true
+}
+
+/// Forcefully terminate the child *and every descendant in its process
+/// group* with SIGKILL and reap it. SIGKILL is preferred over
 /// `portable_pty::Child::kill()` (which sends SIGHUP) because a shell can
 /// ignore SIGHUP — some distros' bash/zsh configurations do exactly that —
 /// leaving the subsequent `wait()` to block forever. SIGKILL cannot be
 /// caught or ignored, so the kernel tears the process down and `wait()`
 /// returns promptly. Callers should drop the master/writer/reader handles
 /// before invoking this so any I/O blocked on the PTY unblocks first.
+///
+/// PRD #92 F5: switched from `kill(pid)` to `killpg(pgid)` so descendants
+/// of shell-wrapped commands are reaped together with the shell. PRD #92 F1
+/// followup: the raw `pid as i32` cast went through a `pid_to_pgid` guard.
+/// Both behaviours now live in the shared
+/// [`signal_child_pgroup_or_fallback`] helper.
+///
+/// PRD #92 F8: callers that want the user's agent to have a catchable
+/// signal (single-pane Ctrl+W) now use
+/// [`terminate_child_with_grace_and_wait`] instead. This function
+/// retains the SIGKILL-only semantics for the contexts where a grace
+/// window is wrong or unnecessary: the registry's `Drop` impl, the
+/// `PtyGuard` / `AgentPty` cleanup paths, and the third phase of
+/// `shutdown_all_graceful` (after the SIGTERM phase has already run
+/// daemon-wide).
 fn force_kill_child_and_wait(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
-    if let Some(pid) = child.process_id() {
-        // SAFETY: `kill(2)` is async-signal-safe; sending SIGKILL to a pid we
-        // just learned from `process_id()` cannot affect any other process
-        // until the kernel reaps the child below.
-        let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        if rc != 0 {
-            // Log so a weakened cleanup guarantee is observable. ESRCH on an
-            // already-reaped child is benign; anything else means the child
-            // may outlive us.
-            let err = std::io::Error::last_os_error();
-            tracing::warn!(pid, error = %err, "SIGKILL failed in force_kill_child_and_wait");
+    signal_child_pgroup_or_fallback(child, libc::SIGKILL, "force-kill");
+    let _ = child.wait();
+}
+
+/// PRD #92 F8: SIGTERM-then-SIGKILL escalation used by the single-pane
+/// Ctrl+W path. Sends `SIGTERM` to the child's process group, polls
+/// `try_wait` until the child exits or `grace` elapses, then sends
+/// `SIGKILL` as the backstop and reaps the child.
+///
+/// Why this lives separately from [`force_kill_child_and_wait`]: the
+/// daemon-wide `shutdown_all_graceful` path issues SIGTERM to every
+/// agent in parallel and polls them all together, so a per-agent
+/// graceful helper would serialise the grace windows and slow daemon
+/// shutdown to `O(grace × N)`. The single-pane Ctrl+W path closes one
+/// agent at a time, so the simpler per-agent shape is appropriate
+/// here. Both paths share [`signal_child_pgroup_or_fallback`] for the
+/// low-level killpg behaviour.
+///
+/// Why F8 exists at all: pre-F8, Ctrl+W sent SIGKILL directly, which
+/// is uncatchable. Even a well-behaved agent that wanted to clean up
+/// its descendants — Claude Code's internal `setsid`'d sub-shells that
+/// the F5 manual-test pass surfaced — had no opportunity to do so.
+/// The graceful escalation gives the agent a 3-second window during
+/// which a SIGTERM trap can run.
+fn terminate_child_with_grace_and_wait(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    grace: Duration,
+) {
+    // Phase 1: SIGTERM the process group.
+    signal_child_pgroup_or_fallback(child, libc::SIGTERM, "graceful-close-sigterm");
+
+    // Phase 2: poll `try_wait` until the child exits or the grace
+    // elapses. Polling avoids the obvious "sleep for grace then
+    // SIGKILL" alternative — a child that exits promptly after
+    // SIGTERM doesn't have to wait around for the deadline. 50 ms
+    // polling cadence is small enough to feel responsive in the UI
+    // and large enough to keep CPU cost negligible (~60 polls over 3 s).
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(_) => break,
         }
-    } else {
-        // No PID exposed — fall back to portable-pty's signaller.
-        let _ = child.kill();
+        std::thread::sleep(Duration::from_millis(50));
     }
+
+    // Phase 3: SIGKILL backstop. Reaches survivors regardless of
+    // SIGTERM-trapping state.
+    signal_child_pgroup_or_fallback(child, libc::SIGKILL, "graceful-close-sigkill");
     let _ = child.wait();
 }
 
@@ -519,6 +692,12 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     //     pane-id would tag every spawned agent with the wrong pane.
     cmd.env_remove(DOT_AGENT_DECK_VIA_DAEMON);
     cmd.env_remove(DOT_AGENT_DECK_PANE_ID);
+    // PRD #92 F9 followup-7: same scrub-then-overlay rule for the
+    // daemon-injected agent_id. If the daemon itself was launched
+    // from inside another deck pane that already had this set, an
+    // unfiltered inherit would tag every spawned agent with the
+    // parent deck's id and the hook script would misroute events.
+    cmd.env_remove(DOT_AGENT_DECK_AGENT_ID);
     // PRD #93 tuning env var: same scrub rationale — a deck launched
     // with this set would otherwise leak it into every child it spawns,
     // where it's meaningless to the child's environment.
@@ -742,6 +921,22 @@ pub struct RunningAgent {
     /// rationale as `display_name` / `tab_membership` — older clients
     /// that omit the field round-trip as `None`.
     pub agent_type: Option<AgentType>,
+    /// The full env vec passed to [`AgentPtyRegistry::spawn_agent`] at
+    /// the original spawn, captured so
+    /// [`AgentPtyRegistry::respawn_agent_for_pane`] can re-apply it on
+    /// the fresh child. Includes `DOT_AGENT_DECK_PANE_ID` and any extra
+    /// vars the caller (a role config, the orchestration setup) injected;
+    /// without this capture the respawn ran with a leaner env than the
+    /// original and silently dropped role-supplied vars.
+    pub spawn_env: Vec<(String, String)>,
+    /// Last-known PTY size (rows, cols), captured at spawn and
+    /// refreshed by [`AgentPtyRegistry::resize`]. Replayed on respawn
+    /// so the fresh PTY comes up at the same geometry instead of the
+    /// default 24×80 — without this, the new agent's first output
+    /// briefly wraps or truncates until the TUI's next resize call
+    /// lands.
+    pub pty_rows: u16,
+    pub pty_cols: u16,
     /// PRD #93 round-2 reviewer REV-3: set to `true` by the reader thread
     /// once the PTY returns EOF (the child died or was killed). The daemon's
     /// idle monitor consults this via [`AgentPtyRegistry::live_count`] so an
@@ -804,6 +999,31 @@ pub struct AgentRecord {
 /// [`AgentBus`] and [`AttachHandle`].
 pub struct AgentPtyRegistry {
     inner: Mutex<RegistryInner>,
+    /// Per-pane dispatch mutex held by `AppState::handle_delegate`
+    /// across the entire respawn+write window for a `clear = true`
+    /// delegate. Two concurrent connections submitting `Delegate`
+    /// signals to the same worker pane would otherwise race the
+    /// `registry.remove` + `spawn_agent` gap inside
+    /// [`AgentPtyRegistry::respawn_agent_for_pane`]: the second call
+    /// would observe `NotFound` and its prompt would be silently
+    /// dropped. The mutex map is keyed by `pane_id_env` so writes to
+    /// different panes still proceed in parallel; the existing
+    /// per-agent `writer` mutex serializes byte-level writes to one
+    /// PTY, but the respawn's remove+spawn window needs a higher-level
+    /// lock because the agent identity itself rolls over.
+    ///
+    /// Entries are NEVER pruned. The map grows monotonically by every
+    /// `pane_id_env` ever seen, ~64 B/entry, bounded by pane creation
+    /// rate — negligible in practice. Pruning was tried in F9
+    /// followup-2 and reverted in F9 followup-3 because it re-opened
+    /// the F9 followup-1 race: after a close+respawn for the same
+    /// `pane_id_env`, an in-flight dispatcher holds an `Arc<AsyncMutex>`
+    /// that's no longer in the map, so a fresh dispatcher gets a
+    /// *different* `AsyncMutex` instance for the same `pane_id_env`.
+    /// The two dispatchers then don't serialize against each other,
+    /// re-introducing the registry remove+spawn race the lock exists
+    /// to prevent.
+    dispatch_mutexes: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     /// Total number of explicit `KIND_DETACH` frames the daemon has observed
     /// across all attach-stream connections. Plain socket close (implicit
     /// detach) does *not* increment this — only the M2.5 explicit-detach
@@ -820,11 +1040,28 @@ pub struct AgentPtyRegistry {
     /// per-agent pump_reader so the EOF path can notify without holding a
     /// registry lock.
     change_notify: Arc<Notify>,
+    /// PRD #92 F1: latch set the first time the daemon enters its
+    /// `KIND_SHUTDOWN` teardown so a second `KIND_SHUTDOWN` (or a SIGTERM
+    /// landing during shutdown) doesn't re-iterate the agent map or fight
+    /// the original shutdown for ownership of each `Child`. Read by
+    /// [`shutdown_all_graceful`]; a second call returns immediately.
+    shutting_down: AtomicBool,
 }
 
 struct RegistryInner {
     next_id: u64,
     agents: HashMap<String, RunningAgent>,
+}
+
+/// Internal selector for the two public byte-write entrypoints.
+/// `Submit` is the prompt path (payload + `SUBMIT_DELAY` + `\r`);
+/// `Notice` is the visibility path (payload + `\n`, no submit). Kept
+/// private because the public API exposes the two named methods
+/// directly — see [`AgentPtyRegistry::write_to_pane_and_submit`] and
+/// [`AgentPtyRegistry::write_to_pane_notice`].
+enum SubmitMode {
+    Submit,
+    Notice,
 }
 
 impl Default for AgentPtyRegistry {
@@ -840,9 +1077,30 @@ impl AgentPtyRegistry {
                 next_id: 1,
                 agents: HashMap::new(),
             }),
+            dispatch_mutexes: Mutex::new(HashMap::new()),
             detach_count: AtomicU64::new(0),
             change_notify: Arc::new(Notify::new()),
+            shutting_down: AtomicBool::new(false),
         }
+    }
+
+    /// Borrow (or lazily create) the per-pane dispatch mutex for a
+    /// given `pane_id_env`. Callers hold this lock across the entire
+    /// respawn+write window of a `clear = true` delegate so two
+    /// concurrent same-pane delegates can't race the `registry.remove`
+    /// + `spawn_agent` gap inside [`AgentPtyRegistry::respawn_agent_for_pane`].
+    ///
+    /// PRD #92 F9 followup-3: entries are never pruned. The map grows
+    /// by `pane_id_env` ever seen, which is small in practice; pruning
+    /// would re-open the followup-1 race where two dispatchers for the
+    /// same `pane_id_env` across a close+respawn end up holding
+    /// different `AsyncMutex` instances and stop serializing against
+    /// each other.
+    pub fn pane_dispatch_lock(&self, pane_id_env: &str) -> Arc<AsyncMutex<()>> {
+        let mut map = self.dispatch_mutexes.lock().unwrap();
+        map.entry(pane_id_env.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 
     /// PRD #93 round-2 reviewer REV-1: borrow the change-notify the daemon's
@@ -871,6 +1129,19 @@ impl AgentPtyRegistry {
 
     /// Spawn a new agent and return its registry id.
     pub fn spawn_agent(&self, mut opts: SpawnOptions<'_>) -> Result<String, AgentPtyError> {
+        // CodeRabbit MAJOR (PRD #92 PR #105): Guard A — reject the spawn
+        // immediately if the registry has already entered its shutdown
+        // path. `daemon_protocol::handle_attach` already rejects an
+        // in-flight `StartAgent` once the latch flips, but `spawn_agent`
+        // is also reachable from other callers (e.g. respawn, tests),
+        // and the early return keeps every entry point uniform without
+        // having to plumb the check through each one. Guard B below
+        // closes the TOCTOU window between this check and the
+        // `inner.agents.insert` that publishes the new agent.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(AgentPtyError::Spawn("registry is shutting down".into()));
+        }
+
         // Capture the caller-supplied `DOT_AGENT_DECK_PANE_ID` *before*
         // moving `opts` into `spawn`, so the registry retains a copy for
         // M2.x rehydration. The agent's child process gets tagged with
@@ -978,6 +1249,45 @@ impl AgentPtyRegistry {
         // outside the variant set at deserialization.
         let agent_type = opts.agent_type.take();
 
+        // PRD #92 F9 followup-7: pre-allocate the registry id *before*
+        // `spawn` so we can inject `DOT_AGENT_DECK_AGENT_ID = <id>` into
+        // the spawned child's environment. The agent's hook script reads
+        // this env var and attaches the id to each emitted `AgentEvent`
+        // as `agent_id`, which lets the post-respawn dispatch task scope
+        // its `SessionStart` wait to the NEW agent — closing the
+        // stale-OLD-agent race that the followup-6 broadcast filter
+        // (pane_id only) couldn't distinguish.
+        //
+        // Two lock acquisitions (here + the post-spawn insert) are cheap
+        // and uncontended for the common single-spawn path; a failed
+        // spawn or duplicate-pane-id rejection just wastes the
+        // pre-allocated id (`next_id` is monotonic and not required to
+        // be contiguous).
+        //
+        // Caller-supplied `DOT_AGENT_DECK_AGENT_ID` values are stripped
+        // before our injection wins: `respawn_agent_for_pane` replays
+        // the OLD agent's `spawn_env` (which carries its id), and an
+        // untrimmed replay would tag the NEW agent's hooks with the
+        // OLD id — defeating the whole point of the filter.
+        let preallocated_id = {
+            let mut inner = self.inner.lock().unwrap();
+            let id = inner.next_id.to_string();
+            inner.next_id += 1;
+            id
+        };
+        opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
+        opts.env
+            .push((DOT_AGENT_DECK_AGENT_ID.to_string(), preallocated_id.clone()));
+
+        // Capture the full env vec and the requested PTY size BEFORE
+        // `spawn(opts)` consumes the options. Stored on `RunningAgent`
+        // so [`respawn_agent_for_pane`] can re-apply them to the fresh
+        // child instead of resetting to a leaner env and the 24×80
+        // default geometry.
+        let captured_env = opts.env.clone();
+        let captured_rows = opts.rows;
+        let captured_cols = opts.cols;
+
         // Defense in depth: `spawn` already protects the child internally
         // via its own `ChildGuard`, so any failure or panic *inside* spawn
         // cannot orphan the child. This outer `PtyGuard` covers the
@@ -988,9 +1298,25 @@ impl AgentPtyRegistry {
         let guard = PtyGuard::new(spawn(opts)?);
         let mut inner = self.inner.lock().unwrap();
 
+        // CodeRabbit MAJOR (PRD #92 PR #105): Guard B — re-check the
+        // shutdown latch *inside* the inner lock, so the check + insert
+        // are atomic against `shutdown_all_graceful`'s `inner.lock()` +
+        // drain. Without this, the race is:
+        //   T0 daemon_protocol checks is_shutting_down() — false
+        //   T1 shutdown flips the latch and drains `inner.agents`
+        //   T2 spawn_agent reaches the insert below and adds an agent
+        //      the drain already iterated past — orphaned child.
+        // Guard A at the top of `spawn_agent` covers the common case;
+        // this re-check closes the narrow window between Guard A and
+        // the insert. On Err the `guard` Drop kills the child we just
+        // spawned, so the rejection doesn't leak a PTY.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(AgentPtyError::Spawn("registry is shutting down".into()));
+        }
+
         // CodeRabbit MAJOR (PRD #93 round-9): reject the spawn if
         // another live agent already claims this `pane_id_env`.
-        // `write_to_pane` routes by `pane_id_env`, so two agents sharing
+        // `write_to_pane_and_submit` routes by `pane_id_env`, so two agents sharing
         // one id silently misroute every delegate/work-done write to
         // whichever entry `values().find(...)` happened to visit first.
         // The check sits INSIDE the post-spawn lock acquisition so the
@@ -1005,7 +1331,7 @@ impl AgentPtyRegistry {
         // so a dead-but-not-yet-reaped entry would otherwise block
         // reuse of its pane_id_env forever. The same `exited.load`
         // filter is applied across every operational lookup —
-        // `write_to_pane`, `agent_records`, and this dup check —
+        // `write_to_pane_and_submit`, `agent_records`, and this dup check —
         // so the live/dead boundary stays consistent
         // (round-11 reviewer #A). Cleanup paths (`close_agent`,
         // `shutdown_all`) deliberately still touch exited entries.
@@ -1049,11 +1375,18 @@ impl AgentPtyRegistry {
             cwd: cwd_stored,
             tab_membership,
             agent_type,
+            spawn_env: captured_env,
+            pty_rows: captured_rows,
+            pty_cols: captured_cols,
             exited,
         };
 
-        let id = inner.next_id.to_string();
-        inner.next_id += 1;
+        // Use the id we pre-allocated above (before spawn) and injected
+        // as `DOT_AGENT_DECK_AGENT_ID` into the child's env. Keeping
+        // the inserted-into-registry id identical to the env-injected
+        // id is the invariant the agent-id-scoped SessionStart filter
+        // depends on.
+        let id = preallocated_id;
         inner.agents.insert(id.clone(), agent);
         // Signal *after* releasing the lock would be cleaner, but we still
         // hold `inner` here. Notify is cheap and a spurious wake-up is
@@ -1096,7 +1429,50 @@ impl AgentPtyRegistry {
     /// other writer mutexes, so holding for the ~150ms `SUBMIT_DELAY`
     /// affects only the offending pane and the deck dispatches at most
     /// one delegate or work-done per pane at a time in practice.
-    pub async fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), AgentPtyError> {
+    pub async fn write_to_pane_and_submit(
+        &self,
+        pane_id: &str,
+        text: &str,
+    ) -> Result<(), AgentPtyError> {
+        self.write_to_pane_internal(pane_id, text, SubmitMode::Submit)
+            .await
+    }
+
+    /// Writes bytes to the pane's PTY without triggering submission semantics
+    /// (no SUBMIT_DELAY, no CR). Used for visible status notices (e.g., respawn
+    /// failures) that must appear in the orchestrator pane's scrollback but
+    /// should not be processed by the agent's LLM as a user prompt.
+    ///
+    /// The notice is terminated with a single `\n` (LF, NOT CR) — agents
+    /// like claude / codex submit on CR, so LF leaves the bytes as a
+    /// visible-but-unsubmitted line in the pane's scrollback.
+    ///
+    /// KNOWN LIMITATIONS — agent-side behavior the daemon cannot control:
+    /// - If an agent's TUI interprets LF (\n) as Enter, the notice will be
+    ///   submitted as a prompt anyway. Observed safe: TODO(M7.1) — populate
+    ///   after manual test against each supported agent. Observed unsafe:
+    ///   (none confirmed).
+    /// - Subsequent [`AgentPtyRegistry::write_to_pane_and_submit`] calls on
+    ///   the same pane will submit "{notice text}\n{user prompt}" together —
+    ///   the notice bytes accumulate in the agent's stdin line buffer.
+    ///
+    /// Both limitations point to F11 (bus-push status delivery) as the proper
+    /// long-term fix — see `audit/pre-daemon-parity-audit.md`.
+    pub async fn write_to_pane_notice(
+        &self,
+        pane_id: &str,
+        text: &str,
+    ) -> Result<(), AgentPtyError> {
+        self.write_to_pane_internal(pane_id, text, SubmitMode::Notice)
+            .await
+    }
+
+    async fn write_to_pane_internal(
+        &self,
+        pane_id: &str,
+        text: &str,
+        mode: SubmitMode,
+    ) -> Result<(), AgentPtyError> {
         // Resolve writer under the sync lock, then drop the lock before
         // awaiting the async writer mutex — otherwise we'd hold the
         // registry mutex across an `await`, blocking every other registry
@@ -1127,10 +1503,26 @@ impl AgentPtyRegistry {
         w.write_all(&payload)
             .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
         let _ = w.flush();
-        tokio::time::sleep(SUBMIT_DELAY).await;
-        w.write_all(b"\r")
-            .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
-        let _ = w.flush();
+        match mode {
+            SubmitMode::Submit => {
+                tokio::time::sleep(SUBMIT_DELAY).await;
+                w.write_all(b"\r")
+                    .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
+                let _ = w.flush();
+            }
+            SubmitMode::Notice => {
+                // PRD #92 F9 followup-2: terminate the notice on a `\n`
+                // so it forms a visible line in the orchestrator pane's
+                // scrollback without an agent TUI treating it as a
+                // submitted prompt (claude / codex submit on CR).
+                // `encode_pane_payload` strips trailing whitespace so a
+                // caller-provided `\n` would have been swallowed; the
+                // single byte is written here unambiguously.
+                w.write_all(b"\n")
+                    .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
+                let _ = w.flush();
+            }
+        }
         Ok(())
     }
 
@@ -1138,6 +1530,23 @@ impl AgentPtyRegistry {
     /// streaming subscribers will observe their broadcast receiver close
     /// shortly after (once the reader thread sees EOF and drops its bus
     /// reference).
+    ///
+    /// PRD #92 F8: the kill path now uses
+    /// [`terminate_child_with_grace_and_wait`] — SIGTERM with a
+    /// 3-second grace before SIGKILL — so a well-behaved agent can
+    /// trap SIGTERM and clean up its own descendants (e.g. the
+    /// `setsid`'d sub-shells Claude Code creates internally).
+    /// Misbehaving agents are still reaped after the grace window.
+    ///
+    /// PRD #92 F9 followup-3: this path used to prune the
+    /// `dispatch_mutexes` entry for `agent.pane_id_env`. Pruning was
+    /// reverted because it re-opened the followup-1 race: an
+    /// in-flight dispatcher holds an `Arc<AsyncMutex>` already cloned
+    /// out of the map; after the close+respawn a fresh dispatcher
+    /// would `or_insert_with(...)` a *different* `AsyncMutex` for the
+    /// same `pane_id_env`, and the two dispatchers stop serializing.
+    /// The map's monotonic growth is bounded by pane creation rate
+    /// (~64 B/entry) — accepted as negligible.
     pub fn close_agent(&self, id: &str) -> Result<(), AgentPtyError> {
         let mut agent = {
             let mut inner = self.inner.lock().unwrap();
@@ -1146,7 +1555,7 @@ impl AgentPtyRegistry {
                 .remove(id)
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?
         };
-        force_kill_child_and_wait(&mut agent.child);
+        terminate_child_with_grace_and_wait(&mut agent.child, AGENT_TERMINATE_GRACE);
         // Notify the idle monitor so it observes the registry shrink
         // immediately. The pump_reader thread will *also* signal once it
         // sees EOF from the kill, but doing it here makes the
@@ -1154,6 +1563,167 @@ impl AgentPtyRegistry {
         // on the kernel's PTY drain timing.
         self.change_notify.notify_one();
         Ok(())
+    }
+
+    /// Respawn the agent attached to a given `pane_id_env`: gracefully
+    /// terminate the current child, then spawn a fresh one running
+    /// `command` and rebind it to the same `pane_id_env`. Returns the
+    /// new registry id.
+    ///
+    /// PRD #92 F9: the per-role `clear` flag pre-baseline meant "kill
+    /// the worker agent and spawn a fresh one before the next task
+    /// lands so the new task starts with empty context." Pre-PRD-#76
+    /// this was implemented TUI-side via close-then-create on the
+    /// pane controller (see `git show 2fc39c3:src/ui.rs::dispatch_delegate_events`).
+    /// Post-PRD-#93 the daemon owns the PTYs, so the equivalent has
+    /// to happen daemon-side — this method.
+    ///
+    /// Identity-preserving fields on [`RunningAgent`] (`pane_id_env`,
+    /// `display_name`, `cwd`, `tab_membership`, `agent_type`) are
+    /// captured from the existing entry and re-applied to the new
+    /// spawn. The TUI's pane card therefore stays put across the
+    /// respawn: the daemon's `agent_records()` snapshot still lists
+    /// the same `pane_id_env` and `tab_membership`, so a TUI that
+    /// reattaches mid-respawn rebinds to the new agent cleanly.
+    /// Registry ids (`id`) are sequential and DO change — callers
+    /// that key off the old id (e.g. a subscriber holding an
+    /// `AttachHandle`) will see their broadcast receiver close once
+    /// the old child's reader thread reaches EOF; the standard
+    /// reattach path (`subscribe` by `pane_id_env` lookup) brings
+    /// them onto the new agent's bus.
+    ///
+    /// The blocking termination work (up to
+    /// [`AGENT_TERMINATE_GRACE`] of `try_wait` polling, mirroring
+    /// `close_agent`'s contract) runs on a `spawn_blocking` pool task
+    /// so the daemon's async runtime threads stay responsive. Mirrors
+    /// the pattern `daemon_protocol.rs::handle_close_agent` uses for
+    /// the Ctrl+W close path (PRD #92 F8 followup auditor #1).
+    ///
+    /// The new agent comes up at a default 24×80 PTY size; the TUI's
+    /// next `resize` call (sent on attach / render) corrects it to
+    /// the client's actual geometry. Deferring the post-respawn prompt
+    /// write until the freshly-spawned agent signals readiness is the
+    /// caller's responsibility — the daemon doesn't peek into the new
+    /// agent's stdout, so it can't observe "ready" directly here. The
+    /// dispatch path subscribes to the daemon-wide hook broadcast
+    /// before this call and waits for the new agent's `SessionStart`
+    /// event (10 s timeout fallback) — see
+    /// [`crate::state::SESSION_START_WAIT_TIMEOUT`].
+    pub async fn respawn_agent_for_pane(
+        &self,
+        pane_id_env: &str,
+        command: &str,
+    ) -> Result<String, AgentPtyError> {
+        // Step 1: atomically lift the existing entry out of the
+        // registry. Holding the sync lock across the find+remove keeps
+        // a concurrent `write_to_pane_and_submit` from racing in and
+        // writing to a PTY whose child we're about to terminate (the
+        // writer mutex is per-agent so concurrent writes against the
+        // same `pane_id_env` are still serialized, but a write that arrived
+        // BEFORE we removed the entry could already be flushing).
+        //
+        // The `exited` filter is deliberately omitted: a dead-but-not-
+        // yet-reaped agent should also be replaced — its registry
+        // entry is the place the new agent's identity (display_name,
+        // tab_membership, etc.) lives, and `clear = true` on a
+        // crashed agent should still produce a fresh worker.
+        let removed = {
+            let mut inner = self.inner.lock().unwrap();
+            let agent_id = inner
+                .agents
+                .iter()
+                .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env))
+                .map(|(id, _)| id.clone())
+                .ok_or_else(|| AgentPtyError::NotFound(pane_id_env.to_string()))?;
+            inner
+                .agents
+                .remove(&agent_id)
+                .expect("agent_id was just located inside the same lock hold")
+        };
+
+        let RunningAgent {
+            child,
+            master,
+            writer,
+            bus: _,
+            // The `pane_id_env` lives inside `spawn_env` already (the
+            // initial `spawn_agent` call placed it there), so we don't
+            // re-inject it explicitly on respawn — see step 3 below.
+            pane_id_env: _captured_pane_id_env,
+            display_name,
+            cwd,
+            tab_membership,
+            agent_type,
+            spawn_env,
+            pty_rows,
+            pty_cols,
+            exited: _,
+        } = removed;
+
+        // Drop this reference to the writer Arc; the slave half closes
+        // when the last reference is dropped (typically immediately,
+        // unless a concurrent write is in flight against the old
+        // `pane_id_env`). The writer is an `Arc<AsyncMutex<...>>` and
+        // `write_to_pane_internal` clones the Arc before awaiting the
+        // inner lock, so a write that started before the respawn's atomic
+        // remove still holds a clone and delays the slave-close until
+        // it finishes its CR write and drops the clone. The terminate
+        // helper still escalates to SIGKILL if the child hangs on
+        // slave EOF, so a buggy agent is still reaped within the
+        // grace window.
+        drop(writer);
+        drop(master);
+
+        // Step 2: terminate the previous child on the blocking pool.
+        // `terminate_child_with_grace_and_wait` polls `try_wait`
+        // synchronously for up to `AGENT_TERMINATE_GRACE` (3 s); running
+        // that on a tokio worker thread would block other futures on
+        // the same worker. Same shape `daemon_protocol.rs` uses for
+        // `close_agent`.
+        let mut child = child;
+        let join = tokio::task::spawn_blocking(move || {
+            terminate_child_with_grace_and_wait(&mut child, AGENT_TERMINATE_GRACE);
+        })
+        .await;
+        if let Err(join_err) = join {
+            // The spawn_blocking task ran the SIGTERM → poll → SIGKILL
+            // sequence in `terminate_child_with_grace_and_wait`. A
+            // `JoinError` here means the closure panicked or was
+            // cancelled before returning; the SIGKILL backstop inside
+            // the helper only fires if the closure reached that line.
+            // The helper is panic-free in practice (no panic-prone
+            // calls in its body), so this branch is a defensive log —
+            // the child may or may not have been reaped depending on
+            // where the panic landed.
+            tracing::warn!(
+                pane_id = %pane_id_env,
+                error = %join_err,
+                "respawn: spawn_blocking for terminate panicked or was cancelled; \
+                 proceeding with fresh spawn anyway"
+            );
+        }
+
+        // Step 3: spawn a fresh agent with the captured identity.
+        // Replay the full env from the original spawn (including
+        // `DOT_AGENT_DECK_PANE_ID` and any role-supplied extras) and
+        // the last-known PTY size so the fresh child comes up with
+        // the same environment + geometry as its predecessor. Earlier
+        // versions reconstructed a minimal env containing only
+        // `DOT_AGENT_DECK_PANE_ID` and pinned the size to the 24×80
+        // default, silently dropping role-supplied env vars and
+        // briefly mis-wrapping the new agent's first output until the
+        // TUI's next resize landed.
+        let opts = SpawnOptions {
+            command: Some(command),
+            cwd: cwd.as_deref(),
+            display_name: display_name.as_deref(),
+            rows: pty_rows,
+            cols: pty_cols,
+            env: spawn_env,
+            tab_membership,
+            agent_type,
+        };
+        self.spawn_agent(opts)
     }
 
     /// Subscribe to an agent's live output and take its scrollback snapshot
@@ -1186,10 +1756,10 @@ impl AgentPtyRegistry {
         }
         let rows = rows.min(PTY_RESIZE_DIM_MAX);
         let cols = cols.min(PTY_RESIZE_DIM_MAX);
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let agent = inner
             .agents
-            .get(id)
+            .get_mut(id)
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
         agent
             .master
@@ -1199,7 +1769,27 @@ impl AgentPtyRegistry {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| AgentPtyError::Resize(e.to_string()))
+            .map_err(|e| AgentPtyError::Resize(e.to_string()))?;
+        // Refresh the captured size so a subsequent respawn replays
+        // the latest geometry, not the spawn-time default.
+        agent.pty_rows = rows;
+        agent.pty_cols = cols;
+        Ok(())
+    }
+
+    /// Last-known PTY size for the agent attached to `pane_id_env`,
+    /// captured at spawn and refreshed by [`resize`]. Returns `None`
+    /// if no live agent matches the pane id. Used by tests; production
+    /// callers don't need this.
+    pub fn pty_size_for_pane(&self, pane_id_env: &str) -> Option<(u16, u16)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .values()
+            .find(|a| {
+                a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+            })
+            .map(|a| (a.pty_rows, a.pty_cols))
     }
 
     /// Take just the current scrollback snapshot for an agent.
@@ -1336,6 +1926,16 @@ impl AgentPtyRegistry {
             .count()
     }
 
+    /// PRD #92 F1 followup: true once the registry has entered its
+    /// shutdown path (`shutdown_all_graceful` flipped the latch).
+    /// Consulted by `AttachRequest::StartAgent` in `daemon_protocol.rs`
+    /// to refuse new agent spawns while the daemon is tearing down,
+    /// closing the race window between an in-flight `StartAgent` and a
+    /// `KIND_SHUTDOWN` arrival.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
     /// SIGKILL every agent and drain the registry. Idempotent.
     pub fn shutdown_all(&self) {
         let agents: Vec<RunningAgent> = {
@@ -1350,6 +1950,79 @@ impl AgentPtyRegistry {
         // live_count == 0.
         self.change_notify.notify_one();
     }
+
+    /// PRD #92 F1: graceful shutdown of every agent in the registry. Sends
+    /// SIGTERM to each child, waits up to `grace` for them to exit (polling
+    /// `try_wait` so an early exiter isn't penalised by the wall-clock
+    /// deadline), then SIGKILLs anything that's still alive. Idempotent —
+    /// a second call (e.g. from a second `KIND_SHUTDOWN` arriving during
+    /// teardown, or from a SIGTERM-triggered drop path racing the protocol
+    /// handler) returns immediately so we don't fight ourselves for
+    /// ownership of each `Child`.
+    ///
+    /// The Drop impl still calls [`shutdown_all`] for the SIGKILL-without-grace
+    /// path — that path is reached on idle shutdown and test cleanup where
+    /// the grace period is unnecessary. F1's graceful path is invoked
+    /// explicitly via the `KIND_SHUTDOWN` handler.
+    pub fn shutdown_all_graceful(&self, grace: Duration) {
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            // Already shutting down — second-signal idempotency.
+            return;
+        }
+        let mut agents: Vec<RunningAgent> = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.agents.drain().map(|(_, a)| a).collect()
+        };
+
+        // Phase 1: SIGTERM each child's process group. Some shells
+        // (notably the bash/zsh configurations that intercept SIGHUP)
+        // honour SIGTERM as a clean shutdown signal, so this gives the
+        // agent a chance to flush state. We use `killpg` rather than
+        // `kill` so descendants of shell-wrapped commands (the actual
+        // agent plus anything it spawned) get the signal too — see the
+        // PRD #92 F5 rationale on `force_kill_child_and_wait`.
+        //
+        // PRD #92 F8: the killpg logic + `pid_to_pgid` boundary check is
+        // shared with the single-pane Ctrl+W path via
+        // `signal_child_pgroup_or_fallback`, so the two paths can't
+        // drift on what counts as a valid pgid or how a failed killpg
+        // is logged.
+        for agent in &mut agents {
+            signal_child_pgroup_or_fallback(
+                &mut agent.child,
+                libc::SIGTERM,
+                "shutdown-all-graceful-sigterm",
+            );
+        }
+
+        // Phase 2: poll each child's `try_wait` until all have exited or
+        // the grace window elapses. Polling avoids the obvious "sleep for
+        // grace then SIGKILL" alternative — agents that exit promptly
+        // don't have to wait around for the slowest sibling.
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            let all_exited = agents
+                .iter_mut()
+                .all(|a| matches!(a.child.try_wait(), Ok(Some(_))));
+            if all_exited {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Phase 3: SIGKILL any survivor and reap. `force_kill_child_and_wait`
+        // is no-op-safe on an already-exited child (ESRCH is logged-but-
+        // ignored and `wait` returns the cached status), so this loop is
+        // safe to run unconditionally.
+        for mut agent in agents {
+            force_kill_child_and_wait(&mut agent.child);
+        }
+
+        self.change_notify.notify_one();
+    }
 }
 
 impl Drop for AgentPtyRegistry {
@@ -1362,6 +2035,46 @@ impl Drop for AgentPtyRegistry {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // PRD #92 F1 followup (auditor #3) — defensive boundary check on the
+    // `u32` PID → `libc::pid_t` PGID conversion used by the `killpg`
+    // call sites. The pre-followup code did `pid as i32` directly, which
+    // silently wrapped overflowing `u32` values into negative `i32`s
+    // (undefined behavior for `killpg`) and never guarded against
+    // `pgid == 0` (which `killpg(2)` documents as "signal every process
+    // in the *caller's* process group" — for the daemon that would
+    // signal itself plus every attach client). Real-world Linux PIDs
+    // are positive `i32` values, so this is defense-in-depth; the unit
+    // test pins the boundary semantics.
+
+    #[test]
+    fn pid_to_pgid_accepts_positive_normal_pid() {
+        assert_eq!(pid_to_pgid(1), Some(1));
+        assert_eq!(pid_to_pgid(12345), Some(12345));
+    }
+
+    #[test]
+    fn pid_to_pgid_rejects_zero_pid() {
+        // `killpg(0, ...)` would signal the caller's own group — for
+        // the daemon that's a fatal self-target. Must be filtered out.
+        assert_eq!(pid_to_pgid(0), None);
+    }
+
+    #[test]
+    fn pid_to_pgid_accepts_max_i32_pid() {
+        let max = i32::MAX as u32;
+        assert_eq!(pid_to_pgid(max), Some(i32::MAX));
+    }
+
+    #[test]
+    fn pid_to_pgid_rejects_overflowing_u32_pid() {
+        // Anything above i32::MAX would overflow the `as i32` cast in
+        // the pre-followup code into a negative pgid. The guard
+        // converts those to `None` so the kill path falls back to the
+        // single-PID `child.kill()` path.
+        assert_eq!(pid_to_pgid(i32::MAX as u32 + 1), None);
+        assert_eq!(pid_to_pgid(u32::MAX), None);
+    }
 
     // PRD #76 M2.11 fixup 4 — pin the canonical name resolver so the UI
     // helper, the controller's new-pane path, and the rename path all
@@ -1621,8 +2334,8 @@ mod tests {
     #[test]
     fn registry_rejects_duplicate_pane_id_env() {
         // CodeRabbit MAJOR (PRD #93 round-9): two agents must never
-        // share a `pane_id_env`. `write_to_pane` keys off that string,
-        // so a second spawn with the same id would silently misroute
+        // share a `pane_id_env`. `write_to_pane_and_submit` keys off
+        // that string, so a second spawn with the same id would silently misroute
         // every subsequent delegate/work-done write to whichever entry
         // `values().find(...)` happened to hand back first.
         let registry = AgentPtyRegistry::new();
@@ -1741,12 +2454,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_to_pane_skips_exited_agent_and_routes_to_live_reuser() {
+    async fn write_to_pane_and_submit_skips_exited_agent_and_routes_to_live_reuser() {
         // Round-11 reviewer #A: the symmetric guard for the spawn-side
         // exited filter added in round 10. Without filtering on the
-        // WRITE side, `write_to_pane(pane_id_env=X)` could still find
-        // the dead entry first and route delegate/work-done bytes
-        // into a closed PTY whose pump thread already saw EOF.
+        // WRITE side, `write_to_pane_and_submit(pane_id_env=X)` could
+        // still find the dead entry first and route delegate/work-done
+        // bytes into a closed PTY whose pump thread already saw EOF.
         let registry = Arc::new(AgentPtyRegistry::new());
         let _dead = registry
             .spawn_agent(SpawnOptions {
@@ -1787,9 +2500,9 @@ mod tests {
         // live one did receive something. The dead agent's writer
         // would error out anyway, so a misroute would surface as Err.
         registry
-            .write_to_pane("reuse-me", "echo round11-routing-marker")
+            .write_to_pane_and_submit("reuse-me", "echo round11-routing-marker")
             .await
-            .expect("write_to_pane to a live reuser must succeed");
+            .expect("write_to_pane_and_submit to a live reuser must succeed");
 
         // Allow the PTY to echo the input back into scrollback.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -1808,17 +2521,233 @@ mod tests {
         }
         assert!(
             found,
-            "write_to_pane must have landed bytes in the LIVE reuser's scrollback, not the exited entry's"
+            "write_to_pane_and_submit must have landed bytes in the LIVE reuser's scrollback, not the exited entry's"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// `write_to_pane_notice` must skip both the `SUBMIT_DELAY` sleep
+    /// and the trailing CR — the byte sequence an agent TUI treats as
+    /// "Enter". Used by the `handle_delegate`-side spawn-failure
+    /// notice so the orchestrator LLM doesn't process the diagnostic
+    /// as a user prompt.
+    ///
+    /// Timing is the test signal: `write_to_pane_and_submit` waits
+    /// the full `SUBMIT_DELAY` (150 ms) between payload and CR, so
+    /// the call can't return in less than that. `write_to_pane_notice`
+    /// writes payload + `\n` and returns immediately. PTY line
+    /// discipline normalizes CR/LF in the program-visible input
+    /// stream, so we can't distinguish the two writes by what
+    /// `cat -u` echoes back — but the SUBMIT_DELAY gate is
+    /// observable from the caller's wall clock.
+    #[tokio::test]
+    async fn write_to_pane_notice_skips_submit_delay() {
+        let registry = AgentPtyRegistry::new();
+        let _id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "no-submit".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn cat");
+
+        let start = tokio::time::Instant::now();
+        registry
+            .write_to_pane_notice("no-submit", "notice")
+            .await
+            .expect("write_to_pane_notice");
+        let no_submit_elapsed = start.elapsed();
+        assert!(
+            no_submit_elapsed < SUBMIT_DELAY,
+            "write_to_pane_notice must skip the SUBMIT_DELAY sleep; took {no_submit_elapsed:?} \
+             (>= {SUBMIT_DELAY:?})"
+        );
+
+        let start = tokio::time::Instant::now();
+        registry
+            .write_to_pane_and_submit("no-submit", "prompt")
+            .await
+            .expect("write_to_pane_and_submit");
+        let submit_elapsed = start.elapsed();
+        assert!(
+            submit_elapsed >= SUBMIT_DELAY,
+            "write_to_pane_and_submit must wait at least SUBMIT_DELAY before the CR; \
+             took {submit_elapsed:?} (< {SUBMIT_DELAY:?})"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #92 F9 followup-4 (auditor S2): freeze the KNOWN LIMITATION
+    /// documented on `write_to_pane_notice` — that calling notice then
+    /// submit on the same pane leaves the notice bytes uncommitted in
+    /// the agent's stdin, so the next submit's CR submits them fused
+    /// to the new prompt. The contract is doc-only otherwise; this
+    /// test pins the daemon-side half (bytes land in order with only
+    /// `\n` — never `\r` — between them) so a future change that
+    /// accidentally swaps the notice terminator, inserts a separator,
+    /// or "fixes" the accumulation gets caught.
+    ///
+    /// Stub: a raw-mode `cat` (`stty -echo -icanon -icrnl -opost`)
+    /// that pumps stdin bytes verbatim to stdout. With default
+    /// canonical mode, `/bin/cat` would close the canonical line on
+    /// the notice's `\n` and emit two separate echo lines, hiding
+    /// whether the daemon emitted a fusing CR between the writes —
+    /// raw mode strips that line discipline so the assertion is
+    /// unambiguous.
+    ///
+    /// TEST-SIDE LIMITATION: the downstream agent-TUI behavior
+    /// (claude / codex buffering visible input until CR, then
+    /// submitting the entire accumulated buffer as one prompt) lives
+    /// in the agent process, not the daemon — we can't exercise it
+    /// without a real agent. The assertion below pins the two
+    /// daemon-side guarantees that make that downstream accumulation
+    /// possible: notice bytes precede the submit bytes in the PTY
+    /// scrollback, and the bytes between them contain only `\n`
+    /// (no `\r`, so no early submit signal is emitted between them).
+    #[tokio::test]
+    async fn write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between() {
+        let registry = AgentPtyRegistry::new();
+        let _id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("stty -echo -icanon -icrnl -opost min 1 time 0 && exec cat -u"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "accumulate".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn raw-mode cat shell");
+        let agent_id = registry.agent_ids()[0].clone();
+
+        // Give the shell time to apply `stty` and `exec` into cat
+        // before writes hit the slave — otherwise the first bytes
+        // would traverse the default termios (ICANON + ICRNL + OPOST)
+        // and the order/contents of the scrollback would be ambiguous.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        registry
+            .write_to_pane_notice("accumulate", "NOTICE-MARKER")
+            .await
+            .expect("write_to_pane_notice");
+        registry
+            .write_to_pane_and_submit("accumulate", "USER-PROMPT")
+            .await
+            .expect("write_to_pane_and_submit");
+
+        // Master scrollback should contain the exact byte sequence
+        // the daemon wrote: `NOTICE-MARKER\nUSER-PROMPT\r` (raw cat
+        // echoes each input byte verbatim). The substring check is
+        // tolerant of any startup banner the shell emitted before
+        // stty took effect; the ORDER check is what pins the contract.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        let mut last = Vec::new();
+        let mut between_start = 0usize;
+        let mut between_end = 0usize;
+        while tokio::time::Instant::now() < deadline {
+            last = registry.snapshot(&agent_id).unwrap_or_default();
+            let notice_at = last
+                .windows(b"NOTICE-MARKER".len())
+                .position(|w| w == b"NOTICE-MARKER");
+            let prompt_at = last
+                .windows(b"USER-PROMPT".len())
+                .position(|w| w == b"USER-PROMPT");
+            if let (Some(n), Some(p)) = (notice_at, prompt_at)
+                && n < p
+            {
+                between_start = n + b"NOTICE-MARKER".len();
+                between_end = p;
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            found,
+            "scrollback must contain NOTICE-MARKER followed by USER-PROMPT — \
+             proves the daemon delivered notice + submit bytes to the agent's \
+             stdin in order (the prerequisite for the documented accumulation \
+             behavior). Last snapshot: {:?}",
+            String::from_utf8_lossy(&last)
+        );
+
+        // Tighter check: the slice between the end of NOTICE-MARKER and the
+        // start of USER-PROMPT must contain no `\r` byte. Without this, a
+        // regression that swapped `write_to_pane_notice`'s terminator from
+        // `\n` to `\r` would leave both substrings intact and ordered, so
+        // the order check alone would silently pass while the bug existed.
+        let between = &last[between_start..between_end];
+        assert!(
+            !between.contains(&b'\r'),
+            "between NOTICE-MARKER and USER-PROMPT the daemon must only \
+             emit `\\n` (the notice terminator), never `\\r` — a `\\r` here \
+             would be an early submit signal that breaks the accumulation \
+             contract. Bytes between: {:?}",
+            String::from_utf8_lossy(between)
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #92 F9 followup-3: `close_agent` must NOT prune the
+    /// `dispatch_mutexes` entry for the closed agent's `pane_id_env`.
+    /// Pruning was tried in followup-2 and reverted because it
+    /// re-opened the followup-1 race: an in-flight dispatcher holds
+    /// an `Arc<AsyncMutex>` already cloned out of the map, so a fresh
+    /// dispatcher after the close would `or_insert_with` a *different*
+    /// `AsyncMutex` for the same `pane_id_env` and the two would stop
+    /// serializing against each other. This regression test guards
+    /// against a future re-introduction of pruning.
+    #[tokio::test]
+    async fn close_agent_does_not_prune_dispatch_mutex_entry() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "must-not-be-pruned".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn sh");
+        // Populate the dispatch_mutexes entry by borrowing the lock.
+        let arc_before = registry.pane_dispatch_lock("must-not-be-pruned");
+        assert_eq!(
+            registry.dispatch_mutexes.lock().unwrap().len(),
+            1,
+            "lock-borrow must populate dispatch_mutexes"
+        );
+
+        registry.close_agent(&id).expect("close should succeed");
+        assert_eq!(
+            registry.dispatch_mutexes.lock().unwrap().len(),
+            1,
+            "close_agent must NOT prune the dispatch_mutexes entry — \
+             pruning re-opens the followup-1 race where two dispatchers \
+             across a close+respawn end up with different AsyncMutex \
+             instances for the same pane_id_env"
+        );
+
+        // The post-close lookup must return the *same* AsyncMutex
+        // instance the in-flight dispatcher already holds — that's
+        // the whole point of not pruning. Two dispatchers across a
+        // close+respawn must serialize against the same mutex.
+        let arc_after = registry.pane_dispatch_lock("must-not-be-pruned");
+        assert!(
+            Arc::ptr_eq(&arc_before, &arc_after),
+            "post-close pane_dispatch_lock must return the same Arc \
+             so an in-flight dispatcher and a fresh dispatcher hold \
+             the same AsyncMutex instance"
         );
 
         registry.shutdown_all();
     }
 
     #[test]
-    fn registry_write_to_pane_routes_to_correct_agent_by_pane_id() {
+    fn registry_write_to_pane_and_submit_routes_to_correct_agent_by_pane_id() {
         // CodeRabbit MAJOR (PRD #93 round-9) regression guard: with
-        // distinct pane_id_envs, `write_to_pane(pane_id, bytes)` must
-        // land in *that* agent's PTY and not leak into a sibling.
+        // distinct pane_id_envs, `write_to_pane_and_submit(pane_id,
+        // bytes)` must land in *that* agent's PTY and not leak into a sibling.
         // Mirrors the production routing path delegate/work-done uses.
         // We can't easily read PTY bytes from a `/bin/sh` so we
         // confirm structurally: the registry must contain both agents

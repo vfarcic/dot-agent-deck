@@ -45,6 +45,8 @@
 //! | `KIND_DETACH`     | client → server | empty — detach, leave agent   |
 //! | `KIND_STREAM_END` | server → client | optional reason (e.g. lagged) |
 //! | `KIND_EVENT`      | server → client | JSON [`crate::event::BroadcastMsg`] (M2.17/M2.19, after a `SubscribeEvents` request) |
+//! | `KIND_SHUTDOWN`   | client → server | empty — shut the daemon down (PRD #92 F1) |
+//! | `KIND_SHUTDOWN_ACK` | server → client | empty — acknowledges `KIND_SHUTDOWN` before teardown begins (PRD #92 F1 followup) |
 //!
 //! # Per-connection state machine
 //!
@@ -105,6 +107,28 @@ pub const KIND_DETACH: u8 = 0x13;
 /// `AppState` is otherwise disconnected from the daemon's hook ingestion
 /// loop; this frame is the bridge.
 pub const KIND_EVENT: u8 = 0x14;
+/// PRD #92 F1: client → server header-only frame meaning "shut the daemon
+/// down now." Triggered by the **Stop** option in the Ctrl+C dialog. The
+/// daemon validates the frame is header-only (rejects any non-empty
+/// payload — see followup hardening at the handler), sends back a
+/// [`KIND_SHUTDOWN_ACK`] **before** beginning teardown, then iterates
+/// its agent registry, SIGTERMs each child with a short grace before
+/// SIGKILL, then exits. Idempotent on the daemon side
+/// (`AgentPtyRegistry::shutdown_all_graceful` guards via a latch).
+pub const KIND_SHUTDOWN: u8 = 0x15;
+/// PRD #92 F1 followup: server → client header-only frame acknowledging
+/// receipt of a well-formed [`KIND_SHUTDOWN`]. Sent **before** the daemon
+/// begins teardown so the TUI can distinguish "daemon acknowledged"
+/// from "old daemon closed the connection on an unknown frame" — the
+/// original F1 wire used socket-close as the implicit ack, which was
+/// indistinguishable from the upgrade-mismatch case (a daemon predating
+/// `PROTOCOL_VERSION = 2` would close the connection on an unknown
+/// frame kind). With the explicit ack the client treats
+/// EOF-without-ack, an unrecognised frame, and the 1-second timeout
+/// alike as errors, surfaces them via `ui.status_message`, and does
+/// not exit the TUI — the user can retry, Detach, or `pkill` from a
+/// shell.
+pub const KIND_SHUTDOWN_ACK: u8 = 0x16;
 
 /// PRD #76 M2.21: wire-format version for the attach socket. Bump every time
 /// the on-the-wire shape changes in a way an older client/daemon would
@@ -118,7 +142,7 @@ pub const KIND_EVENT: u8 = 0x14;
 /// Additive `#[serde(default, skip_serializing_if = "Option::is_none")]`
 /// fields do NOT require a bump — they're forward-compatible by design. See
 /// the module-level "Protocol versioning" section for the full bump policy.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -446,7 +470,7 @@ pub async fn serve_attach(
     use tokio::sync::RwLock;
     let dummy_count = Arc::new(AtomicUsize::new(0));
     let dummy_state: SharedState = Arc::new(RwLock::new(crate::state::AppState::default()));
-    serve_attach_with_counter(listener, registry, event_tx, dummy_count, dummy_state).await
+    serve_attach_with_counter(listener, registry, event_tx, dummy_count, dummy_state, None).await
 }
 
 /// PRD #93 M1.2 variant of [`serve_attach`] that maintains `client_count`
@@ -463,6 +487,7 @@ pub async fn serve_attach_with_counter(
     event_tx: broadcast::Sender<BroadcastMsg>,
     client_count: Arc<std::sync::atomic::AtomicUsize>,
     state: SharedState,
+    shutdown: Option<Arc<tokio::sync::Notify>>,
 ) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
@@ -482,6 +507,7 @@ pub async fn serve_attach_with_counter(
                 let counter = client_count.clone();
                 let state = state.clone();
                 let notify = change_notify.clone();
+                let shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
                     // so a `handle_connection` task that panics or is dropped
@@ -511,7 +537,9 @@ pub async fn serve_attach_with_counter(
                         counter: counter.clone(),
                         notify: notify.clone(),
                     };
-                    if let Err(e) = handle_connection(stream, registry, event_tx, state).await {
+                    if let Err(e) =
+                        handle_connection(stream, registry, event_tx, state, shutdown).await
+                    {
                         warn!("attach protocol connection error: {e}");
                     }
                 });
@@ -549,7 +577,7 @@ pub async fn run_attach_server_with_counter(
 ) -> io::Result<()> {
     let listener = bind_attach_listener(path)?;
     info!("Attach protocol listening on {}", path.display());
-    serve_attach_with_counter(listener, registry, event_tx, client_count, state).await
+    serve_attach_with_counter(listener, registry, event_tx, client_count, state, None).await
 }
 
 async fn handle_connection(
@@ -557,11 +585,66 @@ async fn handle_connection(
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
     state: SharedState,
+    shutdown: Option<Arc<tokio::sync::Notify>>,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
         None => return Ok(()),
     };
+    // PRD #92 F1: client → server `KIND_SHUTDOWN` is a header-only frame
+    // that means "shut the daemon down now." It comes before any
+    // `KIND_REQ`, so handle it before the usual request-decoding path.
+    //
+    // PRD #92 F1 followup hardening:
+    //   (a) Reject any non-empty payload — `KIND_SHUTDOWN` is contractually
+    //       header-only, and an attacker (or an upgrade-mismatch peer)
+    //       smuggling bytes alongside the kind byte must not be able to
+    //       trigger daemon teardown by mistake. Drop the frame silently
+    //       (close the connection, do not initiate shutdown).
+    //   (b) Send a `KIND_SHUTDOWN_ACK` **before** initiating teardown so
+    //       the client can distinguish "daemon acknowledged" from
+    //       "old daemon closed the connection on an unknown frame."
+    //       Teardown can take ≥3 seconds (SIGTERM grace + SIGKILL), so
+    //       the ack must be on the wire first.
+    if frame.0 == KIND_SHUTDOWN {
+        if !frame.1.is_empty() {
+            warn!(
+                payload_len = frame.1.len(),
+                "KIND_SHUTDOWN rejected — frame is contractually header-only"
+            );
+            return Ok(());
+        }
+        info!("KIND_SHUTDOWN received — sending ack and beginning graceful daemon shutdown");
+        // Ack first: the client's `send_shutdown` waits up to 1s for this
+        // frame and treats absence as a hard error. Writing the ack
+        // before kicking off the registry drain keeps the wire ordering
+        // honest even if the teardown itself takes the full 3-second
+        // SIGTERM grace.
+        if let Err(e) = write_frame(&mut stream, KIND_SHUTDOWN_ACK, &[]).await {
+            warn!(error = %e, "failed to write KIND_SHUTDOWN_ACK before shutdown — proceeding anyway");
+        }
+        // Drop the registry's children with a 3-second grace window for
+        // SIGTERM to take effect; survivors get SIGKILL via the existing
+        // teardown.
+        let registry_for_shutdown = registry.clone();
+        tokio::task::spawn_blocking(move || {
+            registry_for_shutdown.shutdown_all_graceful(Duration::from_secs(3));
+        })
+        .await
+        .ok();
+        if let Some(s) = shutdown {
+            s.notify_one();
+        } else {
+            // `serve_attach` (test/harness path) doesn't pass a shutdown
+            // notify because tests don't run the production hook loop.
+            // The registry was still drained, so the test can assert on
+            // that side effect.
+            warn!(
+                "KIND_SHUTDOWN handled but no daemon-shutdown notify wired (likely a test harness)"
+            );
+        }
+        return Ok(());
+    }
     if frame.0 != KIND_REQ {
         let resp = AttachResponse::err(format!("expected REQ frame, got kind 0x{:02x}", frame.0));
         write_resp(&mut stream, &resp).await?;
@@ -591,6 +674,21 @@ async fn handle_connection(
             tab_membership,
             agent_type,
         } => {
+            // PRD #92 F1 followup hardening: refuse to start a new agent
+            // while the registry's `shutting_down` latch is set. The
+            // latch is flipped at the start of `shutdown_all_graceful`
+            // so a race between an in-flight `StartAgent` and a
+            // `KIND_SHUTDOWN` cannot spawn a new child the teardown is
+            // about to miss. Reply with a clean error rather than
+            // letting the spawn race the drain.
+            if registry.is_shutting_down() {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err("start-agent: daemon is shutting down"),
+                )
+                .await?;
+                return Ok(());
+            }
             // Trust boundary: same OS user, same exec capability — see the
             // `AttachRequest::StartAgent` docs. We forward `command`/`cwd`/
             // `env` to the spawn path verbatim. The only check here is a
@@ -723,14 +821,43 @@ async fn handle_connection(
                 .into_iter()
                 .find(|r| r.id == id)
                 .and_then(|r| r.pane_id_env);
-            match registry.close_agent(&id) {
+            // PRD #92 F8 followup (auditor #1): `close_agent` runs the
+            // synchronous SIGTERM-with-grace loop in
+            // `terminate_child_with_grace_and_wait`, which calls
+            // `std::thread::sleep` for up to 3 s while polling the
+            // child's `try_wait`. Calling that from inside the async
+            // attach-connection task would block a Tokio worker thread
+            // for the duration of the grace window — under load this
+            // can starve other connections. Mirror the
+            // `KIND_SHUTDOWN` handler's pattern: hop the blocking work
+            // onto a `spawn_blocking` pool task, await the
+            // `JoinHandle`, and surface a join error as a failed
+            // close.
+            let registry_for_close = registry.clone();
+            let id_for_close = id.clone();
+            let close_result =
+                tokio::task::spawn_blocking(move || registry_for_close.close_agent(&id_for_close))
+                    .await;
+            let close_outcome: Result<(), String> = match close_result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(join_err) => {
+                    tracing::warn!(
+                        error = %join_err,
+                        agent_id = %id,
+                        "spawn_blocking for close_agent panicked or was cancelled"
+                    );
+                    Err(format!("close_agent task failed: {join_err}"))
+                }
+            };
+            match close_outcome {
                 Ok(()) => {
                     if let Some(pane_id) = pane_id_env {
                         state.write().await.unregister_pane(&pane_id);
                     }
                     write_resp(&mut stream, &AttachResponse::ok()).await?
                 }
-                Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+                Err(msg) => write_resp(&mut stream, &AttachResponse::err(msg)).await?,
             }
         }
         AttachRequest::SetAgentLabel {
@@ -1431,6 +1558,7 @@ mod tests {
             user_prompt: Some("fix the login bug".into()),
             metadata: HashMap::new(),
             pane_id: Some("7".into()),
+            agent_id: None,
         };
         let payload = serde_json::to_vec(&BroadcastMsg::Event(event)).unwrap();
 
@@ -1571,7 +1699,7 @@ mod tests {
         let state: SharedState =
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let server_task = tokio::spawn(async move {
-            handle_connection(server, registry, event_tx, state)
+            handle_connection(server, registry, event_tx, state, None)
                 .await
                 .unwrap();
         });
@@ -1615,7 +1743,7 @@ mod tests {
         let state: SharedState =
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let server_task = tokio::spawn(async move {
-            handle_connection(server, registry, event_tx, state)
+            handle_connection(server, registry, event_tx, state, None)
                 .await
                 .unwrap();
         });

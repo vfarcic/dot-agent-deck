@@ -700,7 +700,7 @@ async fn hydrate_drops_control_char_pane_id_env_at_capture() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_pane_id_env_is_rejected_at_spawn_time() {
     // CodeRabbit MAJOR (PRD #93 round-9): two agents must never share a
-    // `pane_id_env`. `write_to_pane` keys off that string when routing
+    // `pane_id_env`. `write_to_pane_and_submit` keys off that string when routing
     // delegate/work-done writes, so a second spawn with the same id
     // would silently misroute every write to whichever `values().find`
     // entry the HashMap iterator happened to visit first.
