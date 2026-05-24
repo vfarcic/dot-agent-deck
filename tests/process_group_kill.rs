@@ -153,8 +153,13 @@ async fn close_pane_reaps_shell_descendants() {
 
     // Wait for the shell to write the descendant pid into the relay file.
     // The shell does `echo $!` after backgrounding `sleep 30`, so the
-    // file appears within a few PTY tick cycles. 3s is generous.
-    let pid_file_ready = wait_for(Duration::from_secs(3), Duration::from_millis(20), || {
+    // file appears within a few PTY tick cycles. The earlier 3 s budget
+    // proved insufficient on loaded CI runners (PRD #92 PR #105 — CI
+    // hit the 'shell never wrote pid' branch repeatedly even though
+    // the shell was fine). The shell + descendant otherwise live for
+    // `sleep 30` so a 10 s ceiling is still well under the natural
+    // lifetime and well over any realistic shell-startup cost.
+    let pid_file_ready = wait_for(Duration::from_secs(10), Duration::from_millis(20), || {
         pid_file.exists()
             && std::fs::metadata(&pid_file)
                 .map(|m| m.len() > 0)
@@ -359,14 +364,27 @@ async fn close_pane_uncooperative_agent_killed_after_grace() {
     // the subshell ignores SIGTERM too, `killpg(SIGTERM)` cannot
     // terminate either process. Only the daemon's SIGKILL backstop
     // (delivered after AGENT_TERMINATE_GRACE) can reap them.
+    //
+    // PRD #92 PR #105 followup: write a `ready` sentinel **after**
+    // the parent shell's `trap '' TERM` runs, so the test can wait
+    // for trap-installation before triggering the close. Without
+    // this gate, close-pane could race shell startup — landing
+    // before `trap` had run — and SIGTERM would kill the shell at
+    // its (still-default) handler instead of being ignored. The
+    // sibling test `close_pane_well_behaved_agent_runs_sigterm_trap`
+    // uses the same ready-sentinel shape for the same reason.
+    let sentinel_dir = tempfile::tempdir().unwrap();
+    let ready_path = sentinel_dir.path().join("ready.flag");
+    let cmd = format!(
+        "trap '' TERM; echo ready > {} ; (trap '' TERM; sleep 60) & wait",
+        ready_path.display(),
+    );
+    let cmd_for_pane = cmd.clone();
     let pane_id = {
         let ctrl = ctrl.clone();
-        tokio::task::spawn_blocking(move || {
-            ctrl.create_pane(Some("trap '' TERM; (trap '' TERM; sleep 60) & wait"), None)
-                .unwrap()
-        })
-        .await
-        .unwrap()
+        tokio::task::spawn_blocking(move || ctrl.create_pane(Some(&cmd_for_pane), None).unwrap())
+            .await
+            .unwrap()
     };
 
     // Capture the daemon-registered (shell) PID via the registry.
@@ -376,6 +394,25 @@ async fn close_pane_uncooperative_agent_killed_after_grace() {
         .registry
         .child_pid(&agent_ids[0])
         .expect("daemon-side child should expose a pid") as i32;
+
+    // Wait for the `ready` sentinel — proves the parent shell's
+    // `trap '' TERM` has actually been installed. Without this gate
+    // the close below can land during shell startup (before the
+    // trap runs), SIGTERM kills the shell at its default handler,
+    // and the close returns in tens of milliseconds — failing the
+    // ≥ 2.8 s lower bound for the wrong reason.
+    let ready_appeared = wait_for(Duration::from_secs(10), Duration::from_millis(20), || {
+        ready_path.exists()
+            && std::fs::metadata(&ready_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        ready_appeared,
+        "shell never wrote the 'ready' sentinel at {} — trap may not be installed; aborting before close to avoid a false-negative pass",
+        ready_path.display()
+    );
 
     // Sanity-check the shell is alive before the close.
     assert!(
