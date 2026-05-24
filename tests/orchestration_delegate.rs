@@ -936,7 +936,7 @@ async fn write_to_pane_emits_submit_cr_after_single_line_prompt() {
 
     daemon
         .pty_registry
-        .write_to_pane("coder-pane", "hello world")
+        .write_to_pane("coder-pane", "hello world", true)
         .await
         .expect("write_to_pane should succeed for a known pane");
 
@@ -984,7 +984,7 @@ async fn write_to_pane_wraps_multiline_in_bracketed_paste() {
 
     daemon
         .pty_registry
-        .write_to_pane("coder-pane", "line1\nline2\nline3")
+        .write_to_pane("coder-pane", "line1\nline2\nline3", true)
         .await
         .expect("write_to_pane should succeed for a known pane");
 
@@ -1053,13 +1053,13 @@ async fn write_to_pane_serializes_concurrent_writes_per_pane() {
     let payload_b_for_task = payload_b.clone();
     let write_a = tokio::spawn(async move {
         registry_a
-            .write_to_pane("coder-pane", &payload_a_for_task)
+            .write_to_pane("coder-pane", &payload_a_for_task, true)
             .await
             .expect("write A");
     });
     let write_b = tokio::spawn(async move {
         registry_b
-            .write_to_pane("coder-pane", &payload_b_for_task)
+            .write_to_pane("coder-pane", &payload_b_for_task, true)
             .await
             .expect("write B");
     });
@@ -1156,8 +1156,10 @@ async fn write_to_pane_concurrent_writes_to_different_panes_run_in_parallel() {
     let registry_a = daemon.pty_registry.clone();
     let registry_b = daemon.pty_registry.clone();
     let start = std::time::Instant::now();
-    let write_a = tokio::spawn(async move { registry_a.write_to_pane("orch-pane", "alpha").await });
-    let write_b = tokio::spawn(async move { registry_b.write_to_pane("coder-pane", "beta").await });
+    let write_a =
+        tokio::spawn(async move { registry_a.write_to_pane("orch-pane", "alpha", true).await });
+    let write_b =
+        tokio::spawn(async move { registry_b.write_to_pane("coder-pane", "beta", true).await });
     let (a, b) = tokio::join!(write_a, write_b);
     a.unwrap().expect("write to orch-pane");
     b.unwrap().expect("write to coder-pane");
@@ -1341,15 +1343,15 @@ command = "cat -u"
     // has definitively reaped the old child by the time the respawn
     // returns.
     //
-    // PRD #92 F9 followup #6: theoretical PID-reuse race. After
-    // `wait()` reaps the old PID, the kernel could in principle
-    // reassign that integer to an unrelated process before
-    // `pid_is_alive` polls it, in which case the assertion would
-    // observe "alive" and the test would falsely fail. Stable in
-    // practice — the test machine's PID space rolls slowly enough
-    // that reuse within the same test tick is improbable — but if
-    // this ever flakes, switch to capturing the exit status via a
-    // child-tracking test hook rather than `kill(pid, 0)`.
+    // Theoretical PID-reuse race. After `wait()` reaps the old PID,
+    // the kernel could in principle reassign that integer to an
+    // unrelated process before `pid_is_alive` polls it, in which case
+    // the assertion would observe "alive" and the test would falsely
+    // fail. Stable in practice — the test machine's PID space rolls
+    // slowly enough that reuse within the same test tick is
+    // improbable — but if this ever flakes, switch to capturing the
+    // exit status via a child-tracking test hook rather than
+    // `kill(pid, 0)`.
     assert!(
         !pid_is_alive(pid_initial),
         "old child pid {pid_initial} is still alive after respawn — \
@@ -1536,15 +1538,15 @@ clear = false
 /// refactors that would key the bus off `pane_id_env` (which the
 /// respawn preserves) instead of the agent process itself.
 ///
-/// PRD #92 F9 followup #7: renamed from
-/// `delegate_respawn_clears_agent_scrollback_when_role_clear_is_true`.
-/// The old name implied this test proved an LLM's conversation
-/// history clears across `clear = true`, which it does NOT — the
-/// `cat -u` stub has no concept of context, and real LLM agents
-/// (claude with `--continue`, opencode with session autoload) may
-/// reload their previous session on startup, defeating the
-/// agent-process-reset semantics of `clear = true`. The audit doc
-/// covers that limitation; this test is purely the bus-rotation
+/// The previous name of this test
+/// (`delegate_respawn_clears_agent_scrollback_when_role_clear_is_true`)
+/// implied it proved an LLM's conversation history clears across
+/// `clear = true`, which it does NOT — the `cat -u` stub has no
+/// concept of context, and real LLM agents (claude with `--continue`,
+/// opencode with session autoload) may reload their previous session
+/// on startup, defeating the agent-process-reset semantics of
+/// `clear = true`. The audit doc covers that limitation; this test
+/// is purely the bus-rotation
 /// invariant.
 #[tokio::test]
 async fn delegate_respawn_rotates_agent_bus_when_role_clear_is_true() {
@@ -1588,7 +1590,7 @@ command = "cat -u"
     // `cat -u` echoes it back, so it lands in the bus history.
     daemon
         .pty_registry
-        .write_to_pane("coder-pane", "PRE_RESPAWN_SCROLLBACK_MARKER")
+        .write_to_pane("coder-pane", "PRE_RESPAWN_SCROLLBACK_MARKER", true)
         .await
         .expect("seed write should succeed");
     let _ = wait_for_in_snapshot(
@@ -1653,7 +1655,7 @@ command = "cat -u"
     );
 }
 
-/// PRD #92 F9 followup #1: two concurrent `clear = true` delegate
+/// Two concurrent `clear = true` delegate
 /// signals targeting the same worker pane must both reach the
 /// worker. Pre-fix, the hook loop spawned a fresh tokio task per
 /// accepted connection and `handle_delegate` only took
@@ -1747,7 +1749,10 @@ command = "cat -u"
     // respawn rolls the PID, the second respawn rolls it again. We
     // assert by waiting for the PID to differ from `pid_initial`
     // AND from the next observed value — i.e. two distinct rolls.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // Per-roll budget: 30 s each. The actual respawn (terminate
+    // grace + spawn) is sub-second on a healthy dev box; the wider
+    // budget absorbs CI overload without flaking.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut pid_after_first: u32 = 0;
     while tokio::time::Instant::now() < deadline {
         if let Some(id) = agent_id_for_pane(&daemon.pty_registry, "coder-pane")
@@ -1764,7 +1769,7 @@ command = "cat -u"
         "first respawn never rolled the coder pid past {pid_initial}"
     );
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut pid_after_second: u32 = 0;
     while tokio::time::Instant::now() < deadline {
         if let Some(id) = agent_id_for_pane(&daemon.pty_registry, "coder-pane")
@@ -1811,7 +1816,7 @@ command = "cat -u"
     .await;
 }
 
-/// PRD #92 F9 followup #2: when a `clear = true` respawn fails
+/// When a `clear = true` respawn fails
 /// AFTER the terminate phase already disposed of the previous
 /// child (the most-likely cause: a role config whose `command`
 /// no longer resolves), the operator must see a visible error in
@@ -1898,7 +1903,200 @@ command = "/nonexistent/dot-agent-deck-test-bin-12345"
     );
 }
 
-/// PRD #92 F9 followup #3: a `clear = true` respawn must preserve
+/// A single delegate that fans out to N workers must respawn them
+/// concurrently, not sequentially. Pre-F9-followup-2, the per-target
+/// loop in `handle_delegate` was `.await`-sequential — an N-worker
+/// fan-out paid `(respawn + RESPAWN_READY_DELAY) × N` wall-clock. The
+/// fix replaces the loop with `futures::future::join_all` over
+/// per-pane futures so different panes' respawn+wait windows overlap.
+/// Per-pane work still serializes against itself via the per-pane
+/// dispatch mutex (see `concurrent_clear_true_delegates_both_reach_worker`).
+///
+/// The wall-clock signal is end-to-end "time until the prompt
+/// landed in every worker's new bus" rather than just "PID rolled":
+/// the PID rolls before the 250ms `RESPAWN_READY_DELAY` sleep, so a
+/// PID-roll race below ~30ms is too noisy to bound usefully on a
+/// fast machine. Each worker's full per-pane cost is therefore
+/// `respawn + RESPAWN_READY_DELAY (~250ms) + prompt write`, and a
+/// 3-pane sequential dispatch would pay ~750ms+ while concurrent
+/// dispatch completes in roughly one pane's worth of that. We
+/// measure the 1-pane baseline first to set the upper bound;
+/// concurrent 3-pane must finish within 1.5 × baseline. A
+/// sequential regression (3 × baseline) is well outside that bound.
+#[tokio::test]
+async fn concurrent_fan_out_respawns_overlap_across_panes() {
+    let daemon = spawn_daemon().await;
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+    let config_toml = r#"
+[[orchestrations]]
+name = "tdd-cycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat -u"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "cat -u"
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "cat -u"
+
+[[orchestrations.roles]]
+name = "auditor"
+command = "cat -u"
+"#;
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    let _orch_agent_id = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "orchestrator",
+        true,
+        0,
+        "orch-pane",
+        &cwd,
+    )
+    .await;
+
+    // Helper: wait until the agent currently bound to `pane` has the
+    // worker-task one-liner in its bus snapshot, then return the
+    // elapsed time. Resolves the agent id post-respawn (the registry
+    // id rolls; pane_id_env is stable) so we observe the *new*
+    // agent's bus, not the dead one's.
+    async fn snapshot_contains_prompt(
+        registry: Arc<AgentPtyRegistry>,
+        pane: &'static str,
+        from: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Option<Duration> {
+        let deadline = from + timeout;
+        let needle = b"Read .dot-agent-deck/worker-task-";
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            if let Some(id) = agent_id_for_pane(&registry, pane)
+                && let Ok(snap) = registry.snapshot(&id)
+                && snap.windows(needle.len()).any(|w| w == needle)
+            {
+                return Some(from.elapsed());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    // Baseline: single-worker delegate. Spawn one worker, fire one
+    // delegate, time until the post-respawn prompt is visible.
+    let _coder_initial =
+        start_role_pane(&daemon, "tdd-cycle", "coder", false, 1, "coder-pane", &cwd).await;
+
+    let single_start = tokio::time::Instant::now();
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "baseline".into(),
+            to: vec!["coder".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+    let single_elapsed = snapshot_contains_prompt(
+        daemon.pty_registry.clone(),
+        "coder-pane",
+        single_start,
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("baseline single-pane respawn never produced a visible prompt");
+
+    // Spawn the other two role panes for the 3-way fan-out.
+    let _reviewer_initial = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "reviewer",
+        false,
+        2,
+        "reviewer-pane",
+        &cwd,
+    )
+    .await;
+    let _auditor_initial = start_role_pane(
+        &daemon,
+        "tdd-cycle",
+        "auditor",
+        false,
+        3,
+        "auditor-pane",
+        &cwd,
+    )
+    .await;
+
+    // Wait until each worker's bus is back to a quiet steady-state
+    // (no in-flight respawn) before timing the fan-out. The baseline
+    // delegate above already finished — its prompt is visible — but
+    // we still want a clean t=0 reference for the fan-out.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Fan-out: one delegate targeting all three roles.
+    let fanout_start = tokio::time::Instant::now();
+    send_delegate(
+        &daemon.hook_path,
+        &DelegateSignal {
+            pane_id: "orch-pane".into(),
+            task: "fanout".into(),
+            to: vec!["coder".into(), "reviewer".into(), "auditor".into()],
+            timestamp: Utc::now(),
+        },
+    )
+    .await;
+
+    // Wait for the prompt to land in all three workers' new buses
+    // concurrently. `join_all` over the per-pane waits matches the
+    // dispatch shape under test: all three completion times are
+    // observed in parallel, so the longest one dominates.
+    let panes: [&'static str; 3] = ["coder-pane", "reviewer-pane", "auditor-pane"];
+    let waits = panes.iter().map(|pane| {
+        snapshot_contains_prompt(
+            daemon.pty_registry.clone(),
+            pane,
+            fanout_start,
+            Duration::from_secs(15),
+        )
+    });
+    let elapsed_per_pane: Vec<Option<Duration>> = futures::future::join_all(waits).await;
+    let fanout_elapsed = fanout_start.elapsed();
+    for (pane, el) in panes.iter().zip(elapsed_per_pane.iter()) {
+        assert!(
+            el.is_some(),
+            "fan-out: {pane} prompt never became visible within {fanout_elapsed:?}"
+        );
+    }
+
+    // Concurrent 3-pane fan-out completes in ~1 × the single-pane
+    // baseline (each pane's RESPAWN_READY_DELAY + write overlaps).
+    // Sequential 3-pane would be ~3 × baseline. 1.5 × is a tight
+    // bound that catches a regression to sequential dispatch while
+    // tolerating some CI scheduling jitter.
+    let upper_bound = single_elapsed.mul_f32(1.5);
+    assert!(
+        fanout_elapsed < upper_bound,
+        "fan-out wall-clock {fanout_elapsed:?} >= 1.5 × single-pane baseline \
+         {single_elapsed:?} (upper bound {upper_bound:?}) — \
+         per-target loop reverted to sequential dispatch?"
+    );
+}
+
+/// A `clear = true` respawn must preserve
 /// the full env vec that was passed to the original `spawn_agent`,
 /// not just `DOT_AGENT_DECK_PANE_ID`. Without the capture, any
 /// role-supplied extra env var (or anything the orchestrator
@@ -2035,7 +2233,7 @@ command = "{role_command}"
     );
 }
 
-/// PRD #92 F9 followup #4: a `clear = true` respawn must replay
+/// A `clear = true` respawn must replay
 /// the last-known PTY size, not reset to the 24×80 default.
 /// Without the capture, the new agent's first output briefly
 /// wrapped or truncated until the TUI's next resize call landed.
@@ -2124,7 +2322,7 @@ command = "cat -u"
     );
 }
 
-/// PRD #92 F9 followup #5: when the role config lookup returns
+/// When the role config lookup returns
 /// None for a `clear = true` delegate target (typically because
 /// the user edited `.dot-agent-deck.toml` mid-orchestration and
 /// the role name diverged), the operator's intended respawn is
