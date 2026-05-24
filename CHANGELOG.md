@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.26.0] - 2026-05-24
+
+### Added
+
+- **Orchestration — generally available**
+  Multi-agent orchestration pipelines are now fully supported and documented. Define an `[[orchestrations]]` block in `.dot-agent-deck.toml` with a set of `[[orchestrations.roles]]` — one with `start = true` as the orchestrator, the rest as workers (coder, reviewer, auditor, release, or any roles that fit your project). Press `Ctrl+n`, navigate to the project directory, and cycle the **Mode** field to the orchestration name to open a dedicated tab with a pane for every role.
+  The orchestrator coordinates the pipeline: it reads a task, delegates work to worker roles, waits for results, and chains the next step. Workers run independently in their own panes and report back when done. Parallel delegation is supported — the orchestrator can send work to multiple roles at the same time.
+  A built-in role library (coder, reviewer, auditor, tester, documenter, release, researcher) gives sensible starting-point prompts. Generate a project-tailored config in one step with `Ctrl+d` → `g` on the dashboard. The generated config is a starting point — edit roles, prompts, and models freely.
+  See [Orchestration](https://devopstoolkit.ai/docs/ui/orchestration) for the full reference.
+
+
+
 ## [0.25.2] - 2026-05-24
 
 ### Fixed
@@ -7,8 +19,6 @@
 - **Orchestration Tab Name Now Reflects User Input**
   Typing a custom name in the new-pane form when launching an orchestration now correctly appears as the tab title. Previously the tab always showed the name from the TOML config (or the working-directory basename fallback), silently discarding whatever was typed in the Name field.
   Leaving the Name field empty continues to use the config name, with the existing cwd-basename fallback for unnamed orchestrations.
-
-
 
 ## [0.25.1] - 2026-05-24
 
