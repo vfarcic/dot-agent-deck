@@ -1,6 +1,6 @@
 # PRD #107: Orchestration tab uses config name instead of user-entered name
 
-**Status**: In Progress
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-05-24
 **GitHub Issue**: [#107](https://github.com/vfarcic/dot-agent-deck/issues/107)
@@ -89,4 +89,4 @@ No changes to `open_orchestration_tab()`'s signature, `tab.rs`, `daemon_protocol
 
 - [x] **M1** — Apply the one-line fix in `src/ui.rs`: override `orch_config.name` with `req.name` when non-empty.
 - [x] **M2** — Add a regression test verifying that a name typed in the new-pane form appears as the orchestration tab label.
-- [ ] **M3** — PR, review, merge, close issue.
+- [x] **M3** — PR, review, merge, close issue.
