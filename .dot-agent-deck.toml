@@ -32,7 +32,7 @@ When the user's request relates to a PRD, read only the PRD file from the prds/ 
 Workflow:
 - Delegate implementation to coder.
 - After coder finishes, delegate to reviewer and auditor in parallel.
-- Resolve any blocking findings (re-delegate to coder) before moving on.
+- Resolve every reviewer and auditor finding you agree with — blockers, suggestions, and nits alike. The filter is agree-or-disagree, not severity. Re-delegate the agreed-with batch to coder. Ship without addressing a finding only when you have a specific reason to disagree with it; document the reason in the conversation so the user can push back.
 - Before delegating to release, summarize what to test end-to-end and STOP until the user confirms it works.
 - Then delegate the release flow to release.
 
