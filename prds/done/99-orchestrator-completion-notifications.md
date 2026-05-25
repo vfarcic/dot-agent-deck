@@ -1,10 +1,12 @@
 # PRD #99: Orchestrator Completion Notifications (Pluggable Channels)
 
-**Status**: Planning
+**Status**: Superseded by [#126](https://github.com/vfarcic/dot-agent-deck/issues/126) (closed 2026-05-25, never implemented)
 **Priority**: Medium
 **Created**: 2026-05-21
 **GitHub Issue**: [#99](https://github.com/vfarcic/dot-agent-deck/issues/99)
 **Related**: PRD #8 (terminal bell — local, per-session), PRD #58 / #82 (multi-role orchestration), PRD #78 (tab-level status indicators)
+
+> **Supersession note (2026-05-25)**: This PRD's pluggable-channels-in-deck design was reviewed and replaced. The new architecture (see [#126](https://github.com/vfarcic/dot-agent-deck/issues/126)) delegates notification delivery to agents via their own MCPs/CLIs (Slack MCP, ntfy, `osascript`, etc.) rather than implementing channels inside the deck. Only one minimal local desktop channel survives — for events with no agent to delegate to (scheduler-side failures, agent crashes). Inactivity nudges fire via prompt injection, not via a deck-side sending path. The "exactly-once orchestrator lifecycle hook" emission point is also dropped — the orchestrator role prompt carries the notification hint instead. None of the work below was started.
 
 ## Problem Statement
 
