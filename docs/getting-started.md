@@ -65,7 +65,7 @@ About 30 seconds after both the TUI and every managed agent are gone, the daemon
 1. Launch the dashboard with `dot-agent-deck`
 2. Press `Ctrl+n` to open a new pane — pick a directory, give the pane a name, and enter the command to run (typically `claude` or `opencode`)
 3. Watch the agent's status, tool calls, and prompts update on the dashboard in real-time
-4. To type into an agent, move keyboard focus into its pane: press `Ctrl+d` to enter command mode, then `1`–`9` to jump to that card's pane
+4. To type into an agent, move keyboard focus into its pane: press `Ctrl+d` to enter command mode, then either `j`/`k` (or `Down`/`Up`) to cycle through cards or `1`–`9` to jump directly to a card
 5. To close the pane you're currently working in, press `Ctrl+w` — it closes the selected card and its pane, even while you're still typing in it. The dashboard tab itself can't be closed.
 
 > **Tip:** The command can be any shell command, but real-time status, tool, and prompt tracking on the dashboard only work for `claude` and `opencode` (the agents Agent Deck installs hooks for).

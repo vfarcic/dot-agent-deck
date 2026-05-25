@@ -47,6 +47,8 @@ These shortcuts work in **command mode**. If you're typing in an agent pane, pre
 
 | Key | Action |
 |---|---|
+| `j` / `Down` | Select next card (wraps at end) |
+| `k` / `Up` | Select previous card (wraps at start) |
 | `1`–`9` | Jump to card N and focus its pane |
 | `/` | Filter sessions (opens filter input — see [Dialogs](#dialogs)) |
 | `r` | Rename selected session (opens rename input — see [Dialogs](#dialogs)) |
@@ -54,8 +56,6 @@ These shortcuts work in **command mode**. If you're typing in an agent pane, pre
 | `?` | Toggle help overlay |
 | `y` / `n` | Approve / deny a pending permission request (only when an agent is waiting) |
 | `Esc` | Clear active filter |
-
-> **Note:** `j`/`k` and `Up`/`Down` for cycling selection through cards are documented in the in-app help but are currently not working — see [#68](https://github.com/vfarcic/dot-agent-deck/issues/68). Use `1`–`9` to jump directly to a card.
 
 ## Directory Picker
 

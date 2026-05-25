@@ -2184,6 +2184,51 @@ fn focus_deck(
     true
 }
 
+/// PRD #68: mirror a selection move made by `handle_normal_key`
+/// (j/k/Up/Down) into the embedded controller's focus. The per-frame
+/// "sync `ui.selected_index` ← focused pane" block at the top of the
+/// outer event loop would otherwise roll the move back on the next
+/// iteration. The digit-jump path (`Ctrl+d` → `1`-`9`) already pairs
+/// selection with focus via [`focus_deck`]; this helper is its
+/// counterpart for the cycling keys. No-op when the index didn't
+/// change or the new selection lacks a `pane_id`.
+fn mirror_selection_into_focus(
+    prev_selected_index: usize,
+    ui: &UiState,
+    filtered: &[(&String, &SessionState)],
+    pane: &dyn PaneController,
+) {
+    if ui.selected_index != prev_selected_index
+        && let Some((_, session)) = filtered.get(ui.selected_index)
+        && let Some(pane_id) = session.pane_id.as_ref()
+    {
+        let _ = pane.focus_pane(pane_id);
+    }
+}
+
+/// PRD #68 / PR #123 Greptile follow-up: one full Normal-mode key
+/// dispatch — `handle_normal_key` plus the focus-mirror that makes
+/// j/k/Up/Down actually land. `run_tui`'s `UiMode::Normal` arm and
+/// `jk_navigation_mirrors_selection_into_focus` both call this
+/// helper, so the test exercises the exact production path; deleting
+/// the mirror line from this function would fail the test instead of
+/// silently regressing the feature. Inlining either step back into
+/// `run_tui` would defeat that — keep the call site in `run_tui` a
+/// one-liner to this helper.
+fn dispatch_normal_mode_key(
+    key: KeyEvent,
+    ui: &mut UiState,
+    total: usize,
+    selected_status: Option<SessionStatus>,
+    filtered: &[(&String, &SessionState)],
+    pane: &dyn PaneController,
+) -> KeyResult {
+    let prev_selected_index = ui.selected_index;
+    let result = handle_normal_key(key, ui, total, selected_status);
+    mirror_selection_into_focus(prev_selected_index, ui, filtered, pane);
+    result
+}
+
 fn handle_normal_key(
     key: KeyEvent,
     ui: &mut UiState,
@@ -4538,7 +4583,14 @@ pub fn run_tui(
                             .as_ref()
                             .and_then(|sid| snapshot.sessions.get(sid))
                             .map(|session| session.status.clone());
-                        handle_normal_key(key, &mut ui, total, selected_status)
+                        dispatch_normal_mode_key(
+                            key,
+                            &mut ui,
+                            total,
+                            selected_status,
+                            &filtered,
+                            &*pane,
+                        )
                     }
                     UiMode::Filter => handle_filter_key(key, &mut ui),
                     UiMode::Help => handle_help_key(key, &mut ui),
@@ -6357,6 +6409,8 @@ fn render_help_overlay(frame: &mut Frame, active_mode_name: Option<&str>, palett
         Line::from(""),
         Line::styled("  Dashboard (command mode)", cyan),
         Line::from(""),
+        Line::from("  j / Down        Select next card"),
+        Line::from("  k / Up          Select previous card"),
         Line::from("  1-9             Jump to pane N"),
         Line::from("  Enter           Focus selected pane"),
         Line::from("  /               Filter sessions"),
@@ -10030,6 +10084,258 @@ mod tests {
             None,
         );
         assert!(matches!(result_y_no_status, KeyResult::Continue));
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #68 — dashboard card navigation (j/k/Up/Down)
+    //
+    // Two layers are pinned here:
+    //
+    // 1. `handle_normal_key` updates `ui.selected_index` with wrap-around
+    //    for j/k/Up/Down. This is the documented contract of the key
+    //    handler (help overlay + docs/keyboard-shortcuts.md).
+    //
+    // 2. `focus_deck` (the Ctrl+d → 1-9 path) still flips the embedded
+    //    controller's focus AND `ui.selected_index` — this is the
+    //    risk-mitigation regression test the PRD asks for. The fix in
+    //    the dispatch loop mirrors `focus_deck`'s "selection + focus"
+    //    pattern after `handle_normal_key`, so the per-frame
+    //    "selected_index ← focused pane" sync no longer rolls back the
+    //    user's j/k move.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_normal_key_j_and_down_advance_with_wrap() {
+        let mut ui = default_ui();
+        ui.selected_index = 0;
+
+        // j advances 0 → 1
+        let r = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+        );
+        assert!(matches!(r, KeyResult::Continue));
+        assert_eq!(ui.selected_index, 1);
+
+        // Down advances 1 → 2
+        let r = handle_normal_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+        );
+        assert!(matches!(r, KeyResult::Continue));
+        assert_eq!(ui.selected_index, 2);
+
+        // wraps 2 → 0
+        let r = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+        );
+        assert!(matches!(r, KeyResult::Continue));
+        assert_eq!(ui.selected_index, 0);
+    }
+
+    #[test]
+    fn handle_normal_key_k_and_up_retreat_with_wrap() {
+        let mut ui = default_ui();
+        ui.selected_index = 0;
+
+        // k from 0 wraps to total - 1
+        let r = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+        );
+        assert!(matches!(r, KeyResult::Continue));
+        assert_eq!(ui.selected_index, 2);
+
+        // Up retreats 2 → 1
+        let r = handle_normal_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+        );
+        assert!(matches!(r, KeyResult::Continue));
+        assert_eq!(ui.selected_index, 1);
+    }
+
+    #[test]
+    fn handle_normal_key_jk_no_op_when_no_cards() {
+        // `total == 0` (empty dashboard): j/k/Up/Down must not panic
+        // and must not move `selected_index` off zero.
+        let mut ui = default_ui();
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Down,
+            KeyCode::Up,
+        ] {
+            let r = handle_normal_key(KeyEvent::new(code, KeyModifiers::NONE), &mut ui, 0, None);
+            assert!(matches!(r, KeyResult::Continue));
+            assert_eq!(ui.selected_index, 0);
+        }
+    }
+
+    /// Pane controller that records every `focus_pane` call. Used by the
+    /// `focus_deck` regression test below — the production embedded
+    /// controller is too heavy to spin up in a unit test, but the
+    /// contract `focus_deck` cares about is "the controller's
+    /// `focus_pane` got called with the right id".
+    struct RecordingFocusPC {
+        focused: std::sync::Mutex<Vec<String>>,
+    }
+    impl crate::pane::PaneController for RecordingFocusPC {
+        fn create_pane(
+            &self,
+            _cmd: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<String, crate::pane::PaneError> {
+            Ok(String::new())
+        }
+        fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn rename_pane(
+            &self,
+            _id: &str,
+            name: &str,
+        ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+            Ok(crate::pane::RenameOutcome::applied(name))
+        }
+        fn focus_pane(&self, id: &str) -> Result<(), crate::pane::PaneError> {
+            self.focused.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// PRD #68 risk-mitigation: pin that the digit-jump path
+    /// (`Ctrl+d` → `1`-`9` → `focus_deck`) still focuses the right
+    /// pane AND sets `ui.selected_index` after the j/k fix lands in
+    /// the dispatch loop. The fix mirrors `focus_deck`'s pattern, so
+    /// breaking the digit path would mean both paths regressed.
+    #[test]
+    fn focus_deck_focuses_target_pane_and_updates_selected_index() {
+        use tokio::sync::RwLock;
+        let mut snapshot = AppState::default();
+        // Three sessions with concrete pane_ids so `focus_deck` has
+        // something to focus on.
+        for (sid, pid) in [("s0", "p0"), ("s1", "p1"), ("s2", "p2")] {
+            let mut sess = make_session(SessionStatus::Idle);
+            sess.session_id = sid.to_string();
+            sess.pane_id = Some(pid.to_string());
+            snapshot.sessions.insert(sid.to_string(), sess);
+        }
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let pc = RecordingFocusPC {
+            focused: std::sync::Mutex::new(Vec::new()),
+        };
+
+        // Build the `filtered` view focus_deck expects.
+        let ids: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        // Sort for stable order across HashMap iteration.
+        let mut ids = ids;
+        ids.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        let ok = focus_deck(1, &mut ui, &ids, &snapshot, &state, &pc);
+        assert!(ok, "focus_deck must accept an in-range idx");
+        assert_eq!(ui.selected_index, 1);
+        // PaneInput transition is also part of the Ctrl+d → 1-9 contract.
+        assert_eq!(ui.mode, UiMode::PaneInput);
+        let calls = pc.focused.lock().unwrap();
+        assert_eq!(
+            calls.as_slice(),
+            &["p1".to_string()],
+            "focus_deck must call focus_pane on the targeted card's pane"
+        );
+    }
+
+    /// Companion to the focus_deck test: pin the dispatch-loop's
+    /// Normal-mode step end-to-end by driving the SAME helper that
+    /// `run_tui` calls — `dispatch_normal_mode_key`. Deleting the
+    /// `mirror_selection_into_focus` line from that helper would
+    /// regress PRD #68 in production AND fail this test, closing the
+    /// Greptile-flagged gap where calling `mirror_selection_into_focus`
+    /// directly from the test would silently pass when someone
+    /// removed the production call site.
+    #[test]
+    fn jk_navigation_mirrors_selection_into_focus() {
+        let mut snapshot = AppState::default();
+        for (sid, pid) in [("s0", "p0"), ("s1", "p1"), ("s2", "p2")] {
+            let mut sess = make_session(SessionStatus::Idle);
+            sess.session_id = sid.to_string();
+            sess.pane_id = Some(pid.to_string());
+            snapshot.sessions.insert(sid.to_string(), sess);
+        }
+        let pc = RecordingFocusPC {
+            focused: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+        let total = filtered.len();
+
+        let mut ui = default_ui();
+        ui.selected_index = 0;
+
+        let press = |ui: &mut UiState, key: KeyEvent| {
+            dispatch_normal_mode_key(key, ui, total, None, &filtered, &pc);
+        };
+
+        // j: 0 → 1, focus mirrored to p1.
+        press(
+            &mut ui,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        assert_eq!(ui.selected_index, 1);
+        // Down: 1 → 2, focus mirrored to p2.
+        press(&mut ui, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(ui.selected_index, 2);
+        // k: 2 → 1, focus mirrored to p1.
+        press(
+            &mut ui,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        );
+        assert_eq!(ui.selected_index, 1);
+
+        let calls = pc.focused.lock().unwrap();
+        assert_eq!(
+            calls.as_slice(),
+            &["p1".to_string(), "p2".to_string(), "p1".to_string()],
+            "every j/k/Up/Down move must mirror the new selection into focus"
+        );
     }
 
     // -----------------------------------------------------------------------
