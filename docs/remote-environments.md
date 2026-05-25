@@ -162,3 +162,4 @@ Agents emit hook events (delegate, work-done, etc.) by piping JSON to `dot-agent
 
 - [Remote Environment Requirements](remote-requirements.md) — what a host must provide before you can register it.
 - [Remote Recipes](remote-recipes.md) — provisioning snippets for common cloud and local-VM hosts.
+- [Installation › Recycling the local daemon](installation.md#recycling-the-local-daemon) — `dot-agent-deck daemon stop` is the local counterpart for recycling the daemon on your laptop after a binary upgrade. The remote lifecycle described above (per-attach daemon, ssh session governs cleanup) is independent.

@@ -70,9 +70,15 @@ impl Drop for DaemonHandle {
 
 async fn spawn_daemon() -> DaemonHandle {
     common::init_test_env();
+    // `common::race_safe_tempdir()` chmods the tempdir to 0o700 after
+    // creation. Without that, a concurrent daemon's `bind_socket` (which
+    // briefly sets the process-global umask to 0o177) can land in between
+    // `mkdir(2)` and the test's first use of the dir, leaving the parent
+    // at mode 0o600 — no execute bit, so the test's subsequent socket
+    // bind fails with EACCES.
     let (dir, hook_path, attach_path) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = common::race_safe_tempdir();
         let hook = dir.path().join("hook.sock");
         let attach = dir.path().join("attach.sock");
         (dir, hook, attach)
@@ -89,6 +95,10 @@ async fn spawn_daemon() -> DaemonHandle {
         let _ = run_daemon_with(&hook_for_daemon, daemon).await;
     });
 
+    // 5s is plenty once the umask race is closed (race_safe_tempdir
+    // above): without contention the daemon binds in <100ms; the only
+    // legitimate stall under parallel load is brief flock serialization
+    // on the per-socket spawn lock.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         if attach_path.exists() && UnixStream::connect(&attach_path).await.is_ok() {
@@ -268,7 +278,7 @@ async fn wait_for_in_snapshot(
 #[tokio::test]
 async fn daemon_writes_delegate_prompt_to_target_role_pane() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let _orch_agent_id = start_role_pane(
@@ -348,7 +358,7 @@ async fn daemon_writes_delegate_prompt_to_target_role_pane() {
 #[tokio::test]
 async fn daemon_writes_work_done_feedback_to_orchestrator_pane() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let orch_agent_id = start_role_pane(
@@ -416,9 +426,9 @@ async fn daemon_writes_work_done_feedback_to_orchestrator_pane() {
 #[tokio::test]
 async fn delegate_writes_task_file_to_each_workers_own_cwd() {
     let daemon = spawn_daemon().await;
-    let orch_cwd_dir = tempfile::tempdir().unwrap();
+    let orch_cwd_dir = common::race_safe_tempdir();
     let orch_cwd = orch_cwd_dir.path().to_string_lossy().into_owned();
-    let worker_cwd_dir = tempfile::tempdir().unwrap();
+    let worker_cwd_dir = common::race_safe_tempdir();
     let worker_cwd = worker_cwd_dir.path().to_string_lossy().into_owned();
     assert_ne!(
         orch_cwd, worker_cwd,
@@ -500,7 +510,7 @@ async fn delegate_writes_task_file_to_each_workers_own_cwd() {
 #[tokio::test]
 async fn delegate_wraps_task_with_role_prompt_template() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     // Write a project config file with a prompt_template on the coder
@@ -599,7 +609,7 @@ prompt_template = "You are the coder. Always run tests before finishing."
 #[tokio::test]
 async fn delegate_applies_prompt_template_for_unnamed_orchestration() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
     // The daemon's loader resolves an empty/missing config name to the
     // cwd basename — same fallback the TUI applies when building
@@ -697,12 +707,18 @@ async fn delegate_does_not_cross_route_between_same_basename_orchestrations() {
     let daemon = spawn_daemon().await;
     // Two distinct cwds whose basenames are identical (the
     // resolve_orchestration_name fallback would collapse them).
-    let parent_a = tempfile::tempdir().unwrap();
+    // Same umask race as race_safe_tempdir: a concurrent `bind_socket`
+    // can leave these freshly created subdirs at mode 0o600 (no exec),
+    // so chmod each back to 0o700 before any code tries to traverse.
+    use std::os::unix::fs::PermissionsExt;
+    let parent_a = common::race_safe_tempdir();
     let cwd_a = parent_a.path().join("collision");
     std::fs::create_dir_all(&cwd_a).unwrap();
-    let parent_b = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(&cwd_a, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let parent_b = common::race_safe_tempdir();
     let cwd_b = parent_b.path().join("collision");
     std::fs::create_dir_all(&cwd_b).unwrap();
+    std::fs::set_permissions(&cwd_b, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_ne!(cwd_a, cwd_b);
 
     let cwd_a_str = cwd_a.to_string_lossy().into_owned();
@@ -802,7 +818,7 @@ async fn delegate_does_not_cross_route_between_same_basename_orchestrations() {
 #[tokio::test]
 async fn delegate_from_non_orchestrator_is_rejected_daemon_side() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let _orch_agent_id = start_role_pane(
@@ -862,7 +878,7 @@ async fn delegate_from_non_orchestrator_is_rejected_daemon_side() {
 #[tokio::test]
 async fn work_done_survives_subscriber_detach_and_reattach() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let orch_agent_id = start_role_pane(
@@ -976,7 +992,7 @@ async fn wait_for_bytes_in_snapshot(
 #[tokio::test]
 async fn write_to_pane_and_submit_emits_cr_after_single_line_prompt() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let coder_agent_id =
@@ -1024,7 +1040,7 @@ async fn write_to_pane_and_submit_emits_cr_after_single_line_prompt() {
 #[tokio::test]
 async fn write_to_pane_and_submit_wraps_multiline_in_bracketed_paste() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let coder_agent_id =
@@ -1086,7 +1102,7 @@ async fn write_to_pane_and_submit_wraps_multiline_in_bracketed_paste() {
 #[tokio::test]
 async fn write_to_pane_and_submit_serializes_concurrent_writes_per_pane() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let coder_agent_id =
@@ -1185,7 +1201,7 @@ async fn write_to_pane_and_submit_serializes_concurrent_writes_per_pane() {
 #[tokio::test]
 async fn write_to_pane_and_submit_concurrent_writes_to_different_panes_run_in_parallel() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let _orch_id = start_role_pane(
@@ -1307,7 +1323,7 @@ async fn wait_for_in_pane_snapshot(
 #[tokio::test]
 async fn delegate_respawns_worker_agent_when_role_clear_is_true() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     // No `clear` line means default `true` per
@@ -1501,7 +1517,7 @@ command = "cat -u"
 #[tokio::test]
 async fn delegate_does_not_respawn_worker_when_role_clear_is_false() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let config_toml = r#"
@@ -1611,7 +1627,7 @@ clear = false
 #[tokio::test]
 async fn delegate_respawn_rotates_agent_bus_when_role_clear_is_true() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let config_toml = r#"
@@ -1736,7 +1752,7 @@ command = "cat -u"
 #[tokio::test]
 async fn concurrent_clear_true_delegates_both_reach_worker() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let config_toml = r#"
@@ -1908,7 +1924,7 @@ command = "cat -u"
 #[tokio::test]
 async fn delegate_clear_true_writes_prompt_promptly_after_session_start() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let config_toml = r#"
@@ -2028,7 +2044,7 @@ command = "cat -u"
 #[tokio::test]
 async fn delegate_clear_true_rejects_session_start_from_old_agent_id() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let config_toml = r#"
@@ -2148,7 +2164,7 @@ command = "cat -u"
 #[tokio::test]
 async fn respawn_failure_surfaces_visible_error_in_orchestrator_pane() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     // The coder role's command points at a path that doesn't exist
@@ -2244,7 +2260,7 @@ command = "/nonexistent/dot-agent-deck-test-bin-12345"
 #[tokio::test]
 async fn concurrent_fan_out_respawns_overlap_across_panes() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let config_toml = r#"
@@ -2431,7 +2447,7 @@ command = "cat -u"
 #[tokio::test]
 async fn respawn_preserves_original_spawn_env() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let marker_value = "preserve-me-please";
@@ -2558,7 +2574,7 @@ command = "{role_command}"
 #[tokio::test]
 async fn respawn_preserves_last_known_pty_size() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     let config_toml = r#"
@@ -2654,7 +2670,7 @@ command = "cat -u"
 #[tokio::test]
 async fn delegate_with_missing_role_config_skips_respawn_and_still_delivers_prompt() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     // Config: only the orchestrator role is listed. The coder pane
@@ -2822,7 +2838,7 @@ start = true
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_pane_renders_new_agent_after_sigterm_trap_respawn() {
     let daemon = spawn_daemon().await;
-    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = common::race_safe_tempdir();
     let cwd = cwd_dir.path().to_string_lossy().into_owned();
 
     // SIGTERM-trapping shell. The diagnostic recipe used

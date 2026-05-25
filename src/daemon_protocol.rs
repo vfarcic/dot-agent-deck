@@ -328,8 +328,16 @@ pub enum AttachRequest {
     /// `client_version` — only the client decides whether to fail (the
     /// `connect` strict path) or continue (call sites that have no version
     /// dependency).
+    ///
+    /// PRD #103 M1.2: optional `client_build_version` carries the client's
+    /// compiled-in `DAD_BUILD_ID`. The daemon logs it but never rejects on
+    /// it — mirroring the server-policy on `client_version`. Older clients
+    /// omit the field; deserialization tolerates that via
+    /// `#[serde(default)]`.
     Hello {
         client_version: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_build_version: Option<String>,
     },
 }
 
@@ -370,6 +378,15 @@ pub struct AttachResponse {
     /// (in which case the client treats `None` as "incompatible").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_version: Option<u32>,
+    /// PRD #103 M1.1: daemon's compiled-in `env!("DAD_BUILD_ID")` — a
+    /// finer-grained identifier than [`PROTOCOL_VERSION`] (it includes the
+    /// commit hash and dirty marker) used by the laptop to detect
+    /// same-tag-different-commit handler-code skew the protocol version
+    /// can't catch. Optional so the field is omitted on unrelated responses
+    /// and absent from pre-PRD-103 daemons (the client treats `None` as
+    /// "incompatible — recycle the daemon").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_version: Option<String>,
 }
 
 impl AttachResponse {
@@ -416,10 +433,22 @@ impl AttachResponse {
     }
     /// PRD #76 M2.21: protocol-version handshake reply. `version` is the
     /// daemon's [`PROTOCOL_VERSION`]; the client compares it against its own.
+    ///
+    /// PRD #103 M1.1: also carries the daemon's compiled-in `DAD_BUILD_ID`
+    /// so the laptop can detect handler-code skew (same protocol version,
+    /// different commit / dirty tree) the protocol version alone can't
+    /// catch.
     pub fn hello(version: u32) -> Self {
         Self {
             ok: true,
             server_version: Some(version),
+            // `local_build_id()` returns the compile-time
+            // `env!("DAD_BUILD_ID")` in production; integration tests
+            // (PRD #103 M4.2) inject a synthetic value via the
+            // `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` env var so they can
+            // simulate same-tag / different-commit skew without
+            // rebuilding the binary.
+            build_version: Some(crate::build_id::local_build_id()),
             ..Default::default()
         }
     }
@@ -901,7 +930,10 @@ async fn handle_connection(
         AttachRequest::SubscribeEvents => {
             handle_subscribe_events(stream, event_tx).await?;
         }
-        AttachRequest::Hello { client_version: _ } => {
+        AttachRequest::Hello {
+            client_version: _,
+            client_build_version,
+        } => {
             // PRD #76 M2.21: the daemon never enforces or rejects on
             // `client_version` — we always reply with our own
             // `PROTOCOL_VERSION` and let the caller decide. Centralizing the
@@ -909,6 +941,28 @@ async fn handle_connection(
             // older daemon (the upgrade-skew direction the daemon can't
             // detect anyway) still gets a sensible mismatch error instead of
             // the daemon rejecting what *would* be its own future shape.
+            //
+            // PRD #103 M1.2: log the client's build_version when present
+            // for post-hoc debugging of mismatch reports. Same server
+            // policy — never reject; the laptop decides.
+            //
+            // `client_build_version` is advisory, not trust-bearing: a
+            // hostile or buggy client could embed newlines / ANSI escapes
+            // that would corrupt log files or terminal display when an
+            // operator tails the log. Pass through `escape_debug` to
+            // render any control bytes as printable escapes before
+            // formatting. The daemon-side `local_build_id()` is from our
+            // own compile-time env and doesn't need the same treatment,
+            // but escaping both keeps the log line consistently quoted.
+            if let Some(cbv) = client_build_version.as_deref() {
+                let daemon_build = crate::build_id::local_build_id();
+                let cbv_safe = cbv.escape_debug().to_string();
+                let daemon_build_safe = daemon_build.escape_debug().to_string();
+                info!(
+                    target: "daemon_protocol",
+                    "Hello from client build_version=\"{cbv_safe}\" (daemon build_version=\"{daemon_build_safe}\")",
+                );
+            }
             write_resp(&mut stream, &AttachResponse::hello(PROTOCOL_VERSION)).await?;
         }
     }
@@ -1627,16 +1681,60 @@ mod tests {
         // `kind_event_frame_round_trip` precedent.
         let req = AttachRequest::Hello {
             client_version: PROTOCOL_VERSION,
+            client_build_version: Some(env!("DAD_BUILD_ID").to_string()),
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["op"], "hello");
         assert_eq!(v["client_version"], PROTOCOL_VERSION);
+        assert_eq!(v["client_build_version"], env!("DAD_BUILD_ID"));
 
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
         match back {
-            AttachRequest::Hello { client_version } => {
+            AttachRequest::Hello {
+                client_version,
+                client_build_version,
+            } => {
                 assert_eq!(client_version, PROTOCOL_VERSION);
+                assert_eq!(client_build_version.as_deref(), Some(env!("DAD_BUILD_ID")));
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_request_omits_client_build_version_when_none() {
+        // PRD #103 M1.2: when a (legacy) client doesn't populate
+        // `client_build_version`, the wire payload must not carry the
+        // field. Older daemons would reject any unknown key as a strictness
+        // failure (they don't, but the contract holds anyway).
+        let req = AttachRequest::Hello {
+            client_version: PROTOCOL_VERSION,
+            client_build_version: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("client_build_version"),
+            "client_build_version=None must be omitted from the wire payload"
+        );
+    }
+
+    #[test]
+    fn hello_request_deserializes_legacy_shape_without_client_build_version() {
+        // PRD #103 M1.2: a pre-PRD-103 client emits only `client_version`.
+        // The daemon side must accept the payload and decode
+        // `client_build_version` as None — `#[serde(default)]` makes this
+        // work, but the test pins the wire contract.
+        let json = r#"{"op":"hello","client_version":2}"#;
+        let req: AttachRequest = serde_json::from_str(json).unwrap();
+        match req {
+            AttachRequest::Hello {
+                client_version,
+                client_build_version,
+            } => {
+                assert_eq!(client_version, 2);
+                assert!(client_build_version.is_none());
             }
             other => panic!("expected Hello, got {other:?}"),
         }
@@ -1649,10 +1747,51 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["server_version"], PROTOCOL_VERSION);
+        // PRD #103 M1.1: hello() must populate `build_version` from the
+        // daemon's compiled-in DAD_BUILD_ID so the laptop can detect
+        // handler-code skew. The exact value is build-time-derived; we just
+        // require it's present and non-empty here.
+        let wire_build_version = v["build_version"]
+            .as_str()
+            .expect("hello() must emit build_version on the wire");
+        assert!(
+            !wire_build_version.is_empty(),
+            "build_version must be non-empty"
+        );
+        assert_eq!(wire_build_version, env!("DAD_BUILD_ID"));
 
         let back: AttachResponse = serde_json::from_str(&json).unwrap();
         assert!(back.ok);
         assert_eq!(back.server_version, Some(PROTOCOL_VERSION));
+        assert_eq!(back.build_version.as_deref(), Some(env!("DAD_BUILD_ID")));
+    }
+
+    #[test]
+    fn response_omits_build_version_when_none() {
+        // PRD #103 M1.1: forward compat. An unrelated response (e.g.
+        // list-agents) must NOT carry `build_version` on the wire — older
+        // peers ignore the field, newer peers treat its absence on a hello
+        // reply as "incompatible / recycle the daemon".
+        let resp = AttachResponse::ok();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("build_version"),
+            "build_version=None should be omitted from the wire payload"
+        );
+    }
+
+    #[test]
+    fn response_deserializes_legacy_shape_without_build_version() {
+        // PRD #103 M1.1: a pre-PRD-103 daemon emits `server_version` but
+        // not `build_version`. The newer client must accept the payload
+        // and decode the field as None — which is what the mismatch logic
+        // uses to flag "daemon too old / recycle it".
+        let json = r#"{"ok":true,"server_version":2}"#;
+        let resp: AttachResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.server_version, Some(2));
+        assert!(resp.build_version.is_none());
     }
 
     #[test]
@@ -1707,6 +1846,7 @@ mod tests {
         let (mut rd, mut wr) = client.into_split();
         let req = AttachRequest::Hello {
             client_version: 99, // deliberately not PROTOCOL_VERSION
+            client_build_version: None,
         };
         let payload = serde_json::to_vec(&req).unwrap();
         write_frame(&mut wr, KIND_REQ, &payload).await.unwrap();
@@ -1751,6 +1891,7 @@ mod tests {
         let (mut rd, mut wr) = client.into_split();
         let req = AttachRequest::Hello {
             client_version: u32::MAX,
+            client_build_version: None,
         };
         let payload = serde_json::to_vec(&req).unwrap();
         write_frame(&mut wr, KIND_REQ, &payload).await.unwrap();

@@ -403,6 +403,86 @@ pub async fn ensure_external_daemon_or_die(attach_path: &Path) -> Result<(), Att
     .await
 }
 
+// ---------------------------------------------------------------------------
+// PRD #103 M1.5 — peer-credential PID discovery on a connected attach socket.
+// ---------------------------------------------------------------------------
+
+/// Return the PID of the process holding the other end of a connected
+/// Unix-domain stream.
+///
+/// Uses `libc::getsockopt` directly (`SO_PEERCRED` on Linux,
+/// `LOCAL_PEERPID` on macOS). The PRD considered
+/// `std::os::unix::net::UnixStream::peer_cred()` and rejected it — on
+/// rustc 1.94 stable that API is still nightly-only behind the
+/// `peer_credentials_unix_socket` feature, so depending on it would not
+/// compile.
+///
+/// **Crucially: this helper exchanges zero protocol bytes with the
+/// peer.** That's the load-bearing property: the entire point of having
+/// it is to drive `dot-agent-deck daemon stop` against a *stale* daemon
+/// (PRD #103 Phase 3), and a stale daemon by definition does not
+/// implement any new protocol surface we add. PID discovery via
+/// `getsockopt` is an OS-level facility and works against any daemon
+/// version, including the v0.24.x daemon that motivated the PRD.
+///
+/// Generic over `AsRawFd` so the same helper covers both
+/// `std::os::unix::net::UnixStream` and `tokio::net::UnixStream` — the
+/// `getsockopt` syscall doesn't care which runtime owns the fd.
+#[cfg(target_os = "linux")]
+pub fn peer_pid<S: AsRawFd>(stream: &S) -> std::io::Result<u32> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` is a freshly-zeroed `libc::ucred` allocated on the
+    // stack and outlives the syscall; `len` tracks its size by value.
+    // `getsockopt` writes at most `len` bytes into the pointee, which is
+    // exactly the layout libc guarantees for `ucred`. The fd comes from
+    // `AsRawFd` so it's owned by the caller for the duration of this
+    // call. No unwinding can leak resources because there are no Drop
+    // types involved.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(cred.pid as u32)
+}
+
+/// macOS variant — uses `LOCAL_PEERPID` (not `LOCAL_PEERCRED`, which
+/// returns a `struct xucred` without a PID). `nix` does not yet ship a
+/// typed wrapper for `LOCAL_PEERPID`, so a small `libc::getsockopt` call
+/// is fine; the unsafe surface is one syscall with a stack-allocated
+/// output.
+#[cfg(target_os = "macos")]
+pub fn peer_pid<S: AsRawFd>(stream: &S) -> std::io::Result<u32> {
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: `pid` is a stack-allocated `pid_t` that outlives the call;
+    // `len` matches its size by value. `getsockopt(LOCAL_PEERPID)`
+    // writes at most `len` bytes into the pointee, which is exactly
+    // `sizeof(pid_t)`. The fd is owned by the caller for the duration
+    // of this call.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            &mut pid as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(pid as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1037,5 +1117,45 @@ mod tests {
             post_mode, 0o700,
             "prepare_state_dir must repair a loose-mode pre-existing state_dir to 0o700, got {post_mode:o}"
         );
+    }
+
+    // PRD #103 M1.5: per-OS unit tests for the `peer_pid` helper. Bind a
+    // Unix listener, connect from the same process, accept, and assert
+    // the server-side stream sees the current process's PID. Both arms
+    // (Linux SO_PEERCRED, macOS LOCAL_PEERPID) must agree with
+    // `std::process::id()` since both ends of the pair live in this test
+    // process.
+
+    /// Shared body for the Linux and macOS `peer_pid` smoke tests.
+    /// Both arms exercise an identical scenario (bind, connect from
+    /// this process, accept, assert the server-side stream sees the
+    /// current PID); the per-OS `#[cfg]` wrappers exist only because
+    /// `peer_pid` itself has two distinct getsockopt implementations
+    /// behind matching `#[cfg]`s.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn peer_pid_smoke_test() {
+        let dir = race_safe_tempdir();
+        let sock = dir.path().join("peer.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let _client = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let (server, _addr) = listener.accept().unwrap();
+        let pid = peer_pid(&server).expect("peer_pid must succeed on a connected stream");
+        assert_eq!(
+            pid,
+            std::process::id(),
+            "peer_pid must return the current process's PID for a same-process connection"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_pid_returns_current_process_id_on_linux() {
+        peer_pid_smoke_test();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn peer_pid_returns_current_process_id_on_macos() {
+        peer_pid_smoke_test();
     }
 }

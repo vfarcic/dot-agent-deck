@@ -2375,7 +2375,7 @@ mod tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let id1 = registry
             .spawn_agent(SpawnOptions {
-                command: Some("/bin/true"),
+                command: Some("/usr/bin/true"),
                 env: vec![(
                     DOT_AGENT_DECK_PANE_ID.to_string(),
                     "pane-recycle".to_string(),
@@ -2395,7 +2395,7 @@ mod tests {
         assert_eq!(
             registry.live_count(),
             0,
-            "test prerequisite: /bin/true must have exited"
+            "test prerequisite: /usr/bin/true must have exited"
         );
         assert_eq!(registry.len(), 1, "exited entry must still be in registry");
 
@@ -2425,11 +2425,11 @@ mod tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let _id = registry
             .spawn_agent(SpawnOptions {
-                command: Some("/bin/true"),
+                command: Some("/usr/bin/true"),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "ghost".to_string())],
                 ..SpawnOptions::default()
             })
-            .expect("spawn /bin/true");
+            .expect("spawn /usr/bin/true");
 
         // Wait for `exited` to flip.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -2463,7 +2463,7 @@ mod tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let _dead = registry
             .spawn_agent(SpawnOptions {
-                command: Some("/bin/true"),
+                command: Some("/usr/bin/true"),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "reuse-me".to_string())],
                 ..SpawnOptions::default()
             })
@@ -2848,14 +2848,14 @@ mod tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
-                command: Some("/bin/true"),
+                command: Some("/usr/bin/true"),
                 ..SpawnOptions::default()
             })
             .expect("spawn should succeed");
         assert_eq!(registry.len(), 1);
 
         // Wait up to a few seconds for the reader thread to drain to EOF
-        // and set `exited`. /bin/true exits quickly, but the PTY drain +
+        // and set `exited`. /usr/bin/true exits quickly, but the PTY drain +
         // OS scheduling can take a couple of hundred ms on a loaded box.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while tokio::time::Instant::now() < deadline {
@@ -2911,7 +2911,7 @@ mod tests {
         // pump_reader on EOF.
         let _id2 = registry
             .spawn_agent(SpawnOptions {
-                command: Some("/bin/true"),
+                command: Some("/usr/bin/true"),
                 ..SpawnOptions::default()
             })
             .expect("spawn should succeed");
