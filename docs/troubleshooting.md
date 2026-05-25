@@ -73,6 +73,45 @@ dot-agent-deck hooks uninstall --agent opencode   # OpenCode
 
 > **Note:** If you uninstall hooks manually, the next dashboard launch will re-install them automatically.
 
+## Delegate prompts silently no-op after an upgrade
+
+After upgrading the `dot-agent-deck` binary, the new TUI may attach to a daemon that was spawned by the *previous* version. The wire format stays compatible, but newer features (delegate role maps, orchestration tab fields, and similar internal refactors) silently no-op because the stale daemon doesn't know about the newer shape.
+
+### Symptom
+
+You upgrade `dot-agent-deck`, relaunch it, and delegate prompts arrive in the TUI as if they were queued — but the orchestration pipeline never moves. Other recently-added features may also fail to take effect without an obvious error.
+
+If you see this, you connected to the stale daemon without going through the version-mismatch prompt — either because an earlier `dot-agent-deck` version (pre-handshake) attached silently, or because the relaunch happened in a non-interactive context. Newer builds prompt you at launch (see *Why this happens* below).
+
+### Fix
+
+Relaunch `dot-agent-deck` from an interactive terminal:
+
+```bash
+dot-agent-deck
+```
+
+You'll see the mismatch prompt — press **S** to stop the stale daemon and continue. The TUI lazy-spawns a fresh daemon at the new binary's version on its way into the dashboard.
+
+If the relaunch is happening from a script, CI job, or piped context (no TTY), the TUI cannot prompt. Run `daemon stop` explicitly first:
+
+```bash
+dot-agent-deck daemon stop
+dot-agent-deck
+```
+
+If managed agents are still running and you cannot detach them first, pass `--force` to terminate them along with the daemon:
+
+```bash
+dot-agent-deck daemon stop --force
+```
+
+See [Installation › Recycling the local daemon](installation.md#recycling-the-local-daemon) for the full command reference, including the data-loss guard and exit codes.
+
+### Why this happens
+
+On every launch, the TUI performs a build-version handshake with the daemon. When it detects a mismatch *and* your terminal is interactive, it prompts you with both build IDs and a single-keystroke choice — press **S** to recycle the daemon and continue, or **Q** to abort. (If managed agents are running, the prompt itself lists them and warns before you confirm.) When the TUI is not attached to a terminal (CI, pipes), it prints the recovery hint to stderr and exits non-zero instead of prompting.
+
 ## Enabling Debug Logs
 
 When something goes wrong and the dashboard's status messages aren't enough to diagnose it, set the `DOT_AGENT_DECK_LOG` environment variable to capture tracing output to a file:

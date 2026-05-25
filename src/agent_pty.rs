@@ -2714,20 +2714,45 @@ mod tests {
     #[tokio::test]
     async fn write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between() {
         let registry = AgentPtyRegistry::new();
+        // The shell prints `RAW-READY` *after* stty applies and *before* exec
+        // into cat, so the test can poll the scrollback for that marker and
+        // know the slave's termios is in raw mode before issuing the notice /
+        // submit writes. On slow Linux CI runners a fixed sleep is not enough
+        // — if `\n` lands while OPOST/ONLCR is still active, the kernel
+        // translates it to `\r\n` in the master scrollback and the no-`\r`
+        // assertion below trips on the ONLCR artifact even though the daemon
+        // never emitted a CR.
         let _id = registry
             .spawn_agent(SpawnOptions {
-                command: Some("stty -echo -icanon -icrnl -opost min 1 time 0 && exec cat -u"),
+                command: Some(
+                    "stty -echo -icanon -icrnl -opost min 1 time 0 && \
+                     printf RAW-READY && exec cat -u",
+                ),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "accumulate".to_string())],
                 ..SpawnOptions::default()
             })
             .expect("spawn raw-mode cat shell");
         let agent_id = registry.agent_ids()[0].clone();
 
-        // Give the shell time to apply `stty` and `exec` into cat
-        // before writes hit the slave — otherwise the first bytes
-        // would traverse the default termios (ICANON + ICRNL + OPOST)
-        // and the order/contents of the scrollback would be ambiguous.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Wait for the shell to apply `stty` and print the readiness marker.
+        // `printf` is a builtin in both bash and dash so no fork is needed
+        // between stty completing and the marker landing, and the marker is
+        // pure alphanumeric+hyphen so OPOST translation does not affect its
+        // appearance even on the off chance stty hadn't applied yet.
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut raw_ready = false;
+        while tokio::time::Instant::now() < ready_deadline {
+            let snap = registry.snapshot(&agent_id).unwrap_or_default();
+            if snap.windows(b"RAW-READY".len()).any(|w| w == b"RAW-READY") {
+                raw_ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            raw_ready,
+            "shell never printed RAW-READY — stty/exec cat -u didn't apply in time"
+        );
 
         registry
             .write_to_pane_notice("accumulate", "NOTICE-MARKER")

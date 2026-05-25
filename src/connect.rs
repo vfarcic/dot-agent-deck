@@ -25,6 +25,7 @@ use std::process::Command;
 
 use thiserror::Error;
 
+use crate::build_id::local_build_id;
 use crate::daemon_protocol::{AttachResponse, PROTOCOL_VERSION};
 use crate::remote::{
     RemoteConfigError, RemoteEntry, RemotesFile, SshError, SshExecutor, SshTarget,
@@ -145,6 +146,25 @@ pub enum RemoteConnectError {
         message_suffix = if message.is_empty() { String::new() } else { format!(": {message}") }
     )]
     RemoteHandshakeError { name: String, message: String },
+    /// PRD #103 M1.4: the laptop and the remote have compatible
+    /// `PROTOCOL_VERSION`s but different `DAD_BUILD_ID`s. Same-tag-different-commit
+    /// (or dirty-tree) skew is the exact case that PROTOCOL_VERSION alone
+    /// can't catch — semantically divergent handler code behind a stable
+    /// wire shape. `remote` is `None` when the remote omits `build_version`
+    /// entirely (pre-PRD-103 binary): treated identically to a real mismatch
+    /// so the user upgrades the remote and the laptop gains the precision
+    /// on the next probe.
+    ///
+    /// Recovery routes to `remote upgrade <name>` (NOT `daemon stop` — the
+    /// local-daemon-stop command is only meaningful for the laptop-side
+    /// stale-daemon case).
+    #[error("Remote '{name}' was built as {remote_str}; laptop was built as {local}. Run `dot-agent-deck remote upgrade {name}` to re-install the remote at the current build.",
+            remote_str = remote.as_deref().unwrap_or("<unknown>"))]
+    BuildVersionMismatch {
+        name: String,
+        remote: Option<String>,
+        local: String,
+    },
     #[error(transparent)]
     Registry(#[from] RemoteConfigError),
     #[error("I/O error: {0}")]
@@ -450,6 +470,12 @@ const PROBE_PROTOCOL_STDOUT_CAP: usize = 64 * 1024;
 ///   `daemon hello`) → `ProtocolMismatch { remote: None, .. }`.
 /// - Remote exits 0 but stdout doesn't parse as a JSON response with a
 ///   `server_version` field → same treatment as "remote too old".
+/// - PRD #103 M1.4: `server_version` matches but `build_version` differs (or
+///   is missing on the remote) → [`RemoteConnectError::BuildVersionMismatch`]
+///   whose user-facing message names both build_ids and points at
+///   `dot-agent-deck remote upgrade <name>`. The local-side `daemon stop`
+///   command is NOT suggested here — that recovery applies only to the
+///   laptop's own stale daemon, not to a remote.
 ///
 /// Transport failures (`SshError`) fold into `HostUnreachable` via the same
 /// `map_probe_ssh_error` the binary-version probe uses — the user's
@@ -515,7 +541,35 @@ pub fn probe_remote_protocol(
                 });
             }
             match resp.server_version {
-                Some(v) if v == PROTOCOL_VERSION => Ok(()),
+                Some(v) if v == PROTOCOL_VERSION => {
+                    // PRD #103 M1.4: PROTOCOL_VERSION matches — now check
+                    // the finer-grained `build_version` (which catches
+                    // same-tag-different-commit skew the protocol version
+                    // can't). A `None` here means a pre-PRD-103 remote
+                    // binary that doesn't emit `build_version`; treat it
+                    // identically to a real mismatch so the user re-runs
+                    // `remote upgrade <name>` and the laptop gains the
+                    // precision on the next probe.
+                    // Route through `local_build_id()` rather than
+                    // `env!("DAD_BUILD_ID")` so the
+                    // `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` test hook (used by
+                    // the M4.2 integration tests) takes effect on the
+                    // remote-mismatch path too.
+                    let local_build = local_build_id();
+                    match resp.build_version.as_deref() {
+                        Some(remote_build) if remote_build == local_build.as_str() => Ok(()),
+                        Some(remote_build) => Err(RemoteConnectError::BuildVersionMismatch {
+                            name: name.to_string(),
+                            remote: Some(remote_build.to_string()),
+                            local: local_build,
+                        }),
+                        None => Err(RemoteConnectError::BuildVersionMismatch {
+                            name: name.to_string(),
+                            remote: None,
+                            local: local_build,
+                        }),
+                    }
+                }
                 Some(v) => {
                     let upgrade_hint = if v < PROTOCOL_VERSION {
                         format!("Run `dot-agent-deck remote upgrade {name}`")
@@ -1818,6 +1872,105 @@ mod tests {
         let err = probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
             .expect_err("transport failure must error");
         assert!(matches!(err, RemoteConnectError::HostUnreachable { .. }));
+    }
+
+    // ----- PRD #103 M1.4: build_version comparison on the remote probe -----
+
+    #[test]
+    fn probe_protocol_build_version_match_returns_ok() {
+        // PROTOCOL_VERSION matches AND build_version matches → Ok. This is
+        // the same shape `AttachResponse::hello` produces locally, so the
+        // happy path needs no special construction.
+        let resp = AttachResponse::hello(PROTOCOL_VERSION);
+        let executor =
+            FakeSshExecutor::new(vec![ok_stdout(&serde_json::to_string(&resp).unwrap())]);
+        let target = ssh_target("u@h", 22);
+        probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
+            .expect("matching build_version is Ok");
+    }
+
+    #[test]
+    fn probe_protocol_build_version_mismatch_returns_build_version_mismatch() {
+        // PROTOCOL_VERSION matches, but the remote was built at a different
+        // commit / dirty tree. Surface BuildVersionMismatch carrying both
+        // ids and pointing at `remote upgrade <name>` (NOT `daemon stop`).
+        let resp = AttachResponse {
+            ok: true,
+            server_version: Some(PROTOCOL_VERSION),
+            build_version: Some("0.25.0-gdeadbee-dirty".to_string()),
+            ..Default::default()
+        };
+        let executor =
+            FakeSshExecutor::new(vec![ok_stdout(&serde_json::to_string(&resp).unwrap())]);
+        let target = ssh_target("u@h", 22);
+        let err = probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
+            .expect_err("differing build_version must error");
+        match err {
+            RemoteConnectError::BuildVersionMismatch {
+                name,
+                remote,
+                local,
+            } => {
+                assert_eq!(name, "lab");
+                assert_eq!(remote.as_deref(), Some("0.25.0-gdeadbee-dirty"));
+                assert_eq!(local, env!("DAD_BUILD_ID"));
+                // Sanity: rendered error names BOTH build ids and points at
+                // `remote upgrade` (not `daemon stop`).
+                let rendered = RemoteConnectError::BuildVersionMismatch {
+                    name: "lab".to_string(),
+                    remote: Some("0.25.0-gdeadbee-dirty".to_string()),
+                    local: env!("DAD_BUILD_ID").to_string(),
+                }
+                .to_string();
+                assert!(
+                    rendered.contains("0.25.0-gdeadbee-dirty"),
+                    "rendered error must name remote build_id: {rendered}"
+                );
+                assert!(
+                    rendered.contains(env!("DAD_BUILD_ID")),
+                    "rendered error must name local build_id: {rendered}"
+                );
+                assert!(
+                    rendered.contains("remote upgrade lab"),
+                    "rendered error must point at `remote upgrade <name>`: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("daemon stop"),
+                    "remote-build skew must NOT suggest `daemon stop`: {rendered}"
+                );
+            }
+            other => panic!("expected BuildVersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_protocol_build_version_missing_treated_as_mismatch() {
+        // A pre-PRD-103 remote daemon emits `server_version` but no
+        // `build_version`. The PROTOCOL_VERSION matches (a pre-PRD-103
+        // binary at a matching protocol version is possible), so the
+        // protocol-version test passes — the missing build_version is what
+        // signals "remote needs upgrade to gain the precision". Treat
+        // None identically to a real mismatch.
+        let json = format!(r#"{{"ok":true,"server_version":{PROTOCOL_VERSION}}}"#);
+        let executor = FakeSshExecutor::new(vec![ok_stdout(&json)]);
+        let target = ssh_target("u@h", 22);
+        let err = probe_remote_protocol(&executor, &target, "lab", REMOTE_INSTALL_PATH)
+            .expect_err("missing build_version must error");
+        match err {
+            RemoteConnectError::BuildVersionMismatch {
+                name,
+                remote,
+                local,
+            } => {
+                assert_eq!(name, "lab");
+                assert!(
+                    remote.is_none(),
+                    "remote=None signals pre-PRD-103 binary, got {remote:?}"
+                );
+                assert_eq!(local, env!("DAD_BUILD_ID"));
+            }
+            other => panic!("expected BuildVersionMismatch, got {other:?}"),
+        }
     }
 
     #[test]

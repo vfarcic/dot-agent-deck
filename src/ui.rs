@@ -1113,6 +1113,14 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          Never send a new task to a worker that is still working on a previous task. \
          Wait for its work-done signal before delegating again to the same worker. \
          Delegating to different workers in parallel is fine.\n\n\
+         Delegation is one-way: orchestrator → worker. Workers NEVER delegate to other workers \
+         — a `dot-agent-deck delegate` call from inside a worker does not route back through your \
+         notification stream, so the downstream task is silently dropped and the calling worker \
+         waits forever (or signals work-done in a paused state). When briefing a worker, never \
+         instruct them to \"delegate the fix to coder\" or \"hand off to <other role>\". \
+         Instead, tell them to report the diagnosis back and signal work-done; you (the orchestrator) \
+         will delegate the next hop. The chain you coordinate is: worker A diagnoses → reports → \
+         you delegate to worker B → worker B works → reports → you re-engage worker A.\n\n\
          When a task related to a PRD is fully completed (all workers done, reviews passed), \
          run `/prd-update-progress` yourself before signaling `--done` or moving to the next task.\n",
     );
@@ -8348,6 +8356,9 @@ mod tests {
         // Instructs orchestrator to wait then delegate.
         assert!(content.contains("Wait for the user to tell you what to work on"));
         assert!(content.contains("delegate immediately"));
+        // Enforces one-way delegation (workers never delegate to other workers).
+        assert!(content.contains("Delegation is one-way"));
+        assert!(content.contains("Workers NEVER delegate to other workers"));
     }
 
     #[test]

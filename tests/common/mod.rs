@@ -32,16 +32,19 @@
 //! daemon's lock root cannot be steered by code other than the
 //! constructor.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use tempfile::TempDir;
 
 /// Holds the per-binary tempdir for the entire test run.
+#[allow(dead_code)]
 static LOCK_DIR_GUARD: OnceLock<TempDir> = OnceLock::new();
 
 /// Idempotent setup hook. Call once before constructing a daemon in a
 /// test — typically at the start of a `spawn_daemon` helper. Creates
 /// the per-binary tempdir on first call; subsequent calls are no-ops.
+#[allow(dead_code)]
 pub fn init_test_env() {
     LOCK_DIR_GUARD.get_or_init(|| {
         tempfile::Builder::new()
@@ -55,6 +58,27 @@ pub fn init_test_env() {
 /// [`dot_agent_deck::daemon::Daemon::with_lock_dir_override`] (in-process
 /// tests) or to `Command::env` for subprocess-based tests. Returns
 /// `None` if [`init_test_env`] was never called.
+#[allow(dead_code)]
 pub fn lock_dir_path() -> Option<PathBuf> {
     LOCK_DIR_GUARD.get().map(|d| d.path().to_path_buf())
+}
+
+/// `tempfile::tempdir()` calls `mkdir(2)` with mode `0o700 & ~umask`. The
+/// crate's `bind_socket` (src/daemon.rs) briefly flips the process-global
+/// umask to `0o177`, and any concurrent `mkdir` (in another test) lands
+/// during that window with mode `0o700 & ~0o177 = 0o600` — no execute
+/// bit, so the directory is no longer traversable and any subsequent
+/// `bind(2)` of a socket inside it fails with `EACCES`. Re-apply 0o700
+/// after creation so concurrent integration tests are robust to the race.
+///
+/// This is the integration-test counterpart of the same-named helper in
+/// `src/daemon_attach.rs` tests module; promoted here so every test
+/// binary that spawns daemons (orchestration_delegate, daemon_protocol,
+/// etc.) gets the fix without duplicating the workaround.
+#[allow(dead_code)]
+pub fn race_safe_tempdir() -> TempDir {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("chmod tempdir to 0o700");
+    dir
 }

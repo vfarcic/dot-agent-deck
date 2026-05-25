@@ -6,6 +6,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
 use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
+use dot_agent_deck::build_version_handshake;
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_attach::ensure_external_daemon_or_die;
@@ -147,6 +148,25 @@ enum DaemonCmd {
     /// `AttachResponse` carrying `server_version` so the client side can
     /// reuse its existing deserializer.
     Hello,
+    /// Stop the local daemon gracefully (SIGTERM, then poll for it to
+    /// stop accepting connections). PRD #103 Phase 3 — documented
+    /// alternative to `kill -9` after upgrading the binary. Refuses
+    /// without `--force` when managed agents are still running.
+    Stop {
+        /// Terminate even when managed agents are running, and escalate
+        /// to SIGKILL if SIGTERM doesn't take effect within the grace
+        /// window. Data-loss guard — only pass this when you have
+        /// already detached anything you cared about.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Stop the local daemon (same flags as `stop`). The next
+    /// `dot-agent-deck` invocation lazy-spawns a fresh daemon.
+    Restart {
+        /// See `stop --force`.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -405,6 +425,8 @@ fn main() -> ExitCode {
         Some(Commands::Daemon { cmd }) => match cmd {
             DaemonCmd::Serve => run_daemon_serve_cli(),
             DaemonCmd::Hello => run_daemon_hello_cli(),
+            DaemonCmd::Stop { force } => run_daemon_stop_cli(force),
+            DaemonCmd::Restart { force } => run_daemon_restart_cli(force),
         },
         Some(Commands::Remote { cmd }) => match cmd {
             RemoteCmd::Add {
@@ -587,6 +609,58 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
         );
         return ExitCode::FAILURE;
     }
+    // PRD #103 Phase 2: build-version handshake against the running daemon.
+    // Runs unconditionally — including the freshly-spawned case where the
+    // build-ids are necessarily equal (PRD M2.3). The cost is one extra
+    // Unix-socket round-trip on cold start; the upside is a smoke test of
+    // the handshake on every launch, which catches regressions in
+    // `ensure_external_daemon_or_die` itself (wrong socket / wrong binary)
+    // or in the wire encoding of the `build_version` field.
+    //
+    // On mismatch + TTY: presents an interactive prompt; on S the daemon
+    // is SIGTERM'd and we fall through (the next attach lazy-spawns a
+    // fresh daemon at the current build). On mismatch + non-TTY: prints
+    // the recovery hint to stderr and exits non-zero. Errors are already
+    // user-visible inside the helper, so we render no further message
+    // here.
+    let handshake_outcome =
+        match build_version_handshake::ensure_compatible_daemon_or_die(&attach_path).await {
+            Ok(outcome) => outcome,
+            Err(build_version_handshake::HandshakeError::MismatchAborted) => {
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    // After a `Recovered` outcome the old daemon was just SIGTERM'd; the
+    // next attach lazy-spawns a fresh one. Re-run the bootstrap so the
+    // socket is back before any client (DaemonClient::list_agents,
+    // spawn_event_subscriber, the embedded-pane controller) touches it.
+    // On `Match` the daemon is already running and compatible — re-running
+    // the bootstrap would just be wasted I/O.
+    if matches!(
+        handshake_outcome,
+        build_version_handshake::HandshakeOutcome::Recovered
+    ) && let Err(e) = ensure_external_daemon_or_die(&attach_path).await
+    {
+        eprintln!(
+            "failed to re-spawn daemon at {} after version-mismatch recovery: {e}",
+            attach_path.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    // Test-only escape hatch (PRD #103 M4.2): integration tests in
+    // tests/build_version_handshake.rs need to exercise the handshake
+    // path (including SIGTERM + lazy re-spawn) without entering the
+    // full TUI. Setting `DOT_AGENT_DECK_EXIT_AFTER_HANDSHAKE` causes
+    // the TUI to exit cleanly here, after the handshake completed and
+    // the daemon socket is back up. Production code never sets it; the
+    // env-var name is grep-ably explicit so a future audit can confirm.
+    if std::env::var_os("DOT_AGENT_DECK_EXIT_AFTER_HANDSHAKE").is_some() {
+        return ExitCode::SUCCESS;
+    }
     // PRD #76 M2.17: subscribe to the daemon's `AgentEvent` broadcast so
     // the TUI's `AppState` mirrors live agent activity.
     spawn_event_subscriber(attach_path.clone(), state.clone());
@@ -760,7 +834,8 @@ fn run_connect(
 
 /// `dot-agent-deck daemon hello` — PRD #76 M2.21 protocol-version handshake.
 /// Prints a JSON-encoded [`dot_agent_deck::daemon_protocol::AttachResponse`]
-/// carrying `server_version = PROTOCOL_VERSION` and exits.
+/// carrying `server_version = PROTOCOL_VERSION` (and, per PRD #103 M1.3,
+/// `build_version = env!("DAD_BUILD_ID")`) and exits.
 ///
 /// Used by the laptop-side `connect` flow over ssh: the remote binary's
 /// compiled-in `PROTOCOL_VERSION` is what its daemon would speak, so a static
@@ -786,6 +861,79 @@ fn run_daemon_hello_cli() -> ExitCode {
     };
     println!("{json}");
     ExitCode::SUCCESS
+}
+
+/// `dot-agent-deck daemon stop [--force]` — PRD #103 Phase 3 (M3.2).
+/// Documented, non-`kill -9` way to recycle the local daemon after a
+/// binary upgrade. Idempotent (no-op exit 0 when no daemon is running)
+/// and safe-by-default (refuses when managed agents are alive unless
+/// `--force` is passed). The recovery flow is in
+/// [`dot_agent_deck::daemon_stop::run_daemon_stop`]; this function
+/// only translates outcomes into stdout/stderr text and exit codes.
+#[tokio::main]
+async fn run_daemon_stop_cli(force: bool) -> ExitCode {
+    let attach_path = attach_socket_path();
+    match dot_agent_deck::daemon_stop::run_daemon_stop(&attach_path, force).await {
+        Ok(dot_agent_deck::daemon_stop::StopOutcome::NoDaemonRunning) => {
+            println!("no daemon running");
+            ExitCode::SUCCESS
+        }
+        Ok(dot_agent_deck::daemon_stop::StopOutcome::Stopped { pid }) => {
+            println!("daemon stopped (pid {pid})");
+            ExitCode::SUCCESS
+        }
+        Ok(dot_agent_deck::daemon_stop::StopOutcome::ForceKilled { pid }) => {
+            println!("daemon force-killed via SIGKILL (pid {pid})");
+            ExitCode::SUCCESS
+        }
+        Err(dot_agent_deck::daemon_stop::StopError::LiveAgents { ids }) => {
+            eprint!(
+                "{}",
+                dot_agent_deck::daemon_stop::format_live_agents_refusal(&ids)
+            );
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("daemon stop: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `dot-agent-deck daemon restart [--force]` — PRD #103 Phase 3 (M3.3).
+/// Thin wrapper over `daemon stop`: the next TUI invocation lazy-spawns
+/// a fresh daemon per PRD #93. Shares the same `--force` semantics as
+/// `daemon stop`.
+#[tokio::main]
+async fn run_daemon_restart_cli(force: bool) -> ExitCode {
+    let attach_path = attach_socket_path();
+    match dot_agent_deck::daemon_stop::run_daemon_restart(&attach_path, force).await {
+        Ok(dot_agent_deck::daemon_stop::StopOutcome::NoDaemonRunning) => {
+            println!("no daemon running; next invocation will spawn one");
+            ExitCode::SUCCESS
+        }
+        Ok(dot_agent_deck::daemon_stop::StopOutcome::Stopped { pid }) => {
+            println!("daemon stopped (pid {pid}); next invocation will spawn a fresh daemon");
+            ExitCode::SUCCESS
+        }
+        Ok(dot_agent_deck::daemon_stop::StopOutcome::ForceKilled { pid }) => {
+            println!(
+                "daemon force-killed via SIGKILL (pid {pid}); next invocation will spawn a fresh daemon"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(dot_agent_deck::daemon_stop::StopError::LiveAgents { ids }) => {
+            eprint!(
+                "{}",
+                dot_agent_deck::daemon_stop::format_live_agents_refusal(&ids)
+            );
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("daemon restart: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `dot-agent-deck daemon serve` — PRD #76 M4.3. Runs the daemon (hook

@@ -1,5 +1,7 @@
 pub mod agent_pty;
 pub mod ascii_art;
+pub mod build_id;
+pub mod build_version_handshake;
 pub mod config;
 pub mod config_gen;
 pub mod config_validation;
@@ -8,6 +10,7 @@ pub mod daemon;
 pub mod daemon_attach;
 pub mod daemon_client;
 pub mod daemon_protocol;
+pub mod daemon_stop;
 pub mod embedded_pane;
 pub mod error;
 pub mod event;
