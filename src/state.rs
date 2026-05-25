@@ -838,8 +838,9 @@ impl AppState {
         // session-create path below so the orchestration deck shows
         // exactly one card per pane after a respawn.
         //
-        // Backward-compat (auditor finding #3 follow-up): skip the
-        // retire block entirely when the incoming event carries no
+        // Backward-compat (auditor finding #3 follow-up; reaffirmed
+        // against CodeRabbit PR #118 finding #1): skip the retire
+        // block entirely when the incoming event carries no
         // `agent_id`. A pre-F9 hook script (no
         // `DOT_AGENT_DECK_AGENT_ID` env var) running against an
         // upgraded daemon would otherwise wipe a tagged session it
@@ -847,6 +848,18 @@ impl AppState {
         // `tool_count`, `first_prompts`, `started_at`. Mirrors the
         // deliberately-permissive "both sides absent" branch of the
         // reuse guard above.
+        //
+        // Trade-off: keeping this guard means a legacy hook can
+        // create a duplicate (untagged) card alongside the tagged
+        // one. Removing it (CodeRabbit's wildcard suggestion on PR
+        // #118) would silently drop accumulated history every time
+        // an old hook fires. PRD #110 prefers the visible duplicate
+        // over silent data loss; the duplicate is observable and
+        // self-resolves once the legacy hook is upgraded, whereas
+        // lost `recent_events` / `tool_count` / `first_prompts` are
+        // not recoverable. The pinned shape lives in the regression
+        // test `pre_f9_hook_with_no_agent_id_does_not_wipe_tagged_session`
+        // below.
         if event.event_type == EventType::SessionStart
             && event.agent_id.is_some()
             && let Some(ref pane_id) = event.pane_id
@@ -1851,6 +1864,37 @@ mod tests {
             .expect("agent-A session must be preserved when a pre-F9 hook fires");
         assert_eq!(agent_a.tool_count, 1);
         assert_eq!(agent_a.agent_id.as_deref(), Some("agent-A"));
+
+        // CodeRabbit PR #118 finding #2: pin the exact number of
+        // sessions that survive the pre-F9 hook on pane "42". The
+        // retire block is skipped (agent_id is None on the incoming
+        // event), the strict-equality reuse guard above doesn't
+        // match either (agent-A vs None), so the SessionStart falls
+        // through to the create path and a fresh `session-legacy`
+        // is inserted next to the preserved `session-A`. That
+        // duplicate is the intentional trade-off documented next to
+        // the `event.agent_id.is_some()` guard: visible duplicate
+        // card over silent data loss. If the count ever changes the
+        // trade-off has shifted — re-read PRD #110 + the guard
+        // comment before updating the expectation here.
+        let pane_42_sessions: Vec<&str> = state
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.pane_id.as_deref() == Some("42"))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(
+            pane_42_sessions.len(),
+            2,
+            "expected the tagged session-A plus the legacy session-legacy on pane 42, got {pane_42_sessions:?}"
+        );
+        assert!(pane_42_sessions.contains(&"session-A"));
+        assert!(pane_42_sessions.contains(&"session-legacy"));
+        let legacy = &state.sessions["session-legacy"];
+        assert!(
+            legacy.agent_id.is_none(),
+            "the legacy session must carry no agent_id (that's what makes it the duplicate)"
+        );
     }
 
     // Follow-up to 0d5e651 (auditor finding #1): the auto-register
