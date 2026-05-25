@@ -267,6 +267,31 @@ This pins three existing PRD positions together as policy:
 
 **Operational consequence:** if a test flakes in CI, the merge is blocked and the test is either fixed or quarantined with an open issue referencing the catalog ID, *not* retried. Quarantine is for "we know what's wrong, fix is in progress" — it is not a graveyard.
 
+### Decision 11: Failing tests fix the deck, not the test. Discovered bugs are a deliverable, and autonomous runs stop after the discovery pass
+
+The single norm most likely to silently kill this harness's value is the easy path of "the test failed, adjust it until it's green." Once that pattern takes hold, the catalog stops describing the deck and starts describing whatever the code happens to do. This decision pins the opposite norm as policy.
+
+**Default behavior when a test fails:** fix the deck, not the test. The test is the spec; the deck is the implementation; implementations adapt to specs.
+
+**Three legitimate exceptions**, each requiring a written justification in the PR description:
+
+1. **Catalog entry itself was wrong.** Behavior the catalog described was never intended. Correct the catalog, update the test, note in the PR why the original entry was wrong.
+2. **Test overspecified.** Catalog entry is correct but the test asserted on something narrower than the spec required (e.g., a specific glyph instead of "status indicator present"). Loosen the test, keep the catalog.
+3. **Intentional behavior change driven by another PRD.** The catalog updates as part of that PRD's scope; the catalog ID stays stable, its prose updates.
+
+Anything outside those three → the deck has a bug → fix the deck.
+
+**Discovered Issues are a real PRD deliverable.** As implementation milestones (M2+) write tests and run them, every test that fails for a non-exception reason produces a `Discovered Issues` entry. Each entry: one-line description, catalog ID that surfaced it, status (`fixed in <milestone>` | `filed as #NNN` | `won't-fix: <rationale>`). See the [Discovered Issues](#discovered-issues) section below; M1 commits to the format, M2+ populate it.
+
+**Autonomous-execution stop point.** If this PRD is executed under full agent autonomy (e.g. via `/dot-ai-prd-full` or any similar autonomous runner), the agent **must stop and surface the discovered-issues list to the user before fixing any of them**, except for the three exceptions above which the agent may resolve in-flight with a PR-description note. The rationale:
+
+- Discovered bugs may be larger than this PRD's scope (e.g., a rendering bug that belongs in PRD #84 instead).
+- Some bugs may need user-level prioritization (fix now vs. file as separate PRD).
+- Some bugs may indicate design problems that need direction, not silent patching.
+- Allowing the agent to fix everything inline would turn this PRD into an open-ended bug-fixing campaign with no checkpoint.
+
+The stop is mandatory, not advisory. The agent presents the list, the user decides which to fix in this PRD, which to file as separate work, and which (if any) are won't-fix. Only after that decision does fix-up work begin.
+
 ## Sequencing note: PRD #77 vs PRD #84 (rendering rework)
 
 PRD #84 is a structural rework of the rendering layer (single contract for layout → PTY size → drawn cells). Many of the visual bugs it targets are exactly the class this harness would prevent regressions on.
@@ -315,6 +340,18 @@ These are tool-agnostic gotchas that any implementation must address. They are i
 *Populated by M1.*
 
 **Pre-committed item (regardless of how M1 reshapes the rest):** the same milestone that ships the first usable end-to-end harness must also update `CLAUDE.md` with the convention that functional UI changes require corresponding harness tests. The convention arrives the moment it can be followed, not before. See [Appendix A](#appendix-a-proposed-claudemd-addition) for proposed wording.
+
+## Discovered Issues
+
+*Populated by M2+ as tests are written and run. See Decision 11 for the policy. If executed under agent autonomy, the agent stops after this list is populated and surfaces it to the user before fixing.*
+
+Entry format:
+
+| ID | Catalog ref | Description | Status |
+|---|---|---|---|
+| *(empty until M2+)* | | | |
+
+`Status` is one of: `fixed in <milestone>`, `filed as #NNN`, `won't-fix: <rationale>`.
 
 ## Appendix A: Proposed CLAUDE.md Additions
 
