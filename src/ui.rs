@@ -2157,6 +2157,28 @@ fn focus_deck(
     true
 }
 
+/// PRD #68: mirror a selection move made by `handle_normal_key`
+/// (j/k/Up/Down) into the embedded controller's focus. The per-frame
+/// "sync `ui.selected_index` ← focused pane" block at the top of the
+/// outer event loop would otherwise roll the move back on the next
+/// iteration. The digit-jump path (`Ctrl+d` → `1`-`9`) already pairs
+/// selection with focus via [`focus_deck`]; this helper is its
+/// counterpart for the cycling keys. No-op when the index didn't
+/// change or the new selection lacks a `pane_id`.
+fn mirror_selection_into_focus(
+    prev_selected_index: usize,
+    ui: &UiState,
+    filtered: &[(&String, &SessionState)],
+    pane: &dyn PaneController,
+) {
+    if ui.selected_index != prev_selected_index
+        && let Some((_, session)) = filtered.get(ui.selected_index)
+        && let Some(pane_id) = session.pane_id.as_ref()
+    {
+        let _ = pane.focus_pane(pane_id);
+    }
+}
+
 fn handle_normal_key(
     key: KeyEvent,
     ui: &mut UiState,
@@ -4510,22 +4532,7 @@ pub fn run_tui(
                             .map(|session| session.status.clone());
                         let prev_selected_index = ui.selected_index;
                         let r = handle_normal_key(key, &mut ui, total, selected_status);
-                        // PRD #68: j/k/Up/Down update `ui.selected_index`,
-                        // but the per-frame "sync selected_index ← focused
-                        // pane" block at the top of this outer loop
-                        // resets the index back to whatever pane is
-                        // currently focused — so plain selection moves
-                        // never visibly land. Mirror the selection into
-                        // focus here so the next iteration's sync agrees
-                        // with the user's move. This matches what
-                        // `focus_deck` (Ctrl+d → 1-9) already does for
-                        // the digit-jump path.
-                        if ui.selected_index != prev_selected_index
-                            && let Some((_, session)) = filtered.get(ui.selected_index)
-                            && let Some(pane_id) = session.pane_id.as_ref()
-                        {
-                            let _ = pane.focus_pane(pane_id);
-                        }
+                        mirror_selection_into_focus(prev_selected_index, &ui, &filtered, &*pane);
                         r
                     }
                     UiMode::Filter => handle_filter_key(key, &mut ui),
@@ -8060,7 +8067,7 @@ mod tests {
             }
         }
 
-        let mut state = AppState::default();
+        let state = AppState::default();
         let cfg = OrchestrationConfig {
             name: "tdd-cycle".into(),
             roles: vec![
@@ -10197,12 +10204,14 @@ mod tests {
         );
     }
 
-    /// Companion to the focus_deck test: simulate the j/k dispatch
-    /// loop fix end-to-end. `handle_normal_key` is the entry point the
-    /// fix wraps; the dispatch loop's post-handler hook then calls
-    /// `focus_pane` on the new selection. Pin both halves together so
-    /// a future refactor can't silently delete the focus mirror and
-    /// re-introduce PRD #68.
+    /// Companion to the focus_deck test: pin the dispatch-loop's
+    /// "after `handle_normal_key`, mirror the new selection into
+    /// focus" step. The production loop calls
+    /// `mirror_selection_into_focus`; this test calls the SAME
+    /// helper, so a future refactor that deletes the production call
+    /// site re-introduces PRD #68 even if the helper still exists,
+    /// and a refactor that deletes the helper breaks this test
+    /// outright.
     #[test]
     fn jk_navigation_mirrors_selection_into_focus() {
         let mut snapshot = AppState::default();
@@ -10222,31 +10231,31 @@ mod tests {
         let mut ui = default_ui();
         ui.selected_index = 0;
 
-        // Inline the dispatch-loop fix shape so a future refactor that
-        // drops the mirror trips the test (the production loop lives
-        // inside `run_ui`, which is too heavy to spin up here).
-        let move_with_focus = |ui: &mut UiState, key: KeyEvent| {
+        // Drive the production code path: `handle_normal_key` plus
+        // the dispatch-loop hook `mirror_selection_into_focus`. If
+        // either is deleted from `run_tui`, this test still exercises
+        // both — but the production bug returns silently because the
+        // outer loop's per-frame sync is what relies on the helper
+        // being called. The companion code-review check is "every
+        // `handle_normal_key` callsite in `run_tui` Normal mode pairs
+        // with `mirror_selection_into_focus`."
+        let press = |ui: &mut UiState, key: KeyEvent| {
             let prev = ui.selected_index;
             let _ = handle_normal_key(key, ui, total, None);
-            if ui.selected_index != prev
-                && let Some((_, session)) = filtered.get(ui.selected_index)
-                && let Some(pid) = session.pane_id.as_ref()
-            {
-                let _ = crate::pane::PaneController::focus_pane(&pc, pid);
-            }
+            mirror_selection_into_focus(prev, ui, &filtered, &pc);
         };
 
         // j: 0 → 1, focus mirrored to p1.
-        move_with_focus(
+        press(
             &mut ui,
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
         );
         assert_eq!(ui.selected_index, 1);
         // Down: 1 → 2, focus mirrored to p2.
-        move_with_focus(&mut ui, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        press(&mut ui, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(ui.selected_index, 2);
         // k: 2 → 1, focus mirrored to p1.
-        move_with_focus(
+        press(
             &mut ui,
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
         );
