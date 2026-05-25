@@ -1,6 +1,6 @@
 # PRD #100: Fix Orchestrator Spawn-Time Role Prompt Sometimes Not Submitting
 
-**Status**: Implementation complete (second attempt) — pending release
+**Status**: Complete — merged 2026-05-25
 **Priority**: High
 **Created**: 2026-05-21
 **Updated**: 2026-05-25
