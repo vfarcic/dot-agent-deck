@@ -398,9 +398,17 @@ impl TabManager {
         // for delegation routing in `ui.rs`) will see "" and find no
         // matching pane — same observable effect as the role being
         // missing.
+        // Follow-up to 0d5e651 (reviewer finding #5): synthetic
+        // dead-slot ids (`__dead-slot__-…`) are seeded into otherwise
+        // `None` slots BEFORE this call so the orchestration tab keeps
+        // the role's card visible. They are placeholder cards, not
+        // live agents — classify them as `Failed` instead of `Working`
+        // so any future consumer (e.g. a "role died" badge) reads the
+        // correct semantic signal.
         let role_statuses: Vec<OrchestrationRoleStatus> = role_pane_ids
             .iter()
             .map(|slot| match slot {
+                Some(id) if crate::ui::is_dead_slot_pane_id(id) => OrchestrationRoleStatus::Failed,
                 Some(_) => OrchestrationRoleStatus::Working,
                 None => OrchestrationRoleStatus::Failed,
             })
@@ -560,8 +568,18 @@ impl TabManager {
                 // dead-slot sentinel — skip the empty-string case
                 // explicitly so a caller asking about pane_id="" doesn't
                 // get a spurious orchestration tab match.
+                // Follow-up to 0d5e651 (reviewer finding #6): also skip
+                // synthetic dead-slot pane ids for consistency with
+                // `close_tab`, `all_managed_pane_ids`, and
+                // `resize_orchestration_role_panes_for`. No production
+                // caller hits the synthetic-id branch today, but the
+                // inconsistency is a footgun for any future code that
+                // assumes "if `tab_index_for_pane` returns Some, the
+                // pane is real."
                 Tab::Orchestration { role_pane_ids, .. }
-                    if !pane_id.is_empty() && role_pane_ids.contains(&pane_id.to_string()) =>
+                    if !pane_id.is_empty()
+                        && !crate::ui::is_dead_slot_pane_id(pane_id)
+                        && role_pane_ids.contains(&pane_id.to_string()) =>
                 {
                     return Some(i);
                 }
@@ -1205,6 +1223,101 @@ mod tests {
         assert_eq!(tm.active_index(), 0);
         let closed = mock.closed.lock().unwrap();
         assert_eq!(closed.len(), 2);
+    }
+
+    // Follow-up to 0d5e651 (reviewer finding #6): `tab_index_for_pane`
+    // must reject synthetic dead-slot ids for consistency with
+    // `close_tab`, `all_managed_pane_ids`, and
+    // `resize_orchestration_role_panes_for`. A synthetic id is a
+    // placeholder card, not a real pane — returning a tab index for
+    // it would mislead any future caller that assumes "Some ⇒ real
+    // pane."
+    #[test]
+    fn tab_index_for_pane_rejects_synthetic_dead_slot_id() {
+        let mock = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(mock);
+
+        let role = |name: &str, start: bool| OrchestrationRoleConfig {
+            name: name.to_string(),
+            command: "claude".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        };
+        let config = OrchestrationConfig {
+            name: "tab-index-dead-slot".to_string(),
+            roles: vec![role("tester", true), role("coder", false)],
+        };
+        let synthetic = crate::ui::dead_slot_pane_id("/tmp", "tab-index-dead-slot", 1);
+        tm.open_orchestration_tab_with_existing_role_panes(
+            &config,
+            "/tmp",
+            vec![Some("real-1".to_string()), Some(synthetic.clone())],
+        )
+        .unwrap();
+
+        assert_eq!(tm.tab_index_for_pane("real-1"), Some(1));
+        assert_eq!(
+            tm.tab_index_for_pane(&synthetic),
+            None,
+            "synthetic dead-slot id must NOT resolve to a tab index"
+        );
+    }
+
+    // Follow-up to 0d5e651 (reviewer finding #5): dead-slot synthetic
+    // ids are placeholder cards, not live agents. The
+    // `Some(_) → Working` mapping previously classified them as
+    // `Working` because the hydration path now fills `None` slots
+    // with `Some(synthetic)` BEFORE calling
+    // `open_orchestration_tab_with_existing_role_panes`. Pin that
+    // synthetic ids resolve to `Failed` so the semantic signal is
+    // correct for any future consumer.
+    #[test]
+    fn role_status_for_dead_slot_synthetic_id_is_failed() {
+        let mock = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(mock);
+
+        let role = |name: &str, start: bool| OrchestrationRoleConfig {
+            name: name.to_string(),
+            command: "claude".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        };
+        let config = OrchestrationConfig {
+            name: "with-dead-slot-status".to_string(),
+            roles: vec![
+                role("tester", true),
+                role("coder", false),
+                role("reviewer", false),
+            ],
+        };
+
+        let synthetic = crate::ui::dead_slot_pane_id("/tmp", "with-dead-slot-status", 1);
+        tm.open_orchestration_tab_with_existing_role_panes(
+            &config,
+            "/tmp",
+            vec![
+                Some("real-1".to_string()),
+                Some(synthetic),
+                Some("real-2".to_string()),
+            ],
+        )
+        .unwrap();
+
+        if let Tab::Orchestration { role_statuses, .. } = tm.active_tab() {
+            assert_eq!(role_statuses[0], OrchestrationRoleStatus::Working);
+            assert_eq!(
+                role_statuses[1],
+                OrchestrationRoleStatus::Failed,
+                "dead-slot synthetic id must resolve to Failed, not Working"
+            );
+            assert_eq!(role_statuses[2], OrchestrationRoleStatus::Working);
+        } else {
+            panic!("expected Orchestration tab");
+        }
     }
 
     #[test]

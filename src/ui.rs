@@ -1467,8 +1467,20 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
 /// the left-side card grid renders 5 cards (one per role) because the
 /// placeholder session sitting on the synthetic id satisfies the
 /// `pane_id ∈ role_pane_ids` filter in [`render_frame`].
+///
+/// Follow-up to 0d5e651 (auditor finding #4): the variable-width
+/// components are length-prefixed so distinct (cwd,
+/// orchestration_name, role_index) tuples can never collide. The
+/// previous `-`-separated form was ambiguous whenever cwd or
+/// orchestration_name contained hyphens: e.g. (cwd="/a", name="b-c",
+/// idx=1) and (cwd="/a-b", name="c", idx=1) both produced
+/// `__dead-slot__-/a-b-c-1`.
 pub fn dead_slot_pane_id(cwd: &str, orchestration_name: &str, role_index: usize) -> String {
-    format!("{DEAD_SLOT_PREFIX}{cwd}-{orchestration_name}-{role_index}")
+    format!(
+        "{DEAD_SLOT_PREFIX}{cwd_len}-{cwd}-{name_len}-{orchestration_name}-{role_index}",
+        cwd_len = cwd.len(),
+        name_len = orchestration_name.len(),
+    )
 }
 
 /// Reserved prefix for synthetic dead-slot pane ids produced by
@@ -1500,8 +1512,10 @@ pub fn is_dead_slot_pane_id(pane_id: &str) -> bool {
 /// `agent_type = None` placeholder session keyed on it (so the dead
 /// slot renders as "No agent" in the card grid), and returns the
 /// fully-populated `role_pane_ids` to the caller. The synthetic id is
-/// NOT a managed pane — `register_pane` is deliberately skipped so
-/// `apply_event` won't accept hook events forged against it.
+/// NOT a managed pane — `register_pane` is deliberately skipped, and
+/// `apply_event` additionally rejects synthetic ids from its
+/// auto-register branch so a forged hook event cannot promote one
+/// into `managed_pane_ids`.
 pub fn fill_dead_slots_with_placeholders(
     role_pane_ids: &mut [Option<String>],
     cwd: &str,
@@ -3459,9 +3473,19 @@ pub fn run_tui(
         let filtered: Vec<(&String, &SessionState)> = match tab_manager.active_tab() {
             Tab::Dashboard => {
                 let exclude = tab_manager.all_managed_pane_ids();
+                // Follow-up to 0d5e651 (auditor finding #2): synthetic
+                // dead-slot placeholders live on the orchestration tab
+                // only. `all_managed_pane_ids` deliberately skips them
+                // (close_tab can't `close_pane` a synthetic id), so we
+                // must filter them out here too — otherwise the
+                // "No agent" ghost card leaks onto the Dashboard.
                 all_filtered
                     .into_iter()
-                    .filter(|(_, s)| s.pane_id.as_ref().is_none_or(|pid| !exclude.contains(pid)))
+                    .filter(|(_, s)| {
+                        s.pane_id
+                            .as_ref()
+                            .is_none_or(|pid| !exclude.contains(pid) && !is_dead_slot_pane_id(pid))
+                    })
                     .collect()
             }
             Tab::Orchestration { role_pane_ids, .. } => {
@@ -7791,14 +7815,40 @@ mod tests {
         assert!(!is_dead_slot_pane_id("42"));
     }
 
+    // Follow-up to 0d5e651 (auditor finding #4): the old format
+    // `__dead-slot__-{cwd}-{name}-{idx}` was ambiguous whenever cwd
+    // or orchestration_name contained hyphens. Two distinct tuples
+    // could produce the same synthetic id, which would then alias
+    // their placeholder sessions. Pin that the length-prefixed format
+    // disambiguates the textbook collision case.
+    #[test]
+    fn dead_slot_pane_id_disambiguates_hyphenated_inputs() {
+        // Under the old `-`-separated form both inputs formatted to
+        // `__dead-slot__-/a-b-c-1`. Under the length-prefixed form
+        // they are guaranteed distinct.
+        let a = dead_slot_pane_id("/a", "b-c", 1);
+        let b = dead_slot_pane_id("/a-b", "c", 1);
+        assert_ne!(
+            a, b,
+            "differently-hyphenated (cwd, orchestration_name) tuples \
+             must produce distinct synthetic ids"
+        );
+    }
+
     #[test]
     fn fill_dead_slots_is_idempotent_across_repeat_calls() {
         // Reconnect runs hydration again — calling
         // `fill_dead_slots_with_placeholders` on already-filled slots
         // must not change them and must not double-seed the
-        // placeholder session. (The placeholder helper itself
-        // overwrites the existing entry under the same session id, so
-        // the count stays at 1.)
+        // placeholder session.
+        //
+        // Follow-up to 0d5e651 (reviewer finding #7): the original
+        // comment claimed the helper "overwrites the existing entry
+        // under the same session id" on the second pass. That's
+        // wrong — the helper's body SKIPS slots where `slot.is_some()`,
+        // so `insert_placeholder_session` is never re-invoked. The
+        // count stays at 1 because the synthetic slot is already
+        // filled on the second pass.
         use crate::state::AppState;
 
         let mut state = AppState::default();
@@ -7810,7 +7860,8 @@ mod tests {
             .values()
             .filter(|s| s.pane_id.as_deref().is_some_and(is_dead_slot_pane_id))
             .count();
-        // Second pass — same input shape.
+        // Second pass — same input shape (slots are already filled,
+        // so the helper short-circuits on each iteration).
         fill_dead_slots_with_placeholders(&mut slots, "/work", "tdd-cycle", &mut state);
         let placeholder_count_second = state
             .sessions
@@ -7820,6 +7871,141 @@ mod tests {
         assert_eq!(slots[1].as_deref(), Some(first_dead.as_str()));
         assert_eq!(placeholder_count_first, 1);
         assert_eq!(placeholder_count_second, 1);
+    }
+
+    // Follow-up to 0d5e651 (reviewer finding #7): a more realistic
+    // idempotency scenario than the one above. A real
+    // disconnect/reconnect loop rebuilds `role_pane_ids` from scratch
+    // every time `hydrate_from_daemon` runs — the slot for a dead
+    // role is `None` again, not pre-filled. Verify that running the
+    // helper twice in a row (with the slot reset between calls)
+    // produces the SAME synthetic id (because `dead_slot_pane_id` is
+    // deterministic in `(cwd, name, role_index)`) and that
+    // `insert_placeholder_session` reuses the same `pane-{synthetic}`
+    // session key so only one placeholder ever exists for the slot.
+    #[test]
+    fn fill_dead_slots_produces_stable_id_across_reconnect_rebuilds() {
+        use crate::state::AppState;
+
+        let mut state = AppState::default();
+        let cwd = "/work";
+        let orchestration_name = "tdd-cycle";
+
+        // First reconnect: dead role at index 1.
+        let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
+        fill_dead_slots_with_placeholders(&mut slots, cwd, orchestration_name, &mut state);
+        let first_dead = slots[1].clone().unwrap();
+
+        // Second reconnect: hydration rebuilt `role_pane_ids` from
+        // scratch — the dead role's slot is `None` again. Run the
+        // helper a second time.
+        let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
+        fill_dead_slots_with_placeholders(&mut slots, cwd, orchestration_name, &mut state);
+        let second_dead = slots[1].clone().unwrap();
+
+        // The synthetic id is deterministic, so both reconnect
+        // attempts produce the same id …
+        assert_eq!(first_dead, second_dead);
+        // … and the placeholder session is keyed on
+        // `pane-{synthetic}`, so a second `insert_placeholder_session`
+        // call reuses the existing entry rather than spawning a
+        // sibling. Exactly one dead-slot session must exist.
+        let dead_session_count = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref().is_some_and(is_dead_slot_pane_id))
+            .count();
+        assert_eq!(
+            dead_session_count, 1,
+            "repeated reconnect loops must not accumulate dead-slot \
+             placeholder sessions; got {dead_session_count}"
+        );
+    }
+
+    // Follow-up to 0d5e651 (auditor finding #2): dead-slot placeholder
+    // sessions belong to the orchestration tab only. The dashboard
+    // scoping uses `all_managed_pane_ids` as an EXCLUDE filter, but
+    // that set now skips synthetic ids (otherwise `close_tab` would
+    // try to `close_pane` them). Without an explicit `is_dead_slot`
+    // filter on the dashboard side, the placeholder "No agent" card
+    // leaks onto the Dashboard tab as a ghost. Pin the exclusion.
+    #[test]
+    fn dashboard_filter_excludes_dead_slot_placeholder_sessions() {
+        use crate::state::AppState;
+
+        let mut state = AppState::default();
+
+        // A real session on a real pane that DOES belong to an
+        // orchestration tab (so it's in `exclude`) — this models the
+        // existing behaviour that orchestration-tab sessions are
+        // hidden from the dashboard.
+        let real_pane = "p-orchestrator".to_string();
+        state.register_pane(real_pane.clone());
+        state.insert_placeholder_session(
+            real_pane.clone(),
+            Some("/work".to_string()),
+            Some(AgentType::ClaudeCode),
+            Some("agent-A".to_string()),
+        );
+
+        // A dead-slot placeholder seeded by `fill_dead_slots_with_placeholders`.
+        let mut slots: Vec<Option<String>> = vec![Some(real_pane.clone()), None];
+        fill_dead_slots_with_placeholders(&mut slots, "/work", "tdd-cycle", &mut state);
+        let dead_pane = slots[1].clone().unwrap();
+
+        // A separate session that lives only on the dashboard (not in
+        // any orchestration tab) — this is what should survive the
+        // filter.
+        let dashboard_pane = "p-dashboard-only".to_string();
+        state.register_pane(dashboard_pane.clone());
+        state.insert_placeholder_session(
+            dashboard_pane.clone(),
+            Some("/work".to_string()),
+            Some(AgentType::ClaudeCode),
+            Some("agent-B".to_string()),
+        );
+
+        // Build the exclude set the way `TabManager::all_managed_pane_ids`
+        // does for an orchestration tab: include the real pane, skip
+        // the synthetic dead-slot id.
+        let exclude: Vec<String> = slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|id| !is_dead_slot_pane_id(id))
+            .cloned()
+            .collect();
+        assert!(
+            !exclude.contains(&dead_pane),
+            "test precondition: synthetic id must NOT be in the exclude set"
+        );
+
+        // Replicate the dashboard scoping filter at
+        // `render_frame`'s Tab::Dashboard branch.
+        let visible_on_dashboard: Vec<String> = state
+            .sessions
+            .values()
+            .filter(|s| {
+                s.pane_id
+                    .as_ref()
+                    .is_none_or(|pid| !exclude.contains(pid) && !is_dead_slot_pane_id(pid))
+            })
+            .filter_map(|s| s.pane_id.clone())
+            .collect();
+
+        assert!(
+            !visible_on_dashboard.contains(&dead_pane),
+            "dead-slot placeholder must NOT appear on the Dashboard; \
+             got {visible_on_dashboard:?}"
+        );
+        assert!(
+            !visible_on_dashboard.contains(&real_pane),
+            "real orchestration-tab pane must continue to be excluded \
+             from the Dashboard via the existing path"
+        );
+        assert!(
+            visible_on_dashboard.contains(&dashboard_pane),
+            "dashboard-only session must remain visible; got {visible_on_dashboard:?}"
+        );
     }
 
     #[test]

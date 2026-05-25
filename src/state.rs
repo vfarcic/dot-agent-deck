@@ -785,6 +785,17 @@ impl AppState {
         if let Some(ref pane_id) = event.pane_id {
             if !self.managed_pane_ids.contains(pane_id) {
                 if event.event_type == EventType::SessionStart {
+                    // Defense in depth (auditor finding #1 follow-up):
+                    // reject the synthetic dead-slot id format from the
+                    // auto-register branch so a forged hook event can't
+                    // bring an `__dead-slot__-…` id into existence.
+                    // Production never sets a synthetic id as
+                    // `DOT_AGENT_DECK_PANE_ID`, but `is_valid_pane_id_env`
+                    // admits the format on its own (it only checks for
+                    // `[A-Za-z0-9_-]`).
+                    if crate::ui::is_dead_slot_pane_id(pane_id) {
+                        return;
+                    }
                     // Auto-register the pane to handle the startup race where
                     // the hook fires before register_pane is called.
                     self.managed_pane_ids.insert(pane_id.clone());
@@ -826,7 +837,18 @@ impl AppState {
         // stale sibling(s) before falling through to the
         // session-create path below so the orchestration deck shows
         // exactly one card per pane after a respawn.
+        //
+        // Backward-compat (auditor finding #3 follow-up): skip the
+        // retire block entirely when the incoming event carries no
+        // `agent_id`. A pre-F9 hook script (no
+        // `DOT_AGENT_DECK_AGENT_ID` env var) running against an
+        // upgraded daemon would otherwise wipe a tagged session it
+        // doesn't know the identity of — losing its `recent_events`,
+        // `tool_count`, `first_prompts`, `started_at`. Mirrors the
+        // deliberately-permissive "both sides absent" branch of the
+        // reuse guard above.
         if event.event_type == EventType::SessionStart
+            && event.agent_id.is_some()
             && let Some(ref pane_id) = event.pane_id
         {
             let to_remove: Vec<String> = self
@@ -1782,6 +1804,81 @@ mod tests {
         assert!(
             !state.sessions.contains_key("session-A"),
             "agent-A's stale session card must be retired"
+        );
+    }
+
+    // Follow-up to 0d5e651 (auditor finding #3): a pre-F9 hook script
+    // (no `DOT_AGENT_DECK_AGENT_ID` env, so `agent_id = None`) firing
+    // `SessionStart` against a pane that already has a session with
+    // `agent_id = Some(…)` must NOT trigger the retire-stale-sibling
+    // block. Otherwise an upgraded daemon would silently wipe the
+    // tagged session — losing its `recent_events`, `tool_count`,
+    // `first_prompts`, and `started_at` — every time an old hook ran.
+    #[test]
+    fn pre_f9_hook_with_no_agent_id_does_not_wipe_tagged_session() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+
+        // Existing session bound to agent-A with some accumulated state.
+        let mut start_a = make_event("session-A", EventType::SessionStart);
+        start_a.pane_id = Some("42".to_string());
+        start_a.agent_id = Some("agent-A".to_string());
+        state.apply_event(start_a);
+        // Add a tool event so the session has something to lose
+        // (tool_count increments on `ToolEnd`, not `ToolStart`).
+        let mut tool_start = make_event("session-A", EventType::ToolStart);
+        tool_start.pane_id = Some("42".to_string());
+        tool_start.agent_id = Some("agent-A".to_string());
+        tool_start.tool_name = Some("Bash".to_string());
+        state.apply_event(tool_start);
+        let mut tool_end = make_event("session-A", EventType::ToolEnd);
+        tool_end.pane_id = Some("42".to_string());
+        tool_end.agent_id = Some("agent-A".to_string());
+        state.apply_event(tool_end);
+        assert_eq!(state.sessions["session-A"].tool_count, 1);
+
+        // A pre-F9 hook (no agent_id) fires SessionStart on the same
+        // pane. The retire block must be skipped.
+        let mut legacy = make_event("session-legacy", EventType::SessionStart);
+        legacy.pane_id = Some("42".to_string());
+        legacy.agent_id = None;
+        state.apply_event(legacy);
+
+        // agent-A's session must still exist with its tool_count intact.
+        let agent_a = state
+            .sessions
+            .get("session-A")
+            .expect("agent-A session must be preserved when a pre-F9 hook fires");
+        assert_eq!(agent_a.tool_count, 1);
+        assert_eq!(agent_a.agent_id.as_deref(), Some("agent-A"));
+    }
+
+    // Follow-up to 0d5e651 (auditor finding #1): the auto-register
+    // branch in `apply_event` would happily admit any pane_id that
+    // matches `is_valid_pane_id_env`, including the synthetic
+    // dead-slot format `__dead-slot__-…`. Defense in depth — even
+    // though synthetic ids are never set as `DOT_AGENT_DECK_PANE_ID`
+    // in production, the docstring previously claimed the synthetic
+    // id was unreachable via hooks. Pin the reject.
+    #[test]
+    fn session_start_with_synthetic_dead_slot_id_does_not_auto_register() {
+        let mut state = AppState::default();
+        let synthetic = crate::ui::dead_slot_pane_id("/work", "tdd-cycle", 4);
+
+        let mut ev = make_event("forged-uuid", EventType::SessionStart);
+        ev.pane_id = Some(synthetic.clone());
+        ev.agent_id = Some("agent-X".to_string());
+        state.apply_event(ev);
+
+        assert!(
+            !state.managed_pane_ids.contains(&synthetic),
+            "synthetic dead-slot id must NOT be promoted into managed_pane_ids \
+             via the auto-register branch"
+        );
+        assert!(
+            !state.sessions.contains_key("forged-uuid"),
+            "no session should be created for a forged hook event against a \
+             synthetic id"
         );
     }
 
