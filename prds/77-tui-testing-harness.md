@@ -63,13 +63,13 @@ This eliminates LLM non-determinism as a flake source and makes the same test me
 
 ### Cross-platform rollout
 
-Same test code, three-stage rollout:
+Same test code, two execution surfaces (per Decision 8): **fast tier in CI** across all supported OSes, **e2e tier on the developer's local machine** at the OS that developer happens to use.
 
-1. **macOS local first** — developer laptop, primary feedback loop.
-2. **Linux in GitHub Actions** — CI gate. Same tests, headless ubuntu-latest runner.
-3. **Windows** — last. Specific runner choice (GHA `windows-latest`, self-hosted, or other) decided when M1 produces the test catalog and we know the actual ConPTY pain points.
+1. **macOS local first** — developer laptop, primary feedback loop. Both fast tier and e2e run here.
+2. **Linux fast tier in GitHub Actions** — `cargo test-fast` on ubuntu-latest as a CI gate. E2e on Linux runs when a Linux developer runs it locally.
+3. **Windows** — last. Fast tier in CI on `windows-latest` when the harness is ready for it. E2e on Windows runs when a Windows developer runs it locally. ConPTY pain points are characterized at that point.
 
-If a test cannot run on a platform for a real reason (e.g. agent CLI not installed), it skips with an explicit reason, not a silent pass.
+If a test cannot run on a platform for a real reason (e.g. agent CLI not installed locally), it skips with an explicit reason, not a silent pass.
 
 ## Design Decisions
 
@@ -213,9 +213,9 @@ tests/
 
 **Added to M1 scope** (in addition to the existing test catalog deliverable): (a) define the catalog ID format, (b) commit to the file-layout-mirrors-catalog convention, (c) write the linkage-check tool. These are small additions; the heavy lift remains producing the catalog itself.
 
-### Decision 8: Synthetic events by default, real-agent tests reserved for chain smoke; Haiku in CI on every PR
+### Decision 8: Synthetic events by default; real-agent tests reserved for chain smoke; e2e runs locally only
 
-This resolves the open question previously flagged at line 115 ("do we run every test against a real agent, or do some tests synthesize hook events directly?") and the CI economics question.
+This resolves the open question previously flagged at line 115 ("do we run every test against a real agent, or do some tests synthesize hook events directly?") and the question of where the e2e suite executes.
 
 **The deck's only contract with the agent is the hook event stream.** A test that wants to verify "pane status flips to `waiting_for_input` when a permission prompt arrives" does not need a real Claude Code session producing that event; it can write the hook JSON directly to the deck's hook socket and assert the deck reacts correctly. That's a *synthetic-event test* — milliseconds, free, deterministic, no LLM in the loop.
 
@@ -223,12 +223,38 @@ This resolves the open question previously flagged at line 115 ("do we run every
 
 **Default for new tests:** synthetic. A test is real-agent only when it explicitly answers "does the agent → hook → deck chain still work end-to-end?" — typically one or two tests per supported agent CLI, not one per behavior.
 
-**CI configuration:**
-- Real-agent tests run with **Haiku** (`claude-haiku-4-5-20251001`) — the cheapest current model. The deck asserts on its own grid/protocol, not on agent text content, so model quality is irrelevant; cost is the only axis.
-- Real-agent tests run **on every PR**, not nightly-only. Conditional on the synthetic-default policy above, the per-PR token cost is small enough that gating PRs on the full chain is worth it.
-- API keys live in GHA secrets; PR-from-fork handling is M2+ scope (fork PRs may have to skip real-agent tests until then).
+**Execution model — local only, before PR:**
 
-This pair of policies — synthetic-by-default plus Haiku-on-every-PR — is the load-bearing assumption that makes the harness affordable. If a future change pushes real-agent tests above ~10% of the suite, the cost math needs revisiting.
+- **`cargo test-fast` runs in CI** on every PR as today. Protocol/state tests plus L1 widget/render tests. Cheap, no API keys, no agent CLIs required on the runner.
+- **`cargo test-e2e` runs locally only**, on the developer's machine, at the end of development and before opening the PR. Enforced by the orchestrator's pre-release gate (Decision 6) and by `feedback_validate_pre_pr.md`. Never runs in GHA.
+- **No nightly e2e drift run.** If the chain breaks (e.g. an agent CLI changes its event format), it surfaces the next time a developer runs `cargo test-e2e` before the next PR. Acceptable given current release cadence; revisit only if drift actually starts biting.
+
+**Why local-only:**
+- Costs land on the developer's account, not CI.
+- No Anthropic API keys in GHA secrets, no rotation, no leak risk.
+- No fork-PR auth carve-outs.
+- macOS local *is* the primary user environment — closer to real-user behavior than an ubuntu-latest runner.
+- Aligns with the existing pre-PR validation workflow rather than introducing a parallel CI gate.
+
+**When real-agent tests do run locally, use Haiku** (`claude-haiku-4-5-20251001`) — the deck asserts on its own grid/protocol, not on agent text content, so model quality is irrelevant; cost is the only axis. M2+ harness implementation pins this via env (`ANTHROPIC_MODEL` or equivalent) so a test run can't accidentally pick a more expensive model.
+
+This pair of policies — synthetic-by-default plus e2e-local-only — keeps the harness cheap and removes the CI-secrets-and-fork-PRs failure surface entirely.
+
+### Decision 10: Existing tests are re-bucketed during M1 catalog work, not enumerated up front
+
+The non-goal "Replacing existing protocol/state-layer tests in `tests/`. Those stay." (line 144) is still correct as a default — but it left an open question: are some existing tests already doing what the harness will do, just without the structure Decisions 6, 7, and 8 now define?
+
+That question is not answered now. Trying to enumerate the current state of `tests/` is wasted work because new tests will be added between today and the day M1 starts, so any list would be stale. Instead, the policy below runs as part of M1's catalog construction, against whatever is in `tests/` at that point:
+
+**Three buckets, applied to every file in `tests/` at M1 time:**
+
+1. **Pure protocol/state, no user-observable behavior** → leave alone. Doesn't need a catalog entry; not part of the spec.
+2. **Covers a user-observable behavior but already works as-is** → add a catalog entry, add a `#[spec("...")]` annotation on the existing tests. No file move, no rewrite. The linkage check now sees it; the catalog credits the coverage that already exists.
+3. **Spawns a subprocess *and* asserts on UI/protocol surface the new harness was built to express** → rename to `e2e_*.rs`, gate with `#[cfg(feature = "e2e")]`, refactor onto the harness API. These are the migrations.
+
+The third bucket is the expensive one and is expected to be small. Bucket 2 is the cheap win — pulls existing coverage into the spec without rewriting anything.
+
+**Added to M1 scope:** the audit pass produces, per existing test file, a one-line classification (bucket 1 / 2 / 3) and, for bucket 2, the catalog ID(s) it maps to. For bucket 3, the audit only flags the file as migration work; the actual rename + refactor lands in the implementation milestones, not in M1.
 
 ### Decision 9: No auto-retry; flake = bug, fix it
 
@@ -306,7 +332,7 @@ The L1/L2 split is deliberate: it gives reviewers a precise question to answer (
 |---|---|
 | Test flake from timing assumptions | Quiescence-based waits + render-stable string signals; never raw `sleep`. |
 | Windows ConPTY surprises (Decision 4) | Design for parsed grid only, not raw bytes. Build macOS+Linux first; Windows is a verification step, not a redesign. |
-| Real-agent API costs on every CI run | Use cheap models in CI; keep test count bounded; consider a "smoke" subset on PRs and a "full" suite nightly. |
+| Real-agent API costs | Eliminated from CI per Decision 8 (e2e runs locally only). Local runs use Haiku and the synthetic-event default keeps real-agent test count small. |
 | Hook-socket clash with developer's real running deck | Per-test `DOT_AGENT_DECK_SOCKET` + `DOT_AGENT_DECK_ATTACH_SOCKET` + redirected `HOME`. |
 | Snapshot rot from color/terminal profile drift | Strip colors before diffing or pin color env vars per test. Document in CONTRIBUTING.md. |
 | Insta goldens accepted blindly during review | Documented review workflow + small snapshots that humans can read in a diff. |
@@ -316,10 +342,13 @@ The L1/L2 split is deliberate: it gives reviewers a precise question to answer (
 - `portable-pty 0.8` (already present)
 - `vt100 0.16` (already present)
 - `insta` (new dev-dep, latest)
-- Real Claude Code and OpenCode CLIs installed in the test environment. CI must install both; local developers are assumed to already have them.
+- Real Claude Code and OpenCode CLIs installed **on the developer's local machine** (where e2e runs per Decision 8). CI runs the fast tier only and does not need the agent CLIs installed.
 
 ## Validation Strategy
 
-End-to-end validation lives in the harness itself: once M1's catalog and M2+'s implementation milestones land, the harness's own test count + green CI on macOS + Linux is the validation. Windows validation is its own milestone in M2+.
+Validation has two surfaces, per Decision 8:
+
+- **Fast tier (CI):** `cargo test-fast` green on macOS and Linux in GitHub Actions is the per-PR signal. Windows joins when the harness's Windows path is ready.
+- **E2e tier (local):** `cargo test-e2e` green on the developer's machine before opening the PR is the chain-level signal. Enforced by the orchestrator's pre-release gate (Decision 6) and by `feedback_validate_pre_pr.md`. Windows e2e validation is its own milestone in M2+.
 
 The user (PRD owner) does final pre-PR sign-off per `feedback_validate_pre_pr.md`: not stopping per-milestone for end-to-end testing, single validation pass before the PR.
