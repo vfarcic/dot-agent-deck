@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.27.0] - 2026-05-25
+
+### Added
+
+- **Hide Command Field in New-Pane Form When Orchestration is Selected**
+  When opening the new-pane form (`Ctrl+n`) and choosing an orchestration mode, the Command field is now hidden. Since orchestration role panes always use the command from `.dot-agent-deck.toml`, the field served no purpose and only added confusion. Selecting "No mode" or a workspace mode restores the Command field as before. `Tab`/`Shift+Tab` navigation and `Enter` confirmation all work correctly with the hidden field, and the footer hint updates to reflect the available fields.
+- **Tab Name Truncation**
+  Tab names in the TUI are now truncated to fit the terminal width, so every open tab remains visible and reachable at a glance.
+  Previously, when many tabs were open or one tab had a long name (such as a branch-style orchestration name like `dot-agent-deck-prd-110-fix-session-reuse-…`), the `Tabs` bar would clip the right-most tabs entirely off-screen. Those tabs were still reachable via `Tab` / `Shift+Tab` but invisible, making it hard to know which sessions were running.
+  Truncation now applies an equal-cap strategy before labels are handed to the widget: each label is allowed at most `floor(available_width / tab_count)` cells (accounting for `" label "` padding and `│` dividers). Labels already shorter than the cap render in full; longer labels are truncated to the cap width with a trailing `…`. The cap recalculates on every frame, so resizing the terminal, opening a tab, closing a tab, or renaming an orchestration session all produce correct widths immediately — no manual refresh needed.
+
+### Fixed
+
+- **Fix Orchestrator Spawn-Time Role Prompt Not Submitting**
+  When orchestration starts, the deck automatically injects the initial role prompt into the orchestrator agent's input. The trailing Enter sometimes did not trigger submission — instead, the cursor dropped to a new line inside the input box with the prompt text un-submitted.
+  Root cause: the TUI client's spawn-time write used two `KIND_STREAM_IN` frames separated by a 150ms sleep. The daemon's per-agent writer mutex was released between frames, leaving a window during which a concurrent daemon-initiated write (e.g. a sibling worker's work-done feedback) could interleave, fusing its payload and CR into the gap. The orchestrator agent then saw the daemon's CR first — submitting the fused line — and the user's trailing CR landed in an empty input box and was rendered as a newline.
+  Fix: a new `WriteAndSubmit` RPC routes the spawn-time injection through the daemon's existing `write_to_pane_and_submit` primitive, which holds the per-agent writer mutex across the full `payload → SUBMIT_DELAY → CR` sequence — the same atomic contract used by the daemon-initiated orchestration-delegate path, which has always worked correctly.
+
+
+
 ## [0.26.1] - 2026-05-25
 
 ### Fixed
