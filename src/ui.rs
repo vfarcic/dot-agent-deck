@@ -2179,6 +2179,29 @@ fn mirror_selection_into_focus(
     }
 }
 
+/// PRD #68 / PR #123 Greptile follow-up: one full Normal-mode key
+/// dispatch — `handle_normal_key` plus the focus-mirror that makes
+/// j/k/Up/Down actually land. `run_tui`'s `UiMode::Normal` arm and
+/// `jk_navigation_mirrors_selection_into_focus` both call this
+/// helper, so the test exercises the exact production path; deleting
+/// the mirror line from this function would fail the test instead of
+/// silently regressing the feature. Inlining either step back into
+/// `run_tui` would defeat that — keep the call site in `run_tui` a
+/// one-liner to this helper.
+fn dispatch_normal_mode_key(
+    key: KeyEvent,
+    ui: &mut UiState,
+    total: usize,
+    selected_status: Option<SessionStatus>,
+    filtered: &[(&String, &SessionState)],
+    pane: &dyn PaneController,
+) -> KeyResult {
+    let prev_selected_index = ui.selected_index;
+    let result = handle_normal_key(key, ui, total, selected_status);
+    mirror_selection_into_focus(prev_selected_index, ui, filtered, pane);
+    result
+}
+
 fn handle_normal_key(
     key: KeyEvent,
     ui: &mut UiState,
@@ -4530,10 +4553,14 @@ pub fn run_tui(
                             .as_ref()
                             .and_then(|sid| snapshot.sessions.get(sid))
                             .map(|session| session.status.clone());
-                        let prev_selected_index = ui.selected_index;
-                        let r = handle_normal_key(key, &mut ui, total, selected_status);
-                        mirror_selection_into_focus(prev_selected_index, &ui, &filtered, &*pane);
-                        r
+                        dispatch_normal_mode_key(
+                            key,
+                            &mut ui,
+                            total,
+                            selected_status,
+                            &filtered,
+                            &*pane,
+                        )
                     }
                     UiMode::Filter => handle_filter_key(key, &mut ui),
                     UiMode::Help => handle_help_key(key, &mut ui),
@@ -10205,13 +10232,13 @@ mod tests {
     }
 
     /// Companion to the focus_deck test: pin the dispatch-loop's
-    /// "after `handle_normal_key`, mirror the new selection into
-    /// focus" step. The production loop calls
-    /// `mirror_selection_into_focus`; this test calls the SAME
-    /// helper, so a future refactor that deletes the production call
-    /// site re-introduces PRD #68 even if the helper still exists,
-    /// and a refactor that deletes the helper breaks this test
-    /// outright.
+    /// Normal-mode step end-to-end by driving the SAME helper that
+    /// `run_tui` calls — `dispatch_normal_mode_key`. Deleting the
+    /// `mirror_selection_into_focus` line from that helper would
+    /// regress PRD #68 in production AND fail this test, closing the
+    /// Greptile-flagged gap where calling `mirror_selection_into_focus`
+    /// directly from the test would silently pass when someone
+    /// removed the production call site.
     #[test]
     fn jk_navigation_mirrors_selection_into_focus() {
         let mut snapshot = AppState::default();
@@ -10231,18 +10258,8 @@ mod tests {
         let mut ui = default_ui();
         ui.selected_index = 0;
 
-        // Drive the production code path: `handle_normal_key` plus
-        // the dispatch-loop hook `mirror_selection_into_focus`. If
-        // either is deleted from `run_tui`, this test still exercises
-        // both — but the production bug returns silently because the
-        // outer loop's per-frame sync is what relies on the helper
-        // being called. The companion code-review check is "every
-        // `handle_normal_key` callsite in `run_tui` Normal mode pairs
-        // with `mirror_selection_into_focus`."
         let press = |ui: &mut UiState, key: KeyEvent| {
-            let prev = ui.selected_index;
-            let _ = handle_normal_key(key, ui, total, None);
-            mirror_selection_into_focus(prev, ui, &filtered, &pc);
+            dispatch_normal_mode_key(key, ui, total, None, &filtered, &pc);
         };
 
         // j: 0 → 1, focus mirrored to p1.
