@@ -487,7 +487,12 @@ impl TabManager {
                     // for roles that didn't survive reconnect — there's
                     // no pane to close, and leaking "" through a pane-id
                     // API confuses downstream callers.
-                    if id.is_empty() {
+                    // Symptom 2 fix (`.dot-agent-deck/agent-card-lifecycle-bugs.md`):
+                    // also skip synthetic dead-slot pane ids
+                    // (`__dead-slot__-...`) — those carry a placeholder
+                    // session on the dashboard but have no backing PTY,
+                    // so `close_pane` would fail with NotFound.
+                    if id.is_empty() || crate::ui::is_dead_slot_pane_id(id) {
                         continue;
                     }
                     let result = self.pane_controller.close_pane(id);
@@ -523,7 +528,16 @@ impl TabManager {
                 }
                 Tab::Orchestration { role_pane_ids, .. } => {
                     // M2.12: skip the empty-string dead-slot sentinel.
-                    ids.extend(role_pane_ids.iter().filter(|id| !id.is_empty()).cloned());
+                    // Symptom 2 fix: also skip synthetic dead-slot pane
+                    // ids (`__dead-slot__-...`) — those are placeholder
+                    // sessions only, not real panes the embedded
+                    // controller owns.
+                    ids.extend(
+                        role_pane_ids
+                            .iter()
+                            .filter(|id| !id.is_empty() && !crate::ui::is_dead_slot_pane_id(id))
+                            .cloned(),
+                    );
                 }
                 Tab::Dashboard => {}
             }
@@ -1307,7 +1321,13 @@ mod tests {
         let mut tm = TabManager::new(mock);
         // No orchestration tab was rebuilt — `first_orchestration_tab_index`
         // is None, so `preferred_start_tab` collapses to 0 (dashboard).
-        let preferred_start_tab: usize = None::<usize>.unwrap_or(0);
+        // `black_box` is the canonical way to opacify the value so
+        // clippy's `unnecessary_literal_unwrap` lint stays quiet —
+        // the test's whole point is exercising the production
+        // `Option::unwrap_or(0)` path with a None input.
+        let first_orchestration_tab_index: Option<usize> =
+            std::hint::black_box::<Option<usize>>(None);
+        let preferred_start_tab: usize = first_orchestration_tab_index.unwrap_or(0);
 
         assert!(tm.switch_to(preferred_start_tab));
         assert!(tm.switch_to(preferred_start_tab));

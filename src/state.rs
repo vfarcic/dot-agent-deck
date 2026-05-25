@@ -815,6 +815,35 @@ impl AppState {
             }
         }
 
+        // PRD #110 follow-up: when a `SessionStart` arrives whose
+        // `agent_id` differs from an existing session on the same
+        // pane, the previous agent has been replaced (F9 clear=true
+        // respawn — the daemon SIGKILLs the old child so no graceful
+        // `SessionEnd` ever fires). The same-agent reuse guard above
+        // doesn't match, so without retiring the stale session here
+        // the dashboard would end up with two cards on the same pane:
+        // the dead-agent's card AND the fresh agent's card. Drop the
+        // stale sibling(s) before falling through to the
+        // session-create path below so the orchestration deck shows
+        // exactly one card per pane after a respawn.
+        if event.event_type == EventType::SessionStart
+            && let Some(ref pane_id) = event.pane_id
+        {
+            let to_remove: Vec<String> = self
+                .sessions
+                .iter()
+                .filter(|(id, session)| {
+                    session.pane_id.as_ref().is_some_and(|p| p == pane_id)
+                        && *id != &event.session_id
+                        && session.agent_id != event.agent_id
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in to_remove {
+                self.sessions.remove(&id);
+            }
+        }
+
         if event.event_type == EventType::SessionEnd {
             // Preserve started_at for the pane so a restarted session keeps its position.
             //
@@ -1066,7 +1095,10 @@ mod tests {
         state.apply_event(first);
 
         // F9 clear=true respawn — different agent process, same pane.
-        // The reuse guard must skip and create a fresh session card.
+        // The reuse guard must skip silent remapping and create a
+        // fresh session card. Symptom 1 follow-up: the stale agent-A
+        // sibling must also be retired so the pane ends with exactly
+        // one card, not two.
         let mut respawn = make_event("s2", EventType::SessionStart);
         respawn.pane_id = Some("pane-1".to_string());
         respawn.agent_id = Some("agent-B".to_string());
@@ -1078,11 +1110,12 @@ mod tests {
         );
         assert_eq!(state.sessions["s2"].pane_id.as_deref(), Some("pane-1"));
         assert_eq!(state.sessions["s2"].agent_id.as_deref(), Some("agent-B"));
-        // The old session card is preserved (no remap), so the new
-        // agent's card is additive rather than replacing the old one.
+        // Symptom 1: the stale agent-A card must be gone — the fresh
+        // card replaces it rather than sitting next to it.
         assert!(
-            state.sessions.contains_key("s1"),
-            "old session card must remain when reuse is skipped"
+            !state.sessions.contains_key("s1"),
+            "stale agent-A session must be retired when agent-B takes \
+             over the same pane"
         );
     }
 
@@ -1648,12 +1681,18 @@ mod tests {
         );
     }
 
-    // PRD #110 followup: SessionEnd from agent A, then a DIFFERENT agent
-    // (F9 clear=true respawn) emits SessionStart. The placeholder must NOT
-    // be remapped onto the new agent — it represents the dead agent A, and
-    // adopting it would silently rebrand the new agent's card.
+    // PRD #110 followup (revised): SessionEnd from agent A leaves a
+    // placeholder bound to agent A. When a DIFFERENT agent B then takes
+    // over the pane (F9 clear=true respawn case where the agent did
+    // emit SessionEnd before being killed, or any external pane
+    // takeover), the stale agent-A placeholder must be retired —
+    // otherwise the dashboard shows two cards in the same slot: a dead
+    // agent-A ghost and the live agent-B card. The reuse guard
+    // continues to refuse silent rebranding (the new card carries
+    // session_id `real-uuid-2`, not the placeholder's `pane-42`), but
+    // the dead sibling is no longer left lying around.
     #[test]
-    fn placeholder_not_reused_when_different_agent_starts_after_session_end() {
+    fn old_session_retired_when_different_agent_starts_after_session_end() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
 
@@ -1673,19 +1712,76 @@ mod tests {
         start2.agent_id = Some("agent-B".to_string());
         state.apply_event(start2);
 
-        // Two cards expected: the placeholder bound to agent-A (the dead
-        // session's restoration card), and a fresh card for agent-B.
-        let mut cards: Vec<(&str, Option<&str>)> = state
+        // Exactly one card expected: the fresh agent-B session. The
+        // agent-A placeholder restored at SessionEnd time has been
+        // retired because a different agent now owns the pane.
+        let cards: Vec<(&str, Option<&str>)> = state
             .sessions
             .values()
             .filter(|s| s.pane_id.as_deref() == Some("42"))
             .map(|s| (s.session_id.as_str(), s.agent_id.as_deref()))
             .collect();
-        cards.sort();
         assert_eq!(
             cards.len(),
-            2,
-            "F9-style respawn must NOT remap onto the dead agent's placeholder; got {cards:?}"
+            1,
+            "F9-style respawn must retire the dead agent's placeholder; \
+             got {cards:?}"
+        );
+        assert_eq!(
+            cards[0].1,
+            Some("agent-B"),
+            "the surviving card must belong to the NEW agent"
+        );
+        assert_eq!(
+            cards[0].0, "real-uuid-2",
+            "the surviving card must not be silently rebranded onto the \
+             placeholder's session id"
+        );
+    }
+
+    // Symptom 1 (post-PRD-110 regression): an F9 clear=true respawn
+    // emits a fresh `SessionStart` for the same pane with a DIFFERENT
+    // `agent_id`. No `SessionEnd` is sent (the daemon SIGKILLs the old
+    // child). Before this fix the stale agent-A session sat next to
+    // the agent-B card in the orchestration deck — two cards on the
+    // same pane. The fix retires the stale sibling.
+    #[test]
+    fn session_start_with_new_agent_id_retires_stale_session_on_same_pane() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+
+        // Old agent A's session card.
+        let mut start_a = make_event("session-A", EventType::SessionStart);
+        start_a.pane_id = Some("42".to_string());
+        start_a.agent_id = Some("agent-A".to_string());
+        state.apply_event(start_a);
+        assert!(state.sessions.contains_key("session-A"));
+
+        // New agent B's session card (post-respawn). No SessionEnd
+        // from agent A in between — that's the F9 hard-kill shape.
+        let mut start_b = make_event("session-B", EventType::SessionStart);
+        start_b.pane_id = Some("42".to_string());
+        start_b.agent_id = Some("agent-B".to_string());
+        state.apply_event(start_b);
+
+        // Exactly one card for the pane, bound to agent-B.
+        let cards: Vec<(&str, Option<&str>)> = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some("42"))
+            .map(|s| (s.session_id.as_str(), s.agent_id.as_deref()))
+            .collect();
+        assert_eq!(
+            cards.len(),
+            1,
+            "F9 clear=true respawn must leave exactly one card on the \
+             pane; got {cards:?}"
+        );
+        assert_eq!(cards[0].0, "session-B");
+        assert_eq!(cards[0].1, Some("agent-B"));
+        assert!(
+            !state.sessions.contains_key("session-A"),
+            "agent-A's stale session card must be retired"
         );
     }
 

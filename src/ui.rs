@@ -981,7 +981,12 @@ fn resize_orchestration_role_panes_for(
     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
         // Filter out empty-string sentinels for dead orchestration slots
         // (M2.12) so we don't issue a resize against a non-existent pane id.
-        let live: Vec<&String> = role_pane_ids.iter().filter(|id| !id.is_empty()).collect();
+        // Symptom 2 fix: also drop synthetic dead-slot pane ids
+        // (`__dead-slot__-...`) — they have no PTY to resize.
+        let live: Vec<&String> = role_pane_ids
+            .iter()
+            .filter(|id| !id.is_empty() && !is_dead_slot_pane_id(id))
+            .collect();
         if live.is_empty() {
             return;
         }
@@ -1447,6 +1452,69 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
     }
 
     out
+}
+
+/// Build the synthetic dead-slot pane id used to keep a role visible on
+/// the orchestration tab even when no live daemon agent backs it. The
+/// `__dead-slot__-` prefix is reserved for this synthesis and namespaced
+/// by `(cwd, orchestration_name, role_index)` so distinct dead slots
+/// never collide and a later reconnect produces the same id (idempotent
+/// across reconnects).
+///
+/// The synthesised id is NOT a real pane: it is intentionally absent
+/// from `EmbeddedPaneController::pane_ids()`, so the orchestration tab's
+/// right-side terminal grid renders 4 panes for the 4 live agents while
+/// the left-side card grid renders 5 cards (one per role) because the
+/// placeholder session sitting on the synthetic id satisfies the
+/// `pane_id ∈ role_pane_ids` filter in [`render_frame`].
+pub fn dead_slot_pane_id(cwd: &str, orchestration_name: &str, role_index: usize) -> String {
+    format!("{DEAD_SLOT_PREFIX}{cwd}-{orchestration_name}-{role_index}")
+}
+
+/// Reserved prefix for synthetic dead-slot pane ids produced by
+/// [`dead_slot_pane_id`]. Anything starting with this prefix is a
+/// placeholder used only by the orchestration tab's card grid — it has
+/// no backing PTY, isn't tracked by `EmbeddedPaneController`, and must
+/// be skipped by close / managed-pane traversals.
+pub const DEAD_SLOT_PREFIX: &str = "__dead-slot__-";
+
+/// Returns true if `pane_id` is one of the synthetic dead-slot ids
+/// produced by [`dead_slot_pane_id`]. Used by `close_tab` and
+/// `all_managed_pane_ids` to skip synthesised slots — there is no
+/// daemon-side pane to close and no real terminal to render on the
+/// right-hand side of the orchestration tab.
+pub fn is_dead_slot_pane_id(pane_id: &str) -> bool {
+    pane_id.starts_with(DEAD_SLOT_PREFIX)
+}
+
+/// Fill missing role slots in `role_pane_ids` with synthetic dead-slot
+/// pane ids and insert a placeholder session into `state` for each one.
+///
+/// Symptom 2 (bug task `agent-card-lifecycle-bugs.md`): when an
+/// orchestration role's daemon agent dies (e.g., a `clear = false`
+/// release agent that runs through its workflow and exits cleanly),
+/// `agent_records()` no longer returns it, the hydration bucket loses
+/// that role's slot, and the role used to disappear from the
+/// orchestration tab on reconnect. This helper bridges the gap: it
+/// generates a stable synthetic id per missing role, inserts a
+/// `agent_type = None` placeholder session keyed on it (so the dead
+/// slot renders as "No agent" in the card grid), and returns the
+/// fully-populated `role_pane_ids` to the caller. The synthetic id is
+/// NOT a managed pane — `register_pane` is deliberately skipped so
+/// `apply_event` won't accept hook events forged against it.
+pub fn fill_dead_slots_with_placeholders(
+    role_pane_ids: &mut [Option<String>],
+    cwd: &str,
+    orchestration_name: &str,
+    state: &mut AppState,
+) {
+    for (role_index, slot) in role_pane_ids.iter_mut().enumerate() {
+        if slot.is_none() {
+            let synthetic = dead_slot_pane_id(cwd, orchestration_name, role_index);
+            state.insert_placeholder_session(synthetic.clone(), Some(cwd.to_string()), None, None);
+            *slot = Some(synthetic);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2781,6 +2849,26 @@ pub fn run_tui(
                 );
                 continue;
             }
+            // Symptom 2 fix (`.dot-agent-deck/agent-card-lifecycle-bugs.md`):
+            // a role whose daemon agent died (most commonly a
+            // `clear = false` role that finishes its workflow and
+            // exits cleanly) is absent from `agent_records()` and
+            // therefore absent from `bucket.role_slots`. Pre-fix the
+            // role just disappeared from the orchestration tab on
+            // reconnect — the user lost the slot entirely. Fill the
+            // remaining `None` slots with synthetic dead-slot pane
+            // ids and seed placeholder sessions so every role in the
+            // config keeps its card on the rebuilt tab, even though
+            // only the live ones have backing PTYs on the right.
+            {
+                let mut st = state.blocking_write();
+                fill_dead_slots_with_placeholders(
+                    &mut role_pane_ids,
+                    &bucket.cwd,
+                    &bucket.orchestration_name,
+                    &mut st,
+                );
+            }
             // Now register the orchestrator pane mapping for any live
             // start role so M5 dispatch keeps routing work-done events
             // back to the right place.
@@ -2798,6 +2886,17 @@ pub fn run_tui(
                     let mut st = state.blocking_write();
                     for (i, role) in orch_config.roles.iter().enumerate() {
                         if let Some(Some(pane_id)) = role_pane_ids.get(i) {
+                            // Symptom 2 fix
+                            // (`.dot-agent-deck/agent-card-lifecycle-bugs.md`):
+                            // dead-slot synthetics are placeholder
+                            // sessions only — there is no daemon-side
+                            // pane to delegate to, so don't pollute
+                            // `pane_role_map` (which `handle_delegate`
+                            // queries to find a target pane) with
+                            // entries pointing at non-existent panes.
+                            if is_dead_slot_pane_id(pane_id) {
+                                continue;
+                            }
                             st.pane_role_map.insert(pane_id.clone(), role.name.clone());
                             st.pane_cwd_map.insert(pane_id.clone(), bucket.cwd.clone());
                             if role.start {
@@ -7615,6 +7714,112 @@ mod tests {
             && s.pane_id == "11"
             && s.role_name.is_empty()
             && !s.is_start_role));
+    }
+
+    // Symptom 2 (`.dot-agent-deck/agent-card-lifecycle-bugs.md`):
+    // when an orchestration role's daemon agent dies (e.g., a
+    // `clear = false` release agent that finishes its workflow and
+    // exits cleanly), the hydration bucket loses that slot. Pre-fix
+    // the role just disappeared from the rebuilt orchestration tab.
+    // `fill_dead_slots_with_placeholders` is the bridge: it stamps a
+    // synthetic id onto every `None` slot and seeds a placeholder
+    // session so every role in the config keeps its dashboard card.
+    #[test]
+    fn fill_dead_slots_replaces_none_with_synthetic_id_and_seeds_placeholder() {
+        use crate::state::AppState;
+
+        let mut state = AppState::default();
+        // 5 roles, only 4 hydrated agents — the LAST role (role_index 4,
+        // the `release`-style slot) is the dead one. This mirrors the
+        // production scenario described in the bug task: the `release`
+        // role is the last in `.dot-agent-deck.toml` and the only one
+        // with `clear = false`, so it's the one most likely to be
+        // missing on reconnect.
+        let mut slots: Vec<Option<String>> = vec![
+            Some("p-orch".to_string()),
+            Some("p-coder".to_string()),
+            Some("p-reviewer".to_string()),
+            Some("p-auditor".to_string()),
+            None,
+        ];
+        fill_dead_slots_with_placeholders(&mut slots, "/work", "tdd-cycle", &mut state);
+
+        assert!(
+            slots.iter().all(Option::is_some),
+            "every slot must be filled"
+        );
+        let dead_id = slots[4].as_deref().unwrap();
+        assert!(
+            is_dead_slot_pane_id(dead_id),
+            "dead slot must carry a synthetic id; got {dead_id:?}"
+        );
+        // Live slots untouched.
+        assert_eq!(slots[0].as_deref(), Some("p-orch"));
+        assert_eq!(slots[1].as_deref(), Some("p-coder"));
+        // Placeholder session exists for the dead slot, with
+        // agent_type=None so it renders as "No agent" in the card grid.
+        let dead_session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some(dead_id))
+            .expect("dead-slot placeholder session must be seeded");
+        assert_eq!(
+            dead_session.agent_type,
+            AgentType::None,
+            "dead-slot placeholder must render as 'No agent'"
+        );
+        assert_eq!(dead_session.agent_id, None);
+    }
+
+    #[test]
+    fn dead_slot_pane_id_is_deterministic_per_role() {
+        // Same (cwd, name, role_index) must produce the same id so a
+        // reconnect doesn't keep minting fresh placeholder cards on
+        // every reattach.
+        let a = dead_slot_pane_id("/work", "tdd-cycle", 4);
+        let b = dead_slot_pane_id("/work", "tdd-cycle", 4);
+        assert_eq!(a, b);
+        // Different role_index → different id.
+        let c = dead_slot_pane_id("/work", "tdd-cycle", 3);
+        assert_ne!(a, c);
+        // Different orchestration → different id.
+        let d = dead_slot_pane_id("/work", "other-cycle", 4);
+        assert_ne!(a, d);
+        // is_dead_slot_pane_id accepts the synthesized id and rejects
+        // a normal numeric pane id.
+        assert!(is_dead_slot_pane_id(&a));
+        assert!(!is_dead_slot_pane_id("42"));
+    }
+
+    #[test]
+    fn fill_dead_slots_is_idempotent_across_repeat_calls() {
+        // Reconnect runs hydration again — calling
+        // `fill_dead_slots_with_placeholders` on already-filled slots
+        // must not change them and must not double-seed the
+        // placeholder session. (The placeholder helper itself
+        // overwrites the existing entry under the same session id, so
+        // the count stays at 1.)
+        use crate::state::AppState;
+
+        let mut state = AppState::default();
+        let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
+        fill_dead_slots_with_placeholders(&mut slots, "/work", "tdd-cycle", &mut state);
+        let first_dead = slots[1].clone().unwrap();
+        let placeholder_count_first = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref().is_some_and(is_dead_slot_pane_id))
+            .count();
+        // Second pass — same input shape.
+        fill_dead_slots_with_placeholders(&mut slots, "/work", "tdd-cycle", &mut state);
+        let placeholder_count_second = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref().is_some_and(is_dead_slot_pane_id))
+            .count();
+        assert_eq!(slots[1].as_deref(), Some(first_dead.as_str()));
+        assert_eq!(placeholder_count_first, 1);
+        assert_eq!(placeholder_count_second, 1);
     }
 
     #[test]

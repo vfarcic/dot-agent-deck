@@ -28,7 +28,7 @@ use tempfile::TempDir;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
-use dot_agent_deck::agent_pty::AgentPtyRegistry;
+use dot_agent_deck::agent_pty::{AgentPtyRegistry, TabMembership};
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_REQ, KIND_RESP, bind_attach_listener, read_frame,
@@ -37,6 +37,9 @@ use dot_agent_deck::daemon_protocol::{
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::event::AgentType;
 use dot_agent_deck::state::AppState;
+use dot_agent_deck::ui::{
+    dead_slot_pane_id, fill_dead_slots_with_placeholders, is_dead_slot_pane_id,
+};
 
 // `bind_attach_listener` flips the process-global umask while binding; share
 // the lock with the other M-series tests so concurrent tempdir creation
@@ -898,4 +901,176 @@ async fn hydrate_preserves_agent_type_end_to_end_opencode() {
 
     drop(ctrl);
     let _ = server.registry.close_agent(&agent_id);
+}
+
+/// Symptom 2 regression
+/// (`.dot-agent-deck/agent-card-lifecycle-bugs.md`): a role whose daemon
+/// agent has died (e.g., a `clear = false` `release` agent that runs
+/// through its workflow and exits cleanly) is absent from
+/// `agent_records()` on reconnect. The TUI's hydration partition
+/// therefore receives sparse role slots — the bucket has one fewer
+/// entry than the orchestration config declares. Pre-fix the missing
+/// role's slot disappeared from the rebuilt orchestration tab
+/// entirely.
+///
+/// This test pins the fix end-to-end at the integration boundary the
+/// real reconnect path uses:
+///   1. Spawn 5 orchestration role agents through `DaemonClient`,
+///      mirroring the production `.dot-agent-deck.toml` layout
+///      (orchestrator + coder + reviewer + auditor + release).
+///   2. Kill the LAST agent (`release`-equivalent) the same way a
+///      `clear = false` agent exiting cleanly would die — its
+///      registry entry is pruned, `list_agents` no longer reports
+///      it.
+///   3. Hydrate. Verify `hydrate_from_daemon` returns 4 panes (the
+///      live ones) — that's the underlying state the fix has to cope
+///      with.
+///   4. Build a `Vec<Option<String>>` of length 5 the way the
+///      hydration loop in `ui.rs` does (one `Some(pane_id)` per
+///      hydrated role slot, the dead role's slot is `None`).
+///   5. Call `fill_dead_slots_with_placeholders` and assert every
+///      slot now carries a non-empty id, the dead one is the
+///      deterministic synthetic id, and a placeholder session has
+///      been seeded so the orchestration tab's card filter
+///      (`pane_id ∈ role_pane_ids`) finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_role_stays_visible_on_reconnect_as_placeholder_card() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    let orchestration_name = "tdd-cycle";
+    let cwd = server._dir.path().to_string_lossy().into_owned();
+    let role_names = ["orchestrator", "coder", "reviewer", "auditor", "release"];
+    let mut spawned_ids: Vec<String> = Vec::new();
+    for (role_index, role_name) in role_names.iter().enumerate() {
+        let pane_env = format!("pane-{role_name}");
+        let id = client
+            .start_agent(StartAgentOptions {
+                command: Some("sh -c 'sleep 30'".to_string()),
+                cwd: Some(cwd.clone()),
+                display_name: Some((*role_name).to_string()),
+                env: vec![("DOT_AGENT_DECK_PANE_ID".to_string(), pane_env)],
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: orchestration_name.to_string(),
+                    role_index,
+                    role_name: (*role_name).to_string(),
+                    is_start_role: role_index == 0,
+                    orchestration_cwd: Some(cwd.clone()),
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("start_agent should succeed");
+        spawned_ids.push(id);
+    }
+
+    // Kill the LAST role (`release`-equivalent). Matches the
+    // production failure mode: an agent that exits cleanly (or that
+    // the user explicitly closed) is pruned from `agent_records()`
+    // and disappears from `list_agents`.
+    let release_id = spawned_ids.last().unwrap().clone();
+    server
+        .registry
+        .close_agent(&release_id)
+        .expect("close_agent for release should succeed");
+
+    // Hydrate. Confirms the precondition the fix has to cope with:
+    // only 4 panes are returned even though the orchestration
+    // declares 5.
+    let ctrl = Arc::new(EmbeddedPaneController::new(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        hydrated.len(),
+        4,
+        "release agent was closed, so only 4 of 5 should hydrate; \
+         got {hydrated:?}"
+    );
+
+    // Build `role_pane_ids` the way the hydration loop does. We map
+    // each surviving role into its slot by role_index.
+    let mut role_pane_ids: Vec<Option<String>> = vec![None; role_names.len()];
+    for h in &hydrated {
+        if let Some(TabMembership::Orchestration { role_index, .. }) = &h.tab_membership {
+            role_pane_ids[*role_index] = Some(h.pane_id.clone());
+        }
+    }
+    assert!(
+        role_pane_ids[4].is_none(),
+        "role_index 4 must be the dead slot"
+    );
+
+    // Apply the fix: every dead slot gets a synthetic id and a
+    // placeholder session is seeded so the orchestration tab keeps
+    // the role's card visible.
+    let mut state = AppState::default();
+    // Seed placeholders for the live hydrated panes too — mirrors the
+    // hydration loop's normal path so the post-fix AppState looks like
+    // the real run_tui's would.
+    for h in &hydrated {
+        state.register_pane(h.pane_id.clone());
+        state.insert_placeholder_session(
+            h.pane_id.clone(),
+            h.cwd.clone(),
+            h.agent_type.clone(),
+            Some(h.agent_id.clone()),
+        );
+    }
+    fill_dead_slots_with_placeholders(&mut role_pane_ids, &cwd, orchestration_name, &mut state);
+
+    // Every role slot is now filled.
+    assert!(
+        role_pane_ids.iter().all(Option::is_some),
+        "all 5 role slots must have a pane id after the dead-slot fill; \
+         got {role_pane_ids:?}"
+    );
+    let dead_id = role_pane_ids[4].as_deref().unwrap();
+    assert_eq!(
+        dead_id,
+        dead_slot_pane_id(&cwd, orchestration_name, 4),
+        "dead slot id must be the deterministic synthetic"
+    );
+    assert!(is_dead_slot_pane_id(dead_id));
+
+    // The placeholder session backing the dead slot exists, has the
+    // 'No agent' shape, and would be picked up by the orchestration
+    // tab's card-filter (`pane_id ∈ role_pane_ids`).
+    let dead_session = state
+        .sessions
+        .values()
+        .find(|s| s.pane_id.as_deref() == Some(dead_id))
+        .expect("dead-slot placeholder session must exist in AppState");
+    assert_eq!(dead_session.agent_type, AgentType::None);
+
+    // And we end up with one session per role — five total, not
+    // four. Pre-fix this would have been four.
+    let cards_per_pane: Vec<&str> = role_pane_ids
+        .iter()
+        .filter_map(|p| p.as_deref())
+        .filter(|pid| {
+            state
+                .sessions
+                .values()
+                .any(|s| s.pane_id.as_deref() == Some(*pid))
+        })
+        .collect();
+    assert_eq!(
+        cards_per_pane.len(),
+        5,
+        "exactly one card must exist per role slot; got {cards_per_pane:?}"
+    );
+
+    drop(ctrl);
+    // Clean up surviving agents so the test doesn't leak the `sleep 30`
+    // children.
+    for id in &spawned_ids[..spawned_ids.len() - 1] {
+        let _ = server.registry.close_agent(id);
+    }
 }
