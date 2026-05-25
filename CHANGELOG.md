@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.26.1] - 2026-05-25
+
+### Fixed
+
+- **Orchestration Role Cards Stay Consistent Across Respawn and Reconnect**
+  Two follow-on symptoms from the orchestration GA release are fixed. After an F9 delegate respawn (`clear = true`), the orchestration tab no longer shows a duplicate card for the same role — the stale card from the previous agent is now retired when the fresh one starts. And after reconnecting to a daemon with a role whose worker had already exited (typically a `clear = false` agent that finished its workflow), the configured role no longer briefly disappears from the orchestration tab; every role in the config keeps a placeholder card on hydration so the tab layout matches `.dot-agent-deck.toml`.
+
+
+
 ## [0.26.0] - 2026-05-25
 
 ### Added
