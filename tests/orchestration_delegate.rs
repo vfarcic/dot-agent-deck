@@ -3196,4 +3196,33 @@ command = "cat -u"
         Some(coder_new.as_str()),
         "new session card must carry the NEW (post-respawn) agent_id"
     );
+
+    // Symptom 1 regression guard: the OLD card (still bound to the
+    // pre-respawn agent_id) must have been retired by `apply_event`
+    // when the NEW SessionStart arrived. Pre-fix the dashboard ended
+    // up with TWO coder cards on `coder-pane` — the live new card and
+    // the stale old card the daemon couldn't kill cleanly (F9 sends
+    // SIGKILL, so no graceful SessionEnd ever fires).
+    let coder_pane_cards: Vec<(&String, Option<&str>)> = st
+        .sessions
+        .iter()
+        .filter(|(_, s)| s.pane_id.as_deref() == Some("coder-pane"))
+        .map(|(id, s)| (id, s.agent_id.as_deref()))
+        .collect();
+    assert_eq!(
+        coder_pane_cards.len(),
+        1,
+        "F9 clear=true respawn must leave exactly one card on coder-pane; \
+         got {coder_pane_cards:?}"
+    );
+    assert_eq!(
+        coder_pane_cards[0].1,
+        Some(coder_new.as_str()),
+        "the surviving coder-pane card must belong to the post-respawn agent"
+    );
+    assert!(
+        !st.sessions.contains_key(&initial_session_id),
+        "the pre-respawn (agent-A) session card must be retired; \
+         it lingered as session_id={initial_session_id}"
+    );
 }

@@ -785,6 +785,17 @@ impl AppState {
         if let Some(ref pane_id) = event.pane_id {
             if !self.managed_pane_ids.contains(pane_id) {
                 if event.event_type == EventType::SessionStart {
+                    // Defense in depth (auditor finding #1 follow-up):
+                    // reject the synthetic dead-slot id format from the
+                    // auto-register branch so a forged hook event can't
+                    // bring an `__dead-slot__-…` id into existence.
+                    // Production never sets a synthetic id as
+                    // `DOT_AGENT_DECK_PANE_ID`, but `is_valid_pane_id_env`
+                    // admits the format on its own (it only checks for
+                    // `[A-Za-z0-9_-]`).
+                    if crate::ui::is_dead_slot_pane_id(pane_id) {
+                        return;
+                    }
                     // Auto-register the pane to handle the startup race where
                     // the hook fires before register_pane is called.
                     self.managed_pane_ids.insert(pane_id.clone());
@@ -812,6 +823,59 @@ impl AppState {
             let old_id = std::mem::replace(&mut event.session_id, existing_id);
             if old_id != event.session_id {
                 self.sessions.remove(&old_id);
+            }
+        }
+
+        // PRD #110 follow-up: when a `SessionStart` arrives whose
+        // `agent_id` differs from an existing session on the same
+        // pane, the previous agent has been replaced (F9 clear=true
+        // respawn — the daemon SIGKILLs the old child so no graceful
+        // `SessionEnd` ever fires). The same-agent reuse guard above
+        // doesn't match, so without retiring the stale session here
+        // the dashboard would end up with two cards on the same pane:
+        // the dead-agent's card AND the fresh agent's card. Drop the
+        // stale sibling(s) before falling through to the
+        // session-create path below so the orchestration deck shows
+        // exactly one card per pane after a respawn.
+        //
+        // Backward-compat (auditor finding #3 follow-up; reaffirmed
+        // against CodeRabbit PR #118 finding #1): skip the retire
+        // block entirely when the incoming event carries no
+        // `agent_id`. A pre-F9 hook script (no
+        // `DOT_AGENT_DECK_AGENT_ID` env var) running against an
+        // upgraded daemon would otherwise wipe a tagged session it
+        // doesn't know the identity of — losing its `recent_events`,
+        // `tool_count`, `first_prompts`, `started_at`. Mirrors the
+        // deliberately-permissive "both sides absent" branch of the
+        // reuse guard above.
+        //
+        // Trade-off: keeping this guard means a legacy hook can
+        // create a duplicate (untagged) card alongside the tagged
+        // one. Removing it (CodeRabbit's wildcard suggestion on PR
+        // #118) would silently drop accumulated history every time
+        // an old hook fires. PRD #110 prefers the visible duplicate
+        // over silent data loss; the duplicate is observable and
+        // self-resolves once the legacy hook is upgraded, whereas
+        // lost `recent_events` / `tool_count` / `first_prompts` are
+        // not recoverable. The pinned shape lives in the regression
+        // test `pre_f9_hook_with_no_agent_id_does_not_wipe_tagged_session`
+        // below.
+        if event.event_type == EventType::SessionStart
+            && event.agent_id.is_some()
+            && let Some(ref pane_id) = event.pane_id
+        {
+            let to_remove: Vec<String> = self
+                .sessions
+                .iter()
+                .filter(|(id, session)| {
+                    session.pane_id.as_ref().is_some_and(|p| p == pane_id)
+                        && *id != &event.session_id
+                        && session.agent_id != event.agent_id
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in to_remove {
+                self.sessions.remove(&id);
             }
         }
 
@@ -1066,7 +1130,10 @@ mod tests {
         state.apply_event(first);
 
         // F9 clear=true respawn — different agent process, same pane.
-        // The reuse guard must skip and create a fresh session card.
+        // The reuse guard must skip silent remapping and create a
+        // fresh session card. Symptom 1 follow-up: the stale agent-A
+        // sibling must also be retired so the pane ends with exactly
+        // one card, not two.
         let mut respawn = make_event("s2", EventType::SessionStart);
         respawn.pane_id = Some("pane-1".to_string());
         respawn.agent_id = Some("agent-B".to_string());
@@ -1078,11 +1145,12 @@ mod tests {
         );
         assert_eq!(state.sessions["s2"].pane_id.as_deref(), Some("pane-1"));
         assert_eq!(state.sessions["s2"].agent_id.as_deref(), Some("agent-B"));
-        // The old session card is preserved (no remap), so the new
-        // agent's card is additive rather than replacing the old one.
+        // Symptom 1: the stale agent-A card must be gone — the fresh
+        // card replaces it rather than sitting next to it.
         assert!(
-            state.sessions.contains_key("s1"),
-            "old session card must remain when reuse is skipped"
+            !state.sessions.contains_key("s1"),
+            "stale agent-A session must be retired when agent-B takes \
+             over the same pane"
         );
     }
 
@@ -1648,12 +1716,18 @@ mod tests {
         );
     }
 
-    // PRD #110 followup: SessionEnd from agent A, then a DIFFERENT agent
-    // (F9 clear=true respawn) emits SessionStart. The placeholder must NOT
-    // be remapped onto the new agent — it represents the dead agent A, and
-    // adopting it would silently rebrand the new agent's card.
+    // PRD #110 followup (revised): SessionEnd from agent A leaves a
+    // placeholder bound to agent A. When a DIFFERENT agent B then takes
+    // over the pane (F9 clear=true respawn case where the agent did
+    // emit SessionEnd before being killed, or any external pane
+    // takeover), the stale agent-A placeholder must be retired —
+    // otherwise the dashboard shows two cards in the same slot: a dead
+    // agent-A ghost and the live agent-B card. The reuse guard
+    // continues to refuse silent rebranding (the new card carries
+    // session_id `real-uuid-2`, not the placeholder's `pane-42`), but
+    // the dead sibling is no longer left lying around.
     #[test]
-    fn placeholder_not_reused_when_different_agent_starts_after_session_end() {
+    fn old_session_retired_when_different_agent_starts_after_session_end() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
 
@@ -1673,19 +1747,182 @@ mod tests {
         start2.agent_id = Some("agent-B".to_string());
         state.apply_event(start2);
 
-        // Two cards expected: the placeholder bound to agent-A (the dead
-        // session's restoration card), and a fresh card for agent-B.
-        let mut cards: Vec<(&str, Option<&str>)> = state
+        // Exactly one card expected: the fresh agent-B session. The
+        // agent-A placeholder restored at SessionEnd time has been
+        // retired because a different agent now owns the pane.
+        let cards: Vec<(&str, Option<&str>)> = state
             .sessions
             .values()
             .filter(|s| s.pane_id.as_deref() == Some("42"))
             .map(|s| (s.session_id.as_str(), s.agent_id.as_deref()))
             .collect();
-        cards.sort();
         assert_eq!(
             cards.len(),
+            1,
+            "F9-style respawn must retire the dead agent's placeholder; \
+             got {cards:?}"
+        );
+        assert_eq!(
+            cards[0].1,
+            Some("agent-B"),
+            "the surviving card must belong to the NEW agent"
+        );
+        assert_eq!(
+            cards[0].0, "real-uuid-2",
+            "the surviving card must not be silently rebranded onto the \
+             placeholder's session id"
+        );
+    }
+
+    // Symptom 1 (post-PRD-110 regression): an F9 clear=true respawn
+    // emits a fresh `SessionStart` for the same pane with a DIFFERENT
+    // `agent_id`. No `SessionEnd` is sent (the daemon SIGKILLs the old
+    // child). Before this fix the stale agent-A session sat next to
+    // the agent-B card in the orchestration deck — two cards on the
+    // same pane. The fix retires the stale sibling.
+    #[test]
+    fn session_start_with_new_agent_id_retires_stale_session_on_same_pane() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+
+        // Old agent A's session card.
+        let mut start_a = make_event("session-A", EventType::SessionStart);
+        start_a.pane_id = Some("42".to_string());
+        start_a.agent_id = Some("agent-A".to_string());
+        state.apply_event(start_a);
+        assert!(state.sessions.contains_key("session-A"));
+
+        // New agent B's session card (post-respawn). No SessionEnd
+        // from agent A in between — that's the F9 hard-kill shape.
+        let mut start_b = make_event("session-B", EventType::SessionStart);
+        start_b.pane_id = Some("42".to_string());
+        start_b.agent_id = Some("agent-B".to_string());
+        state.apply_event(start_b);
+
+        // Exactly one card for the pane, bound to agent-B.
+        let cards: Vec<(&str, Option<&str>)> = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some("42"))
+            .map(|s| (s.session_id.as_str(), s.agent_id.as_deref()))
+            .collect();
+        assert_eq!(
+            cards.len(),
+            1,
+            "F9 clear=true respawn must leave exactly one card on the \
+             pane; got {cards:?}"
+        );
+        assert_eq!(cards[0].0, "session-B");
+        assert_eq!(cards[0].1, Some("agent-B"));
+        assert!(
+            !state.sessions.contains_key("session-A"),
+            "agent-A's stale session card must be retired"
+        );
+    }
+
+    // Follow-up to 0d5e651 (auditor finding #3): a pre-F9 hook script
+    // (no `DOT_AGENT_DECK_AGENT_ID` env, so `agent_id = None`) firing
+    // `SessionStart` against a pane that already has a session with
+    // `agent_id = Some(…)` must NOT trigger the retire-stale-sibling
+    // block. Otherwise an upgraded daemon would silently wipe the
+    // tagged session — losing its `recent_events`, `tool_count`,
+    // `first_prompts`, and `started_at` — every time an old hook ran.
+    #[test]
+    fn pre_f9_hook_with_no_agent_id_does_not_wipe_tagged_session() {
+        let mut state = AppState::default();
+        state.register_pane("42".to_string());
+
+        // Existing session bound to agent-A with some accumulated state.
+        let mut start_a = make_event("session-A", EventType::SessionStart);
+        start_a.pane_id = Some("42".to_string());
+        start_a.agent_id = Some("agent-A".to_string());
+        state.apply_event(start_a);
+        // Add a tool event so the session has something to lose
+        // (tool_count increments on `ToolEnd`, not `ToolStart`).
+        let mut tool_start = make_event("session-A", EventType::ToolStart);
+        tool_start.pane_id = Some("42".to_string());
+        tool_start.agent_id = Some("agent-A".to_string());
+        tool_start.tool_name = Some("Bash".to_string());
+        state.apply_event(tool_start);
+        let mut tool_end = make_event("session-A", EventType::ToolEnd);
+        tool_end.pane_id = Some("42".to_string());
+        tool_end.agent_id = Some("agent-A".to_string());
+        state.apply_event(tool_end);
+        assert_eq!(state.sessions["session-A"].tool_count, 1);
+
+        // A pre-F9 hook (no agent_id) fires SessionStart on the same
+        // pane. The retire block must be skipped.
+        let mut legacy = make_event("session-legacy", EventType::SessionStart);
+        legacy.pane_id = Some("42".to_string());
+        legacy.agent_id = None;
+        state.apply_event(legacy);
+
+        // agent-A's session must still exist with its tool_count intact.
+        let agent_a = state
+            .sessions
+            .get("session-A")
+            .expect("agent-A session must be preserved when a pre-F9 hook fires");
+        assert_eq!(agent_a.tool_count, 1);
+        assert_eq!(agent_a.agent_id.as_deref(), Some("agent-A"));
+
+        // CodeRabbit PR #118 finding #2: pin the exact number of
+        // sessions that survive the pre-F9 hook on pane "42". The
+        // retire block is skipped (agent_id is None on the incoming
+        // event), the strict-equality reuse guard above doesn't
+        // match either (agent-A vs None), so the SessionStart falls
+        // through to the create path and a fresh `session-legacy`
+        // is inserted next to the preserved `session-A`. That
+        // duplicate is the intentional trade-off documented next to
+        // the `event.agent_id.is_some()` guard: visible duplicate
+        // card over silent data loss. If the count ever changes the
+        // trade-off has shifted — re-read PRD #110 + the guard
+        // comment before updating the expectation here.
+        let pane_42_sessions: Vec<&str> = state
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.pane_id.as_deref() == Some("42"))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(
+            pane_42_sessions.len(),
             2,
-            "F9-style respawn must NOT remap onto the dead agent's placeholder; got {cards:?}"
+            "expected the tagged session-A plus the legacy session-legacy on pane 42, got {pane_42_sessions:?}"
+        );
+        assert!(pane_42_sessions.contains(&"session-A"));
+        assert!(pane_42_sessions.contains(&"session-legacy"));
+        let legacy = &state.sessions["session-legacy"];
+        assert!(
+            legacy.agent_id.is_none(),
+            "the legacy session must carry no agent_id (that's what makes it the duplicate)"
+        );
+    }
+
+    // Follow-up to 0d5e651 (auditor finding #1): the auto-register
+    // branch in `apply_event` would happily admit any pane_id that
+    // matches `is_valid_pane_id_env`, including the synthetic
+    // dead-slot format `__dead-slot__-…`. Defense in depth — even
+    // though synthetic ids are never set as `DOT_AGENT_DECK_PANE_ID`
+    // in production, the docstring previously claimed the synthetic
+    // id was unreachable via hooks. Pin the reject.
+    #[test]
+    fn session_start_with_synthetic_dead_slot_id_does_not_auto_register() {
+        let mut state = AppState::default();
+        let synthetic = crate::ui::dead_slot_pane_id("/work", "tdd-cycle", 4);
+
+        let mut ev = make_event("forged-uuid", EventType::SessionStart);
+        ev.pane_id = Some(synthetic.clone());
+        ev.agent_id = Some("agent-X".to_string());
+        state.apply_event(ev);
+
+        assert!(
+            !state.managed_pane_ids.contains(&synthetic),
+            "synthetic dead-slot id must NOT be promoted into managed_pane_ids \
+             via the auto-register branch"
+        );
+        assert!(
+            !state.sessions.contains_key("forged-uuid"),
+            "no session should be created for a forged hook event against a \
+             synthetic id"
         );
     }
 
