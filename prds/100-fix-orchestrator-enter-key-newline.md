@@ -80,19 +80,19 @@ This is **not** orchestrator-only. Every caller of `PaneController::write_to_pan
 
 ### Phase 1: Investigation and reproducer
 
-- [ ] **M1.1** — Instrument the daemon's pane-write path to log every byte sent to a pane, with a feature flag or `RUST_LOG=trace` gate so the instrumentation can stay in tree. Confirm whether bracketed-paste sequences (`\e[200~ ... \e[201~`) are present and whether the trailing byte is `\n` (10), `\r` (13), or both.
-- [ ] **M1.2** — Build a deterministic reproducer. Try the obvious axes first: very long messages, messages with embedded newlines, rapid back-to-back sends, sends immediately after the orchestrator pane mounts, sends while another role pane is animating. Document what triggers the bug.
-- [ ] **M1.3** — Determine whether the bug exists in the local (in-process) path or only the daemon path. This is one data point that helps localize the cause and informs PRD #93's regression surface.
+- [x] **M1.1** — Instrument the daemon's pane-write path to log every byte sent to a pane, with a feature flag or `RUST_LOG=trace` gate so the instrumentation can stay in tree. Confirm whether bracketed-paste sequences (`\e[200~ ... \e[201~`) are present and whether the trailing byte is `\n` (10), `\r` (13), or both.
+- [x] **M1.2** — Build a deterministic reproducer. Try the obvious axes first: very long messages, messages with embedded newlines, rapid back-to-back sends, sends immediately after the orchestrator pane mounts, sends while another role pane is animating. Document what triggers the bug.
+- [x] **M1.3** — Determine whether the bug exists in the local (in-process) path or only the daemon path. This is one data point that helps localize the cause and informs PRD #93's regression surface. *(N/A — PRD #93 Phase 2 deleted the local pane backend; all writes are daemon-mediated. Documented in Root cause.)*
 
 ### Phase 2: Root cause and fix
 
-- [ ] **M2.1** — Document the root cause in this PRD (add a "Root cause" section). Cite the evidence from M1.
-- [ ] **M2.2** — Implement the fix at the smallest layer that resolves it. Likely one of: daemon write path normalization, orchestrator UI input-mode guard, or removing bracketed-paste framing on the send-prompt path.
-- [ ] **M2.3** — Decide and document the fix's scope: orchestrator-only, all-agents, or a layer that incidentally fixes both.
+- [x] **M2.1** — Document the root cause in this PRD (add a "Root cause" section). Cite the evidence from M1.
+- [x] **M2.2** — Implement the fix at the smallest layer that resolves it. Likely one of: daemon write path normalization, orchestrator UI input-mode guard, or removing bracketed-paste framing on the send-prompt path.
+- [x] **M2.3** — Decide and document the fix's scope: orchestrator-only, all-agents, or a layer that incidentally fixes both.
 
 ### Phase 3: Tests and validation
 
-- [ ] **M3.1** — Add an automated regression test that exercises the daemon write path and asserts the submit actually fires (i.e. the orchestrator processed the message, not just that bytes were written). Test must fail before the fix.
+- [x] **M3.1** — Add an automated regression test that exercises the daemon write path and asserts the submit actually fires (i.e. the orchestrator processed the message, not just that bytes were written). Test must fail before the fix.
 - [ ] **M3.2** — Run the M1.2 reproducer 100 consecutive times against the fixed build; confirm zero failures.
 - [ ] **M3.3** — Verify no regression for other agents (Claude Code, OpenCode) — run the existing send-prompt tests and a manual smoke through each agent type.
 
