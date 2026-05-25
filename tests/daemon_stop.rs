@@ -17,7 +17,7 @@
 //! overrides — no cross-test interference.
 
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -25,6 +25,32 @@ use tokio::net::UnixStream;
 
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::daemon_stop::{StopError, StopOutcome, run_daemon_restart, run_daemon_stop};
+
+mod common;
+
+/// Bounded counterpart to `Child::wait`. PRD #103 / CodeRabbit finding
+/// #7: an unbounded `wait()` would hang the whole test suite if the
+/// daemon ever fails to exit. `try_wait()` polling caps the wait at
+/// `timeout` and turns the hang into a diagnostic error.
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> std::io::Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return Err(std::io::Error::other(format!(
+                "daemon child did not exit within {timeout:?}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 5-second deadline matches the rest of the daemon-stop test
+/// conventions (the SIGTERM grace upstream of these tests is also 5 s).
+const CHILD_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct SubprocessDaemon {
     _dir: TempDir,
@@ -44,7 +70,10 @@ impl Drop for SubprocessDaemon {
 }
 
 async fn spawn_subprocess_daemon() -> SubprocessDaemon {
-    let dir = tempfile::tempdir().unwrap();
+    // PRD #103 / CodeRabbit finding #6: bare `tempfile::tempdir()`
+    // races with the daemon's umask flip during socket bind and lands
+    // at 0o600. The race-safe helper re-chmods to 0o700 immediately.
+    let dir = common::race_safe_tempdir();
     let attach_path = dir.path().join("attach.sock");
     let hook_path = dir.path().join("hook.sock");
     let state_dir = dir.path().join("state");
@@ -94,7 +123,7 @@ async fn spawn_subprocess_daemon() -> SubprocessDaemon {
 
 #[tokio::test]
 async fn stop_with_no_daemon_running_is_idempotent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::race_safe_tempdir();
     let attach_path = dir.path().join("nonexistent.sock");
     let outcome = run_daemon_stop(&attach_path, false).await.unwrap();
     assert_eq!(outcome, StopOutcome::NoDaemonRunning);
@@ -130,11 +159,14 @@ async fn stop_stale_daemon_recovers_via_peer_pid_and_sigterm() {
         }
         other => panic!("expected Stopped, got {other:?}"),
     }
-    // Daemon process must be gone: wait() reaps it without hanging.
-    let exit_status =
-        tokio::task::spawn_blocking(move || daemon.child.wait().expect("child must reap"))
-            .await
-            .unwrap();
+    // Daemon process must be gone: wait_with_timeout reaps it within
+    // CHILD_WAIT_TIMEOUT and turns a hang into a diagnostic error
+    // rather than blocking the whole test suite.
+    let exit_status = tokio::task::spawn_blocking(move || {
+        wait_with_timeout(&mut daemon.child, CHILD_WAIT_TIMEOUT).expect("child must reap")
+    })
+    .await
+    .unwrap();
     assert!(
         !exit_status.success() || exit_status.success(),
         "exit status irrelevant — what matters is wait() returned, got {exit_status:?}"
@@ -210,7 +242,7 @@ async fn stop_with_force_terminates_daemon_even_with_live_agents() {
         StopOutcome::Stopped { .. } | StopOutcome::ForceKilled { .. } => {}
         other => panic!("expected Stopped or ForceKilled, got {other:?}"),
     }
-    let _ = daemon.child.wait();
+    let _ = wait_with_timeout(&mut daemon.child, CHILD_WAIT_TIMEOUT);
     let connect_result = UnixStream::connect(&daemon.attach_path).await;
     assert!(
         connect_result.is_err(),
@@ -231,7 +263,7 @@ async fn restart_stops_existing_daemon_and_allows_relaunch() {
         StopOutcome::Stopped { pid } => assert_eq!(pid, pid_before),
         other => panic!("expected Stopped, got {other:?}"),
     }
-    let _ = daemon.child.wait();
+    let _ = wait_with_timeout(&mut daemon.child, CHILD_WAIT_TIMEOUT);
 
     // Lazy-respawn: kick off a second daemon at the same paths to
     // confirm the first one is well and truly gone (otherwise this
@@ -264,7 +296,7 @@ async fn restart_stops_existing_daemon_and_allows_relaunch() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let _ = second.kill();
-    let _ = second.wait();
+    let _ = wait_with_timeout(&mut second, CHILD_WAIT_TIMEOUT);
     assert!(
         up,
         "second daemon must come up at the same socket path after restart"

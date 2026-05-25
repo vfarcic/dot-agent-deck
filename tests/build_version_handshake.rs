@@ -36,6 +36,8 @@ use tokio::net::UnixStream;
 
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 
+mod common;
+
 /// Build-ids sharing the `0.25.0-` tag prefix but differing in the
 /// `-g<sha>` suffix — the same-tag / different-commit case that the
 /// PRD explicitly calls out. Used in the "no agents, S press" test
@@ -86,7 +88,11 @@ impl Drop for TestDaemon {
 /// env iff `Some(_)` — `None` lets the daemon fall back to its
 /// compile-time `DAD_BUILD_ID`.
 async fn spawn_daemon(build_id_override: Option<&str>) -> TestDaemon {
-    let dir = tempfile::tempdir().unwrap();
+    // PRD #103 / CodeRabbit finding #5: bare `tempfile::tempdir()`
+    // races with the daemon's umask flip during socket bind and lands
+    // at 0o600, which then trips EACCES on subsequent `bind(2)`. The
+    // race-safe helper re-chmods to 0o700 immediately after creation.
+    let dir = common::race_safe_tempdir();
     let attach_path = dir.path().join("attach.sock");
     let hook_path = dir.path().join("hook.sock");
     let state_dir = dir.path().join("state");
@@ -508,6 +514,18 @@ async fn tty_with_live_agents_requires_two_s_presses_and_names_agents() {
     assert!(
         snapshot.contains("Stopping the daemon will end these agents."),
         "prompt must warn about data loss: {snapshot}"
+    );
+    // PRD #103 M4.2 / CodeRabbit finding #3: the live-agent prompt
+    // must surface the same `running daemon:` / `this binary:` build
+    // IDs as the no-agent prompt — without them the user can't tell
+    // which side of the mismatch is newer.
+    assert!(
+        snapshot.contains(&format!("running daemon:  {DAEMON_BUILD}")),
+        "live-agent prompt must name the daemon build id: {snapshot}"
+    );
+    assert!(
+        snapshot.contains(&format!("this binary:     {TUI_BUILD}")),
+        "live-agent prompt must name the TUI build id: {snapshot}"
     );
 
     // First S — must NOT terminate yet. The implementation re-renders

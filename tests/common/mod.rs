@@ -38,11 +38,13 @@ use std::sync::OnceLock;
 use tempfile::TempDir;
 
 /// Holds the per-binary tempdir for the entire test run.
+#[allow(dead_code)]
 static LOCK_DIR_GUARD: OnceLock<TempDir> = OnceLock::new();
 
 /// Idempotent setup hook. Call once before constructing a daemon in a
 /// test — typically at the start of a `spawn_daemon` helper. Creates
 /// the per-binary tempdir on first call; subsequent calls are no-ops.
+#[allow(dead_code)]
 pub fn init_test_env() {
     LOCK_DIR_GUARD.get_or_init(|| {
         tempfile::Builder::new()
@@ -56,6 +58,7 @@ pub fn init_test_env() {
 /// [`dot_agent_deck::daemon::Daemon::with_lock_dir_override`] (in-process
 /// tests) or to `Command::env` for subprocess-based tests. Returns
 /// `None` if [`init_test_env`] was never called.
+#[allow(dead_code)]
 pub fn lock_dir_path() -> Option<PathBuf> {
     LOCK_DIR_GUARD.get().map(|d| d.path().to_path_buf())
 }
