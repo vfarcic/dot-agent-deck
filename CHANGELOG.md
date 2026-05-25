@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.26.0] - 2026-05-25
+
+### Added
+
+- **Orchestration — generally available**
+  Run multi-agent pipelines where a designated orchestrator coordinates specialist workers — a coder, reviewer, auditor, release agent, or any roles that fit your project. Previously, this capability existed in the codebase but was undocumented and effectively hidden from users.
+  Define an `[[orchestrations]]` block in `.dot-agent-deck.toml` with one role marked `start = true` as the orchestrator and the rest as workers. Press `Ctrl+n`, navigate to your project directory, and cycle the **Mode** field to the orchestration name — the deck opens a dedicated tab with a pane for every role. The orchestrator reads a task, delegates work to workers, waits for results, and chains the next step. Workers run independently in their own panes and report back when done. Parallel delegation is supported: the orchestrator can send work to multiple roles simultaneously.
+  A built-in role library (coder, reviewer, auditor, tester, documenter, release, researcher) provides starting-point prompts and commands for common workflows. Generate a project-tailored config in one step by pressing `Ctrl+d` → `g` on the dashboard — the agent analyzes your project and proposes roles, commands, and prompt templates. Treat the generated config as a starting point and edit it freely.
+  See [Orchestration](https://devopstoolkit.ai/docs/ui/orchestration) for the full configuration reference, examples, and troubleshooting.
+
+### Fixed
+
+- **Stale-Daemon Version Skew Detection and `daemon stop`/`restart` Commands**
+  The local TUI now detects when it is connecting to a daemon built from a different commit and exits with a clear error message instead of silently misfiring. Previously, upgrading the `dot-agent-deck` binary while a daemon from the previous build was still running could cause delegate prompts to appear queued in the TUI but never progress — the stale daemon's handler code predated internal role-map schema changes, so orchestration silently no-op'd with no error visible to the user.
+  A new `DAD_BUILD_ID` build variable (`<version>-g<short-sha>[-dirty]`, e.g. `0.25.0-g243b049`) is compiled into every binary. On startup, the TUI performs a build-version handshake with the local daemon and, on mismatch, prints a message naming both build IDs and exits non-zero — prompting the user to run `dot-agent-deck daemon stop` before relaunching. The same field is compared on remote connections (`probe_remote_protocol`), where a mismatch points at `remote upgrade` instead.
+  Two new CLI subcommands make daemon lifecycle management safe and documented: `dot-agent-deck daemon stop` gracefully shuts down the local daemon (via `SIGTERM`, falling back to `SIGKILL` after 5 s with `--force`), refusing if managed agents are still alive unless `--force` is passed. `dot-agent-deck daemon restart` stops the daemon and lets the next TUI launch re-spawn it. Both commands discover the daemon PID via socket peer credentials (`SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS) — an OS-level facility that works against any daemon version, including pre-handshake binaries.
+  See the updated [Installation](https://devopstoolkit.ai/docs/ui/installation) and [Troubleshooting](https://devopstoolkit.ai/docs/ui/troubleshooting) docs for the recommended upgrade flow and recovery steps.
+- **Session Reuse No Longer Hides New Sessions After clear=true Delegate**
+  Delegating to a worker with `clear=true` now correctly shows a fresh session card in the TUI dashboard. Previously, the session-reuse guard introduced for opencode deck continuity would remap a respawned agent's new `session_id` back to the old one, making it appear as though no new session had started — even though the daemon had correctly killed and respawned the worker process.
+  The reuse logic now checks the `agent_id` carried in each `SessionStart` event before applying the remap. When the same agent restarts naturally within a pane (e.g., an opencode crash or config reload), the session card is reused as before. When a different `agent_id` arrives — which is what happens after a `clear=true` delegate — the reuse is skipped and a new session card is created, so the dashboard accurately reflects the fresh agent run.
+  Pre-F9 hook scripts that emit `SessionStart` without an `agent_id` continue to fall through to the reuse path, preserving backward compatibility.
+- **Orchestration Tabs Restored on Remote Reconnect**
+  Fixes orchestration panes being dumped onto the dashboard tab when a TUI reconnects to a daemon running on a different host (e.g., a laptop TUI reconnecting to a VM daemon). Previously, the hydration code tried to load the config file from the daemon's local path—a path that doesn't exist on the TUI's machine—causing every active orchestration session to silently fall back to the dashboard instead of appearing in its own orchestration tab.
+  The TUI now synthesises a minimal `OrchestrationConfig` directly from the metadata already present in the daemon's `list_agents` response (orchestration name, role names, and role indices). The synthesised config is structurally complete, so tabs are rebuilt correctly without needing access to the daemon-side config file. When the config file *is* available locally (same-host connections), it is still used to enrich display-only fields like `description` and `prompt_template`—no regression for local connections.
+  The active-tab reset on reconnect is also fixed: after hydrating orchestration tabs the TUI now lands on the first orchestration tab rather than unconditionally snapping back to the dashboard. Users reconnecting to running orchestration sessions will find their tabs where they left them.
+  Security hardening included: role indices from the wire are capped at 256 (preventing multi-gigabyte allocation from a malformed daemon response), and role and orchestration names are validated to reject control bytes and ANSI escape sequences that could disrupt terminal rendering or spoof tab labels.
+
+
+
 ## [0.25.2] - 2026-05-24
 
 ### Fixed
