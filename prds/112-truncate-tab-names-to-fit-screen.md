@@ -1,6 +1,6 @@
 # PRD #112: Truncate Tab Names When They Don't Fit on Screen
 
-**Status**: Not started
+**Status**: In Progress — implementation + tests complete, pending end-to-end UI validation
 **Priority**: Medium
 **Created**: 2026-05-24
 
@@ -33,25 +33,25 @@ Recompute on every frame — the inputs (terminal width, tab list, tab names) ar
 ## Acceptance Criteria
 
 ### Fit detection
-- [ ] When the sum of all full tab labels (with their `" {name} "` padding and dividers) fits within the tab bar area, every tab renders with its full name unchanged.
-- [ ] When the sum exceeds the available width, the equal-cap truncation applies.
+- [x] When the sum of all full tab labels (with their `" {name} "` padding and dividers) fits within the tab bar area, every tab renders with its full name unchanged.
+- [x] When the sum exceeds the available width, the equal-cap truncation applies.
 
 ### Truncation behavior
-- [ ] The cap is computed as available tab-bar width divided by the number of tabs (after accounting for the per-tab padding and divider characters used in `src/ui.rs:4924-4945`).
-- [ ] A tab whose rendered width is at or below the cap renders in full.
-- [ ] A tab whose rendered width exceeds the cap renders as `prefix…` such that the total rendered width (including the ellipsis) is at most the cap.
-- [ ] After truncation, the total rendered width of all tabs is `≤` the available width — no clipping by `Tabs`.
+- [x] The cap is computed as available tab-bar width divided by the number of tabs (after accounting for the per-tab padding and divider characters used in `src/ui.rs:4924-4945`).
+- [x] A tab whose rendered width is at or below the cap renders in full.
+- [x] A tab whose rendered width exceeds the cap renders as `prefix…` such that the total rendered width (including the ellipsis) is at most the cap.
+- [x] After truncation, the total rendered width of all tabs is `≤` the available width — no clipping by `Tabs`.
 
 ### Reactivity
-- [ ] Resizing the terminal recomputes truncation on the next render (no manual refresh required).
-- [ ] Adding a tab (new mode, new orchestration) recomputes on the next render.
-- [ ] Closing a tab recomputes on the next render — if remaining tabs now fit in full, full names return.
-- [ ] Renaming a tab (e.g. orchestration status change in #78) recomputes on the next render.
+- [x] Resizing the terminal recomputes truncation on the next render (no manual refresh required).
+- [x] Adding a tab (new mode, new orchestration) recomputes on the next render.
+- [x] Closing a tab recomputes on the next render — if remaining tabs now fit in full, full names return.
+- [x] Renaming a tab (e.g. orchestration status change in #78) recomputes on the next render.
 
 ### Visual / interaction
 - [ ] Active-tab highlight style (`src/ui.rs:4938-4943`) still applies to the truncated label.
 - [ ] Truncated labels do not break the divider rendering between tabs.
-- [ ] Mouse click on a truncated tab still selects it (existing tab-bar mouse routing should not depend on label content; verify it doesn't).
+- [x] Mouse click on a truncated tab still selects it (existing tab-bar mouse routing should not depend on label content; verify it doesn't).
 
 ## Out of Scope
 

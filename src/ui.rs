@@ -23,6 +23,7 @@ use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
+use crate::tab_layout::fit_tab_labels;
 use crate::terminal_widget::TerminalWidget;
 use crate::theme::ColorPalette;
 
@@ -5287,9 +5288,11 @@ fn render_frame(
         ])
         .split(area);
 
-        // Render the tab bar.
-        let titles: Vec<Line> = tab_bar
-            .labels
+        // Render the tab bar. Cap long labels so trailing tabs don't clip
+        // off the right edge of `Tabs`'s clipped output — every tab stays
+        // at least partially visible for click-to-switch.
+        let fitted_labels = fit_tab_labels(&tab_bar.labels, chunks[0].width);
+        let titles: Vec<Line> = fitted_labels
             .iter()
             .map(|l| Line::from(format!(" {l} ")))
             .collect();
@@ -8040,7 +8043,7 @@ mod tests {
             }
         }
 
-        let mut state = AppState::default();
+        let state = AppState::default();
         let cfg = OrchestrationConfig {
             name: "tdd-cycle".into(),
             roles: vec![

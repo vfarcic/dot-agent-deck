@@ -27,6 +27,7 @@ pub mod project_config;
 pub mod remote;
 pub mod state;
 pub mod tab;
+pub mod tab_layout;
 pub mod terminal_widget;
 pub mod theme;
 pub mod ui;
