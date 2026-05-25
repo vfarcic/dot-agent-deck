@@ -332,6 +332,22 @@ pub trait PaneController: Send + Sync {
     fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError>;
     fn toggle_layout(&self) -> Result<(), PaneError>;
     fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError>;
+    /// PRD #100: write `text` to `pane_id` and submit atomically — the
+    /// daemon side holds its per-agent writer mutex across the full
+    /// `payload → SUBMIT_DELAY → CR` sequence, matching the contract
+    /// `AgentPtyRegistry::write_to_pane_and_submit` provides to
+    /// daemon-initiated callers (orchestration delegate / work-done
+    /// feedback). The default impl forwards to [`Self::write_to_pane`],
+    /// which is the historical two-`STREAM_IN`-frames-with-gap pattern
+    /// — fine for test mocks and any caller whose pane has no
+    /// concurrent same-pane writer in production. The
+    /// `EmbeddedPaneController` impl overrides this with the atomic
+    /// `WriteAndSubmit` RPC; the orchestrator spawn-time role-prompt
+    /// injection in `ui.rs` uses the override because it shares its
+    /// pane with daemon-initiated writes.
+    fn write_and_submit_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
+        self.write_to_pane(pane_id, text)
+    }
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
     fn as_any(&self) -> &dyn Any;

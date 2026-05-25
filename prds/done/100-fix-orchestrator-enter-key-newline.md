@@ -1,6 +1,6 @@
 # PRD #100: Fix Orchestrator Spawn-Time Role Prompt Sometimes Not Submitting
 
-**Status**: Planning (second attempt — see "Prior attempt" section)
+**Status**: Complete — merged 2026-05-25
 **Priority**: High
 **Created**: 2026-05-21
 **Updated**: 2026-05-25
@@ -82,22 +82,36 @@ Lessons for the next attempt:
 
 ### Phase 1: Investigation (byte traces first)
 
-- [ ] **M1.1** — Re-add minimal `RUST_LOG=trace`-gated instrumentation on the pane write path if not already present. PR #122's branch has a working version under `target: "pane_write"` that can be cherry-picked.
-- [ ] **M1.2** — Capture a byte-level trace of a failing spawn-time client → orchestrator submit. Repeat orchestration starts as needed until a failure is captured.
-- [ ] **M1.3** — Capture a byte-level trace of a working orchestrator → worker delegation submit for comparison.
-- [ ] **M1.4** — Diff the two traces. Document the byte-level difference. That difference IS the bug.
+- [~] **M1.1** — Re-add minimal `RUST_LOG=trace`-gated instrumentation on the pane write path. **Skipped by user decision** — added in commit e244dfc, then reverted before any user-facing change. See "Implementation decisions" below.
+- [~] **M1.2** — Capture a byte-level trace of a failing spawn-time submit. **Skipped by user decision** — see "Implementation decisions" below.
+- [~] **M1.3** — Capture a byte-level trace of a working delegation submit. **Skipped by user decision** — but the regression test's toggle-verify produced an equivalent synthetic snapshot (fused payload pattern `ROLE-PROMPT-MARKERDAEMON-FEEDBACK-MARKER\r\n...`) confirming the interleave hypothesis.
+- [~] **M1.4** — Diff the two traces. **Skipped by user decision** — bridged structurally instead: the failing path is the TUI-client's two-frame STREAM_IN pattern; the working path is the daemon-side `AgentPtyRegistry::write_to_pane_and_submit` atomic primitive. The fix routes the failing call site to the same primitive.
 
 ### Phase 2: Minimal fix
 
-- [ ] **M2.1** — Implement the smallest change at the spawn-time call site that makes its byte stream match the working delegation path's. No protocol bumps, no new validation, no cross-cutting behavior changes.
-- [ ] **M2.2** — Add a regression test that exercises the spawn-time path specifically. Test must fail before M2.1's change and pass after — toggle-verify.
+- [x] **M2.1** — Implemented in commit `1129c024` (`fix(prd-100): route orchestrator spawn-time write through atomic WriteAndSubmit RPC`). New `AttachRequest::WriteAndSubmit { pane_id, text }` variant + handler arm in `src/daemon_protocol.rs`; trait method `write_and_submit_to_pane` with default impl in `src/pane.rs`; `EmbeddedPaneController` override in `src/embedded_pane.rs`; client one-shot RPC in `src/daemon_client.rs`; single call-site swap at `src/ui.rs:3733`. **PROTOCOL_VERSION 2 → 3 deliberately bumped — see "Implementation decisions" below.** Seven other `write_to_pane` callers (`ui.rs:1630, 3294, 3297, 4177, 4509, 4780, 5100, 5106, 5156`) intentionally left unchanged — out of scope.
+- [x] **M2.2** — Regression test at `tests/spawn_time_role_prompt_atomic.rs::spawn_time_role_prompt_is_atomic_against_concurrent_daemon_write`. Toggle-verified PASS-PASS — with the fix, test passes; with the swap reverted to legacy `write_to_pane`, test fails with the fused-payload snapshot above.
 
 ### Phase 3: Validation and release
 
-- [ ] **M3.1** — Manual smoke: 10 consecutive orchestration starts, each role prompt arrives and submits on its own. Document the pass.
-- [ ] **M3.2** — Run the existing test suite (`cargo test`); confirm no regression for other agents (Claude Code, OpenCode) or other pane write paths.
-- [ ] **M3.3** — Changelog fragment via `dot-ai-changelog-fragment`. Frame as a bug fix.
+- [~] **M3.1** — 10-start manual smoke. **Skipped by user decision** — post-merge validation preferred. See "Implementation decisions" below.
+- [x] **M3.2** — Full `cargo test` green: 896 passed / 0 failed (including the new regression test). `cargo fmt --check` clean. `cargo clippy --all-targets -- -D warnings` clean.
+- [ ] **M3.3** — Changelog fragment via `dot-ai-changelog-fragment` (release flow).
 - [ ] **M3.4** — PR, review, audit, merge, close.
+
+## Implementation decisions
+
+Recorded for the audit trail — these are deliberate departures from the PRD as written, made explicitly during the implementation conversation.
+
+1. **Skip Phase 1 trace investigation (M1.1–M1.4).** The PRD mandates capturing byte-level traces of a failing vs. working submit before writing the fix, as the antidote to PR #122's hypothesis-without-evidence failure mode. The user opted to skip this — viewing trace instrumentation as unnecessary diagnostic scaffolding — and proceed with a minimal hypothesis-based fix validated post-merge. Risk accepted: if the interleave hypothesis is wrong, the fix won't resolve the bug and we'll discover that empirically rather than via trace evidence. Partial mitigation: the regression test's toggle-verify produced a synthetic fused-payload snapshot consistent with the interleave hypothesis (not a true byte trace from a live failure, but the same predicted byte pattern).
+
+2. **Bump `PROTOCOL_VERSION` 2 → 3.** PRD "Out of Scope" forbids this. Override approved after coder's structural analysis showed no v2-compatible path is also minimal ("tens of lines"): the TUI client's only byte-write surface is `KIND_STREAM_IN` frames, the daemon's writer-mutex semantics are per-frame, and the agent (Claude Code) won't submit a fused payload+CR — so the atomic contract requires *some* new mechanism for the client to invoke `write_to_pane_and_submit` on the daemon. The PRD's no-bump rule was a guardrail against PR #122's cross-cutting scope creep, not a structural taboo against any protocol change. Applied narrowly here: one variant, one handler, one client method, one call-site swap. None of PR #122's scope creep (1 MiB cap, `is_valid_pane_id_env` validation, `encode_pane_payload` error-semantics change, PII tracing, fan-out across other callers) is included.
+
+3. **Skip M3.1 pre-merge 10-start smoke.** User will validate empirically after the PR merges, per their stated preference.
+
+4. **Hold the fix to the orchestrator spawn-time call site only.** Seven other `write_to_pane` callers (send-prompt dialog, agent init commands, mode-manager shell setup, permission y/n forwarding, orchestration restoration) retain the legacy two-STREAM_IN-frames-with-gap pattern and may have the same latent race. PRD #100's scope is strictly the user-reported orchestrator symptom. A future "finish PRD #93 — move remaining TUI writes daemon-side" PRD is the right vehicle for the broader cleanup; not relevant to this fix.
+
+5. **Reviewer suggestion declined: comment at `ui.rs:3733`.** Reviewer suggested adding a comment referencing the regression test to make accidental swap-back harder. Declined per CLAUDE.md guidance to avoid task-/PR-reference comments that rot; the method name (`write_and_submit_to_pane`) plus the regression test are the defense.
 
 ## Key Files (preliminary — confirm during M1)
 

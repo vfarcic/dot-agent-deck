@@ -1774,6 +1774,24 @@ impl PaneController for EmbeddedPaneController {
         Ok(())
     }
 
+    /// PRD #100: atomic counterpart of [`Self::write_to_pane`]. Routes
+    /// through the new `WriteAndSubmit` RPC so the daemon holds its
+    /// per-agent writer mutex across `payload → SUBMIT_DELAY → CR`,
+    /// matching the daemon-initiated `write_to_pane_and_submit` contract.
+    /// Used at the orchestrator spawn-time role-prompt injection site
+    /// in `ui.rs`, where a concurrent daemon-initiated write (e.g.
+    /// work-done feedback for a sibling worker) could otherwise
+    /// interleave into the legacy two-frame path's mid-sequence gap and
+    /// submit the user's prompt with daemon bytes fused in.
+    fn write_and_submit_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
+        let client = self.client.clone();
+        let pane_id = pane_id.to_string();
+        let text = text.to_string();
+        self.runtime
+            .block_on(async move { client.write_and_submit(&pane_id, &text).await })
+            .map_err(|e| PaneError::CommandFailed(format!("write_and_submit: {e}")))
+    }
+
     fn name(&self) -> &str {
         "embedded"
     }
