@@ -1,8 +1,9 @@
 # PRD #68: Fix Dashboard Card Navigation Keys
 
-**Status**: Draft
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-04-28
+**Completed**: 2026-05-25
 
 ## Problem
 
@@ -33,12 +34,12 @@ Fix so that pressing `j`/`k`/`Up`/`Down` while the dashboard has keyboard focus 
 
 ## Acceptance Criteria
 
-- [ ] From a freshly launched dashboard with multiple session cards, pressing `j` or `Down` advances the selection to the next card; the previously-selected card is no longer highlighted.
-- [ ] Pressing `k` or `Up` moves the selection back.
-- [ ] Selection wraps at the end / start of the list (matches existing `(selected_index + 1) % total` logic).
-- [ ] After fix, restore `j`/`k` / `Up`/`Down` rows in:
+- [x] From a freshly launched dashboard with multiple session cards, pressing `j` or `Down` advances the selection to the next card; the previously-selected card is no longer highlighted.
+- [x] Pressing `k` or `Up` moves the selection back.
+- [x] Selection wraps at the end / start of the list (matches existing `(selected_index + 1) % total` logic).
+- [x] After fix, restore `j`/`k` / `Up`/`Down` rows in:
   - `docs/keyboard-shortcuts.md` Dashboard table
-  - `docs/getting-started.mdx` Basic Workflow step on focusing a pane
+  - `docs/getting-started.md` Basic Workflow step on focusing a pane
   - `src/ui.rs` help overlay text
 
 ## Out of Scope
