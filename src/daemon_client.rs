@@ -260,6 +260,34 @@ impl DaemonClient {
             .ok_or_else(|| ClientError::Malformed("start-agent ok but no id in response".into()))
     }
 
+    /// PRD #100: route a pane write through the daemon's atomic
+    /// `write_to_pane_and_submit` primitive instead of the
+    /// two-`STREAM_IN`-frames-with-gap pattern. Same one-shot connection
+    /// shape as `resize_agent` / `stop_agent`. The daemon holds the
+    /// per-agent writer mutex across `payload → SUBMIT_DELAY → CR`, so a
+    /// concurrent daemon-initiated write (work-done feedback, respawn
+    /// notice) cannot interleave between the payload and the submit CR.
+    pub async fn write_and_submit(&self, pane_id: &str, text: &str) -> Result<(), ClientError> {
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::WriteAndSubmit {
+                pane_id: pane_id.to_string(),
+                text: text.to_string(),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "write-and-submit failed".into()),
+            ));
+        }
+        Ok(())
+    }
+
     /// Push a TUI pane resize through to the daemon's PTY. Idempotent on the
     /// wire: each call opens a fresh short-lived connection (matching the
     /// pattern used for `stop_agent` / `list_agents`). Callers that fire

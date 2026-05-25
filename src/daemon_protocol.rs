@@ -142,7 +142,7 @@ pub const KIND_SHUTDOWN_ACK: u8 = 0x16;
 /// Additive `#[serde(default, skip_serializing_if = "Option::is_none")]`
 /// fields do NOT require a bump — they're forward-compatible by design. See
 /// the module-level "Protocol versioning" section for the full bump policy.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -313,6 +313,24 @@ pub enum AttachRequest {
         display_name: Option<String>,
         #[serde(default)]
         cwd: Option<String>,
+    },
+    /// PRD #100: atomic write-and-submit RPC. Routes the client's
+    /// `pane_id` + `text` straight to
+    /// [`crate::agent_pty::AgentPtyRegistry::write_to_pane_and_submit`]
+    /// on the daemon side, which holds the per-agent writer mutex across
+    /// the full `payload → SUBMIT_DELAY → CR` sequence (PRD #93 round-8
+    /// atomic contract). Lets a TUI client trigger the same atomic
+    /// byte stream the daemon-initiated orchestration-delegate path
+    /// already produces — without the two-`STREAM_IN`-frames-with-150ms-gap
+    /// pattern, whose mid-sequence mutex release lets a concurrent
+    /// daemon-initiated write interleave and fuse a daemon-side CR onto
+    /// the user's payload, submitting it prematurely. The user's
+    /// trailing CR then lands in an empty input box and is rendered as
+    /// a newline — PRD #100's "Enter inserted a newline instead of
+    /// submitting" symptom.
+    WriteAndSubmit {
+        pane_id: String,
+        text: String,
     },
     /// PRD #76 M2.17: long-lived subscription to the daemon's
     /// `AgentEvent` broadcast. Server replies with an OK `RESP` then
@@ -927,6 +945,12 @@ async fn handle_connection(
             Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
+        AttachRequest::WriteAndSubmit { pane_id, text } => {
+            match registry.write_to_pane_and_submit(&pane_id, &text).await {
+                Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
+                Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+            }
+        }
         AttachRequest::SubscribeEvents => {
             handle_subscribe_events(stream, event_tx).await?;
         }

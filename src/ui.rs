@@ -3730,7 +3730,7 @@ pub fn run_tui(
                         .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(10));
                 if agent_ready || timeout_ready {
                     if let Some(prompt) = orchestrator_prompt.take() {
-                        let _ = pane.write_to_pane(start_pane_id, &prompt);
+                        let _ = pane.write_and_submit_to_pane(start_pane_id, &prompt);
                     }
                     role_statuses[*start_role_index] = OrchestrationRoleStatus::Working;
                     ui.orchestration_prompted.insert(*id);
