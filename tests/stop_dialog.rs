@@ -239,11 +239,18 @@ mod stub_server {
         F: FnOnce(tokio::net::UnixStream) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stub.sock");
-        let listener = {
+        // Create the tempdir INSIDE the bind lock so a concurrent
+        // `bind_socket` call (which briefly sets the process umask to
+        // 0o177) cannot strip the execute bit from the directory before
+        // we bind a socket inside it.  See `common::race_safe_tempdir`
+        // for the same fix applied to other harnesses that use
+        // `bind_attach_listener`.
+        let (dir, path, listener) = {
             let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            UnixListener::bind(&path).expect("bind stub listener")
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("stub.sock");
+            let listener = UnixListener::bind(&path).expect("bind stub listener");
+            (dir, path, listener)
         };
         let handle = tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
