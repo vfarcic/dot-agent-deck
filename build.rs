@@ -126,17 +126,28 @@ fn git_is_dirty() -> bool {
     !output.stdout.is_empty()
 }
 
-/// Parse `.git/HEAD` to extract the symbolic ref path (e.g. `refs/heads/main`).
-/// Returns `None` on detached HEAD (where HEAD contains a raw SHA — the
-/// existing `.git/HEAD` watch already covers that case) or when `.git/HEAD`
-/// is unreadable.
+/// Resolve the symbolic ref path HEAD points at (e.g. `refs/heads/main`)
+/// via `git symbolic-ref -q HEAD`. Returns `None` on detached HEAD (the
+/// existing HEAD watch already covers that case) or when git isn't
+/// available.
+///
+/// We can't read `.git/HEAD` directly: in a worktree, `.git` is a *file*
+/// containing `gitdir: ...`, not a directory, so the literal path
+/// points at nothing. `git symbolic-ref` handles both layouts uniformly
+/// and prints just the ref path (or fails silently with a non-zero exit
+/// when HEAD is detached).
 fn parse_head_ref_path() -> Option<String> {
-    let contents = std::fs::read_to_string(".git/HEAD").ok()?;
-    let trimmed = contents.trim();
-    let ref_path = trimmed.strip_prefix("ref:")?.trim();
+    let output = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let ref_path = String::from_utf8(output.stdout).ok()?.trim().to_string();
     if ref_path.is_empty() {
         None
     } else {
-        Some(ref_path.to_string())
+        Some(ref_path)
     }
 }

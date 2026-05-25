@@ -200,12 +200,32 @@ pub async fn ensure_compatible_daemon_or_die(
     match decision {
         InteractiveDecision::Quit => Err(HandshakeError::MismatchAborted),
         InteractiveDecision::Stop => {
+            // PRD #103 PID-reuse mitigation: re-resolve `peer_pid()` on
+            // the SAME `UnixStream` we kept open across the interactive
+            // prompt. Holding the stream open prevents the kernel from
+            // tearing down the socket pairing in the window where the
+            // user was deciding S/Q. If `peer_pid()` now fails the
+            // daemon has already exited on its own — there's nothing to
+            // terminate, so short-circuit to success rather than
+            // signalling an arbitrary same-UID PID.
+            let resolved_pid = match peer_pid(&probe.stream) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "build_version_handshake",
+                        error = %e,
+                        original_pid = probe.peer_pid,
+                        "re-resolved peer_pid failed after prompt; treating daemon as already gone"
+                    );
+                    return Ok(HandshakeOutcome::Recovered);
+                }
+            };
             // Phase 2 doesn't escalate to SIGKILL — the user can re-run
             // `dot-agent-deck daemon stop --force` for that. The
             // graceful-SIGTERM outcome is the only success variant we
             // care about here; treat both Stopped and Killed (the
             // latter is unreachable with `None`) as Recovered.
-            terminate_daemon_graceful(probe.peer_pid, attach_path, TERMINATE_POLL_TIMEOUT, None)
+            terminate_daemon_graceful(resolved_pid, attach_path, TERMINATE_POLL_TIMEOUT, None)
                 .await?;
             Ok(HandshakeOutcome::Recovered)
         }
@@ -215,28 +235,41 @@ pub async fn ensure_compatible_daemon_or_die(
 struct ProbeOutcome {
     response: AttachResponse,
     peer_pid: u32,
+    /// The original connected `UnixStream` is held alive across the
+    /// interactive prompt so the kernel can't recycle the daemon's PID
+    /// while the user is deciding S/Q (PRD #103 PID-reuse mitigation —
+    /// see [`ensure_compatible_daemon_or_die`]). Used for the
+    /// re-resolved `peer_pid()` call right before SIGTERM.
+    stream: UnixStream,
 }
 
 async fn probe_daemon(attach_path: &Path) -> Result<ProbeOutcome, HandshakeError> {
-    let stream = UnixStream::connect(attach_path)
+    let mut stream = UnixStream::connect(attach_path)
         .await
         .map_err(HandshakeError::Probe)?;
     let pid = peer_pid(&stream).map_err(HandshakeError::PeerPid)?;
-    let (mut rd, mut wr) = stream.into_split();
-    let req = AttachRequest::Hello {
-        client_version: PROTOCOL_VERSION,
-        // Same `local_build_id()` the comparison uses — keeps the
-        // wire-advertised `client_build_version` consistent with the
-        // value we're matching against, even under the test-only
-        // `DOT_AGENT_DECK_BUILD_ID_OVERRIDE`.
-        client_build_version: Some(local_build_id()),
+    // Borrow-split so the original `stream` survives the Hello exchange
+    // and can be held across the interactive prompt. `into_split()`
+    // (which consumes the stream) would force us to reunite the halves
+    // afterwards; the borrow-split is simpler.
+    let resp = {
+        let (mut rd, mut wr) = stream.split();
+        let req = AttachRequest::Hello {
+            client_version: PROTOCOL_VERSION,
+            // Same `local_build_id()` the comparison uses — keeps the
+            // wire-advertised `client_build_version` consistent with the
+            // value we're matching against, even under the test-only
+            // `DOT_AGENT_DECK_BUILD_ID_OVERRIDE`.
+            client_build_version: Some(local_build_id()),
+        };
+        issue_command(&mut rd, &mut wr, &req)
+            .await
+            .map_err(|e| HandshakeError::Probe(io::Error::other(e.to_string())))?
     };
-    let resp = issue_command(&mut rd, &mut wr, &req)
-        .await
-        .map_err(|e| HandshakeError::Probe(io::Error::other(e.to_string())))?;
     Ok(ProbeOutcome {
         response: resp,
         peer_pid: pid,
+        stream,
     })
 }
 
@@ -435,6 +468,13 @@ fn render_mismatch_prompt(
             "⚠  Daemon version mismatch  ({n} managed agent(s) running)\n",
             n = agents.len()
         ));
+        // Surface both build-ids in the live-agent variant too — the
+        // no-agent branch shows them and the user loses crucial context
+        // (which side is "newer") if they're only visible in one of the
+        // two prompts. PRD #103 M4.2 / CodeRabbit finding #3.
+        out.push_str(&format!("   running daemon:  {daemon_display}\n"));
+        out.push_str(&format!("   this binary:     {local_build}\n"));
+        out.push('\n');
         for id in agents {
             out.push_str(&format!("   {id}\n"));
         }
@@ -584,6 +624,9 @@ mod tests {
             &["agent-1".into(), "agent-2".into()],
         );
         let expected = "⚠  Daemon version mismatch  (2 managed agent(s) running)\n\
+             \x20  running daemon:  0.25.0-gabc1234\n\
+             \x20  this binary:     0.25.0-gdeadbee\n\
+             \n\
              \x20  agent-1\n\
              \x20  agent-2\n\
              \n\

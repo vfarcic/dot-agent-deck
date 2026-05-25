@@ -25,6 +25,7 @@ use std::process::Command;
 
 use thiserror::Error;
 
+use crate::build_id::local_build_id;
 use crate::daemon_protocol::{AttachResponse, PROTOCOL_VERSION};
 use crate::remote::{
     RemoteConfigError, RemoteEntry, RemotesFile, SshError, SshExecutor, SshTarget,
@@ -549,18 +550,23 @@ pub fn probe_remote_protocol(
                     // identically to a real mismatch so the user re-runs
                     // `remote upgrade <name>` and the laptop gains the
                     // precision on the next probe.
-                    let local_build = env!("DAD_BUILD_ID");
+                    // Route through `local_build_id()` rather than
+                    // `env!("DAD_BUILD_ID")` so the
+                    // `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` test hook (used by
+                    // the M4.2 integration tests) takes effect on the
+                    // remote-mismatch path too.
+                    let local_build = local_build_id();
                     match resp.build_version.as_deref() {
-                        Some(remote_build) if remote_build == local_build => Ok(()),
+                        Some(remote_build) if remote_build == local_build.as_str() => Ok(()),
                         Some(remote_build) => Err(RemoteConnectError::BuildVersionMismatch {
                             name: name.to_string(),
                             remote: Some(remote_build.to_string()),
-                            local: local_build.to_string(),
+                            local: local_build,
                         }),
                         None => Err(RemoteConnectError::BuildVersionMismatch {
                             name: name.to_string(),
                             remote: None,
-                            local: local_build.to_string(),
+                            local: local_build,
                         }),
                     }
                 }
