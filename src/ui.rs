@@ -424,10 +424,28 @@ impl NewPaneFormState {
         }
     }
 
+    /// PRD #106: the Command field is hidden (and the form treats it as
+    /// non-existent for navigation/submission) whenever the user has selected
+    /// an orchestration. Orchestrations spawn role panes via commands defined
+    /// in `.dot-agent-deck.toml`, so a user-typed command is silently ignored
+    /// — we drop the field rather than presenting a false affordance.
+    fn command_visible(&self) -> bool {
+        self.selected_orchestration().is_none()
+    }
+
     fn next_field(&self) -> FormField {
+        let cmd_visible = self.command_visible();
         match self.focused {
             FormField::Mode => FormField::Name,
-            FormField::Name => FormField::Command,
+            FormField::Name => {
+                if cmd_visible {
+                    FormField::Command
+                } else if self.has_mode_field {
+                    FormField::Mode
+                } else {
+                    FormField::Name
+                }
+            }
             FormField::Command => {
                 if self.has_mode_field {
                     FormField::Mode
@@ -439,13 +457,22 @@ impl NewPaneFormState {
     }
 
     fn prev_field(&self) -> FormField {
+        let cmd_visible = self.command_visible();
         match self.focused {
-            FormField::Mode => FormField::Command,
+            FormField::Mode => {
+                if cmd_visible {
+                    FormField::Command
+                } else {
+                    FormField::Name
+                }
+            }
             FormField::Name => {
                 if self.has_mode_field {
                     FormField::Mode
-                } else {
+                } else if cmd_visible {
                     FormField::Command
+                } else {
+                    FormField::Name
                 }
             }
             FormField::Command => FormField::Name,
@@ -2523,10 +2550,13 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             FormField::Mode => {
                 form.focused = FormField::Name;
             }
-            FormField::Name => {
+            FormField::Name if form.command_visible() => {
                 form.focused = FormField::Command;
             }
-            FormField::Command => {
+            // PRD #106: when the Command field is hidden (orchestration
+            // selected), pressing Enter on Name submits — there's no later
+            // field to advance to.
+            FormField::Name | FormField::Command => {
                 let req = NewPaneRequest {
                     dir: form.dir.clone(),
                     name: form.name.clone(),
@@ -6539,13 +6569,33 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
     frame.render_widget(paragraph, popup_area);
 }
 
+/// Footer-hint string for the unified new-pane form. Factored out so the
+/// focus-dependent wording can be unit-tested without driving a TestBackend.
+/// `name_submits` is true when focus is on Name and the Command field is
+/// hidden (orchestration selected) — i.e. Enter on Name submits the form.
+fn new_pane_form_footer_hint(has_mode_field: bool, name_submits: bool) -> &'static str {
+    if has_mode_field {
+        if name_submits {
+            "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: submit  Esc: cancel"
+        } else {
+            "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: next  Esc: cancel"
+        }
+    } else {
+        "  Tab: switch field  Enter: next/confirm  Esc: cancel"
+    }
+}
+
 fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: ColorPalette) {
     let area = frame.area();
     let popup_width = 56.min(area.width.saturating_sub(4));
     // The mode field (when modes exist) or the tip line (when they don't)
     // each need 2 extra rows.  Always reserve them.
     let mode_extra: u16 = 2;
-    let popup_height = (12 + mode_extra).min(area.height.saturating_sub(4));
+    // PRD #106: when the Command field is hidden (orchestration selected) the
+    // form is two rows shorter — Command's label row plus its spacing row.
+    let cmd_visible = form.command_visible();
+    let cmd_rows: u16 = if cmd_visible { 2 } else { 0 };
+    let popup_height = (10 + mode_extra + cmd_rows).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -6629,30 +6679,32 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
             },
         ),
     ]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  Command: ", cmd_style),
-        Span::styled(
-            format!(
-                "{:<width$}",
-                form.command,
-                width = inner_width.saturating_sub(11)
+    if cmd_visible {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  Command: ", cmd_style),
+            Span::styled(
+                format!(
+                    "{:<width$}",
+                    form.command,
+                    width = inner_width.saturating_sub(11)
+                ),
+                if form.focused == FormField::Command {
+                    Style::default().fg(palette.text_primary)
+                } else {
+                    unfocused_label
+                },
             ),
-            if form.focused == FormField::Command {
-                Style::default().fg(palette.text_primary)
-            } else {
-                unfocused_label
-            },
-        ),
-    ]));
+        ]));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(""));
 
-    let footer = if form.has_mode_field {
-        "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: next  Esc: cancel"
-    } else {
-        "  Tab: switch field  Enter: next/confirm  Esc: cancel"
-    };
+    // PRD #106 follow-up: when the Command field is hidden (orchestration
+    // selected) and focus is on Name, Enter submits — surface that instead of
+    // the generic "Enter: next" wording, which is misleading in that state.
+    let name_submits = form.focused == FormField::Name && !cmd_visible;
+    let footer = new_pane_form_footer_hint(form.has_mode_field, name_submits);
     lines.push(Line::styled(
         footer,
         Style::default().fg(palette.text_secondary),
@@ -8040,7 +8092,7 @@ mod tests {
             }
         }
 
-        let mut state = AppState::default();
+        let state = AppState::default();
         let cfg = OrchestrationConfig {
             name: "tdd-cycle".into(),
             roles: vec![
@@ -10834,8 +10886,8 @@ mod tests {
             handle_new_pane_form_key(key, &mut ui);
         }
 
-        // Move to Command field and submit
-        handle_new_pane_form_key(enter, &mut ui); // Name → Command
+        // PRD #106: with an orchestration selected, Command is hidden — so
+        // pressing Enter on Name submits directly. No second navigation step.
         let result = handle_new_pane_form_key(enter, &mut ui); // submit
 
         let req = match result {
@@ -10872,12 +10924,12 @@ mod tests {
             vec![make_orchestration("config-name")],
         ));
 
-        // Select orchestration, skip Name field (leave it empty), submit
+        // Select orchestration, skip Name field (leave it empty), submit.
+        // PRD #106: Command is hidden, so Enter on Name submits.
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         handle_new_pane_form_key(right, &mut ui);
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_new_pane_form_key(enter, &mut ui); // Mode → Name
-        handle_new_pane_form_key(enter, &mut ui); // Name → Command (name stays "")
         let result = handle_new_pane_form_key(enter, &mut ui); // submit
 
         let req = match result {
@@ -10967,6 +11019,220 @@ mod tests {
         handle_new_pane_form_key(key_l, &mut ui);
 
         assert_eq!(ui.new_pane_form.as_ref().unwrap().name, "hl");
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #106: Command field visibility when orchestration is selected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn command_hidden_only_when_orchestration_selected() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("dev")],
+            vec![make_orchestration("tdd")],
+        );
+
+        // 0 = No mode → command visible
+        assert!(f.command_visible());
+
+        // 1 = workspace mode → command visible
+        f.selection_index = 1;
+        assert!(f.command_visible());
+
+        // 2 = orchestration → command hidden
+        f.selection_index = 2;
+        assert!(!f.command_visible());
+
+        // Toggling back restores it.
+        f.selection_index = 0;
+        assert!(f.command_visible());
+    }
+
+    #[test]
+    fn tab_skips_hidden_command_field_with_orchestration() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("tdd")],
+        );
+        // Select the orchestration (index 1).
+        f.selection_index = 1;
+        assert!(!f.command_visible());
+
+        assert_eq!(f.focused, FormField::Mode);
+
+        // Mode → Name (skipping nothing yet).
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Name);
+
+        // Name should wrap back to Mode rather than visiting hidden Command.
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Mode);
+
+        // Shift+Tab from Mode should land on Name (skip Command).
+        f.focused = f.prev_field();
+        assert_eq!(f.focused, FormField::Name);
+
+        // Shift+Tab from Name → Mode.
+        f.focused = f.prev_field();
+        assert_eq!(f.focused, FormField::Mode);
+    }
+
+    #[test]
+    fn tab_visits_command_when_workspace_mode_selected() {
+        // Regression guard: with a workspace mode (not an orchestration),
+        // Tab cycling must still pass through the Command field.
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("dev")],
+            vec![make_orchestration("tdd")],
+        );
+        f.selection_index = 1; // workspace mode
+        assert!(f.command_visible());
+
+        f.focused = FormField::Mode;
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Name);
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Command);
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Mode);
+    }
+
+    #[test]
+    fn enter_on_name_submits_when_orchestration_selected() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/proj"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("tdd")],
+        ));
+
+        // Select the orchestration.
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui);
+
+        // Enter from Mode → Name.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Name);
+
+        // Enter on Name should submit directly, not advance to a hidden field.
+        let result = handle_new_pane_form_key(enter, &mut ui);
+        assert!(matches!(result, KeyResult::NewPane(_)));
+        assert!(ui.new_pane_form.is_none());
+        assert_eq!(ui.mode, UiMode::Normal);
+        if let KeyResult::NewPane(req) = result {
+            assert!(req.orchestration_config.is_some());
+            assert!(req.mode_config.is_none());
+        }
+    }
+
+    #[test]
+    fn tab_through_hidden_command_after_cycling_to_orchestration() {
+        // End-to-end: user starts on Mode (No mode selected), navigates to
+        // Command, comes back, then cycles forward to an orchestration. From
+        // there, Tab must skip the now-hidden Command field cleanly.
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("dev")],
+            vec![make_orchestration("tdd")],
+        ));
+
+        // Walk Mode → Name → Command → Name → Mode (all visible at this
+        // point because "No mode" is selected).
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
+        handle_new_pane_form_key(tab, &mut ui);
+        handle_new_pane_form_key(tab, &mut ui);
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().focused,
+            FormField::Command
+        );
+        handle_new_pane_form_key(backtab, &mut ui);
+        handle_new_pane_form_key(backtab, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Mode);
+
+        // Right-arrow twice to land on the orchestration (0 → 1 → 2).
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui);
+        handle_new_pane_form_key(right, &mut ui);
+        assert!(
+            ui.new_pane_form
+                .as_ref()
+                .unwrap()
+                .selected_orchestration()
+                .is_some()
+        );
+
+        // Now Tab forward: Mode → Name → Mode (skipping hidden Command).
+        handle_new_pane_form_key(tab, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Name);
+        handle_new_pane_form_key(tab, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Mode);
+    }
+
+    #[test]
+    fn footer_hint_switches_to_submit_when_name_focused_with_orchestration() {
+        // PRD #106 follow-up: when the Command field is hidden and focus is
+        // on Name, Enter submits — the footer must say so.
+        let submit_hint = new_pane_form_footer_hint(true, true);
+        assert!(
+            submit_hint.contains("Enter: submit"),
+            "expected submit hint, got {submit_hint:?}"
+        );
+
+        // Sanity checks: every other focus/visibility combination keeps the
+        // legacy 'Enter: next' wording.
+        let next_hint = new_pane_form_footer_hint(true, false);
+        assert!(
+            next_hint.contains("Enter: next") && !next_hint.contains("submit"),
+            "expected next hint, got {next_hint:?}"
+        );
+        let no_mode_hint = new_pane_form_footer_hint(false, false);
+        assert!(
+            no_mode_hint.contains("Enter: next/confirm"),
+            "expected next/confirm hint when there's no mode field, got {no_mode_hint:?}"
+        );
+    }
+
+    #[test]
+    fn enter_on_name_still_advances_to_command_without_orchestration() {
+        // Regression guard for the non-orchestration flow: with a workspace
+        // mode (or "No mode") selected, Enter on Name must still advance to
+        // the Command field rather than submit.
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            "agent".to_string(),
+            "claude".to_string(),
+            vec![make_mode("dev")],
+            vec![],
+        ));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        let result = handle_new_pane_form_key(enter, &mut ui); // Name → Command
+        assert!(matches!(result, KeyResult::Continue));
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().focused,
+            FormField::Command
+        );
     }
 
     #[test]
