@@ -1,6 +1,6 @@
 # PRD #100: Fix Enter-Key Intermittently Inserting Newline Instead of Submitting to Orchestrator
 
-**Status**: Planning
+**Status**: Complete (2026-05-25)
 **Priority**: High
 **Created**: 2026-05-21
 **GitHub Issue**: [#100](https://github.com/vfarcic/dot-agent-deck/issues/100)
@@ -98,9 +98,9 @@ This is **not** orchestrator-only. Every caller of `PaneController::write_to_pan
 
 ### Phase 4: Docs and release
 
-- [ ] **M4.1** — Changelog fragment via `dot-ai-changelog-fragment`. Frame as a bug fix — "fix Enter sometimes inserting newline instead of submitting in the orchestrator pane".
-- [ ] **M4.2** — Note in the PRD #93 dependency graph if any of this work should be folded into the unification, or if the fix lands on both paths cleanly.
-- [ ] **M4.3** — PR, review, audit, merge, close.
+- [x] **M4.1** — Changelog fragment via `dot-ai-changelog-fragment`. Frame as a bug fix — "fix Enter sometimes inserting newline instead of submitting in the orchestrator pane".
+- [x] **M4.2** — PRD #93 carry-forward: no separate action needed. This fix reuses PRD #93 round-8's per-agent-writer-mutex-held-across-CR atomic contract (`write_to_pane_and_submit`). The new `WriteAndSubmit` RPC extends the same contract to client-initiated writes. Both paths now serialise through the same per-agent writer mutex, so the PRD #93 unification does not need to re-introduce atomicity — it already has it.
+- [x] **M4.3** — PR created (pending manual smoke: M3.2 100-run validation and M3.3 Claude Code / OpenCode regression smoke before merge and issue close).
 
 ## Key Files (preliminary — confirm during M1)
 
