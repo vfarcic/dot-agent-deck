@@ -171,7 +171,16 @@ struct Pane {
 /// Thread-safe pane registry.
 type PaneRegistry = Arc<Mutex<HashMap<String, Pane>>>;
 
-use crate::pane_input::{SUBMIT_DELAY, encode_pane_payload};
+// Send-prompt encoding (`encode_pane_payload`, `SUBMIT_DELAY`) lives
+// entirely on the daemon side now — the TUI hands raw `text` to the
+// `WriteAndSubmit` RPC and the daemon does the framing under the
+// per-agent writer mutex (PRD #100 M2.2). `escape_bytes_for_log` is
+// still imported because the TUI-side trace logs the raw text with
+// the same byte-escape format the daemon-side trace uses (PRD #100
+// reviewer trace-symmetry alignment).
+// See `crate::daemon_protocol::AttachRequest::WriteAndSubmit` and
+// `crate::agent_pty::AgentPtyRegistry::write_to_pane_and_submit`.
+use crate::pane_input::escape_bytes_for_log;
 
 /// Embedded terminal pane controller. Spawns agents on the daemon at
 /// [`Self::client`]'s socket path and renders their PTY output through a
@@ -366,23 +375,6 @@ impl EmbeddedPaneController {
         let current = *id;
         *id += 1;
         current.to_string()
-    }
-
-    /// Enqueue `payload` for the pane's I/O task to forward as one
-    /// `KIND_STREAM_IN` frame. Held under the `panes` mutex only long
-    /// enough to look up the sender — the actual write happens on the
-    /// I/O task. A closed channel means the I/O task has already exited
-    /// (e.g. socket close); surface that as `CommandFailed` so callers
-    /// can decide whether to retry.
-    fn queue_stream_input(&self, pane_id: &str, payload: Vec<u8>) -> Result<(), PaneError> {
-        let panes = self.panes.lock().unwrap();
-        let pane = panes
-            .get(pane_id)
-            .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
-        pane.backend
-            .input_tx
-            .send(StreamCmd::Input(payload))
-            .map_err(|_| PaneError::CommandFailed(format!("Pane {pane_id} stream I/O task ended")))
     }
 
     /// Build a stream-backed pane against the daemon. The PTY lives in
@@ -1740,38 +1732,103 @@ impl PaneController for EmbeddedPaneController {
         Ok(())
     }
 
-    /// Concurrency contract: callers must not invoke `write_to_pane` concurrently
-    /// for the same `pane_id`. The pane lock is released around `SUBMIT_DELAY` so
-    /// other panes can be drawn — but interleaved writes for the *same* pane would
-    /// produce `payload_A + payload_B + CR + CR`, fusing two prompts. The current
-    /// architecture is single-threaded for pane I/O, so this is a latent constraint
-    /// rather than an active hazard; a per-pane submit mutex would enforce it if
-    /// concurrent callers are ever introduced.
+    /// PRD #100 M2.2: the send-prompt path now issues a single
+    /// `WriteAndSubmit` RPC instead of queuing two STREAM_IN frames
+    /// (payload, then `\r` after a 150 ms client-side sleep). The
+    /// daemon's [`crate::agent_pty::AgentPtyRegistry::write_to_pane_and_submit`]
+    /// holds the per-agent writer mutex across the full payload +
+    /// `SUBMIT_DELAY` + CR sequence — the same atomic contract
+    /// orchestration dispatch already had (PRD #93 round-8). No other
+    /// writer (orchestration delegate, work-done feedback, respawn
+    /// notice) can interleave bytes between the user's payload and
+    /// the user's CR, which closed the PRD #100 bug surface.
     ///
-    /// PRD #93 round-8: an embedded bracketed-paste marker in a multi-line
-    /// `text` causes [`encode_pane_payload`] to return Err — log at warn
-    /// and drop the write, same handling as a missing pane below.
+    /// The old two-frame approach had a 150 ms window during which the
+    /// writer mutex was released; a daemon-initiated write landing in
+    /// the gap produced byte streams like
+    /// `[user payload][daemon notice][\n][user \r]`, which the
+    /// receiving agent rendered as "Enter inserted a newline instead
+    /// of submitting".
+    ///
+    /// Concurrency: the daemon's per-agent writer mutex serializes
+    /// concurrent callers for the same pane, so the historical
+    /// single-threaded-pane-I/O constraint is no longer required to
+    /// avoid `payload_A + payload_B + CR + CR` fusion.
+    ///
+    /// **Runtime requirement.** This impl drives the RPC via
+    /// `self.runtime.block_on(...)`. `Handle::block_on` on a
+    /// `current_thread` runtime would deadlock the single worker, so
+    /// the TUI must run on a multi-thread runtime. In production this
+    /// is guaranteed by `#[tokio::main]` in `src/main.rs` (which
+    /// defaults to multi-thread) plus the TUI loop running inside
+    /// `tokio::task::spawn_blocking`. A future refactor that moves
+    /// the TUI onto a `flavor = "current_thread"` runtime would have
+    /// to either keep this RPC on the runtime side or use
+    /// `tokio::task::block_in_place` — both `write_to_pane` and the
+    /// existing `block_on` sites in `create_pane` / `close_pane` /
+    /// `hydrate_from_daemon` share this constraint.
+    ///
+    /// **Error semantics — behavior change from pre-fix path
+    /// (PRD #100 audit #3, reviewer MEDIUM).** The pre-fix body
+    /// converted [`crate::pane_input::PaneInputError`] (embedded
+    /// `\x1b[200~` / `\x1b[201~` in a multi-line payload) into
+    /// `tracing::warn!` + `Ok(())` — silent to the caller. The new
+    /// path runs `encode_pane_payload` daemon-side inside
+    /// `write_to_pane_and_submit`; a rejection there becomes
+    /// `AgentPtyError::InvalidPayload` → `AttachResponse::err` →
+    /// `ClientError::Server` → `PaneError::CommandFailed`. The
+    /// daemon still logs `warn` at the encode site, but this method
+    /// now also returns `Err` to the caller. Callers using
+    /// `let _ = pane.write_to_pane(...)` (the majority) see no
+    /// difference; `ui.rs:5126` (`KeyResult::SendConfigGenPrompt`)
+    /// and `ui.rs:4750` (permission y/n) match the `Result` and
+    /// will now surface
+    /// `"Failed to send config prompt: write_to_pane: WriteAndSubmit
+    /// RPC failed: …"` in the status bar where the embedded-marker
+    /// case was previously silent. This is the desired direction —
+    /// a dropped user prompt should be observable, not silent.
     fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
-        let payload = match encode_pane_payload(text) {
-            Ok(payload) => payload,
-            Err(e) => {
-                tracing::warn!(
-                    pane_id = %pane_id,
-                    error = %e,
-                    "write_to_pane: dropping write — encode_pane_payload rejected the input"
-                );
-                return Ok(());
+        // PRD #100 reviewer trace-symmetry: TUI-side trace now logs
+        // the full payload (escaped) too, matching the daemon-side
+        // trace in `agent_pty::write_to_pane_internal` and the
+        // STREAM_IN handler. The asymmetry the reviewer flagged was
+        // unintentional — operators investigating a byte-stream
+        // race want both sides at the same fidelity. Same
+        // `pane_write` target so a single RUST_LOG switch captures
+        // both. **PII WARNING** (PRD #100 audit #5): `text` is the
+        // user's prompt body byte-for-byte and may include pasted
+        // credentials. Trace gating + `pane_write` target keep this
+        // off in production (default log level is info), but
+        // `RUST_LOG=trace dot-agent-deck` (or `RUST_LOG=pane_write=trace`)
+        // with `DOT_AGENT_DECK_LOG=/path` captures user prompts to
+        // disk. Filter selectively with
+        // `RUST_LOG=trace,pane_write=warn`.
+        tracing::trace!(
+            target: "pane_write",
+            source = "tui",
+            pane_id = %pane_id,
+            payload_len = text.len(),
+            payload = %escape_bytes_for_log(text.as_bytes()),
+            "tui write_to_pane: issuing WriteAndSubmit RPC"
+        );
+        let client = self.client.clone();
+        let pane_id = pane_id.to_string();
+        let text = text.to_string();
+        self.runtime.block_on(async move {
+            match client.write_to_pane_and_submit(&pane_id, &text).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        error = %e,
+                        "write_to_pane: daemon WriteAndSubmit RPC failed"
+                    );
+                    Err(PaneError::CommandFailed(format!(
+                        "write_to_pane: WriteAndSubmit RPC failed: {e}"
+                    )))
+                }
             }
-        };
-        // Write the payload (content, optionally bracketed-paste-wrapped), flush, then
-        // pause briefly before sending the submit CR. Agent TUIs like claude treat a
-        // CR that arrives fused to the preceding text as newline-in-input; only a CR
-        // that arrives as a separate event after a pause is honored as Enter. The
-        // pane lock is released during the sleep so the UI thread can keep drawing.
-        self.queue_stream_input(pane_id, payload)?;
-        std::thread::sleep(SUBMIT_DELAY);
-        self.queue_stream_input(pane_id, b"\r".to_vec())?;
-        Ok(())
+        })
     }
 
     fn name(&self) -> &str {

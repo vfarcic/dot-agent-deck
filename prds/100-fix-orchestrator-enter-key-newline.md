@@ -56,6 +56,26 @@ These are hypotheses, not conclusions. Investigation in Phase 1 nails down which
 - `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` pass. `cargo test` passes.
 - Manual smoke: a long-form orchestrator prompt sent through the daemon submits on first Enter, 10 consecutive times.
 
+## Root cause
+
+Phase 1 ruled out the three leading hypotheses in their original framing and surfaced a fourth, which the evidence and the regression test in `tests/client_write_to_pane_atomic.rs` confirm. Summary:
+
+- **PRD #93 Phase 2 collapsed the local/daemon split.** The in-process pane backend was deleted; every pane is now a `StreamBackend` routed through the daemon's attach socket (`src/embedded_pane.rs:74-78`). M1.3 ("does the bug exist on the local path?") is therefore moot — there is no longer a separate local path to compare against.
+- **Two write surfaces remain, both daemon-mediated.** (a) Client-initiated via `EmbeddedPaneController::write_to_pane` (`src/embedded_pane.rs:1754` pre-fix) → STREAM_IN frames → daemon's `handle_attach_stream` input loop (`src/daemon_protocol.rs:1148`) → per-agent PTY writer. (b) Daemon-initiated (orchestration dispatch) via `AgentPtyRegistry::write_to_pane_and_submit` (`src/agent_pty.rs:1466`) → directly into the per-agent PTY writer.
+- **The daemon-initiated path is atomic; the client-initiated path was not.** PRD #93 round-8 made `write_to_pane_and_submit` hold the per-agent writer mutex across the full payload + `SUBMIT_DELAY` + CR sequence (`src/agent_pty.rs:1455-1465`). The client-initiated path queued *two* STREAM_IN frames separated by a 150 ms `std::thread::sleep` (the pre-fix `src/embedded_pane.rs:1771-1773`), and the daemon's input loop took the writer mutex briefly per frame. So during the 150 ms gap the writer mutex was **free** on the daemon side.
+- **A concurrent daemon-initiated write landed in that gap.** If a `write_to_pane_and_submit` (work-done feedback) or `write_to_pane_notice` (respawn notice) fired against the orchestrator pane while the user's send-prompt was mid-flight, the byte order written to the PTY master was `[user payload][daemon payload][daemon \r][user \r]`. After ICRNL and canonical line buffering the slave received one fused line; the daemon's CR submitted the combined `user-prompt + daemon-bytes` to the receiving agent, and the user's trailing CR was a no-op on an empty input box. To the user this manifested as "Enter inserted a newline into the orchestrator's input instead of submitting" — the PRD #100 symptom.
+- **The orchestrator pane is uniquely affected** because it is the only pane that simultaneously *receives* daemon-initiated writes (work-done feedback, respawn notices) and *originates* user prompts. Other role panes only receive daemon writes; the dashboard's pure-user-input panes only originate writes. Neither shape produces concurrent same-pane writers.
+
+The regression test toggle in Phase 2 confirmed the byte surface: with the pre-fix `write_to_pane` body, the scrollback shows `USERMSG-PAYLOADBGWRITER-MSG\r\n` (one fused canonical line); with the post-fix RPC body, two distinct `USERMSG-PAYLOAD\r\n` and `BGWRITER-MSG\r\n` lines surface. The fused line is exactly the bug shape the user observes in production.
+
+## Fix scope
+
+The fix routes all client-initiated send-prompt writes through a new `WriteAndSubmit` daemon RPC (`AttachRequest::WriteAndSubmit { pane_id, text }` in `src/daemon_protocol.rs`). On the daemon side the RPC handler calls `AgentPtyRegistry::write_to_pane_and_submit`, which holds the per-agent writer mutex across the entire payload + `SUBMIT_DELAY` + CR sequence — the same atomic contract orchestration dispatch already had since PRD #93 round-8.
+
+This is **not** orchestrator-only. Every caller of `PaneController::write_to_pane` now benefits — the deck's send-prompt dialog (`src/ui.rs:1603`), the spawn-time init-command writes (`src/ui.rs:3264-3267`, `5070-5076`), the start-pane prompt (`src/ui.rs:3703`), the permission y/n forwarding (`src/ui.rs:4750`), the mode-manager init/command writes (`src/mode_manager.rs:308-322`), and the renew-after-respawn path (`src/mode_manager.rs:421-422`) all go through the same atomic RPC. The orchestrator-only symptom in the PRD was an *observation*, not a constraint — it surfaced there because the orchestrator pane is the only pane with concurrent daemon-initiated writes.
+
+`PROTOCOL_VERSION` bumped from 2 to 3 (`src/daemon_protocol.rs:146`). The version handshake in `src/connect.rs` already rejects mismatched daemons with a clear error, so the upgrade boundary is honest.
+
 ## Milestones
 
 ### Phase 1: Investigation and reproducer

@@ -337,6 +337,42 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// PRD #100 M2.2: atomic "write payload + submit CR" against a
+    /// pane addressed by its `DOT_AGENT_DECK_PANE_ID`. The daemon
+    /// holds the per-agent writer mutex across the full payload +
+    /// SUBMIT_DELAY + CR sequence, so no other writer (orchestration
+    /// dispatch, work-done feedback, respawn notice) can interleave
+    /// bytes between the user's payload and the user's CR.
+    ///
+    /// Replaces the deck's older two-STREAM_IN-frames send-prompt path
+    /// (payload, then `\r` after a 150 ms client-side sleep), which
+    /// released the writer mutex between the two frames and let a
+    /// daemon-initiated write land in the gap — the PRD #100 symptom.
+    pub async fn write_to_pane_and_submit(
+        &self,
+        pane_id: &str,
+        text: &str,
+    ) -> Result<(), ClientError> {
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::WriteAndSubmit {
+                pane_id: pane_id.to_string(),
+                text: text.to_string(),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "write-and-submit failed".into()),
+            ));
+        }
+        Ok(())
+    }
+
     /// PRD #76 M2.17: open a long-lived `SubscribeEvents` connection.
     /// Returns once the daemon has confirmed the subscription with a
     /// successful RESP — subsequent frames on the wire are `KIND_EVENT`

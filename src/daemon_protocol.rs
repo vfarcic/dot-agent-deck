@@ -90,6 +90,7 @@ pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
 use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, is_valid_pane_id_env};
 use crate::event::{AgentType, BroadcastMsg};
+use crate::pane_input::escape_bytes_for_log;
 use crate::state::SharedState;
 
 // ---------------------------------------------------------------------------
@@ -142,12 +143,24 @@ pub const KIND_SHUTDOWN_ACK: u8 = 0x16;
 /// Additive `#[serde(default, skip_serializing_if = "Option::is_none")]`
 /// fields do NOT require a bump — they're forward-compatible by design. See
 /// the module-level "Protocol versioning" section for the full bump policy.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
 /// 16 MiB is well above any reasonable PTY chunk or scrollback snapshot.
 const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+/// PRD #100 audit #2: per-call cap on the `text` field of
+/// [`AttachRequest::WriteAndSubmit`]. Sized at 1 MiB — large enough to
+/// accommodate the longest realistic user prompt or pasted document
+/// (a 1 MiB plain-text file is roughly 200k words / 600 pages of
+/// novel-length prose) while small enough that an accidental TUI bug
+/// or hostile same-UID caller can't park the per-agent writer mutex
+/// for seconds at a time. Smaller than `MAX_FRAME_LEN` (16 MiB) so
+/// callers see a typed
+/// [`crate::agent_pty::AgentPtyError::PayloadTooLarge`] before the
+/// wire framing rejects the request.
+pub const WRITE_AND_SUBMIT_MAX_TEXT: usize = 1024 * 1024;
 
 /// Bounded timeout for a single STREAM_OUT/STREAM_END write to a client. If
 /// a client stops draining its socket, the OS send buffer fills and our
@@ -338,6 +351,45 @@ pub enum AttachRequest {
         client_version: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_build_version: Option<String>,
+    },
+    /// PRD #100 M2.2: atomic "write payload then submit CR" against a
+    /// pane addressed by its `DOT_AGENT_DECK_PANE_ID`. The daemon
+    /// runs the full sequence under the per-agent writer mutex — the
+    /// same atomic contract `AgentPtyRegistry::write_to_pane_and_submit`
+    /// already gives orchestration dispatch — so a concurrent
+    /// daemon-initiated write (work-done feedback, respawn notice)
+    /// cannot interleave between the user's payload and the user's
+    /// submit CR. Without this RPC the TUI's send-prompt path queued
+    /// two STREAM_IN frames separated by a 150 ms client-side sleep,
+    /// during which the writer mutex was free and another writer
+    /// could land its own payload + LF/CR between the user's bytes
+    /// — manifesting at the receiving agent as "Enter inserted a
+    /// newline instead of submitting" (PRD #100 symptom).
+    ///
+    /// `pane_id` is the agent's `DOT_AGENT_DECK_PANE_ID` env value,
+    /// not the daemon-side registry id — same convention as the
+    /// daemon-initiated write path. The daemon resolves it to the
+    /// agent's writer mutex internally.
+    ///
+    /// **Trust model.** Same-UID owns the registry — identical
+    /// addressing scope to the internal orchestration-dispatch path
+    /// in `AgentPtyRegistry::write_to_pane_and_submit`. NOT bound to
+    /// a per-connection attach the way [`AttachRequest::AttachStream`]
+    /// plus STREAM_IN bytes are: a single connected client can
+    /// target any live `pane_id` per call. Authorization is
+    /// unchanged (still 0o600 socket plus same-UID = full daemon
+    /// access); if that boundary ever tightens (multi-user daemon,
+    /// broker), this RPC needs a per-pane caller→agent binding,
+    /// whereas STREAM_IN already has it.
+    ///
+    /// `text` is capped at [`WRITE_AND_SUBMIT_MAX_TEXT`] (1 MiB) per
+    /// call so a buggy or hostile same-UID caller can't park the
+    /// per-agent writer mutex for seconds at a time on a
+    /// multi-megabyte payload. Oversize requests surface as
+    /// `AgentPtyError::PayloadTooLarge` → `ClientError::Server`.
+    WriteAndSubmit {
+        pane_id: String,
+        text: String,
     },
 }
 
@@ -927,6 +979,68 @@ async fn handle_connection(
             Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
+        AttachRequest::WriteAndSubmit { pane_id, text } => {
+            // PRD #100 M2.2: atomic payload + submit CR under the
+            // per-agent writer mutex. The receiving side is the same
+            // `write_to_pane_and_submit` orchestration dispatch uses;
+            // calling it here gives client-initiated writes the same
+            // "no other writer can interleave between payload and CR"
+            // contract.
+            //
+            // PRD #100 audit #4: pre-validate `pane_id` so a malformed
+            // env value fails fast with a typed error instead of
+            // dropping into the `HashMap::values().find(...)` lookup —
+            // mirrors the existing validation at spawn/hydrate time
+            // (`is_valid_pane_id_env`).
+            if !is_valid_pane_id_env(&pane_id) {
+                let resp = AttachResponse::err(format!(
+                    "write-and-submit: invalid pane_id (must match \
+                     the env-var grammar): {pane_id:?}"
+                ));
+                write_resp(&mut stream, &resp).await?;
+                return Ok(());
+            }
+            // PRD #100 audit #2: cap `text` at
+            // [`WRITE_AND_SUBMIT_MAX_TEXT`] bytes BEFORE acquiring
+            // any registry lock. The wire-level `MAX_FRAME_LEN` cap
+            // (16 MiB) leaves room for an accidental TUI bug to
+            // flood the writer mutex with a multi-megabyte payload
+            // that wedges the pane for seconds while
+            // `encode_pane_payload` allocates and the writer drains;
+            // this cap catches those well before they hit the PTY.
+            if text.len() > WRITE_AND_SUBMIT_MAX_TEXT {
+                let err = crate::agent_pty::AgentPtyError::PayloadTooLarge {
+                    len: text.len(),
+                    cap: WRITE_AND_SUBMIT_MAX_TEXT,
+                };
+                tracing::warn!(
+                    pane_id = %pane_id,
+                    error = %err,
+                    "write-and-submit: rejecting oversize text"
+                );
+                write_resp(&mut stream, &AttachResponse::err(err.to_string())).await?;
+                return Ok(());
+            }
+            match registry.write_to_pane_and_submit(&pane_id, &text).await {
+                Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
+                Err(e) => {
+                    // PRD #100 audit nit: surface failures so an
+                    // operator tailing daemon logs can correlate a
+                    // failed RPC with the cause (NotFound, encode
+                    // rejection, writer I/O error). Existing
+                    // StopAgent / SetAgentLabel handlers also don't
+                    // log on Err, but this RPC is on the hot
+                    // user-prompt path — a silent failure here is a
+                    // dropped user prompt.
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        error = %e,
+                        "write-and-submit: failed to write to pane"
+                    );
+                    write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?
+                }
+            }
+        }
         AttachRequest::SubscribeEvents => {
             handle_subscribe_events(stream, event_tx).await?;
         }
@@ -1148,6 +1262,36 @@ async fn handle_attach_stream(
             Ok(Some((KIND_STREAM_IN, bytes))) => {
                 use std::io::Write;
                 let mut w = writer.lock().await;
+                // PRD #100 M1.1: byte-level trace of STREAM_IN frames
+                // forwarded to the per-agent PTY writer. This is the
+                // daemon-side counterpart to the client-side trace in
+                // `EmbeddedPaneController::write_to_pane`. Useful for
+                // confirming that the bytes the TUI queued (payload, then
+                // `\r`) arrived as two distinct frames and that no other
+                // path interleaved a write on the same writer mutex
+                // between them. Gated by `RUST_LOG=trace` (or
+                // `dot_agent_deck::daemon_protocol=trace`). Emitted
+                // INSIDE the writer mutex (PRD #100 reviewer #8) so
+                // trace order matches actual write order.
+                //
+                // PRD #100 audit #5: **PII WARNING.** STREAM_IN bytes
+                // are user keystrokes — including anything pasted
+                // into the pane and the user's typed prompts. Trace
+                // gating + the `pane_write` target keep this off in
+                // production; an operator running
+                // `RUST_LOG=trace dot-agent-deck` (or
+                // `RUST_LOG=pane_write=trace`) with `DOT_AGENT_DECK_LOG`
+                // pointed at a file captures user input verbatim to
+                // disk. To suppress selectively while keeping other
+                // trace output: `RUST_LOG=trace,pane_write=warn`.
+                tracing::trace!(
+                    target: "pane_write",
+                    source = "stream_in",
+                    agent_id = %id,
+                    payload_len = bytes.len(),
+                    payload = %escape_bytes_for_log(&bytes),
+                    "STREAM_IN forwarded to PTY writer"
+                );
                 if w.write_all(&bytes).is_err() {
                     break;
                 }
