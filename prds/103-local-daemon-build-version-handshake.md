@@ -1,6 +1,6 @@
 # PRD #103: Local daemon build-version handshake + `daemon stop` CLI
 
-**Status**: Planning
+**Status**: Complete
 **Priority**: High
 **Created**: 2026-05-22
 **GitHub Issue**: [#103](https://github.com/vfarcic/dot-agent-deck/issues/103)
