@@ -16,6 +16,13 @@ use dot_agent_deck::theme::{ColorPalette, Theme, resolve_palette};
 use dot_agent_deck::ui::{CardDensityKind, render_card_to_buffer};
 use spec::spec;
 
+/// Width threshold at which the card switches into the "wide" layout
+/// (inline stats row). Tracks the internal `render_session_card`'s
+/// `let wide = w >= 60;` branch — keep in sync. Lives here rather than
+/// in the lib so tests don't pull in another exported symbol just to
+/// pin a numeric constant.
+const WIDE_CARD_THRESHOLD: u16 = 60;
+
 /// Construct a deterministic `SessionState` for snapshot tests. All
 /// time-bearing fields are pinned to a fixed `Utc` instant so the
 /// `Last:` elapsed-time line renders the same value across runs.
@@ -73,15 +80,23 @@ fn pane_004_card_title_row() {
     // reaches it.
     let session = working_session_fixture();
     let palette: ColorPalette = resolve_palette(Theme::Dark);
+    // 80-cell-wide buffer triggers the layout's "wide" branch (inline
+    // stats row). The height comes from the density tier itself so
+    // the snapshot's geometry tracks the production layout module —
+    // M2.1 reviewer S3 (no magic numbers).
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let wide = width >= WIDE_CARD_THRESHOLD;
+    let height = density.rendered_height(wide);
     let buffer = render_card_to_buffer(
         &session,
         Some("example-coder"),
         Some(1),
-        CardDensityKind::Normal,
+        density,
         palette,
         0, // animation tick
-        80,
-        9, // Normal density's card height when stacked (wide)
+        width,
+        height,
     );
     insta::assert_snapshot!(buffer_to_text(&buffer));
 }

@@ -1,11 +1,11 @@
 default_job = "test-fast"
 
 [jobs.test-fast]
-command = ["cargo", "nextest", "run", "--no-fail-fast"]
+command = ["cargo", "nextest", "run"]
 need_stdout = true
 
 [jobs.test-e2e]
-command = ["cargo", "nextest", "run", "--features", "e2e", "--no-fail-fast"]
+command = ["cargo", "nextest", "run", "--features", "e2e"]
 need_stdout = true
 
 [jobs.clippy]

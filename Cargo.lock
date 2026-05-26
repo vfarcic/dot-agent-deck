@@ -2259,11 +2259,6 @@ dependencies = [
 [[package]]
 name = "spec"
 version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
 
 [[package]]
 name = "stable_deref_trait"

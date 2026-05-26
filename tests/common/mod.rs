@@ -124,6 +124,18 @@ impl TuiDeck {
         let tempdir = tempfile::tempdir().expect("create per-test tempdir");
         let work = tempdir.path().to_path_buf();
 
+        // M2.1 auditor S1: lock the per-test tempdir to 0o700 so a
+        // co-located uid on a shared developer machine cannot list
+        // per-test HOME contents, fixtures, or failure recordings.
+        // The sockets themselves are already 0o600; the parent dir
+        // needs to match.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            std::fs::set_permissions(&work, perms).expect("set tempdir mode to 0o700");
+        }
+
         // Decision 12: copy fixture into the tempdir, then `git init`
         // (some deck paths probe `.git`).
         let fixture_src = locate_fixture(fixture_name);
@@ -150,20 +162,34 @@ impl TuiDeck {
             })
             .expect("openpty");
 
+        // Cargo sets `CARGO_BIN_EXE_<bin-name>` at integration-test
+        // build time to the path of the freshly-built binary under
+        // test. The `env!()` evaluates at compile time so the harness
+        // always launches whatever the current test build produced
+        // (debug vs. release matches the test's profile).
         let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
         let mut cmd = CommandBuilder::new(bin);
         cmd.cwd(&work);
+        // M2.1 auditor S2: portable-pty 0.8 unconditionally env_clears
+        // on Unix before applying our `cmd.env(...)` calls, but the old
+        // comment claimed env_clear was avoided. Make the scrub
+        // explicit so the behavior is documented in this file and not
+        // dependent on an internal portable-pty detail.
+        cmd.env_clear();
 
-        // Decision 20: scrub host inheritance, set pinned values, then
-        // layer the test's per-deck env (so a test asking for `NO_COLOR=1`
-        // wins). The harness controls the entire env passed to portable-pty
-        // — we never pass `cmd.env_clear` (it surfaces inconsistently
-        // across platforms), instead we set every var explicitly.
+        // Decision 20: pinned env values. Order: portable-pty env_clear
+        // above means nothing leaks from the host; we then set Decision
+        // 20's pins, and finally layer the test's `with_env` overrides
+        // (so a test asking for `NO_COLOR=1` still wins).
         let state_dir = work.join("state");
         let pinned: &[(&str, &str)] = &[
             ("TERM", "xterm-256color"),
             ("LC_ALL", "C.UTF-8"),
             ("COLORTERM", "truecolor"),
+            // M2.1 auditor S3: pin SHELL so portable-pty cannot leak
+            // the parent password DB entry on Unix. /bin/sh is
+            // sufficient for the deck's spawn paths.
+            ("SHELL", "/bin/sh"),
             ("HOME", home.to_str().expect("HOME path is UTF-8")),
             (
                 "DOT_AGENT_DECK_SOCKET",
@@ -386,7 +412,14 @@ impl Drop for TuiDeck {
         }
 
         if should_dump {
-            let recordings_dir = std::path::PathBuf::from("target/test-recordings")
+            // M2.1 auditor S4 + S5: scope to a per-run subdir under an
+            // ABSOLUTE workspace-relative path so (a) tests whose cwd
+            // is a per-test tempdir still land artifacts in the
+            // workspace's target/, and (b) two concurrent
+            // `cargo test-e2e` invocations cannot clobber each
+            // other's artifacts.
+            let recordings_dir = workspace_test_recordings_root()
+                .join(current_run_id())
                 .join(sanitize_test_name(&self.test_name));
             if let Err(e) = self.dump_recordings(&recordings_dir) {
                 eprintln!("[tui-harness] failed to write recordings to {recordings_dir:?}: {e}");
@@ -472,9 +505,49 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
             copy_dir_recursively(&from, &to)?;
         } else if ty.is_file() {
             std::fs::copy(&from, &to)?;
+        } else {
+            // M2.1 auditor Nit 3: refuse to copy symlinks / sockets /
+            // FIFOs from a fixture. Fixtures are plain files only —
+            // a symlink at copy time most likely indicates a fixture
+            // bug (or an attacker pre-staging a symlink targeting the
+            // tempdir's parent), so surface it loudly instead of
+            // silently skipping.
+            return Err(std::io::Error::other(format!(
+                "fixture entry {} is not a regular file or directory \
+                 (symlinks/sockets/FIFOs are not supported in fixtures)",
+                from.display()
+            )));
         }
     }
     Ok(())
+}
+
+/// Workspace-relative `target/test-recordings/` resolved to an
+/// ABSOLUTE path at harness construction time. The fixture-copy step
+/// `cwd`s the deck into a per-test tempdir, so any relative path here
+/// would land artifacts in the wrong place (M2.1 auditor S5).
+fn workspace_test_recordings_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-recordings")
+}
+
+/// Identifier for the active `cargo test-e2e` invocation. Nextest
+/// sets `NEXTEST_RUN_ID` for setup scripts and tests; outside nextest
+/// we fall back to a process-PID + nanosecond-timestamp combination
+/// that two concurrent invocations cannot collide on. Used by the
+/// recordings dump (M2.1 auditor S4).
+fn current_run_id() -> String {
+    if let Ok(id) = std::env::var("NEXTEST_RUN_ID")
+        && !id.is_empty()
+    {
+        return id;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("run-{}-{nanos}", std::process::id())
 }
 
 fn current_test_name() -> String {

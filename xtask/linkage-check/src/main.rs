@@ -90,7 +90,16 @@ fn main() -> ExitCode {
             }
         };
 
-        let lines: Vec<&str> = text.lines().collect();
+        // M2.1 auditor Nit 5: strip line + block comments before running
+        // the no-sleep / no-ignore regex checks so a comment that
+        // mentions `std::thread::sleep` (e.g. explaining why the
+        // harness does NOT call it) does not register as a violation.
+        // The spec-attribute and fn regexes do NOT use the stripped
+        // copy — they intentionally allow the `#[spec(...)]` line to
+        // sit next to `// doc comment` content.
+        let stripped = strip_rust_comments(&text);
+        let raw_lines: Vec<&str> = text.lines().collect();
+        let stripped_lines: Vec<&str> = stripped.lines().collect();
         let file_name = file
             .file_name()
             .and_then(|n| n.to_str())
@@ -101,13 +110,14 @@ fn main() -> ExitCode {
         // Walk lines, link each `#[spec("...")]` to the next function
         // definition. The annotation may be followed by other
         // attributes (`#[test]`, `#[ignore]`) before the `fn`; we
-        // accumulate those and stop at the first `fn`.
-        for (i, line) in lines.iter().enumerate() {
+        // accumulate those and stop at the first `fn`. Use the stripped
+        // view so `#[ignore]` inside a comment does not count.
+        for (i, line) in stripped_lines.iter().enumerate() {
             if let Some(caps) = spec_re.captures(line) {
                 let id = caps.get(1).unwrap().as_str().to_string();
                 let mut fn_name: Option<String> = None;
                 let mut between_ignored = false;
-                for next in &lines[i + 1..] {
+                for next in &stripped_lines[i + 1..] {
                     if ignore_re.is_match(next) {
                         between_ignored = true;
                     }
@@ -132,18 +142,20 @@ fn main() -> ExitCode {
 
         if is_e2e {
             // Check 5: forbidden waits / polling in e2e test bodies.
-            for (idx, line) in lines.iter().enumerate() {
-                // Skip lines under the file's `mod common;` declaration —
-                // the harness internals MAY sleep; we only police the
-                // bodies of the test file itself.
-                if sleep_re.is_match(line) {
+            // Run against the stripped (comment-free) view so a
+            // commented-out `// std::thread::sleep` doesn't trip the
+            // check, but keep the raw line numbers in the error message
+            // so violators are easy to locate.
+            for (idx, _raw) in raw_lines.iter().enumerate() {
+                let stripped_line = stripped_lines.get(idx).copied().unwrap_or("");
+                if sleep_re.is_match(stripped_line) {
                     e2e_violations.push(format!(
                         "{}:{}: forbidden sleep call (Decision 21)",
                         file.display(),
                         idx + 1
                     ));
                 }
-                if polling_re.is_match(line) {
+                if polling_re.is_match(stripped_line) {
                     e2e_violations.push(format!(
                         "{}:{}: forbidden fixed-count polling loop (Decision 21)",
                         file.display(),
@@ -167,15 +179,13 @@ fn main() -> ExitCode {
             ));
         }
 
-        // Check 4: function name carries `<sub>_<NNN>` prefix.
+        // Check 4: function name carries `<sub>_<NNN>` prefix per
+        // Decision 17. M2.1 reviewer S1: hyphenated sub-areas
+        // (e.g. `prompt/pane-input/001`, `lifecycle/daemon-idle/001`)
+        // become snake_case in Rust identifiers — `sub_area_prefix`
+        // normalizes `-` → `_` on the sub-area before comparing.
         if let Some(fname) = &ann.fn_name {
-            let (sub_nnn, _) = match ann.id.rsplit_once('/') {
-                Some((rest, nnn)) => match rest.rsplit_once('/') {
-                    Some((_, sub)) => (format!("{sub}_{nnn}"), ()),
-                    None => (String::new(), ()),
-                },
-                None => (String::new(), ()),
-            };
+            let sub_nnn = sub_area_prefix(&ann.id).unwrap_or_default();
             if !sub_nnn.is_empty() && !fname.starts_with(&sub_nnn) {
                 failures.push(format!(
                     "[4] {} fn `{}` does not start with `{}` (Decision 17, derived from #[spec({:?})])",
@@ -314,5 +324,191 @@ fn visit(dir: &Path, acc: &mut BTreeMap<PathBuf, ()>) {
         } else if ft.is_file() && p.extension().and_then(|e| e.to_str()) == Some("rs") {
             acc.insert(p, ());
         }
+    }
+}
+
+/// Strip Rust `//` line comments and `/* … */` block comments from
+/// `src`, replacing each stripped byte with a space. Line endings are
+/// preserved 1-for-1 so per-line indexing into the stripped text
+/// matches the raw source. String literals are honoured so a `//`
+/// inside `"…"` is not mistakenly treated as a comment.
+fn strip_rust_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut block_depth: usize = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        let next = bytes.get(i + 1).map(|b| *b as char);
+
+        if block_depth > 0 {
+            // Inside a block comment — only `*/` or nested `/*` matter;
+            // newlines are preserved so line numbers align.
+            if c == '/' && next == Some('*') {
+                block_depth += 1;
+                out.push(' ');
+                out.push(' ');
+                i += 2;
+                continue;
+            }
+            if c == '*' && next == Some('/') {
+                block_depth -= 1;
+                out.push(' ');
+                out.push(' ');
+                i += 2;
+                continue;
+            }
+            if c == '\n' {
+                out.push('\n');
+            } else {
+                out.push(' ');
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_string {
+            out.push(c);
+            if c == '\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_char {
+            out.push(c);
+            if c == '\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if c == '\'' {
+                in_char = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if c == '/' && next == Some('/') {
+            // Line comment — eat until newline (preserve the newline).
+            while i < bytes.len() && bytes[i] as char != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && next == Some('*') {
+            block_depth = 1;
+            out.push(' ');
+            out.push(' ');
+            i += 2;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '\'' {
+            // Heuristic: only treat `'` as a char literal start when the
+            // following byte is not an identifier continuation (lifetimes
+            // look like `'a`). Comments inside lifetime annotations can't
+            // exist anyway, so being conservative is fine.
+            let after_after = bytes.get(i + 2).map(|b| *b as char);
+            let looks_like_lifetime = next.is_some_and(|n| n.is_ascii_alphabetic() || n == '_')
+                && after_after.is_some_and(|a| a != '\'');
+            if !looks_like_lifetime {
+                in_char = true;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Derive the Decision-17 `<sub>_<NNN>` prefix from a catalog ID,
+/// applying the hyphen → underscore normalization used by Rust
+/// identifiers (M2.1 reviewer S1). Returns `None` if the ID is not
+/// of the expected three-segment shape.
+fn sub_area_prefix(id: &str) -> Option<String> {
+    let (rest, nnn) = id.rsplit_once('/')?;
+    let (_area, sub) = rest.rsplit_once('/')?;
+    Some(format!("{}_{nnn}", sub.replace('-', "_")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sub_area_prefix_handles_plain_sub_area() {
+        assert_eq!(
+            sub_area_prefix("dashboard/pane/004").as_deref(),
+            Some("pane_004")
+        );
+    }
+
+    #[test]
+    fn sub_area_prefix_normalizes_hyphens_in_sub_area() {
+        // PRD #77 catalog has these in the M2 allowlist; without the
+        // hyphen → underscore normalization the function-name prefix
+        // would be `pane-input_001_…` which is not a valid Rust ident.
+        assert_eq!(
+            sub_area_prefix("prompt/pane-input/001").as_deref(),
+            Some("pane_input_001")
+        );
+        assert_eq!(
+            sub_area_prefix("lifecycle/daemon-idle/002").as_deref(),
+            Some("daemon_idle_002")
+        );
+        assert_eq!(
+            sub_area_prefix("error/agent-spawn/001").as_deref(),
+            Some("agent_spawn_001")
+        );
+    }
+
+    #[test]
+    fn sub_area_prefix_rejects_malformed_id() {
+        assert_eq!(sub_area_prefix("not-an-id"), None);
+        assert_eq!(sub_area_prefix("only/two"), None);
+    }
+
+    #[test]
+    fn strip_rust_comments_removes_line_comments() {
+        let src = "fn foo() { /* keep this */ let x = 1; // and this\nlet y = 2;}";
+        let out = strip_rust_comments(src);
+        // The `// and this` content disappears; the `let y = 2;` survives.
+        assert!(!out.contains("and this"));
+        assert!(out.contains("let y = 2;"));
+    }
+
+    #[test]
+    fn strip_rust_comments_preserves_string_literal_double_slashes() {
+        let src = r#"let url = "https://example.com/path";"#;
+        let out = strip_rust_comments(src);
+        assert!(out.contains("https://example.com/path"));
+    }
+
+    #[test]
+    fn strip_rust_comments_preserves_line_count() {
+        let src = "// line1\nlet x = 0;\n// line3";
+        let out = strip_rust_comments(src);
+        // Three lines in → three lines out — the per-line indexing in
+        // check 5/6 depends on this invariant.
+        assert_eq!(out.lines().count(), src.lines().count());
     }
 }

@@ -1837,7 +1837,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 | `--continue` "dashboard-first landing" detail ([docs/session-management.md#resuming-sessions](../docs/session-management.md)) | Implicit consequence of `session/restore/001`; not separately worth a catalog ID. Reconsider if the landing-tab logic ever has its own surface. |
 ## Refined Milestones
 
-*Populated by M1.*
+No refinement needed at M1 — the original [Milestones](#milestones) list stands as written. The Pre-committed items below remained load-bearing and shipped with M2.
 
 **Pre-committed items** (regardless of how M1 reshapes the rest): the milestone that ships the first usable end-to-end harness must also:
 

@@ -12,7 +12,7 @@ publish = false
 [lib]
 proc-macro = true
 
+# The attribute is a literal `TokenStream → TokenStream` identity, so
+# only the compiler-provided `proc_macro` crate is needed — no
+# `proc-macro2`, `quote`, or `syn`.
 [dependencies]
-proc-macro2 = "1"
-quote = "1"
-syn = { version = "2", features = ["full"] }

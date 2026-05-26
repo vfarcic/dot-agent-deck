@@ -9,11 +9,10 @@ path = "target/nextest/default/junit.xml"
 [profile.e2e]
 slow-timeout = { period = "120s", terminate-after = 2 }
 
-# Decision 28: wipe the per-test recording dir before every e2e run so a
-# previous run's artifacts don't pollute the next failure dump.
-[[profile.e2e.scripts]]
-filter = "all()"
-setup = "wipe-recordings"
-
-[scripts.setup.wipe-recordings]
-command = ['sh', '-c', 'rm -rf target/test-recordings']
+# Decision 28: per-run recording isolation lives inside the harness
+# (see `tests/common/mod.rs`) — it scopes every failure dump under
+# `<workspace>/target/test-recordings/<run-id>/<test-name>/` where
+# `<run-id>` is `NEXTEST_RUN_ID` when nextest is driving the run and a
+# process-PID + timestamp fallback otherwise. No setup-script `rm -rf`
+# is needed and two concurrent `cargo test-e2e` invocations never
+# touch each other's artifacts.
