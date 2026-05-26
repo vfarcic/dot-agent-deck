@@ -1125,6 +1125,14 @@ async fn handle_attach_stream(
     let mut rx = handle.rx;
     let writer = handle.writer;
 
+    // PRD #128 trace-field-symmetry: cache the agent's `pane_id_env`
+    // once per attach so the per-frame STREAM_IN trace can emit
+    // `pane_id` alongside `agent_id` without re-locking the registry on
+    // every frame. `pane_id_env` is fixed for an agent's lifetime, so
+    // one lookup is enough. Empty string when the agent has no
+    // pane_id_env (rare — daemon-side test agents).
+    let pane_id = registry.pane_id_env_for_agent(&id).unwrap_or_default();
+
     // Output task: forward broadcast bytes → STREAM_OUT frames. Owns `wr`
     // for the duration of streaming.
     //
@@ -1180,11 +1188,16 @@ async fn handle_attach_stream(
                 // path interleaved a write on the same writer mutex
                 // between them. Gated by `RUST_LOG=trace`. Emitted
                 // INSIDE the writer mutex so trace order matches actual
-                // write order.
+                // write order. Both `agent_id` and `pane_id` are
+                // emitted so the M1.4 diff against the daemon-initiated
+                // trace in `AgentPtyRegistry::write_to_pane_internal`
+                // can join on either key (`pane_id` is cached once per
+                // attach above).
                 tracing::trace!(
                     target: "pane_write",
                     source = "stream_in",
                     agent_id = %id,
+                    pane_id = %pane_id,
                     payload_len = bytes.len(),
                     payload = %escape_bytes_for_log(&bytes),
                     "STREAM_IN forwarded to PTY writer"

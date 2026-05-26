@@ -81,11 +81,23 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 /// close marker. 150ms tuned empirically.
 pub const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// Render bytes for trace logging in a human-scannable form: printable
-/// ASCII as-is, everything else as `\xNN`. The common framing bytes
-/// (`\x1b[200~`, `\x1b[201~`, `\r`, `\n`) thus surface as
-/// `\x1b[200~`, `\r`, `\n` rather than raw control codes that
-/// terminals would interpret on rendering.
+/// Render bytes for trace logging in a human-scannable, unambiguous
+/// form. Rules:
+///
+/// * Printable ASCII (`0x20..=0x7E`) is emitted verbatim, **except**
+///   for the backslash byte (`0x5C`), which is doubled to `\\`.
+///   Without that escape, a literal `\x0a` typed into a user prompt
+///   and a real `0x0A` byte would render identically — defeating the
+///   point of an unambiguous byte-level trace.
+/// * Every other byte (controls, ESC, CR, LF, all `0x80..=0xFF`,
+///   including UTF-8 continuation bytes) is rendered as `\xNN` with
+///   lowercase hex.
+///
+/// So the common framing bytes (`\x1b[200~`, `\x1b[201~`, `\r`, `\n`)
+/// surface as the literal six-character strings `\x1b`, `\x0d`, `\x0a`
+/// rather than as raw control codes terminals would interpret on
+/// rendering, and a literal backslash in user input cannot forge a
+/// fake `\xNN` escape.
 ///
 /// PRD #128 (cherry-picked from PR #122): bracketed-paste framing and
 /// `\r` vs `\n` are the two leading hypotheses for the orchestrator
@@ -93,11 +105,16 @@ pub const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(1
 /// distinguish them at a glance. Gated behind `RUST_LOG=trace` — the
 /// helper itself does no logging; callers emit `tracing::trace!`.
 pub fn escape_bytes_for_log(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len());
     for &b in bytes {
         match b {
+            b'\\' => out.push_str("\\\\"),
             0x20..=0x7e => out.push(b as char),
-            _ => out.push_str(&format!("\\x{b:02x}")),
+            _ => {
+                // Writing to a `String` cannot fail, hence the `let _`.
+                let _ = write!(out, "\\x{b:02x}");
+            }
         }
     }
     out
@@ -189,5 +206,40 @@ mod tests {
         assert_eq!(escape_bytes_for_log(b"ls -la"), "ls -la");
         assert_eq!(escape_bytes_for_log(b"\n"), "\\x0a");
         assert_eq!(escape_bytes_for_log(b"\r"), "\\x0d");
+    }
+
+    /// A literal backslash in user input must be doubled, otherwise an
+    /// adversarial (or just unlucky) input like `\x0a` typed into a
+    /// prompt would render identically to a real `0x0A` byte and the
+    /// byte-level trace loses its unambiguity.
+    #[test]
+    fn escape_bytes_for_log_escapes_literal_backslash() {
+        assert_eq!(escape_bytes_for_log(b"\\"), "\\\\");
+        // Literal `\x0a` (six bytes) becomes `\\x0a` (seven chars,
+        // distinguishable from a real 0x0A byte which renders as `\x0a`).
+        assert_eq!(escape_bytes_for_log(b"\\x0a"), "\\\\x0a");
+        // Literal `\\` (two bytes) becomes four backslashes.
+        assert_eq!(escape_bytes_for_log(b"\\\\"), "\\\\\\\\");
+    }
+
+    /// Tab is a non-printable control byte and must be escaped.
+    #[test]
+    fn escape_bytes_for_log_escapes_tab() {
+        assert_eq!(escape_bytes_for_log(b"\t"), "\\x09");
+        assert_eq!(escape_bytes_for_log(b"a\tb"), "a\\x09b");
+    }
+
+    /// UTF-8 multi-byte sequences are escaped byte-by-byte. This is the
+    /// correct behavior for a *byte-level* trace — the goal is to show
+    /// what hit the PTY master, not to reconstruct the user-visible
+    /// glyph. An 'é' (0xC3 0xA9) thus renders as `\xc3\xa9`.
+    #[test]
+    fn escape_bytes_for_log_escapes_utf8_multibyte_per_byte() {
+        // 'é' in UTF-8 is 0xC3 0xA9.
+        assert_eq!(escape_bytes_for_log("é".as_bytes()), "\\xc3\\xa9");
+        // '€' in UTF-8 is 0xE2 0x82 0xAC.
+        assert_eq!(escape_bytes_for_log("€".as_bytes()), "\\xe2\\x82\\xac");
+        // Mixed ASCII + multibyte.
+        assert_eq!(escape_bytes_for_log("aé".as_bytes()), "a\\xc3\\xa9");
     }
 }
