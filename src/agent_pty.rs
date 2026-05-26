@@ -1859,16 +1859,22 @@ impl AgentPtyRegistry {
             .agents
             .get_mut(id)
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
-        // PRD #104 A1 followup: skip the entire post-ioctl bookkeeping
+        // PRD #104 A1 followup: skip the entire ioctl + bookkeeping
         // when neither dimension changes. The local TUI resize sweep
         // calls `resize_pane_pty` on every frame the viewport is
         // unchanged (cheap idempotent path), so without this guard
-        // every no-op tick would clear the scrollback ring and any
-        // hydration-replay snapshot taken mid-stream would observe an
-        // empty buffer instead of the live agent's actual scrollback.
-        // Compute the diff *before* the ioctl so we can return early
-        // without paying the kernel round-trip when nothing changed.
-        let dims_changed = agent.pty_rows != rows || agent.pty_cols != cols;
+        // every no-op tick would:
+        //   (a) issue TIOCSWINSZ to the kernel, which on Linux/macOS
+        //       delivers SIGWINCH to the child even when the dimensions
+        //       are identical — causing the inner TUI to redraw on every
+        //       frame tick;
+        //   (b) clear the scrollback ring unnecessarily, so a
+        //       hydration-replay snapshot taken mid-stream would observe
+        //       an empty buffer instead of the live agent's scrollback.
+        // Guard is *before* the ioctl to avoid both side-effects.
+        if agent.pty_rows == rows && agent.pty_cols == cols {
+            return Ok(());
+        }
         agent
             .master
             .resize(PtySize {
@@ -1878,9 +1884,6 @@ impl AgentPtyRegistry {
                 pixel_height: 0,
             })
             .map_err(|e| AgentPtyError::Resize(e.to_string()))?;
-        if !dims_changed {
-            return Ok(());
-        }
         // Refresh the captured size so a subsequent respawn replays
         // the latest geometry, not the spawn-time default. PRD #104
         // also surfaces this on `AgentRecord` via `agent_records()`
