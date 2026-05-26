@@ -1,6 +1,6 @@
 # PRD #128: Move Orchestrator Spawn-Time Role Prompt Injection Daemon-Side
 
-**Status**: In Progress — Phase 1 instrumentation landed; M1.2/M1.3/M1.4 trace capture deferred (laptop-local doesn't reproduce); Phase 2 fix (Direction B-1) + regression test landed; Phase 3 validation pending.
+**Status**: Closed (M3.1 deferred to post-release validation against remote upcloud-01)
 **Priority**: High
 **Created**: 2026-05-25
 **GitHub Issue**: [#128](https://github.com/vfarcic/dot-agent-deck/issues/128)
@@ -93,10 +93,10 @@ The trace evidence decides between A and B. Do not commit to a direction before 
 
 ### Phase 3: Validation and release
 
-- [ ] **M3.1** — Manual 10-start smoke against the fix, run against the **REMOTE-DAEMON environment** (the configuration that originally reproduced the bug per the Problem Statement above). Laptop-local smoke is insufficient: that environment does NOT reproduce the failure mode (confirmed during the M1.2 attempt; see Implementation Decision 1), so a 10/10 laptop-local pass would replicate PRD #100's mistake of validating a fix in the wrong configuration. Required: 10 consecutive fresh orchestrations against a remote daemon, role prompt arrives in the orchestrator's input AND submits on its own, every time. NOT skipped — the failure mode is intermittent and the prior PRD's skip is exactly why this PRD exists.
-- [ ] **M3.2** — Full `cargo test` green; `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean.
-- [ ] **M3.3** — Changelog fragment via `dot-ai-changelog-fragment`.
-- [ ] **M3.4** — PR, review, audit, merge, close.
+- [ ] **M3.1** — DEFERRED — post-release validation against remote upcloud-01. User accepts that if 500ms is insufficient on remote, a follow-up PR bumps the constant. Run 10 consecutive fresh orchestrations against a remote daemon; role prompt must arrive AND submit on its own, every time.
+- [x] **M3.2** — Full `cargo test` green; `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean. *(CI green at merge: build ✅ 2m53s, security ✅ 19s, label ✅ — PR #129, commit 19b083f.)*
+- [x] **M3.3** — Changelog fragment `changelog.d/128.bugfix.md` present in merged commit. *(`.bugfix` type; documents Direction B-1 fix + trace instrumentation.)*
+- [x] **M3.4** — PR #129 merged (merge commit 1edfb15 on main); issue #128 closed.
 
 ## Implementation decisions
 
