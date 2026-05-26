@@ -482,6 +482,371 @@ The harness lands first; #84 then refactors against a green safety net and accep
 - [ ] **M3 — First chain-smoke tests + STOP for validation** (per Decision 29). One real Claude Code chain-smoke test (using `claude-haiku-4-5-20251001`), one real OpenCode chain-smoke test (using `openrouter/google/gemini-2.5-flash-lite`). Both picked from M1's catalog. After this milestone lands, **stop and wait for explicit validation** before continuing to M4+.
 - [ ] **M4+ — Catalog buildout.** Scope shape TBD when M3 lands. Carries the catalog-vs-deck "fix the deck not the test" policy (Decision 11) and the Discovered Issues collection (Decision 25).
 
+## M1: Existing-Test Audit
+
+Per Decision 10 — pure-data unit tests stay live in `src/*/mod tests`; everything else moved to `./tmp/legacy-tests/` (gitignored; git history preserves originals via the rename detection on the staged delete).
+
+**Carve-out result:** 296 pure-data unit tests kept across 17 `src/*` files; 25 `tests/*.rs` files plus `tests/common/` moved wholesale; 11 `src/*/mod tests` blocks partially or fully moved.
+
+### Pure-data tests (stay live)
+
+| File | Test function | One-line justification |
+|---|---|---|
+| src/agent_pty.rs | `pid_to_pgid_accepts_positive_normal_pid` | Pure u32→Option<i32> conversion; no I/O. |
+| src/agent_pty.rs | `pid_to_pgid_rejects_zero_pid` | Validation predicate on pid. |
+| src/agent_pty.rs | `pid_to_pgid_accepts_max_i32_pid` | Boundary predicate. |
+| src/agent_pty.rs | `pid_to_pgid_rejects_overflowing_u32_pid` | Boundary predicate. |
+| src/agent_pty.rs | `resolve_display_name_prefers_trimmed_form_name` | String-in / string-out resolver. |
+| src/agent_pty.rs | `resolve_display_name_whitespace_only_form_falls_through_to_command` | String-in / string-out resolver. |
+| src/agent_pty.rs | `resolve_display_name_no_inputs_falls_back_to_shell` | String-in / string-out resolver. |
+| src/agent_pty.rs | `resolve_display_name_rejects_control_char_form_name` | String validator. |
+| src/agent_pty.rs | `resolve_display_name_rejects_control_char_command_falls_to_shell` | String validator. |
+| src/agent_pty.rs | `validate_tab_membership_rejects_orchestration_cwd_with_nul_byte` | Validation predicate on TabMembership. |
+| src/agent_pty.rs | `validate_tab_membership_rejects_orchestration_cwd_with_control_char` | Validation predicate. |
+| src/agent_pty.rs | `validate_tab_membership_rejects_relative_orchestration_cwd` | Validation predicate. |
+| src/agent_pty.rs | `validate_tab_membership_rejects_oversized_orchestration_cwd` | Validation predicate. |
+| src/agent_pty.rs | `validate_tab_membership_accepts_well_formed_orchestration_cwd` | Validation predicate. |
+| src/agent_pty.rs | `validate_tab_membership_rejects_oversized_role_index` | Validation predicate. |
+| src/agent_pty.rs | `validate_tab_membership_accepts_role_index_at_ceiling` | Validation predicate. |
+| src/agent_pty.rs | `validate_tab_membership_rejects_role_name_with_ansi_escape` | Validation predicate. |
+| src/agent_pty.rs | `validate_tab_membership_rejects_role_name_with_nul_byte` | Validation predicate. |
+| src/agent_pty.rs | `validate_tab_membership_accepts_empty_role_name` | Validation predicate. |
+| src/ascii_art.rs | `system_prompt_embedded` | Static-data sanity check. |
+| src/ascii_art.rs | `parse_single_frame` | String parser. |
+| src/ascii_art.rs | `parse_multi_frames` | String parser. |
+| src/ascii_art.rs | `parse_trailing_delimiter` | String parser. |
+| src/ascii_art.rs | `parse_empty_input` | String parser. |
+| src/ascii_art.rs | `validate_valid_frame` | Validation predicate. |
+| src/ascii_art.rs | `validate_too_many_lines` | Validation predicate. |
+| src/ascii_art.rs | `validate_line_too_long` | Validation predicate. |
+| src/ascii_art.rs | `validate_non_ascii_rejected` | Validation predicate. |
+| src/ascii_art.rs | `validate_empty_frame` | Validation predicate. |
+| src/ascii_art.rs | `validate_all_frames_empty_vec` | Validation predicate. |
+| src/ascii_art.rs | `validate_all_frames_mixed` | Validation predicate. |
+| src/ascii_art.rs | `build_user_message_format` | Format encoder. |
+| src/build_version_handshake.rs | `non_tty_error_message_names_both_build_ids` | Format encoder. |
+| src/build_version_handshake.rs | `non_tty_error_message_renders_unknown_daemon_build` | Format encoder. |
+| src/build_version_handshake.rs | `mismatch_prompt_no_agents_matches_prd_form` | Format encoder. |
+| src/build_version_handshake.rs | `mismatch_prompt_with_agents_lists_them_under_header_and_warns_about_data_loss` | Format encoder. |
+| src/build_version_handshake.rs | `mismatch_prompt_pluralization_pinned_at_n_managed_agents` | Format encoder. |
+| src/config.rs | `bell_config_defaults` | Struct-default predicate. |
+| src/config.rs | `bell_config_deserialize_empty` | TOML parser round-trip. |
+| src/config.rs | `bell_config_deserialize_partial` | TOML parser round-trip. |
+| src/config.rs | `dashboard_config_without_bell_section` | TOML parser round-trip. |
+| src/config.rs | `dashboard_config_with_bell_section` | TOML parser round-trip. |
+| src/config.rs | `should_bell_respects_enabled` | Pure predicate on config. |
+| src/config.rs | `theme_defaults_to_auto` | TOML parser round-trip. |
+| src/config.rs | `theme_deserialize_light` | TOML parser round-trip. |
+| src/config.rs | `theme_get_set_field` | Pure field reflection. |
+| src/config.rs | `saved_session_round_trip` | TOML serde round-trip. |
+| src/config.rs | `saved_session_empty_default` | Struct-default predicate. |
+| src/config.rs | `saved_session_deserialize_empty` | TOML parser round-trip. |
+| src/config.rs | `should_bell_per_status` | Pure predicate matrix. |
+| src/config.rs | `star_prompt_default_values` | Struct-default predicate. |
+| src/config.rs | `star_prompt_serde_round_trip` | JSON serde round-trip. |
+| src/config.rs | `star_prompt_serde_missing_fields` | JSON parser. |
+| src/config.rs | `star_prompt_increment_and_check_triggers_at_10` | Pure counter logic. |
+| src/config.rs | `star_prompt_snooze_resets_window` | Pure counter logic. |
+| src/config.rs | `star_prompt_dismiss_permanently` | Pure counter logic. |
+| src/config.rs | `idle_art_config_defaults` | Struct-default predicate. |
+| src/config.rs | `dashboard_config_without_idle_art` | TOML parser round-trip. |
+| src/config.rs | `dashboard_config_with_idle_art` | TOML parser round-trip. |
+| src/config.rs | `idle_art_get_set_fields` | Pure field reflection. |
+| src/config.rs | `auto_config_prompt_defaults_to_true` | Struct-default predicate. |
+| src/config.rs | `auto_config_prompt_deserialize_missing` | TOML parser. |
+| src/config.rs | `auto_config_prompt_deserialize_false` | TOML parser. |
+| src/config.rs | `auto_config_prompt_get_set_field` | Pure field reflection. |
+| src/config.rs | `config_gen_state_default_empty` | Struct-default predicate. |
+| src/config.rs | `config_gen_state_suppress_and_check` | Pure membership predicate. |
+| src/config.rs | `config_gen_state_serde_round_trip` | JSON serde round-trip. |
+| src/config_gen.rs | `prompt_interpolates_directory` | Template-string encoder. |
+| src/config_gen.rs | `prompt_contains_key_sections` | Template-string encoder. |
+| src/config_gen.rs | `prompt_contains_orchestration_sections` | Template-string encoder. |
+| src/config_gen.rs | `prompt_contains_orchestration_guidelines` | Template-string encoder. |
+| src/config_gen.rs | `prompt_contains_orchestration_example` | Template-string encoder. |
+| src/config_gen.rs | `prompt_contains_role_library_section` | Template-string encoder. |
+| src/config_gen.rs | `prompt_renders_every_library_role` | Template + static-data check. |
+| src/config_gen.rs | `role_library_parses_and_has_expected_roles` | Static-data parser. |
+| src/config_gen.rs | `prompt_contains_context_handoff_mandate` | Template-string encoder. |
+| src/config_gen.rs | `every_worker_role_has_missing_context_backstop` | Static-data invariant. |
+| src/config_gen.rs | `release_role_has_clear_false` | Static-data invariant. |
+| src/config_validation.rs | `valid_config_has_no_issues` | Pure validation predicate. |
+| src/config_validation.rs | `invalid_regex_produces_error` | Pure validation predicate. |
+| src/config_validation.rs | `duplicate_mode_names_produce_warning` | Pure validation predicate. |
+| src/config_validation.rs | `interval_without_watch_produces_warning` | Pure validation predicate. |
+| src/config_validation.rs | `watch_with_interval_is_valid` | Pure validation predicate. |
+| src/config_validation.rs | `multiple_issues_across_modes` | Pure validation predicate. |
+| src/config_validation.rs | `display_format` | Format encoder. |
+| src/config_validation.rs | `rules_with_zero_reactive_panes_produces_error` | Pure validation predicate. |
+| src/config_validation.rs | `empty_config_is_valid` | Pure validation predicate. |
+| src/config_validation.rs | `empty_mode_is_valid` | Pure validation predicate. |
+| src/config_validation.rs | `valid_orchestration_has_no_issues` | Pure validation predicate. |
+| src/config_validation.rs | `orchestration_fewer_than_two_roles_is_error` | Pure validation predicate. |
+| src/config_validation.rs | `orchestration_no_start_role_is_error` | Pure validation predicate. |
+| src/config_validation.rs | `orchestration_multiple_start_roles_is_error` | Pure validation predicate. |
+| src/config_validation.rs | `orchestration_duplicate_role_names_is_error` | Pure validation predicate. |
+| src/config_validation.rs | `orchestration_duplicate_names_produce_warning` | Pure validation predicate. |
+| src/config_validation.rs | `orchestration_worker_without_description_warns` | Pure validation predicate. |
+| src/config_validation.rs | `orchestration_role_name_with_slash_is_error` | Pure validation predicate. |
+| src/config_validation.rs | `orchestration_role_name_with_backslash_is_error` | Pure validation predicate. |
+| src/config_validation.rs | `orchestration_role_name_with_path_traversal_is_error` | Pure validation predicate. |
+| src/config_validation.rs | `sanitize_role_name_removes_traversal` | Pure validation predicate. |
+| src/config_validation.rs | `sanitize_role_name_slash_removal_cannot_create_dotdot` | Pure validation predicate. |
+| src/connect.rs | `build_connect_command_has_t_flag_and_via_daemon_env` | Pure `Command` construction. |
+| src/connect.rs | `build_connect_command_passes_port_and_key` | Pure `Command` construction. |
+| src/connect.rs | `build_connect_command_omits_key_when_none` | Pure `Command` construction. |
+| src/connect.rs | `parse_version_output_accepts_canonical_and_v_prefixed` | Pure string parser. |
+| src/connect.rs | `parse_version_output_rejects_wrong_program_name` | Pure string parser. |
+| src/connect.rs | `parse_version_output_rejects_garbage_and_empty` | Pure string parser. |
+| src/connect.rs | `exit_code_from_status_passes_through_normal_exit` | Pure ExitStatus mapper. |
+| src/connect.rs | `exit_code_from_status_maps_signal_to_128_plus_signal` | Pure ExitStatus mapper. |
+| src/daemon_protocol.rs | `frame_round_trip` | Binary frame serde (in-memory Cursor). |
+| src/daemon_protocol.rs | `frame_eof_returns_none` | Binary frame serde (in-memory). |
+| src/daemon_protocol.rs | `frame_partial_header_returns_err` | Binary frame serde (in-memory). |
+| src/daemon_protocol.rs | `frame_partial_body_returns_err` | Binary frame serde (in-memory). |
+| src/daemon_protocol.rs | `frame_zero_length_payload` | Binary frame serde (in-memory). |
+| src/daemon_protocol.rs | `frame_rejects_oversize` | Binary frame serde (in-memory). |
+| src/daemon_protocol.rs | `request_serde_round_trip` | JSON serde round-trip. |
+| src/daemon_protocol.rs | `start_agent_omits_display_name_when_none` | JSON serde wire-shape pin. |
+| src/daemon_protocol.rs | `start_agent_with_mode_tab_membership_round_trip` | JSON serde round-trip. |
+| src/daemon_protocol.rs | `start_agent_with_orchestration_tab_membership_round_trip` | JSON serde round-trip. |
+| src/daemon_protocol.rs | `agent_record_with_tab_membership_round_trip` | JSON serde round-trip. |
+| src/daemon_protocol.rs | `agent_record_omits_tab_membership_when_none` | JSON serde wire-shape pin. |
+| src/daemon_protocol.rs | `agent_record_without_tab_membership_field_deserializes` | JSON parser. |
+| src/daemon_protocol.rs | `start_agent_deserializes_old_client_shape_without_tab_membership` | JSON parser. |
+| src/daemon_protocol.rs | `agent_record_deserializes_old_daemon_shape_without_tab_membership` | JSON parser. |
+| src/daemon_protocol.rs | `set_agent_label_serde_round_trip` | JSON serde round-trip. |
+| src/daemon_protocol.rs | `resize_request_serde_round_trip` | JSON serde round-trip. |
+| src/daemon_protocol.rs | `subscribe_events_request_serde_round_trip` | JSON serde round-trip. |
+| src/daemon_protocol.rs | `kind_event_frame_round_trip` | Binary frame + JSON serde (in-memory). |
+| src/daemon_protocol.rs | `response_helpers` | Pure constructor checks. |
+| src/daemon_protocol.rs | `hello_request_serde_round_trip` | JSON serde round-trip. |
+| src/daemon_protocol.rs | `hello_request_omits_client_build_version_when_none` | JSON serde wire-shape pin. |
+| src/daemon_protocol.rs | `hello_request_deserializes_legacy_shape_without_client_build_version` | JSON parser. |
+| src/daemon_protocol.rs | `hello_response_serde_round_trip` | JSON serde round-trip. |
+| src/daemon_protocol.rs | `response_omits_build_version_when_none` | JSON serde wire-shape pin. |
+| src/daemon_protocol.rs | `response_deserializes_legacy_shape_without_build_version` | JSON parser. |
+| src/daemon_protocol.rs | `response_omits_server_version_when_none` | JSON serde wire-shape pin. |
+| src/daemon_protocol.rs | `response_deserializes_legacy_shape_without_server_version` | JSON parser. |
+| src/daemon_stop.rs | `live_agents_error_message_mentions_force_flag` | Format encoder. |
+| src/daemon_stop.rs | `timed_out_error_message_mentions_force_recovery` | Format encoder. |
+| src/event.rs | `parse_full_event` | JSON parser. |
+| src/event.rs | `parse_minimal_event` | JSON parser. |
+| src/event.rs | `parse_event_with_user_prompt` | JSON parser. |
+| src/event.rs | `parse_event_without_user_prompt` | JSON parser. |
+| src/event.rs | `reject_invalid_event_type` | JSON parser. |
+| src/event.rs | `agent_type_from_command_recognizes_claude` | Pure classifier. |
+| src/event.rs | `agent_type_from_command_recognizes_opencode` | Pure classifier. |
+| src/event.rs | `agent_type_from_command_returns_none_for_unknown_or_empty` | Pure classifier. |
+| src/event.rs | `parse_open_code_event` | JSON parser. |
+| src/event.rs | `serialize_deserialize_delegate_signal` | JSON serde round-trip. |
+| src/event.rs | `serialize_deserialize_work_done_signal` | JSON serde round-trip. |
+| src/event.rs | `work_done_signal_defaults` | JSON parser default. |
+| src/event.rs | `agent_event_not_parseable_as_daemon_message` | JSON parser. |
+| src/hook.rs | `map_session_start` | Pure event-type mapper. |
+| src/hook.rs | `map_pre_tool_use` | Pure event-type mapper. |
+| src/hook.rs | `map_post_tool_use` | Pure event-type mapper. |
+| src/hook.rs | `map_notification` | Pure event-type mapper. |
+| src/hook.rs | `map_permission_request` | Pure event-type mapper. |
+| src/hook.rs | `map_stop` | Pure event-type mapper. |
+| src/hook.rs | `map_session_end` | Pure event-type mapper. |
+| src/hook.rs | `map_unknown_returns_none` | Pure event-type mapper. |
+| src/hook.rs | `tool_detail_bash_command` | Pure JSON extractor. |
+| src/hook.rs | `tool_detail_bash_truncates_long_command` | Pure JSON extractor. |
+| src/hook.rs | `tool_detail_read_file_path` | Pure JSON extractor. |
+| src/hook.rs | `tool_detail_edit_file_path` | Pure JSON extractor. |
+| src/hook.rs | `tool_detail_grep_pattern` | Pure JSON extractor. |
+| src/hook.rs | `tool_detail_glob_pattern` | Pure JSON extractor. |
+| src/hook.rs | `tool_detail_agent_description` | Pure JSON extractor. |
+| src/hook.rs | `tool_detail_unknown_tool_uses_first_string` | Pure JSON extractor. |
+| src/hook.rs | `tool_detail_none_when_no_input` | Pure JSON extractor. |
+| src/hook.rs | `tool_detail_none_when_no_tool_name` | Pure JSON extractor. |
+| src/hook.rs | `build_event_session_start` | Pure builder. |
+| src/hook.rs | `build_event_tool_start_with_detail` | Pure builder. |
+| src/hook.rs | `build_event_unknown_hook_returns_none` | Pure builder. |
+| src/hook.rs | `build_event_user_prompt_submit_extracts_prompt` | Pure builder. |
+| src/hook.rs | `build_event_prompt_truncated_to_200` | Pure builder. |
+| src/hook.rs | `build_event_bash_tool_start_stores_full_command` | Pure builder. |
+| src/hook.rs | `build_event_bash_tool_end_no_bash_command` | Pure builder. |
+| src/hook.rs | `build_event_non_bash_tool_start_no_bash_command` | Pure builder. |
+| src/hook.rs | `deserialize_claude_code_hook_input` | JSON parser. |
+| src/hook.rs | `deserialize_minimal_hook_input` | JSON parser. |
+| src/hook.rs | `map_opencode_session_created` | Pure event-type mapper. |
+| src/hook.rs | `map_opencode_session_deleted` | Pure event-type mapper. |
+| src/hook.rs | `map_opencode_session_idle` | Pure event-type mapper. |
+| src/hook.rs | `map_opencode_session_error` | Pure event-type mapper. |
+| src/hook.rs | `map_opencode_session_status_default` | Pure event-type mapper. |
+| src/hook.rs | `map_opencode_session_status_idle` | Pure event-type mapper. |
+| src/hook.rs | `map_opencode_session_status_error` | Pure event-type mapper. |
+| src/hook.rs | `map_opencode_tool_before` | Pure event-type mapper. |
+| src/hook.rs | `map_opencode_tool_after` | Pure event-type mapper. |
+| src/hook.rs | `map_opencode_permission_asked` | Pure event-type mapper. |
+| src/hook.rs | `map_opencode_unknown_returns_none` | Pure event-type mapper. |
+| src/hook.rs | `build_opencode_event_session_created` | Pure builder. |
+| src/hook.rs | `build_opencode_event_tool_with_detail` | Pure builder. |
+| src/hook.rs | `build_opencode_event_bash_tool_start_stores_full_command` | Pure builder. |
+| src/hook.rs | `build_opencode_event_unknown_returns_none` | Pure builder. |
+| src/hook.rs | `deserialize_opencode_hook_input` | JSON parser. |
+| src/hook.rs | `deserialize_minimal_opencode_input` | JSON parser. |
+| src/hook.rs | `pane_id_propagated_from_env_claude_code` | Pure builder + env (test-local). |
+| src/hook.rs | `pane_id_propagated_from_env_opencode` | Pure builder + env (test-local). |
+| src/hook.rs | `send_to_missing_socket_returns_none` | Pure failure predicate. |
+| src/hyperlink.rs | `plain_text_passes_through` | Stream filter parser. |
+| src/hyperlink.rs | `single_link_bel` | Stream filter parser. |
+| src/hyperlink.rs | `single_link_st` | Stream filter parser. |
+| src/hyperlink.rs | `link_with_id_param` | Stream filter parser. |
+| src/hyperlink.rs | `link_with_surrounding_text` | Stream filter parser. |
+| src/hyperlink.rs | `ansi_inside_link` | Stream filter parser. |
+| src/hyperlink.rs | `non_osc8_passes_through` | Stream filter parser. |
+| src/hyperlink.rs | `split_across_chunks` | Stream filter parser. |
+| src/hyperlink.rs | `regular_csi_passes_through` | Stream filter parser. |
+| src/hyperlink.rs | `row_set_get` | Pure map predicate. |
+| src/hyperlink.rs | `row_shift_up` | Pure map predicate. |
+| src/hyperlink.rs | `row_clear` | Pure map predicate. |
+| src/hyperlink.rs | `full_pipeline` | Stream filter parser (in-memory vt100). |
+| src/opencode_manage.rs | `plugin_template_uses_exec_file_sync` | Template encoder. |
+| src/opencode_manage.rs | `plugin_subpath_appends_plugin_and_name` | Pure path constructor. |
+| src/pane.rs | `rename_outcome_applied_returns_applied_for_valid_input` | Validation predicate. |
+| src/pane.rs | `rename_outcome_applied_trims_surrounding_whitespace` | Validation predicate. |
+| src/pane.rs | `rename_outcome_applied_rejects_control_bytes` | Validation predicate. |
+| src/pane.rs | `rename_outcome_applied_treats_empty_as_cleared` | Validation predicate. |
+| src/pane.rs | `rename_outcome_applied_treats_whitespace_only_as_cleared` | Validation predicate. |
+| src/pane.rs | `rename_outcome_applied_rejects_oversized_label` | Validation predicate. |
+| src/pane.rs | `rename_outcome_applied_accepts_unicode_label` | Validation predicate. |
+| src/pane_input.rs | `encode_pane_payload_single_line` | Pure encoder. |
+| src/pane_input.rs | `encode_pane_payload_strips_trailing_whitespace` | Pure encoder. |
+| src/pane_input.rs | `encode_pane_payload_wraps_multiline` | Pure encoder. |
+| src/pane_input.rs | `encode_pane_payload_multiline_with_trailing_newline` | Pure encoder. |
+| src/pane_input.rs | `encode_pane_payload_empty` | Pure encoder. |
+| src/pane_input.rs | `encode_pane_payload_rejects_embedded_paste_end_marker` | Pure encoder. |
+| src/pane_input.rs | `encode_pane_payload_rejects_embedded_paste_start_marker` | Pure encoder. |
+| src/pane_input.rs | `encode_pane_payload_single_line_with_marker_still_passes` | Pure encoder. |
+| src/project_config.rs | `parse_valid_full_config` | TOML parser. |
+| src/project_config.rs | `parse_minimal_config` | TOML parser. |
+| src/project_config.rs | `watch_defaults_to_false` | TOML parser default. |
+| src/project_config.rs | `pane_watch_defaults_to_true` | TOML parser default. |
+| src/project_config.rs | `pane_watch_can_be_set_to_false` | TOML parser. |
+| src/project_config.rs | `pane_name_defaults_to_none` | TOML parser default. |
+| src/project_config.rs | `reactive_panes_defaults_to_two` | TOML parser default. |
+| src/project_config.rs | `reactive_panes_configurable` | TOML parser. |
+| src/project_config.rs | `parse_full_orchestration_config` | TOML parser. |
+| src/project_config.rs | `parse_orchestration_alongside_modes` | TOML parser. |
+| src/project_config.rs | `orchestration_clear_defaults_to_true` | TOML parser default. |
+| src/project_config.rs | `orchestration_description_defaults_to_none` | TOML parser default. |
+| src/project_config.rs | `orchestration_prompt_template_defaults_to_none` | TOML parser default. |
+| src/project_config.rs | `synthesize_uses_provided_orchestration_name` | Pure data transform. |
+| src/project_config.rs | `synthesize_role_count_matches_max_index_plus_one` | Pure data transform. |
+| src/project_config.rs | `synthesize_marks_start_role_from_metadata` | Pure data transform. |
+| src/project_config.rs | `synthesize_leaves_display_fields_at_defaults` | Pure data transform. |
+| src/project_config.rs | `synthesize_handles_empty_role_name_via_placeholder` | Pure data transform. |
+| src/project_config.rs | `synthesize_empty_slots_yields_empty_roles` | Pure data transform. |
+| src/project_config.rs | `synthesize_first_wins_on_duplicate_role_index` | Pure data transform. |
+| src/project_config.rs | `orchestration_role_start_defaults_to_false` | TOML parser default. |
+| src/project_config.rs | `modes_only_config_still_works` | TOML parser. |
+| src/project_config.rs | `orchestrations_only_config_works` | TOML parser. |
+| src/project_config.rs | `missing_required_pattern_is_error` | TOML parser error path. |
+| src/remote.rs | `ssh_target_parse_with_user` | URL parser. |
+| src/remote.rs | `ssh_target_parse_without_user` | URL parser. |
+| src/remote.rs | `system_ssh_executor_quotes_arguments_safely` | Pure Command construction. |
+| src/remote.rs | `system_ssh_executor_omits_key_flag_when_none` | Pure Command construction. |
+| src/remote.rs | `system_ssh_executor_emits_no_timeout_options_by_default` | Pure Command construction. |
+| src/remote.rs | `system_ssh_executor_with_wallclock_timeout_sets_ssh_options` | Pure Command construction. |
+| src/remote.rs | `detect_platform_known` | Pure classifier. |
+| src/remote.rs | `detect_platform_unknown` | Pure classifier. |
+| src/remote.rs | `parse_version_output_typical` | Pure string parser. |
+| src/remote.rs | `validate_version_string_accepts_semver_shapes` | Validation predicate. |
+| src/remote.rs | `validate_version_string_strips_optional_v_prefix` | Validation predicate. |
+| src/remote.rs | `validate_version_string_rejects_malformed` | Validation predicate. |
+| src/remote.rs | `build_install_command_rejects_invalid_version` | Pure command-string builder. |
+| src/remote.rs | `build_install_command_url_unprefixed_version` | Pure command-string builder. |
+| src/remote.rs | `build_install_command_is_atomic` | Pure command-string builder. |
+| src/remote.rs | `build_install_command_url_normalizes_v_prefixed_version` | Pure command-string builder. |
+| src/remote.rs | `classify_ssh_error_host_key_verification_failed` | Pure classifier. |
+| src/remote.rs | `classify_ssh_error_host_key_changed_routes_to_same_variant` | Pure classifier. |
+| src/remote.rs | `classify_ssh_error_connection_refused_still_works` | Pure classifier. |
+| src/remote.rs | `classify_ssh_error_auth_failed_still_works` | Pure classifier. |
+| src/state.rs | `compose_delegate_prompt_appends_work_done_footer` | Pure prompt encoder. |
+| src/tab_layout.rs | `all_fit_returns_labels_unchanged` | Pure layout-fitting math. |
+| src/tab_layout.rs | `single_overflow_truncates_only_long_tab` | Pure layout-fitting math. |
+| src/tab_layout.rs | `all_overflow_caps_every_label` | Pure layout-fitting math. |
+| src/tab_layout.rs | `unicode_label_width_uses_cells_not_bytes` | Pure layout-fitting math. |
+| src/tab_layout.rs | `single_tab_truncates_or_passes_through` | Pure layout-fitting math. |
+| src/tab_layout.rs | `zero_width_collapses_to_empty_when_cap_is_zero` | Pure layout-fitting math. |
+| src/tab_layout.rs | `rendered_total_matches_padding_plus_dividers_formula` | Pure layout-fitting math. |
+| src/tab_layout.rs | `truncated_total_stays_within_available_width` | Pure layout-fitting math. |
+| src/theme.rs | `dark_palette_values` | Static-data predicate. |
+| src/theme.rs | `light_palette_values` | Static-data predicate. |
+| src/theme.rs | `resolve_explicit_dark` | Pure resolver. |
+| src/theme.rs | `resolve_explicit_light` | Pure resolver. |
+| src/theme.rs | `theme_display` | Format encoder. |
+| src/theme.rs | `theme_from_str` | String parser. |
+| src/ui.rs | `dead_slot_pane_id_is_deterministic_per_role` | ID generator. |
+| src/ui.rs | `dead_slot_pane_id_disambiguates_hyphenated_inputs` | ID generator. |
+| src/version.rs | `test_current_version_parses` | Static-data parser. |
+| src/version.rs | `test_should_notify_newer` | Semver predicate. |
+| src/version.rs | `test_should_notify_same` | Semver predicate. |
+| src/version.rs | `test_should_notify_older` | Semver predicate. |
+| src/version.rs | `test_v_prefix_stripped` | Semver predicate. |
+| src/version.rs | `test_invalid_version_returns_none` | Semver predicate. |
+
+### Moved to tmp/legacy-tests/
+
+#### Whole-file moves under `tests/`
+
+| Original path | Moved to | Reason |
+|---|---|---|
+| tests/agent_metadata.rs | tmp/legacy-tests/tests/agent_metadata.rs | Spawns daemon and exercises label-lifecycle protocol; needs L2 rewrite. |
+| tests/build_id.rs | tmp/legacy-tests/tests/build_id.rs | Spawns process with build-id overrides; touches env + subprocess. |
+| tests/build_version_handshake.rs | tmp/legacy-tests/tests/build_version_handshake.rs | Boots real daemon to exercise the build-version handshake; needs L2. |
+| tests/close_pane_errors.rs | tmp/legacy-tests/tests/close_pane_errors.rs | Drives daemon close-pane error paths; needs L2. |
+| tests/common/mod.rs | tmp/legacy-tests/tests/common/mod.rs | Shared scaffolding for the moved tests — moves with them. |
+| tests/connect_lookup.rs | tmp/legacy-tests/tests/connect_lookup.rs | Touches filesystem registry and SSH probing; needs L2 once remote harness exists. |
+| tests/daemon_attach_cleanup.rs | tmp/legacy-tests/tests/daemon_attach_cleanup.rs | Boots daemon, attaches, asserts socket-cleanup; needs L2. |
+| tests/daemon_integration.rs | tmp/legacy-tests/tests/daemon_integration.rs | Boots daemon, exercises real protocol; needs L2. |
+| tests/daemon_lifecycle.rs | tmp/legacy-tests/tests/daemon_lifecycle.rs | Daemon start/stop lifecycle; needs L2. |
+| tests/daemon_protocol.rs | tmp/legacy-tests/tests/daemon_protocol.rs | Live daemon protocol roundtrip; needs L2 (in-memory frame tests remain in src/). |
+| tests/daemon_stop.rs | tmp/legacy-tests/tests/daemon_stop.rs | Exercises `daemon stop` against a real daemon; needs L2. |
+| tests/event_forwarding.rs | tmp/legacy-tests/tests/event_forwarding.rs | Hook → daemon → UI event flow against real sockets; needs L2. |
+| tests/external_daemon.rs | tmp/legacy-tests/tests/external_daemon.rs | Spawns + ensures external daemon, trust checks; needs L2. |
+| tests/integration_test.rs | tmp/legacy-tests/tests/integration_test.rs | Top-level integration smoke against the spawned binary; needs L2. |
+| tests/local_attach.rs | tmp/legacy-tests/tests/local_attach.rs | Attaches a real PTY to a running daemon; needs L2. |
+| tests/mode_integration_test.rs | tmp/legacy-tests/tests/mode_integration_test.rs | Mode activation + pane wiring through Tab/Mode/Daemon; needs L2. |
+| tests/orchestration_delegate.rs | tmp/legacy-tests/tests/orchestration_delegate.rs | Drives orchestration delegate signal through daemon; needs L2. |
+| tests/pane_auto_renew_on_respawn.rs | tmp/legacy-tests/tests/pane_auto_renew_on_respawn.rs | Spawns/renews PTY against a real daemon; needs L2. |
+| tests/process_group_kill.rs | tmp/legacy-tests/tests/process_group_kill.rs | Exercises real process-group signalling; needs L2. |
+| tests/rehydration.rs | tmp/legacy-tests/tests/rehydration.rs | Daemon hydration after reconnect; needs L2. |
+| tests/remote_add.rs | tmp/legacy-tests/tests/remote_add.rs | Touches filesystem registry + SSH; needs L2 (remote harness later). |
+| tests/remote_lifecycle.rs | tmp/legacy-tests/tests/remote_lifecycle.rs | End-to-end remote add/connect/remove flow; needs L2. |
+| tests/resize_coalescing.rs | tmp/legacy-tests/tests/resize_coalescing.rs | SIGWINCH coalescing across daemon + PTY; needs L2. |
+| tests/session_restore_test.rs | tmp/legacy-tests/tests/session_restore_test.rs | Restores saved session against daemon + TUI; needs L2. |
+| tests/spawn_time_role_prompt_atomic.rs | tmp/legacy-tests/tests/spawn_time_role_prompt_atomic.rs | Atomic role-prompt write at agent spawn; touches filesystem + daemon. |
+| tests/stop_dialog.rs | tmp/legacy-tests/tests/stop_dialog.rs | Exercises stop-dialog interactive flow; needs L2 (TUI input). |
+
+#### Partial / full `mod tests` moves under `src/`
+
+| Original path | Moved to | Reason |
+|---|---|---|
+| src/agent_pty.rs (`mod tests`: spawn_*, registry_*, write_to_pane_*, close_agent_*, agent_records_*, change_notify_*, live_count_*, child_guard_*, spawn_options_env_*, spawn_scrubs_*) | tmp/legacy-tests/src/agent_pty.rs | Touches PTY registry, child processes, async I/O. |
+| src/build_version_handshake.rs (`mod tests`: terminate_*) | tmp/legacy-tests/src/build_version_handshake.rs | Async terminate path drives real Unix sockets and child processes. |
+| src/config.rs (`mod tests`: saved_session_load_save_clear, star_prompt_load_save_cycle, attach_socket_fallback_is_per_user, state_dir_*, config_gen_state_suppress_dir_deduplicates, config_gen_state_load_save_cycle) + cfg(test) STATE_DIR_ENV_LOCK / CONFIG_GEN_STATE_ENV_LOCK / ConfigGenStateEnvGuard helpers | tmp/legacy-tests/src/config.rs | Read/write filesystem and process-global env vars. |
+| src/connect.rs (`mod tests`: lookup_*, picker_*, probe_*, run_connect_*, touch_last_connected_*, probe_timeout_secs_*, probe_protocol_*) | tmp/legacy-tests/src/connect.rs | Exercises SSH mocks, filesystem registry, env vars — all subsystem-shaped, not pure-data. |
+| src/daemon.rs (whole `mod tests`) | tmp/legacy-tests/src/daemon.rs | Boots daemons, sockets, idle monitor, lock dirs. |
+| src/daemon_attach.rs (whole `mod tests`) | tmp/legacy-tests/src/daemon_attach.rs | Unix-socket trust checks, spawn lock, env vars. |
+| src/daemon_client.rs (whole `mod tests`) | tmp/legacy-tests/src/daemon_client.rs | End-to-end daemon-protocol calls against a real server. |
+| src/daemon_protocol.rs (`mod tests`: daemon_hello_dispatch_*) | tmp/legacy-tests/src/daemon_protocol.rs | Dispatches through `handle_connection` on a live UnixStream pair. |
+| src/daemon_stop.rs (`mod tests`: stop_returns_*, restart_no_daemon_running_is_idempotent) | tmp/legacy-tests/src/daemon_stop.rs | Touches real attach sockets and async daemon termination. |
+| src/hooks_manage.rs (whole `mod tests`) | tmp/legacy-tests/src/hooks_manage.rs | Writes Claude Code settings.json on the filesystem. |
+| src/init.rs (whole `mod tests`) | tmp/legacy-tests/src/init.rs | Writes config files to disk. |
+| src/llm.rs (whole `mod tests`) | tmp/legacy-tests/src/llm.rs | Hits LLM HTTP endpoints / asserts env-missing errors. |
+| src/mode_manager.rs (whole `mod tests`) | tmp/legacy-tests/src/mode_manager.rs | Drives `ModeManager` through a mock `PaneController` — Mode* subsystem. |
+| src/opencode_manage.rs (`mod tests`: install_*, uninstall_*, auto_install_*, detect_opencode_root_*) plus dead test-only `auto_install_to` helper | tmp/legacy-tests/src/opencode_manage.rs | Touches filesystem and env vars to install/inspect OpenCode plugin dirs. |
+| src/project_config.rs (`mod tests`: load_missing_file_returns_none, load_malformed_toml_returns_error, load_valid_file, mode_lookup_by_name_returns_none_when_renamed) | tmp/legacy-tests/src/project_config.rs | Filesystem-backed config load. |
+| src/remote.rs (`mod tests`: run_with_wallclock_kill_*, remotes_toml_written_at_0o600, remotes_toml_save_creates_parent_directory, remotes_file_round_trip_two_entries) | tmp/legacy-tests/src/remote.rs | Spawns real child processes and writes registry files. |
+| src/state.rs (`mod tests`: session lifecycle, placeholder, dispatch, work_done file write, async wait_for_session_start, …) | tmp/legacy-tests/src/state.rs | Exercises `AppState` event handling, async, and filesystem. |
+| src/tab.rs (whole `mod tests`) | tmp/legacy-tests/src/tab.rs | Drives `TabManager` through a mock controller — Tab* subsystem. |
+| src/terminal_widget.rs (whole `mod tests`) | tmp/legacy-tests/src/terminal_widget.rs | UI render tests against a ratatui buffer — will be reborn as L1 widget tests in M2. |
+| src/ui.rs (`mod tests`: layout dims, partition_*, dedupe_*, fill_dead_slots_*, dashboard_filter_*, synthesised_orchestration_tab_*, config-gen prompt handlers, …) | tmp/legacy-tests/src/ui.rs | UI/state subsystem — large block of TUI helpers driven against handcrafted state. |
+
 ## Test Case Catalog
 
 *Populated by M1.*
