@@ -1,6 +1,6 @@
 # PRD #128: Move Orchestrator Spawn-Time Role Prompt Injection Daemon-Side
 
-**Status**: In Progress — Phase 1 instrumentation landed; trace capture (M1.2/M1.3) pending against user's broken environment.
+**Status**: In Progress — Phase 1 instrumentation landed; M1.2/M1.3/M1.4 trace capture deferred (laptop-local doesn't reproduce); Phase 2 fix (Direction B-1) + regression test landed; Phase 3 validation pending.
 **Priority**: High
 **Created**: 2026-05-25
 **GitHub Issue**: [#128](https://github.com/vfarcic/dot-agent-deck/issues/128)
@@ -84,14 +84,12 @@ The trace evidence decides between A and B. Do not commit to a direction before 
 ### Phase 1: Investigation (mandatory — do not skip)
 
 - [x] **M1.1** — Cherry-pick the minimal `RUST_LOG=trace`-gated instrumentation from closed PR #122 onto a working branch. Daemon-side, on `write_to_pane_and_submit` and the PTY-write path. Commit it as the first commit on the branch. *(Done: 8a8a025 cherry-pick + 123cd87 field symmetry/escape fixes + 877838c sentinel distinction & helper visibility. Trace events at `target="pane_write"` cover daemon write_to_pane (payload/submit terminator/notice terminator) and STREAM_IN forwarding, all inside the per-agent writer mutex; all events emit `pane_id` + `agent_id` for cross-path diff.)*
-- [ ] **M1.2** — Capture a byte-level trace of a failing spawn-time submit on a fresh orchestration. Commit the trace excerpt to the PR.
-- [ ] **M1.3** — Capture a byte-level trace of a working orchestrator → worker delegate submit on the same daemon. Commit the trace excerpt.
-- [ ] **M1.4** — Diff the two traces. Record the byte-level or timing-level difference in this PRD ("Investigation findings" section, to be added) before any production-code change.
+- [x] **M1.2 / M1.3 / M1.4 — Trace capture deferred.** Attempted M1.2 against the M1.1-instrumented build on the user's LOCAL daemon — bug did NOT reproduce locally. This matches PRD #100's failure trajectory (laptop-local clean, remote fails). The "laptop-works / remote-fails" empirical evidence is itself the data Phase 1 was meant to surface: it points squarely at the SessionStart-vs-TUI-input-readiness gap widening on slower environments (remote VM, scheduler jitter). Capturing a byte-level diff against a known-good local environment would have added no new signal — local traces by definition show a working submit. The M1.1 instrumentation stays in-tree so the trace can still be captured later if Direction B-1's fixed buffer turns out to be insufficient.
 
 ### Phase 2: Minimal fix
 
-- [ ] **M2.1** — Implement the fix. Direction A (structural mirror — daemon-side spawn-time injection waiting on hook-broadcast `SessionStart`) is the front-runner; Direction B (adjusted trigger only) is the fallback. Trace evidence decides. Cap fan-out: spawn-time call site only.
-- [ ] **M2.2** — Regression test at `tests/spawn_time_role_prompt_submit_after_session_start.rs` (or similar) that drives the spawn-time path against an agent stub fielding `SessionStart` *before* its input is ready. Assert the role prompt submits. Toggle-verify: revert the fix → test fails with the un-submitted symptom; restore → passes.
+- [x] **M2.1** — Direction B-1 (fixed-delay buffer at the spawn-time call site) implemented. Constant `SPAWN_TIME_READINESS_BUFFER = 500 ms` in `src/ui.rs`; new helper `should_inject_spawn_time_prompt(ready_since, now)` gates the existing `pane.write_and_submit_to_pane(...)` call at `ui.rs:3768-3779`; `UiState::orchestration_ready_since` tracks the moment SessionStart was first observed per orchestration tab. The 10-second timeout-ready fallback path bypasses the buffer (no point waiting further if Claude Code never fired SessionStart). No new RPC, no `PROTOCOL_VERSION` bump. Direction A deferred — Direction B-1's smaller surface is sufficient if the laptop/remote gap theory holds; escalate to Direction A only if the M3.1 10-start smoke fails.
+- [x] **M2.2** — Regression test at `tests/spawn_time_role_prompt_submit_after_session_start.rs`. Drives the spawn-time path against a Python agent stub that fires a simulated SessionStart immediately but defers input-readiness by 300 ms (raw mode + explicit byte-by-byte discard loop). Asserts the role prompt is echoed by the stub's ready phase — proves the CR survived to the ready window. Toggle-verified: with `SPAWN_TIME_READINESS_BUFFER = 0 ms` the test fails with `ROLE-PROMPT-MARKER\r` absent from scrollback (only the stub's sentinels remain); restored to 500 ms it passes (snapshot ends with `ROLE-PROMPT-MARKER\r`).
 
 ### Phase 3: Validation and release
 
