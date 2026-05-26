@@ -1,0 +1,18 @@
+[package]
+name = "spec"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# PRD #77 Decision 7: tests carry a `#[spec("<area>/<sub>/<NNN>")]`
+# annotation that the linkage-check binary scans for. The macro itself
+# is a compile-time no-op — it only exists so the annotation is
+# valid Rust syntax.
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

@@ -492,6 +492,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "spec",
  "tempfile",
  "terminal-colorsaurus",
  "thiserror 2.0.18",
@@ -2256,6 +2257,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spec"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3402,6 +3412,13 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+
+[[package]]
+name = "xtask-linkage-check"
+version = "0.0.0"
+dependencies = [
+ "regex",
+]
 
 [[package]]
 name = "xterm-color"

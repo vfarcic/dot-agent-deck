@@ -1,3 +1,10 @@
+[workspace]
+members = [
+    ".",
+    "xtask/linkage-check",
+    "xtask/spec",
+]
+
 [package]
 name = "dot-agent-deck"
 version = "0.1.0"
@@ -33,6 +40,7 @@ serial_test = "3"
 # PRD #77 Decision 22: insta pinned to a specific version, not `latest`,
 # so a future patch release cannot silently reshape snapshot diffs.
 insta = { version = "=1.47.2", features = ["yaml"] }
+spec = { path = "xtask/spec" }
 
 [features]
 # PRD #77 Decision 6: `cargo test-e2e` (alias) enables this feature so

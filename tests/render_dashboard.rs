@@ -14,6 +14,7 @@ use dot_agent_deck::event::AgentType;
 use dot_agent_deck::state::{ActiveTool, SessionState, SessionStatus};
 use dot_agent_deck::theme::{ColorPalette, Theme, resolve_palette};
 use dot_agent_deck::ui::{CardDensityKind, render_card_to_buffer};
+use spec::spec;
 
 /// Construct a deterministic `SessionState` for snapshot tests. All
 /// time-bearing fields are pinned to a fixed `Utc` instant so the
@@ -59,6 +60,7 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
     out
 }
 
+#[spec("dashboard/pane/004")]
 #[test]
 fn pane_004_card_title_row() {
     // PRD #77 catalog: dashboard/pane/004 — Card title row carries

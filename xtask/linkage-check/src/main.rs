@@ -1,0 +1,318 @@
+//! PRD #77 catalog ↔ test linkage check.
+//!
+//! Invoked as `cargo xtask linkage-check` (alias in `.cargo/config.toml`).
+//! Performs the six checks listed in Decision 7:
+//!
+//! 1. Every catalog ID has at least one `#[spec("...")]` referencing
+//!    it OR is on the allowlist (`m2.allowlist`).
+//! 2. Every `#[spec("...")]` references a real catalog ID.
+//! 3. Catalog IDs match the format regex.
+//! 4. Function name carries the `<sub>_<NNN>` prefix (Decision 17).
+//! 5. No raw `std::thread::sleep` / `tokio::time::sleep` /
+//!    `for _ in 0..N` polling in `tests/e2e_*.rs` bodies (Decision 21).
+//! 6. No `#[ignore]` on `#[spec(...)]`-annotated tests (Decision 26).
+//!
+//! Exits 0 on success, 1 on any failure with a per-finding summary.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use regex::Regex;
+
+const PRD_PATH: &str = "prds/77-tui-testing-harness.md";
+const ALLOWLIST_PATH: &str = "xtask/linkage-check/m2.allowlist";
+const TESTS_DIR: &str = "tests";
+
+fn main() -> ExitCode {
+    // Allow `cargo xtask linkage-check` to pass through; we accept any
+    // first arg (including none) so the alias can carry the subcommand
+    // verb without us re-parsing it.
+    let _args: Vec<String> = std::env::args().collect();
+
+    let root = repo_root();
+    let prd_path = root.join(PRD_PATH);
+    let allowlist_path = root.join(ALLOWLIST_PATH);
+    let tests_dir = root.join(TESTS_DIR);
+
+    let mut failures: Vec<String> = Vec::new();
+
+    let catalog_ids = match parse_catalog_ids(&prd_path) {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("failed to parse catalog at {}: {e}", prd_path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let allowlist = match read_allowlist(&allowlist_path) {
+        Ok(set) => set,
+        Err(e) => {
+            eprintln!(
+                "failed to read allowlist at {}: {e}",
+                allowlist_path.display()
+            );
+            return ExitCode::from(2);
+        }
+    };
+
+    // Check 3: format regex on catalog IDs.
+    let id_re = Regex::new(r"^[a-z][a-z0-9-]*/[a-z][a-z0-9-]*/\d{3}$")
+        .expect("catalog ID format regex compiles");
+    for id in &catalog_ids {
+        if !id_re.is_match(id) {
+            failures.push(format!(
+                "[3] catalog ID {id:?} does not match `<area>/<sub>/<NNN>`"
+            ));
+        }
+    }
+
+    // Scan tests/ for `#[spec(...)]` annotations + function defs.
+    let test_files = collect_test_rs_files(&tests_dir);
+    let mut annotations: Vec<SpecAnnotation> = Vec::new();
+    let mut e2e_violations: Vec<String> = Vec::new();
+    let mut ignore_violations: Vec<String> = Vec::new();
+
+    let spec_re = Regex::new(r#"#\[spec\("([^"]+)"\)\]"#).expect("spec attr regex compiles");
+    let fn_re = Regex::new(r"^\s*fn\s+([A-Za-z_][A-Za-z0-9_]*)").expect("fn regex compiles");
+    let ignore_re = Regex::new(r"#\[ignore\b").expect("ignore regex compiles");
+    // Decision 21: forbidden in test bodies.
+    let sleep_re =
+        Regex::new(r"(std::thread::sleep|tokio::time::sleep)\b").expect("sleep regex compiles");
+    let polling_re =
+        Regex::new(r"for\s+_\s+in\s+0\.\.\s*\d+\s*\{").expect("polling regex compiles");
+
+    for file in &test_files {
+        let text = match std::fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("failed to read {}: {e}", file.display());
+                continue;
+            }
+        };
+
+        let lines: Vec<&str> = text.lines().collect();
+        let file_name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unknown>")
+            .to_string();
+        let is_e2e = file_name.starts_with("e2e_") && file_name.ends_with(".rs");
+
+        // Walk lines, link each `#[spec("...")]` to the next function
+        // definition. The annotation may be followed by other
+        // attributes (`#[test]`, `#[ignore]`) before the `fn`; we
+        // accumulate those and stop at the first `fn`.
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(caps) = spec_re.captures(line) {
+                let id = caps.get(1).unwrap().as_str().to_string();
+                let mut fn_name: Option<String> = None;
+                let mut between_ignored = false;
+                for next in &lines[i + 1..] {
+                    if ignore_re.is_match(next) {
+                        between_ignored = true;
+                    }
+                    if let Some(c) = fn_re.captures(next) {
+                        fn_name = Some(c.get(1).unwrap().as_str().to_string());
+                        break;
+                    }
+                }
+                if between_ignored {
+                    ignore_violations.push(format!(
+                        "{}: #[spec({id:?})] annotates an #[ignore]-d test (Decision 26)",
+                        file.display()
+                    ));
+                }
+                annotations.push(SpecAnnotation {
+                    id,
+                    file: file.clone(),
+                    fn_name,
+                });
+            }
+        }
+
+        if is_e2e {
+            // Check 5: forbidden waits / polling in e2e test bodies.
+            for (idx, line) in lines.iter().enumerate() {
+                // Skip lines under the file's `mod common;` declaration —
+                // the harness internals MAY sleep; we only police the
+                // bodies of the test file itself.
+                if sleep_re.is_match(line) {
+                    e2e_violations.push(format!(
+                        "{}:{}: forbidden sleep call (Decision 21)",
+                        file.display(),
+                        idx + 1
+                    ));
+                }
+                if polling_re.is_match(line) {
+                    e2e_violations.push(format!(
+                        "{}:{}: forbidden fixed-count polling loop (Decision 21)",
+                        file.display(),
+                        idx + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut annotated_ids: BTreeSet<&str> = BTreeSet::new();
+    for ann in &annotations {
+        annotated_ids.insert(&ann.id);
+
+        // Check 2: annotation references a real catalog ID.
+        if !catalog_ids.contains(&ann.id) {
+            failures.push(format!(
+                "[2] {} carries #[spec({:?})] which is not in the catalog",
+                ann.file.display(),
+                ann.id
+            ));
+        }
+
+        // Check 4: function name carries `<sub>_<NNN>` prefix.
+        if let Some(fname) = &ann.fn_name {
+            let (sub_nnn, _) = match ann.id.rsplit_once('/') {
+                Some((rest, nnn)) => match rest.rsplit_once('/') {
+                    Some((_, sub)) => (format!("{sub}_{nnn}"), ()),
+                    None => (String::new(), ()),
+                },
+                None => (String::new(), ()),
+            };
+            if !sub_nnn.is_empty() && !fname.starts_with(&sub_nnn) {
+                failures.push(format!(
+                    "[4] {} fn `{}` does not start with `{}` (Decision 17, derived from #[spec({:?})])",
+                    ann.file.display(),
+                    fname,
+                    sub_nnn,
+                    ann.id
+                ));
+            }
+        } else {
+            failures.push(format!(
+                "[4] {} #[spec({:?})] is not followed by a `fn` definition",
+                ann.file.display(),
+                ann.id
+            ));
+        }
+    }
+
+    // Check 1: every catalog ID has at least one annotation OR is on
+    // the allowlist (M2 ships only `dashboard/pane/004` and
+    // `hooks/delivery/001`; M4+ ticks IDs off the allowlist as it
+    // lands tests).
+    for id in &catalog_ids {
+        if annotated_ids.contains(id.as_str()) {
+            continue;
+        }
+        if allowlist.contains(id) {
+            continue;
+        }
+        failures.push(format!(
+            "[1] catalog ID `{id}` has no #[spec({id:?})]-annotated test and is not on the M2 allowlist"
+        ));
+    }
+
+    failures.extend(e2e_violations);
+    failures.extend(ignore_violations);
+
+    if failures.is_empty() {
+        println!(
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted)",
+            catalog_ids.len(),
+            annotations.len(),
+            allowlist.len()
+        );
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("linkage-check: {} failure(s):", failures.len());
+        for f in &failures {
+            eprintln!("  {f}");
+        }
+        ExitCode::FAILURE
+    }
+}
+
+struct SpecAnnotation {
+    id: String,
+    file: PathBuf,
+    fn_name: Option<String>,
+}
+
+/// Locate the workspace root by walking up from the binary's
+/// `current_dir()` until we see the workspace `Cargo.toml` (which has
+/// a `[workspace]` block).
+fn repo_root() -> PathBuf {
+    let mut dir = std::env::current_dir().expect("current_dir is readable");
+    loop {
+        let candidate = dir.join("Cargo.toml");
+        if let Ok(s) = std::fs::read_to_string(&candidate)
+            && s.contains("[workspace]")
+        {
+            return dir;
+        }
+        if !dir.pop() {
+            panic!("could not locate workspace root from {dir:?}");
+        }
+    }
+}
+
+/// Parse `## Test Case Catalog` out of the PRD: extract every
+/// occurrence of `##### <area>/<sub>/<NNN>` (the catalog entry header
+/// form). The deliberate-skips table at the bottom uses table rows,
+/// not headers, so it is excluded by construction.
+fn parse_catalog_ids(prd_path: &Path) -> std::io::Result<BTreeSet<String>> {
+    let text = std::fs::read_to_string(prd_path)?;
+    let mut in_catalog = false;
+    let header_re = Regex::new(r"^#####\s+([a-z][a-z0-9-]*/[a-z][a-z0-9-]*/\d{3})\b")
+        .expect("catalog header regex compiles");
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    for line in text.lines() {
+        if line.starts_with("## ") {
+            in_catalog = line.starts_with("## Test Case Catalog");
+            continue;
+        }
+        if !in_catalog {
+            continue;
+        }
+        if let Some(caps) = header_re.captures(line) {
+            ids.insert(caps.get(1).unwrap().as_str().to_string());
+        }
+    }
+    Ok(ids)
+}
+
+fn read_allowlist(path: &Path) -> std::io::Result<BTreeSet<String>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(e),
+    };
+    let mut set = BTreeSet::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        set.insert(line.to_string());
+    }
+    Ok(set)
+}
+
+fn collect_test_rs_files(tests_dir: &Path) -> Vec<PathBuf> {
+    let mut out: BTreeMap<PathBuf, ()> = BTreeMap::new();
+    visit(tests_dir, &mut out);
+    out.into_keys().collect()
+}
+
+fn visit(dir: &Path, acc: &mut BTreeMap<PathBuf, ()>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            visit(&p, acc);
+        } else if ft.is_file() && p.extension().and_then(|e| e.to_str()) == Some("rs") {
+            acc.insert(p, ());
+        }
+    }
+}

@@ -11,7 +11,9 @@
 mod common;
 
 use common::{TuiDeck, write_hook_line};
+use spec::spec;
 
+#[spec("hooks/delivery/001")]
 #[test]
 fn delivery_001_session_start_creates_card() {
     // PRD #77 catalog: hooks/delivery/001 — A Claude Code SessionStart
