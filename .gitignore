@@ -1,6 +1,9 @@
 /target
 tmp/
 .dot-agent-deck/
+# PRD #77 M2: validation recordings committed for replay via `asciinema play`.
+!.dot-agent-deck/m2-recordings/
+!.dot-agent-deck/m2-recordings/*
 .claude/scheduled_tasks.lock
 
 # Documentation site

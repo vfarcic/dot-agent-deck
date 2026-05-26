@@ -1,0 +1,3 @@
+[alias]
+test-fast = "nextest run"
+test-e2e = "nextest run --features e2e"
