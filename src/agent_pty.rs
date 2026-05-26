@@ -17,7 +17,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast};
 
 use crate::event::AgentType;
-use crate::pane_input::{PaneInputError, SUBMIT_DELAY, encode_pane_payload};
+use crate::pane_input::{PaneInputError, SUBMIT_DELAY, encode_pane_payload, escape_bytes_for_log};
 
 /// Trigger flag the deck client honors to mean "the daemon is already
 /// running; attach over its stream socket instead of spawning one." The
@@ -1093,6 +1093,7 @@ struct RegistryInner {
 /// private because the public API exposes the two named methods
 /// directly — see [`AgentPtyRegistry::write_to_pane_and_submit`] and
 /// [`AgentPtyRegistry::write_to_pane_notice`].
+#[derive(Debug)]
 enum SubmitMode {
     Submit,
     Notice,
@@ -1520,26 +1521,58 @@ impl AgentPtyRegistry {
         // thread already saw EOF. Mirrors `live_count`'s contract:
         // operational lookups treat exited entries as gone, cleanup
         // paths (`close_agent`, `shutdown_all`) still touch them.
-        let writer = {
+        // Capture both the writer and the agent_id (HashMap key) so the
+        // trace events below can emit `pane_id` AND `agent_id` — the
+        // M1.4 cross-path byte trace diffs against the STREAM_IN trace
+        // in `daemon_protocol::handle_attach_stream`, which keys off
+        // agent_id; both sides need the common key to correlate writes.
+        let (writer, agent_id) = {
             let inner = self.inner.lock().unwrap();
             inner
                 .agents
-                .values()
-                .find(|a| {
+                .iter()
+                .find(|(_, a)| {
                     a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst)
                 })
-                .map(|a| a.writer.clone())
+                .map(|(id, a)| (a.writer.clone(), id.clone()))
                 .ok_or_else(|| AgentPtyError::NotFound(pane_id.to_string()))?
         };
         use std::io::Write as _;
         let payload = encode_pane_payload(text)?;
         let mut w = writer.lock().await;
+        // PRD #128 (cherry-picked from PR #122): byte-level trace of every
+        // daemon-initiated PTY write. Gated by `RUST_LOG=trace`. Logs the
+        // payload and trailing terminator separately so an operator can
+        // see whether bracketed-paste framing (`\x1b[200~...\x1b[201~`) is
+        // present and whether the terminator is `\r` (13) or `\n` (10).
+        // Emitted INSIDE the writer mutex critical section so trace order
+        // matches actual write order under concurrent writers. Both
+        // `pane_id` and `agent_id` are emitted so the M1.4 diff against
+        // the STREAM_IN trace can join on either key.
+        tracing::trace!(
+            target: "pane_write",
+            source = "daemon",
+            mode = ?mode,
+            pane_id = %pane_id,
+            agent_id = %agent_id,
+            payload_len = payload.len(),
+            payload = %escape_bytes_for_log(&payload),
+            "daemon write_to_pane: payload bytes"
+        );
         w.write_all(&payload)
             .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
         let _ = w.flush();
         match mode {
             SubmitMode::Submit => {
                 tokio::time::sleep(SUBMIT_DELAY).await;
+                tracing::trace!(
+                    target: "pane_write",
+                    source = "daemon",
+                    pane_id = %pane_id,
+                    agent_id = %agent_id,
+                    terminator = %escape_bytes_for_log(b"\r"),
+                    "daemon write_to_pane: submit terminator"
+                );
                 w.write_all(b"\r")
                     .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
                 let _ = w.flush();
@@ -1552,6 +1585,14 @@ impl AgentPtyRegistry {
                 // `encode_pane_payload` strips trailing whitespace so a
                 // caller-provided `\n` would have been swallowed; the
                 // single byte is written here unambiguously.
+                tracing::trace!(
+                    target: "pane_write",
+                    source = "daemon",
+                    pane_id = %pane_id,
+                    agent_id = %agent_id,
+                    terminator = %escape_bytes_for_log(b"\n"),
+                    "daemon write_to_pane: notice terminator"
+                );
                 w.write_all(b"\n")
                     .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
                 let _ = w.flush();
@@ -1851,6 +1892,25 @@ impl AgentPtyRegistry {
     pub fn child_pid(&self, id: &str) -> Option<u32> {
         let inner = self.inner.lock().unwrap();
         inner.agents.get(id).and_then(|a| a.child.process_id())
+    }
+
+    /// `pane_id_env` recorded for a given agent_id. Three states are
+    /// distinguished — the M1.4 cross-path byte-trace diff needs to
+    /// tell them apart, not just "is there a string or not":
+    ///
+    /// * `None` — the agent is not in the registry (gone / never
+    ///   registered under this id).
+    /// * `Some(None)` — the agent is registered but never carried a
+    ///   `pane_id_env` (rare; daemon-side test agents).
+    /// * `Some(Some(s))` — the agent is registered and `s` is its
+    ///   `pane_id_env`.
+    ///
+    /// Used by `handle_attach_stream` to enrich the STREAM_IN trace
+    /// with the same `pane_id` field daemon-initiated writes log, so
+    /// the trace audit can be diffed on a common key.
+    pub(crate) fn pane_id_env_for_agent(&self, agent_id: &str) -> Option<Option<String>> {
+        let inner = self.inner.lock().unwrap();
+        inner.agents.get(agent_id).map(|a| a.pane_id_env.clone())
     }
 
     /// All currently-owned agent ids, sorted ascending.

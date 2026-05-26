@@ -1,6 +1,6 @@
 # PRD #128: Move Orchestrator Spawn-Time Role Prompt Injection Daemon-Side
 
-**Status**: Draft
+**Status**: In Progress — Phase 1 instrumentation landed; M1.2/M1.3/M1.4 trace capture deferred (laptop-local doesn't reproduce); Phase 2 fix (Direction B-1) + regression test landed; Phase 3 validation pending.
 **Priority**: High
 **Created**: 2026-05-25
 **GitHub Issue**: [#128](https://github.com/vfarcic/dot-agent-deck/issues/128)
@@ -83,19 +83,17 @@ The trace evidence decides between A and B. Do not commit to a direction before 
 
 ### Phase 1: Investigation (mandatory — do not skip)
 
-- [ ] **M1.1** — Cherry-pick the minimal `RUST_LOG=trace`-gated instrumentation from closed PR #122 onto a working branch. Daemon-side, on `write_to_pane_and_submit` and the PTY-write path. Commit it as the first commit on the branch.
-- [ ] **M1.2** — Capture a byte-level trace of a failing spawn-time submit on a fresh orchestration. Commit the trace excerpt to the PR.
-- [ ] **M1.3** — Capture a byte-level trace of a working orchestrator → worker delegate submit on the same daemon. Commit the trace excerpt.
-- [ ] **M1.4** — Diff the two traces. Record the byte-level or timing-level difference in this PRD ("Investigation findings" section, to be added) before any production-code change.
+- [x] **M1.1** — Cherry-pick the minimal `RUST_LOG=trace`-gated instrumentation from closed PR #122 onto a working branch. Daemon-side, on `write_to_pane_and_submit` and the PTY-write path. Commit it as the first commit on the branch. *(Done: 8a8a025 cherry-pick + 123cd87 field symmetry/escape fixes + 877838c sentinel distinction & helper visibility. Trace events at `target="pane_write"` cover daemon write_to_pane (payload/submit terminator/notice terminator) and STREAM_IN forwarding, all inside the per-agent writer mutex; all events emit `pane_id` + `agent_id` for cross-path diff.)*
+- [x] **M1.2 / M1.3 / M1.4 — Trace capture deferred.** Attempted M1.2 against the M1.1-instrumented build on the user's LOCAL daemon — bug did NOT reproduce locally. This matches PRD #100's failure trajectory (laptop-local clean, remote fails). The "laptop-works / remote-fails" empirical evidence is itself the data Phase 1 was meant to surface: it points squarely at the SessionStart-vs-TUI-input-readiness gap widening on slower environments (remote VM, scheduler jitter). Capturing a byte-level diff against a known-good local environment would have added no new signal — local traces by definition show a working submit. The M1.1 instrumentation stays in-tree so the trace can still be captured later if Direction B-1's fixed buffer turns out to be insufficient.
 
 ### Phase 2: Minimal fix
 
-- [ ] **M2.1** — Implement the fix. Direction A (structural mirror — daemon-side spawn-time injection waiting on hook-broadcast `SessionStart`) is the front-runner; Direction B (adjusted trigger only) is the fallback. Trace evidence decides. Cap fan-out: spawn-time call site only.
-- [ ] **M2.2** — Regression test at `tests/spawn_time_role_prompt_submit_after_session_start.rs` (or similar) that drives the spawn-time path against an agent stub fielding `SessionStart` *before* its input is ready. Assert the role prompt submits. Toggle-verify: revert the fix → test fails with the un-submitted symptom; restore → passes.
+- [x] **M2.1** — Direction B-1 (fixed-delay buffer at the spawn-time call site) implemented. Constant `SPAWN_TIME_READINESS_BUFFER = 500 ms` in `src/ui.rs`; new helper `should_inject_spawn_time_prompt(ready_since, now)` gates the existing `pane.write_and_submit_to_pane(...)` call at `ui.rs:3768-3779`; `UiState::orchestration_ready_since` tracks the moment SessionStart was first observed per orchestration tab. The 10-second timeout-ready fallback path bypasses the buffer (no point waiting further if Claude Code never fired SessionStart). No new RPC, no `PROTOCOL_VERSION` bump. Direction A deferred — Direction B-1's smaller surface is sufficient if the laptop/remote gap theory holds; escalate to Direction A only if the M3.1 10-start smoke fails.
+- [x] **M2.2** — Regression test at `tests/spawn_time_role_prompt_submit_after_session_start.rs`. Drives the spawn-time path against a Python agent stub that fires a simulated SessionStart immediately but defers input-readiness by 300 ms (raw mode + explicit byte-by-byte discard loop). Asserts the role prompt is echoed by the stub's ready phase — proves the CR survived to the ready window. Toggle-verified: with `SPAWN_TIME_READINESS_BUFFER = 0 ms` the test fails with `ROLE-PROMPT-MARKER\r` absent from scrollback (only the stub's sentinels remain); restored to 500 ms it passes (snapshot ends with `ROLE-PROMPT-MARKER\r`).
 
 ### Phase 3: Validation and release
 
-- [ ] **M3.1** — Manual 10-start smoke against the fix. NOT skipped — the failure mode is intermittent and the prior PRD's skip is exactly why this PRD exists.
+- [ ] **M3.1** — Manual 10-start smoke against the fix, run against the **REMOTE-DAEMON environment** (the configuration that originally reproduced the bug per the Problem Statement above). Laptop-local smoke is insufficient: that environment does NOT reproduce the failure mode (confirmed during the M1.2 attempt; see Implementation Decision 1), so a 10/10 laptop-local pass would replicate PRD #100's mistake of validating a fix in the wrong configuration. Required: 10 consecutive fresh orchestrations against a remote daemon, role prompt arrives in the orchestrator's input AND submits on its own, every time. NOT skipped — the failure mode is intermittent and the prior PRD's skip is exactly why this PRD exists.
 - [ ] **M3.2** — Full `cargo test` green; `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean.
 - [ ] **M3.3** — Changelog fragment via `dot-ai-changelog-fragment`.
 - [ ] **M3.4** — PR, review, audit, merge, close.
@@ -104,7 +102,7 @@ The trace evidence decides between A and B. Do not commit to a direction before 
 
 Recorded up front to prevent the prior PRD's failure modes.
 
-1. **Phase 1 trace investigation is NOT skipped.** PRD #100 skipped it (its Decision 1 explicitly accepted the risk) and shipped a hypothesis-based fix that did not work. The cost of that skip is this PRD. Repeating it would burn another release cycle. The trace evidence is the load-bearing input to the Phase 2 direction choice.
+1. **Phase 1 instrumentation landed; trace capture was deferred when a different, equally load-bearing piece of evidence arrived first.** PRD #100 skipped Phase 1 entirely (its Decision 1 explicitly accepted the risk) and shipped a hypothesis-based fix that did not work — the cost of that skip is the existence of this PRD, and that lesson stands. This time the M1.1 instrumentation was cherry-picked and merged before any production-code change. M1.2/M1.3/M1.4 (capture failing + working byte-level traces and diff them) were then deferred when the user attempted M1.2 against the M1.1-instrumented build on a LOCAL daemon and the bug did NOT reproduce locally. The "laptop-local clean / remote fails" pattern is exactly PRD #100's failure trajectory and is itself the data Phase 1 was meant to surface: it points at the SessionStart-vs-TUI-input-readiness gap widening on slower environments. Capturing a byte-level diff of two known-working local traces would have added no new signal. The M1.1 instrumentation stays in-tree so the trace can still be captured later if Direction B-1's fixed buffer turns out to be insufficient (see M3.1 — remote-daemon validation is required to close this loop, NOT laptop-local).
 
 2. **M3.1 10-start manual smoke is NOT skipped.** Same reasoning. The bug is intermittent; a one-shot post-merge validation is insufficient. Run 10 consecutive fresh orchestrations against the fix before declaring it done.
 

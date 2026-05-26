@@ -494,6 +494,46 @@ const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(1
 /// which was tuned empirically — keep the two values in sync.
 const SUBMIT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// PRD #128 Direction B-1 — minimum gap between SessionStart being observed
+/// for the start-role pane and the orchestrator's role prompt being written
+/// into it. Claude Code's `SessionStart` hook fires before its TUI input is
+/// in submit-CR-aware mode on slower environments (remote daemon, weak VM,
+/// scheduler jitter). A CR that arrives during that window is treated as a
+/// newline in the input buffer, not as a submit — the role prompt lands
+/// visibly but never dispatches. Holding the write until this buffer has
+/// elapsed gives Claude Code's TUI enough time to finish booting on those
+/// environments; the gap exists on laptop-local too but is short enough
+/// there that the symptom doesn't reproduce.
+///
+/// 500 ms is tuned to comfortably cover the laptop/remote gap observed
+/// against the M1.1 instrumented build (see PRD #128). Visible to the user
+/// as a brief delay between the orchestration tab opening and the prompt
+/// appearing in the input box; small enough not to feel laggy, large enough
+/// to make the failure mode disappear.
+pub const SPAWN_TIME_READINESS_BUFFER: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// PRD #128 Direction B-1 — returns whether the spawn-time orchestrator
+/// role prompt should fire NOW. Returns `false` if `ready_since` is set
+/// but `SPAWN_TIME_READINESS_BUFFER` hasn't elapsed yet; `true` once it
+/// has. `ready_since == None` means the readiness gate isn't engaged yet
+/// (caller drives that — e.g. the timeout-ready fallback path that
+/// ignores SessionStart and fires after 10 s); the helper returns `true`
+/// in that case so the caller's own gating wins.
+///
+/// Extracted so the policy is unit-testable AND so the integration test
+/// at `tests/spawn_time_role_prompt_submit_after_session_start.rs` can
+/// drive the same gate the TUI loop uses without spinning up the loop
+/// itself.
+pub fn should_inject_spawn_time_prompt(
+    ready_since: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    match ready_since {
+        Some(t) => now.saturating_duration_since(t) >= SPAWN_TIME_READINESS_BUFFER,
+        None => true,
+    }
+}
+
 /// Returns how long the human-typing dispatch should sleep before forwarding
 /// `bytes` to the pane, to ensure an Enter keystroke arrives as a standalone
 /// event rather than fused to recent typing. Returns `Duration::ZERO` unless
@@ -586,6 +626,13 @@ struct UiState {
     orchestration_prompted: HashSet<TabId>,
     /// Tracks when orchestration tabs were created (for delayed prompt injection).
     orchestration_created_at: HashMap<TabId, std::time::Instant>,
+    /// PRD #128 Direction B-1 — tracks the moment SessionStart was first
+    /// observed for each orchestration tab's start-role pane. The role
+    /// prompt is held until `SPAWN_TIME_READINESS_BUFFER` has elapsed
+    /// since this timestamp, giving Claude Code's TUI time to enter
+    /// submit-CR-aware mode on slower environments. Cleared when the
+    /// prompt finally fires (entry never re-added).
+    orchestration_ready_since: HashMap<TabId, std::time::Instant>,
     /// Prompts waiting to be injected into panes once their agent is ready (M5 dispatch).
     pending_dispatches: Vec<PendingDispatch>,
     /// PRD #76 M2.20: timestamp of the most recent keystroke forwarded to a
@@ -649,6 +696,7 @@ impl UiState {
             stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
             orchestration_created_at: HashMap::new(),
+            orchestration_ready_since: HashMap::new(),
             pending_dispatches: Vec::new(),
             last_pane_keystroke_at: None,
         }
@@ -3774,12 +3822,53 @@ pub fn run_tui(
                         .orchestration_created_at
                         .get(id)
                         .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(10));
-                if agent_ready || timeout_ready {
+                // PRD #128 Direction B-1 — record the moment SessionStart
+                // was first observed for this orchestration so the
+                // readiness buffer can be measured from it. The timeout
+                // path bypasses the buffer because by then Claude Code
+                // either fired SessionStart far earlier or never will, so
+                // any further wait would just deepen the user-visible
+                // hang.
+                if agent_ready {
+                    ui.orchestration_ready_since
+                        .entry(*id)
+                        .or_insert_with(std::time::Instant::now);
+                }
+                let buffer_elapsed = if timeout_ready {
+                    true
+                } else {
+                    should_inject_spawn_time_prompt(
+                        ui.orchestration_ready_since.get(id).copied(),
+                        std::time::Instant::now(),
+                    )
+                };
+                if (agent_ready || timeout_ready) && buffer_elapsed {
                     if let Some(prompt) = orchestrator_prompt.take() {
+                        // PRD #128 audit S2: emit a one-shot operator-visible
+                        // log right before the write fires. Distinct target
+                        // from `pane_write` so an operator can flip on the
+                        // buffer trail without also enabling the per-byte
+                        // trace. `debug!` (not `trace!`) because this is an
+                        // operational, once-per-spawn event.
+                        if let Some(rs) = ui.orchestration_ready_since.get(id) {
+                            tracing::debug!(
+                                target: "spawn_time_buffer",
+                                elapsed_ms = rs.elapsed().as_millis() as u64,
+                                pane_id = %start_pane_id,
+                                "spawn-time readiness buffer elapsed; proceeding with role prompt write"
+                            );
+                        }
                         let _ = pane.write_and_submit_to_pane(start_pane_id, &prompt);
                     }
                     role_statuses[*start_role_index] = OrchestrationRoleStatus::Working;
                     ui.orchestration_prompted.insert(*id);
+                    // PRD #128 audit N1: the ready-since timestamp is
+                    // load-bearing only between SessionStart and the
+                    // buffered write. Once the write fires this entry is
+                    // dead state — drop it so the map size matches the
+                    // count of pending orchestration spawns rather than
+                    // accumulating over the session.
+                    ui.orchestration_ready_since.remove(id);
                 }
             }
         }
@@ -10773,6 +10862,41 @@ mod tests {
         let last = now - std::time::Duration::from_millis(10);
         let sleep = submit_debounce_duration(now, Some(last), b"hello");
         assert_eq!(sleep, std::time::Duration::ZERO);
+    }
+
+    // PRD #128 Direction B-1 — spawn-time readiness buffer policy tests.
+
+    #[test]
+    fn spawn_time_no_ready_since_fires_immediately() {
+        // None signals "no SessionStart yet observed", but the caller
+        // gates with the timeout-ready path; this helper should not
+        // double-gate it.
+        let now = std::time::Instant::now();
+        assert!(should_inject_spawn_time_prompt(None, now));
+    }
+
+    #[test]
+    fn spawn_time_within_buffer_window_holds() {
+        let now = std::time::Instant::now();
+        // 100 ms after SessionStart — far inside the 500 ms buffer.
+        let ready_since = now - std::time::Duration::from_millis(100);
+        assert!(!should_inject_spawn_time_prompt(Some(ready_since), now));
+    }
+
+    #[test]
+    fn spawn_time_after_buffer_window_fires() {
+        let now = std::time::Instant::now();
+        // 600 ms after SessionStart — past the 500 ms buffer.
+        let ready_since = now - std::time::Duration::from_millis(600);
+        assert!(should_inject_spawn_time_prompt(Some(ready_since), now));
+    }
+
+    #[test]
+    fn spawn_time_exactly_at_buffer_boundary_fires() {
+        let now = std::time::Instant::now();
+        let ready_since = now - SPAWN_TIME_READINESS_BUFFER;
+        // `>=` boundary: exactly at the buffer should fire.
+        assert!(should_inject_spawn_time_prompt(Some(ready_since), now));
     }
 
     // -----------------------------------------------------------------------

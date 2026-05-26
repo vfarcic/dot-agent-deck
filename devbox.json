@@ -10,7 +10,8 @@
     "rustc@1.94.1",
     "cargo@1.94.1",
     "clippy@1.94.1",
-    "rustfmt@1.94.1"
+    "rustfmt@1.94.1",
+    "python3@3.12.7"
   ],
   "shell": {
     "init_hook": [

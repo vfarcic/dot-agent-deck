@@ -90,6 +90,7 @@ pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
 use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, is_valid_pane_id_env};
 use crate::event::{AgentType, BroadcastMsg};
+use crate::pane_input::escape_bytes_for_log;
 use crate::state::SharedState;
 
 // ---------------------------------------------------------------------------
@@ -1124,6 +1125,21 @@ async fn handle_attach_stream(
     let mut rx = handle.rx;
     let writer = handle.writer;
 
+    // PRD #128 trace-field-symmetry: cache the agent's `pane_id_env`
+    // once per attach so the per-frame STREAM_IN trace can emit
+    // `pane_id` alongside `agent_id` without re-locking the registry on
+    // every frame. `pane_id_env` is fixed for an agent's lifetime, so
+    // one lookup is enough. Three states are distinguished — the M1.4
+    // cross-path diff needs to tell them apart, not just see an empty
+    // string. Angle-bracket sentinels (`<agent-gone>` / `<no-pane>`)
+    // can never collide with a real `pane_id_env` value because
+    // `is_valid_pane_id_env` rejects `<` and `>`.
+    let pane_id: String = match registry.pane_id_env_for_agent(&id) {
+        Some(Some(s)) => s,
+        Some(None) => "<no-pane>".to_string(),
+        None => "<agent-gone>".to_string(),
+    };
+
     // Output task: forward broadcast bytes → STREAM_OUT frames. Owns `wr`
     // for the duration of streaming.
     //
@@ -1172,6 +1188,27 @@ async fn handle_attach_stream(
             Ok(Some((KIND_STREAM_IN, bytes))) => {
                 use std::io::Write;
                 let mut w = writer.lock().await;
+                // PRD #128 (cherry-picked from PR #122): byte-level trace
+                // of STREAM_IN frames forwarded to the per-agent PTY
+                // writer. Useful for confirming that bytes the TUI
+                // queued arrived as distinct frames and that no other
+                // path interleaved a write on the same writer mutex
+                // between them. Gated by `RUST_LOG=trace`. Emitted
+                // INSIDE the writer mutex so trace order matches actual
+                // write order. Both `agent_id` and `pane_id` are
+                // emitted so the M1.4 diff against the daemon-initiated
+                // trace in `AgentPtyRegistry::write_to_pane_internal`
+                // can join on either key (`pane_id` is cached once per
+                // attach above).
+                tracing::trace!(
+                    target: "pane_write",
+                    source = "stream_in",
+                    agent_id = %id,
+                    pane_id = %pane_id,
+                    payload_len = bytes.len(),
+                    payload = %escape_bytes_for_log(&bytes),
+                    "STREAM_IN forwarded to PTY writer"
+                );
                 if w.write_all(&bytes).is_err() {
                     break;
                 }
