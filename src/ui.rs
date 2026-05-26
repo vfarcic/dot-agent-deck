@@ -7311,3 +7311,82 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// PRD #77 — L1 harness public surface
+// ---------------------------------------------------------------------------
+//
+// Stable test-only entry points consumed by `tests/render_dashboard.rs`.
+// They are always-public (not feature-gated) because Rust integration
+// tests cannot enable a crate feature on demand — but no production
+// caller exercises them. See PRD #77 Decision 2 for the L1 / L2 split.
+
+/// Card density tier picked by the dashboard's adaptive layout
+/// (`choose_density`). Public so L1 snapshot tests can pin a specific
+/// tier rather than depending on the runtime calculation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardDensityKind {
+    Compact,
+    Normal,
+    Spacious,
+}
+
+impl From<CardDensityKind> for CardDensity {
+    fn from(kind: CardDensityKind) -> Self {
+        match kind {
+            CardDensityKind::Compact => CardDensity::Compact,
+            CardDensityKind::Normal => CardDensity::Normal,
+            CardDensityKind::Spacious => CardDensity::Spacious,
+        }
+    }
+}
+
+/// L1 harness helper — render exactly one session card at the requested
+/// density into a fresh `TestBackend` buffer and return it for snapshot
+/// assertions.
+///
+/// Wraps the internal `render_session_card` so the L1 snapshot test in
+/// `tests/render_dashboard.rs` can pin a card's text layout without
+/// re-implementing the renderer. See PRD #77 catalog entry
+/// `dashboard/pane/004`.
+#[allow(clippy::too_many_arguments)]
+pub fn render_card_to_buffer(
+    session: &SessionState,
+    display_name: Option<&str>,
+    card_number: Option<u8>,
+    density: CardDensityKind,
+    palette: ColorPalette,
+    tick: u64,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let display_name_owned = display_name.map(str::to_string);
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            render_session_card(
+                frame,
+                area,
+                session,
+                tick,
+                false,
+                display_name_owned.as_ref(),
+                card_number,
+                density.into(),
+                palette,
+                None,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
