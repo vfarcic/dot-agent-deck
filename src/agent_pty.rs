@@ -1894,17 +1894,23 @@ impl AgentPtyRegistry {
         inner.agents.get(id).and_then(|a| a.child.process_id())
     }
 
-    /// `pane_id_env` recorded for a given agent_id, or `None` if the
-    /// agent is not in the registry (or never carried a pane id env).
+    /// `pane_id_env` recorded for a given agent_id. Three states are
+    /// distinguished — the M1.4 cross-path byte-trace diff needs to
+    /// tell them apart, not just "is there a string or not":
+    ///
+    /// * `None` — the agent is not in the registry (gone / never
+    ///   registered under this id).
+    /// * `Some(None)` — the agent is registered but never carried a
+    ///   `pane_id_env` (rare; daemon-side test agents).
+    /// * `Some(Some(s))` — the agent is registered and `s` is its
+    ///   `pane_id_env`.
+    ///
     /// Used by `handle_attach_stream` to enrich the STREAM_IN trace
     /// with the same `pane_id` field daemon-initiated writes log, so
-    /// the M1.4 cross-path byte trace can be diffed on a common key.
-    pub fn pane_id_env_for_agent(&self, agent_id: &str) -> Option<String> {
+    /// the trace audit can be diffed on a common key.
+    pub(crate) fn pane_id_env_for_agent(&self, agent_id: &str) -> Option<Option<String>> {
         let inner = self.inner.lock().unwrap();
-        inner
-            .agents
-            .get(agent_id)
-            .and_then(|a| a.pane_id_env.clone())
+        inner.agents.get(agent_id).map(|a| a.pane_id_env.clone())
     }
 
     /// All currently-owned agent ids, sorted ascending.

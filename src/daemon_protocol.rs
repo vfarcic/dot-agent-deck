@@ -1129,9 +1129,16 @@ async fn handle_attach_stream(
     // once per attach so the per-frame STREAM_IN trace can emit
     // `pane_id` alongside `agent_id` without re-locking the registry on
     // every frame. `pane_id_env` is fixed for an agent's lifetime, so
-    // one lookup is enough. Empty string when the agent has no
-    // pane_id_env (rare — daemon-side test agents).
-    let pane_id = registry.pane_id_env_for_agent(&id).unwrap_or_default();
+    // one lookup is enough. Three states are distinguished — the M1.4
+    // cross-path diff needs to tell them apart, not just see an empty
+    // string. Angle-bracket sentinels (`<agent-gone>` / `<no-pane>`)
+    // can never collide with a real `pane_id_env` value because
+    // `is_valid_pane_id_env` rejects `<` and `>`.
+    let pane_id: String = match registry.pane_id_env_for_agent(&id) {
+        Some(Some(s)) => s,
+        Some(None) => "<no-pane>".to_string(),
+        None => "<agent-gone>".to_string(),
+    };
 
     // Output task: forward broadcast bytes → STREAM_OUT frames. Owns `wr`
     // for the duration of streaming.
