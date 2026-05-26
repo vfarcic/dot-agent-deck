@@ -481,7 +481,38 @@ The harness lands first; #84 then refactors against a green safety net and accep
   - **Status (2026-05-26):** Both deliverables landed (audit in `ac9240d`, catalog in `14f15a0`, reviewer/auditor fixes in `101d1e2`). Awaiting Decision 29 user validation; milestone checkbox stays unchecked until validation completes. One open Decision 10 reconsideration surfaced by audit pass — `tmp/legacy-tests/` files remain tracked by `git mv`, contradicting the "gitignored / history preserves originals" framing; user choice between (a) `git rm --cached -r tmp/legacy-tests/` to untrack, or (b) amend Decision 10 to acknowledge rename-tracking behavior.
 - [ ] **M2 — Minimum viable harness + 2 tests + STOP for validation** (per Decision 29). Build the minimum harness slice required to support exactly two specific catalog entries chosen from M1's catalog: one L1 test (in-process `TestBackend` + insta) and one L2 synthetic-event test (PTY + harness builder + recording on failure). Ship as part of this milestone: the linkage-check xtask binary (Decision 7), the failure-recording infrastructure (Decision 28), the CONTRIBUTING.md sections (Decision 19), the CLAUDE.md additions from Appendix A, and the `bacon.toml` at repo root (Decision 14). **M2 validation handoff additionally delivers `full-stream.cast` recordings of both seed tests** — capture them by running each test with `DOT_AGENT_DECK_RECORD=1` (Decision 28's existing opt-in) so the user can replay with `asciinema play` regardless of pass/fail. No amendment to Decision 28 is needed; this is a one-time delivery scope on M2's validation, not a new harness default. After this milestone lands, **stop and wait for explicit validation** before continuing to M3.
 - [ ] **M3 — First chain-smoke tests + STOP for validation** (per Decision 29). One real Claude Code chain-smoke test (using `claude-haiku-4-5-20251001`), one real OpenCode chain-smoke test (using `openrouter/google/gemini-2.5-flash-lite`). Both picked from M1's catalog. After this milestone lands, **stop and wait for explicit validation** before continuing to M4+.
-- [ ] **M4+ — Catalog buildout.** Scope shape TBD when M3 lands. Carries the catalog-vs-deck "fix the deck not the test" policy (Decision 11) and the Discovered Issues collection (Decision 25).
+- [ ] **M4+ — Catalog buildout.** Scope shape TBD when M3 lands. Carries the catalog-vs-deck "fix the deck not the test" policy (Decision 11) and the Discovered Issues collection (Decision 25). Current orchestrator proposal in [M4+ Buildout Strategy (Proposal)](#m4-buildout-strategy-proposal); to be locked in formally after M3.
+
+## M4+ Buildout Strategy (Proposal)
+
+**Status:** Proposal only. The PRD's M4+ milestone description defers the firm decision until M3 lands — what we learn from M2 (harness API ergonomics) and M3 (real-agent plumbing) will inform whether to revise this. Lock in formally at the M3 user-validation stop.
+
+### Recommendation: one area per delegation
+
+After M3, deliver the remaining ~91 catalog tests **one area at a time**, not one-test-at-a-time and not all-at-once.
+
+| Strategy | Verdict |
+|---|---|
+| One test per delegation | Too much orchestrator overhead; ~91 round-trips for negligible per-test isolation gain. |
+| **One area per delegation (~5–18 tests each) — recommended** | Sweet spot. Coder builds area context once; tests in the same `tests/e2e_*.rs` file share fixtures and harness helpers; reviewer + auditor each get a coherent chunk. |
+| One sub-area at a time | Reasonable as a sub-strategy for the two largest areas (dashboard panes, prompts); split those by sub-area inside one area's batch. |
+| All ~91 at once | Bad. Decision 25 mandates a stop after every Discovered Issue surfaces, so a single giant batch can't actually run to completion — it would halt mid-flight anyway. |
+
+### Why area-grouping fits the existing decisions
+
+- **Decision 7's file layout** (`tests/e2e_pane_lifecycle.rs`, `tests/e2e_focus_navigation.rs`, etc.) already mirrors catalog areas — one delegation per file is a natural unit.
+- **Decision 11 + Decision 25** require stopping after Discovered Issues surface. Per-area batches let the orchestrator collect a clean Discovered Issues list per area before surfacing to the user; smaller stops are easier to act on than per-test stops.
+- **Fixtures (Decision 12)** tend to be area-scoped — one prompt fixture, one orchestration config — and area-grouping amortizes fixture work.
+
+### Proposed sequencing (~12 areas after M2 + M3)
+
+1. **Validate harness API with simple snapshots first.** `status/badge` (L1 snapshots), `status/transition` (L2 synthetic events). Mechanically simple; catches harness ergonomics issues early.
+2. **Exercise distinct harness surfaces.** `prompt/permission`, `prompt/quit`, `tabs/navigation`, `lifecycle/start`, `lifecycle/stop`, `lifecycle/restart`.
+3. **High-blast-radius areas.** `embed/attach`, `hooks/delivery` + `hooks/install`, `session/restore`. Most likely to surface Decision 25 Discovered Issues — front-load them so the deck-bug tail is found early.
+4. **Resize + error paths.** `resize/sigwinch`, `resize/layout`, `error/socket`, `error/config`, `error/agent-spawn`. Historically high signal-to-noise for deck bugs.
+5. **Orchestration last.** `orchestration/delegate`. Most novel surface; benefits from the harness being mature.
+
+After each area delegation: reviewer + auditor in parallel → resolve agreed findings → `/prd-update-progress` → Decision 25 stop if anything surfaced. PR cadence (one PR per area vs. rolled-up batches) is the next decision after this one, picked at M4+ kickoff with cost data from M2 + M3 in hand.
 
 ## M1: Existing-Test Audit
 
