@@ -3844,10 +3844,31 @@ pub fn run_tui(
                 };
                 if (agent_ready || timeout_ready) && buffer_elapsed {
                     if let Some(prompt) = orchestrator_prompt.take() {
+                        // PRD #128 audit S2: emit a one-shot operator-visible
+                        // log right before the write fires. Distinct target
+                        // from `pane_write` so an operator can flip on the
+                        // buffer trail without also enabling the per-byte
+                        // trace. `debug!` (not `trace!`) because this is an
+                        // operational, once-per-spawn event.
+                        if let Some(rs) = ui.orchestration_ready_since.get(id) {
+                            tracing::debug!(
+                                target: "spawn_time_buffer",
+                                elapsed_ms = rs.elapsed().as_millis() as u64,
+                                pane_id = %start_pane_id,
+                                "spawn-time readiness buffer elapsed; proceeding with role prompt write"
+                            );
+                        }
                         let _ = pane.write_and_submit_to_pane(start_pane_id, &prompt);
                     }
                     role_statuses[*start_role_index] = OrchestrationRoleStatus::Working;
                     ui.orchestration_prompted.insert(*id);
+                    // PRD #128 audit N1: the ready-since timestamp is
+                    // load-bearing only between SessionStart and the
+                    // buffered write. Once the write fires this entry is
+                    // dead state — drop it so the map size matches the
+                    // count of pending orchestration spawns rather than
+                    // accumulating over the session.
+                    ui.orchestration_ready_since.remove(id);
                 }
             }
         }

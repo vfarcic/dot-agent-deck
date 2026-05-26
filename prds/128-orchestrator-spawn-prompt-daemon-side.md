@@ -93,7 +93,7 @@ The trace evidence decides between A and B. Do not commit to a direction before 
 
 ### Phase 3: Validation and release
 
-- [ ] **M3.1** — Manual 10-start smoke against the fix. NOT skipped — the failure mode is intermittent and the prior PRD's skip is exactly why this PRD exists.
+- [ ] **M3.1** — Manual 10-start smoke against the fix, run against the **REMOTE-DAEMON environment** (the configuration that originally reproduced the bug per the Problem Statement above). Laptop-local smoke is insufficient: that environment does NOT reproduce the failure mode (confirmed during the M1.2 attempt; see Implementation Decision 1), so a 10/10 laptop-local pass would replicate PRD #100's mistake of validating a fix in the wrong configuration. Required: 10 consecutive fresh orchestrations against a remote daemon, role prompt arrives in the orchestrator's input AND submits on its own, every time. NOT skipped — the failure mode is intermittent and the prior PRD's skip is exactly why this PRD exists.
 - [ ] **M3.2** — Full `cargo test` green; `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean.
 - [ ] **M3.3** — Changelog fragment via `dot-ai-changelog-fragment`.
 - [ ] **M3.4** — PR, review, audit, merge, close.
@@ -102,7 +102,7 @@ The trace evidence decides between A and B. Do not commit to a direction before 
 
 Recorded up front to prevent the prior PRD's failure modes.
 
-1. **Phase 1 trace investigation is NOT skipped.** PRD #100 skipped it (its Decision 1 explicitly accepted the risk) and shipped a hypothesis-based fix that did not work. The cost of that skip is this PRD. Repeating it would burn another release cycle. The trace evidence is the load-bearing input to the Phase 2 direction choice.
+1. **Phase 1 instrumentation landed; trace capture was deferred when a different, equally load-bearing piece of evidence arrived first.** PRD #100 skipped Phase 1 entirely (its Decision 1 explicitly accepted the risk) and shipped a hypothesis-based fix that did not work — the cost of that skip is the existence of this PRD, and that lesson stands. This time the M1.1 instrumentation was cherry-picked and merged before any production-code change. M1.2/M1.3/M1.4 (capture failing + working byte-level traces and diff them) were then deferred when the user attempted M1.2 against the M1.1-instrumented build on a LOCAL daemon and the bug did NOT reproduce locally. The "laptop-local clean / remote fails" pattern is exactly PRD #100's failure trajectory and is itself the data Phase 1 was meant to surface: it points at the SessionStart-vs-TUI-input-readiness gap widening on slower environments. Capturing a byte-level diff of two known-working local traces would have added no new signal. The M1.1 instrumentation stays in-tree so the trace can still be captured later if Direction B-1's fixed buffer turns out to be insufficient (see M3.1 — remote-daemon validation is required to close this loop, NOT laptop-local).
 
 2. **M3.1 10-start manual smoke is NOT skipped.** Same reasoning. The bug is intermittent; a one-shot post-merge validation is insufficient. Run 10 consecutive fresh orchestrations against the fix before declaring it done.
 
