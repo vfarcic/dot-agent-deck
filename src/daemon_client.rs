@@ -233,6 +233,8 @@ impl DaemonClient {
                 cwd: None,
                 tab_membership: None,
                 agent_type: None,
+                rows: 0,
+                cols: 0,
             })
             .collect())
     }
@@ -703,6 +705,8 @@ mod tests {
                 name: "\x1b[31mevil".into(),
             }),
             agent_type: None,
+            rows: 0,
+            cols: 0,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -721,6 +725,8 @@ mod tests {
                 orchestration_cwd: None,
             }),
             agent_type: None,
+            rows: 0,
+            cols: 0,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(

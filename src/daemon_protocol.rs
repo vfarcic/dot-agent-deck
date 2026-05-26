@@ -1437,6 +1437,8 @@ mod tests {
                 orchestration_cwd: None,
             }),
             agent_type: None,
+            rows: 0,
+            cols: 0,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -1452,6 +1454,8 @@ mod tests {
             cwd: None,
             tab_membership: None,
             agent_type: None,
+            rows: 0,
+            cols: 0,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();

@@ -858,6 +858,24 @@ impl AgentBus {
             .collect()
     }
 
+    /// Drop the scrollback ring on the floor, leaving live subscribers
+    /// untouched (PRD #104 M3). Called from
+    /// [`AgentPtyRegistry::resize`] after the master ioctl succeeds so
+    /// the next attach-replay snapshot only covers bytes written at
+    /// the new (rows, cols) — without this, a single snapshot could
+    /// span multiple dimension epochs and the early bytes would be
+    /// parsed at the wrong width.
+    ///
+    /// Takes the same `state` mutex `push`/`subscribe`/`snapshot` use,
+    /// so a concurrent `subscribe` either sees the full pre-resize
+    /// snapshot (and the live receiver picks up post-resize bytes) or
+    /// sees an empty snapshot and the receiver picks up everything —
+    /// no torn read.
+    fn clear_scrollback(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.scrollback.clear();
+    }
+
     /// Current number of live broadcast subscribers. Lets diagnostics and
     /// tests observe when an attach handler has dropped its receiver — e.g.
     /// after a wedged client triggered the bounded-write timeout — without
@@ -1026,6 +1044,39 @@ pub struct AgentRecord {
     /// with daemons predating this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<AgentType>,
+    /// Current PTY rows as last opened or resized on the daemon (PRD
+    /// #104). Threaded into the client's vt100 parser at hydration so
+    /// snapshot bytes are parsed at the dims they were written at —
+    /// without this, a wide-PTY agent's scrollback was clamped to
+    /// 80 columns on reattach and the historical rows were corrupted.
+    ///
+    /// `#[serde(default)]` keeps the wire shape backwards-compatible
+    /// for *decode*: an older daemon that omits the field round-trips
+    /// as `0`, and the hydration path falls back to the 24×80
+    /// placeholder when it sees `0`.
+    ///
+    /// `skip_serializing_if = "is_zero_u16"` (PRD #104 RN1, reviewer):
+    /// on the *encode* side, a daemon that has no real dims yet (e.g.
+    /// a future code path that constructs an `AgentRecord` before the
+    /// PTY is open) emits the legacy shape — no `rows`/`cols` keys —
+    /// instead of the new-shape literal `0`. Pre-PRD clients see the
+    /// same JSON they always have; post-PRD clients decode the absent
+    /// field via `#[serde(default)]`. Symmetric with the
+    /// `pane_id_env` / `display_name` / `cwd` / `tab_membership` /
+    /// `agent_type` fields that already use this pattern.
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub rows: u16,
+    /// Current PTY cols. See `rows` for the full rationale.
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub cols: u16,
+}
+
+/// Skip-predicate for `AgentRecord::rows` / `AgentRecord::cols`
+/// serialization. Pulled out as a named helper so the two `#[serde]`
+/// attributes share one symbol — closure literals aren't allowed in
+/// `skip_serializing_if`.
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
 }
 
 /// In-process registry of agent PTYs owned by the daemon. M1.1 only exposed
@@ -1318,9 +1369,22 @@ impl AgentPtyRegistry {
         // so [`respawn_agent_for_pane`] can re-apply them to the fresh
         // child instead of resetting to a leaner env and the 24×80
         // default geometry.
+        //
+        // PRD #104 R3 (reviewer): apply the same `[1, PTY_RESIZE_DIM_MAX]`
+        // clamp that [`spawn`] (at the top of this file) and
+        // [`AgentPtyRegistry::resize`] use. Pre-PRD this was a private
+        // shortcut for the respawn path — a caller-supplied `0` would
+        // already have been rejected by `spawn`, and an oversized value
+        // was clamped inside `spawn`'s `pty_system.openpty` call but
+        // the capture here kept the raw value. With PRD #104 the
+        // captured value is now wire-visible via `AgentRecord.rows/cols`
+        // and would surface to the client's vt100 parser
+        // (`parser_init_dims` clamps defensively, but pinning at the
+        // capture site keeps the on-wire value consistent with the
+        // kernel's actual TIOCGWINSZ).
         let captured_env = opts.env.clone();
-        let captured_rows = opts.rows;
-        let captured_cols = opts.cols;
+        let captured_rows = opts.rows.clamp(1, PTY_RESIZE_DIM_MAX);
+        let captured_cols = opts.cols.clamp(1, PTY_RESIZE_DIM_MAX);
 
         // Defense in depth: `spawn` already protects the child internally
         // via its own `ChildGuard`, so any failure or panic *inside* spawn
@@ -1795,6 +1859,16 @@ impl AgentPtyRegistry {
             .agents
             .get_mut(id)
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+        // PRD #104 A1 followup: skip the entire post-ioctl bookkeeping
+        // when neither dimension changes. The local TUI resize sweep
+        // calls `resize_pane_pty` on every frame the viewport is
+        // unchanged (cheap idempotent path), so without this guard
+        // every no-op tick would clear the scrollback ring and any
+        // hydration-replay snapshot taken mid-stream would observe an
+        // empty buffer instead of the live agent's actual scrollback.
+        // Compute the diff *before* the ioctl so we can return early
+        // without paying the kernel round-trip when nothing changed.
+        let dims_changed = agent.pty_rows != rows || agent.pty_cols != cols;
         agent
             .master
             .resize(PtySize {
@@ -1804,10 +1878,47 @@ impl AgentPtyRegistry {
                 pixel_height: 0,
             })
             .map_err(|e| AgentPtyError::Resize(e.to_string()))?;
+        if !dims_changed {
+            return Ok(());
+        }
         // Refresh the captured size so a subsequent respawn replays
-        // the latest geometry, not the spawn-time default.
+        // the latest geometry, not the spawn-time default. PRD #104
+        // also surfaces this on `AgentRecord` via `agent_records()`
+        // so the client's vt100 parser is initialised at the dims the
+        // snapshot bytes were written at.
         agent.pty_rows = rows;
         agent.pty_cols = cols;
+        // PRD #104 M3: drop the scrollback ring on resize. After this
+        // point a snapshot returned to a fresh subscriber represents
+        // a single (rows, cols) epoch — the agent's current one. The
+        // inner TUI's SIGWINCH-driven full-screen redraw repopulates
+        // scrollback at the new dims within the first frame, so this
+        // is not a content-loss for the interactive case. Pre-PRD,
+        // a snapshot could carry bytes from before *and* after a
+        // resize, and the parser at attach time had no way to know
+        // which was which.
+        //
+        // PRD #104 R2 (reviewer): the clear takes the same
+        // `AgentBus::state` mutex that `AgentBus::push` (and
+        // `subscribe`/`snapshot`) take, so push and clear serialize
+        // through one lock — no data race, no torn read.
+        // Residual best-effort gap: a `pump_reader` thread that has
+        // already returned from `reader.read(...)` with pre-resize
+        // bytes in its userspace buffer but has not yet acquired the
+        // bus lock will push those bytes AFTER this clear. The kernel
+        // can also have pre-SIGWINCH-emit bytes buffered on the
+        // master FD that `pump_reader` will read after the ioctl
+        // returns. Neither can be closed without holding the bus lock
+        // across a blocking `read()` (or coordinating with the inner
+        // agent's SIGWINCH ack — neither tractable). The interactive
+        // recovery path makes this acceptable: the inner TUI's
+        // SIGWINCH-driven full-screen redraw emits a clear + reposition
+        // + content burst at the new dims that overwrites the parser's
+        // live screen within a frame, so any leaked pre-resize bytes
+        // age out of the parser's live area into the (still-correct
+        // at the wider dim case) parser-side scrollback. See the
+        // Risks table in `prds/104-snapshot-replay-preserves-pty-dims.md`.
+        agent.bus.clear_scrollback();
         Ok(())
     }
 
@@ -1885,6 +1996,8 @@ impl AgentPtyRegistry {
                 cwd: agent.cwd.clone(),
                 tab_membership: agent.tab_membership.clone(),
                 agent_type: agent.agent_type.clone(),
+                rows: agent.pty_rows,
+                cols: agent.pty_cols,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -3256,5 +3369,303 @@ mod tests {
             42,
             "opts.env PANE_ID was clobbered — scrub must run before opts.env is applied"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #104 M1: daemon stores and reports current PTY dims via
+    // `AgentRecord.rows/cols`. Without these, the client's vt100 parser
+    // initialises every reattached pane at 24×80 and snapshots that were
+    // emitted at a wider geometry get clamped — scrolled-back rows are
+    // permanently corrupted (PRD #104 problem statement).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn agent_record_round_trips_explicit_rows_cols() {
+        let rec = AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 120,
+            cols: 40,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["rows"], 120);
+        assert_eq!(v["cols"], 40);
+        let back: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rows, 120);
+        assert_eq!(back.cols, 40);
+    }
+
+    #[test]
+    fn agent_record_without_rows_cols_fields_deserializes_as_zero() {
+        // Forward compat: an older daemon predating PRD #104 omits these
+        // fields entirely. `#[serde(default)]` makes them decode as 0,
+        // which the hydration path detects and falls back to the 24×80
+        // placeholder for.
+        let legacy_json = r#"{
+            "id": "1",
+            "pane_id_env": null,
+            "display_name": null,
+            "cwd": null
+        }"#;
+        let back: AgentRecord = serde_json::from_str(legacy_json)
+            .expect("older daemon shape must decode via #[serde(default)] on rows/cols");
+        assert_eq!(back.rows, 0);
+        assert_eq!(back.cols, 0);
+    }
+
+    #[test]
+    fn spawn_at_120x40_surfaces_dims_via_agent_records() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                rows: 120,
+                cols: 40,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        let records = registry.agent_records();
+        let rec = records.iter().find(|r| r.id == id).expect("agent missing");
+        assert_eq!(rec.rows, 120);
+        assert_eq!(rec.cols, 40);
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn resize_updates_dims_reported_via_agent_records() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                rows: 24,
+                cols: 80,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        registry
+            .resize(&id, 100, 30)
+            .expect("resize should succeed");
+        let records = registry.agent_records();
+        let rec = records.iter().find(|r| r.id == id).expect("agent missing");
+        assert_eq!(rec.rows, 100);
+        assert_eq!(rec.cols, 30);
+        registry.shutdown_all();
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #104 M3: clearing scrollback on resize. A snapshot returned to
+    // a fresh subscriber always covers a single (rows, cols) epoch.
+    // ---------------------------------------------------------------------
+
+    /// Push `bytes` into `registry`'s agent `id` by writing through the
+    /// PTY master and spinning until the reader thread surfaces `bytes`
+    /// verbatim in the bus's scrollback. Pulled out of
+    /// `resize_clears_scrollback` so the sibling A1 test
+    /// (`resize_with_unchanged_dims_preserves_scrollback`) can reuse it
+    /// without duplicating the spin-and-write boilerplate.
+    ///
+    /// We search for the literal byte run rather than just "snapshot
+    /// grew" because the R2 residual gap (pre-resize `pump_reader`
+    /// bytes that land after `clear_scrollback`) can otherwise make a
+    /// fresh write look stuck behind a stale baseline.
+    fn write_and_wait_for_scrollback(registry: &AgentPtyRegistry, id: &str, bytes: &[u8]) {
+        let writer = {
+            let inner = registry.inner.lock().unwrap();
+            let agent = inner.agents.get(id).expect("agent must exist");
+            agent.writer.clone()
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use std::io::Write as _;
+            let mut w = writer.lock().await;
+            w.write_all(bytes).unwrap();
+            let _ = w.flush();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            let snap = registry.snapshot(id).unwrap();
+            if snap.windows(bytes.len()).any(|w| w == bytes) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let snap = registry.snapshot(id).unwrap();
+        panic!(
+            "test prerequisite: bytes {:?} never surfaced in scrollback within 3s; \
+             current snapshot len={}",
+            String::from_utf8_lossy(bytes),
+            snap.len()
+        );
+    }
+
+    #[test]
+    fn resize_clears_scrollback() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                // Use `cat` so the child stays alive long enough for us
+                // to feed bytes through the master side and observe the
+                // reader thread push them to scrollback.
+                command: Some("/bin/cat"),
+                rows: 24,
+                cols: 80,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        // Write bytes through the agent's writer; the kernel echoes them
+        // back through the master, where pump_reader appends to
+        // `AgentBus::scrollback`. Spin briefly until non-empty so the
+        // test doesn't race the reader thread.
+        write_and_wait_for_scrollback(&registry, &id, b"hello");
+        assert!(
+            !registry.snapshot(&id).unwrap().is_empty(),
+            "test prerequisite: pre-resize snapshot should have echoed bytes"
+        );
+
+        registry
+            .resize(&id, 30, 100)
+            .expect("resize should succeed");
+        assert!(
+            registry.snapshot(&id).unwrap().is_empty(),
+            "resize must drop scrollback so the next subscriber sees a single-epoch snapshot"
+        );
+
+        // Bytes pushed after the resize must repopulate snapshot — the
+        // bus is still functional, only the historical buffer was cleared.
+        write_and_wait_for_scrollback(&registry, &id, b"fresh");
+        assert!(
+            !registry.snapshot(&id).unwrap().is_empty(),
+            "post-resize writes must reach the (cleared) scrollback"
+        );
+
+        registry.shutdown_all();
+    }
+
+    // PRD #104 A1 (auditor): a `resize(id, same_rows, same_cols)` must
+    // be a true no-op — including leaving scrollback untouched. The
+    // UI's per-frame resize sweep calls `resize_pane_pty` on every
+    // unchanged tick, and clearing every time would wipe in-flight
+    // scrollback bytes before a fresh subscriber could observe them.
+    #[test]
+    fn resize_with_unchanged_dims_preserves_scrollback() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                rows: 24,
+                cols: 80,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        write_and_wait_for_scrollback(&registry, &id, b"keep-me");
+        let pre = registry.snapshot(&id).unwrap();
+        assert!(!pre.is_empty(), "test prerequisite: scrollback non-empty");
+
+        // Same dims — must not touch scrollback or any of the registry
+        // bookkeeping that resize would normally refresh.
+        registry
+            .resize(&id, 24, 80)
+            .expect("no-op resize should succeed");
+        let post = registry.snapshot(&id).unwrap();
+        assert_eq!(
+            pre, post,
+            "no-op resize must leave scrollback bytes untouched"
+        );
+        // The captured dims must also match what was already stored —
+        // the no-op path skips the refresh too, but the result is the
+        // same because the values weren't changing in the first place.
+        let records = registry.agent_records();
+        let rec = records.iter().find(|r| r.id == id).expect("agent missing");
+        assert_eq!((rec.rows, rec.cols), (24, 80));
+
+        registry.shutdown_all();
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #104 R3 (reviewer): `pty_rows` / `pty_cols` are now
+    // wire-visible via `AgentRecord`, so the spawn-time capture site
+    // must apply the same `[1, PTY_RESIZE_DIM_MAX]` clamp `resize()`
+    // applies. Without this, a caller-supplied oversized value would
+    // surface to the client unchanged.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn spawn_clamps_oversized_rows_cols_in_captured_dims() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                rows: PTY_RESIZE_DIM_MAX + 1,
+                cols: PTY_RESIZE_DIM_MAX + 100,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should clamp + succeed");
+        let records = registry.agent_records();
+        let rec = records.iter().find(|r| r.id == id).expect("agent missing");
+        assert_eq!(rec.rows, PTY_RESIZE_DIM_MAX);
+        assert_eq!(rec.cols, PTY_RESIZE_DIM_MAX);
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn spawn_at_u16_max_rows_cols_clamps_not_panics() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                rows: u16::MAX,
+                cols: u16::MAX,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should clamp u16::MAX cleanly");
+        let records = registry.agent_records();
+        let rec = records.iter().find(|r| r.id == id).expect("agent missing");
+        assert_eq!(rec.rows, PTY_RESIZE_DIM_MAX);
+        assert_eq!(rec.cols, PTY_RESIZE_DIM_MAX);
+        registry.shutdown_all();
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #104 RN1 (reviewer): `AgentRecord.rows/cols` now use
+    // `skip_serializing_if = "is_zero_u16"` so a daemon that hasn't
+    // recorded real dims yet emits the pre-PRD wire shape. The serde
+    // round-trip still has to work for both new (non-zero) and legacy
+    // (zero / absent) cases.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn agent_record_omits_rows_cols_when_zero_on_the_wire() {
+        let rec = AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(
+            !obj.contains_key("rows"),
+            "rows=0 must be omitted from the wire payload so pre-PRD clients keep decoding"
+        );
+        assert!(
+            !obj.contains_key("cols"),
+            "cols=0 must be omitted from the wire payload so pre-PRD clients keep decoding"
+        );
+        // Round-trip via deserialize still produces 0 thanks to
+        // `#[serde(default)]`.
+        let back: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rows, 0);
+        assert_eq!(back.cols, 0);
     }
 }

@@ -508,6 +508,8 @@ fn agent_record_round_trips_explicit_agent_type() {
         cwd: Some("/work".into()),
         tab_membership: None,
         agent_type: Some(AgentType::ClaudeCode),
+        rows: 0,
+        cols: 0,
     };
     let json = serde_json::to_string(&rec).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -526,6 +528,8 @@ fn agent_record_omits_agent_type_when_none() {
         cwd: None,
         tab_membership: None,
         agent_type: None,
+        rows: 0,
+        cols: 0,
     };
     let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
     assert!(
