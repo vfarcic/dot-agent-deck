@@ -17,7 +17,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast};
 
 use crate::event::AgentType;
-use crate::pane_input::{PaneInputError, SUBMIT_DELAY, encode_pane_payload};
+use crate::pane_input::{PaneInputError, SUBMIT_DELAY, encode_pane_payload, escape_bytes_for_log};
 
 /// Trigger flag the deck client honors to mean "the daemon is already
 /// running; attach over its stream socket instead of spawning one." The
@@ -1093,6 +1093,7 @@ struct RegistryInner {
 /// private because the public API exposes the two named methods
 /// directly — see [`AgentPtyRegistry::write_to_pane_and_submit`] and
 /// [`AgentPtyRegistry::write_to_pane_notice`].
+#[derive(Debug)]
 enum SubmitMode {
     Submit,
     Notice,
@@ -1534,12 +1535,35 @@ impl AgentPtyRegistry {
         use std::io::Write as _;
         let payload = encode_pane_payload(text)?;
         let mut w = writer.lock().await;
+        // PRD #128 (cherry-picked from PR #122): byte-level trace of every
+        // daemon-initiated PTY write. Gated by `RUST_LOG=trace`. Logs the
+        // payload and trailing terminator separately so an operator can
+        // see whether bracketed-paste framing (`\x1b[200~...\x1b[201~`) is
+        // present and whether the terminator is `\r` (13) or `\n` (10).
+        // Emitted INSIDE the writer mutex critical section so trace order
+        // matches actual write order under concurrent writers.
+        tracing::trace!(
+            target: "pane_write",
+            source = "daemon",
+            mode = ?mode,
+            pane_id = %pane_id,
+            payload_len = payload.len(),
+            payload = %escape_bytes_for_log(&payload),
+            "daemon write_to_pane: payload bytes"
+        );
         w.write_all(&payload)
             .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
         let _ = w.flush();
         match mode {
             SubmitMode::Submit => {
                 tokio::time::sleep(SUBMIT_DELAY).await;
+                tracing::trace!(
+                    target: "pane_write",
+                    source = "daemon",
+                    pane_id = %pane_id,
+                    terminator = %escape_bytes_for_log(b"\r"),
+                    "daemon write_to_pane: submit terminator"
+                );
                 w.write_all(b"\r")
                     .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
                 let _ = w.flush();
@@ -1552,6 +1576,13 @@ impl AgentPtyRegistry {
                 // `encode_pane_payload` strips trailing whitespace so a
                 // caller-provided `\n` would have been swallowed; the
                 // single byte is written here unambiguously.
+                tracing::trace!(
+                    target: "pane_write",
+                    source = "daemon",
+                    pane_id = %pane_id,
+                    terminator = %escape_bytes_for_log(b"\n"),
+                    "daemon write_to_pane: notice terminator"
+                );
                 w.write_all(b"\n")
                     .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
                 let _ = w.flush();

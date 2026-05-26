@@ -81,6 +81,28 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 /// close marker. 150ms tuned empirically.
 pub const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// Render bytes for trace logging in a human-scannable form: printable
+/// ASCII as-is, everything else as `\xNN`. The common framing bytes
+/// (`\x1b[200~`, `\x1b[201~`, `\r`, `\n`) thus surface as
+/// `\x1b[200~`, `\r`, `\n` rather than raw control codes that
+/// terminals would interpret on rendering.
+///
+/// PRD #128 (cherry-picked from PR #122): bracketed-paste framing and
+/// `\r` vs `\n` are the two leading hypotheses for the orchestrator
+/// spawn-time submit bug, so the pane-write trace must let an operator
+/// distinguish them at a glance. Gated behind `RUST_LOG=trace` — the
+/// helper itself does no logging; callers emit `tracing::trace!`.
+pub fn escape_bytes_for_log(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +172,22 @@ mod tests {
         let input = "hello \x1b[201~ world";
         let out = encode_pane_payload(input).unwrap();
         assert_eq!(out, input.as_bytes());
+    }
+
+    /// The trace-log helper must render bracketed-paste markers, CR, and
+    /// LF unambiguously so an operator can tell at a glance whether the
+    /// daemon emitted `\x1b[200~...\x1b[201~` framing and whether the
+    /// submit terminator was `\r` (13), `\n` (10), or both.
+    #[test]
+    fn escape_bytes_for_log_renders_paste_framing_and_terminators() {
+        let bytes = b"\x1b[200~hello\nworld\x1b[201~\r";
+        assert_eq!(
+            escape_bytes_for_log(bytes),
+            "\\x1b[200~hello\\x0aworld\\x1b[201~\\x0d"
+        );
+        assert_eq!(escape_bytes_for_log(b""), "");
+        assert_eq!(escape_bytes_for_log(b"ls -la"), "ls -la");
+        assert_eq!(escape_bytes_for_log(b"\n"), "\\x0a");
+        assert_eq!(escape_bytes_for_log(b"\r"), "\\x0d");
     }
 }

@@ -90,6 +90,7 @@ pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
 use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, is_valid_pane_id_env};
 use crate::event::{AgentType, BroadcastMsg};
+use crate::pane_input::escape_bytes_for_log;
 use crate::state::SharedState;
 
 // ---------------------------------------------------------------------------
@@ -1172,6 +1173,22 @@ async fn handle_attach_stream(
             Ok(Some((KIND_STREAM_IN, bytes))) => {
                 use std::io::Write;
                 let mut w = writer.lock().await;
+                // PRD #128 (cherry-picked from PR #122): byte-level trace
+                // of STREAM_IN frames forwarded to the per-agent PTY
+                // writer. Useful for confirming that bytes the TUI
+                // queued arrived as distinct frames and that no other
+                // path interleaved a write on the same writer mutex
+                // between them. Gated by `RUST_LOG=trace`. Emitted
+                // INSIDE the writer mutex so trace order matches actual
+                // write order.
+                tracing::trace!(
+                    target: "pane_write",
+                    source = "stream_in",
+                    agent_id = %id,
+                    payload_len = bytes.len(),
+                    payload = %escape_bytes_for_log(&bytes),
+                    "STREAM_IN forwarded to PTY writer"
+                );
                 if w.write_all(&bytes).is_err() {
                     break;
                 }
