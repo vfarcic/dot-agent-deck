@@ -486,7 +486,7 @@ The harness lands first; #84 then refactors against a green safety net and accep
 
 Per Decision 10 — pure-data unit tests stay live in `src/*/mod tests`; everything else moved to `./tmp/legacy-tests/` (gitignored; git history preserves originals via the rename detection on the staged delete).
 
-**Carve-out result:** 296 pure-data unit tests kept across 17 `src/*` files; 25 `tests/*.rs` files plus `tests/common/` moved wholesale; 11 `src/*/mod tests` blocks partially or fully moved.
+**Carve-out result:** 296 pure-data unit tests kept across 22 `src/*` files; 25 `tests/*.rs` files plus `tests/common/` moved wholesale; 20 `src/*/mod tests` blocks moved (9 whole-block moves where every test in the file was non-pure-data, 11 partial splits where pure-data tests stay live and the remaining tests move).
 
 ### Pure-data tests (stay live)
 
@@ -1121,25 +1121,134 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 
 #### prompt/quit
 
-##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog.
+##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** dialog appears; options include Quit / Cancel (and Detach on remote, covered by `prompt/quit/003`).
-- **Does not assert:** local-vs-remote rendering — covered separately.
+- **Asserts:** dialog appears; option list reads `Detach / Stop / Cancel` in that order; the selection cursor starts on Detach (index 0).
+- **Does not assert:** local-vs-remote rendering — the dialog is identical (`Detach` is the daemon-attach-aware option in both cases since every pane is daemon-backed).
 - **Platform coverage:** mac+linux.
 
-##### prompt/quit/002 — `Ctrl+c` a second time exits immediately.
+##### prompt/quit/002 — `Ctrl+c` again while the quit dialog is open exits the TUI without sending an explicit `KIND_DETACH` frame.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** the harness's spawned binary exits; daemon stays alive (idle-shutdown window applies).
+- **Asserts:** the harness's spawned binary exits; daemon and managed agents stay alive; no detach frame was observed on the daemon socket.
 - **Does not assert:** daemon's eventual idle exit (covered by `lifecycle/daemon-idle/*`).
 - **Platform coverage:** mac+linux.
 
-##### prompt/quit/003 — On a remote attach, the quit dialog includes Detach as a distinct third option that sends an explicit `KIND_DETACH` frame.
-- **Layer:** L2 (remote harness — staged once it lands; entry pre-recorded so the milestone can pick it up).
+##### prompt/quit/003 — Selecting **Detach** from the quit dialog sends an explicit `KIND_DETACH` frame to the daemon, then exits.
+- **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** dialog renders three options; selecting Detach causes the TUI to send the detach frame and exit.
-- **Does not assert:** server-side log message about the detach.
+- **Asserts:** dialog yields a `KIND_DETACH` frame on the daemon's attach socket before the TUI exits; managed agents stay alive afterwards.
+- **Does not assert:** any difference between local and remote daemons — the frame and exit behavior are identical; the observable difference (daemon-side log line) is daemon-side, not deck-side.
+- **Platform coverage:** mac+linux.
+
+##### prompt/quit/004 — Selecting **Stop** with managed agents alive opens a secondary confirm dialog (`No` / `Yes`, `No` default) naming the agent count.
+- **Layer:** L2.
+- **Agent:** none (synthetic — one running stub agent).
+- **Asserts:** the secondary dialog appears with header containing `1 managed agent will be terminated`; options read `No / Yes` in that order with `No` selected; pressing `No` returns to the primary `Detach / Stop / Cancel` dialog; pressing `Yes` performs StopAndQuit (daemon and agents terminate).
+- **Does not assert:** the singular/plural agent-count wording (loose substring match on the count).
+- **Platform coverage:** mac+linux.
+
+##### prompt/quit/005 — Selecting **Stop** with zero managed agents skips the secondary confirm and terminates the daemon directly.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** no secondary dialog appears; the TUI exits and the daemon socket disappears within the grace window.
+- **Does not assert:** SIGTERM vs SIGKILL escalation (covered by `lifecycle/stop/003`).
+- **Platform coverage:** mac+linux.
+
+#### prompt/dir-picker
+
+##### prompt/dir-picker/001 — `Ctrl+n` opens the new-pane flow; the directory picker is the first step and lists the start directory's entries.
+- **Layer:** L2.
+- **Agent:** none (fixture with a small directory tree at the harness's redirected `HOME`).
+- **Asserts:** the picker appears with the fixture's root entries rendered; the selection cursor starts on the first entry (`..` parent is visible but not selected).
+- **Does not assert:** sort order beyond "directories before files" (covered if needed).
+- **Platform coverage:** mac+linux.
+
+##### prompt/dir-picker/002 — `j` / `Down` / `k` / `Up` cycle the selected directory; selection wraps end-to-end.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** selection cursor advances through entries; pressing `Up` on the first entry jumps to the last (and vice versa).
+- **Does not assert:** rendering of inactive entries beyond presence.
+- **Platform coverage:** mac+linux.
+
+##### prompt/dir-picker/003 — `l` / `Right` / `Enter` descend into the selected directory; `h` / `Left` / `Backspace` ascend.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** after descending, the picker shows the child directory's contents; after ascending, it shows the parent's contents again.
+- **Does not assert:** any breadcrumb / path rendering beyond directory contents.
+- **Platform coverage:** mac+linux.
+
+##### prompt/dir-picker/004 — `Space` confirms the current directory and advances to the new-pane form.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** the directory picker closes; the new-pane form appears with the chosen directory pre-filled.
+- **Does not assert:** the form's default field values (covered by `prompt/new-pane/*`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/dir-picker/005 — `/` opens filter mode; typing narrows directories case-insensitively; the `..` parent stays visible.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** filter accepts a substring; only matching directories remain; `..` is rendered regardless of filter.
+- **Does not assert:** filter regex syntax (it is plain substring matching).
+- **Platform coverage:** mac+linux.
+
+##### prompt/dir-picker/006 — `Esc` clears the active filter; pressing `Esc` again closes the picker.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** first `Esc` empties the filter and restores the full directory list; second `Esc` returns control to the dashboard.
+- **Does not assert:** filter input box visibility between key presses.
+- **Platform coverage:** mac+linux.
+
+##### prompt/dir-picker/007 — `q` cancels the picker and returns to the dashboard without spawning a pane.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** the picker closes; no new pane appears; daemon `list_agents` is unchanged.
+- **Does not assert:** rendering of any toast / status-line message.
+- **Platform coverage:** mac+linux.
+
+#### prompt/new-pane
+
+##### prompt/new-pane/001 — The new-pane form opens after the directory picker with three fields visible (Name, Command, Mode) and the initial focus on Name.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** the form renders all three field labels; the focus indicator is on the Name field; Mode is set to the default.
+- **Does not assert:** the default command string (a configurable `default_command`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/new-pane/002 — `Tab` and `Shift+Tab` cycle focus forward and backward between fields.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** `Tab` from Name moves focus to Command; another `Tab` moves to Mode; `Shift+Tab` from Mode moves back to Command; cycling wraps at both ends.
+- **Does not assert:** which field accepts which input (text vs cycle).
+- **Platform coverage:** mac+linux.
+
+##### prompt/new-pane/003 — On the Mode field, `Left` / `Right` / `h` / `l` cycle through the available modes including the default and any project-defined modes / orchestrations.
+- **Layer:** L2.
+- **Agent:** none (fixture `.dot-agent-deck.toml` defines one mode and one orchestration).
+- **Asserts:** cycling from the default shows the mode name, then the orchestration name, then wraps back; the rendered Mode field text follows the cycle.
+- **Does not assert:** what happens to other fields while the Mode cycles (Command may be hidden when an orchestration is selected — covered by `prompt/new-pane/004`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/new-pane/004 — Selecting an orchestration hides the Command field (each role's command is supplied by the config).
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** with the Mode cycled to an orchestration, the Command label is not rendered; cycling back to a non-orchestration Mode re-renders Command.
+- **Does not assert:** what content `Command` had before being hidden (no data loss expected, but not pinned here).
+- **Platform coverage:** mac+linux.
+
+##### prompt/new-pane/005 — `Enter` submits the form; the resulting pane (or mode / orchestration tab) is created.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** after submit, a card / tab appears that matches the form inputs.
+- **Does not assert:** post-submit focus location (covered by `lifecycle/start/*`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/new-pane/006 — `Esc` cancels the form and returns to the dashboard.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** form closes; no new pane appears; daemon `list_agents` is unchanged.
+- **Does not assert:** the dashboard's selection cursor location on return.
 - **Platform coverage:** mac+linux.
 
 ### Focus / navigation
@@ -1288,6 +1397,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the exact scroll keymap on every platform.
 - **Platform coverage:** mac+linux.
 
+##### embed/attach/005 — `AgentRecord.tab_membership` returned by the daemon's `list_agents` is sanitized on hydration; hostile fields (ANSI escapes, NUL bytes, control chars, oversized cwd/role_name) do not corrupt the rebuilt tab bar.
+- **Layer:** L2.
+- **Agent:** none (fixture forces a daemon to advertise an `AgentRecord` whose `tab_membership` carries `\x1b[31m`, an embedded NUL, and an over-cap role name; harness exposes a helper to override the daemon's outgoing record).
+- **Asserts:** after reattach, the rebuilt tab bar contains no raw ANSI / control bytes in any rendered cell; the offending agent either appears under a sanitized label or is bucketed back to the dashboard (per `validate_tab_membership`'s policy).
+- **Does not assert:** the exact sanitization output beyond "no raw control bytes survive into the rendered grid" (the pure-data `validate_tab_membership_*` tests pin the per-field policy).
+- **Platform coverage:** mac+linux.
+
 ### Hook delivery
 
 #### hooks/delivery
@@ -1325,6 +1441,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Agent:** none.
 - **Asserts:** an event sent while the TUI is detached is reflected in the card status on reattach.
 - **Does not assert:** how the daemon buffers (snapshot vs queue).
+- **Platform coverage:** mac+linux.
+
+##### hooks/delivery/006 — `DOT_AGENT_DECK_PANE_ID` is scrubbed and re-set per-agent so hooks from agent A never carry agent B's `pane_id`.
+- **Layer:** L2.
+- **Agent:** none (two synthetic agents started under the same daemon; each invokes the bundled `hook` subcommand and the daemon's env-scrub is what isolates them).
+- **Asserts:** with two cards alive, a hook emitted from agent A updates only A's card; a subsequent hook from agent B updates only B's card; neither hook's payload arrives carrying the other agent's `pane_id`.
+- **Does not assert:** the absolute env-scrub call sites (covered by `agent_pty` pure-data tests `spawn_scrubs_via_daemon_env_from_child`, `spawn_scrubs_pane_id_env_from_child`, `spawn_opts_env_overrides_pane_id_scrub` — moved to `tmp/legacy-tests/`; this catalog entry replaces that lost end-to-end signal).
 - **Platform coverage:** mac+linux.
 
 #### hooks/install
@@ -1451,6 +1574,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Agent:** none (run with stdout redirected to a pipe).
 - **Asserts:** exit code is non-zero; stderr mentions `dot-agent-deck daemon stop`.
 - **Does not assert:** exact stderr wording (pinned in lib pure-data tests).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/handshake/005 — Build-version mismatch prompt: pressing `Q` / `Ctrl+C` / `Ctrl+D` / `Esc` aborts startup with a non-zero exit and leaves the stale daemon running.
+- **Layer:** L2.
+- **Agent:** none (uses `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` to simulate skew).
+- **Asserts:** for each abort keystroke (`Q`, `q`, `Ctrl+C`, `Ctrl+D`, `Esc`): the TUI exits non-zero; the daemon socket is still answering after the exit; no fresh daemon was spawned.
+- **Does not assert:** any rendered error message after abort (the prompt itself is the user-visible artifact).
 - **Platform coverage:** mac+linux.
 
 ### Resize
@@ -1623,8 +1753,8 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 | Doc behavior | Why skipped |
 |---|---|
 | Idle ASCII art rendering on cards ([docs/configuration.md#idle-ascii-art](../docs/configuration.md), [docs/configuration.md#standalone-cli](../docs/configuration.md)) | LLM-driven side feature; lives outside the deck/daemon/PTY surface the harness covers. Reconsider in M4+ if the feature warrants its own catalog section. |
-| `dot-agent-deck connect <remote>` end-to-end SSH flow ([docs/remote-environments.md](../docs/remote-environments.md), [docs/remote-recipes.md](../docs/remote-recipes.md)) | Requires a remote-harness shape that does not exist yet. Catalogued at M4+ when remote testing lands. `prompt/quit/003` reserves the Detach option's slot in advance. |
-| `dot-agent-deck remote add / list / upgrade / remove` ([docs/remote-environments.md](../docs/remote-environments.md)) | Same — remote-harness territory; the lib already covers the pure-data slices (URL parsing, command construction, error classification) in the kept tests. |
+| `dot-agent-deck connect <remote>` end-to-end SSH flow ([docs/remote-environments.md](../docs/remote-environments.md), [docs/remote-recipes.md](../docs/remote-recipes.md)) | Requires a remote-harness shape that does not exist yet. Catalogued at M4+ when remote testing lands. Local quit-dialog coverage (`prompt/quit/001`–`005`) already pins the Detach / Stop / Cancel behavior; remote attach adds only the daemon-side log distinction. |
+| `dot-agent-deck remote add / list / upgrade / remove` ([docs/remote-environments.md](../docs/remote-environments.md)) | Same — remote-harness territory; the lib already covers the pure-data slices (URL parsing, command construction, error classification) in the kept tests. **Security properties deferred to M4+ end-to-end coverage:** shell-metacharacter quoting on remote-CLI argv assembly (unit-covered by `system_ssh_executor_quotes_arguments_safely`), `remotes.toml` written at mode 0o600 (covered by the now-moved `remotes_toml_written_at_0o600` test — restore at M4+), `DOT_AGENT_DECK_VIA_DAEMON=1` propagation on the remote shell (unit-covered by `build_connect_command_has_t_flag_and_via_daemon_env`). |
 | `dot-agent-deck ascii` CLI subcommand ([docs/configuration.md#standalone-cli](../docs/configuration.md)) | Non-TUI subcommand; tested as a CLI smoke in M4+ if it warrants coverage. |
 | `dot-agent-deck validate` CLI subcommand ([docs/workspace-modes.md#config-validation](../docs/workspace-modes.md)) | Non-TUI; the underlying validator is exhaustively covered by the pure-data `config_validation` tests. |
 | `dot-agent-deck watch` CLI subcommand ([docs/workspace-modes.md#dot-agent-deck-watch](../docs/workspace-modes.md)) | Non-TUI subcommand; an L2 test would only exercise its output formatting against a real shell — low value compared to the deck-rendering surface. |
