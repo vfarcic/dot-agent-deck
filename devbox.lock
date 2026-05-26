@@ -1,6 +1,54 @@
 {
   "lockfile_version": "1",
   "packages": {
+    "asciinema@3.2.0": {
+      "last_modified": "2026-05-08T21:03:27Z",
+      "resolved": "github:NixOS/nixpkgs/b3da656039dc7a6240f27b2ef8cc6a3ef3bccae7#asciinema",
+      "source": "devbox-search",
+      "version": "3.2.0",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/6jllrz04svnr1xxzywbbykgwarfq6pmj-asciinema-3.2.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/6jllrz04svnr1xxzywbbykgwarfq6pmj-asciinema-3.2.0"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/413jlfgry7m2zd31m8iqnk2pir20b1p0-asciinema-3.2.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/413jlfgry7m2zd31m8iqnk2pir20b1p0-asciinema-3.2.0"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/90zb6rmkdia30vvyc87hlznpydfd4yv2-asciinema-3.2.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/90zb6rmkdia30vvyc87hlznpydfd4yv2-asciinema-3.2.0"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/rbh9jvrblsgac93lv18ddywcjkk7bf8v-asciinema-3.2.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/rbh9jvrblsgac93lv18ddywcjkk7bf8v-asciinema-3.2.0"
+        }
+      }
+    },
     "gh@2.92.0": {
       "last_modified": "2026-05-01T13:14:57Z",
       "resolved": "github:NixOS/nixpkgs/c6d65881c5624c9cae5ea6cedef24699b0c0a4c0#gh",
