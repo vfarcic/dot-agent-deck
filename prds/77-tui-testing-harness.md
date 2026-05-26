@@ -879,6 +879,46 @@ Per Decision 10 — pure-data unit tests stay live in `src/*/mod tests`; everyth
 | src/terminal_widget.rs (whole `mod tests`) | tmp/legacy-tests/src/terminal_widget.rs | UI render tests against a ratatui buffer — will be reborn as L1 widget tests in M2. |
 | src/ui.rs (`mod tests`: layout dims, partition_*, dedupe_*, fill_dead_slots_*, dashboard_filter_*, synthesised_orchestration_tab_*, config-gen prompt handlers, …) | tmp/legacy-tests/src/ui.rs | UI/state subsystem — large block of TUI helpers driven against handcrafted state. |
 
+## M2: Implementation Notes
+
+Recorded at the M2 user-validation handoff so the user has the harness shape and the open questions in one place.
+
+### Decision 16 re-check verdict — keep the in-house path
+
+Default per Decision 16 is in-house on `portable-pty + vt100`. A single re-check happens at M2 kickoff; *all four* listed criteria must hold for ratatui-testlib to displace it.
+
+| Criterion | Verdict | Notes |
+|---|---|---|
+| 1. Cross-platform support landed and tested | Not met | No widely-published library by the name `ratatui-testlib` exists in the ecosystem at M2 kickoff. The closest match is ratatui's built-in `TestBackend` — already used by the L1 slice — but it is an in-process buffer, not a PTY-driven L2 substrate. |
+| 2. ≥200 stars + multiple maintainers | Not met | No discoverable repository. |
+| 3. Released past 1.0 | Not met | No discoverable release. |
+| 4. Covers our use cases | Not met | No published L2 library covers synthetic-event injection through the daemon's hook socket plus catalog-ID linkage as a single substrate. |
+
+Conclusion: keep the in-house harness on `portable-pty 0.8` + `vt100 0.16` (both already production deps per Decision 1). The annotation surface for the linkage check is satisfied by the new `xtask/spec` proc-macro, not by a third-party library. Per Decision 16, no further re-check happens unless a future v1.0 + cross-platform release explicitly motivates a reopen.
+
+### Seed catalog entries shipped
+
+- **L1** — `dashboard/pane/004` (`tests/render_dashboard.rs::pane_004_card_title_row`). Renders a single Working session via `dot_agent_deck::ui::render_card_to_buffer` and snapshots the resulting `ratatui::buffer::Buffer` with `insta` (file snapshot at `tests/snapshots/render_dashboard__pane_004_card_title_row.snap`).
+- **L2 synthetic** — `hooks/delivery/001` (`tests/e2e_hook_delivery.rs::delivery_001_session_start_creates_card`). Launches the production binary in a `portable-pty` PTY against the `minimal` fixture, writes a Claude Code `SessionStart` payload to the per-test hook socket, and waits for the rendered grid to contain the session token.
+
+### New conventions added by M2
+
+- `tests/common/mod.rs` is the shared L2 harness — `TuiDeck::launch_with_fixture("minimal")`, `TuiDeck::builder()` (with `.with_env(k, v)`, `.with_pty_size(cols, rows)`), `deck.resize(cols, rows)`, `deck.wait_until_quiescent()`, `deck.wait_for_string(s)`, `deck.hook_socket_path()` / `.attach_socket_path()`, plus a `write_hook_line` helper. Internals: portable-pty PTY pair, a reader thread feeding `vt100::Parser`, per-test tempdir + redirected `HOME`, pinned env per Decision 20, in-memory CastEvent ring buffer (asciinema v2 inline encoder). On `Drop` the harness dumps `target/test-recordings/<test-name>/{final-grid.txt, final-grid.svg, full-stream.cast, fixture.toml}` if the test panicked OR `DOT_AGENT_DECK_RECORD=1` is set.
+- `xtask/` is now a Cargo workspace with two members: `xtask/linkage-check` (binary, `cargo xtask linkage-check`) and `xtask/spec` (proc-macro for the `#[spec(...)]` attribute). The root `Cargo.toml` gains a `[workspace]` block; `spec` is added as a `dot-agent-deck` dev-dep.
+- `xtask/linkage-check/m2.allowlist` seeds 111 catalog IDs that are exempt from "must have a test" at M2 time. M4+ ticks entries off as it lands tests.
+- `.cargo/config.toml` aliases `test-fast`, `test-e2e`, and `xtask`.
+- `.config/nextest.toml` defines `profile.default` (retries=0, fail-fast=false, slow-timeout 60s/3, junit path) and `profile.e2e` (slow-timeout 120s/2); a nextest setup script wipes `target/test-recordings/` at the start of every `cargo test-e2e` per Decision 28.
+- `bacon.toml` lives at repo root with the four jobs (test-fast / test-e2e / clippy / fmt) from Decision 14.
+- `tests/fixtures/minimal/.dot-agent-deck.toml` is the seed fixture per Decision 12.
+- `insta` is pinned via `=1.47.2` (Decision 22). The `e2e` feature is added to `Cargo.toml` and every `tests/e2e_*.rs` file opens with `#![cfg(feature = "e2e")]` (Decision 6).
+
+### Second-opinion flags for the M2 stop
+
+1. **`wait_until_quiescent` does not settle on the empty dashboard.** The production TUI emits periodic refresh ticks at idle, so a 50ms quiet window is never observed — `wait_until_quiescent()` panics with the 10s ceiling. The L2 seed test sidesteps this by using `wait_for_string` (which the catalog explicitly endorses for "loose substring matches"), but the PRD calls quiescence the *primary* wait. Two options to surface at the stop: (a) raise `QUIESCENT_IDLE_MS` to a value that beats the refresh cadence (the PRD's note says the 50ms default is tunable), or (b) suppress the refresh tick in test mode via a deck-side env-var or capped tick rate. I lean toward (a) but defer to user judgment — Decision 21 explicitly leaves the constant as tunable.
+2. **`#[spec(...)]` requires a proc-macro crate.** Decision 7 specifies the annotation form `#[spec("...")]`. Rust rejects unknown attribute macros at compile time, so a proc-macro crate (`xtask/spec`) was added to define it as a no-op. That's three workspace members (main + linkage-check + spec) where the PRD only described one xtask. Surface as informational — the alternative was less consistent (free-standing const markers + linkage-check scanning a different shape).
+3. **L1 cast format.** The worker-task asked for `full-stream.cast` recordings of *both* M2 tests. The L1 test renders in-process via `TestBackend` and has no PTY stream, so a cast doesn't fit; I committed the `insta` snapshot file instead and documented the choice in `.dot-agent-deck/m2-recordings/README.md`. Flagging in case the user expected a synthetic cast.
+4. **M4+ Buildout Strategy** lives at the top of the milestone block (added in commit `8cac6e5` before this task). M2's work doesn't touch it; surfacing here for traceability.
+
 ## Test Case Catalog
 
 This is the authoritative list of test cases the harness must cover. IDs are stable per Decision 7; tests reference them via `#[spec("…")]` annotations once the harness exists in M2. Coverage is enumerated from the code as it ships today (Decision 27 — "code is authoritative"); documented behaviors with no catalog entry are listed as deliberate skips at the end of this section.
