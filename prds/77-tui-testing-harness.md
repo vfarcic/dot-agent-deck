@@ -924,6 +924,43 @@ Conclusion: keep the in-house harness on `portable-pty 0.8` + `vt100 0.16` (both
 3. **L1 cast format.** The worker-task asked for `full-stream.cast` recordings of *both* M2 tests. The L1 test renders in-process via `TestBackend` and has no PTY stream, so a cast doesn't fit; I committed the `insta` snapshot file instead and documented the choice in `.dot-agent-deck/m2-recordings/README.md`. Flagging in case the user expected a synthetic cast.
 4. **M4+ Buildout Strategy** lives at the top of the milestone block (added in commit `8cac6e5` before this task). M2's work doesn't touch it; surfacing here for traceability.
 
+## M3: Implementation Notes
+
+Recorded at the M3 user-validation handoff so the milestone state and the open question for the OpenCode side are in one place.
+
+### Catalog entries shipped
+
+- **`chain-smoke/claude/001`** — `tests/e2e_chain_smoke_claude.rs::claude_001_thinking_working_idle`. Spawns the real `claude` CLI under a per-test redirected HOME (host credentials imported by the new `with_imported_claude_credentials()` harness builder), runs `claude -p "<prompt>" --model claude-haiku-4-5-20251001 --allowedTools Bash`, and asserts the deck's dashboard card status traverses Thinking → Working → Idle with the `Bash` tool name visible during Working. Test runs in ≈5 s; observed cost is one Haiku-4.5 invocation at <500 input + <200 output tokens — well under the <$0.05 Decision-23 bound.
+- **`chain-smoke/opencode/001`** — *not shipping in M3.* See the deck-bug note below.
+
+### Fixtures
+
+- `tests/fixtures/chain-smoke-claude/.dot-agent-deck.toml` — empty marker (no modes / orchestrations). The agent invocation is driven by a generated `session.toml` written into the per-test tempdir.
+- `tests/fixtures/chain-smoke-opencode/.dot-agent-deck.toml` — same shape, reserved for the OpenCode test once the deck plugin path is fixed.
+
+### Harness extension
+
+`tests/common/mod.rs` gains three test-facing pieces:
+
+1. `TuiDeckBuilder::with_continue_session(name, command)` stages a `session.toml` in the per-test tempdir, sets `DOT_AGENT_DECK_SESSION` to that path, and adds `--continue` to the deck argv so a single chain-smoke pane auto-opens on launch. The pane's `dir` is the tempdir itself so the agent has a real cwd (the deck's restore path skips panes whose `dir` doesn't exist).
+2. `TuiDeckBuilder::with_imported_claude_credentials()` copies `~/.claude/.credentials.json` (mode 0o600 preserved), `~/.claude/settings.json` (with `hooks` stripped — the deck installs its own pointing at the per-test socket), and `~/.claude/plugins/` if present. All `fs::copy` per the M2.1 auditor rule.
+3. `TuiDeckBuilder::with_imported_opencode_credentials()` copies `~/.local/share/opencode/auth.json` + `~/.config/opencode/opencode.jsonc`. The host's `~/.config/opencode/plugin/dot-agent-deck/` is deliberately NOT copied — the deck reinstalls its own at launch.
+4. `common::check_claude_available()` / `check_opencode_available()` + the new `skip_unless!(...)` macro implement Decision 26's runtime-skip exception (missing CLI or credentials → clean SKIP with a stable user-facing message). No silent model fallback per Decision 8.
+
+### Open issue surfaced — OpenCode plugin discovery
+
+The OpenCode test was written, run, and **failed because the deck's plugin install path is incompatible with current OpenCode**. Captured here so the M3 stop has the context:
+
+- `src/opencode_manage.rs::auto_install` writes the deck's JS hook plugin to `<config>/plugin/dot-agent-deck/index.js` (`~/.config/opencode/plugin/dot-agent-deck/` on this host).
+- OpenCode 1.15.10's plugin loader, observed via `opencode run … --print-logs --log-level DEBUG`, loads *only* internal plugins (`service=plugin name=EG loading internal plugin` and friends) and never attempts to load any external `<config>/plugin/<name>/index.js`. The deck's plugin file is on disk and never invoked.
+- Consequence: the deck receives no `session.created` / `tool.execute.before` events from OpenCode, the card stays in the "No agent" placeholder forever, and the catalog's Thinking → Working → Idle traversal can't be observed. Confirmed by running `opencode run` directly against a manually-staged HOME mirror that included the deck's plugin and a netcat listener on `DOT_AGENT_DECK_SOCKET` — zero bytes hit the socket.
+- Per Decision 11 (failing test = deck bug, not a test bug), I did not commit a failing OpenCode test or `#[ignore]` it (Decision 26 forbids the latter). The catalog entry `chain-smoke/opencode/001` is parked back on `xtask/linkage-check/m2.allowlist` with an inline comment naming the blocker. The harness builder methods + skip-check helper are ready for the OpenCode test to drop in once the deck plugin install is updated to match OpenCode 1.x's discovery (likely an `opencode plugin`-style npm-package install or a `package.json` declaration in `~/.config/opencode/`).
+
+### Second-opinion flags for the M3 stop
+
+1. **OpenCode deck-side fix.** Recommend a follow-up PRD or in-PRD-77 issue to align `src/opencode_manage.rs::auto_install` with OpenCode 1.x's plugin loader. Once that lands, the M3 chain-smoke test will need to be re-introduced — the harness side is already done.
+2. **Snapshot fixture's `last_activity` was time-pinned to a fixed past instant.** This worked for the M2 commit but the snapshot drifts as the date rolls (the rendered `Last: Xs ago` is `Utc::now() - last_activity`). I switched `tests/render_dashboard.rs::working_session_fixture` to use `Utc::now()` so elapsed always reads `0s ago`. Not a catalog-level change; documenting so future contributors don't reintroduce the pin.
+
 ## Test Case Catalog
 
 This is the authoritative list of test cases the harness must cover. IDs are stable per Decision 7; tests reference them via `#[spec("…")]` annotations once the harness exists in M2. Coverage is enumerated from the code as it ships today (Decision 27 — "code is authoritative"); documented behaviors with no catalog entry are listed as deliberate skips at the end of this section.
