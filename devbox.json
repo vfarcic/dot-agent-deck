@@ -7,7 +7,8 @@
     "git@2.53.0",
     "upcloud-cli@3.29.0",
     "gh@2.92.0",
-    "asciinema@3.2.0"
+    "asciinema@3.2.0",
+    "cargo-nextest@0.9.137"
   ],
   "shell": {
     "init_hook": [

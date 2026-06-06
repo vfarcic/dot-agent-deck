@@ -1,5 +1,11 @@
 # Contributing to dot-agent-deck
 
+## Prerequisites
+
+Enter `devbox shell` for the pinned toolchain — it provides `cargo-nextest` (test runner), `asciinema` (cast replay), and the rest of the project's CLI deps. Outside devbox, install nextest manually with `cargo install cargo-nextest --locked`. The `cargo test-fast` / `cargo test-e2e` aliases in `.cargo/config.toml` resolve through nextest; without it they error with `no such command: nextest`.
+
+For `cargo test-e2e` chain-smoke tests you also need the agent CLIs (`claude` and `opencode`) installed locally and logged in — the tests skip with a specific reason if either is missing (per Decision 8).
+
 ## Snapshot review workflow
 
 L1 widget/layout regressions are pinned by `insta` file snapshots under `tests/snapshots/`. When a PR's diff includes a new or modified `.snap` file, read the snapshot diff like a rendered screen — each line corresponds to one row of the dashboard's parsed grid. Accept the change only if the new rendering matches the catalog entry's prose; otherwise loop the change back to the author. Locally, `cargo insta review` walks pending diffs interactively.
