@@ -453,7 +453,33 @@ The harness ships in small validated slices. Three stop-for-user-validation chec
 
 The harness lands first; #84 then refactors against a green safety net and accepts the resulting wave of L1 snapshot regeneration as part of its scope. L2 tests (assertions on observable state) should largely survive #84 untouched.
 
-**Event-driven render — prerequisite for quiescence (added 2026-06-06).** M2 surfaced that the deck's render loop redraws unconditionally every ~16 ms with no async→render wakeup, which makes `wait_until_quiescent` non-functional (see amended Decision 21). The fix is a wakeup channel bumped by the event subscriber + per-pane PTY tasks; the render loop idles until woken or a long-timeout fires. This change does not fit cleanly inside the per-frame layout/PTY-size contract that #84 targets, but it shares #84's theme of "single owner of the render lifecycle" and the two changes can land together or sequentially. Either way it ships before the M4+ "assert nothing happened" catalog entries (`dashboard/pane/003`, `prompt/permission/003`, `hooks/delivery/004`, …) become writable.
+**Event-driven render — prerequisite for quiescence (added 2026-06-06).** M2 surfaced that the deck's render loop redraws unconditionally every ~16 ms with no async→render wakeup, which makes `wait_until_quiescent` non-functional (see amended Decision 21). The fix is a wakeup channel bumped by the event subscriber + per-pane PTY tasks; the render loop idles until woken or a long-timeout fires. This change does not fit cleanly inside the per-frame layout/PTY-size contract that #84 targets, but it shares #84's theme of "single owner of the render lifecycle" and the two changes can land together or sequentially. Either way it ships before the "assert nothing happened" catalog entries (`dashboard/pane/003`, `prompt/permission/003`, `hooks/delivery/004`, …) become writable.
+
+### Decision 30: Paired test docs — every `#[spec]` test ships with an auto-generated `.md`
+
+**Added 2026-06-06 after the M3 stop.** Reading the test source is the most accurate way to know what a test does, but it isn't the *easiest*. To make the catalog navigable for non-Rust readers (and to give AI workers a "what does this test do" answer that doesn't require reading the test source), every `#[spec]`-annotated test ships with a paired Markdown file.
+
+**The `.md` contains:**
+- Catalog ID + the catalog body (Layer, Agent, Asserts, Does not assert, Platform).
+- **Scenario** — a 1–3 sentence plain-English narrative authored by the test writer via a `/// Scenario:` doc comment on the test function.
+- **Steps** — auto-extracted from the test function body via `syn`; harness method calls map to plain-English steps (`launch_with_fixture(F)` → "Launch the deck with fixture F", `wait_for_string(S)` → "Wait for S to appear on screen", etc.). Unknown calls fall back to a raw call line.
+- Source location (`file:function`).
+- Cast filename (if any) + replay command.
+- Rerun command (per Decision 18).
+
+**Pair location:** the `.md` lives next to the cast under `.dot-agent-deck/<milestone>-recordings/`. L1 tests have no cast; their `.md` lives at the same path with the Replay section omitted.
+
+**Regeneration:**
+- On-demand: `cargo xtask docs --tests` regenerates every `.md`.
+- Automatic at record time: when `DOT_AGENT_DECK_RECORD=1` produces a cast, the harness also writes the paired `.md`.
+
+**Enforcement (linkage-check rule 7).** Every `#[spec(...)]` test must:
+1. Carry a `/// Scenario:` doc comment of at least one sentence.
+2. Have its paired `.md` in sync with the test source + catalog (re-running `cargo xtask docs --tests` produces no diff).
+
+Both checks run alongside the original six in `cargo xtask linkage-check` and are required status checks on `main`. The hard CI enforcement is the load-bearing layer; CLAUDE.md / CONTRIBUTING.md describe the convention but cannot force compliance on their own.
+
+**Why syntactic step extraction over per-statement comments:** the syntactic approach works on existing tests with zero author retrofit. New harness methods need a one-line entry in the method-name → step-template map, with a raw-call fallback so absence isn't a failure. Per-statement comments can be a future enhancement if quality demands it.
 
 ## Key Design Constraints
 
@@ -487,11 +513,22 @@ The harness lands first; #84 then refactors against a green safety net and accep
   - **Status (2026-06-06):** Validated. Deliverables landed across `6669e80`, `5eabe0a`, `d3f7bc2`, `9ee95fc`, `226a646`, `5b62538`, `f7c9042`, `58d72ba`. Reviewer + auditor fixes in `e40bd12`. Seed tests = `dashboard/pane/004` (L1) + `hooks/delivery/001` (L2 synthetic). Decision 16 re-check verdict: **keep in-house** (no ratatui-testlib at M2 kickoff meeting all four criteria). Q1 quiescence reconsideration resolved via **Option C**: Decision 21 amended to acknowledge `wait_for_string` as the primary practical wait today and quiescence as primary once the render loop becomes event-driven. Rationale: deck busy-redraws every ~16 ms and has no async→render wakeup, so a simple env-gated tick suppression would break async updates; a fingerprint-based change-detection alternative (option A) would be flake-prone for a test framework (violates Decision 9); and a production render-loop refactor (option B) was premature with only 2 harness tests as a safety net. Event-driven render is the prerequisite for quiescence and is tracked for M4+/#84 — not part of #77's scope.
 - [x] **M3 — First chain-smoke tests + STOP for validation** (per Decision 29). One real Claude Code chain-smoke test (using `claude-haiku-4-5-20251001`), one real OpenCode chain-smoke test (using `openrouter/google/gemini-2.5-flash-lite`). Both picked from M1's catalog. After this milestone lands, **stop and wait for explicit validation** before continuing to M4+.
   - **Status (2026-06-06):** Validated — closed as **1 of 2 chain-smoke tests + di-001 escalated to PRD #79** (option (b) from the M3 stop). `chain-smoke/claude/001` shipped green (commits `ee58882`..`1788d54`); reviewer + auditor + 13-item fix batch (`1788d54`) all clean. `chain-smoke/opencode/001` deferred until PRD #79's scope expansion ships the deck install-path fix (`src/opencode_manage.rs` plugin registration vs OpenCode 1.x's loader). Harness side for OpenCode is complete (`with_imported_opencode_credentials`, fixture marker file) — the test drops in trivially once #79 lands. Catalog entry stays allowlisted in `xtask/linkage-check/m2.allowlist` with an inline comment naming the blocker.
-- [ ] **M4+ — Catalog buildout.** Scope shape TBD when M3 lands. Carries the catalog-vs-deck "fix the deck not the test" policy (Decision 11) and the Discovered Issues collection (Decision 25). Current orchestrator proposal in [M4+ Buildout Strategy (Proposal)](#m4-buildout-strategy-proposal); to be locked in formally after M3.
+- [ ] **M4 — Test documentation generation** (per Decision 30). Build the auto-doc system that pairs a `.md` with every `#[spec]` test. Deliverables:
+  - `cargo xtask docs --tests` generator (parses catalog + test source via `syn`; emits `.md` paired with each test under `.dot-agent-deck/<milestone>-recordings/`).
+  - `/// Scenario:` doc-comment convention.
+  - Linkage-check rule 7 (Scenario required + generated `.md` in sync; `cargo xtask linkage-check` exit 1 if either fails).
+  - Generator hook in `tests/common/mod.rs` so `DOT_AGENT_DECK_RECORD=1` runs also write/refresh the paired `.md`.
+  - Append CLAUDE.md rule 7 (Appendix A new entry below).
+  - Update CONTRIBUTING.md "how to add a new test" with the Scenario step + the regenerate command.
+  - Retrofit `Scenario:` doc comments + generated `.md` files for the existing three `#[spec]` tests (`dashboard/pane/004`, `hooks/delivery/001`, `chain-smoke/claude/001`).
+  - After this milestone lands, **stop and wait for explicit validation** before opening the foundation PR.
+- [ ] **M5+ — Catalog buildout absorbed into per-PRD test maintenance** (locked in 2026-06-06 at the M3 stop). No dedicated catalog buildout phase within PRD #77. Per CLAUDE.md rule 4, every future PRD that touches a cataloged area ships the corresponding `#[spec]` test (and its `.md` per Decision 30 + CLAUDE.md rule 7) as part of the PRD's scope. The catalog IDs still allowlisted in `xtask/linkage-check/m2.allowlist` are the coverage roadmap; entries get removed as each future PRD lands its tests. The catalog-vs-deck "fix the deck not the test" policy (Decision 11) and the Discovered Issues collection (Decision 25) carry forward into those future PRDs. **PRD #77 closes after M4.** The [M4+ Buildout Strategy (Proposal)](#m4-buildout-strategy-proposal) section is preserved below for historical context — superseded by this entry.
 
 ## M4+ Buildout Strategy (Proposal)
 
-**Status:** Proposal only. The PRD's M4+ milestone description defers the firm decision until M3 lands — what we learn from M2 (harness API ergonomics) and M3 (real-agent plumbing) will inform whether to revise this. Lock in formally at the M3 user-validation stop.
+**Status (2026-06-06): SUPERSEDED** by the M5+ milestone entry above. At the M3 user-validation stop, this proposal was set aside in favor of the simpler model: harness is permanent infrastructure; each future PRD adds the catalog tests for the area it touches (CLAUDE.md rule 4). No dedicated by-area buildout phase inside PRD #77. The text below is preserved as historical context.
+
+**Status (original):** Proposal only. The PRD's M4+ milestone description defers the firm decision until M3 lands — what we learn from M2 (harness API ergonomics) and M3 (real-agent plumbing) will inform whether to revise this. Lock in formally at the M3 user-validation stop.
 
 ### Recommendation: one area per delegation
 
@@ -1911,6 +1948,8 @@ To be added as permanent instructions in `CLAUDE.md` in the same milestone that 
 > **Fast Tests Per Task, E2E Before PR**: `cargo test-fast` (alias for `cargo nextest run`) runs the fast tier — protocol/state tests plus L1 widget/render tests — and is the per-task gate. `cargo test-e2e` (alias for `cargo nextest run --features e2e`) additionally runs the L2 PTY/real-agent suite and is required to pass before the release flow. Do not run `cargo test-e2e` per task; it spawns binaries, hits LLM APIs, and is intentionally bounded to the pre-PR step.
 
 > **Iterate on a Failing Test by Rerunning Only That Test**: When a single test fails, after fixing the code, rerun *only that test* first (`cargo test-fast lifecycle_001` or `cargo test-e2e lifecycle_001`) to verify the fix in isolation. Decision 17's function-name prefix (`<sub-area>_<NNN>_…`) makes the filter pick exactly one test. Only after that test passes, rerun the full tier (`cargo test-fast`, plus `cargo test-e2e` pre-PR) before committing.
+
+> **Every `#[spec]` Test Has a Scenario Comment and Regenerated Docs** (per Decision 30): When adding or modifying a `#[spec(...)]`-annotated test in `tests/`, the test function MUST carry a `/// Scenario:` doc comment of 1–3 sentences describing in plain English what the test does — start the app, what gets pressed/sent/written, what should happen visibly. Run `cargo xtask docs --tests` before committing so the paired `.md` file under `.dot-agent-deck/<milestone>-recordings/` regenerates. CI's linkage-check rule 7 fails the build if the comment is missing or the `.md` is out of sync. This applies to L1 tests too (their `.md` omits the Replay section since there is no PTY cast).
 
 ## Risks & Mitigations
 
