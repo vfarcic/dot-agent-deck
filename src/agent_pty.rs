@@ -17,7 +17,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast};
 
 use crate::event::AgentType;
-use crate::pane_input::{PaneInputError, SUBMIT_DELAY, encode_pane_payload};
+use crate::pane_input::{PaneInputError, SUBMIT_DELAY, encode_pane_payload, escape_bytes_for_log};
 
 /// Trigger flag the deck client honors to mean "the daemon is already
 /// running; attach over its stream socket instead of spawning one." The
@@ -858,6 +858,24 @@ impl AgentBus {
             .collect()
     }
 
+    /// Drop the scrollback ring on the floor, leaving live subscribers
+    /// untouched (PRD #104 M3). Called from
+    /// [`AgentPtyRegistry::resize`] after the master ioctl succeeds so
+    /// the next attach-replay snapshot only covers bytes written at
+    /// the new (rows, cols) — without this, a single snapshot could
+    /// span multiple dimension epochs and the early bytes would be
+    /// parsed at the wrong width.
+    ///
+    /// Takes the same `state` mutex `push`/`subscribe`/`snapshot` use,
+    /// so a concurrent `subscribe` either sees the full pre-resize
+    /// snapshot (and the live receiver picks up post-resize bytes) or
+    /// sees an empty snapshot and the receiver picks up everything —
+    /// no torn read.
+    fn clear_scrollback(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.scrollback.clear();
+    }
+
     /// Current number of live broadcast subscribers. Lets diagnostics and
     /// tests observe when an attach handler has dropped its receiver — e.g.
     /// after a wedged client triggered the bounded-write timeout — without
@@ -1026,6 +1044,39 @@ pub struct AgentRecord {
     /// with daemons predating this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<AgentType>,
+    /// Current PTY rows as last opened or resized on the daemon (PRD
+    /// #104). Threaded into the client's vt100 parser at hydration so
+    /// snapshot bytes are parsed at the dims they were written at —
+    /// without this, a wide-PTY agent's scrollback was clamped to
+    /// 80 columns on reattach and the historical rows were corrupted.
+    ///
+    /// `#[serde(default)]` keeps the wire shape backwards-compatible
+    /// for *decode*: an older daemon that omits the field round-trips
+    /// as `0`, and the hydration path falls back to the 24×80
+    /// placeholder when it sees `0`.
+    ///
+    /// `skip_serializing_if = "is_zero_u16"` (PRD #104 RN1, reviewer):
+    /// on the *encode* side, a daemon that has no real dims yet (e.g.
+    /// a future code path that constructs an `AgentRecord` before the
+    /// PTY is open) emits the legacy shape — no `rows`/`cols` keys —
+    /// instead of the new-shape literal `0`. Pre-PRD clients see the
+    /// same JSON they always have; post-PRD clients decode the absent
+    /// field via `#[serde(default)]`. Symmetric with the
+    /// `pane_id_env` / `display_name` / `cwd` / `tab_membership` /
+    /// `agent_type` fields that already use this pattern.
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub rows: u16,
+    /// Current PTY cols. See `rows` for the full rationale.
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub cols: u16,
+}
+
+/// Skip-predicate for `AgentRecord::rows` / `AgentRecord::cols`
+/// serialization. Pulled out as a named helper so the two `#[serde]`
+/// attributes share one symbol — closure literals aren't allowed in
+/// `skip_serializing_if`.
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
 }
 
 /// In-process registry of agent PTYs owned by the daemon. M1.1 only exposed
@@ -1093,6 +1144,7 @@ struct RegistryInner {
 /// private because the public API exposes the two named methods
 /// directly — see [`AgentPtyRegistry::write_to_pane_and_submit`] and
 /// [`AgentPtyRegistry::write_to_pane_notice`].
+#[derive(Debug)]
 enum SubmitMode {
     Submit,
     Notice,
@@ -1318,9 +1370,22 @@ impl AgentPtyRegistry {
         // so [`respawn_agent_for_pane`] can re-apply them to the fresh
         // child instead of resetting to a leaner env and the 24×80
         // default geometry.
+        //
+        // PRD #104 R3 (reviewer): apply the same `[1, PTY_RESIZE_DIM_MAX]`
+        // clamp that [`spawn`] (at the top of this file) and
+        // [`AgentPtyRegistry::resize`] use. Pre-PRD this was a private
+        // shortcut for the respawn path — a caller-supplied `0` would
+        // already have been rejected by `spawn`, and an oversized value
+        // was clamped inside `spawn`'s `pty_system.openpty` call but
+        // the capture here kept the raw value. With PRD #104 the
+        // captured value is now wire-visible via `AgentRecord.rows/cols`
+        // and would surface to the client's vt100 parser
+        // (`parser_init_dims` clamps defensively, but pinning at the
+        // capture site keeps the on-wire value consistent with the
+        // kernel's actual TIOCGWINSZ).
         let captured_env = opts.env.clone();
-        let captured_rows = opts.rows;
-        let captured_cols = opts.cols;
+        let captured_rows = opts.rows.clamp(1, PTY_RESIZE_DIM_MAX);
+        let captured_cols = opts.cols.clamp(1, PTY_RESIZE_DIM_MAX);
 
         // Defense in depth: `spawn` already protects the child internally
         // via its own `ChildGuard`, so any failure or panic *inside* spawn
@@ -1520,26 +1585,58 @@ impl AgentPtyRegistry {
         // thread already saw EOF. Mirrors `live_count`'s contract:
         // operational lookups treat exited entries as gone, cleanup
         // paths (`close_agent`, `shutdown_all`) still touch them.
-        let writer = {
+        // Capture both the writer and the agent_id (HashMap key) so the
+        // trace events below can emit `pane_id` AND `agent_id` — the
+        // M1.4 cross-path byte trace diffs against the STREAM_IN trace
+        // in `daemon_protocol::handle_attach_stream`, which keys off
+        // agent_id; both sides need the common key to correlate writes.
+        let (writer, agent_id) = {
             let inner = self.inner.lock().unwrap();
             inner
                 .agents
-                .values()
-                .find(|a| {
+                .iter()
+                .find(|(_, a)| {
                     a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst)
                 })
-                .map(|a| a.writer.clone())
+                .map(|(id, a)| (a.writer.clone(), id.clone()))
                 .ok_or_else(|| AgentPtyError::NotFound(pane_id.to_string()))?
         };
         use std::io::Write as _;
         let payload = encode_pane_payload(text)?;
         let mut w = writer.lock().await;
+        // PRD #128 (cherry-picked from PR #122): byte-level trace of every
+        // daemon-initiated PTY write. Gated by `RUST_LOG=trace`. Logs the
+        // payload and trailing terminator separately so an operator can
+        // see whether bracketed-paste framing (`\x1b[200~...\x1b[201~`) is
+        // present and whether the terminator is `\r` (13) or `\n` (10).
+        // Emitted INSIDE the writer mutex critical section so trace order
+        // matches actual write order under concurrent writers. Both
+        // `pane_id` and `agent_id` are emitted so the M1.4 diff against
+        // the STREAM_IN trace can join on either key.
+        tracing::trace!(
+            target: "pane_write",
+            source = "daemon",
+            mode = ?mode,
+            pane_id = %pane_id,
+            agent_id = %agent_id,
+            payload_len = payload.len(),
+            payload = %escape_bytes_for_log(&payload),
+            "daemon write_to_pane: payload bytes"
+        );
         w.write_all(&payload)
             .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
         let _ = w.flush();
         match mode {
             SubmitMode::Submit => {
                 tokio::time::sleep(SUBMIT_DELAY).await;
+                tracing::trace!(
+                    target: "pane_write",
+                    source = "daemon",
+                    pane_id = %pane_id,
+                    agent_id = %agent_id,
+                    terminator = %escape_bytes_for_log(b"\r"),
+                    "daemon write_to_pane: submit terminator"
+                );
                 w.write_all(b"\r")
                     .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
                 let _ = w.flush();
@@ -1552,6 +1649,14 @@ impl AgentPtyRegistry {
                 // `encode_pane_payload` strips trailing whitespace so a
                 // caller-provided `\n` would have been swallowed; the
                 // single byte is written here unambiguously.
+                tracing::trace!(
+                    target: "pane_write",
+                    source = "daemon",
+                    pane_id = %pane_id,
+                    agent_id = %agent_id,
+                    terminator = %escape_bytes_for_log(b"\n"),
+                    "daemon write_to_pane: notice terminator"
+                );
                 w.write_all(b"\n")
                     .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
                 let _ = w.flush();
@@ -1795,6 +1900,22 @@ impl AgentPtyRegistry {
             .agents
             .get_mut(id)
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+        // PRD #104 A1 followup: skip the entire ioctl + bookkeeping
+        // when neither dimension changes. The local TUI resize sweep
+        // calls `resize_pane_pty` on every frame the viewport is
+        // unchanged (cheap idempotent path), so without this guard
+        // every no-op tick would:
+        //   (a) issue TIOCSWINSZ to the kernel, which on Linux/macOS
+        //       delivers SIGWINCH to the child even when the dimensions
+        //       are identical — causing the inner TUI to redraw on every
+        //       frame tick;
+        //   (b) clear the scrollback ring unnecessarily, so a
+        //       hydration-replay snapshot taken mid-stream would observe
+        //       an empty buffer instead of the live agent's scrollback.
+        // Guard is *before* the ioctl to avoid both side-effects.
+        if agent.pty_rows == rows && agent.pty_cols == cols {
+            return Ok(());
+        }
         agent
             .master
             .resize(PtySize {
@@ -1805,9 +1926,43 @@ impl AgentPtyRegistry {
             })
             .map_err(|e| AgentPtyError::Resize(e.to_string()))?;
         // Refresh the captured size so a subsequent respawn replays
-        // the latest geometry, not the spawn-time default.
+        // the latest geometry, not the spawn-time default. PRD #104
+        // also surfaces this on `AgentRecord` via `agent_records()`
+        // so the client's vt100 parser is initialised at the dims the
+        // snapshot bytes were written at.
         agent.pty_rows = rows;
         agent.pty_cols = cols;
+        // PRD #104 M3: drop the scrollback ring on resize. After this
+        // point a snapshot returned to a fresh subscriber represents
+        // a single (rows, cols) epoch — the agent's current one. The
+        // inner TUI's SIGWINCH-driven full-screen redraw repopulates
+        // scrollback at the new dims within the first frame, so this
+        // is not a content-loss for the interactive case. Pre-PRD,
+        // a snapshot could carry bytes from before *and* after a
+        // resize, and the parser at attach time had no way to know
+        // which was which.
+        //
+        // PRD #104 R2 (reviewer): the clear takes the same
+        // `AgentBus::state` mutex that `AgentBus::push` (and
+        // `subscribe`/`snapshot`) take, so push and clear serialize
+        // through one lock — no data race, no torn read.
+        // Residual best-effort gap: a `pump_reader` thread that has
+        // already returned from `reader.read(...)` with pre-resize
+        // bytes in its userspace buffer but has not yet acquired the
+        // bus lock will push those bytes AFTER this clear. The kernel
+        // can also have pre-SIGWINCH-emit bytes buffered on the
+        // master FD that `pump_reader` will read after the ioctl
+        // returns. Neither can be closed without holding the bus lock
+        // across a blocking `read()` (or coordinating with the inner
+        // agent's SIGWINCH ack — neither tractable). The interactive
+        // recovery path makes this acceptable: the inner TUI's
+        // SIGWINCH-driven full-screen redraw emits a clear + reposition
+        // + content burst at the new dims that overwrites the parser's
+        // live screen within a frame, so any leaked pre-resize bytes
+        // age out of the parser's live area into the (still-correct
+        // at the wider dim case) parser-side scrollback. See the
+        // Risks table in `prds/104-snapshot-replay-preserves-pty-dims.md`.
+        agent.bus.clear_scrollback();
         Ok(())
     }
 
@@ -1853,6 +2008,25 @@ impl AgentPtyRegistry {
         inner.agents.get(id).and_then(|a| a.child.process_id())
     }
 
+    /// `pane_id_env` recorded for a given agent_id. Three states are
+    /// distinguished — the M1.4 cross-path byte-trace diff needs to
+    /// tell them apart, not just "is there a string or not":
+    ///
+    /// * `None` — the agent is not in the registry (gone / never
+    ///   registered under this id).
+    /// * `Some(None)` — the agent is registered but never carried a
+    ///   `pane_id_env` (rare; daemon-side test agents).
+    /// * `Some(Some(s))` — the agent is registered and `s` is its
+    ///   `pane_id_env`.
+    ///
+    /// Used by `handle_attach_stream` to enrich the STREAM_IN trace
+    /// with the same `pane_id` field daemon-initiated writes log, so
+    /// the trace audit can be diffed on a common key.
+    pub(crate) fn pane_id_env_for_agent(&self, agent_id: &str) -> Option<Option<String>> {
+        let inner = self.inner.lock().unwrap();
+        inner.agents.get(agent_id).map(|a| a.pane_id_env.clone())
+    }
+
     /// All currently-owned agent ids, sorted ascending.
     pub fn agent_ids(&self) -> Vec<String> {
         self.agent_records().into_iter().map(|r| r.id).collect()
@@ -1885,6 +2059,8 @@ impl AgentPtyRegistry {
                 cwd: agent.cwd.clone(),
                 tab_membership: agent.tab_membership.clone(),
                 agent_type: agent.agent_type.clone(),
+                rows: agent.pty_rows,
+                cols: agent.pty_cols,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -2068,6 +2244,7 @@ impl Drop for AgentPtyRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     // PRD #92 F1 followup (auditor #3) — defensive boundary check on the
     // `u32` PID → `libc::pid_t` PGID conversion used by the `killpg`
@@ -2307,5 +2484,1251 @@ mod tests {
             orchestration_cwd: None,
         };
         assert!(validate_tab_membership(tm).is_some());
+    }
+
+    #[test]
+    fn spawn_default_shell_works() {
+        let pty = spawn(SpawnOptions::default()).expect("spawn should succeed");
+        let mut child = pty.child;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn spawn_rejects_zero_rows() {
+        let Err(err) = spawn(SpawnOptions {
+            rows: 0,
+            cols: 80,
+            ..SpawnOptions::default()
+        }) else {
+            panic!("spawn must reject rows=0");
+        };
+        assert!(
+            matches!(err, AgentPtyError::Validation(_)),
+            "expected Validation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_rejects_zero_cols() {
+        let Err(err) = spawn(SpawnOptions {
+            rows: 24,
+            cols: 0,
+            ..SpawnOptions::default()
+        }) else {
+            panic!("spawn must reject cols=0");
+        };
+        assert!(
+            matches!(err, AgentPtyError::Validation(_)),
+            "expected Validation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_clamps_oversized_rows() {
+        let pty = spawn(SpawnOptions {
+            rows: u16::MAX,
+            cols: 80,
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed when rows are oversized — they must clamp");
+        let size = pty.master.get_size().expect("get_size should succeed");
+        assert_eq!(
+            size.rows, PTY_RESIZE_DIM_MAX,
+            "rows must be clamped to PTY_RESIZE_DIM_MAX, not u16::MAX"
+        );
+        let mut child = pty.child;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn spawn_clamps_oversized_cols() {
+        let pty = spawn(SpawnOptions {
+            rows: 24,
+            cols: u16::MAX,
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed when cols are oversized — they must clamp");
+        let size = pty.master.get_size().expect("get_size should succeed");
+        assert_eq!(
+            size.cols, PTY_RESIZE_DIM_MAX,
+            "cols must be clamped to PTY_RESIZE_DIM_MAX, not u16::MAX"
+        );
+        let mut child = pty.child;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn registry_spawn_and_close() {
+        let registry = AgentPtyRegistry::new();
+        assert!(registry.is_empty());
+
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.agent_ids(), vec![id.clone()]);
+
+        registry.close_agent(&id).expect("close should succeed");
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn registry_resize_rejects_zero_dims() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry.spawn_agent(SpawnOptions::default()).unwrap();
+        for (rows, cols) in [(0u16, 80u16), (24u16, 0u16), (0u16, 0u16)] {
+            let err = registry.resize(&id, rows, cols).unwrap_err();
+            assert!(matches!(err, AgentPtyError::Resize(_)));
+        }
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn registry_resize_unknown_errors() {
+        let registry = AgentPtyRegistry::new();
+        let err = registry.resize("nope", 50, 200).unwrap_err();
+        assert!(matches!(err, AgentPtyError::NotFound(_)));
+    }
+
+    #[test]
+    fn registry_resize_succeeds_on_known_agent() {
+        // Verifying the resulting kernel-level size requires a child that
+        // reads TIOCGWINSZ — the integration test in tests/daemon_protocol.rs
+        // covers that. Here we just confirm the method returns Ok for a
+        // valid id and non-zero dims, i.e. the portable_pty resize ioctl
+        // didn't error.
+        let registry = AgentPtyRegistry::new();
+        let id = registry.spawn_agent(SpawnOptions::default()).unwrap();
+        registry
+            .resize(&id, 50, 200)
+            .expect("resize should succeed");
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn registry_rejects_duplicate_pane_id_env() {
+        // CodeRabbit MAJOR (PRD #93 round-9): two agents must never
+        // share a `pane_id_env`. `write_to_pane_and_submit` keys off
+        // that string, so a second spawn with the same id would silently misroute
+        // every subsequent delegate/work-done write to whichever entry
+        // `values().find(...)` happened to hand back first.
+        let registry = AgentPtyRegistry::new();
+        let id1 = registry
+            .spawn_agent(SpawnOptions {
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-x".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("first spawn should succeed");
+
+        let err = registry
+            .spawn_agent(SpawnOptions {
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-x".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect_err("duplicate pane_id_env spawn must fail");
+        match err {
+            AgentPtyError::DuplicatePaneId(p) => assert_eq!(p, "pane-x"),
+            other => panic!("expected DuplicatePaneId, got {other:?}"),
+        }
+
+        // Registry must still have exactly one agent — the rejection
+        // can't have leaked the spawned child.
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.agent_ids(), vec![id1]);
+        registry.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn registry_allows_pane_id_reuse_when_prior_agent_has_exited() {
+        // Round-10 auditor #3: the duplicate-pane-id check must mirror
+        // `live_count`'s contract — a dead-but-not-yet-reaped registry
+        // entry doesn't block reuse of its `pane_id_env`. Without the
+        // `!exited.load(...)` filter, a previously-crashed worker's
+        // entry would hold its pane id hostage until something else
+        // explicitly removed it.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id1 = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-recycle".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("first spawn should succeed");
+
+        // Wait for the reader thread to observe EOF and set `exited`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if registry.live_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "test prerequisite: /usr/bin/true must have exited"
+        );
+        assert_eq!(registry.len(), 1, "exited entry must still be in registry");
+
+        // Now: reuse the same pane_id_env. The exited agent shouldn't
+        // block this — only a live agent would.
+        let id2 = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-recycle".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("reuse of an exited agent's pane_id_env must succeed");
+        assert_ne!(id1, id2);
+
+        registry.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn agent_records_filters_exited_entries() {
+        // Round-11 reviewer #A: agent_records is the hydration source.
+        // An exited-but-not-reaped entry must not show up — the TUI
+        // would otherwise materialize a ghost pane for a dead agent
+        // (or race a fresh agent that reused the same pane_id_env).
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "ghost".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn /usr/bin/true");
+
+        // Wait for `exited` to flip.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if registry.live_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(registry.live_count(), 0);
+        assert_eq!(
+            registry.len(),
+            1,
+            "exited entry still present in agents map"
+        );
+        assert!(
+            registry.agent_records().is_empty(),
+            "agent_records must drop exited entries so hydration doesn't materialize ghost panes"
+        );
+
+        registry.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn write_to_pane_and_submit_skips_exited_agent_and_routes_to_live_reuser() {
+        // Round-11 reviewer #A: the symmetric guard for the spawn-side
+        // exited filter added in round 10. Without filtering on the
+        // WRITE side, `write_to_pane_and_submit(pane_id_env=X)` could
+        // still find the dead entry first and route delegate/work-done
+        // bytes into a closed PTY whose pump thread already saw EOF.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _dead = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "reuse-me".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn dead agent");
+
+        // Wait for the dead agent's reader to see EOF and flip `exited`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if registry.live_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(registry.live_count(), 0, "dead agent must have exited");
+
+        // Reuse the same pane_id_env for a fresh agent. `/bin/sh` will
+        // stay alive long enough to receive a write.
+        let live_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "reuse-me".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn live agent reusing the pane_id_env");
+        assert_eq!(registry.live_count(), 1);
+
+        // Take a snapshot before the write so we can detect bytes
+        // arriving on the live agent's scrollback specifically.
+        let before = registry.snapshot(&live_id).unwrap();
+
+        // Operational write must route to the live agent, not the
+        // dead one. We can't easily prove "dead agent received
+        // nothing" because its writer is gone — but we CAN prove the
+        // live one did receive something. The dead agent's writer
+        // would error out anyway, so a misroute would surface as Err.
+        registry
+            .write_to_pane_and_submit("reuse-me", "echo round11-routing-marker")
+            .await
+            .expect("write_to_pane_and_submit to a live reuser must succeed");
+
+        // Allow the PTY to echo the input back into scrollback.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut found = false;
+        while tokio::time::Instant::now() < deadline {
+            let snap = registry.snapshot(&live_id).unwrap();
+            if snap
+                .windows(b"round11-routing-marker".len())
+                .any(|w| w == b"round11-routing-marker")
+                && snap.len() > before.len()
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            found,
+            "write_to_pane_and_submit must have landed bytes in the LIVE reuser's scrollback, not the exited entry's"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// `write_to_pane_notice` must skip both the `SUBMIT_DELAY` sleep
+    /// and the trailing CR — the byte sequence an agent TUI treats as
+    /// "Enter". Used by the `handle_delegate`-side spawn-failure
+    /// notice so the orchestrator LLM doesn't process the diagnostic
+    /// as a user prompt.
+    ///
+    /// Timing is the test signal: `write_to_pane_and_submit` waits
+    /// the full `SUBMIT_DELAY` (150 ms) between payload and CR, so
+    /// the call can't return in less than that. `write_to_pane_notice`
+    /// writes payload + `\n` and returns immediately. PTY line
+    /// discipline normalizes CR/LF in the program-visible input
+    /// stream, so we can't distinguish the two writes by what
+    /// `cat -u` echoes back — but the SUBMIT_DELAY gate is
+    /// observable from the caller's wall clock.
+    #[tokio::test]
+    async fn write_to_pane_notice_skips_submit_delay() {
+        let registry = AgentPtyRegistry::new();
+        let _id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "no-submit".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn cat");
+
+        let start = tokio::time::Instant::now();
+        registry
+            .write_to_pane_notice("no-submit", "notice")
+            .await
+            .expect("write_to_pane_notice");
+        let no_submit_elapsed = start.elapsed();
+        assert!(
+            no_submit_elapsed < SUBMIT_DELAY,
+            "write_to_pane_notice must skip the SUBMIT_DELAY sleep; took {no_submit_elapsed:?} \
+             (>= {SUBMIT_DELAY:?})"
+        );
+
+        let start = tokio::time::Instant::now();
+        registry
+            .write_to_pane_and_submit("no-submit", "prompt")
+            .await
+            .expect("write_to_pane_and_submit");
+        let submit_elapsed = start.elapsed();
+        assert!(
+            submit_elapsed >= SUBMIT_DELAY,
+            "write_to_pane_and_submit must wait at least SUBMIT_DELAY before the CR; \
+             took {submit_elapsed:?} (< {SUBMIT_DELAY:?})"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #92 F9 followup-4 (auditor S2): freeze the KNOWN LIMITATION
+    /// documented on `write_to_pane_notice` — that calling notice then
+    /// submit on the same pane leaves the notice bytes uncommitted in
+    /// the agent's stdin, so the next submit's CR submits them fused
+    /// to the new prompt. The contract is doc-only otherwise; this
+    /// test pins the daemon-side half (bytes land in order with only
+    /// `\n` — never `\r` — between them) so a future change that
+    /// accidentally swaps the notice terminator, inserts a separator,
+    /// or "fixes" the accumulation gets caught.
+    ///
+    /// Stub: a raw-mode `cat` (`stty -echo -icanon -icrnl -opost`)
+    /// that pumps stdin bytes verbatim to stdout. With default
+    /// canonical mode, `/bin/cat` would close the canonical line on
+    /// the notice's `\n` and emit two separate echo lines, hiding
+    /// whether the daemon emitted a fusing CR between the writes —
+    /// raw mode strips that line discipline so the assertion is
+    /// unambiguous.
+    ///
+    /// TEST-SIDE LIMITATION: the downstream agent-TUI behavior
+    /// (claude / codex buffering visible input until CR, then
+    /// submitting the entire accumulated buffer as one prompt) lives
+    /// in the agent process, not the daemon — we can't exercise it
+    /// without a real agent. The assertion below pins the two
+    /// daemon-side guarantees that make that downstream accumulation
+    /// possible: notice bytes precede the submit bytes in the PTY
+    /// scrollback, and the bytes between them contain only `\n`
+    /// (no `\r`, so no early submit signal is emitted between them).
+    #[tokio::test]
+    async fn write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between() {
+        let registry = AgentPtyRegistry::new();
+        // The shell prints `RAW-READY` *after* stty applies and *before* exec
+        // into cat, so the test can poll the scrollback for that marker and
+        // know the slave's termios is in raw mode before issuing the notice /
+        // submit writes. On slow Linux CI runners a fixed sleep is not enough
+        // — if `\n` lands while OPOST/ONLCR is still active, the kernel
+        // translates it to `\r\n` in the master scrollback and the no-`\r`
+        // assertion below trips on the ONLCR artifact even though the daemon
+        // never emitted a CR.
+        let _id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(
+                    "stty -echo -icanon -icrnl -opost min 1 time 0 && \
+                     printf RAW-READY && exec cat -u",
+                ),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "accumulate".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn raw-mode cat shell");
+        let agent_id = registry.agent_ids()[0].clone();
+
+        // Wait for the shell to apply `stty` and print the readiness marker.
+        // `printf` is a builtin in both bash and dash so no fork is needed
+        // between stty completing and the marker landing, and the marker is
+        // pure alphanumeric+hyphen so OPOST translation does not affect its
+        // appearance even on the off chance stty hadn't applied yet.
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut raw_ready = false;
+        while tokio::time::Instant::now() < ready_deadline {
+            let snap = registry.snapshot(&agent_id).unwrap_or_default();
+            if snap.windows(b"RAW-READY".len()).any(|w| w == b"RAW-READY") {
+                raw_ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            raw_ready,
+            "shell never printed RAW-READY — stty/exec cat -u didn't apply in time"
+        );
+
+        registry
+            .write_to_pane_notice("accumulate", "NOTICE-MARKER")
+            .await
+            .expect("write_to_pane_notice");
+        registry
+            .write_to_pane_and_submit("accumulate", "USER-PROMPT")
+            .await
+            .expect("write_to_pane_and_submit");
+
+        // Master scrollback should contain the exact byte sequence
+        // the daemon wrote: `NOTICE-MARKER\nUSER-PROMPT\r` (raw cat
+        // echoes each input byte verbatim). The substring check is
+        // tolerant of any startup banner the shell emitted before
+        // stty took effect; the ORDER check is what pins the contract.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        let mut last = Vec::new();
+        let mut between_start = 0usize;
+        let mut between_end = 0usize;
+        while tokio::time::Instant::now() < deadline {
+            last = registry.snapshot(&agent_id).unwrap_or_default();
+            let notice_at = last
+                .windows(b"NOTICE-MARKER".len())
+                .position(|w| w == b"NOTICE-MARKER");
+            let prompt_at = last
+                .windows(b"USER-PROMPT".len())
+                .position(|w| w == b"USER-PROMPT");
+            if let (Some(n), Some(p)) = (notice_at, prompt_at)
+                && n < p
+            {
+                between_start = n + b"NOTICE-MARKER".len();
+                between_end = p;
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            found,
+            "scrollback must contain NOTICE-MARKER followed by USER-PROMPT — \
+             proves the daemon delivered notice + submit bytes to the agent's \
+             stdin in order (the prerequisite for the documented accumulation \
+             behavior). Last snapshot: {:?}",
+            String::from_utf8_lossy(&last)
+        );
+
+        // Tighter check: the slice between the end of NOTICE-MARKER and the
+        // start of USER-PROMPT must contain no `\r` byte. Without this, a
+        // regression that swapped `write_to_pane_notice`'s terminator from
+        // `\n` to `\r` would leave both substrings intact and ordered, so
+        // the order check alone would silently pass while the bug existed.
+        let between = &last[between_start..between_end];
+        assert!(
+            !between.contains(&b'\r'),
+            "between NOTICE-MARKER and USER-PROMPT the daemon must only \
+             emit `\\n` (the notice terminator), never `\\r` — a `\\r` here \
+             would be an early submit signal that breaks the accumulation \
+             contract. Bytes between: {:?}",
+            String::from_utf8_lossy(between)
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #92 F9 followup-3: `close_agent` must NOT prune the
+    /// `dispatch_mutexes` entry for the closed agent's `pane_id_env`.
+    /// Pruning was tried in followup-2 and reverted because it
+    /// re-opened the followup-1 race: an in-flight dispatcher holds
+    /// an `Arc<AsyncMutex>` already cloned out of the map, so a fresh
+    /// dispatcher after the close would `or_insert_with` a *different*
+    /// `AsyncMutex` for the same `pane_id_env` and the two would stop
+    /// serializing against each other. This regression test guards
+    /// against a future re-introduction of pruning.
+    #[tokio::test]
+    async fn close_agent_does_not_prune_dispatch_mutex_entry() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "must-not-be-pruned".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn sh");
+        // Populate the dispatch_mutexes entry by borrowing the lock.
+        let arc_before = registry.pane_dispatch_lock("must-not-be-pruned");
+        assert_eq!(
+            registry.dispatch_mutexes.lock().unwrap().len(),
+            1,
+            "lock-borrow must populate dispatch_mutexes"
+        );
+
+        registry.close_agent(&id).expect("close should succeed");
+        assert_eq!(
+            registry.dispatch_mutexes.lock().unwrap().len(),
+            1,
+            "close_agent must NOT prune the dispatch_mutexes entry — \
+             pruning re-opens the followup-1 race where two dispatchers \
+             across a close+respawn end up with different AsyncMutex \
+             instances for the same pane_id_env"
+        );
+
+        // The post-close lookup must return the *same* AsyncMutex
+        // instance the in-flight dispatcher already holds — that's
+        // the whole point of not pruning. Two dispatchers across a
+        // close+respawn must serialize against the same mutex.
+        let arc_after = registry.pane_dispatch_lock("must-not-be-pruned");
+        assert!(
+            Arc::ptr_eq(&arc_before, &arc_after),
+            "post-close pane_dispatch_lock must return the same Arc \
+             so an in-flight dispatcher and a fresh dispatcher hold \
+             the same AsyncMutex instance"
+        );
+
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn registry_write_to_pane_and_submit_routes_to_correct_agent_by_pane_id() {
+        // CodeRabbit MAJOR (PRD #93 round-9) regression guard: with
+        // distinct pane_id_envs, `write_to_pane_and_submit(pane_id,
+        // bytes)` must land in *that* agent's PTY and not leak into a sibling.
+        // Mirrors the production routing path delegate/work-done uses.
+        // We can't easily read PTY bytes from a `/bin/sh` so we
+        // confirm structurally: the registry must contain both agents
+        // and their `pane_id_env`s must be the values we set.
+        let registry = AgentPtyRegistry::new();
+        let id_a = registry
+            .spawn_agent(SpawnOptions {
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-a".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a");
+        let id_b = registry
+            .spawn_agent(SpawnOptions {
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-b".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn b");
+
+        let records = registry.agent_records();
+        let rec_a = records.iter().find(|r| r.id == id_a).unwrap();
+        let rec_b = records.iter().find(|r| r.id == id_b).unwrap();
+        assert_eq!(rec_a.pane_id_env.as_deref(), Some("pane-a"));
+        assert_eq!(rec_b.pane_id_env.as_deref(), Some("pane-b"));
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn registry_close_unknown_errors() {
+        let registry = AgentPtyRegistry::new();
+        assert!(matches!(
+            registry.close_agent("does-not-exist"),
+            Err(AgentPtyError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn registry_assigns_sequential_ids() {
+        let registry = AgentPtyRegistry::new();
+        let id1 = registry.spawn_agent(SpawnOptions::default()).unwrap();
+        let id2 = registry.spawn_agent(SpawnOptions::default()).unwrap();
+        let n1: u64 = id1.parse().unwrap();
+        let n2: u64 = id2.parse().unwrap();
+        assert_eq!(n2, n1 + 1);
+        registry.shutdown_all();
+    }
+
+    /// Returns true if `kill(pid, 0)` reports the process is gone (ESRCH).
+    /// `kill(pid, 0)` performs an existence check without actually signalling.
+    fn pid_is_dead(pid: u32) -> bool {
+        let r = unsafe { libc::kill(pid as i32, 0) };
+        if r == 0 {
+            return false;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        errno == Some(libc::ESRCH)
+    }
+
+    #[test]
+    fn registry_shutdown_all_clears_state() {
+        let registry = AgentPtyRegistry::new();
+        let id1 = registry.spawn_agent(SpawnOptions::default()).unwrap();
+        let id2 = registry.spawn_agent(SpawnOptions::default()).unwrap();
+        assert_eq!(registry.len(), 2);
+
+        // Capture child PIDs so we can verify they're actually gone after
+        // shutdown_all (not just absent from the registry map).
+        let pids: Vec<u32> = {
+            let inner = registry.inner.lock().unwrap();
+            [&id1, &id2]
+                .into_iter()
+                .map(|id| inner.agents.get(id).unwrap().child.process_id().unwrap())
+                .collect()
+        };
+
+        registry.shutdown_all();
+        assert!(registry.is_empty());
+
+        for pid in &pids {
+            assert!(
+                pid_is_dead(*pid),
+                "pid {pid} should be dead after shutdown_all"
+            );
+        }
+
+        // Idempotent.
+        registry.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn live_count_excludes_exited_agent_after_child_dies() {
+        // PRD #93 round-2 reviewer REV-3: the daemon's idle monitor calls
+        // `live_count()` (not `len()`) so an agent whose child exited but
+        // whose registry entry hasn't been removed doesn't pin the daemon
+        // up past its idle window. Test: spawn a command that exits
+        // immediately, wait for the reader thread to observe EOF and set
+        // the `exited` flag, then assert `live_count` is 0 even though
+        // `len` is still 1.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        assert_eq!(registry.len(), 1);
+
+        // Wait up to a few seconds for the reader thread to drain to EOF
+        // and set `exited`. /usr/bin/true exits quickly, but the PTY drain +
+        // OS scheduling can take a couple of hundred ms on a loaded box.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if registry.live_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "registry.live_count must drop to 0 once the child has exited and the reader sees EOF"
+        );
+        assert_eq!(
+            registry.len(),
+            1,
+            "len() still counts the exited entry — only live_count filters"
+        );
+
+        // Cleanup leaves the registry empty so other tests can't observe
+        // the leftover entry via shared global state.
+        registry.close_agent(&id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn change_notify_fires_on_spawn_and_close_and_agent_exit() {
+        // PRD #93 round-2 reviewer REV-1: the registry signals
+        // `change_notify` on spawn, close, and (via pump_reader) when the
+        // child exits. Without these signals an edge-triggered idle
+        // monitor would miss transitions and either fire too early or
+        // never re-arm.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let notify = registry.change_notify();
+
+        // Spawn → must notify.
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("spawn must signal change_notify");
+
+        // Close → must notify.
+        registry.close_agent(&id).expect("close should succeed");
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("close must signal change_notify");
+
+        // Agent dies on its own (no explicit close) → must notify via
+        // pump_reader on EOF.
+        let _id2 = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        // Drain the spawn signal first so we test the exit signal in
+        // isolation. The spawn notify might already have a permit stored.
+        let _ = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
+        // Now wait for the exit signal.
+        tokio::time::timeout(Duration::from_secs(3), notify.notified())
+            .await
+            .expect("agent exit must signal change_notify");
+    }
+
+    #[test]
+    fn registry_drop_kills_agents() {
+        // Constructing-and-dropping a registry with a live agent must not
+        // hang and must terminate the child. We capture the PID before the
+        // registry goes out of scope, then verify the kernel reaped it.
+        let pid: u32;
+        {
+            let registry = AgentPtyRegistry::new();
+            let id = registry.spawn_agent(SpawnOptions::default()).unwrap();
+            pid = registry
+                .inner
+                .lock()
+                .unwrap()
+                .agents
+                .get(&id)
+                .unwrap()
+                .child
+                .process_id()
+                .unwrap();
+        }
+        assert!(pid_is_dead(pid), "pid {pid} should be dead after Drop");
+    }
+
+    #[test]
+    fn child_guard_drop_kills_orphan_child() {
+        // Models the leak scenario the in-`spawn()` ChildGuard now covers:
+        // a child has been spawned, but a *later* fallible step (the real
+        // ones being `take_writer` / `try_clone_reader`) errors out before
+        // the child can be moved into the returned AgentPty. Dropping the
+        // guard on that error path must force-kill and reap the child so
+        // no orphan PID is left behind.
+        let pty_system = NativePtySystem::default();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let cmd = CommandBuilder::new(&default_shell);
+        let child = pair.slave.spawn_command(cmd).expect("spawn should succeed");
+        drop(pair.slave);
+        let pid = child.process_id().expect("child should expose a pid");
+
+        let guard = ChildGuard::new(child);
+        // Drop the master *before* the guard so any PTY I/O the child is
+        // blocked on unblocks before SIGKILL — matching the production
+        // shutdown order.
+        drop(pair.master);
+        drop(guard);
+
+        assert!(
+            pid_is_dead(pid),
+            "pid {pid} should be dead after ChildGuard drop"
+        );
+    }
+
+    #[test]
+    fn spawn_options_env_reaches_child() {
+        // Spawn a shell that exits with a status determined by a value passed
+        // through SpawnOptions::env. If the env var fails to propagate, the
+        // child exits 99 instead of 42 and the assertion below fires.
+        let pty = spawn(SpawnOptions {
+            command: Some("sh -c 'exit ${DOT_AGENT_DECK_PANE_ID:-99}'"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), "42".into())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+        let mut child = pty.child;
+        let status = child.wait().expect("wait should succeed");
+        assert_eq!(
+            status.exit_code(),
+            42,
+            "child did not see DOT_AGENT_DECK_PANE_ID env var"
+        );
+    }
+
+    /// Test mutex covering temporary process-env mutation. `std::env::set_var`
+    /// is process-global, so any test that pokes at the environment must run
+    /// serialized to avoid leaking the value into a sibling test's spawn.
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn spawn_scrubs_via_daemon_env_from_child() {
+        // Set the var on the parent process, then spawn — the child must NOT
+        // see it (this protects against the inheritance footgun where a
+        // daemon launched with DOT_AGENT_DECK_VIA_DAEMON=1 hands the flag to
+        // every agent it spawns, so an agent that shells out to
+        // `dot-agent-deck` would itself try to act as a stream client).
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // SAFETY: tests in this module are serialized by ENV_TEST_LOCK and
+        // we restore the prior value before releasing the lock, so the
+        // process-global env mutation is invisible to other tests.
+        let prior = std::env::var(DOT_AGENT_DECK_VIA_DAEMON).ok();
+        unsafe {
+            std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, "1");
+        }
+
+        // Child exits 0 if the var is absent (the default branch of the
+        // `${VAR:+...}` form); 1 if it inherited the value from the parent.
+        let pty = spawn(SpawnOptions {
+            command: Some("sh -c 'exit ${DOT_AGENT_DECK_VIA_DAEMON:+1}'"),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+        let mut child = pty.child;
+        let status = child.wait().expect("wait should succeed");
+
+        // Restore the prior env state before asserting so a failure doesn't
+        // leak the var into subsequent tests within the same process.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_VIA_DAEMON),
+            }
+        }
+
+        assert_eq!(
+            status.exit_code(),
+            0,
+            "child saw DOT_AGENT_DECK_VIA_DAEMON — agent_pty::spawn must scrub it"
+        );
+    }
+
+    #[test]
+    fn spawn_scrubs_pane_id_env_from_child() {
+        // Mirror of the VIA_DAEMON scrub test for PANE_ID. The footgun: a
+        // daemon spawned as a child of an existing deck pane would inherit
+        // that pane's id and tag every agent it later spawns with the wrong
+        // pane (so hooks would route events to the wrong tab).
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
+        // before the lock is released.
+        let prior = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
+        unsafe {
+            std::env::set_var(DOT_AGENT_DECK_PANE_ID, "stale-pane");
+        }
+
+        // Spawn without setting PANE_ID via opts.env — the child must not
+        // observe the inherited value. Exit 0 if absent, 1 if inherited.
+        let pty = spawn(SpawnOptions {
+            command: Some("sh -c 'exit ${DOT_AGENT_DECK_PANE_ID:+1}'"),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+        let mut child = pty.child;
+        let status = child.wait().expect("wait should succeed");
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_PANE_ID, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_PANE_ID),
+            }
+        }
+
+        assert_eq!(
+            status.exit_code(),
+            0,
+            "child saw inherited DOT_AGENT_DECK_PANE_ID — agent_pty::spawn must scrub it"
+        );
+    }
+
+    #[test]
+    fn spawn_opts_env_overrides_pane_id_scrub() {
+        // The scrub must not clobber a deliberately-supplied PANE_ID via
+        // opts.env — embedded_pane relies on this so daemon-spawned agents
+        // get tagged with the right pane id even when the daemon's own env
+        // happens to carry a stale one.
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
+        // before the lock is released.
+        let prior = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
+        unsafe {
+            std::env::set_var(DOT_AGENT_DECK_PANE_ID, "stale-pane");
+        }
+
+        let pty = spawn(SpawnOptions {
+            command: Some("sh -c 'exit ${DOT_AGENT_DECK_PANE_ID:-99}'"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), "42".into())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+        let mut child = pty.child;
+        let status = child.wait().expect("wait should succeed");
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_PANE_ID, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_PANE_ID),
+            }
+        }
+
+        assert_eq!(
+            status.exit_code(),
+            42,
+            "opts.env PANE_ID was clobbered — scrub must run before opts.env is applied"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #104 M1: daemon stores and reports current PTY dims via
+    // `AgentRecord.rows/cols`. Without these, the client's vt100 parser
+    // initialises every reattached pane at 24×80 and snapshots that were
+    // emitted at a wider geometry get clamped — scrolled-back rows are
+    // permanently corrupted (PRD #104 problem statement).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn agent_record_round_trips_explicit_rows_cols() {
+        let rec = AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 120,
+            cols: 40,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["rows"], 120);
+        assert_eq!(v["cols"], 40);
+        let back: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rows, 120);
+        assert_eq!(back.cols, 40);
+    }
+
+    #[test]
+    fn agent_record_without_rows_cols_fields_deserializes_as_zero() {
+        // Forward compat: an older daemon predating PRD #104 omits these
+        // fields entirely. `#[serde(default)]` makes them decode as 0,
+        // which the hydration path detects and falls back to the 24×80
+        // placeholder for.
+        let legacy_json = r#"{
+            "id": "1",
+            "pane_id_env": null,
+            "display_name": null,
+            "cwd": null
+        }"#;
+        let back: AgentRecord = serde_json::from_str(legacy_json)
+            .expect("older daemon shape must decode via #[serde(default)] on rows/cols");
+        assert_eq!(back.rows, 0);
+        assert_eq!(back.cols, 0);
+    }
+
+    #[test]
+    fn spawn_at_120x40_surfaces_dims_via_agent_records() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                rows: 120,
+                cols: 40,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        let records = registry.agent_records();
+        let rec = records.iter().find(|r| r.id == id).expect("agent missing");
+        assert_eq!(rec.rows, 120);
+        assert_eq!(rec.cols, 40);
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn resize_updates_dims_reported_via_agent_records() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                rows: 24,
+                cols: 80,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        registry
+            .resize(&id, 100, 30)
+            .expect("resize should succeed");
+        let records = registry.agent_records();
+        let rec = records.iter().find(|r| r.id == id).expect("agent missing");
+        assert_eq!(rec.rows, 100);
+        assert_eq!(rec.cols, 30);
+        registry.shutdown_all();
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #104 M3: clearing scrollback on resize. A snapshot returned to
+    // a fresh subscriber always covers a single (rows, cols) epoch.
+    // ---------------------------------------------------------------------
+
+    /// Push `bytes` into `registry`'s agent `id` by writing through the
+    /// PTY master and spinning until the reader thread surfaces `bytes`
+    /// verbatim in the bus's scrollback. Pulled out of
+    /// `resize_clears_scrollback` so the sibling A1 test
+    /// (`resize_with_unchanged_dims_preserves_scrollback`) can reuse it
+    /// without duplicating the spin-and-write boilerplate.
+    ///
+    /// We search for the literal byte run rather than just "snapshot
+    /// grew" because the R2 residual gap (pre-resize `pump_reader`
+    /// bytes that land after `clear_scrollback`) can otherwise make a
+    /// fresh write look stuck behind a stale baseline.
+    fn write_and_wait_for_scrollback(registry: &AgentPtyRegistry, id: &str, bytes: &[u8]) {
+        let writer = {
+            let inner = registry.inner.lock().unwrap();
+            let agent = inner.agents.get(id).expect("agent must exist");
+            agent.writer.clone()
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use std::io::Write as _;
+            let mut w = writer.lock().await;
+            w.write_all(bytes).unwrap();
+            let _ = w.flush();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            let snap = registry.snapshot(id).unwrap();
+            if snap.windows(bytes.len()).any(|w| w == bytes) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let snap = registry.snapshot(id).unwrap();
+        panic!(
+            "test prerequisite: bytes {:?} never surfaced in scrollback within 3s; \
+             current snapshot len={}",
+            String::from_utf8_lossy(bytes),
+            snap.len()
+        );
+    }
+
+    #[test]
+    fn resize_clears_scrollback() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                // Use `cat` so the child stays alive long enough for us
+                // to feed bytes through the master side and observe the
+                // reader thread push them to scrollback.
+                command: Some("/bin/cat"),
+                rows: 24,
+                cols: 80,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        // Write bytes through the agent's writer; the kernel echoes them
+        // back through the master, where pump_reader appends to
+        // `AgentBus::scrollback`. Spin briefly until non-empty so the
+        // test doesn't race the reader thread.
+        write_and_wait_for_scrollback(&registry, &id, b"hello");
+        assert!(
+            !registry.snapshot(&id).unwrap().is_empty(),
+            "test prerequisite: pre-resize snapshot should have echoed bytes"
+        );
+
+        registry
+            .resize(&id, 30, 100)
+            .expect("resize should succeed");
+        assert!(
+            registry.snapshot(&id).unwrap().is_empty(),
+            "resize must drop scrollback so the next subscriber sees a single-epoch snapshot"
+        );
+
+        // Bytes pushed after the resize must repopulate snapshot — the
+        // bus is still functional, only the historical buffer was cleared.
+        write_and_wait_for_scrollback(&registry, &id, b"fresh");
+        assert!(
+            !registry.snapshot(&id).unwrap().is_empty(),
+            "post-resize writes must reach the (cleared) scrollback"
+        );
+
+        registry.shutdown_all();
+    }
+
+    // PRD #104 A1 (auditor): a `resize(id, same_rows, same_cols)` must
+    // be a true no-op — including leaving scrollback untouched. The
+    // UI's per-frame resize sweep calls `resize_pane_pty` on every
+    // unchanged tick, and clearing every time would wipe in-flight
+    // scrollback bytes before a fresh subscriber could observe them.
+    #[test]
+    fn resize_with_unchanged_dims_preserves_scrollback() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                rows: 24,
+                cols: 80,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        write_and_wait_for_scrollback(&registry, &id, b"keep-me");
+        let pre = registry.snapshot(&id).unwrap();
+        assert!(!pre.is_empty(), "test prerequisite: scrollback non-empty");
+
+        // Same dims — must not touch scrollback or any of the registry
+        // bookkeeping that resize would normally refresh.
+        registry
+            .resize(&id, 24, 80)
+            .expect("no-op resize should succeed");
+        let post = registry.snapshot(&id).unwrap();
+        assert_eq!(
+            pre, post,
+            "no-op resize must leave scrollback bytes untouched"
+        );
+        // The captured dims must also match what was already stored —
+        // the no-op path skips the refresh too, but the result is the
+        // same because the values weren't changing in the first place.
+        let records = registry.agent_records();
+        let rec = records.iter().find(|r| r.id == id).expect("agent missing");
+        assert_eq!((rec.rows, rec.cols), (24, 80));
+
+        registry.shutdown_all();
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #104 R3 (reviewer): `pty_rows` / `pty_cols` are now
+    // wire-visible via `AgentRecord`, so the spawn-time capture site
+    // must apply the same `[1, PTY_RESIZE_DIM_MAX]` clamp `resize()`
+    // applies. Without this, a caller-supplied oversized value would
+    // surface to the client unchanged.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn spawn_clamps_oversized_rows_cols_in_captured_dims() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                rows: PTY_RESIZE_DIM_MAX + 1,
+                cols: PTY_RESIZE_DIM_MAX + 100,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should clamp + succeed");
+        let records = registry.agent_records();
+        let rec = records.iter().find(|r| r.id == id).expect("agent missing");
+        assert_eq!(rec.rows, PTY_RESIZE_DIM_MAX);
+        assert_eq!(rec.cols, PTY_RESIZE_DIM_MAX);
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn spawn_at_u16_max_rows_cols_clamps_not_panics() {
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                rows: u16::MAX,
+                cols: u16::MAX,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should clamp u16::MAX cleanly");
+        let records = registry.agent_records();
+        let rec = records.iter().find(|r| r.id == id).expect("agent missing");
+        assert_eq!(rec.rows, PTY_RESIZE_DIM_MAX);
+        assert_eq!(rec.cols, PTY_RESIZE_DIM_MAX);
+        registry.shutdown_all();
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #104 RN1 (reviewer): `AgentRecord.rows/cols` now use
+    // `skip_serializing_if = "is_zero_u16"` so a daemon that hasn't
+    // recorded real dims yet emits the pre-PRD wire shape. The serde
+    // round-trip still has to work for both new (non-zero) and legacy
+    // (zero / absent) cases.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn agent_record_omits_rows_cols_when_zero_on_the_wire() {
+        let rec = AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(
+            !obj.contains_key("rows"),
+            "rows=0 must be omitted from the wire payload so pre-PRD clients keep decoding"
+        );
+        assert!(
+            !obj.contains_key("cols"),
+            "cols=0 must be omitted from the wire payload so pre-PRD clients keep decoding"
+        );
+        // Round-trip via deserialize still produces 0 thanks to
+        // `#[serde(default)]`.
+        let back: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rows, 0);
+        assert_eq!(back.cols, 0);
     }
 }

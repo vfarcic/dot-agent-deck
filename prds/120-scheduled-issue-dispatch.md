@@ -1,10 +1,13 @@
 # PRD #120: Scheduled agent dispatch on open GitHub issues
 
-**Status**: Planning
+**Status**: Planning (blocked on #127)
 **Priority**: Medium
 **Created**: 2026-05-25
 **GitHub Issue**: [#120](https://github.com/vfarcic/dot-agent-deck/issues/120)
+**Depends on**: [#127](https://github.com/vfarcic/dot-agent-deck/issues/127) (general scheduler primitive — provides the cron + spawn primitives this PRD composes), which depends on [#126](https://github.com/vfarcic/dot-agent-deck/issues/126) (agent-driven notifications).
 **Related**: `src/orchestration/`, `.dot-agent-deck.toml`, `src/worktree.rs`, the existing delegate / agent-card lifecycle
+
+> **Scope note (2026-05-25)**: This PRD's original "Phase 1: Scheduler primitive and config" section will be removed/subsumed once #127 lands. The general scheduler (cron primitive + spawn primitive + reuse-by-default tab lifecycle) belongs in #127. What remains in this PRD's scope is the GitHub-specific layer that composes those primitives: repo provisioning (clone/pull), per-issue worktrees, issue enumeration via `gh`, idempotency (worktree-exists + linked-PR check), per-issue dedup keys, and the tab-close → worktree-cleanup hook. The detailed scope below will be revised after #127 merges.
 
 ## Problem Statement
 

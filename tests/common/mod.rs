@@ -1359,6 +1359,67 @@ pub fn write_hook_line(socket: &Path, json_line: &str) -> std::io::Result<()> {
     Err(last_err.unwrap_or_else(|| std::io::Error::other("timed out waiting for hook socket")))
 }
 
+// ---------------------------------------------------------------------------
+// Legacy test helpers
+// ---------------------------------------------------------------------------
+//
+// Carried forward from the pre-M1 `tests/common/mod.rs`. The M1 audit moved
+// the originals into `tmp/legacy-tests/` (Decision 10), but a subset of
+// integration tests on `main` — `tests/daemon_protocol.rs`,
+// `tests/rehydration.rs`, `tests/spawn_time_role_prompt_submit_after_session_start.rs`,
+// `tests/snapshot_replay_dims.rs` — keep calling these helpers via
+// `common::*`. Restored here so the merge with `main` builds. Per the
+// M5+ "absorbed into per-PRD test maintenance" decision, the legacy
+// integration tests are grandfathered until a future PRD refactors
+// them onto the PRD #77 harness.
+//
+// The `dot_agent_deck::daemon::run_daemon_with` lock-root context that
+// drove the original helpers (`flock(2)` over a per-socket `.lock`
+// resolved via `XDG_RUNTIME_DIR` / `$HOME/.cache`) is documented in
+// `tmp/legacy-tests/tests/common/mod.rs`; only the surface those tests
+// import is reproduced here.
+
+use std::os::unix::fs::PermissionsExt as _LegacyPermissionsExt;
+use std::sync::OnceLock;
+
+#[allow(dead_code)]
+static LOCK_DIR_GUARD: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+/// Idempotent setup hook for legacy daemon-spawning tests. Creates the
+/// per-binary lock-dir tempdir on first call; subsequent calls are
+/// no-ops.
+#[allow(dead_code)]
+pub fn init_test_env() {
+    LOCK_DIR_GUARD.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("dot-agent-deck-test-lock-")
+            .tempdir()
+            .expect("create per-binary lock-dir tempdir")
+    });
+}
+
+/// Path to the per-binary lock-dir tempdir, for passing to
+/// `dot_agent_deck::daemon::Daemon::with_lock_dir_override` (in-process
+/// tests) or to `Command::env` for subprocess-based tests. Returns
+/// `None` if [`init_test_env`] was never called.
+#[allow(dead_code)]
+pub fn lock_dir_path() -> Option<PathBuf> {
+    LOCK_DIR_GUARD.get().map(|d| d.path().to_path_buf())
+}
+
+/// Race-safe `tempfile::tempdir()` wrapper: re-applies 0o700 after
+/// creation so the per-test directory survives the daemon's
+/// `bind_socket` umask flip. Mirrors `src/daemon_attach.rs`'s
+/// same-named helper; promoted here so every legacy daemon-spawning
+/// test binary gets the fix without duplicating the workaround.
+#[allow(dead_code)]
+pub fn race_safe_tempdir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("chmod tempdir to 0o700");
+    dir
+}
+
 #[cfg(test)]
 mod harness_unit_tests {
     use super::*;

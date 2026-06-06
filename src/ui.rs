@@ -494,6 +494,46 @@ const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(1
 /// which was tuned empirically — keep the two values in sync.
 const SUBMIT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// PRD #128 Direction B-1 — minimum gap between SessionStart being observed
+/// for the start-role pane and the orchestrator's role prompt being written
+/// into it. Claude Code's `SessionStart` hook fires before its TUI input is
+/// in submit-CR-aware mode on slower environments (remote daemon, weak VM,
+/// scheduler jitter). A CR that arrives during that window is treated as a
+/// newline in the input buffer, not as a submit — the role prompt lands
+/// visibly but never dispatches. Holding the write until this buffer has
+/// elapsed gives Claude Code's TUI enough time to finish booting on those
+/// environments; the gap exists on laptop-local too but is short enough
+/// there that the symptom doesn't reproduce.
+///
+/// 500 ms is tuned to comfortably cover the laptop/remote gap observed
+/// against the M1.1 instrumented build (see PRD #128). Visible to the user
+/// as a brief delay between the orchestration tab opening and the prompt
+/// appearing in the input box; small enough not to feel laggy, large enough
+/// to make the failure mode disappear.
+pub const SPAWN_TIME_READINESS_BUFFER: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// PRD #128 Direction B-1 — returns whether the spawn-time orchestrator
+/// role prompt should fire NOW. Returns `false` if `ready_since` is set
+/// but `SPAWN_TIME_READINESS_BUFFER` hasn't elapsed yet; `true` once it
+/// has. `ready_since == None` means the readiness gate isn't engaged yet
+/// (caller drives that — e.g. the timeout-ready fallback path that
+/// ignores SessionStart and fires after 10 s); the helper returns `true`
+/// in that case so the caller's own gating wins.
+///
+/// Extracted so the policy is unit-testable AND so the integration test
+/// at `tests/spawn_time_role_prompt_submit_after_session_start.rs` can
+/// drive the same gate the TUI loop uses without spinning up the loop
+/// itself.
+pub fn should_inject_spawn_time_prompt(
+    ready_since: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    match ready_since {
+        Some(t) => now.saturating_duration_since(t) >= SPAWN_TIME_READINESS_BUFFER,
+        None => true,
+    }
+}
+
 /// Returns how long the human-typing dispatch should sleep before forwarding
 /// `bytes` to the pane, to ensure an Enter keystroke arrives as a standalone
 /// event rather than fused to recent typing. Returns `Duration::ZERO` unless
@@ -586,6 +626,13 @@ struct UiState {
     orchestration_prompted: HashSet<TabId>,
     /// Tracks when orchestration tabs were created (for delayed prompt injection).
     orchestration_created_at: HashMap<TabId, std::time::Instant>,
+    /// PRD #128 Direction B-1 — tracks the moment SessionStart was first
+    /// observed for each orchestration tab's start-role pane. The role
+    /// prompt is held until `SPAWN_TIME_READINESS_BUFFER` has elapsed
+    /// since this timestamp, giving Claude Code's TUI time to enter
+    /// submit-CR-aware mode on slower environments. Cleared when the
+    /// prompt finally fires (entry never re-added).
+    orchestration_ready_since: HashMap<TabId, std::time::Instant>,
     /// Prompts waiting to be injected into panes once their agent is ready (M5 dispatch).
     pending_dispatches: Vec<PendingDispatch>,
     /// PRD #76 M2.20: timestamp of the most recent keystroke forwarded to a
@@ -649,6 +696,7 @@ impl UiState {
             stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
             orchestration_created_at: HashMap::new(),
+            orchestration_ready_since: HashMap::new(),
             pending_dispatches: Vec::new(),
             last_pane_keystroke_at: None,
         }
@@ -3774,12 +3822,53 @@ pub fn run_tui(
                         .orchestration_created_at
                         .get(id)
                         .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(10));
-                if agent_ready || timeout_ready {
+                // PRD #128 Direction B-1 — record the moment SessionStart
+                // was first observed for this orchestration so the
+                // readiness buffer can be measured from it. The timeout
+                // path bypasses the buffer because by then Claude Code
+                // either fired SessionStart far earlier or never will, so
+                // any further wait would just deepen the user-visible
+                // hang.
+                if agent_ready {
+                    ui.orchestration_ready_since
+                        .entry(*id)
+                        .or_insert_with(std::time::Instant::now);
+                }
+                let buffer_elapsed = if timeout_ready {
+                    true
+                } else {
+                    should_inject_spawn_time_prompt(
+                        ui.orchestration_ready_since.get(id).copied(),
+                        std::time::Instant::now(),
+                    )
+                };
+                if (agent_ready || timeout_ready) && buffer_elapsed {
                     if let Some(prompt) = orchestrator_prompt.take() {
+                        // PRD #128 audit S2: emit a one-shot operator-visible
+                        // log right before the write fires. Distinct target
+                        // from `pane_write` so an operator can flip on the
+                        // buffer trail without also enabling the per-byte
+                        // trace. `debug!` (not `trace!`) because this is an
+                        // operational, once-per-spawn event.
+                        if let Some(rs) = ui.orchestration_ready_since.get(id) {
+                            tracing::debug!(
+                                target: "spawn_time_buffer",
+                                elapsed_ms = rs.elapsed().as_millis() as u64,
+                                pane_id = %start_pane_id,
+                                "spawn-time readiness buffer elapsed; proceeding with role prompt write"
+                            );
+                        }
                         let _ = pane.write_and_submit_to_pane(start_pane_id, &prompt);
                     }
                     role_statuses[*start_role_index] = OrchestrationRoleStatus::Working;
                     ui.orchestration_prompted.insert(*id);
+                    // PRD #128 audit N1: the ready-since timestamp is
+                    // load-bearing only between SessionStart and the
+                    // buffered write. Once the write fires this entry is
+                    // dead state — drop it so the map size matches the
+                    // count of pending orchestration spawns rather than
+                    // accumulating over the session.
+                    ui.orchestration_ready_since.remove(id);
                 }
             }
         }
@@ -7267,51 +7356,6 @@ fn update_idle_art(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dead_slot_pane_id_is_deterministic_per_role() {
-        // Same (cwd, name, role_index) must produce the same id so a
-        // reconnect doesn't keep minting fresh placeholder cards on
-        // every reattach.
-        let a = dead_slot_pane_id("/work", "tdd-cycle", 4);
-        let b = dead_slot_pane_id("/work", "tdd-cycle", 4);
-        assert_eq!(a, b);
-        // Different role_index → different id.
-        let c = dead_slot_pane_id("/work", "tdd-cycle", 3);
-        assert_ne!(a, c);
-        // Different orchestration → different id.
-        let d = dead_slot_pane_id("/work", "other-cycle", 4);
-        assert_ne!(a, d);
-        // is_dead_slot_pane_id accepts the synthesized id and rejects
-        // a normal numeric pane id.
-        assert!(is_dead_slot_pane_id(&a));
-        assert!(!is_dead_slot_pane_id("42"));
-    }
-
-    // Follow-up to 0d5e651 (auditor finding #4): the old format
-    // `__dead-slot__-{cwd}-{name}-{idx}` was ambiguous whenever cwd
-    // or orchestration_name contained hyphens. Two distinct tuples
-    // could produce the same synthetic id, which would then alias
-    // their placeholder sessions. Pin that the length-prefixed format
-    // disambiguates the textbook collision case.
-    #[test]
-    fn dead_slot_pane_id_disambiguates_hyphenated_inputs() {
-        // Under the old `-`-separated form both inputs formatted to
-        // `__dead-slot__-/a-b-c-1`. Under the length-prefixed form
-        // they are guaranteed distinct.
-        let a = dead_slot_pane_id("/a", "b-c", 1);
-        let b = dead_slot_pane_id("/a-b", "c", 1);
-        assert_ne!(
-            a, b,
-            "differently-hyphenated (cwd, orchestration_name) tuples \
-             must produce distinct synthetic ids"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // PRD #77 — L1 harness public surface
 // ---------------------------------------------------------------------------
@@ -7406,4 +7450,4864 @@ pub fn render_card_to_buffer(
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::{AgentEvent, AgentType, EventType};
+    use crate::project_config::OrchestrationRoleConfig;
+    use chrono::{Duration, Utc};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::collections::HashMap;
+    use tempfile::tempdir;
+
+    fn default_ui() -> UiState {
+        UiState::default()
+    }
+
+    // PRD #76 M2.15: pin the layout-math helpers so a future change to the
+    // mode-tab / dashboard render layout can't silently divorce spawn-time
+    // dims from resize-time dims. The helpers are the single source of
+    // truth for both `AgentSpawnOptions.rows/cols` (spawn) and
+    // `resize_pane_pty` (resize); if one diverges from the render, the
+    // agent draws into a mismatched buffer.
+
+    #[test]
+    fn mode_agent_pane_dims_uses_left_half_minus_chrome() {
+        // 80×24 terminal: half_width = 80/2 - 2 = 38; rows = 24 - 3 = 21.
+        // The -2 accounts for the agent pane's borders; the -3 covers tab
+        // bar + hints bar chrome around the mode-tab content area.
+        let (rows, cols) = mode_agent_pane_dims(Rect::new(0, 0, 80, 24));
+        assert_eq!((rows, cols), (21, 38));
+    }
+
+    #[test]
+    fn mode_agent_pane_dims_saturates_on_tiny_viewport() {
+        // height < 3 must not underflow into u16::MAX rows — saturating
+        // arithmetic keeps the inner dims at 0 so `resize_pane_pty`
+        // skips the call (rows == 0) rather than handing the daemon a
+        // pathological dimension.
+        let (rows, cols) = mode_agent_pane_dims(Rect::new(0, 0, 2, 1));
+        assert_eq!((rows, cols), (0, 0));
+    }
+
+    #[test]
+    fn mode_side_pane_dims_divides_height_by_side_count() {
+        // 100×30 terminal with 3 side panes: half_width = 100/2 - 2 = 48,
+        // rows per side = 30/3 - 2 = 8.
+        let (rows, cols) = mode_side_pane_dims(Rect::new(0, 0, 100, 30), 3);
+        assert_eq!((rows, cols), (8, 48));
+    }
+
+    #[test]
+    fn mode_side_pane_dims_clamps_zero_count_to_one() {
+        // side_count == 0 must clamp to 1 to dodge a division-by-zero.
+        let (rows, cols) = mode_side_pane_dims(Rect::new(0, 0, 100, 30), 0);
+        assert_eq!((rows, cols), (28, 48));
+    }
+
+    #[test]
+    fn dashboard_pane_dims_tiled_divides_main_height() {
+        // 100×30 terminal, no tab bar, 2 panes, tiled. main_height = 30-1
+        // (hints bar) = 29; chunk = 29/2 = 14; rows = 14 - 2 = 12.
+        // right_width = 100 * 67 / 100 = 67; cols = 67 - 2 = 65.
+        let (rows, cols) =
+            dashboard_pane_dims(Rect::new(0, 0, 100, 30), 2, false, PaneLayout::Tiled, false);
+        assert_eq!((rows, cols), (12, 65));
+    }
+
+    #[test]
+    fn dashboard_pane_dims_tiled_with_tab_bar_subtracts_chrome() {
+        // Same shape but show_tab_bar=true: chrome_rows = 1, main_height
+        // = 30 - 2 = 28; chunk = 14; rows = 12.
+        let (rows, cols) =
+            dashboard_pane_dims(Rect::new(0, 0, 100, 30), 2, false, PaneLayout::Tiled, true);
+        assert_eq!((rows, cols), (12, 65));
+    }
+
+    #[test]
+    fn dashboard_pane_dims_stacked_focused_takes_remainder() {
+        // 100×30, 3 panes, stacked, focused: unfocused = 2; main = 29;
+        // chunk = 29 - 2 = 27; rows = 25. The other two panes collapse
+        // to 1-row title bars (next assertion).
+        let (rows, cols) = dashboard_pane_dims(
+            Rect::new(0, 0, 100, 30),
+            3,
+            true,
+            PaneLayout::Stacked,
+            false,
+        );
+        assert_eq!((rows, cols), (25, 65));
+    }
+
+    #[test]
+    fn dashboard_pane_dims_stacked_unfocused_collapses_to_title_bar() {
+        // Unfocused in stacked mode: chunk = 1; rows = saturating_sub(2) = 0.
+        // `resize_pane_pty` callers gate on rows > 0, so this just signals
+        // "don't bother dispatching a resize for this pane right now."
+        let (rows, _cols) = dashboard_pane_dims(
+            Rect::new(0, 0, 100, 30),
+            3,
+            false,
+            PaneLayout::Stacked,
+            false,
+        );
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn dashboard_pane_dims_zero_pane_count_does_not_divide_by_zero() {
+        // Edge case: pane_count = 0 (the very first pane is about to be
+        // added). Clamp to 1 so the math produces a sane value instead
+        // of a panic / overflow.
+        let (rows, cols) =
+            dashboard_pane_dims(Rect::new(0, 0, 100, 30), 0, false, PaneLayout::Tiled, false);
+        assert_eq!((rows, cols), (27, 65));
+    }
+
+    // PRD #76 M2.15 fixup F3 — pin the orchestration helper's geometry to
+    // the orchestration renderer's `[34%, 66%]` split. Before this helper
+    // existed, every spawn / resize site for orchestration role panes
+    // routed through `dashboard_pane_dims` (67%), so the daemon-side PTY
+    // ran one column wider than the rendered area.
+
+    #[test]
+    fn orchestration_role_pane_dims_uses_right_66_percent_width() {
+        // 100×30 terminal, no tab bar, 2 roles, tiled. main_height = 30-1
+        // (hints bar) = 29; chunk = 29/2 = 14; rows = 12. right_width =
+        // 100 * 66 / 100 = 66; cols = 64. Critical assertion: cols = 64,
+        // NOT 65 (which is what `dashboard_pane_dims` would return for
+        // the same input). The 1-col gap is exactly the F3 drift bug.
+        let (rows, cols) = orchestration_role_pane_dims(
+            Rect::new(0, 0, 100, 30),
+            2,
+            0,
+            None,
+            PaneLayout::Tiled,
+            false,
+        );
+        assert_eq!((rows, cols), (12, 64));
+    }
+
+    #[test]
+    fn orchestration_role_pane_dims_matches_renderer_constants() {
+        // Drift guard: the helper's width and the renderer's
+        // `Layout::horizontal([ORCHESTRATION_LEFT_PERCENT, ORCHESTRATION_PANES_PERCENT])`
+        // must produce the same right-column width by construction.
+        // Without this, a future tweak to one but not the other silently
+        // re-introduces the F3 spawn-vs-render drift.
+        let area = Rect::new(0, 0, 200, 50);
+        let (_rows, helper_cols) =
+            orchestration_role_pane_dims(area, 3, 0, None, PaneLayout::Tiled, false);
+        // Inner cols = right-column width - 2 (pane borders).
+        let renderer_cols = (area.width * ORCHESTRATION_PANES_PERCENT / 100).saturating_sub(2);
+        assert_eq!(helper_cols, renderer_cols);
+        // Sanity: dashboard helper differs because of the 67 vs 66 split.
+        let dashboard_renderer_cols =
+            (area.width * DASHBOARD_PANES_PERCENT / 100).saturating_sub(2);
+        assert_ne!(renderer_cols, dashboard_renderer_cols);
+    }
+
+    #[test]
+    fn orchestration_role_pane_dims_tiled_divides_height_equally() {
+        // 4 roles, Tiled: every role_index returns the same dims.
+        let area = Rect::new(0, 0, 100, 30);
+        let r0 = orchestration_role_pane_dims(area, 4, 0, None, PaneLayout::Tiled, true);
+        let r1 = orchestration_role_pane_dims(area, 4, 1, None, PaneLayout::Tiled, true);
+        let r2 = orchestration_role_pane_dims(area, 4, 2, None, PaneLayout::Tiled, true);
+        let r3 = orchestration_role_pane_dims(area, 4, 3, None, PaneLayout::Tiled, true);
+        assert_eq!(r0, r1);
+        assert_eq!(r1, r2);
+        assert_eq!(r2, r3);
+    }
+
+    #[test]
+    fn orchestration_role_pane_dims_stacked_role_zero_expands() {
+        // In Stacked mode with no focused role, role_index 0 mirrors
+        // the renderer's "expand the first slot if nothing is focused"
+        // fallback (see `render_terminal_panes` Stacked branch). Role
+        // 0 gets the lion's share; others collapse to the 1-row
+        // sentinel that resize callers gate on (`rows > 0` skips the
+        // resize).
+        let area = Rect::new(0, 0, 100, 30);
+        let (rows_focused, _) =
+            orchestration_role_pane_dims(area, 3, 0, None, PaneLayout::Stacked, false);
+        let (rows_unfocused, _) =
+            orchestration_role_pane_dims(area, 3, 1, None, PaneLayout::Stacked, false);
+        assert!(rows_focused > rows_unfocused);
+        assert_eq!(rows_unfocused, 0);
+    }
+
+    // PRD #76 M2.15 fixup pass 2 G2 — pin the focus-aware behavior so a
+    // future refactor of `orchestration_role_pane_dims` can't silently
+    // re-introduce the "role 0 hardcoded as expanded" bug.
+
+    #[test]
+    fn orchestration_role_pane_dims_stacked_expands_focused_non_zero_role() {
+        // The reviewer R1 / fixup-pass-2 G2 bug: when the focused role
+        // is non-zero, the resize sweep must expand THAT role's PTY,
+        // not role 0. Pre-fix, the helper hardcoded role_index==0 as
+        // expanded, so a focused non-zero role got the collapsed (1
+        // row → 0 inner rows after border) height while role 0 got
+        // the lion's share. With `focused_role_index=Some(2)`, the
+        // helper must give role 2 the expanded rows and role 0 the
+        // collapsed sentinel.
+        let area = Rect::new(0, 0, 100, 30);
+        let (r0_rows, _) =
+            orchestration_role_pane_dims(area, 3, 0, Some(2), PaneLayout::Stacked, false);
+        let (r1_rows, _) =
+            orchestration_role_pane_dims(area, 3, 1, Some(2), PaneLayout::Stacked, false);
+        let (r2_rows, _) =
+            orchestration_role_pane_dims(area, 3, 2, Some(2), PaneLayout::Stacked, false);
+        assert_eq!(r0_rows, 0, "role 0 must collapse when role 2 is focused");
+        assert_eq!(r1_rows, 0, "role 1 must collapse when role 2 is focused");
+        assert!(
+            r2_rows > 0,
+            "focused role must receive the expanded rows, got {r2_rows}"
+        );
+        // The focused row count must match what role 0 would have
+        // received under the no-focus fallback — i.e. swapping which
+        // slot is expanded, not changing the geometry.
+        let (rows_when_role0_expanded, _) =
+            orchestration_role_pane_dims(area, 3, 0, None, PaneLayout::Stacked, false);
+        assert_eq!(
+            r2_rows, rows_when_role0_expanded,
+            "focused role's expanded rows must equal the no-focus role-0 expansion"
+        );
+    }
+
+    #[test]
+    fn orchestration_role_pane_dims_tiled_ignores_focused_role_index() {
+        // Tiled layout divides height equally across all roles, so
+        // `focused_role_index` must be a geometric no-op there.
+        let area = Rect::new(0, 0, 100, 30);
+        let none_dims = orchestration_role_pane_dims(area, 3, 1, None, PaneLayout::Tiled, false);
+        let focused_self =
+            orchestration_role_pane_dims(area, 3, 1, Some(1), PaneLayout::Tiled, false);
+        let focused_other =
+            orchestration_role_pane_dims(area, 3, 1, Some(2), PaneLayout::Tiled, false);
+        assert_eq!(none_dims, focused_self);
+        assert_eq!(none_dims, focused_other);
+    }
+
+    #[test]
+    fn orchestration_role_pane_dims_matches_renderer_when_focused_role_nonzero() {
+        // Extended drift guard (fixup pass 2 G2): the helper's
+        // expanded-row height for a focused role must equal the
+        // renderer's expanded height for the same slot. The renderer
+        // gives the focused slot `Constraint::Fill(1)` after carving
+        // 1-row title bars off the other (count-1) slots — i.e. the
+        // expanded inner height = main_height - (count-1) - 2 (border).
+        let area = Rect::new(0, 0, 200, 50);
+        let role_count: u16 = 4;
+        let chrome_rows: u16 = 1; // hints bar; no tab bar in this test
+        let main_height = area.height.saturating_sub(chrome_rows);
+        let expanded_outer = main_height.saturating_sub(role_count - 1);
+        let expanded_inner = expanded_outer.saturating_sub(2);
+        let (helper_rows, _) = orchestration_role_pane_dims(
+            area,
+            role_count as usize,
+            2,
+            Some(2),
+            PaneLayout::Stacked,
+            false,
+        );
+        assert_eq!(helper_rows, expanded_inner);
+    }
+
+    #[test]
+    fn orchestration_role_pane_dims_zero_role_count_does_not_divide_by_zero() {
+        // Defensive: role_count = 0 (transient state during a tab
+        // teardown). Clamp to 1 so the helper returns a sane value.
+        let (rows, cols) = orchestration_role_pane_dims(
+            Rect::new(0, 0, 100, 30),
+            0,
+            0,
+            None,
+            PaneLayout::Tiled,
+            false,
+        );
+        // main_height = 29, count = 1, chunk = 29, rows = 27.
+        // right_width = 66, cols = 64.
+        assert_eq!((rows, cols), (27, 64));
+    }
+
+    // PRD #76 M2.12: pin the hydration partition's bucket semantics so
+    // a future tweak to `partition_hydrated_panes` can't silently strand
+    // mode/orchestration panes on the dashboard or double-build a tab.
+
+    fn hydrated(
+        pane_id: &str,
+        agent_id: &str,
+        cwd: Option<&str>,
+        membership: Option<TabMembership>,
+    ) -> HydratedPane {
+        HydratedPane {
+            pane_id: pane_id.to_string(),
+            agent_id: agent_id.to_string(),
+            display_name: None,
+            cwd: cwd.map(|s| s.to_string()),
+            tab_membership: membership,
+            agent_type: None,
+        }
+    }
+
+    #[test]
+    fn partition_routes_dashboard_panes_unchanged() {
+        let panes = vec![
+            hydrated("1", "a-1", Some("/work"), None),
+            hydrated("2", "a-2", None, None),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.dashboard_pane_ids, vec!["1".to_string(), "2".to_string()]);
+        assert!(p.mode_buckets.is_empty());
+        assert!(p.orchestration_buckets.is_empty());
+    }
+
+    /// Round-10 reviewer #2: two saved panes that share
+    /// `(dir, name, mode)` must NOT both be dropped when only one was
+    /// hydrated. The pre-round-10 `HashSet` dedupe collapsed both;
+    /// the count-based budget drops at most one per match.
+    #[test]
+    fn dedupe_drops_only_count_matched_saved_panes() {
+        use config::SavedPane;
+        let mut metadata: HashMap<String, SavedPane> = HashMap::new();
+        // One hydrated dashboard pane with (dir=/w, name=foo, mode=None).
+        metadata.insert(
+            "pane-1".into(),
+            SavedPane {
+                dir: "/w".into(),
+                name: "foo".into(),
+                command: String::new(),
+                mode: None,
+            },
+        );
+        let mut budget = build_dedupe_budget(&metadata);
+
+        let saved_a = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: "vim".into(),
+            mode: None,
+        };
+        let saved_b = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: "tail -f log".into(),
+            mode: None,
+        };
+
+        // First saved pane matches the hydrated → consumed.
+        assert!(try_consume_dedupe_slot(&mut budget, &saved_a));
+        // Second saved pane shares the key but the budget is exhausted → restored.
+        assert!(!try_consume_dedupe_slot(&mut budget, &saved_b));
+    }
+
+    #[test]
+    fn dedupe_distinguishes_mode_panes_from_dashboard() {
+        use config::SavedPane;
+        let mut metadata: HashMap<String, SavedPane> = HashMap::new();
+        metadata.insert(
+            "pane-1".into(),
+            SavedPane {
+                dir: "/w".into(),
+                name: "foo".into(),
+                command: String::new(),
+                mode: Some("k8s-ops".into()),
+            },
+        );
+        let mut budget = build_dedupe_budget(&metadata);
+
+        // Same (dir, name) but different mode — must NOT dedupe.
+        let saved_dashboard = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: "vim".into(),
+            mode: None,
+        };
+        assert!(!try_consume_dedupe_slot(&mut budget, &saved_dashboard));
+
+        // Matching mode → DEDUPED.
+        let saved_mode = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: String::new(),
+            mode: Some("k8s-ops".into()),
+        };
+        assert!(try_consume_dedupe_slot(&mut budget, &saved_mode));
+    }
+
+    #[test]
+    fn dedupe_restores_saved_panes_when_daemon_empty() {
+        use config::SavedPane;
+        // No hydrated metadata (daemon restarted, hydration returned
+        // empty). The saved-session file is the only source of truth;
+        // every saved pane must restore.
+        let metadata: HashMap<String, SavedPane> = HashMap::new();
+        let mut budget = build_dedupe_budget(&metadata);
+
+        let saved = SavedPane {
+            dir: "/w".into(),
+            name: "foo".into(),
+            command: "vim".into(),
+            mode: None,
+        };
+        assert!(!try_consume_dedupe_slot(&mut budget, &saved));
+    }
+
+    #[test]
+    fn partition_groups_mode_membership_by_cwd_and_name() {
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/work"),
+                Some(TabMembership::Mode {
+                    name: "k8s-ops".into(),
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/work2"),
+                Some(TabMembership::Mode {
+                    name: "k8s-ops".into(),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert!(p.dashboard_pane_ids.is_empty());
+        assert_eq!(p.mode_buckets.len(), 2);
+        assert_eq!(p.mode_buckets[0].cwd, "/work");
+        assert_eq!(p.mode_buckets[0].mode_name, "k8s-ops");
+        assert_eq!(p.mode_buckets[0].agent_pane_id, "1");
+        assert_eq!(p.mode_buckets[1].cwd, "/work2");
+        assert_eq!(p.mode_buckets[1].agent_pane_id, "2");
+    }
+
+    #[test]
+    fn partition_duplicate_mode_bucket_drops_extras_to_dashboard() {
+        // Two agents claim the same (cwd, mode_name) — that's a logic
+        // error (mode tabs have one agent each), so the first wins and
+        // the rest end up on the dashboard rather than getting a doubled
+        // mode tab. M2.12 fixup reviewer #3: the helper is pure, so the
+        // duplicate is surfaced via `rejections` for the caller to log.
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/work"),
+                Some(TabMembership::Mode {
+                    name: "k8s-ops".into(),
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/work"),
+                Some(TabMembership::Mode {
+                    name: "k8s-ops".into(),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.mode_buckets.len(), 1);
+        assert_eq!(p.mode_buckets[0].agent_pane_id, "1");
+        assert_eq!(p.dashboard_pane_ids, vec!["2".to_string()]);
+        assert_eq!(
+            p.rejections,
+            vec![HydrationRejection::DuplicateMode {
+                cwd: "/work".into(),
+                mode_name: "k8s-ops".into(),
+                agent_id: "a-2".into(),
+                pane_id: "2".into(),
+            }]
+        );
+    }
+
+    /// Round-12 reviewer #1: a 3-role orchestration whose workers
+    /// have distinct per-pane cwds (round-9 #2 allows this) must
+    /// hydrate into ONE orchestration bucket, not three. The bucket
+    /// key is `(orchestration_cwd, name)` — shared across roles.
+    #[test]
+    fn partition_buckets_orchestration_by_orchestration_cwd_not_per_pane_cwd() {
+        let orch_cwd = "/proj".to_string();
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some(orch_cwd.clone()),
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/proj/sub-a"), // worker's own cwd diverges
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 1,
+                    role_name: "coder".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(orch_cwd.clone()),
+                }),
+            ),
+            hydrated(
+                "3",
+                "a-3",
+                Some("/proj/sub-b"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 2,
+                    role_name: "reviewer".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(orch_cwd.clone()),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(
+            p.orchestration_buckets.len(),
+            1,
+            "all three roles share the same orchestration_cwd → one bucket"
+        );
+        let bucket = &p.orchestration_buckets[0];
+        assert_eq!(bucket.cwd, orch_cwd);
+        assert_eq!(bucket.orchestration_name, "tdd-cycle");
+        assert_eq!(bucket.role_slots.len(), 3);
+    }
+
+    /// Negative-case mirror of the above: two panes with the same
+    /// orchestration name but distinct orchestration_cwds must end
+    /// up in DIFFERENT buckets — the round-11 #C collision-fix
+    /// invariant carried through the hydration partition.
+    #[test]
+    fn partition_separates_orchestrations_by_orchestration_cwd_not_pane_cwd() {
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/shared"), // same per-pane cwd
+                Some(TabMembership::Orchestration {
+                    name: "foo".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/home/u/project-a".into()),
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/shared"), // same per-pane cwd — would collide on old key
+                Some(TabMembership::Orchestration {
+                    name: "foo".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/home/u/project-b".into()),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(
+            p.orchestration_buckets.len(),
+            2,
+            "distinct orchestration_cwds must split into distinct buckets"
+        );
+    }
+
+    /// Legacy data path: a pre-round-11 daemon emits orchestration
+    /// panes with no `orchestration_cwd`. Partition must still
+    /// produce reasonable buckets (falls back to per-pane cwd) so
+    /// reattach against an older daemon doesn't strand panes.
+    #[test]
+    fn partition_falls_back_to_per_pane_cwd_when_orchestration_cwd_missing() {
+        let panes = vec![hydrated(
+            "1",
+            "a-1",
+            Some("/legacy-work"),
+            Some(TabMembership::Orchestration {
+                name: "tdd-cycle".into(),
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+                orchestration_cwd: None,
+            }),
+        )];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.orchestration_buckets.len(), 1);
+        assert_eq!(p.orchestration_buckets[0].cwd, "/legacy-work");
+    }
+
+    #[test]
+    fn partition_collects_orchestration_role_slots() {
+        let panes = vec![
+            hydrated(
+                "10",
+                "a-10",
+                Some("/work"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                    role_name: String::new(),
+                    is_start_role: false,
+                    orchestration_cwd: None,
+                }),
+            ),
+            hydrated(
+                "11",
+                "a-11",
+                Some("/work"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 2,
+                    role_name: String::new(),
+                    is_start_role: false,
+                    orchestration_cwd: None,
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.orchestration_buckets.len(), 1);
+        let bucket = &p.orchestration_buckets[0];
+        assert_eq!(bucket.cwd, "/work");
+        assert_eq!(bucket.orchestration_name, "tdd-cycle");
+        assert_eq!(bucket.role_slots.len(), 2);
+        assert!(bucket.role_slots.iter().any(|s| s.role_index == 0
+            && s.pane_id == "10"
+            && s.role_name.is_empty()
+            && !s.is_start_role));
+        assert!(bucket.role_slots.iter().any(|s| s.role_index == 2
+            && s.pane_id == "11"
+            && s.role_name.is_empty()
+            && !s.is_start_role));
+    }
+
+    // Symptom 2 (`.dot-agent-deck/agent-card-lifecycle-bugs.md`):
+    // when an orchestration role's daemon agent dies (e.g., a
+    // `clear = false` release agent that finishes its workflow and
+    // exits cleanly), the hydration bucket loses that slot. Pre-fix
+    // the role just disappeared from the rebuilt orchestration tab.
+    // `fill_dead_slots_with_placeholders` is the bridge: it stamps a
+    // synthetic id onto every `None` slot and seeds a placeholder
+    // session so every role in the config keeps its dashboard card.
+    #[test]
+    fn fill_dead_slots_replaces_none_with_synthetic_id_and_seeds_placeholder() {
+        use crate::state::AppState;
+
+        let mut state = AppState::default();
+        // 5 roles, only 4 hydrated agents — the LAST role (role_index 4,
+        // the `release`-style slot) is the dead one. This mirrors the
+        // production scenario described in the bug task: the `release`
+        // role is the last in `.dot-agent-deck.toml` and the only one
+        // with `clear = false`, so it's the one most likely to be
+        // missing on reconnect.
+        let mut slots: Vec<Option<String>> = vec![
+            Some("p-orch".to_string()),
+            Some("p-coder".to_string()),
+            Some("p-reviewer".to_string()),
+            Some("p-auditor".to_string()),
+            None,
+        ];
+        fill_dead_slots_with_placeholders(&mut slots, "/work", "tdd-cycle", &mut state);
+
+        assert!(
+            slots.iter().all(Option::is_some),
+            "every slot must be filled"
+        );
+        let dead_id = slots[4].as_deref().unwrap();
+        assert!(
+            is_dead_slot_pane_id(dead_id),
+            "dead slot must carry a synthetic id; got {dead_id:?}"
+        );
+        // Live slots untouched.
+        assert_eq!(slots[0].as_deref(), Some("p-orch"));
+        assert_eq!(slots[1].as_deref(), Some("p-coder"));
+        // Placeholder session exists for the dead slot, with
+        // agent_type=None so it renders as "No agent" in the card grid.
+        let dead_session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some(dead_id))
+            .expect("dead-slot placeholder session must be seeded");
+        assert_eq!(
+            dead_session.agent_type,
+            AgentType::None,
+            "dead-slot placeholder must render as 'No agent'"
+        );
+        assert_eq!(dead_session.agent_id, None);
+    }
+
+    #[test]
+    fn dead_slot_pane_id_is_deterministic_per_role() {
+        // Same (cwd, name, role_index) must produce the same id so a
+        // reconnect doesn't keep minting fresh placeholder cards on
+        // every reattach.
+        let a = dead_slot_pane_id("/work", "tdd-cycle", 4);
+        let b = dead_slot_pane_id("/work", "tdd-cycle", 4);
+        assert_eq!(a, b);
+        // Different role_index → different id.
+        let c = dead_slot_pane_id("/work", "tdd-cycle", 3);
+        assert_ne!(a, c);
+        // Different orchestration → different id.
+        let d = dead_slot_pane_id("/work", "other-cycle", 4);
+        assert_ne!(a, d);
+        // is_dead_slot_pane_id accepts the synthesized id and rejects
+        // a normal numeric pane id.
+        assert!(is_dead_slot_pane_id(&a));
+        assert!(!is_dead_slot_pane_id("42"));
+    }
+
+    // Follow-up to 0d5e651 (auditor finding #4): the old format
+    // `__dead-slot__-{cwd}-{name}-{idx}` was ambiguous whenever cwd
+    // or orchestration_name contained hyphens. Two distinct tuples
+    // could produce the same synthetic id, which would then alias
+    // their placeholder sessions. Pin that the length-prefixed format
+    // disambiguates the textbook collision case.
+    #[test]
+    fn dead_slot_pane_id_disambiguates_hyphenated_inputs() {
+        // Under the old `-`-separated form both inputs formatted to
+        // `__dead-slot__-/a-b-c-1`. Under the length-prefixed form
+        // they are guaranteed distinct.
+        let a = dead_slot_pane_id("/a", "b-c", 1);
+        let b = dead_slot_pane_id("/a-b", "c", 1);
+        assert_ne!(
+            a, b,
+            "differently-hyphenated (cwd, orchestration_name) tuples \
+             must produce distinct synthetic ids"
+        );
+    }
+
+    #[test]
+    fn fill_dead_slots_is_idempotent_across_repeat_calls() {
+        // Reconnect runs hydration again — calling
+        // `fill_dead_slots_with_placeholders` on already-filled slots
+        // must not change them and must not double-seed the
+        // placeholder session.
+        //
+        // Follow-up to 0d5e651 (reviewer finding #7): the original
+        // comment claimed the helper "overwrites the existing entry
+        // under the same session id" on the second pass. That's
+        // wrong — the helper's body SKIPS slots where `slot.is_some()`,
+        // so `insert_placeholder_session` is never re-invoked. The
+        // count stays at 1 because the synthetic slot is already
+        // filled on the second pass.
+        use crate::state::AppState;
+
+        let mut state = AppState::default();
+        let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
+        fill_dead_slots_with_placeholders(&mut slots, "/work", "tdd-cycle", &mut state);
+        let first_dead = slots[1].clone().unwrap();
+        let placeholder_count_first = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref().is_some_and(is_dead_slot_pane_id))
+            .count();
+        // Second pass — same input shape (slots are already filled,
+        // so the helper short-circuits on each iteration).
+        fill_dead_slots_with_placeholders(&mut slots, "/work", "tdd-cycle", &mut state);
+        let placeholder_count_second = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref().is_some_and(is_dead_slot_pane_id))
+            .count();
+        assert_eq!(slots[1].as_deref(), Some(first_dead.as_str()));
+        assert_eq!(placeholder_count_first, 1);
+        assert_eq!(placeholder_count_second, 1);
+    }
+
+    // Follow-up to 0d5e651 (reviewer finding #7): a more realistic
+    // idempotency scenario than the one above. A real
+    // disconnect/reconnect loop rebuilds `role_pane_ids` from scratch
+    // every time `hydrate_from_daemon` runs — the slot for a dead
+    // role is `None` again, not pre-filled. Verify that running the
+    // helper twice in a row (with the slot reset between calls)
+    // produces the SAME synthetic id (because `dead_slot_pane_id` is
+    // deterministic in `(cwd, name, role_index)`) and that
+    // `insert_placeholder_session` reuses the same `pane-{synthetic}`
+    // session key so only one placeholder ever exists for the slot.
+    #[test]
+    fn fill_dead_slots_produces_stable_id_across_reconnect_rebuilds() {
+        use crate::state::AppState;
+
+        let mut state = AppState::default();
+        let cwd = "/work";
+        let orchestration_name = "tdd-cycle";
+
+        // First reconnect: dead role at index 1.
+        let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
+        fill_dead_slots_with_placeholders(&mut slots, cwd, orchestration_name, &mut state);
+        let first_dead = slots[1].clone().unwrap();
+
+        // Second reconnect: hydration rebuilt `role_pane_ids` from
+        // scratch — the dead role's slot is `None` again. Run the
+        // helper a second time.
+        let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
+        fill_dead_slots_with_placeholders(&mut slots, cwd, orchestration_name, &mut state);
+        let second_dead = slots[1].clone().unwrap();
+
+        // The synthetic id is deterministic, so both reconnect
+        // attempts produce the same id …
+        assert_eq!(first_dead, second_dead);
+        // … and the placeholder session is keyed on
+        // `pane-{synthetic}`, so a second `insert_placeholder_session`
+        // call reuses the existing entry rather than spawning a
+        // sibling. Exactly one dead-slot session must exist.
+        let dead_session_count = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref().is_some_and(is_dead_slot_pane_id))
+            .count();
+        assert_eq!(
+            dead_session_count, 1,
+            "repeated reconnect loops must not accumulate dead-slot \
+             placeholder sessions; got {dead_session_count}"
+        );
+    }
+
+    // CodeRabbit PR #118 finding #3: the production hydration loop
+    // splits dead-slot pane-id assignment from placeholder-session
+    // seeding, so `open_orchestration_tab_with_existing_role_panes`'s
+    // Err arm doesn't orphan placeholder sessions in `AppState`. Pin
+    // the contract that `assign_synthetic_dead_slot_ids` is pure (no
+    // state mutation) — that's the prerequisite for the deferred-seed
+    // pattern at `src/ui.rs::hydrate_from_daemon`.
+    #[test]
+    fn assign_synthetic_dead_slot_ids_does_not_mutate_state() {
+        use crate::state::AppState;
+
+        let state = AppState::default();
+        let mut slots: Vec<Option<String>> = vec![
+            Some("p-live".to_string()),
+            None,
+            Some("p-other".to_string()),
+            None,
+        ];
+        let assigned = assign_synthetic_dead_slot_ids(&mut slots, "/work", "tdd-cycle");
+        assert_eq!(
+            assigned.len(),
+            2,
+            "the two `None` slots must each yield a synthetic id"
+        );
+        assert!(assigned.iter().all(|id| is_dead_slot_pane_id(id)));
+        // Slots reflect the assignment …
+        assert_eq!(slots[1].as_deref(), Some(assigned[0].as_str()));
+        assert_eq!(slots[3].as_deref(), Some(assigned[1].as_str()));
+        // … but `AppState` is untouched. The split-phase pattern relies
+        // on this so a tab-open `Err` cannot leak placeholder sessions.
+        assert!(
+            state.sessions.is_empty(),
+            "assign_synthetic_dead_slot_ids must be pure; sessions={:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // CodeRabbit PR #118 finding #3: when
+    // `open_orchestration_tab_with_existing_role_panes` returns Err
+    // (e.g., `MismatchedRoleCount` from a malformed daemon record),
+    // the hydration loop must not leave orphaned placeholder sessions
+    // behind for the synthetic dead-slot ids it just minted. The fix
+    // defers `insert_placeholder_session` calls into the `Ok` arm
+    // only; the `Err` arm is a no-op for `AppState`. This test pins
+    // that contract by replaying the production sequence end-to-end.
+    #[test]
+    fn dead_slot_placeholders_not_seeded_when_tab_open_fails() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        use crate::state::AppState;
+
+        fn mk_role(name: &str, start: bool) -> OrchestrationRoleConfig {
+            OrchestrationRoleConfig {
+                name: name.to_string(),
+                command: String::new(),
+                start,
+                description: None,
+                prompt_template: None,
+                clear: true,
+            }
+        }
+
+        let state = AppState::default();
+        let cfg = OrchestrationConfig {
+            name: "tdd-cycle".into(),
+            roles: vec![
+                mk_role("orch", true),
+                mk_role("coder", false),
+                mk_role("release", false),
+            ],
+        };
+
+        // Bucket-driven shape: roles 0 + 1 alive, role 2 dead.
+        let mut role_pane_ids: Vec<Option<String>> =
+            vec![Some("p-orch".into()), Some("p-coder".into()), None];
+
+        // Phase 1 (production hydration): mint synthetic ids for the
+        // dead slot. State must remain untouched.
+        let synthetic_ids =
+            assign_synthetic_dead_slot_ids(&mut role_pane_ids, "/work", "tdd-cycle");
+        assert_eq!(synthetic_ids.len(), 1, "exactly the role 2 slot is dead");
+        assert!(state.sessions.is_empty(), "phase 1 must not seed sessions");
+
+        // Force the tab-open Err by passing a length-mismatched vec.
+        // In production this is unreachable (the vec is built from
+        // `cfg.roles.len()`); the Err arm exists defensively for
+        // malformed daemon records and future-caller bugs. This is
+        // what we want to pin: even on Err, no orphan sessions.
+        struct NoopPC;
+        impl crate::pane::PaneController for NoopPC {
+            fn create_pane(
+                &self,
+                _cmd: Option<&str>,
+                _cwd: Option<&str>,
+            ) -> Result<String, crate::pane::PaneError> {
+                Ok(String::new())
+            }
+            fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn rename_pane(
+                &self,
+                _id: &str,
+                name: &str,
+            ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+                Ok(crate::pane::RenameOutcome::applied(name))
+            }
+            fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+                Ok(Vec::new())
+            }
+            fn resize_pane(
+                &self,
+                _id: &str,
+                _direction: crate::pane::PaneDirection,
+                _amount: u16,
+            ) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let mut tm = crate::tab::TabManager::new(Arc::new(NoopPC));
+        let mut bad_vec = role_pane_ids.clone();
+        bad_vec.truncate(role_pane_ids.len() - 1);
+        let result = tm.open_orchestration_tab_with_existing_role_panes(&cfg, "/work", bad_vec);
+        assert!(
+            result.is_err(),
+            "test precondition: mismatched-length role_pane_ids must Err"
+        );
+
+        // Phase 2 (production hydration `Ok` arm) was deliberately
+        // skipped because of the Err. The `Err` arm is a no-op for
+        // `AppState`, so no synthetic placeholder must remain.
+        let leaked: Vec<String> = state
+            .sessions
+            .keys()
+            .filter(|k| is_dead_slot_pane_id(k))
+            .cloned()
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "tab-open Err must not leave orphan placeholder sessions; got {leaked:?}"
+        );
+        // And the synthetic ids we minted should be gone from state
+        // entirely — `assign_synthetic_dead_slot_ids` never touched
+        // it, and the Err arm never seeded them.
+        for synthetic in &synthetic_ids {
+            assert!(
+                !state.sessions.contains_key(synthetic),
+                "synthetic id {synthetic} must not have an `AppState` entry"
+            );
+        }
+    }
+
+    // Follow-up to 0d5e651 (auditor finding #2): dead-slot placeholder
+    // sessions belong to the orchestration tab only. The dashboard
+    // scoping uses `all_managed_pane_ids` as an EXCLUDE filter, but
+    // that set now skips synthetic ids (otherwise `close_tab` would
+    // try to `close_pane` them). Without an explicit `is_dead_slot`
+    // filter on the dashboard side, the placeholder "No agent" card
+    // leaks onto the Dashboard tab as a ghost. Pin the exclusion.
+    #[test]
+    fn dashboard_filter_excludes_dead_slot_placeholder_sessions() {
+        use crate::state::AppState;
+
+        let mut state = AppState::default();
+
+        // A real session on a real pane that DOES belong to an
+        // orchestration tab (so it's in `exclude`) — this models the
+        // existing behaviour that orchestration-tab sessions are
+        // hidden from the dashboard.
+        let real_pane = "p-orchestrator".to_string();
+        state.register_pane(real_pane.clone());
+        state.insert_placeholder_session(
+            real_pane.clone(),
+            Some("/work".to_string()),
+            Some(AgentType::ClaudeCode),
+            Some("agent-A".to_string()),
+        );
+
+        // A dead-slot placeholder seeded by `fill_dead_slots_with_placeholders`.
+        let mut slots: Vec<Option<String>> = vec![Some(real_pane.clone()), None];
+        fill_dead_slots_with_placeholders(&mut slots, "/work", "tdd-cycle", &mut state);
+        let dead_pane = slots[1].clone().unwrap();
+
+        // A separate session that lives only on the dashboard (not in
+        // any orchestration tab) — this is what should survive the
+        // filter.
+        let dashboard_pane = "p-dashboard-only".to_string();
+        state.register_pane(dashboard_pane.clone());
+        state.insert_placeholder_session(
+            dashboard_pane.clone(),
+            Some("/work".to_string()),
+            Some(AgentType::ClaudeCode),
+            Some("agent-B".to_string()),
+        );
+
+        // Build the exclude set the way `TabManager::all_managed_pane_ids`
+        // does for an orchestration tab: include the real pane, skip
+        // the synthetic dead-slot id.
+        let exclude: Vec<String> = slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|id| !is_dead_slot_pane_id(id))
+            .cloned()
+            .collect();
+        assert!(
+            !exclude.contains(&dead_pane),
+            "test precondition: synthetic id must NOT be in the exclude set"
+        );
+
+        // Replicate the dashboard scoping filter at
+        // `render_frame`'s Tab::Dashboard branch.
+        let visible_on_dashboard: Vec<String> = state
+            .sessions
+            .values()
+            .filter(|s| {
+                s.pane_id
+                    .as_ref()
+                    .is_none_or(|pid| !exclude.contains(pid) && !is_dead_slot_pane_id(pid))
+            })
+            .filter_map(|s| s.pane_id.clone())
+            .collect();
+
+        assert!(
+            !visible_on_dashboard.contains(&dead_pane),
+            "dead-slot placeholder must NOT appear on the Dashboard; \
+             got {visible_on_dashboard:?}"
+        );
+        assert!(
+            !visible_on_dashboard.contains(&real_pane),
+            "real orchestration-tab pane must continue to be excluded \
+             from the Dashboard via the existing path"
+        );
+        assert!(
+            visible_on_dashboard.contains(&dashboard_pane),
+            "dashboard-only session must remain visible; got {visible_on_dashboard:?}"
+        );
+    }
+
+    #[test]
+    fn partition_separates_orchestrations_by_cwd() {
+        // Same orchestration name, different cwds — two separate tabs.
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/work-a"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                    role_name: String::new(),
+                    is_start_role: false,
+                    orchestration_cwd: None,
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/work-b"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                    role_name: String::new(),
+                    is_start_role: false,
+                    orchestration_cwd: None,
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.orchestration_buckets.len(), 2);
+    }
+
+    #[test]
+    fn partition_mixed_input_preserves_order() {
+        // dashboard pane, then mode, then orchestration in input order.
+        let panes = vec![
+            hydrated("1", "a-1", Some("/w"), None),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/w"),
+                Some(TabMembership::Mode { name: "m".into() }),
+            ),
+            hydrated(
+                "3",
+                "a-3",
+                Some("/w"),
+                Some(TabMembership::Orchestration {
+                    name: "o".into(),
+                    role_index: 0,
+                    role_name: String::new(),
+                    is_start_role: false,
+                    orchestration_cwd: None,
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.dashboard_pane_ids, vec!["1".to_string()]);
+        assert_eq!(p.mode_buckets.len(), 1);
+        assert_eq!(p.mode_buckets[0].agent_pane_id, "2");
+        assert_eq!(p.orchestration_buckets.len(), 1);
+        assert_eq!(p.orchestration_buckets[0].role_slots.len(), 1);
+        let slot = &p.orchestration_buckets[0].role_slots[0];
+        assert_eq!(slot.role_index, 0);
+        assert_eq!(slot.pane_id, "3");
+    }
+
+    // ------------------------------------------------------------
+    // PRD #111: orchestration tab hydration with synthesised config
+    // (remote-reconnect path: laptop TUI connects to VM daemon whose
+    // bucket.cwd doesn't exist locally → no local project config).
+    // ------------------------------------------------------------
+
+    #[test]
+    fn partition_propagates_role_name_and_is_start_role() {
+        // PRD #111: the partition must echo the daemon's role_name +
+        // is_start_role into the bucket so the hydration site can
+        // synthesise a config when the local TOML is absent.
+        let panes = vec![
+            hydrated(
+                "p0",
+                "a-0",
+                Some("/remote/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "review".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/remote/proj".into()),
+                }),
+            ),
+            hydrated(
+                "p1",
+                "a-1",
+                Some("/remote/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "review".into(),
+                    role_index: 1,
+                    role_name: "reviewer".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some("/remote/proj".into()),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.orchestration_buckets.len(), 1);
+        let bucket = &p.orchestration_buckets[0];
+        let slot_0 = bucket
+            .role_slots
+            .iter()
+            .find(|s| s.role_index == 0)
+            .expect("slot 0");
+        assert_eq!(slot_0.role_name, "orchestrator");
+        assert!(slot_0.is_start_role);
+        let slot_1 = bucket
+            .role_slots
+            .iter()
+            .find(|s| s.role_index == 1)
+            .expect("slot 1");
+        assert_eq!(slot_1.role_name, "reviewer");
+        assert!(!slot_1.is_start_role);
+    }
+
+    /// PRD #111 happy path: daemon reports orchestration panes whose
+    /// `cwd` doesn't resolve to a local project config file (laptop TUI
+    /// → VM daemon). The hydration logic synthesises an
+    /// `OrchestrationConfig` from the bucket metadata; opening the
+    /// tab with that config must succeed and produce a `Tab::Orchestration`
+    /// with the right name, role count, and `start_role_index`.
+    /// Crucially, no role pane lands on the dashboard.
+    #[test]
+    fn synthesised_orchestration_tab_rebuilds_without_local_config() {
+        use crate::project_config::{OrchestrationConfig, SynthesisRoleSlot};
+
+        let panes = vec![
+            hydrated(
+                "p0",
+                "a-0",
+                Some("/remote/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "review".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/remote/proj".into()),
+                }),
+            ),
+            hydrated(
+                "p1",
+                "a-1",
+                Some("/remote/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "review".into(),
+                    role_index: 2,
+                    role_name: "reviewer".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some("/remote/proj".into()),
+                }),
+            ),
+        ];
+        let partition = partition_hydrated_panes(&panes);
+        assert_eq!(partition.dashboard_pane_ids.len(), 0);
+        let bucket = &partition.orchestration_buckets[0];
+
+        let synthesis_slots: Vec<SynthesisRoleSlot> = bucket
+            .role_slots
+            .iter()
+            .map(|s| SynthesisRoleSlot {
+                role_index: s.role_index,
+                role_name: s.role_name.clone(),
+                is_start_role: s.is_start_role,
+            })
+            .collect();
+        let cfg = OrchestrationConfig::synthesize_from_bucket_metadata(
+            &bucket.orchestration_name,
+            &synthesis_slots,
+        );
+        assert_eq!(cfg.name, "review");
+        assert_eq!(cfg.roles.len(), 3);
+        assert_eq!(cfg.roles[0].name, "orchestrator");
+        assert_eq!(cfg.roles[1].name, "role-1"); // dead slot placeholder
+        assert_eq!(cfg.roles[2].name, "reviewer");
+        assert!(cfg.roles[0].start);
+        assert!(!cfg.roles[1].start);
+        assert!(!cfg.roles[2].start);
+
+        // Build the role_pane_ids vec the way the hydration site does.
+        let mut role_pane_ids: Vec<Option<String>> = vec![None; cfg.roles.len()];
+        for slot in &bucket.role_slots {
+            role_pane_ids[slot.role_index] = Some(slot.pane_id.clone());
+        }
+        assert_eq!(role_pane_ids[0], Some("p0".into()));
+        assert_eq!(role_pane_ids[1], None);
+        assert_eq!(role_pane_ids[2], Some("p1".into()));
+
+        // Finally drive the tab open through the real TabManager+mock
+        // pane controller. This is the same call the hydration loop
+        // makes; if it succeeds with a synthesised config we're done.
+        struct NoopPC;
+        impl crate::pane::PaneController for NoopPC {
+            fn create_pane(
+                &self,
+                _cmd: Option<&str>,
+                _cwd: Option<&str>,
+            ) -> Result<String, crate::pane::PaneError> {
+                Ok(String::new())
+            }
+            fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn rename_pane(
+                &self,
+                _id: &str,
+                name: &str,
+            ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+                Ok(crate::pane::RenameOutcome::applied(name))
+            }
+            fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+                Ok(Vec::new())
+            }
+            fn resize_pane(
+                &self,
+                _id: &str,
+                _direction: crate::pane::PaneDirection,
+                _amount: u16,
+            ) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let mut tm = crate::tab::TabManager::new(Arc::new(NoopPC));
+        let (tab_index, _flat) = tm
+            .open_orchestration_tab_with_existing_role_panes(&cfg, &bucket.cwd, role_pane_ids)
+            .expect("synthesised-config hydration must succeed");
+        assert_eq!(tab_index, 1, "first non-dashboard tab is at index 1");
+        let labels = tm.tab_labels();
+        assert_eq!(labels[0], "Dashboard");
+        assert_eq!(labels[1], "review");
+    }
+
+    /// PRD #111 reviewer S2: with a duplicate `role_index` in the
+    /// hydrated bucket the two consumers must agree on which slot
+    /// wins. The hydration loop keeps the *first* pane_id at that
+    /// index (`if role_pane_ids[role_index].is_some() { continue; }`)
+    /// and the synthesis path keeps the *first* role_name / start
+    /// flag (project_config first-wins guard). Without that
+    /// alignment the rendered tab carries the second slot's role
+    /// label but the first slot's live pane — a confusing mismatch.
+    #[test]
+    fn duplicate_role_index_first_wins_through_full_hydration_path() {
+        use crate::project_config::SynthesisRoleSlot;
+
+        let panes = vec![
+            hydrated(
+                "first-pane",
+                "a-0",
+                Some("/remote/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "review".into(),
+                    role_index: 0,
+                    role_name: "first".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/remote/proj".into()),
+                }),
+            ),
+            hydrated(
+                "second-pane",
+                "a-1",
+                Some("/remote/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "review".into(),
+                    role_index: 0,
+                    role_name: "second".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some("/remote/proj".into()),
+                }),
+            ),
+        ];
+        let partition = partition_hydrated_panes(&panes);
+        assert_eq!(partition.orchestration_buckets.len(), 1);
+        let bucket = &partition.orchestration_buckets[0];
+        assert_eq!(
+            bucket.role_slots.len(),
+            2,
+            "partition must preserve both duplicates so the hydration loop can decide"
+        );
+
+        // Synthesis path: first slot's role_name and start flag win.
+        let synthesis_slots: Vec<SynthesisRoleSlot> = bucket
+            .role_slots
+            .iter()
+            .map(|s| SynthesisRoleSlot {
+                role_index: s.role_index,
+                role_name: s.role_name.clone(),
+                is_start_role: s.is_start_role,
+            })
+            .collect();
+        let cfg = crate::project_config::OrchestrationConfig::synthesize_from_bucket_metadata(
+            &bucket.orchestration_name,
+            &synthesis_slots,
+        );
+        assert_eq!(cfg.roles.len(), 1);
+        assert_eq!(
+            cfg.roles[0].name, "first",
+            "synthesis must keep the first slot's role_name on duplicate role_index"
+        );
+        assert!(
+            cfg.roles[0].start,
+            "synthesis must keep the first slot's is_start_role on duplicate role_index"
+        );
+
+        // Hydration de-dup loop: first slot's pane_id wins. Replicates
+        // the `if role_pane_ids[role_index].is_some() { continue; }`
+        // guard at the hydration call site.
+        let mut role_pane_ids: Vec<Option<String>> = vec![None; cfg.roles.len()];
+        for slot in &bucket.role_slots {
+            if role_pane_ids[slot.role_index].is_some() {
+                continue;
+            }
+            role_pane_ids[slot.role_index] = Some(slot.pane_id.clone());
+        }
+        assert_eq!(
+            role_pane_ids[0].as_deref(),
+            Some("first-pane"),
+            "hydration loop must keep the first slot's pane_id on duplicate role_index"
+        );
+    }
+
+    /// PRD #111 regression: local config path still wins when the
+    /// project config file is found AND carries this orchestration
+    /// name. The synthesis fallback must NOT shadow display-only
+    /// enrichment (description, prompt_template) that only the local
+    /// TOML carries.
+    ///
+    /// Reviewer S1: this test drives `resolve_orch_config_for_hydration`
+    /// — the exact helper the hydration loop calls — so a future
+    /// refactor that accidentally flipped the precedence (or always
+    /// synthesised, dropping `local`) would fail here. The prior
+    /// version only asserted properties of two independently-built
+    /// configs without driving the selection seam.
+    #[test]
+    fn local_config_enrichment_preserved_when_available() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        let local = OrchestrationConfig {
+            name: "review".into(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".into(),
+                    command: "claude".into(),
+                    start: true,
+                    description: Some("Coordinates".into()),
+                    prompt_template: Some("You coordinate.".into()),
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "reviewer".into(),
+                    command: "claude --model sonnet".into(),
+                    start: false,
+                    description: Some("Reviews code".into()),
+                    prompt_template: Some("Run tests.".into()),
+                    clear: false,
+                },
+            ],
+        };
+        // Build a bucket that *would* synthesise to a config with no
+        // description / prompt_template / clear=true defaults if the
+        // helper picked the synthesis branch. The test asserts the
+        // local config's enrichment fields round-trip through the
+        // helper instead.
+        let bucket = OrchestrationHydrationBucket {
+            cwd: "/remote/proj".into(),
+            orchestration_name: "review".into(),
+            role_slots: vec![
+                OrchestrationRoleSlot {
+                    role_index: 0,
+                    pane_id: "p0".into(),
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                },
+                OrchestrationRoleSlot {
+                    role_index: 1,
+                    pane_id: "p1".into(),
+                    role_name: "reviewer".into(),
+                    is_start_role: false,
+                },
+            ],
+        };
+        let chosen = resolve_orch_config_for_hydration(Some(local.clone()), &bucket);
+        assert_eq!(
+            chosen.roles[0].description.as_deref(),
+            Some("Coordinates"),
+            "local config's description must survive selection"
+        );
+        assert_eq!(
+            chosen.roles[1].prompt_template.as_deref(),
+            Some("Run tests."),
+            "local config's prompt_template must survive selection"
+        );
+        assert!(
+            !chosen.roles[1].clear,
+            "local config's non-default `clear=false` must survive selection"
+        );
+        assert_eq!(chosen.roles[0].command, "claude");
+        assert_eq!(chosen.roles[1].command, "claude --model sonnet");
+
+        // And the sibling case: when local is None, the helper falls
+        // back to synthesis whose enrichment fields are defaults.
+        let synthesised = resolve_orch_config_for_hydration(None, &bucket);
+        assert_eq!(synthesised.name, "review");
+        assert!(synthesised.roles[0].description.is_none());
+        assert!(synthesised.roles[1].prompt_template.is_none());
+        assert!(
+            synthesised.roles[1].clear,
+            "synthesis defaults `clear` to true (mirrors loader default)"
+        );
+        // Synthesis carries the role identity, just not the enrichment.
+        assert_eq!(synthesised.roles[0].name, "orchestrator");
+        assert!(synthesised.roles[0].start);
+        assert_eq!(synthesised.roles[1].name, "reviewer");
+    }
+
+    #[test]
+    fn test_format_elapsed() {
+        let now = Utc::now();
+        assert_eq!(format_elapsed(now), "0s ago");
+        assert_eq!(format_elapsed(now - Duration::seconds(3)), "3s ago");
+        assert_eq!(format_elapsed(now - Duration::seconds(90)), "1m 30s ago");
+        assert_eq!(format_elapsed(now - Duration::seconds(60)), "1m ago");
+        assert_eq!(format_elapsed(now - Duration::seconds(3900)), "1h 5m ago");
+        assert_eq!(format_elapsed(now - Duration::seconds(3600)), "1h ago");
+    }
+
+    #[test]
+    fn test_status_style() {
+        let (label, style) = status_style(&SessionStatus::Thinking);
+        assert_eq!(label, "Thinking");
+        assert_eq!(style.fg, Some(Color::Cyan));
+
+        let (label, style) = status_style(&SessionStatus::Working);
+        assert_eq!(label, "Working");
+        assert_eq!(style.fg, Some(Color::Yellow));
+
+        let (label, style) = status_style(&SessionStatus::WaitingForInput);
+        assert_eq!(label, "Needs Input");
+        assert_eq!(style.fg, Some(Color::Red));
+
+        let (label, _) = status_style(&SessionStatus::Idle);
+        assert_eq!(label, "Idle");
+
+        let (label, _) = status_style(&SessionStatus::Error);
+        assert_eq!(label, "Error");
+    }
+
+    #[test]
+    fn test_render_empty_state() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState::default();
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
+                )
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_render_with_sessions() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+
+        let mut event1 = AgentEvent {
+            session_id: "session-abc-123".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/home/user/project".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+        };
+        state.apply_event(event1.clone());
+
+        event1.event_type = EventType::ToolStart;
+        event1.tool_name = Some("Read".to_string());
+        event1.tool_detail = Some("src/main.rs".to_string());
+        state.apply_event(event1);
+
+        let event2 = AgentEvent {
+            session_id: "session-def-456".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/home/user/other".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+        };
+        state.apply_event(event2);
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
+                )
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_recent_tool_lines() {
+        use crate::state::SessionState;
+        use std::collections::VecDeque;
+
+        let mut events = VecDeque::new();
+        for (name, detail) in [
+            ("Read", "src/main.rs"),
+            ("Write", "out.txt"),
+            ("Bash", ""),
+            ("Grep", "pattern"),
+        ] {
+            events.push_back(AgentEvent {
+                session_id: "s1".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::ToolStart,
+                tool_name: Some(name.to_string()),
+                tool_detail: if detail.is_empty() {
+                    None
+                } else {
+                    Some(detail.to_string())
+                },
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: None,
+                agent_id: None,
+            });
+        }
+
+        let session = SessionState {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            cwd: None,
+            status: crate::state::SessionStatus::Idle,
+            active_tool: None,
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+            recent_events: events,
+            tool_count: 0,
+            last_user_prompt: None,
+            first_prompts: Vec::new(),
+            pane_id: None,
+            agent_id: None,
+        };
+
+        let palette = ColorPalette::dark();
+        let lines = recent_tool_lines(&session, 3, palette);
+        assert_eq!(lines.len(), 3);
+        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(text[0], "  Write — out.txt");
+        assert_eq!(text[1], "  Bash");
+        assert_eq!(text[2], "  Grep — pattern");
+
+        // Compact mode: only 1 tool (most recent)
+        let lines_compact = recent_tool_lines(&session, 1, palette);
+        assert_eq!(lines_compact.len(), 1);
+        assert_eq!(lines_compact[0].to_string(), "  Grep — pattern");
+    }
+
+    #[test]
+    fn test_prompt_display_in_card() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        let mut event = AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+        };
+        state.apply_event(event.clone());
+
+        event.event_type = EventType::Thinking;
+        event.user_prompt = Some("fix the login bug".to_string());
+        state.apply_event(event);
+
+        assert_eq!(
+            state.sessions["s1"].last_user_prompt.as_deref(),
+            Some("fix the login bug")
+        );
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
+                )
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn orchestrator_context_includes_agents_and_protocol() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+
+        let config = OrchestrationConfig {
+            name: "code-review".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "claude".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: Some("You coordinate the team.".to_string()),
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "coder".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("Implements code changes".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "reviewer".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        };
+
+        let content = build_orchestrator_context(&config);
+
+        // Contains the orchestrator's own template.
+        assert!(content.contains("You coordinate the team."));
+        // Lists worker agents with descriptions.
+        assert!(content.contains("**coder**: Implements code changes"));
+        assert!(content.contains("**reviewer**: (no description)"));
+        // Does NOT list the orchestrator itself.
+        assert!(!content.contains("**orchestrator**"));
+        // Contains delegation protocol.
+        assert!(content.contains("Delegation protocol"));
+        assert!(content.contains("dot-agent-deck work-done"));
+        // Instructs orchestrator to wait then delegate.
+        assert!(content.contains("Wait for the user to tell you what to work on"));
+        assert!(content.contains("delegate immediately"));
+        // Enforces one-way delegation (workers never delegate to other workers).
+        assert!(content.contains("Delegation is one-way"));
+        assert!(content.contains("Workers NEVER delegate to other workers"));
+    }
+
+    #[test]
+    fn orchestrator_context_no_template() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+
+        let config = OrchestrationConfig {
+            name: "test".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "lead".to_string(),
+                    command: "claude".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "worker".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("Does work".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        };
+
+        let content = build_orchestrator_context(&config);
+        // Starts directly with available agents (no template preamble).
+        assert!(content.starts_with("## Available agents"));
+        assert!(content.contains("**worker**: Does work"));
+    }
+
+    #[test]
+    fn prepare_orchestrator_prompt_returns_full_content() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+
+        let config = OrchestrationConfig {
+            name: "test".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "lead".to_string(),
+                    command: "claude".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "worker".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("Does work".to_string()),
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        };
+
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let prompt = prepare_orchestrator_prompt(&config, cwd);
+        assert!(prompt.is_some());
+        let prompt = prompt.unwrap();
+        // One-liner referencing the file.
+        assert!(prompt.contains("orchestrator-context.md"));
+        assert!(!prompt.contains('\n'));
+        // File was written with full content.
+        let file_path = dir.path().join(".dot-agent-deck/orchestrator-context.md");
+        assert!(file_path.exists());
+        let content = std::fs::read_to_string(file_path).unwrap();
+        assert!(content.contains("Available agents"));
+        assert!(content.contains("**worker**: Does work"));
+    }
+
+    #[test]
+    fn test_flash_dot() {
+        // WaitingForInput: visible in first half (ticks 0–29), hidden in second half (30–59)
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 0),
+            "●"
+        );
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 29),
+            "●"
+        );
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 30),
+            " "
+        );
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 59),
+            " "
+        );
+        assert_eq!(
+            flash_dot(&crate::state::SessionStatus::WaitingForInput, 60),
+            "●"
+        );
+        // Idle also blinks
+        assert_eq!(flash_dot(&crate::state::SessionStatus::Idle, 0), "●");
+        assert_eq!(flash_dot(&crate::state::SessionStatus::Idle, 30), " ");
+        // Working never blinks
+        assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 0), "●");
+        assert_eq!(flash_dot(&crate::state::SessionStatus::Working, 30), "●");
+    }
+
+    #[test]
+    fn test_grid_columns() {
+        assert_eq!(grid_columns(79), 1);
+        assert_eq!(grid_columns(99), 1);
+        assert_eq!(grid_columns(100), 2);
+        assert_eq!(grid_columns(150), 2);
+        assert_eq!(grid_columns(179), 2);
+        assert_eq!(grid_columns(180), 3);
+        assert_eq!(grid_columns(250), 3);
+    }
+
+    #[test]
+    fn test_render_wide_grid_layout() {
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        for id in ["s1", "s2", "s3"] {
+            state.apply_event(AgentEvent {
+                session_id: id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: Some("/tmp".to_string()),
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: None,
+                agent_id: None,
+            });
+        }
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
+                )
+            })
+            .unwrap();
+    }
+
+    /// Concatenate every cell symbol on a row into a single string and join
+    /// rows with newlines. Used by the render-decision tests below to grep
+    /// the rendered buffer for the placeholder lines.
+    fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut out = String::with_capacity((area.width as usize + 1) * area.height as usize);
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #76 M2.13: dashboard placeholder render-decision tests.
+    //
+    // `render_session_card` flips a single gate on `session.agent_type ==
+    // AgentType::None`: when set, the card shows the "Launch an agent to
+    // get started" empty state and the "No agent" status badge; when
+    // populated (e.g. by the hydration path threading
+    // `AgentRecord.agent_type` through `insert_placeholder_session`), the
+    // card renders as a real session.
+    //
+    // Wire-format and AppState-side coverage live in `tests/rehydration.rs`
+    // (`hydrate_preserves_agent_type_end_to_end` + its OpenCode counterpart).
+    // These two tests pin the render side specifically so a future change to
+    // the gate, the placeholder copy, or the agent-type field can't silently
+    // re-introduce the "reconnect shows Launch an agent" bug.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dashboard_placeholder_with_agent_type_does_not_show_launch_an_agent() {
+        // Simulate the post-hydration state: a placeholder session whose
+        // `agent_type` was populated from the daemon's registry via
+        // `insert_placeholder_session(.., Some(ClaudeCode))`. The dashboard
+        // card must render the agent (no "Launch an agent" empty state,
+        // no "No agent" status badge).
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            Some(AgentType::ClaudeCode),
+            None,
+        );
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
+                )
+            })
+            .unwrap();
+
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            !rendered.contains("Launch an agent to get started"),
+            "hydrated placeholder (agent_type=ClaudeCode) must not render the \
+             empty-state line; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("No agent"),
+            "hydrated placeholder (agent_type=ClaudeCode) must not show the \
+             'No agent' status badge; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn dashboard_placeholder_without_agent_type_shows_launch_an_agent() {
+        // Negative case: a placeholder created without an `agent_type` (the
+        // legacy local-mode path, or hydration from a pre-M2.13 daemon that
+        // doesn't echo the field) still renders the empty state. This pins
+        // the gate in the other direction so a refactor that drops the
+        // distinction can't silently change the empty-state UX either.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session("1".to_string(), Some("/tmp".to_string()), None, None);
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    },
+                    &TabBarInfo {
+                        show: false,
+                        labels: vec!["Dashboard".into()],
+                        active_index: 0,
+                    },
+                )
+            })
+            .unwrap();
+
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            rendered.contains("Launch an agent to get started"),
+            "unhydrated placeholder (agent_type=None) must render the \
+             empty-state line; got:\n{rendered}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Navigation tests
+    // ---------------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------------
+    // Dir picker tests
+    // ---------------------------------------------------------------------------
+
+    fn make_dir_picker(entries: &[&str]) -> DirPickerState {
+        let mut picker = DirPickerState {
+            current_dir: PathBuf::from("/tmp"),
+            entries: entries.iter().copied().map(PathBuf::from).collect(),
+            selected: 0,
+            scroll_offset: 0,
+            filter_text: String::new(),
+            filtering: false,
+            filtered_indices: Vec::new(),
+        };
+        picker.refilter();
+        picker
+    }
+
+    #[test]
+    fn dir_picker_refilter_matches_case_insensitive() {
+        let mut picker = make_dir_picker(&["..", "/tmp/Alpha", "/tmp/beta"]);
+        picker.filter_text = "ALP".to_string();
+        picker.refilter();
+        assert_eq!(picker.filtered_indices.len(), 2);
+        assert_eq!(picker.filtered_indices[0], 0); // parent entry
+        assert_eq!(picker.filtered_indices[1], 1); // Alpha matches regardless of case
+    }
+
+    #[test]
+    fn dir_picker_parent_entry_always_present() {
+        let mut picker = make_dir_picker(&["..", "/tmp/app", "/tmp/docs"]);
+        picker.filter_text = "zzz".to_string();
+        picker.refilter();
+        assert_eq!(picker.filtered_indices.len(), 1);
+        let idx = picker.filtered_indices[0];
+        assert_eq!(picker.entries[idx], PathBuf::from(".."));
+    }
+
+    #[test]
+    fn dir_picker_selection_wraps() {
+        let mut picker = make_dir_picker(&["..", "/tmp/a", "/tmp/b"]);
+        let total = picker.filtered_indices.len();
+        assert_eq!(total, 3);
+        picker.select_previous();
+        assert_eq!(picker.selected, total - 1);
+        picker.select_next();
+        assert_eq!(picker.selected, 0);
+        picker.select_next();
+        assert_eq!(picker.selected, 1);
+        picker.selected = 0;
+        picker.select_previous();
+        assert_eq!(picker.selected, total - 1);
+    }
+
+    #[test]
+    fn dir_picker_filter_typing_narrows_entries() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        ui.dir_picker = Some(make_dir_picker(&[
+            "..",
+            "/tmp/alpha",
+            "/tmp/beta",
+            "/tmp/Bravo",
+        ]));
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            &mut ui,
+        );
+
+        let picker = ui.dir_picker.as_ref().unwrap();
+        assert!(picker.filtering);
+        assert_eq!(picker.filter_text, "b");
+        let filtered: Vec<String> = picker
+            .filtered_indices
+            .iter()
+            .map(|&idx| {
+                let entry = &picker.entries[idx];
+                entry
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| entry.to_string_lossy().to_string())
+            })
+            .collect();
+        assert_eq!(filtered, vec!["..", "beta", "Bravo"]);
+    }
+
+    #[test]
+    fn dir_picker_backspace_clears_filter_when_empty() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        ui.dir_picker = Some(make_dir_picker(&["..", "/tmp/alpha", "/tmp/beta"]));
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut ui,
+        );
+
+        let picker = ui.dir_picker.as_ref().unwrap();
+        assert!(!picker.filtering);
+        assert!(picker.filter_text.is_empty());
+        assert_eq!(picker.filtered_indices.len(), picker.entries.len());
+    }
+
+    #[test]
+    fn dir_picker_filter_esc_clears_text() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        ui.dir_picker = Some(make_dir_picker(&["..", "/tmp/app", "/tmp/docs"]));
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
+
+        let picker = ui.dir_picker.as_ref().unwrap();
+        assert!(picker.filter_text.is_empty());
+        assert!(!picker.filtering);
+        assert_eq!(picker.filtered_indices.len(), picker.entries.len());
+    }
+
+    #[test]
+    fn dir_picker_esc_clears_then_closes_picker() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        ui.dir_picker = Some(make_dir_picker(&["..", "/tmp/foo", "/tmp/bar"]));
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+
+        handle_dir_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
+        {
+            let picker = ui.dir_picker.as_ref().unwrap();
+            assert!(picker.filter_text.is_empty());
+            assert!(!picker.filtering);
+            assert_eq!(ui.mode, UiMode::DirPicker);
+        }
+
+        handle_dir_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
+        assert!(ui.dir_picker.is_none());
+        assert_eq!(ui.mode, UiMode::Normal);
+    }
+
+    #[test]
+    fn dir_picker_refresh_resets_filter_on_navigation() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let child = root.join("alpha");
+        let grandchild = child.join("beta");
+        std::fs::create_dir_all(&grandchild).unwrap();
+
+        let mut picker = DirPickerState::new(root.clone());
+        assert!(picker.entries.iter().any(|entry| entry == &child));
+
+        picker.filter_text = "alpha".to_string();
+        picker.refilter();
+        let child_pos = picker
+            .filtered_indices
+            .iter()
+            .position(|&idx| picker.entries[idx] == child)
+            .expect("alpha entry present");
+        picker.selected = child_pos;
+        picker.enter_selected();
+
+        assert_eq!(picker.current_dir, child);
+        assert!(picker.filter_text.is_empty());
+        assert!(!picker.filtering);
+
+        picker.filter_text = "beta".to_string();
+        picker.filtering = true;
+        picker.refilter();
+        assert!(
+            picker
+                .filtered_indices
+                .iter()
+                .any(|&idx| picker.entries[idx] == grandchild)
+        );
+
+        picker.go_up();
+
+        assert_eq!(picker.current_dir, root);
+        assert!(picker.filter_text.is_empty());
+        assert!(!picker.filtering);
+    }
+
+    #[test]
+    fn dir_picker_enter_confirms_when_no_subdirs() {
+        // Use a fresh tempdir for current_dir so load_project_config can't
+        // pick up a stray .dot-agent-deck.toml from /tmp on the host.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        let mut picker = make_dir_picker(&[".."]);
+        picker.current_dir = tmp.path().to_path_buf();
+        ui.dir_picker = Some(picker);
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &mut ui,
+        );
+
+        // Goes directly to unified NewPaneForm
+        assert_eq!(ui.mode, UiMode::NewPaneForm);
+        assert!(ui.new_pane_form.is_some());
+        let form = ui.new_pane_form.as_ref().unwrap();
+        assert!(form.modes.is_empty());
+        assert!(!form.has_mode_field);
+        assert_eq!(form.focused, FormField::Name);
+    }
+
+    #[test]
+    fn dir_picker_filter_mode_q_cancels_picker() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        ui.dir_picker = Some(make_dir_picker(&["..", "/tmp/a"]));
+
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_dir_picker_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut ui,
+        );
+
+        assert!(ui.dir_picker.is_none());
+        assert_eq!(ui.mode, UiMode::Normal);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Filter tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_sessions_no_filter() {
+        let mut state = AppState::default();
+        for id in ["a", "b", "c"] {
+            state.apply_event(AgentEvent {
+                session_id: id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: None,
+                agent_id: None,
+            });
+        }
+
+        let ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn test_filter_sessions_by_id() {
+        let mut state = AppState::default();
+        for id in ["alpha", "beta", "gamma"] {
+            state.apply_event(AgentEvent {
+                session_id: id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: None,
+                agent_id: None,
+            });
+        }
+
+        let mut ui = default_ui();
+        ui.filter_text = "bet".to_string();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "beta");
+    }
+
+    #[test]
+    fn test_filter_sessions_by_cwd() {
+        let mut state = AppState::default();
+        state.apply_event(AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/home/user/myproject".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+        });
+        state.apply_event(AgentEvent {
+            session_id: "s2".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp/other".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+        });
+
+        let mut ui = default_ui();
+        ui.filter_text = "myproject".to_string();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "s1");
+    }
+
+    #[test]
+    fn test_filter_sessions_by_display_name() {
+        let mut state = AppState::default();
+        state.apply_event(AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+        });
+        state.apply_event(AgentEvent {
+            session_id: "s2".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+        });
+
+        let mut ui = default_ui();
+        ui.display_names
+            .insert("s1".to_string(), "frontend".to_string());
+        ui.filter_text = "front".to_string();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "s1");
+    }
+
+    #[test]
+    fn test_filter_sessions_case_insensitive() {
+        let mut state = AppState::default();
+        state.apply_event(AgentEvent {
+            session_id: "MySession".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+        });
+
+        let mut ui = default_ui();
+        ui.filter_text = "mysess".to_string();
+        let filtered = filter_sessions(&state, &ui);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Mode transition tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_mode_transitions() {
+        let mut ui = default_ui();
+        assert_eq!(ui.mode, UiMode::Normal);
+
+        // Normal -> Filter
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+        );
+        assert_eq!(ui.mode, UiMode::Filter);
+
+        // Filter -> Normal (Esc)
+        handle_filter_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
+        assert_eq!(ui.mode, UiMode::Normal);
+
+        // Normal -> Help
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+        );
+        assert_eq!(ui.mode, UiMode::Help);
+
+        // Help -> Normal
+        handle_help_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
+        assert_eq!(ui.mode, UiMode::Normal);
+
+        // Normal -> Rename
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+        );
+        assert_eq!(ui.mode, UiMode::Rename);
+
+        // Rename -> Normal (Esc)
+        handle_rename_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+            Some("s1"),
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
+    }
+
+    // M2.11 fixup 5 — handle_rename_key no longer writes to
+    // ui.display_names on Enter; the dispatch loop now calls
+    // `pane.rename_pane` first and mirrors the controller-returned
+    // RenameOutcome into both display-name maps. These tests pin
+    // the residual handler responsibilities: clearing rename_text
+    // and returning to Normal mode. The full commit pathway (handler
+    // → controller → UI maps) is covered by
+    // `tests/agent_metadata.rs::rename_outcome_*` and
+    // `rename_pane_*_on_local_backend` in this crate.
+    #[test]
+    fn test_rename_handler_clears_buffer_and_exits_on_enter() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::Rename;
+        ui.rename_text = "my-agent".to_string();
+
+        handle_rename_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            Some("session-123"),
+        );
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(
+            ui.rename_text.is_empty(),
+            "rename_text must be cleared after Enter"
+        );
+        // Crucially: handler does NOT touch display_names. The
+        // dispatch loop mirrors the controller's RenameOutcome
+        // into the maps so the raw input never reaches them.
+        assert!(
+            !ui.display_names.contains_key("session-123"),
+            "handler must not insert raw rename_text into display_names"
+        );
+    }
+
+    #[test]
+    fn test_rename_handler_preserves_existing_label_on_enter() {
+        // Even when the handler runs with non-empty rename_text, it
+        // must not mutate display_names — the dispatch loop owns
+        // both maps now, gated by the RenameOutcome.
+        let mut ui = default_ui();
+        ui.display_names
+            .insert("s1".to_string(), "old-name".to_string());
+        ui.mode = UiMode::Rename;
+        ui.rename_text.clear();
+
+        handle_rename_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            Some("s1"),
+        );
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert_eq!(
+            ui.display_names.get("s1"),
+            Some(&"old-name".to_string()),
+            "handler must NOT remove existing display_names entry — \
+             the dispatch loop owns that based on RenameOutcome::Cleared"
+        );
+    }
+
+    #[test]
+    fn test_filter_typing() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::Filter;
+
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.filter_text, "ab");
+
+        handle_filter_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert_eq!(ui.filter_text, "a");
+
+        // Enter keeps filter
+        handle_filter_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert_eq!(ui.filter_text, "a");
+    }
+
+    #[test]
+    fn test_filter_esc_clears() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::Filter;
+        ui.filter_text = "hello".to_string();
+
+        handle_filter_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.filter_text.is_empty());
+    }
+
+    #[test]
+    fn test_normal_esc_clears_filter() {
+        let mut ui = default_ui();
+        ui.filter_text = "active-filter".to_string();
+
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ui,
+            5,
+            None,
+        );
+        assert!(ui.filter_text.is_empty());
+    }
+
+    #[test]
+    fn test_rename_not_available_when_empty() {
+        let mut ui = default_ui();
+        // total = 0, rename should not activate
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut ui,
+            0,
+            None,
+        );
+        assert_eq!(ui.mode, UiMode::Normal);
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #92 F2 — y / n permission key tests
+    //
+    // Behavior: pressing `y` on a dashboard card whose selected session is in
+    // `WaitingForInput` returns `KeyResult::SendPermissionResponse(true)` so
+    // the dispatcher forwards `y` to the agent's PTY. Pressing `n` returns
+    // `SendPermissionResponse(false)`. Any other status, or `total == 0`,
+    // falls through to `KeyResult::Continue`. PRD #18 documented these keys
+    // on the help overlay since baseline but no handler existed until now.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn permission_y_on_waiting_for_input_returns_approve() {
+        let mut ui = default_ui();
+        let result = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut ui,
+            1,
+            Some(SessionStatus::WaitingForInput),
+        );
+        assert!(
+            matches!(result, KeyResult::SendPermissionResponse(true)),
+            "y on a WaitingForInput card must approve, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn permission_n_on_waiting_for_input_returns_deny() {
+        let mut ui = default_ui();
+        let result = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut ui,
+            1,
+            Some(SessionStatus::WaitingForInput),
+        );
+        assert!(
+            matches!(result, KeyResult::SendPermissionResponse(false)),
+            "n on a WaitingForInput card must deny, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn permission_y_n_on_non_waiting_status_is_no_op() {
+        // Any non-WaitingForInput status: keys must NOT trigger the permission
+        // response. They fall through to `Continue` so future keybindings or
+        // ignored input remain unaffected. Cover a representative sample of
+        // statuses (Working, Idle, Thinking, Error) to pin the gate.
+        for status in [
+            SessionStatus::Working,
+            SessionStatus::Idle,
+            SessionStatus::Thinking,
+            SessionStatus::Error,
+            SessionStatus::Compacting,
+        ] {
+            let mut ui = default_ui();
+            let result_y = handle_normal_key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                &mut ui,
+                1,
+                Some(status.clone()),
+            );
+            assert!(
+                matches!(result_y, KeyResult::Continue),
+                "y on status {status:?} must no-op, got {result_y:?}"
+            );
+            let result_n = handle_normal_key(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                &mut ui,
+                1,
+                Some(status.clone()),
+            );
+            assert!(
+                matches!(result_n, KeyResult::Continue),
+                "n on status {status:?} must no-op, got {result_n:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_y_n_with_no_card_selected_is_no_op() {
+        // No card selected (total == 0, status None): both keys must
+        // no-op. Belt-and-braces — the handler gates on `total > 0` AND on
+        // status, so either guard alone is sufficient, but tests pin both.
+        let mut ui = default_ui();
+        let result_y = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut ui,
+            0,
+            None,
+        );
+        assert!(matches!(result_y, KeyResult::Continue));
+        let result_n = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut ui,
+            0,
+            None,
+        );
+        assert!(matches!(result_n, KeyResult::Continue));
+        // Also exercise the case where `total > 0` but `selected_status` is
+        // None (the selected session is missing from the snapshot — a race we
+        // tolerate gracefully).
+        let result_y_no_status = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut ui,
+            1,
+            None,
+        );
+        assert!(matches!(result_y_no_status, KeyResult::Continue));
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #68 — dashboard card navigation (j/k/Up/Down)
+    //
+    // Two layers are pinned here:
+    //
+    // 1. `handle_normal_key` updates `ui.selected_index` with wrap-around
+    //    for j/k/Up/Down. This is the documented contract of the key
+    //    handler (help overlay + docs/keyboard-shortcuts.md).
+    //
+    // 2. `focus_deck` (the Ctrl+d → 1-9 path) still flips the embedded
+    //    controller's focus AND `ui.selected_index` — this is the
+    //    risk-mitigation regression test the PRD asks for. The fix in
+    //    the dispatch loop mirrors `focus_deck`'s "selection + focus"
+    //    pattern after `handle_normal_key`, so the per-frame
+    //    "selected_index ← focused pane" sync no longer rolls back the
+    //    user's j/k move.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_normal_key_j_and_down_advance_with_wrap() {
+        let mut ui = default_ui();
+        ui.selected_index = 0;
+
+        // j advances 0 → 1
+        let r = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+        );
+        assert!(matches!(r, KeyResult::Continue));
+        assert_eq!(ui.selected_index, 1);
+
+        // Down advances 1 → 2
+        let r = handle_normal_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+        );
+        assert!(matches!(r, KeyResult::Continue));
+        assert_eq!(ui.selected_index, 2);
+
+        // wraps 2 → 0
+        let r = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+        );
+        assert!(matches!(r, KeyResult::Continue));
+        assert_eq!(ui.selected_index, 0);
+    }
+
+    #[test]
+    fn handle_normal_key_k_and_up_retreat_with_wrap() {
+        let mut ui = default_ui();
+        ui.selected_index = 0;
+
+        // k from 0 wraps to total - 1
+        let r = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+        );
+        assert!(matches!(r, KeyResult::Continue));
+        assert_eq!(ui.selected_index, 2);
+
+        // Up retreats 2 → 1
+        let r = handle_normal_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+        );
+        assert!(matches!(r, KeyResult::Continue));
+        assert_eq!(ui.selected_index, 1);
+    }
+
+    #[test]
+    fn handle_normal_key_jk_no_op_when_no_cards() {
+        // `total == 0` (empty dashboard): j/k/Up/Down must not panic
+        // and must not move `selected_index` off zero.
+        let mut ui = default_ui();
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Down,
+            KeyCode::Up,
+        ] {
+            let r = handle_normal_key(KeyEvent::new(code, KeyModifiers::NONE), &mut ui, 0, None);
+            assert!(matches!(r, KeyResult::Continue));
+            assert_eq!(ui.selected_index, 0);
+        }
+    }
+
+    /// Pane controller that records every `focus_pane` call. Used by the
+    /// `focus_deck` regression test below — the production embedded
+    /// controller is too heavy to spin up in a unit test, but the
+    /// contract `focus_deck` cares about is "the controller's
+    /// `focus_pane` got called with the right id".
+    struct RecordingFocusPC {
+        focused: std::sync::Mutex<Vec<String>>,
+    }
+    impl crate::pane::PaneController for RecordingFocusPC {
+        fn create_pane(
+            &self,
+            _cmd: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<String, crate::pane::PaneError> {
+            Ok(String::new())
+        }
+        fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn rename_pane(
+            &self,
+            _id: &str,
+            name: &str,
+        ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+            Ok(crate::pane::RenameOutcome::applied(name))
+        }
+        fn focus_pane(&self, id: &str) -> Result<(), crate::pane::PaneError> {
+            self.focused.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// PRD #68 risk-mitigation: pin that the digit-jump path
+    /// (`Ctrl+d` → `1`-`9` → `focus_deck`) still focuses the right
+    /// pane AND sets `ui.selected_index` after the j/k fix lands in
+    /// the dispatch loop. The fix mirrors `focus_deck`'s pattern, so
+    /// breaking the digit path would mean both paths regressed.
+    #[test]
+    fn focus_deck_focuses_target_pane_and_updates_selected_index() {
+        use tokio::sync::RwLock;
+        let mut snapshot = AppState::default();
+        // Three sessions with concrete pane_ids so `focus_deck` has
+        // something to focus on.
+        for (sid, pid) in [("s0", "p0"), ("s1", "p1"), ("s2", "p2")] {
+            let mut sess = make_session(SessionStatus::Idle);
+            sess.session_id = sid.to_string();
+            sess.pane_id = Some(pid.to_string());
+            snapshot.sessions.insert(sid.to_string(), sess);
+        }
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let pc = RecordingFocusPC {
+            focused: std::sync::Mutex::new(Vec::new()),
+        };
+
+        // Build the `filtered` view focus_deck expects.
+        let ids: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        // Sort for stable order across HashMap iteration.
+        let mut ids = ids;
+        ids.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        let ok = focus_deck(1, &mut ui, &ids, &snapshot, &state, &pc);
+        assert!(ok, "focus_deck must accept an in-range idx");
+        assert_eq!(ui.selected_index, 1);
+        // PaneInput transition is also part of the Ctrl+d → 1-9 contract.
+        assert_eq!(ui.mode, UiMode::PaneInput);
+        let calls = pc.focused.lock().unwrap();
+        assert_eq!(
+            calls.as_slice(),
+            &["p1".to_string()],
+            "focus_deck must call focus_pane on the targeted card's pane"
+        );
+    }
+
+    /// Companion to the focus_deck test: pin the dispatch-loop's
+    /// Normal-mode step end-to-end by driving the SAME helper that
+    /// `run_tui` calls — `dispatch_normal_mode_key`. Deleting the
+    /// `mirror_selection_into_focus` line from that helper would
+    /// regress PRD #68 in production AND fail this test, closing the
+    /// Greptile-flagged gap where calling `mirror_selection_into_focus`
+    /// directly from the test would silently pass when someone
+    /// removed the production call site.
+    #[test]
+    fn jk_navigation_mirrors_selection_into_focus() {
+        let mut snapshot = AppState::default();
+        for (sid, pid) in [("s0", "p0"), ("s1", "p1"), ("s2", "p2")] {
+            let mut sess = make_session(SessionStatus::Idle);
+            sess.session_id = sid.to_string();
+            sess.pane_id = Some(pid.to_string());
+            snapshot.sessions.insert(sid.to_string(), sess);
+        }
+        let pc = RecordingFocusPC {
+            focused: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+        let total = filtered.len();
+
+        let mut ui = default_ui();
+        ui.selected_index = 0;
+
+        let press = |ui: &mut UiState, key: KeyEvent| {
+            dispatch_normal_mode_key(key, ui, total, None, &filtered, &pc);
+        };
+
+        // j: 0 → 1, focus mirrored to p1.
+        press(
+            &mut ui,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        assert_eq!(ui.selected_index, 1);
+        // Down: 1 → 2, focus mirrored to p2.
+        press(&mut ui, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(ui.selected_index, 2);
+        // k: 2 → 1, focus mirrored to p1.
+        press(
+            &mut ui,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        );
+        assert_eq!(ui.selected_index, 1);
+
+        let calls = pc.focused.lock().unwrap();
+        assert_eq!(
+            calls.as_slice(),
+            &["p1".to_string(), "p2".to_string(), "p1".to_string()],
+            "every j/k/Up/Down move must mirror the new selection into focus"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bell transition detection tests
+    // -----------------------------------------------------------------------
+
+    fn make_session(status: SessionStatus) -> SessionState {
+        SessionState {
+            session_id: String::new(),
+            agent_type: AgentType::ClaudeCode,
+            cwd: None,
+            status,
+            active_tool: None,
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+            recent_events: std::collections::VecDeque::new(),
+            tool_count: 0,
+            last_user_prompt: None,
+            first_prompts: Vec::new(),
+            pane_id: None,
+            agent_id: None,
+        }
+    }
+
+    #[test]
+    fn bell_on_transition_to_waiting() {
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::WaitingForInput));
+
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::Working);
+
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        assert!(need_bell);
+    }
+
+    #[test]
+    fn bell_no_repeat_same_status() {
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::WaitingForInput));
+
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::WaitingForInput);
+
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        assert!(!need_bell);
+    }
+
+    #[test]
+    fn bell_respects_config_toggle_off() {
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::Idle));
+
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::Working);
+
+        // Default config has on_idle = false
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        assert!(!need_bell);
+    }
+
+    #[test]
+    fn bell_respects_config_toggle_on() {
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::Idle));
+
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::Working);
+
+        let config = BellConfig {
+            on_idle: true,
+            ..Default::default()
+        };
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
+        assert!(need_bell);
+    }
+
+    #[test]
+    fn bell_disabled_globally() {
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::WaitingForInput));
+
+        let last = HashMap::new(); // new session
+
+        let config = BellConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
+        assert!(!need_bell);
+    }
+
+    #[test]
+    fn bell_multiple_transitions_single_bool() {
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::WaitingForInput));
+        sessions.insert("b".into(), make_session(SessionStatus::Error));
+
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::Working);
+        last.insert("b".into(), SessionStatus::Working);
+
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        assert!(need_bell);
+    }
+
+    #[test]
+    fn bell_cleanup_removed_sessions() {
+        let sessions = HashMap::new(); // no sessions
+
+        let mut last = HashMap::new();
+        last.insert("gone".into(), SessionStatus::Working);
+
+        let (_, new_map) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        assert!(!new_map.contains_key("gone"));
+    }
+
+    #[test]
+    fn bell_new_session_triggers() {
+        let mut sessions = HashMap::new();
+        sessions.insert("new".into(), make_session(SessionStatus::WaitingForInput));
+
+        let last = HashMap::new(); // empty — session is brand new
+
+        let (need_bell, new_map) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        assert!(need_bell);
+        assert_eq!(new_map.get("new"), Some(&SessionStatus::WaitingForInput));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Card density tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_choose_density_wide() {
+        // Wide layout (no extra stats line)
+        // Spacious=11, Normal=9, Compact=7
+
+        // 1 session, 1 col, plenty of height -> Spacious
+        assert_eq!(choose_density(1, 1, 20, true), CardDensity::Spacious);
+
+        // 2 sessions, 2 cols = 1 row, height 11 -> Spacious (1*11=11)
+        assert_eq!(choose_density(2, 2, 11, true), CardDensity::Spacious);
+
+        // 2 sessions, 2 cols = 1 row, height 10 -> Normal (1*9=9 fits)
+        assert_eq!(choose_density(2, 2, 10, true), CardDensity::Normal);
+
+        // 4 sessions, 2 cols = 2 rows, height 18 -> Normal (2*9=18)
+        assert_eq!(choose_density(4, 2, 18, true), CardDensity::Normal);
+
+        // 4 sessions, 2 cols = 2 rows, height 17 -> Compact (2*7=14 fits)
+        assert_eq!(choose_density(4, 2, 17, true), CardDensity::Compact);
+
+        // Many sessions, small screen -> Compact
+        assert_eq!(choose_density(10, 1, 20, true), CardDensity::Compact);
+
+        // Edge: 0 sessions -> Spacious (0 rows needed)
+        assert_eq!(choose_density(0, 1, 10, true), CardDensity::Spacious);
+    }
+
+    #[test]
+    fn test_choose_density_narrow() {
+        // Narrow layout: each mode needs 1 extra row for stats line
+        // Spacious=12, Normal=10, Compact=8
+
+        // 1 session, height 12 -> Spacious (1*12=12)
+        assert_eq!(choose_density(1, 1, 12, false), CardDensity::Spacious);
+
+        // 1 session, height 11 -> Normal (1*10=10 fits)
+        assert_eq!(choose_density(1, 1, 11, false), CardDensity::Normal);
+
+        // 2 sessions, 1 col, height 20 -> Normal (2*10=20)
+        assert_eq!(choose_density(2, 1, 20, false), CardDensity::Normal);
+
+        // 2 sessions, 1 col, height 19 -> Compact (2*8=16 fits)
+        assert_eq!(choose_density(2, 1, 19, false), CardDensity::Compact);
+    }
+
+    #[test]
+    fn test_collect_recent_prompts_from_events() {
+        use std::collections::VecDeque;
+
+        let mut events = VecDeque::new();
+        for prompt in ["first prompt", "second prompt", "third prompt"] {
+            events.push_back(AgentEvent {
+                session_id: "s1".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::Thinking,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: Some(prompt.to_string()),
+                metadata: HashMap::new(),
+                pane_id: None,
+                agent_id: None,
+            });
+        }
+
+        let session = SessionState {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            cwd: None,
+            status: SessionStatus::Idle,
+            active_tool: None,
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+            recent_events: events,
+            tool_count: 0,
+            last_user_prompt: Some("third prompt".to_string()),
+            first_prompts: Vec::new(),
+            pane_id: None,
+            agent_id: None,
+        };
+
+        // Spacious: get all 3
+        let prompts = collect_recent_prompts(&session, 3);
+        assert_eq!(
+            prompts,
+            vec!["first prompt", "second prompt", "third prompt"]
+        );
+
+        // Normal/Compact: get only the most recent
+        let prompts = collect_recent_prompts(&session, 1);
+        assert_eq!(prompts, vec!["third prompt"]);
+    }
+
+    #[test]
+    fn test_collect_recent_prompts_fallback_to_last() {
+        use std::collections::VecDeque;
+
+        // No prompt events in recent_events, but last_user_prompt is set
+        let session = SessionState {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            cwd: None,
+            status: SessionStatus::Idle,
+            active_tool: None,
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+            recent_events: VecDeque::new(),
+            tool_count: 0,
+            last_user_prompt: Some("old prompt".to_string()),
+            first_prompts: Vec::new(),
+            pane_id: None,
+            agent_id: None,
+        };
+
+        let prompts = collect_recent_prompts(&session, 3);
+        assert_eq!(prompts, vec!["old prompt"]);
+    }
+
+    #[test]
+    fn test_collect_recent_prompts_empty() {
+        use std::collections::VecDeque;
+
+        let session = SessionState {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            cwd: None,
+            status: SessionStatus::Idle,
+            active_tool: None,
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+            recent_events: VecDeque::new(),
+            tool_count: 0,
+            last_user_prompt: None,
+            first_prompts: Vec::new(),
+            pane_id: None,
+            agent_id: None,
+        };
+
+        let prompts = collect_recent_prompts(&session, 3);
+        assert!(prompts.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // keyevent_to_bytes tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn keyevent_printable_ascii() {
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(keyevent_to_bytes(&key), Some(vec![b'a']));
+
+        let key = KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT);
+        assert_eq!(keyevent_to_bytes(&key), Some(vec![b'Z']));
+    }
+
+    #[test]
+    fn keyevent_enter_tab_backspace_esc() {
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(vec![b'\r'])
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(vec![b'\t'])
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            Some(vec![0x7f])
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(vec![0x1b])
+        );
+    }
+
+    #[test]
+    fn keyevent_ctrl_c_and_ctrl_a() {
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(keyevent_to_bytes(&key), Some(vec![0x03]));
+
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(keyevent_to_bytes(&key), Some(vec![0x01]));
+
+        let key = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(keyevent_to_bytes(&key), Some(vec![0x1a]));
+    }
+
+    #[test]
+    fn keyevent_alt_prefix() {
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+        assert_eq!(keyevent_to_bytes(&key), Some(vec![0x1b, b'x']));
+    }
+
+    #[test]
+    fn keyevent_arrow_keys() {
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Some(b"\x1b[B".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            Some(b"\x1b[C".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Some(b"\x1b[D".to_vec())
+        );
+    }
+
+    #[test]
+    fn keyevent_f_keys() {
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
+            Some(b"\x1bOP".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE)),
+            Some(b"\x1b[24~".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::F(13), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn keyevent_special_nav_keys() {
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            Some(b"\x1b[H".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            Some(b"\x1b[F".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+            Some(b"\x1b[3~".to_vec())
+        );
+    }
+
+    #[test]
+    fn keyevent_backtab() {
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(b"\x1b[Z".to_vec())
+        );
+    }
+
+    #[test]
+    fn handle_pane_input_forwards_printable() {
+        let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        match handle_pane_input_key(key) {
+            KeyResult::ForwardToPane(bytes) => assert_eq!(bytes, vec![b'l']),
+            other => panic!("Expected ForwardToPane, got {:?}", other),
+        }
+    }
+
+    // PRD #76 M2.20 — submit-debounce policy tests.
+
+    #[test]
+    fn enter_following_recent_keystroke_sleeps_at_least_debounce_minus_elapsed() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_millis(30);
+        let sleep = submit_debounce_duration(now, Some(last), b"\r");
+        // Expected ~120ms (150 - 30). Allow a few ms tolerance for arithmetic.
+        let expected = std::time::Duration::from_millis(120);
+        let lower = expected.saturating_sub(std::time::Duration::from_millis(5));
+        let upper = expected + std::time::Duration::from_millis(5);
+        assert!(
+            sleep >= lower && sleep <= upper,
+            "expected ~{expected:?}, got {sleep:?}"
+        );
+    }
+
+    #[test]
+    fn enter_with_stale_last_keystroke_does_not_sleep() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_millis(500);
+        let sleep = submit_debounce_duration(now, Some(last), b"\r");
+        assert_eq!(sleep, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn enter_with_no_prior_keystroke_does_not_sleep() {
+        let now = std::time::Instant::now();
+        let sleep = submit_debounce_duration(now, None, b"\r");
+        assert_eq!(sleep, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn non_enter_bytes_never_sleep_even_when_recent() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_millis(10);
+        let sleep = submit_debounce_duration(now, Some(last), b"hello");
+        assert_eq!(sleep, std::time::Duration::ZERO);
+    }
+
+    // PRD #128 Direction B-1 — spawn-time readiness buffer policy tests.
+
+    #[test]
+    fn spawn_time_no_ready_since_fires_immediately() {
+        // None signals "no SessionStart yet observed", but the caller
+        // gates with the timeout-ready path; this helper should not
+        // double-gate it.
+        let now = std::time::Instant::now();
+        assert!(should_inject_spawn_time_prompt(None, now));
+    }
+
+    #[test]
+    fn spawn_time_within_buffer_window_holds() {
+        let now = std::time::Instant::now();
+        // 100 ms after SessionStart — far inside the 500 ms buffer.
+        let ready_since = now - std::time::Duration::from_millis(100);
+        assert!(!should_inject_spawn_time_prompt(Some(ready_since), now));
+    }
+
+    #[test]
+    fn spawn_time_after_buffer_window_fires() {
+        let now = std::time::Instant::now();
+        // 600 ms after SessionStart — past the 500 ms buffer.
+        let ready_since = now - std::time::Duration::from_millis(600);
+        assert!(should_inject_spawn_time_prompt(Some(ready_since), now));
+    }
+
+    #[test]
+    fn spawn_time_exactly_at_buffer_boundary_fires() {
+        let now = std::time::Instant::now();
+        let ready_since = now - SPAWN_TIME_READINESS_BUFFER;
+        // `>=` boundary: exactly at the buffer should fire.
+        assert!(should_inject_spawn_time_prompt(Some(ready_since), now));
+    }
+
+    // -----------------------------------------------------------------------
+    // Idle ASCII art tests
+    // -----------------------------------------------------------------------
+
+    fn idle_art_config(enabled: bool, timeout_secs: u64) -> IdleArtConfig {
+        IdleArtConfig {
+            enabled,
+            provider: "anthropic".to_string(),
+            model: "claude-haiku-4-5".to_string(),
+            timeout_secs,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Unified NewPaneFormState tests
+    // -----------------------------------------------------------------------
+
+    fn make_mode(name: &str) -> ModeConfig {
+        ModeConfig {
+            name: name.to_string(),
+            init_command: None,
+            panes: vec![],
+            rules: vec![],
+            reactive_panes: 2,
+        }
+    }
+
+    fn make_orchestration(name: &str) -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: name.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "coder".to_string(),
+                    command: "claude".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: Some("Code.".to_string()),
+                    clear: true,
+                },
+                OrchestrationRoleConfig {
+                    name: "reviewer".to_string(),
+                    command: "claude".to_string(),
+                    start: false,
+                    description: Some("Reviews code".to_string()),
+                    prompt_template: Some("Review.".to_string()),
+                    clear: true,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_update_idle_art_gated_on_config_disabled() {
+        let mut cache = HashMap::new();
+        let config = idle_art_config(false, 10);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = "s1".to_string();
+        s.last_activity = Utc::now() - Duration::seconds(100);
+        sessions.insert("s1".to_string(), s);
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(cache.is_empty(), "Should not create entries when disabled");
+    }
+
+    #[test]
+    fn test_update_idle_art_gated_on_density() {
+        let mut cache = HashMap::new();
+        let config = idle_art_config(true, 10);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = "s1".to_string();
+        s.last_activity = Utc::now() - Duration::seconds(100);
+        sessions.insert("s1".to_string(), s);
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Normal);
+        assert!(
+            cache.is_empty(),
+            "Should not create entries in Normal density"
+        );
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Compact);
+        assert!(
+            cache.is_empty(),
+            "Should not create entries in Compact density"
+        );
+    }
+
+    #[test]
+    fn unified_form_mode_option_count() {
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            vec![],
+        );
+        assert_eq!(f.mode_option_count(), 2); // "No mode" + 1 mode
+
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![],
+        );
+        assert_eq!(f.mode_option_count(), 1); // "No mode" only
+    }
+
+    #[test]
+    fn unified_form_mode_cycling() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("alpha"), make_mode("beta")],
+            vec![],
+        );
+        assert_eq!(f.selection_index, 0);
+
+        // Can't go below 0
+        f.select_previous_mode();
+        assert_eq!(f.selection_index, 0);
+
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 1);
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 2);
+
+        // Can't go past last
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 2);
+    }
+
+    #[test]
+    fn unified_form_selected_mode() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("k8s"), make_mode("rust-tdd")],
+            vec![],
+        );
+
+        // Index 0 = "No mode"
+        assert!(f.selected_mode().is_none());
+        assert_eq!(f.mode_display_name(), "No mode");
+
+        f.selection_index = 1;
+        assert_eq!(f.selected_mode().unwrap().name, "k8s");
+        assert_eq!(f.mode_display_name(), "k8s");
+
+        f.selection_index = 2;
+        assert_eq!(f.selected_mode().unwrap().name, "rust-tdd");
+    }
+
+    #[test]
+    fn unified_form_selected_orchestration() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("dev")],
+            vec![make_orchestration("tdd"), make_orchestration("review")],
+        );
+
+        // Index 0 = "No mode", 1 = mode "dev", 2+ = orchestrations
+        assert!(f.selected_orchestration().is_none());
+        assert!(f.selected_mode().is_none());
+
+        f.selection_index = 1;
+        assert!(f.selected_orchestration().is_none());
+        assert_eq!(f.selected_mode().unwrap().name, "dev");
+
+        f.selection_index = 2;
+        assert!(f.selected_mode().is_none());
+        assert_eq!(f.selected_orchestration().unwrap().name, "tdd");
+        assert_eq!(f.mode_display_name(), "Orch: tdd");
+
+        f.selection_index = 3;
+        assert_eq!(f.selected_orchestration().unwrap().name, "review");
+        assert_eq!(f.mode_display_name(), "Orch: review");
+    }
+
+    #[test]
+    fn unified_form_orchestration_cycling() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("dev")],
+            vec![make_orchestration("tdd")],
+        );
+        // 0=No mode, 1=dev, 2=tdd
+        assert_eq!(f.mode_option_count(), 3);
+
+        f.select_next_mode();
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 2);
+        assert_eq!(f.selected_orchestration().unwrap().name, "tdd");
+
+        // Can't go past last
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 2);
+    }
+
+    #[test]
+    fn unified_form_tab_cycles_with_mode() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            vec![],
+        );
+        assert_eq!(f.focused, FormField::Mode);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Name);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Command);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Mode); // wraps
+
+        // Reverse
+        f.focused = f.prev_field();
+        assert_eq!(f.focused, FormField::Command);
+    }
+
+    #[test]
+    fn unified_form_tab_cycles_without_mode() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![],
+        );
+        assert!(!f.has_mode_field);
+        assert_eq!(f.focused, FormField::Name);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Command);
+
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Name); // wraps, skips Mode
+
+        f.focused = f.prev_field();
+        assert_eq!(f.focused, FormField::Command);
+    }
+
+    #[test]
+    fn unified_form_initial_focus_with_modes() {
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            vec![],
+        );
+        assert_eq!(f.focused, FormField::Mode);
+    }
+
+    #[test]
+    fn unified_form_initial_focus_without_modes() {
+        let f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![],
+        );
+        assert_eq!(f.focused, FormField::Name);
+    }
+
+    #[test]
+    fn unified_form_arrow_cycles_mode() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a"), make_mode("b")],
+            vec![],
+        ));
+
+        // Right arrow cycles forward
+        let key = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().selection_index, 1);
+
+        // Left arrow cycles back
+        let key = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().selection_index, 0);
+    }
+
+    #[test]
+    fn unified_form_enter_navigates_fields() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            "agent".to_string(),
+            "claude".to_string(),
+            vec![make_mode("a")],
+            vec![],
+        ));
+
+        // Enter on Mode → Name
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Name);
+
+        // Enter on Name → Command
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().focused,
+            FormField::Command
+        );
+
+        // Enter on Command → submit
+        let result = handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.new_pane_form.is_none());
+        assert!(matches!(result, KeyResult::NewPane(_)));
+    }
+
+    #[test]
+    fn unified_form_submit_with_mode() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/proj"),
+            "agent".to_string(),
+            "claude".to_string(),
+            vec![make_mode("k8s-ops")],
+            vec![],
+        ));
+
+        // Select mode "k8s-ops" (index 1)
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui);
+
+        // Navigate to Command field and submit
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        handle_new_pane_form_key(enter, &mut ui); // Name → Command
+        let result = handle_new_pane_form_key(enter, &mut ui); // submit
+
+        match result {
+            KeyResult::NewPane(req) => {
+                assert_eq!(req.dir, PathBuf::from("/tmp/proj"));
+                assert!(
+                    req.mode_config
+                        .as_ref()
+                        .is_some_and(|c| c.name == "k8s-ops")
+                );
+            }
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unified_form_submit_no_mode() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            "agent".to_string(),
+            "claude".to_string(),
+            vec![make_mode("a")],
+            vec![],
+        ));
+
+        // Stay on "No mode" (index 0), navigate through fields
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        handle_new_pane_form_key(enter, &mut ui); // Name → Command
+        let result = handle_new_pane_form_key(enter, &mut ui);
+
+        match result {
+            KeyResult::NewPane(req) => {
+                assert!(req.mode_config.is_none());
+            }
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
+    }
+
+    // PRD #107 regression: user-entered name in the new-pane form should
+    // override the orchestration config name so the tab title matches.
+    #[test]
+    fn orchestration_form_user_name_overrides_config_name() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/proj"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("config-name")],
+        ));
+
+        // Select the orchestration (Right from "No mode" → first orchestration slot)
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui);
+
+        // Move focus to the Name field
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+
+        // Type a custom name
+        for c in "user-typed-name".chars() {
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            handle_new_pane_form_key(key, &mut ui);
+        }
+
+        // PRD #106: with an orchestration selected, Command is hidden — so
+        // pressing Enter on Name submits directly. No second navigation step.
+        let result = handle_new_pane_form_key(enter, &mut ui); // submit
+
+        let req = match result {
+            KeyResult::NewPane(r) => r,
+            other => panic!("Expected NewPane, got {:?}", other),
+        };
+
+        // The form must carry the user's input in req.name.
+        assert_eq!(req.name, "user-typed-name");
+
+        // Simulate the handler fix (ui.rs KeyResult::NewPane branch):
+        // when req.name is non-empty, orch_config.name is overridden before
+        // open_orchestration_tab is called, so the tab label matches user input.
+        let mut orch = req.orchestration_config.unwrap();
+        if !req.name.is_empty() {
+            orch.name = req.name.clone();
+        }
+        assert_eq!(
+            orch.name, "user-typed-name",
+            "tab should show the user-entered name, not the TOML config name"
+        );
+    }
+
+    // PRD #107: empty name in the form must leave the config name untouched.
+    #[test]
+    fn orchestration_form_empty_name_keeps_config_name() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/proj"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("config-name")],
+        ));
+
+        // Select orchestration, skip Name field (leave it empty), submit.
+        // PRD #106: Command is hidden, so Enter on Name submits.
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        let result = handle_new_pane_form_key(enter, &mut ui); // submit
+
+        let req = match result {
+            KeyResult::NewPane(r) => r,
+            other => panic!("Expected NewPane, got {:?}", other),
+        };
+
+        assert!(req.name.is_empty());
+
+        // Simulate handler: empty name → no override → config name preserved.
+        let mut orch = req.orchestration_config.unwrap();
+        if !req.name.is_empty() {
+            orch.name = req.name.clone();
+        }
+        assert_eq!(
+            orch.name, "config-name",
+            "config name must be kept when the user left the Name field empty"
+        );
+    }
+
+    #[test]
+    fn unified_form_esc_cancels() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            vec![],
+        ));
+
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.new_pane_form.is_none());
+    }
+
+    #[test]
+    fn unified_form_typing_in_text_fields() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            vec![],
+        ));
+
+        // Move to Name field
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui);
+
+        // Type into Name field
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().name, "x");
+
+        // Backspace
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        handle_new_pane_form_key(key, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().name, "");
+    }
+
+    #[test]
+    fn unified_form_h_l_types_chars_in_name() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            vec![],
+        ));
+
+        // Move to Name field
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui);
+
+        // h and l should type characters, not cycle modes
+        let key_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        handle_new_pane_form_key(key_h, &mut ui);
+        let key_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        handle_new_pane_form_key(key_l, &mut ui);
+
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().name, "hl");
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #106: Command field visibility when orchestration is selected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn command_hidden_only_when_orchestration_selected() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("dev")],
+            vec![make_orchestration("tdd")],
+        );
+
+        // 0 = No mode → command visible
+        assert!(f.command_visible());
+
+        // 1 = workspace mode → command visible
+        f.selection_index = 1;
+        assert!(f.command_visible());
+
+        // 2 = orchestration → command hidden
+        f.selection_index = 2;
+        assert!(!f.command_visible());
+
+        // Toggling back restores it.
+        f.selection_index = 0;
+        assert!(f.command_visible());
+    }
+
+    #[test]
+    fn tab_skips_hidden_command_field_with_orchestration() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("tdd")],
+        );
+        // Select the orchestration (index 1).
+        f.selection_index = 1;
+        assert!(!f.command_visible());
+
+        assert_eq!(f.focused, FormField::Mode);
+
+        // Mode → Name (skipping nothing yet).
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Name);
+
+        // Name should wrap back to Mode rather than visiting hidden Command.
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Mode);
+
+        // Shift+Tab from Mode should land on Name (skip Command).
+        f.focused = f.prev_field();
+        assert_eq!(f.focused, FormField::Name);
+
+        // Shift+Tab from Name → Mode.
+        f.focused = f.prev_field();
+        assert_eq!(f.focused, FormField::Mode);
+    }
+
+    #[test]
+    fn tab_visits_command_when_workspace_mode_selected() {
+        // Regression guard: with a workspace mode (not an orchestration),
+        // Tab cycling must still pass through the Command field.
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("dev")],
+            vec![make_orchestration("tdd")],
+        );
+        f.selection_index = 1; // workspace mode
+        assert!(f.command_visible());
+
+        f.focused = FormField::Mode;
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Name);
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Command);
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::Mode);
+    }
+
+    #[test]
+    fn enter_on_name_submits_when_orchestration_selected() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/proj"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("tdd")],
+        ));
+
+        // Select the orchestration.
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui);
+
+        // Enter from Mode → Name.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Name);
+
+        // Enter on Name should submit directly, not advance to a hidden field.
+        let result = handle_new_pane_form_key(enter, &mut ui);
+        assert!(matches!(result, KeyResult::NewPane(_)));
+        assert!(ui.new_pane_form.is_none());
+        assert_eq!(ui.mode, UiMode::Normal);
+        if let KeyResult::NewPane(req) = result {
+            assert!(req.orchestration_config.is_some());
+            assert!(req.mode_config.is_none());
+        }
+    }
+
+    #[test]
+    fn tab_through_hidden_command_after_cycling_to_orchestration() {
+        // End-to-end: user starts on Mode (No mode selected), navigates to
+        // Command, comes back, then cycles forward to an orchestration. From
+        // there, Tab must skip the now-hidden Command field cleanly.
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("dev")],
+            vec![make_orchestration("tdd")],
+        ));
+
+        // Walk Mode → Name → Command → Name → Mode (all visible at this
+        // point because "No mode" is selected).
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
+        handle_new_pane_form_key(tab, &mut ui);
+        handle_new_pane_form_key(tab, &mut ui);
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().focused,
+            FormField::Command
+        );
+        handle_new_pane_form_key(backtab, &mut ui);
+        handle_new_pane_form_key(backtab, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Mode);
+
+        // Right-arrow twice to land on the orchestration (0 → 1 → 2).
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui);
+        handle_new_pane_form_key(right, &mut ui);
+        assert!(
+            ui.new_pane_form
+                .as_ref()
+                .unwrap()
+                .selected_orchestration()
+                .is_some()
+        );
+
+        // Now Tab forward: Mode → Name → Mode (skipping hidden Command).
+        handle_new_pane_form_key(tab, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Name);
+        handle_new_pane_form_key(tab, &mut ui);
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Mode);
+    }
+
+    #[test]
+    fn footer_hint_switches_to_submit_when_name_focused_with_orchestration() {
+        // PRD #106 follow-up: when the Command field is hidden and focus is
+        // on Name, Enter submits — the footer must say so.
+        let submit_hint = new_pane_form_footer_hint(true, true);
+        assert!(
+            submit_hint.contains("Enter: submit"),
+            "expected submit hint, got {submit_hint:?}"
+        );
+
+        // Sanity checks: every other focus/visibility combination keeps the
+        // legacy 'Enter: next' wording.
+        let next_hint = new_pane_form_footer_hint(true, false);
+        assert!(
+            next_hint.contains("Enter: next") && !next_hint.contains("submit"),
+            "expected next hint, got {next_hint:?}"
+        );
+        let no_mode_hint = new_pane_form_footer_hint(false, false);
+        assert!(
+            no_mode_hint.contains("Enter: next/confirm"),
+            "expected next/confirm hint when there's no mode field, got {no_mode_hint:?}"
+        );
+    }
+
+    #[test]
+    fn enter_on_name_still_advances_to_command_without_orchestration() {
+        // Regression guard for the non-orchestration flow: with a workspace
+        // mode (or "No mode") selected, Enter on Name must still advance to
+        // the Command field rather than submit.
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            "agent".to_string(),
+            "claude".to_string(),
+            vec![make_mode("dev")],
+            vec![],
+        ));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        let result = handle_new_pane_form_key(enter, &mut ui); // Name → Command
+        assert!(matches!(result, KeyResult::Continue));
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().focused,
+            FormField::Command
+        );
+    }
+
+    #[test]
+    fn config_gen_prompt_enter_on_yes_sends_prompt() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_selected = 0; // Yes
+        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_config_gen_prompt_key(enter, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.config_gen_target.is_none());
+        assert!(
+            matches!(result, KeyResult::SendConfigGenPrompt { ref pane_id, ref cwd }
+                if pane_id == "pane-1" && cwd == "/my/project")
+        );
+    }
+
+    #[test]
+    fn test_update_idle_art_waiting_before_timeout() {
+        let mut cache = HashMap::new();
+        let config = idle_art_config(true, 300);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = "s1".to_string();
+        s.last_activity = Utc::now() - Duration::seconds(10); // only 10s, timeout is 300s
+        sessions.insert("s1".to_string(), s);
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(cache.contains_key("s1"));
+        assert!(matches!(cache["s1"].phase, IdleArtPhase::Waiting));
+    }
+
+    #[test]
+    fn test_update_idle_art_reset_on_active() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "s1".to_string(),
+            IdleArtEntry {
+                phase: IdleArtPhase::HasArt(AsciiArtResult {
+                    frames: vec!["art".to_string()],
+                }),
+                idle_since: Utc::now() - Duration::seconds(600),
+                dismissed: false,
+            },
+        );
+
+        let config = idle_art_config(true, 300);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Working); // no longer idle
+        s.session_id = "s1".to_string();
+        sessions.insert("s1".to_string(), s);
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(
+            !cache.contains_key("s1"),
+            "Should remove entry when session is no longer idle"
+        );
+    }
+
+    #[test]
+    fn test_update_idle_art_reset_on_new_idle_stretch() {
+        let old_idle_since = Utc::now() - Duration::seconds(600);
+        let new_idle_since = Utc::now() - Duration::seconds(5);
+        let mut cache = HashMap::new();
+        cache.insert(
+            "s1".to_string(),
+            IdleArtEntry {
+                phase: IdleArtPhase::HasArt(AsciiArtResult {
+                    frames: vec!["old art".to_string()],
+                }),
+                idle_since: old_idle_since,
+                dismissed: false,
+            },
+        );
+
+        let config = idle_art_config(true, 300);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = "s1".to_string();
+        s.last_activity = new_idle_since; // different from old idle_since
+        sessions.insert("s1".to_string(), s);
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(
+            matches!(cache["s1"].phase, IdleArtPhase::Waiting),
+            "Should reset to Waiting on new idle stretch"
+        );
+        assert_eq!(cache["s1"].idle_since, new_idle_since);
+    }
+
+    #[test]
+    fn test_update_idle_art_removes_stale_sessions() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "gone".to_string(),
+            IdleArtEntry {
+                phase: IdleArtPhase::Waiting,
+                idle_since: Utc::now(),
+                dismissed: false,
+            },
+        );
+
+        let config = idle_art_config(true, 300);
+        let sessions = HashMap::new(); // empty — "gone" no longer exists
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(
+            !cache.contains_key("gone"),
+            "Should remove entries for non-existent sessions"
+        );
+    }
+
+    #[test]
+    fn test_build_art_input_combines_prompts() {
+        let mut s = make_session(SessionStatus::Idle);
+        s.first_prompts = vec!["Fix auth".to_string(), "Add tests".to_string()];
+        s.last_user_prompt = Some("Run deploy".to_string());
+
+        let input = build_art_input(&s);
+        assert_eq!(input, "Fix auth | Add tests | Run deploy");
+    }
+
+    #[test]
+    fn test_build_art_input_deduplicates_last_prompt() {
+        let mut s = make_session(SessionStatus::Idle);
+        s.first_prompts = vec!["Fix auth".to_string()];
+        s.last_user_prompt = Some("Fix auth".to_string()); // same as first
+
+        let input = build_art_input(&s);
+        assert_eq!(input, "Fix auth");
+    }
+
+    #[test]
+    fn test_build_art_input_empty() {
+        let s = make_session(SessionStatus::Idle);
+        let input = build_art_input(&s);
+        assert_eq!(input, "");
+    }
+
+    #[test]
+    fn test_build_art_output_with_tools() {
+        let mut s = make_session(SessionStatus::Idle);
+        s.recent_events.push_back(AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::ToolStart,
+            tool_name: Some("Bash".to_string()),
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+        });
+        let output = build_art_output(&s);
+        assert!(output.contains("Bash"));
+    }
+
+    #[test]
+    fn test_build_art_output_no_tools() {
+        let s = make_session(SessionStatus::Idle);
+        let output = build_art_output(&s);
+        assert_eq!(output, "Session idle");
+    }
+
+    #[test]
+    fn test_frame_cycling() {
+        // 3 frames, cycling at 120 ticks per frame
+        let num_frames = 3;
+        let frame_for = |tick: u64| (tick / 120) as usize % num_frames;
+        assert_eq!(frame_for(0), 0);
+        assert_eq!(frame_for(119), 0);
+        assert_eq!(frame_for(120), 1);
+        assert_eq!(frame_for(239), 1);
+        assert_eq!(frame_for(240), 2);
+        assert_eq!(frame_for(360), 0); // wraps
+    }
+
+    #[test]
+    fn test_idle_art_has_art_cached() {
+        let idle_since = Utc::now() - Duration::seconds(600);
+        let mut cache = HashMap::new();
+        let art = AsciiArtResult {
+            frames: vec!["frame1".to_string(), "frame2".to_string()],
+        };
+        cache.insert(
+            "s1".to_string(),
+            IdleArtEntry {
+                phase: IdleArtPhase::HasArt(art),
+                idle_since,
+                dismissed: false,
+            },
+        );
+
+        let config = idle_art_config(true, 300);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = "s1".to_string();
+        s.last_activity = idle_since;
+        sessions.insert("s1".to_string(), s);
+
+        // Update should NOT reset HasArt to Waiting (same idle_since)
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(
+            matches!(cache["s1"].phase, IdleArtPhase::HasArt(_)),
+            "Should keep cached art for same idle stretch"
+        );
+    }
+
+    #[test]
+    fn test_idle_art_failed_stays_failed_within_cooldown() {
+        let mut cache = HashMap::new();
+        let idle_since = Utc::now() - Duration::seconds(600);
+        cache.insert(
+            "s1".to_string(),
+            IdleArtEntry {
+                phase: IdleArtPhase::Failed(std::time::Instant::now()),
+                idle_since,
+                dismissed: false,
+            },
+        );
+
+        let config = idle_art_config(true, 300);
+        let mut sessions = HashMap::new();
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = "s1".to_string();
+        s.last_activity = idle_since;
+        sessions.insert("s1".to_string(), s);
+
+        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
+        assert!(
+            matches!(cache["s1"].phase, IdleArtPhase::Failed(_)),
+            "Failed should stay Failed within cooldown period"
+        );
+    }
+
+    #[test]
+    fn config_gen_prompt_enter_on_no_dismisses() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_selected = 1; // No
+        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_config_gen_prompt_key(enter, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.config_gen_target.is_none());
+        assert!(matches!(result, KeyResult::Continue));
+    }
+
+    #[test]
+    fn config_gen_prompt_enter_on_never_suppresses_dir() {
+        // Picking "Never" calls suppress_dir() → save(), which reads
+        // DOT_AGENT_DECK_CONFIG_GEN_STATE. Hold the shared lock and point at
+        // a temp path so we don't race against other tests touching the same
+        // env var, and don't pollute the real home dir.
+        let _guard = crate::config::CONFIG_GEN_STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config-gen-state.json");
+        // Drop guard restores the env var even if an assertion below panics.
+        let _env_restore = crate::config::ConfigGenStateEnvGuard::set(path.to_str().unwrap());
+
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_selected = 2; // Never
+        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_config_gen_prompt_key(enter, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.config_gen_target.is_none());
+        assert!(ui.config_gen_state.is_suppressed("/my/project"));
+        assert!(matches!(result, KeyResult::Continue));
+        assert!(ui.status_message.is_some());
+    }
+
+    #[test]
+    fn config_gen_prompt_arrow_navigation() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_selected = 0;
+
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_config_gen_prompt_key(down, &mut ui);
+        assert_eq!(ui.config_gen_selected, 1);
+
+        handle_config_gen_prompt_key(down, &mut ui);
+        assert_eq!(ui.config_gen_selected, 2);
+
+        // Can't go past last
+        handle_config_gen_prompt_key(down, &mut ui);
+        assert_eq!(ui.config_gen_selected, 2);
+
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        handle_config_gen_prompt_key(up, &mut ui);
+        assert_eq!(ui.config_gen_selected, 1);
+    }
+
+    #[test]
+    fn config_gen_prompt_esc_dismisses() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ConfigGenPrompt;
+        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let result = handle_config_gen_prompt_key(esc, &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(matches!(result, KeyResult::Continue));
+    }
+
+    #[test]
+    fn pending_dispatch_timeout() {
+        let pane_ctrl =
+            Arc::new(crate::embedded_pane::EmbeddedPaneController::for_render_only_tests());
+        let pane: Arc<dyn PaneController> = pane_ctrl;
+        let snapshot = AppState::default();
+        let mut ui = default_ui();
+
+        // Add a pending dispatch with an expired timeout.
+        ui.pending_dispatches.push(PendingDispatch {
+            pane_id: "999".to_string(),
+            prompt: "Do work".to_string(),
+            created_at: std::time::Instant::now() - std::time::Duration::from_secs(60),
+        });
+
+        process_pending_dispatches(&mut ui, &pane, &snapshot);
+
+        // Should be removed due to timeout.
+        assert!(ui.pending_dispatches.is_empty());
+    }
+
+    #[test]
+    fn pending_dispatch_waits_for_agent_ready() {
+        let pane_ctrl =
+            Arc::new(crate::embedded_pane::EmbeddedPaneController::for_render_only_tests());
+        let pane: Arc<dyn PaneController> = pane_ctrl;
+        let snapshot = AppState::default(); // No sessions → agent not ready
+        let mut ui = default_ui();
+
+        ui.pending_dispatches.push(PendingDispatch {
+            pane_id: "1".to_string(),
+            prompt: "Do work".to_string(),
+            created_at: std::time::Instant::now(),
+        });
+
+        process_pending_dispatches(&mut ui, &pane, &snapshot);
+
+        // Should still be pending — agent not ready and not timed out.
+        assert_eq!(ui.pending_dispatches.len(), 1);
+    }
+
+    // PRD #93 Phase 2 / M4.2: the quit dialog collapsed from a
+    // mode-dependent (Quit-or-Detach) action to a single Detach
+    // confirmation. Pin that Enter on index 0 always returns
+    // `DetachAndQuit` so a future refactor can't silently reintroduce
+    // a local-mode "kill agents on exit" path.
+    #[test]
+    fn quit_confirm_enter_returns_detach() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::QuitConfirm;
+        ui.quit_confirm_selected = 0;
+
+        let result = handle_quit_confirm_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            0,
+        );
+        assert!(matches!(result, KeyResult::DetachAndQuit));
+    }
+
+    #[test]
+    fn quit_confirm_cancel_returns_to_normal_mode() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::QuitConfirm;
+        // PRD #92 F1: Cancel moved from index 1 to index 2 to make room
+        // for Stop in the middle.
+        ui.quit_confirm_selected = 2;
+
+        let result = handle_quit_confirm_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            0,
+        );
+        assert!(matches!(result, KeyResult::Continue));
+        assert_eq!(ui.mode, UiMode::Normal);
+    }
+
+    #[test]
+    fn quit_confirm_down_clamps_to_three_options() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::QuitConfirm;
+        ui.quit_confirm_selected = 0;
+
+        // Three presses on Down — selection must stop at index 2 (Cancel),
+        // proving QUIT_OPTION_COUNT == 3 after the PRD #92 F1 expansion.
+        handle_quit_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui, 0);
+        assert_eq!(ui.quit_confirm_selected, 1);
+        handle_quit_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui, 0);
+        assert_eq!(ui.quit_confirm_selected, 2);
+        handle_quit_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui, 0);
+        assert_eq!(ui.quit_confirm_selected, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #92 F1 — Stop option in the Ctrl+C dialog
+    //
+    // Primary dialog gains a Stop option at index 1 (Detach default / Stop
+    // / Cancel). Picking Stop with no agents proceeds directly; with
+    // agents alive the secondary y/n dialog confirms first. The secondary
+    // dialog defaults to No; No returns to the primary dialog; Yes is
+    // KeyResult::StopAndQuit. KIND_SHUTDOWN side effects and registry
+    // teardown are exercised by tests/stop_dialog.rs.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quit_confirm_stop_with_no_agents_returns_stop_and_quit() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::QuitConfirm;
+        ui.quit_confirm_selected = 1; // Stop
+
+        let result = handle_quit_confirm_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            0, // no agents
+        );
+        assert!(
+            matches!(result, KeyResult::StopAndQuit),
+            "Stop with 0 agents must skip the secondary dialog, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_stop_with_agents_prompts_secondary_dialog() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::QuitConfirm;
+        ui.quit_confirm_selected = 1; // Stop
+
+        let result = handle_quit_confirm_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            3, // three agents alive
+        );
+        assert!(
+            matches!(result, KeyResult::StopConfirmPrompt { agent_count: 3 }),
+            "Stop with N>0 agents must request secondary confirmation with N rendered, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn stop_confirm_defaults_to_no() {
+        // Default selection on entry must be No (index 0). The dispatcher
+        // sets this when transitioning into StopConfirm; the test
+        // re-asserts the contract from the handler's perspective.
+        let ui = default_ui();
+        assert_eq!(
+            ui.stop_confirm_selected, 0,
+            "secondary dialog must default to No (index 0)"
+        );
+    }
+
+    #[test]
+    fn stop_confirm_yes_returns_stop_and_quit() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::StopConfirm;
+        ui.stop_confirm_selected = 1; // Yes
+        ui.stop_confirm_agent_count = 2;
+
+        let result =
+            handle_stop_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+        assert!(
+            matches!(result, KeyResult::StopAndQuit),
+            "Enter on Yes must confirm Stop, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn stop_confirm_y_shortcut_returns_stop_and_quit() {
+        // `y` is a shortcut for Yes regardless of which option is
+        // currently highlighted — matches conventional y/n dialogs.
+        let mut ui = default_ui();
+        ui.mode = UiMode::StopConfirm;
+        ui.stop_confirm_selected = 0; // No is highlighted
+        ui.stop_confirm_agent_count = 2;
+
+        let result = handle_stop_confirm_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert!(
+            matches!(result, KeyResult::StopAndQuit),
+            "y must confirm Stop even when No is highlighted, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn stop_confirm_no_returns_to_primary_dialog() {
+        // Selecting No (or pressing Esc / n) must return to the primary
+        // QuitConfirm dialog with Stop still selected, so the user can
+        // pick Detach or Cancel without re-opening the Ctrl+C dialog.
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        ] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::StopConfirm;
+            ui.stop_confirm_selected = 0; // No
+            ui.stop_confirm_agent_count = 1;
+
+            let result = handle_stop_confirm_key(key, &mut ui);
+            assert!(
+                matches!(result, KeyResult::Continue),
+                "{key:?} on No path must Continue, got {result:?}"
+            );
+            assert_eq!(
+                ui.mode,
+                UiMode::QuitConfirm,
+                "{key:?} on No path must return to QuitConfirm"
+            );
+            assert_eq!(
+                ui.stop_confirm_selected, 0,
+                "{key:?} on No path must reset stop_confirm_selected to default (No)"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_confirm_down_clamps_to_two_options() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::StopConfirm;
+        ui.stop_confirm_selected = 0;
+
+        // Two presses on Down — selection must stop at index 1 (Yes),
+        // proving STOP_OPTION_COUNT == 2.
+        handle_stop_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui);
+        assert_eq!(ui.stop_confirm_selected, 1);
+        handle_stop_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui);
+        assert_eq!(ui.stop_confirm_selected, 1);
+    }
 }

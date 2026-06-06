@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use std::any::Any;
 
-use crate::agent_pty::{self, DOT_AGENT_DECK_PANE_ID, TabMembership};
+use crate::agent_pty::{self, DOT_AGENT_DECK_PANE_ID, PTY_RESIZE_DIM_MAX, TabMembership};
 use crate::daemon_client::{AttachConnection, DaemonClient, StartAgentOptions};
 use crate::event::AgentType;
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
@@ -170,6 +170,56 @@ struct Pane {
 
 /// Thread-safe pane registry.
 type PaneRegistry = Arc<Mutex<HashMap<String, Pane>>>;
+
+/// Resolve the (rows, cols) the local vt100 parser should be initialised
+/// at on hydration (PRD #104 M2).
+///
+/// The daemon now echoes its current PTY dims via `AgentRecord.rows/cols`.
+/// Three cases need handling:
+///
+/// - **Sane dims** (`1..=PTY_RESIZE_DIM_MAX`): use them. This is the
+///   normal new-daemon path — snapshot bytes parse at the dims they
+///   were written at.
+/// - **Zero** (`0, 0`): the daemon predates this PRD and doesn't carry
+///   the field on the wire. Fall back to the historical 24×80
+///   placeholder; the post-hydration resize sweep in `ui.rs` lands
+///   the real viewport dims a frame later.
+/// - **Out of range** (e.g. `> PTY_RESIZE_DIM_MAX`): a daemon-side bug
+///   or hostile peer sending nonsense. Same fall-back as the zero
+///   case — vt100 has subtle edge cases at zero / huge sizes and a
+///   panic in the parser would take down the whole TUI hydration
+///   path, so we refuse to construct one with those values.
+///
+/// In all fall-back cases we emit a single debug log so the case is
+/// observable in operation without spamming every hydration call.
+///
+/// Public so the PRD #104 M4 reproducer (`tests/snapshot_replay_dims.rs`)
+/// can pin the contract end to end without spinning up a daemon: the
+/// test reads the same dims this function resolves to and constructs a
+/// `vt100::Parser` at the same geometry the hydration path would.
+pub fn parser_init_dims(rows: u16, cols: u16) -> (u16, u16) {
+    let in_range = |v: u16| (1..=PTY_RESIZE_DIM_MAX).contains(&v);
+    if in_range(rows) && in_range(cols) {
+        return (rows, cols);
+    }
+    // PRD #104 RN3/AN1 (reviewer / auditor nit): one debug emission for
+    // both fall-back branches — the original (rows, cols) pair is the
+    // useful diagnostic regardless of which axis tripped the guard, and
+    // the `reason` tag distinguishes the legacy-daemon case from the
+    // out-of-range case without duplicating the message body.
+    let reason = if rows == 0 && cols == 0 {
+        "legacy-daemon-zero"
+    } else {
+        "out-of-range"
+    };
+    tracing::debug!(
+        rows,
+        cols,
+        reason,
+        "hydrate_from_daemon: daemon-supplied PTY dims unusable — falling back to 24×80 parser init"
+    );
+    (24, 80)
+}
 
 use crate::pane_input::{SUBMIT_DELAY, encode_pane_payload};
 
@@ -797,12 +847,23 @@ impl EmbeddedPaneController {
             let display_name = record.display_name.clone();
             let cwd_record = record.cwd.clone();
             let pane_name = display_name.clone().unwrap_or_else(|| agent_id.clone());
-            // PRD #76 M2.15: at hydration time we don't know the daemon's
-            // current PTY dims (the daemon doesn't echo them via
-            // `list_agents`). Seed the local vt100 parser at 24×80 and let
-            // the post-hydration resize sweep in `ui.rs` immediately push
-            // the real viewport dims to the daemon — `resize_pane_pty`
-            // synchronises both sides on its first call.
+            // PRD #104: the daemon now echoes its current PTY dims via
+            // `AgentRecord.rows/cols`. Size the local vt100 parser at
+            // those dims before the snapshot bytes stream through — a
+            // parser sized at 24×80 receiving bytes emitted at, say,
+            // 200×60 clamps cursor sequences to col 79 and inserts
+            // spurious wraps at col 80, baking permanent corruption
+            // into the parser's scrollback. The post-hydration resize
+            // sweep in `ui.rs` continues to run unchanged; its role
+            // shifts from "wrong dims → correct dims" to "daemon's
+            // dims → local viewport dims".
+            //
+            // Fall back to the historical 24×80 placeholder when the
+            // daemon predates this PRD (the field serdes as 0) or when
+            // the supplied value is outside the registry's own resize
+            // bounds — vt100 has subtle edge cases at zero / huge
+            // sizes, and a debug log keeps the fall-back observable.
+            let (parser_rows, parser_cols) = parser_init_dims(record.rows, record.cols);
             self.wire_stream_pane(
                 pane_id.clone(),
                 agent_id.clone(),
@@ -810,8 +871,8 @@ impl EmbeddedPaneController {
                 pane_name,
                 None,
                 cwd_record.clone(),
-                24,
-                80,
+                parser_rows,
+                parser_cols,
             );
             hydrated.push(HydratedPane {
                 pane_id,
@@ -1802,5 +1863,45 @@ impl PaneController for EmbeddedPaneController {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // PRD #104 M2: hydration sizes the local vt100 parser from the
+    // daemon-reported dims. Pin the small helper so its three branches
+    // (sane / older-daemon zero / out-of-range) keep their documented
+    // contracts — a regression that silently re-clamped every snapshot
+    // to 24×80 would otherwise show up only as visual scrollback
+    // corruption.
+
+    #[test]
+    fn parser_init_dims_uses_daemon_supplied_values_when_in_range() {
+        assert_eq!(parser_init_dims(120, 40), (120, 40));
+        assert_eq!(parser_init_dims(1, 1), (1, 1));
+        assert_eq!(
+            parser_init_dims(PTY_RESIZE_DIM_MAX, PTY_RESIZE_DIM_MAX),
+            (PTY_RESIZE_DIM_MAX, PTY_RESIZE_DIM_MAX)
+        );
+    }
+
+    #[test]
+    fn parser_init_dims_falls_back_to_24x80_when_daemon_omits_field() {
+        // Pre-PRD daemon: field absent on the wire → serde_default → 0.
+        assert_eq!(parser_init_dims(0, 0), (24, 80));
+    }
+
+    #[test]
+    fn parser_init_dims_falls_back_when_out_of_range() {
+        // Defensive clamp: vt100 panics on zero rows/cols and has
+        // subtle edge cases at huge sizes. Refuse anything outside
+        // the registry's own resize bounds.
+        assert_eq!(parser_init_dims(0, 80), (24, 80));
+        assert_eq!(parser_init_dims(24, 0), (24, 80));
+        assert_eq!(parser_init_dims(PTY_RESIZE_DIM_MAX + 1, 40), (24, 80));
+        assert_eq!(parser_init_dims(40, PTY_RESIZE_DIM_MAX + 1), (24, 80));
+        assert_eq!(parser_init_dims(u16::MAX, u16::MAX), (24, 80));
     }
 }

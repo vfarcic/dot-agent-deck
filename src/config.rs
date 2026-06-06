@@ -550,6 +550,55 @@ impl ConfigGenState {
     }
 }
 
+/// Serializes tests that mutate `DOT_AGENT_DECK_STATE_DIR` /
+/// `XDG_STATE_HOME` / `HOME`. Rust runs unit tests in parallel and these are
+/// process-global, so any test that wants to observe a specific value of
+/// `state_dir()` must hold this lock for the duration of its env-var fiddling.
+#[cfg(test)]
+pub static STATE_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes tests that mutate `DOT_AGENT_DECK_CONFIG_GEN_STATE` or call
+/// `ConfigGenState::save()` / `load()` (directly or through handlers like
+/// `handle_config_gen_prompt_key`). Rust runs unit tests in parallel, so
+/// without this lock those tests race on the shared env var and on whatever
+/// state file each one points it at.
+#[cfg(test)]
+pub(crate) static CONFIG_GEN_STATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only RAII guard that sets `DOT_AGENT_DECK_CONFIG_GEN_STATE` and
+/// restores its prior value on drop, even if the test panics. Callers must
+/// hold `CONFIG_GEN_STATE_ENV_LOCK` for the guard's lifetime.
+#[cfg(test)]
+pub(crate) struct ConfigGenStateEnvGuard {
+    prev: Option<String>,
+}
+
+#[cfg(test)]
+impl ConfigGenStateEnvGuard {
+    pub(crate) fn set(value: &str) -> Self {
+        let prev = std::env::var("DOT_AGENT_DECK_CONFIG_GEN_STATE").ok();
+        // SAFETY: callers must hold CONFIG_GEN_STATE_ENV_LOCK for the
+        // duration of this guard, which serializes env-var access.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", value);
+        }
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ConfigGenStateEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: see ConfigGenStateEnvGuard::set.
+        unsafe {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_CONFIG_GEN_STATE"),
+            }
+        }
+    }
+}
+
 pub(crate) fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -678,6 +727,47 @@ on_idle = true
     }
 
     #[test]
+    fn saved_session_load_save_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.toml");
+        let prev = std::env::var("DOT_AGENT_DECK_SESSION").ok();
+        // SAFETY: test is single-threaded; no other code reads this var concurrently.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_SESSION", path.to_str().unwrap());
+        }
+
+        // Load returns default when file missing
+        let session = SavedSession::load();
+        assert!(session.panes.is_empty());
+
+        // Save then load round-trips
+        let session = SavedSession {
+            panes: vec![SavedPane {
+                dir: "/tmp/test".to_string(),
+                name: "test".to_string(),
+                command: "echo hi".to_string(),
+                mode: None,
+            }],
+        };
+        session.save().unwrap();
+        let loaded = SavedSession::load();
+        assert_eq!(loaded.panes.len(), 1);
+        assert_eq!(loaded.panes[0].dir, "/tmp/test");
+
+        // Clear removes the file
+        SavedSession::clear().unwrap();
+        assert!(!path.exists());
+
+        // SAFETY: test cleanup — restore original env var.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_SESSION", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_SESSION"),
+            }
+        }
+    }
+
+    #[test]
     fn should_bell_per_status() {
         let bc = BellConfig::default();
         assert!(bc.should_bell(&SessionStatus::WaitingForInput));
@@ -766,6 +856,48 @@ on_idle = true
     }
 
     #[test]
+    fn star_prompt_load_save_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("star.json");
+        let prev = std::env::var("DOT_AGENT_DECK_STAR_PROMPT").ok();
+        // SAFETY: test is single-threaded; no other code reads this var concurrently.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_STAR_PROMPT", path.to_str().unwrap());
+        }
+
+        let state = StarPromptState {
+            launch_count: 15,
+            permanently_dismissed: false,
+            last_prompt_at_launch: 10,
+        };
+        state.save().unwrap();
+
+        let loaded = StarPromptState::load();
+        assert_eq!(loaded.launch_count, 15);
+        assert!(!loaded.permanently_dismissed);
+        assert_eq!(loaded.last_prompt_at_launch, 10);
+
+        // Load from corrupted file returns default
+        std::fs::write(&path, "not valid json!!!").unwrap();
+        let loaded = StarPromptState::load();
+        assert_eq!(loaded.launch_count, 0);
+
+        // Load from missing file returns default
+        std::fs::remove_file(&path).unwrap();
+        let loaded = StarPromptState::load();
+        assert_eq!(loaded.launch_count, 0);
+        assert!(!loaded.permanently_dismissed);
+
+        // SAFETY: test cleanup — restore original env var.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_STAR_PROMPT", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_STAR_PROMPT"),
+            }
+        }
+    }
+
+    #[test]
     fn idle_art_config_defaults() {
         let config = IdleArtConfig::default();
         assert!(!config.enabled);
@@ -841,6 +973,148 @@ timeout_secs = 600
     }
 
     #[test]
+    fn attach_socket_fallback_is_per_user() {
+        // PRD #93 round-2 reviewer REV-2: when XDG_RUNTIME_DIR is unset
+        // *and* DOT_AGENT_DECK_ATTACH_SOCKET is unset, the fallback under
+        // /tmp must include the uid so two users on the same host don't
+        // collide. The old `/tmp/dot-agent-deck-attach.sock` would
+        // sandwich two daemons onto one path and let the first binder
+        // arbitrarily lock the rest of the host out.
+        let _g = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+        let prev_sock = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
+        let prev_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: state-dir lock held, restored on the way out.
+        unsafe {
+            std::env::remove_var("DOT_AGENT_DECK_ATTACH_SOCKET");
+            std::env::remove_var("DOT_AGENT_DECK_SOCKET");
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+
+        // SAFETY: getuid is async-signal-safe and infallible.
+        let uid = unsafe { libc::getuid() };
+        let attach = attach_socket_path();
+        let hook = socket_path();
+        let attach_str = attach.to_string_lossy();
+        let hook_str = hook.to_string_lossy();
+        assert!(
+            attach_str.contains(&format!("-{uid}.sock")),
+            "attach fallback must embed uid: got {attach_str}"
+        );
+        assert!(
+            hook_str.contains(&format!("-{uid}.sock")),
+            "hook fallback must embed uid: got {hook_str}"
+        );
+        assert!(
+            attach_str.starts_with("/tmp/"),
+            "attach fallback should live under /tmp when XDG is unset: got {attach_str}"
+        );
+
+        // SAFETY: same lock; restoring previous values.
+        unsafe {
+            match prev_attach {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_ATTACH_SOCKET"),
+            }
+            match prev_sock {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn state_dir_uses_explicit_override_first() {
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
+        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: env-var lock held; restored on the way out.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_STATE_DIR", "/tmp/explicit-state");
+            std::env::set_var("XDG_STATE_HOME", "/should/be/ignored");
+        }
+
+        assert_eq!(state_dir(), PathBuf::from("/tmp/explicit-state"));
+
+        // SAFETY: same lock held; restoring previous values.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn state_dir_uses_xdg_state_home_when_set() {
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
+        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: env-var lock held; restored on the way out.
+        unsafe {
+            std::env::remove_var("DOT_AGENT_DECK_STATE_DIR");
+            std::env::set_var("XDG_STATE_HOME", "/var/lib/state");
+        }
+
+        assert_eq!(state_dir(), PathBuf::from("/var/lib/state/dot-agent-deck"));
+
+        // SAFETY: same lock held; restoring previous values.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn state_dir_falls_back_to_home_when_xdg_unset() {
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
+        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
+        let prev_home = std::env::var("HOME").ok();
+        // SAFETY: env-var lock held; restored on the way out.
+        unsafe {
+            std::env::remove_var("DOT_AGENT_DECK_STATE_DIR");
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::set_var("HOME", "/home/test-user");
+        }
+
+        assert_eq!(
+            state_dir(),
+            PathBuf::from("/home/test-user/.local/state/dot-agent-deck")
+        );
+
+        // SAFETY: same lock held; restoring previous values.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
     fn auto_config_prompt_get_set_field() {
         let mut dc = DashboardConfig::default();
         assert_eq!(dc.get_field("auto_config_prompt").unwrap(), "true");
@@ -866,6 +1140,31 @@ timeout_secs = 600
     }
 
     #[test]
+    fn config_gen_state_suppress_dir_deduplicates() {
+        // suppress_dir() calls save(), which reads DOT_AGENT_DECK_CONFIG_GEN_STATE.
+        // Hold the env-var lock and point at a temp path so we neither race
+        // against load_save_cycle nor pollute the real home dir.
+        let _guard = CONFIG_GEN_STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config-gen-state.json");
+        // Drop guard restores the env var even if an assertion below panics.
+        let _env_restore = ConfigGenStateEnvGuard::set(path.to_str().unwrap());
+
+        let mut state = ConfigGenState::default();
+        state.suppressed_dirs.push("/dup".to_string());
+        state.suppressed_dirs.push("/dup".to_string()); // manual dup
+        // suppress_dir should not add again
+        assert_eq!(state.suppressed_dirs.len(), 2);
+        // But the method itself checks before adding
+        let mut state2 = ConfigGenState::default();
+        state2.suppressed_dirs.push("/dup".to_string());
+        state2.suppress_dir("/dup");
+        assert_eq!(state2.suppressed_dirs.len(), 1);
+    }
+
+    #[test]
     fn config_gen_state_serde_round_trip() {
         let state = ConfigGenState {
             suppressed_dirs: vec!["/a".to_string(), "/b".to_string()],
@@ -875,5 +1174,46 @@ timeout_secs = 600
         assert_eq!(loaded.suppressed_dirs.len(), 2);
         assert!(loaded.is_suppressed("/a"));
         assert!(loaded.is_suppressed("/b"));
+    }
+
+    #[test]
+    fn config_gen_state_load_save_cycle() {
+        // Serialize against any other test that touches this env var or calls
+        // save()/load() — Rust runs unit tests in parallel.
+        let _guard = CONFIG_GEN_STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config-gen-state.json");
+        let prev = std::env::var("DOT_AGENT_DECK_CONFIG_GEN_STATE").ok();
+        // SAFETY: env-var lock held for the duration of this test.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", path.to_str().unwrap());
+        }
+
+        // Load returns default when file missing
+        let state = ConfigGenState::load();
+        assert!(state.suppressed_dirs.is_empty());
+
+        // Save then load round-trips
+        let mut state = ConfigGenState::default();
+        state.suppressed_dirs.push("/test/dir".to_string());
+        state.save().unwrap();
+        let loaded = ConfigGenState::load();
+        assert_eq!(loaded.suppressed_dirs.len(), 1);
+        assert!(loaded.is_suppressed("/test/dir"));
+
+        // Load from corrupted file returns default
+        std::fs::write(&path, "not valid json!!!").unwrap();
+        let loaded = ConfigGenState::load();
+        assert!(loaded.suppressed_dirs.is_empty());
+
+        // SAFETY: test cleanup — restore original env var.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_CONFIG_GEN_STATE", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_CONFIG_GEN_STATE"),
+            }
+        }
     }
 }

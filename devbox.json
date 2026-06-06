@@ -8,7 +8,11 @@
     "upcloud-cli@3.29.0",
     "gh@2.92.0",
     "asciinema@3.2.0",
-    "cargo-nextest@0.9.137"
+    "cargo-nextest@0.9.137",
+    "rustc@1.94.1",
+    "cargo@1.94.1",
+    "clippy@1.94.1",
+    "rustfmt@1.94.1"
   ],
   "shell": {
     "init_hook": [
