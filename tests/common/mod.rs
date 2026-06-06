@@ -569,15 +569,17 @@ impl Drop for TuiDeck {
         }
 
         if should_dump {
-            // M2.1 auditor S4 + S5: scope to a per-run subdir under an
-            // ABSOLUTE workspace-relative path so (a) tests whose cwd
-            // is a per-test tempdir still land artifacts in the
-            // workspace's target/, and (b) two concurrent
-            // `cargo test-e2e` invocations cannot clobber each
-            // other's artifacts.
-            let recordings_dir = workspace_test_recordings_root()
-                .join(current_run_id())
-                .join(sanitize_test_name(&self.test_name));
+            // M4.3 flattened layout: each test gets its own per-test
+            // subdirectory under `.dot-agent-deck/recordings/`, so
+            // the cast and any failure artifacts sit alongside the
+            // generated `.md`. `.dot-agent-deck/` is gitignored, so
+            // the dump is purely developer-machine state — like
+            // `target/`. The per-run subdir from M2.1 is gone:
+            // concurrent `cargo test-e2e` on the same checkout is
+            // not a real-world workflow, and the per-test path means
+            // a re-run simply replaces the previous artifacts.
+            let recordings_dir =
+                workspace_recordings_root().join(sanitize_test_name(&self.test_name));
             if let Err(e) = self.dump_recordings(&recordings_dir) {
                 eprintln!("[tui-harness] failed to write recordings to {recordings_dir:?}: {e}");
             }
@@ -630,25 +632,34 @@ impl TuiDeck {
     fn dump_recordings(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
 
+        // M4.3: atomic writes for every artifact in the per-test
+        // dir. Two `cargo test-e2e` runs on the same checkout (or one
+        // run racing `cargo xtask docs --tests` against the `.md`)
+        // can land here concurrently for the same test; tempfile +
+        // rename inside the destination directory keeps the
+        // post-rename file either fully old or fully new — never
+        // half-written.
+
         // final-grid.txt
         let grid = self.snapshot_grid();
-        std::fs::write(dir.join("final-grid.txt"), &grid)?;
+        atomic_write(&dir.join("final-grid.txt"), grid.as_bytes())?;
 
         // final-grid.svg — minimal monospace render. Not pixel-perfect,
         // but valid SVG that opens in any browser.
         let svg = render_grid_to_svg(&grid, self.cols, self.rows);
-        std::fs::write(dir.join("final-grid.svg"), svg)?;
+        atomic_write(&dir.join("final-grid.svg"), svg.as_bytes())?;
 
         // full-stream.cast — asciinema v2 format (header + one JSON
         // array per event). Inline encoder, ~20 lines.
         let cast = self.encode_asciinema_cast();
-        std::fs::write(dir.join("full-stream.cast"), cast)?;
+        atomic_write(&dir.join("full-stream.cast"), cast.as_bytes())?;
 
         // fixture.toml — copy of the deck's .dot-agent-deck.toml so a
         // reviewer can replay against the same config.
         let fixture_src = self.fixture_path.join(".dot-agent-deck.toml");
         if fixture_src.exists() {
-            std::fs::copy(&fixture_src, dir.join("fixture.toml"))?;
+            let bytes = std::fs::read(&fixture_src)?;
+            atomic_write(&dir.join("fixture.toml"), &bytes)?;
         }
         Ok(())
     }
@@ -720,32 +731,36 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Workspace-relative `target/test-recordings/` resolved to an
+/// Workspace-relative `.dot-agent-deck/recordings/` resolved to an
 /// ABSOLUTE path at harness construction time. The fixture-copy step
 /// `cwd`s the deck into a per-test tempdir, so any relative path here
-/// would land artifacts in the wrong place (M2.1 auditor S5).
-fn workspace_test_recordings_root() -> PathBuf {
+/// would land artifacts in the wrong place. M4.3: artifacts moved
+/// from `target/test-recordings/<run-id>/<test>/` to
+/// `.dot-agent-deck/recordings/<test>/` — gitignored dev-time state,
+/// no per-run subdir (concurrent runs on one checkout aren't a
+/// real-world workflow).
+fn workspace_recordings_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-recordings")
+        .join(".dot-agent-deck")
+        .join("recordings")
 }
 
-/// Identifier for the active `cargo test-e2e` invocation. Nextest
-/// sets `NEXTEST_RUN_ID` for setup scripts and tests; outside nextest
-/// we fall back to a process-PID + nanosecond-timestamp combination
-/// that two concurrent invocations cannot collide on. Used by the
-/// recordings dump (M2.1 auditor S4).
-fn current_run_id() -> String {
-    if let Ok(id) = std::env::var("NEXTEST_RUN_ID")
-        && !id.is_empty()
-    {
-        return id;
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("run-{}-{nanos}", std::process::id())
+/// Atomic file write: stage `bytes` in a sibling tempfile under
+/// `dst.parent()` and then `persist(dst)` so the rename is atomic on
+/// Unix (same filesystem). Concurrent writers see either the
+/// previous or the new file, never a half-written one.
+fn atomic_write(dst: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = dst.parent().ok_or_else(|| {
+        std::io::Error::other(format!("dump path has no parent: {}", dst.display()))
+    })?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".tui-harness-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    std::io::Write::write_all(tmp.as_file_mut(), bytes)?;
+    tmp.as_file().sync_all().ok();
+    tmp.persist(dst).map_err(|e| e.error)?;
+    Ok(())
 }
 
 fn current_test_name() -> String {

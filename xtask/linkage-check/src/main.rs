@@ -16,8 +16,11 @@
 //!      `for _ in 0..N` polling in `tests/e2e_*.rs` bodies (Decision 21).
 //!   6. No `#[ignore]` on `#[spec(...)]`-annotated tests (Decision 26).
 //!   7. Every `#[spec(...)]` test carries a `/// Scenario:` doc
-//!      comment with a body AND its paired `.md` is byte-identical
-//!      to a fresh generation (Decision 30 / M4).
+//!      comment with a body AND `cargo xtask docs --tests` exits 0
+//!      against the current source + catalog (Decision 30 / M4.3).
+//!      The byte-identity diff against the on-disk `.md` is gone:
+//!      `.dot-agent-deck/` is gitignored dev-time state and would
+//!      not exist on a fresh clone.
 //!
 //! - `docs` — invokes the `xtask-docs` binary's logic (paired-`.md`
 //!   generator). Forwards remaining args.
@@ -238,26 +241,17 @@ fn main() -> ExitCode {
     failures.extend(e2e_violations);
     failures.extend(ignore_violations);
 
-    // Check 7 (PRD #77 Decision 30 / M4): every #[spec] test has a
-    // /// Scenario: doc comment AND its paired .md is byte-identical
-    // to a fresh `cargo xtask docs --tests` generation. The
-    // xtask-docs library is our single source of truth for both
-    // halves — it returns Err on missing-scenario and a non-empty
-    // drift list on out-of-sync .md.
+    // Check 7 (PRD #77 Decision 30 / M4.3): every #[spec] test has
+    // a `/// Scenario:` doc comment with a body AND
+    // `cargo xtask docs --tests` succeeds against the current source
+    // + catalog. The xtask-docs library raises `Err` on a missing
+    // Scenario or a malformed test source, which is exactly the two
+    // failure modes we want to surface here. The byte-identity check
+    // against on-disk `.md` is gone in M4.3: `.dot-agent-deck/` is
+    // gitignored, so on a fresh clone there is no `.md` to compare.
     let docs_config = xtask_docs::DocsConfig::from_workspace(root.clone());
-    match xtask_docs::check_in_sync(&docs_config) {
-        Ok(drift) => {
-            for path in &drift {
-                let rel = path.strip_prefix(&root).unwrap_or(path.as_path());
-                failures.push(format!(
-                    "[7] paired .md is out of sync: {} — run `cargo xtask docs --tests`",
-                    rel.display()
-                ));
-            }
-        }
-        Err(e) => {
-            failures.push(format!("[7] doc generation failed: {e}"));
-        }
+    if let Err(e) = xtask_docs::check_rule_7(&docs_config) {
+        failures.push(format!("[7] {e}"));
     }
 
     if failures.is_empty() {
