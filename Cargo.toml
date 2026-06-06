@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "xtask/docs",
     "xtask/linkage-check",
     "xtask/spec",
 ]
