@@ -174,6 +174,15 @@ pub struct TuiDeck {
     parser: Arc<Mutex<vt100::Parser>>,
     last_byte_at: Arc<Mutex<Instant>>,
     cast_events: Arc<Mutex<Vec<CastEvent>>>,
+    /// M4.6 P1: append-only buffer of EVERY byte the reader thread
+    /// has seen since launch. `wait_for_strings_in_order` snapshots
+    /// this against an index captured at call time so two status
+    /// transitions rendered in the same polling window can't race
+    /// the wait past one of them — the substring search runs over
+    /// the rolling history, not the live vt100 grid. Bounded by
+    /// total test duration (the harness's 10s wait ceiling +
+    /// per-test cap) — same memory profile as `cast_events`.
+    byte_history: Arc<Mutex<Vec<u8>>>,
     cast_started_at: Instant,
     reader_stop: Arc<AtomicBool>,
     reader_handle: Option<JoinHandle<()>>,
@@ -402,15 +411,19 @@ impl TuiDeck {
         )));
         let last_byte_at = Arc::new(Mutex::new(Instant::now()));
         let cast_events = Arc::new(Mutex::new(Vec::<CastEvent>::new()));
+        let byte_history = Arc::new(Mutex::new(Vec::<u8>::new()));
         let reader_stop = Arc::new(AtomicBool::new(false));
         let cast_started_at = Instant::now();
 
         // Reader thread: pulls bytes off the PTY master, feeds the
-        // parser, updates `last_byte_at`, and appends to the cast log.
+        // parser, updates `last_byte_at`, and appends to the cast log
+        // plus the byte-history buffer (M4.6 P1, for race-free
+        // `wait_for_strings_in_order`).
         let mut reader = pair.master.try_clone_reader().expect("clone PTY reader");
         let parser_for_reader = Arc::clone(&parser);
         let last_for_reader = Arc::clone(&last_byte_at);
         let cast_for_reader = Arc::clone(&cast_events);
+        let history_for_reader = Arc::clone(&byte_history);
         let stop_for_reader = Arc::clone(&reader_stop);
         let start_for_reader = cast_started_at;
         let reader_handle = std::thread::Builder::new()
@@ -428,6 +441,7 @@ impl TuiDeck {
                                 offset_secs: start_for_reader.elapsed().as_secs_f64(),
                                 data: chunk.to_vec(),
                             });
+                            history_for_reader.lock().unwrap().extend_from_slice(chunk);
                         }
                         Err(e)
                             if e.kind() == std::io::ErrorKind::Interrupted
@@ -448,6 +462,7 @@ impl TuiDeck {
             parser,
             last_byte_at,
             cast_events,
+            byte_history,
             cast_started_at,
             reader_stop,
             reader_handle: Some(reader_handle),
@@ -523,6 +538,64 @@ impl TuiDeck {
                 panic!(
                     "did not see {needle:?} within {WAIT_TIMEOUT:?}.\n\
                      Final grid:\n{grid}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Wait for `needles` to appear, in order, in the cumulative
+    /// byte stream the deck has emitted since this call started.
+    ///
+    /// Unlike [`wait_for_string`], which asserts against the *current*
+    /// rendered grid, this primitive walks a rolling history of every
+    /// byte the PTY reader thread has captured. Two transitions
+    /// rendered in the same ~20 ms polling window (e.g. Thinking →
+    /// Working on a fast Haiku response) both land in the history,
+    /// so a later poll still finds the earlier substring rather than
+    /// spinning past it (M4.6 P1 / Decision 9: flake = bug).
+    ///
+    /// Semantics:
+    /// - History is snapshotted from the byte-history buffer at call
+    ///   time; bytes the deck emitted before this call are NOT
+    ///   considered.
+    /// - Each substring must be observed AFTER its predecessor was
+    ///   observed (strictly increasing offsets).
+    /// - Single 10-second total ceiling — internal poll cadence is
+    ///   ~20 ms.
+    /// - Substrings are matched against a lossy UTF-8 decode of the
+    ///   raw bytes; status labels like `Thinking` / `Working` / `Bash`
+    ///   / `Idle` are plain ASCII and unaffected by interleaved ANSI
+    ///   control sequences.
+    pub fn wait_for_strings_in_order(&self, needles: &[&str]) {
+        if needles.is_empty() {
+            return;
+        }
+        let start_idx = self.byte_history.lock().unwrap().len();
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            let snapshot: Vec<u8> = {
+                let hist = self.byte_history.lock().unwrap();
+                if hist.len() > start_idx {
+                    hist[start_idx..].to_vec()
+                } else {
+                    Vec::new()
+                }
+            };
+            let matched = match_needles_in_order(&snapshot, needles);
+            if matched == needles.len() {
+                return;
+            }
+            if Instant::now() > deadline {
+                let grid = self.snapshot_grid();
+                let so_far = needles[..matched].join(", ");
+                let next = needles[matched];
+                panic!(
+                    "did not see `{next}` (needle #{} of {} — already \
+                     matched in order: [{so_far}]) within {WAIT_TIMEOUT:?}.\n\
+                     Final grid:\n{grid}",
+                    matched + 1,
+                    needles.len(),
                 );
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -694,6 +767,30 @@ impl TuiDeck {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Walk `needles` against `haystack` in order, returning how many
+/// elements of `needles` matched. The N-th element must be found at
+/// an offset strictly greater than the offset that matched the
+/// (N-1)-th element. Used by [`TuiDeck::wait_for_strings_in_order`]
+/// and exercised by the unit tests below — extracted so the polling
+/// logic stays trivial and the matching invariant is testable
+/// without spawning a PTY.
+fn match_needles_in_order(haystack: &[u8], needles: &[&str]) -> usize {
+    let text = String::from_utf8_lossy(haystack);
+    let mut cursor = 0usize;
+    let mut matched = 0usize;
+    for needle in needles {
+        match text[cursor..].find(needle) {
+            Some(rel_idx) => {
+                let abs_end = cursor + rel_idx + needle.len();
+                cursor = abs_end;
+                matched += 1;
+            }
+            None => break,
+        }
+    }
+    matched
+}
 
 fn locate_fixture(name: &str) -> PathBuf {
     // CARGO_MANIFEST_DIR is the repo root for integration tests.
@@ -944,12 +1041,18 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
     // settings.json is JSONC (line + block comments) — M3.1 auditor
     // S0 fix: strip comments before serde_json parse so the strip is
     // never a no-op on a real settings.json with `// foo` lines.
+    // M4.6 P2: settings.json can carry the same tokens / sensitive
+    // config that motivate the 0o600 mode on credentials.json, so
+    // route it through the same atomic-0o600 helper rather than
+    // inheriting umask via fs::write. `write_credential_file_atomic_0o600`
+    // treats its input as opaque bytes — the JSONC body comes out
+    // intact.
     let src_settings = src_root.join("settings.json");
     if src_settings.exists() {
         require_regular_file_no_symlink(&src_settings, "~/.claude/settings.json")?;
         let raw = std::fs::read_to_string(&src_settings)?;
         let dst_text = strip_hooks_from_claude_settings(&raw)?;
-        std::fs::write(dst_root.join("settings.json"), dst_text)?;
+        write_credential_file_atomic_0o600(&dst_root.join("settings.json"), dst_text.as_bytes())?;
     }
 
     // plugins/ (and any other supporting dirs) — best-effort copy if
@@ -1502,5 +1605,54 @@ mod harness_unit_tests {
         assert_eq!(toml_escape("\0"), "\\u0000");
         assert_eq!(toml_escape("\x1b"), "\\u001B");
         assert_eq!(toml_escape("\x7f"), "\\u007F");
+    }
+
+    #[test]
+    fn match_needles_in_order_finds_full_sequence_when_ordered() {
+        // M4.6 P1: rolling-history matcher must succeed when every
+        // needle appears in order, even when two transitions land
+        // back-to-back in a single chunk.
+        let haystack = b"prelude Thinking... then Working with `Bash` then Idle now";
+        let needles = ["Thinking", "Working", "Bash", "Idle"];
+        let matched = match_needles_in_order(haystack, &needles);
+        assert_eq!(matched, needles.len());
+    }
+
+    #[test]
+    fn match_needles_in_order_stops_when_needle_is_out_of_order() {
+        // Sequence: text contains Working before Thinking — the
+        // matcher must stop at index 1 (Thinking found, Working
+        // already passed by the cursor).
+        let haystack = b"Working appears first, then Thinking arrives later";
+        let needles = ["Thinking", "Working"];
+        let matched = match_needles_in_order(haystack, &needles);
+        // Thinking is found (offset > 0). Then we search for Working
+        // AFTER Thinking — and there's no second Working, so the
+        // match stops at 1.
+        assert_eq!(matched, 1);
+    }
+
+    #[test]
+    fn match_needles_in_order_returns_zero_when_first_needle_missing() {
+        // Used by wait_for_strings_in_order's timeout path: if even
+        // the first needle never appears, `matched` stays 0 so the
+        // panic message points at the right substring.
+        let haystack = b"completely unrelated output, no status labels here";
+        let needles = ["Thinking", "Working"];
+        let matched = match_needles_in_order(haystack, &needles);
+        assert_eq!(matched, 0);
+    }
+
+    #[test]
+    fn match_needles_in_order_partial_when_later_needle_missing() {
+        // Thinking + Working land in the history, but Bash never
+        // shows up — matcher reports 2 (the cursor advanced past
+        // both before failing on Bash). wait_for_strings_in_order
+        // then surfaces "did not see `Bash` (needle #3 of 4)" on
+        // timeout.
+        let haystack = b"Thinking happened then Working took over, no tool was used";
+        let needles = ["Thinking", "Working", "Bash", "Idle"];
+        let matched = match_needles_in_order(haystack, &needles);
+        assert_eq!(matched, 2);
     }
 }

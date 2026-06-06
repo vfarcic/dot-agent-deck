@@ -449,6 +449,12 @@ fn visit(dir: &Path, acc: &mut BTreeMap<PathBuf, ()>) {
 /// preserved 1-for-1 so per-line indexing into the stripped text
 /// matches the raw source. String literals are honoured so a `//`
 /// inside `"…"` is not mistakenly treated as a comment.
+///
+/// M4.6 P2: also recognises raw string literals (`r"…"`,
+/// `r#"…"#`, `r##"…"##`, etc.). The closing delimiter is `"`
+/// followed by exactly the same number of `#` characters that
+/// opened the literal — an embedded `"` inside the body does NOT
+/// close the string unless it has the matching hash suffix.
 fn strip_rust_comments(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = String::with_capacity(src.len());
@@ -456,9 +462,40 @@ fn strip_rust_comments(src: &str) -> String {
     let mut in_string = false;
     let mut in_char = false;
     let mut block_depth: usize = 0;
+    // M4.6 P2: when inside a raw string literal, this holds the
+    // number of `#` characters required between the closing `"` and
+    // the end of the literal. `None` outside any raw string.
+    let mut raw_string_hashes: Option<usize> = None;
     while i < bytes.len() {
         let c = bytes[i] as char;
         let next = bytes.get(i + 1).map(|b| *b as char);
+
+        if let Some(needed_hashes) = raw_string_hashes {
+            // Inside a raw string — content passes through verbatim;
+            // only the matched `"` + `#…` sequence closes it. No
+            // escape processing.
+            out.push(c);
+            if c == '"' {
+                let mut hashes_seen = 0usize;
+                while hashes_seen < needed_hashes
+                    && bytes.get(i + 1 + hashes_seen).copied() == Some(b'#')
+                {
+                    hashes_seen += 1;
+                }
+                if hashes_seen == needed_hashes {
+                    // Emit the trailing hashes verbatim and exit raw
+                    // mode.
+                    for _ in 0..hashes_seen {
+                        out.push('#');
+                    }
+                    i += 1 + hashes_seen;
+                    raw_string_hashes = None;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
 
         if block_depth > 0 {
             // Inside a block comment — only `*/` or nested `/*` matter;
@@ -512,6 +549,40 @@ fn strip_rust_comments(src: &str) -> String {
             }
             i += 1;
             continue;
+        }
+
+        // Raw string literal start: `r`, `r"`, or `r#…"`. The `r`
+        // must be at a token boundary (previous byte is not an
+        // identifier-continuation char) so the matcher doesn't fire
+        // on `for`, `let_r`, etc.
+        if c == 'r' {
+            let prev = i.checked_sub(1).and_then(|p| bytes.get(p)).copied();
+            let is_token_boundary = match prev {
+                None => true,
+                Some(b) => {
+                    let pc = b as char;
+                    !(pc.is_ascii_alphanumeric() || pc == '_')
+                }
+            };
+            if is_token_boundary {
+                let mut j = i + 1;
+                while bytes.get(j).copied() == Some(b'#') {
+                    j += 1;
+                }
+                if bytes.get(j).copied() == Some(b'"') {
+                    let hashes = j - (i + 1);
+                    // Emit the prefix verbatim: r + hashes + opening "
+                    out.push('r');
+                    for _ in 0..hashes {
+                        out.push('#');
+                    }
+                    out.push('"');
+                    i = j + 1;
+                    raw_string_hashes = Some(hashes);
+                    continue;
+                }
+            }
+            // Fall through — `r` is just an identifier char.
         }
 
         if c == '/' && next == Some('/') {
@@ -627,5 +698,68 @@ mod tests {
         // Three lines in → three lines out — the per-line indexing in
         // check 5/6 depends on this invariant.
         assert_eq!(out.lines().count(), src.lines().count());
+    }
+
+    #[test]
+    fn strip_rust_comments_handles_raw_string_with_embedded_quote() {
+        // M4.6 P2: a raw string can legally contain a bare `"`
+        // because the closing delimiter is `"#`. The stripper must
+        // not exit string mode on the embedded `"` and start
+        // treating the rest of the file as bare code, which would
+        // re-enable the line/block comment scanner and could strip
+        // `// foo` text the author intended to keep.
+        let src = r##"let s = r#"contains " and // not a comment"#; // real comment
+let x = 1;"##;
+        let out = strip_rust_comments(src);
+        // The literal `// not a comment` inside the raw string must
+        // survive (raw-string content passes through verbatim).
+        assert!(
+            out.contains("// not a comment"),
+            "raw-string body should pass through verbatim: {out}"
+        );
+        // The trailing `// real comment` outside the raw string
+        // must be stripped.
+        assert!(
+            !out.contains("real comment"),
+            "real line comment after the raw string must be stripped: {out}"
+        );
+        // Code after the comment line is still present.
+        assert!(out.contains("let x = 1;"));
+    }
+
+    #[test]
+    fn strip_rust_comments_handles_nested_hash_raw_string() {
+        // `r##"…"##` requires TWO `#` after the closing `"`. An
+        // embedded `"#` (one hash) must NOT terminate the literal.
+        let src = r###"let s = r##"contains "# (single-hash) here // not a comment"##; // real
+let y = 2;"###;
+        let out = strip_rust_comments(src);
+        assert!(
+            out.contains("// not a comment"),
+            "embedded `\"#` inside r##\"...\"## must not exit raw mode: {out}"
+        );
+        assert!(
+            !out.contains("real"),
+            "real comment outside the raw string must be stripped: {out}"
+        );
+        assert!(out.contains("let y = 2;"));
+    }
+
+    #[test]
+    fn strip_rust_comments_does_not_misidentify_identifier_starting_with_r() {
+        // `for` starts with `f`, not `r`, but `let r_value = "…"`
+        // is the corner case: the bare `r` is an identifier prefix,
+        // followed by `_value`. The stripper must not treat that
+        // `r` as a raw-string opener (no `#` or `"` follows
+        // immediately). Same for `for` (the `r` is not at a token
+        // boundary).
+        let src = r#"for r_value in 0..3 { let _ = r_value; }
+// line comment after"#;
+        let out = strip_rust_comments(src);
+        // Identifiers preserved.
+        assert!(out.contains("for r_value in 0..3"));
+        assert!(out.contains("let _ = r_value;"));
+        // The trailing line comment is still stripped.
+        assert!(!out.contains("line comment after"));
     }
 }

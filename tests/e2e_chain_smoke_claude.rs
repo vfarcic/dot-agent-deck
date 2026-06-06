@@ -65,14 +65,18 @@ fn claude_001_thinking_working_idle() {
     // anchor and uses no LLM tokens.
     deck.wait_for_string("claude-smoke");
 
-    // Decision 21 (amended): use wait_for_string everywhere. The deck
-    // re-renders the card on each AgentEvent so each status label
-    // appears in order on the dashboard.
-    //
     // Catalog assertion: status traverses Thinking → Working → Idle,
     // and the Bash tool name appears on the card during Working.
-    deck.wait_for_string("Thinking");
-    deck.wait_for_string("Working");
-    deck.wait_for_string("Bash");
-    deck.wait_for_string("Idle");
+    //
+    // M4.6 P1: `wait_for_strings_in_order` walks the rolling byte
+    // history rather than the live vt100 grid, so two consecutive
+    // status transitions rendered in the same polling window (a
+    // realistic outcome on a fast Haiku response — Thinking →
+    // Working can both land in the same ~20 ms window) both stay
+    // matchable. The previous shape — four sequential
+    // `wait_for_string` calls against the current grid — could spin
+    // past `Thinking` if `Working` had already overwritten the card
+    // before the first poll, and would then timeout (Decision 9:
+    // flake = bug).
+    deck.wait_for_strings_in_order(&["Thinking", "Working", "Bash", "Idle"]);
 }

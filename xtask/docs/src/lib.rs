@@ -322,24 +322,47 @@ pub fn discover_tests(tests_dir: &Path) -> Result<Vec<DiscoveredTest>, String> {
                 return Err(format!("parse test source {}: {e}", path.display()));
             }
         };
-        for item in &parsed.items {
-            if let syn::Item::Fn(item_fn) = item
-                && let Some(spec_id) = read_spec_attr(&item_fn.attrs)
-            {
-                let fn_name = item_fn.sig.ident.to_string();
-                let scenario = read_scenario_doc(&item_fn.attrs);
-                let steps = extract_steps_from_body(&item_fn.block);
-                out.push(DiscoveredTest {
-                    spec_id,
-                    fn_name,
-                    source_path: path.clone(),
-                    scenario,
-                    steps,
-                });
-            }
-        }
+        // M4.6 P2: walk both top-level items AND items nested inside
+        // inline `mod` blocks. A `#[spec]` test placed inside
+        // `#[cfg(test)] mod foo { ... }` was previously silently
+        // dropped, which let linkage-check rule 7 pass against tests
+        // the generator never saw.
+        collect_spec_tests_from_items(&parsed.items, &path, &mut out);
     }
     Ok(out)
+}
+
+/// Recurse into `items`, pushing every `#[spec]`-annotated fn to
+/// `out`. Items inside inline `Item::Mod { content: Some(_) }` are
+/// walked the same way. External `mod foo;` declarations (no inline
+/// content) are skipped — resolving them would require a file
+/// lookup that's out of scope for the test-file walker (PRD #77 M4.6
+/// P2).
+fn collect_spec_tests_from_items(items: &[syn::Item], path: &Path, out: &mut Vec<DiscoveredTest>) {
+    for item in items {
+        match item {
+            syn::Item::Fn(item_fn) => {
+                if let Some(spec_id) = read_spec_attr(&item_fn.attrs) {
+                    let fn_name = item_fn.sig.ident.to_string();
+                    let scenario = read_scenario_doc(&item_fn.attrs);
+                    let steps = extract_steps_from_body(&item_fn.block);
+                    out.push(DiscoveredTest {
+                        spec_id,
+                        fn_name,
+                        source_path: path.to_path_buf(),
+                        scenario,
+                        steps,
+                    });
+                }
+            }
+            syn::Item::Mod(item_mod) => {
+                if let Some((_, nested_items)) = &item_mod.content {
+                    collect_spec_tests_from_items(nested_items, path, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn collect_rs_files(dir: &Path, acc: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -558,6 +581,10 @@ fn step_for_method(name: &str, args: &[String]) -> Option<String> {
             arg_or(args, 0)
         ),
         "wait_for_string" => format!("Wait for {} to appear on screen", arg_or(args, 0)),
+        "wait_for_strings_in_order" => format!(
+            "Wait for {} to appear in order in the rolling byte history",
+            arg_or(args, 0)
+        ),
         "wait_until_quiescent" => "Wait until the deck stops emitting output".to_string(),
         "with_imported_claude_credentials" => {
             "Import Claude credentials into the test HOME".to_string()
@@ -696,6 +723,20 @@ fn display_expr(expr: &syn::Expr) -> String {
         syn::Expr::Reference(r) => display_expr(&r.expr),
         syn::Expr::Paren(p) => display_expr(&p.expr),
         syn::Expr::Group(g) => display_expr(&g.expr),
+        syn::Expr::Array(a) => {
+            // M4.6: render array literals (e.g.
+            // `&["Thinking", "Working"]` passed to
+            // `wait_for_strings_in_order`) as a compact bracketed
+            // list rather than the generic `…` placeholder, so the
+            // generated Steps line carries the actual sequence.
+            let rendered = a
+                .elems
+                .iter()
+                .map(display_expr)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{rendered}]")
+        }
         syn::Expr::MethodCall(m) => {
             // E.g. `&agent_command` or `cmd.as_str()` — show the
             // method name.
@@ -1017,5 +1058,46 @@ mod tests {
         assert!(out.starts_with("```` "));
         assert!(out.ends_with(" ````"));
         assert!(out.contains("a ` b `` c ``` d"));
+    }
+
+    #[test]
+    fn collect_spec_tests_from_items_discovers_both_top_level_and_nested() {
+        // M4.6 P2: previously the discover_tests walker only scanned
+        // `parsed.items` at the top level, so a #[spec] test placed
+        // inside `#[cfg(test)] mod foo { ... }` was silently
+        // dropped — and linkage-check rule 7 (which relies on the
+        // same discovery) would let the missing test slide.
+        let src = r#"
+            #[spec("hooks/delivery/001")]
+            #[test]
+            /// Scenario: top-level fn.
+            fn delivery_001_top() {}
+
+            mod nested {
+                #[spec("dashboard/pane/005")]
+                #[test]
+                /// Scenario: nested fn.
+                fn pane_005_nested() {}
+
+                mod deeper {
+                    #[spec("chain-smoke/claude/002")]
+                    #[test]
+                    /// Scenario: doubly-nested fn.
+                    fn claude_002_deep() {}
+                }
+            }
+        "#;
+        let parsed = syn::parse_file(src).expect("test src parses");
+        let mut out: Vec<DiscoveredTest> = Vec::new();
+        let dummy_path = std::path::PathBuf::from("tests/synthetic.rs");
+        collect_spec_tests_from_items(&parsed.items, &dummy_path, &mut out);
+        let ids: Vec<&str> = out.iter().map(|t| t.spec_id.as_str()).collect();
+        assert!(ids.contains(&"hooks/delivery/001"));
+        assert!(ids.contains(&"dashboard/pane/005"));
+        assert!(
+            ids.contains(&"chain-smoke/claude/002"),
+            "doubly-nested mod should also be walked: {ids:?}"
+        );
+        assert_eq!(out.len(), 3);
     }
 }
