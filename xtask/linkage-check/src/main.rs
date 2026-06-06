@@ -24,8 +24,15 @@
 //!
 //! - `docs` — invokes the `xtask-docs` binary's logic (paired-`.md`
 //!   generator). Forwards remaining args.
+//! - `list-tests` — PRD #77 Decision 31: emits a Markdown report of
+//!   every `#[spec]` test created or modified in this branch versus
+//!   `origin/main`, plus per-catalog-entry prose diffs and any
+//!   `m2.allowlist` changes. The orchestrator surfaces this to the
+//!   user before delegating release.
 //!
 //! Exits 0 on success, 1 on any failure with a per-finding summary.
+
+mod list_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -46,6 +53,9 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.first().map(String::as_str), Some("docs")) {
         return run_docs(&args[1..]);
+    }
+    if matches!(args.first().map(String::as_str), Some("list-tests")) {
+        return run_list_tests(&args[1..]);
     }
 
     let root = repo_root();
@@ -310,6 +320,41 @@ fn run_docs(args: &[String]) -> ExitCode {
         println!("wrote {}", rel.display());
     }
     ExitCode::SUCCESS
+}
+
+/// `cargo xtask list-tests` dispatch (PRD #77 Decision 31). Emits a
+/// Markdown synthetic-test inventory between the current branch and
+/// `origin/main` on stdout. The orchestrator runs this before
+/// delegating release.
+fn run_list_tests(args: &[String]) -> ExitCode {
+    if let Some(first) = args.first() {
+        match first.as_str() {
+            "-h" | "--help" => {
+                println!("usage: cargo xtask list-tests");
+                println!();
+                println!("Emits a Markdown report of every #[spec] test created or");
+                println!("modified in this branch versus origin/main, plus per-catalog");
+                println!("prose diffs and any xtask/linkage-check/m2.allowlist changes.");
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("xtask list-tests: unknown argument {other:?}");
+                eprintln!("usage: cargo xtask list-tests");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let root = repo_root();
+    match list_tests::run(&root) {
+        Ok(report) => {
+            print!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("xtask list-tests: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 struct SpecAnnotation {

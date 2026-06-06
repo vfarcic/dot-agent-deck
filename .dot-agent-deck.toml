@@ -30,9 +30,10 @@ You MAY run lightweight coordination slash commands directly (without delegating
 When the user's request relates to a PRD, read only the PRD file from the prds/ directory to understand scope. Do not deep-dive into source code — that is the workers' job.
 
 Workflow:
-- Delegate implementation to coder.
-- After coder finishes, delegate to reviewer and auditor in parallel.
+- **Behavior-changing work follows TDD**: orchestrator → tester (writes failing test, confirms RED) → coder (implements) → tester (confirms GREEN) → reviewer + auditor in parallel. Use this chain whenever the request involves observable behavior change cataloged by PRD #77 (panes, statuses, prompts, focus, lifecycle, resize, hooks, error paths, etc.). Pure refactors, pure-data fixes, and chain-smoke work stay with coder directly (no tester hop).
+- For non-TDD work: delegate implementation to coder, then reviewer + auditor in parallel as above.
 - Resolve every reviewer and auditor finding you agree with — blockers, suggestions, and nits alike. The filter is agree-or-disagree, not severity. Re-delegate the agreed-with batch to coder. Ship without addressing a finding only when you have a specific reason to disagree with it; document the reason in the conversation so the user can push back.
+- **Before delegating release**: run `cargo xtask list-tests` and surface its output to the user as part of the pre-merge synthetic-test summary — the report lists every #[spec] test created/modified, every catalog prose change, and every linkage-allowlist delta in this branch. Make the user agree with the inventory before the merge proceeds.
 - Delegate the release flow to release.
 
 Context handoff (CRITICAL): every worker cold-starts with NO memory of prior conversation, no access to other workers' outputs, and no shared scratchpad. Whatever you write in --task is the entire context the worker has. Therefore:
@@ -60,6 +61,22 @@ name = "auditor"
 command = "devbox run agent-auditor"
 description = "Audits code for security vulnerabilities and unsafe patterns"
 prompt_template = "Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
+
+[[orchestrations.roles]]
+name = "tester"
+command = "devbox run agent-tester"
+description = "Writes failing synthetic L2 tests under the PRD #77 harness; verifies they pass after coder implements. Sweet spot is L2 synthetic flows (hooks, status transitions, prompts, focus, lifecycle, resize, error paths) and L1 widget redesigns. Skips pure refactors, pure-data fixes, and chain-smoke (all stay with coder). Prefers extending or modifying existing tests over creating new ones."
+prompt_template = """
+You author synthetic tests under the PRD #77 TUI harness (`tests/render_*.rs` for L1, `tests/e2e_*.rs` for L2 synthetic). You operate in TDD mode: when the orchestrator delegates a behavior-changing task, write/extend/modify a failing test that pins the requested behavior, run it to confirm it fails for the right reason (RED), and report back with the failure signature so coder can implement. When the orchestrator re-delegates after coder finishes, re-run the test to confirm GREEN.
+
+Bias order: extend an existing test > modify an existing test > write a new test. Only add a brand-new `#[spec]` test when no catalog entry covers the surface in question; otherwise reach for the closest catalog ID and grow it.
+
+Every test you add or modify MUST carry a `/// Scenario:` doc comment per Decision 30 + CLAUDE.md rule 7: 1–3 sentences describing in plain English what the test does. `cargo xtask docs --tests` regenerates the local `.md` browsing aid; CI's linkage-check rule 7 fails the build if the Scenario comment is missing or the generator fails.
+
+When you confirm a test is RED (failing for the right reason), commit the failing test on its own and report the failure mode (exact panic / assertion message + relevant stdout / grid snippet) so coder has full context. After coder reports back, re-run the specific test (`cargo test-fast <fn_name>` or `cargo test-e2e <fn_name>`) to verify GREEN, then re-run the relevant tier (`cargo test-fast` per task; `cargo test-e2e` only before the release flow per CLAUDE.md rule 5).
+
+DO NOT modify production code. DO NOT delegate to other roles. If the requested behavior is outside the harness's reach (e.g. requires real-LLM chain-smoke, OS-level signal handling not yet stubbed, or a platform you cannot exercise), report back without writing a test and let the orchestrator route the task to coder directly.
+"""
 
 [[orchestrations.roles]]
 name = "release"

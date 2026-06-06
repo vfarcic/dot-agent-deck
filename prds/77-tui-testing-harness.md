@@ -188,6 +188,8 @@ Anything outside these three → the deck has a bug → fix the deck.
 
 **Autonomous-execution stop point.** Under agent autonomy, the agent stops after the Discovered Issues list is populated and surfaces it to the user before fixing anything (except the three exceptions above).
 
+**Cross-reference with Decision 31:** under the tester-coder TDD chain (Decision 31), tester writes the failing test that documents the fix; coder implements; tester re-runs to confirm GREEN.
+
 ### Decision 12: Test fixtures live in `tests/fixtures/<scenario>/`, copied into per-test tempdirs
 
 - Fixtures are committed files under `tests/fixtures/<scenario>/`, **copied into the per-test tempdir at launch** by the harness. Never referenced in place.
@@ -484,6 +486,23 @@ Both checks run alongside the original six in `cargo xtask linkage-check` and ar
 
 **Why syntactic step extraction over per-statement comments:** the syntactic approach works on existing tests with zero author retrofit. New harness methods need a one-line entry in the method-name → step-template map, with a raw-call fallback so absence isn't a failure. Per-statement comments can be a future enhancement if quality demands it.
 
+### Decision 31: Tester role + synthetic-test inventory in pre-merge surface
+
+**Added 2026-06-06.** The orchestrator multi-agent setup gains a `tester` role specialized for TDD-style synthetic-test authoring + verification. The orchestrator delegates to tester when a feature or bug request involves observable behavior change cataloged by PRD #77; tester writes/extends/modifies tests (bias: extend > modify > new) and reports back with the failure mode. Coder then implements; tester verifies green. The chain replaces "coder writes both test and implementation" for the harness-relevant slice of work.
+
+Before opening the foundation PR or any subsequent merge, the orchestrator runs `cargo xtask list-tests` and surfaces the synthetic-test inventory (catalog IDs created/modified/touched, allowlist deltas) to the user. This makes "which tests changed in this PR" answerable in one command at PR review time.
+
+Tester's binding instruction (full text in `.dot-agent-deck.toml`'s role definition) requires that every test added or modified ship with a `/// Scenario:` doc comment per Decision 30 + CLAUDE.md rule 7.
+
+**Why now:** at M4's close PRD #77 hands the harness off to per-PRD test maintenance. Without a dedicated tester role, "write the test alongside the fix" rides on the coder's discretion under time pressure — exactly when it's most likely to be skipped. Splitting the test-author seat out makes the TDD step a delegation boundary the orchestrator can't accidentally walk past. Pairing it with `cargo xtask list-tests` makes the synthetic-test delta a structural artifact of every PR rather than something the reviewer has to derive from the diff.
+
+**Scope guardrails for tester:**
+- Sweet spot: L2 synthetic flows (hooks, status transitions, prompts, focus, lifecycle, resize, error paths) and L1 widget redesigns where rendering changes are observable in `TestBackend`.
+- Out of scope: pure refactors, pure-data fixes, chain-smoke (real-agent work — stays with coder; cost + flakiness profile is not the tester's tier).
+- Bias order: extend > modify > new. Adding a brand-new `#[spec]` test is the last resort, reached only when no catalog ID covers the surface.
+
+**`cargo xtask list-tests` report shape:** four Markdown sections — Created, Modified, Catalog prose changes, Linkage-allowlist deltas. Empty sections render as `_(none)_` so the structure is stable for the orchestrator's pre-merge surface and for PR-template inclusion.
+
 ## Key Design Constraints
 
 - **Pin terminal environment** per Decision 20. No silent host inheritance.
@@ -566,6 +585,8 @@ After each area delegation: reviewer + auditor in parallel → resolve agreed fi
 Per Decision 10 — pure-data unit tests stay live in `src/*/mod tests`; everything else moved to `./tmp/legacy-tests/` (gitignored; git history preserves originals via the rename detection on the staged delete).
 
 **Carve-out result:** 296 pure-data unit tests kept across 22 `src/*` files; 25 `tests/*.rs` files plus `tests/common/` moved wholesale; 20 `src/*/mod tests` blocks moved (9 whole-block moves where every test in the file was non-pure-data, 11 partial splits where pure-data tests stay live and the remaining tests move).
+
+**Note (2026-06-06):** the `cfg(test)` helpers in `src/config.rs` (`STATE_DIR_ENV_LOCK`, `CONFIG_GEN_STATE_ENV_LOCK`, `ConfigGenStateEnvGuard`) were re-introduced via `c479cb4` (merge from `main`) because main's resurrected `src/ui.rs` tests reference them. The audit's "deleted-helpers" framing in this section is partially stale as a result. See di-003.
 
 ### Pure-data tests (stay live)
 
@@ -1070,6 +1091,16 @@ Locked in 2026-06-06 after the M4 review. The earlier M2/M3 convention committed
 - **`.gitignore`:** blanket-ignores `.dot-agent-deck/`. The earlier `!.dot-agent-deck/m2-recordings/` negations were removed and the previously-committed `m2-recordings/` + `m3-recordings/` directories were `git rm`-ed in the same commit. They remain reachable in git history; no history scrub.
 - **Linkage-check rule 7:** simplified. The byte-identity diff against on-disk `.md` is gone — with `.md` gitignored, the on-disk file doesn't exist on a fresh clone, so a diff is structurally meaningless. Rule 7 now asserts (a) every `#[spec(...)]` test carries a `/// Scenario:` doc comment with a body and (b) `cargo xtask docs --tests` exits 0 against the current source + catalog. The convention is enforced by Scenario-presence + the generator succeeding.
 - **Why:** the asymmetric "this one dir under a gitignored prefix is committed" exception was confusing; milestone-prefixed subdirs didn't scale to per-PRD additions; reading the Scenario doc comment in the test source on GitHub is the actual external-reader surface, and the `.md` is a local convenience.
+
+### M4.4 status note — `tester` role, `cargo xtask list-tests`, and the post-main-merge legacy shim
+
+Locked in 2026-06-06 alongside Decision 31. Three threads land in one batch:
+
+1. **`tester` role.** New entry in `.dot-agent-deck.toml`'s orchestration roles with `start = false` and a binding `prompt_template` that pins the TDD chain (RED → coder → GREEN), the bias order (extend > modify > new), and the Scenario-doc-comment requirement. `devbox.json` gains `"agent-tester": ["claude --model opus"]`. The orchestrator's own `prompt_template` is updated to describe the TDD chain for behavior-changing work AND to require running `cargo xtask list-tests` before delegating release. The dynamically-built `.dot-agent-deck/orchestrator-context.md` (regenerated at TUI launch from `build_orchestrator_context` in `src/ui.rs`) picks up both halves automatically.
+
+2. **`cargo xtask list-tests`.** New subcommand added to the existing `xtask-linkage-check` multiplexer (cleaner than a separate workspace member — the multiplexer already routes `linkage-check` + `docs --tests`, this is the fourth arm). Implementation lives in `xtask/linkage-check/src/list_tests.rs`. Shells to `git merge-base HEAD origin/main` + `git show <ref>:<path>` + `git ls-tree -r --name-only <ref> tests` for the source diff; reuses `xtask_docs::parse_catalog` (via a tempfile staged from each ref's PRD body) for the catalog prose diff; reads `xtask/linkage-check/m2.allowlist` at both refs for the allowlist diff. Emits four Markdown sections (Created / Modified / Catalog prose / Allowlist), each rendering `_(none)_` when empty so the report's structure is stable. 8 unit tests cover the pure-data delta helpers + the markdown renderer + the syn-based source extractor; the git-shelling path is exercised end-to-end via the manual `cargo xtask list-tests` invocation rather than a unit test (synthetic git fixtures are flaky and the surface is thin).
+
+3. **Legacy compatibility shim in `tests/common/mod.rs`.** The post-main merge (commit `c479cb4`) brought four test files back from main that weren't on this branch since the M1 audit. Those tests (`tests/snapshot_replay_dims.rs`, `tests/rehydration.rs`, `tests/daemon_protocol.rs`, `tests/spawn_time_role_prompt_submit_after_session_start.rs`) import `common::init_test_env`, `common::lock_dir_path`, `common::race_safe_tempdir`, and a `LOCK_DIR_GUARD` static — helpers that lived in the original `tests/common/mod.rs` before M1 moved it to `tmp/legacy-tests/`. M2 replaced that file wholesale with the L2 harness. The shim restores the legacy helpers (plus their `OnceLock<TempDir>` backing) as a separate section in our `tests/common/mod.rs`, behind a one-paragraph comment explaining the carry-forward. The two surfaces are orthogonal (legacy = process-global lock dir; harness = per-test tempdir + PTY) and naming-disjoint, so they coexist cleanly. Tracked as di-002 for the eventual refactor pass that brings the four legacy test files onto the L2 harness.
 
 ### Second-opinion flags for the M4 stop
 
@@ -2013,6 +2044,8 @@ Entry format (per Decision 25):
 | ID | Catalog ref | Description | Severity | Status |
 |---|---|---|---|---|
 | di-001 | chain-smoke/opencode/001 | OpenCode 1.15.10's plugin loader does not auto-discover the deck's installed plugin at `<config>/plugin/dot-agent-deck/index.js`. Hooks never fire end-to-end, so the chain-smoke status traversal cannot be observed. Deck install path in `src/opencode_manage.rs` needs to align with OpenCode 1.x's loader (npm-package register OR package.json import). | major | escalated to PRD #79 |
+| di-002 | (multiple) | Four test files added on `main` post-M1-audit (`tests/snapshot_replay_dims.rs`, `tests/rehydration.rs`, `tests/daemon_protocol.rs`, `tests/spawn_time_role_prompt_submit_after_session_start.rs`) coexist with the harness convention but carry no `#[spec]` annotation. They pass linkage-check (rule scope) but should eventually be either refactored onto the L2 harness with catalog IDs OR explicitly noted as permanent integration-test outliers. | minor | won't-fix in #77: future PRDs refactor each on its own when touching those areas |
+| di-003 | (none) | `src/config.rs` re-gained the `cfg(test)` helpers (`STATE_DIR_ENV_LOCK`, `CONFIG_GEN_STATE_ENV_LOCK`, `ConfigGenStateEnvGuard`) via the post-M1 merge from `main` (commit `c479cb4`); main's resurrected `src/ui.rs` tests reference them. The M1 audit's deleted-helpers note is now partially stale. | minor | accepted: helpers are still gated `#[cfg(test)]`; production behavior unchanged |
 
 `Severity` is one of: `blocker`, `major`, `minor`.
 `Status` is one of: `fixed in <milestone>`, `filed as #NNN`, `won't-fix: <rationale>`, `escalated to PRD #NNN`.

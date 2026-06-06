@@ -3423,7 +3423,10 @@ dependencies = [
 name = "xtask-linkage-check"
 version = "0.0.0"
 dependencies = [
+ "proc-macro2",
  "regex",
+ "syn 2.0.117",
+ "tempfile",
  "xtask-docs",
 ]
 
