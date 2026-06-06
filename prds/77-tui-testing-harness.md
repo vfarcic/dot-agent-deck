@@ -118,7 +118,7 @@ tests/
   render_dashboard.rs         ← L1: layout/dashboard/*
 ```
 
-**CI-enforced linkage** — Rust binary at `xtask/linkage-check/`, invoked as `cargo xtask linkage-check`. Added to CI alongside fmt/clippy/test-fast, configured as a required status check on `main`. Six checks, all must pass:
+**CI-enforced linkage** — Rust binary at `xtask/linkage-check/`, invoked as `cargo xtask linkage-check`. Added to CI alongside fmt/clippy/test-fast, configured as a required status check on `main`. Seven checks, all must pass:
 
 1. Every catalog ID has at least one test referencing it.
 2. Every `#[spec("...")]` references a real catalog ID.
@@ -126,6 +126,7 @@ tests/
 4. Function name carries the annotation's `<sub>_<NNN>` prefix (Decision 17).
 5. No raw `std::thread::sleep`, `tokio::time::sleep`, or `for _ in 0..N` polling in `tests/e2e_*.rs` (Decision 21).
 6. No `#[ignore]` on `#[spec(...)]`-annotated tests (Decision 26).
+7. Every `#[spec(...)]` test carries a `/// Scenario:` doc comment with a body AND its paired `.md` is byte-identical to a fresh `cargo xtask docs --tests` regeneration (Decision 30).
 
 **Fluent harness API:** test bodies read close to catalog prose (`deck.start_agent(...)`, `deck.pane(0).wait_until_status(Running)`), not raw PTY plumbing.
 

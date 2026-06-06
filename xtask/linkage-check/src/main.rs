@@ -1,16 +1,26 @@
-//! PRD #77 catalog ↔ test linkage check.
+//! PRD #77 catalog ↔ test linkage check + `xtask` subcommand
+//! multiplexer.
 //!
-//! Invoked as `cargo xtask linkage-check` (alias in `.cargo/config.toml`).
-//! Performs the six checks listed in Decision 7:
+//! Invoked as `cargo xtask <subcommand>` (alias in `.cargo/config.toml`).
+//! Subcommands:
 //!
-//! 1. Every catalog ID has at least one `#[spec("...")]` referencing
-//!    it OR is on the allowlist (`m2.allowlist`).
-//! 2. Every `#[spec("...")]` references a real catalog ID.
-//! 3. Catalog IDs match the format regex.
-//! 4. Function name carries the `<sub>_<NNN>` prefix (Decision 17).
-//! 5. No raw `std::thread::sleep` / `tokio::time::sleep` /
-//!    `for _ in 0..N` polling in `tests/e2e_*.rs` bodies (Decision 21).
-//! 6. No `#[ignore]` on `#[spec(...)]`-annotated tests (Decision 26).
+//! - `linkage-check` (default) — performs the seven checks listed
+//!   in Decision 7 + Decision 30:
+//!
+//!   1. Every catalog ID has at least one `#[spec("...")]` referencing
+//!      it OR is on the allowlist (`m2.allowlist`).
+//!   2. Every `#[spec("...")]` references a real catalog ID.
+//!   3. Catalog IDs match the format regex.
+//!   4. Function name carries the `<sub>_<NNN>` prefix (Decision 17).
+//!   5. No raw `std::thread::sleep` / `tokio::time::sleep` /
+//!      `for _ in 0..N` polling in `tests/e2e_*.rs` bodies (Decision 21).
+//!   6. No `#[ignore]` on `#[spec(...)]`-annotated tests (Decision 26).
+//!   7. Every `#[spec(...)]` test carries a `/// Scenario:` doc
+//!      comment with a body AND its paired `.md` is byte-identical
+//!      to a fresh generation (Decision 30 / M4).
+//!
+//! - `docs` — invokes the `xtask-docs` binary's logic (paired-`.md`
+//!   generator). Forwards remaining args.
 //!
 //! Exits 0 on success, 1 on any failure with a per-finding summary.
 
@@ -25,10 +35,15 @@ const ALLOWLIST_PATH: &str = "xtask/linkage-check/m2.allowlist";
 const TESTS_DIR: &str = "tests";
 
 fn main() -> ExitCode {
-    // Allow `cargo xtask linkage-check` to pass through; we accept any
-    // first arg (including none) so the alias can carry the subcommand
-    // verb without us re-parsing it.
-    let _args: Vec<String> = std::env::args().collect();
+    // PRD #77 M4: route subcommands through this binary so the
+    // single `cargo xtask` alias can drive both linkage-check and
+    // docs. `cargo xtask docs --tests` → docs generator;
+    // anything else (including no first arg or `linkage-check`) →
+    // the seven Decision-7 / Decision-30 checks below.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("docs")) {
+        return run_docs(&args[1..]);
+    }
 
     let root = repo_root();
     let prd_path = root.join(PRD_PATH);
@@ -223,9 +238,31 @@ fn main() -> ExitCode {
     failures.extend(e2e_violations);
     failures.extend(ignore_violations);
 
+    // Check 7 (PRD #77 Decision 30 / M4): every #[spec] test has a
+    // /// Scenario: doc comment AND its paired .md is byte-identical
+    // to a fresh `cargo xtask docs --tests` generation. The
+    // xtask-docs library is our single source of truth for both
+    // halves — it returns Err on missing-scenario and a non-empty
+    // drift list on out-of-sync .md.
+    let docs_config = xtask_docs::DocsConfig::from_workspace(root.clone());
+    match xtask_docs::check_in_sync(&docs_config) {
+        Ok(drift) => {
+            for path in &drift {
+                let rel = path.strip_prefix(&root).unwrap_or(path.as_path());
+                failures.push(format!(
+                    "[7] paired .md is out of sync: {} — run `cargo xtask docs --tests`",
+                    rel.display()
+                ));
+            }
+        }
+        Err(e) => {
+            failures.push(format!("[7] doc generation failed: {e}"));
+        }
+    }
+
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 7 rules)",
             catalog_ids.len(),
             annotations.len(),
             allowlist.len()
@@ -238,6 +275,47 @@ fn main() -> ExitCode {
         }
         ExitCode::FAILURE
     }
+}
+
+/// `cargo xtask docs --tests` dispatch. Performs the same work as
+/// the `xtask-docs` binary's main, in-process — we share the
+/// library entry points so the two binaries stay in lockstep.
+fn run_docs(args: &[String]) -> ExitCode {
+    for arg in args {
+        match arg.as_str() {
+            "--tests" => {}
+            "-h" | "--help" => {
+                println!("usage: cargo xtask docs --tests");
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("xtask docs: unknown argument {other:?}");
+                eprintln!("usage: cargo xtask docs --tests");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let root = repo_root();
+    let config = xtask_docs::DocsConfig::from_workspace(root.clone());
+    let generated = match xtask_docs::generate_all(&config) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("xtask docs: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let written = match xtask_docs::write_all(&generated) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("xtask docs: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for path in &written {
+        let rel = path.strip_prefix(&root).unwrap_or(path.as_path());
+        println!("wrote {}", rel.display());
+    }
+    ExitCode::SUCCESS
 }
 
 struct SpecAnnotation {
