@@ -48,12 +48,35 @@ struct CastEvent {
     data: Vec<u8>,
 }
 
+/// Optional pre-staged saved-session entry — when set, the harness
+/// generates a `session.toml` under the per-test tempdir and passes
+/// `--continue` so the deck auto-opens one pane running this command
+/// at launch. Used by chain-smoke tests to drive real agents
+/// (PRD #77 Decision 8) without user keystrokes.
+#[derive(Debug, Clone)]
+struct ContinueSession {
+    pane_name: String,
+    command: String,
+}
+
+/// Which agent's credential set the test wants imported from the host
+/// HOME into the per-test tempdir HOME. Both variants are real
+/// `std::fs::copy` (M2.1 auditor S3 — no symlinks across fixtures);
+/// the credentials file is re-stamped to 0o600 after copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialImport {
+    ClaudeCode,
+    OpenCode,
+}
+
 /// Builder for [`TuiDeck`]. Use the test surface
 /// [`TuiDeck::builder`].
 pub struct TuiDeckBuilder {
     cols: u16,
     rows: u16,
     extra_env: Vec<(String, String)>,
+    continue_session: Option<ContinueSession>,
+    credential_imports: Vec<CredentialImport>,
 }
 
 impl TuiDeckBuilder {
@@ -70,6 +93,49 @@ impl TuiDeckBuilder {
     pub fn with_pty_size(mut self, cols: u16, rows: u16) -> Self {
         self.cols = cols;
         self.rows = rows;
+        self
+    }
+
+    /// Stage a `session.toml` in the per-test tempdir and pass
+    /// `--continue` on launch so the deck auto-opens one pane running
+    /// `command` against the tempdir as its working directory.
+    /// Used by chain-smoke tests to drive a real agent CLI without
+    /// keystrokes.
+    pub fn with_continue_session(
+        mut self,
+        pane_name: impl Into<String>,
+        command: impl Into<String>,
+    ) -> Self {
+        self.continue_session = Some(ContinueSession {
+            pane_name: pane_name.into(),
+            command: command.into(),
+        });
+        self
+    }
+
+    /// Import the host user's Claude Code credentials + settings into
+    /// the per-test tempdir HOME so a spawned `claude` CLI can
+    /// authenticate. Hook entries in the imported `settings.json` are
+    /// stripped — the deck installs its own hooks pointing at the
+    /// per-test paths. Real `fs::copy` (no symlinks per M2.1 auditor
+    /// S3); 0o600 is preserved on the credentials file.
+    ///
+    /// The actual copy happens at launch time; if a required source
+    /// file is missing the launch panics with the per-Decision-26
+    /// skip message. Tests should pair this with
+    /// [`check_claude_available`] and [`skip_unless!`] to convert that
+    /// panic into a clean runtime skip.
+    pub fn with_imported_claude_credentials(mut self) -> Self {
+        self.credential_imports.push(CredentialImport::ClaudeCode);
+        self
+    }
+
+    /// Same shape as [`with_imported_claude_credentials`] but for
+    /// OpenCode (`~/.opencode/`, `~/.config/opencode/opencode.jsonc`).
+    /// The deck installs its own plugin into the tempdir HOME, so any
+    /// `~/.opencode/plugin/` directory on the host is NOT copied.
+    pub fn with_imported_opencode_credentials(mut self) -> Self {
+        self.credential_imports.push(CredentialImport::OpenCode);
         self
     }
 
@@ -115,6 +181,8 @@ impl TuiDeck {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             extra_env: Vec::new(),
+            continue_session: None,
+            credential_imports: Vec::new(),
         }
     }
 
@@ -149,6 +217,34 @@ impl TuiDeck {
         let home = work.join("home");
         std::fs::create_dir_all(&home).expect("create per-test HOME");
 
+        // Chain-smoke credential imports (PRD #77 Decision 8). Tests
+        // pair these with `check_*_available()` + `skip_unless!`; if
+        // the credentials disappeared between the precheck and here,
+        // we panic with the Decision-26-shaped skip message so the
+        // failure surfaces explicitly rather than running a logged-out
+        // CLI that would burn the test budget on a 401 storm.
+        for kind in &builder.credential_imports {
+            match kind {
+                CredentialImport::ClaudeCode => {
+                    import_claude_credentials(&home).expect("import Claude credentials");
+                }
+                CredentialImport::OpenCode => {
+                    import_opencode_credentials(&home).expect("import OpenCode credentials");
+                }
+            }
+        }
+
+        // Write the saved-session file the deck reads under `--continue`,
+        // if the test asked for one. The pane runs `command` in the
+        // tempdir's working directory so the agent has a real cwd to
+        // operate against (the deck's restore path skips panes whose
+        // `dir` doesn't exist on disk).
+        let session_toml_path = work.join("session.toml");
+        if let Some(cs) = &builder.continue_session {
+            write_continue_session_file(&session_toml_path, &work, &cs.pane_name, &cs.command)
+                .expect("write continue session.toml");
+        }
+
         let hook_socket = work.join("hook.sock");
         let attach_socket = work.join("attach.sock");
 
@@ -170,6 +266,11 @@ impl TuiDeck {
         let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
         let mut cmd = CommandBuilder::new(bin);
         cmd.cwd(&work);
+        // Pass `--continue` when a saved session was staged so the deck
+        // auto-opens the chain-smoke pane on launch.
+        if builder.continue_session.is_some() {
+            cmd.arg("--continue");
+        }
         // M2.1 auditor S2: portable-pty 0.8 unconditionally env_clears
         // on Unix before applying our `cmd.env(...)` calls, but the old
         // comment claimed env_clear was avoided. Make the scrub
@@ -223,6 +324,18 @@ impl TuiDeck {
         }
         for (k, v) in pinned {
             final_env.insert((*k).into(), (*v).into());
+        }
+        // Point the deck's saved-session reader at our staged file so
+        // `--continue` picks up exactly the chain-smoke pane and
+        // nothing from the developer's real session.toml.
+        if builder.continue_session.is_some() {
+            final_env.insert(
+                "DOT_AGENT_DECK_SESSION".into(),
+                session_toml_path
+                    .to_str()
+                    .expect("session.toml path is UTF-8")
+                    .to_string(),
+            );
         }
         // Decision 20: NO_COLOR and CLICOLOR_FORCE must NOT leak in.
         // We set up `final_env` from scratch, so they are absent by
@@ -598,6 +711,289 @@ fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
     }
     s.push_str("</svg>\n");
     s
+}
+
+/// PRD #77 Decision 26 runtime-skip helper: returns `Ok(())` when the
+/// host has the Claude Code CLI on PATH and a readable credentials
+/// file; `Err(reason)` with a stable user-facing message otherwise.
+/// Tests pair this with [`skip_unless!`].
+pub fn check_claude_available() -> Result<(), String> {
+    if std::process::Command::new("claude")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        .not()
+    {
+        return Err("Claude Code CLI not installed (could not invoke `claude --version`)".into());
+    }
+    let home = host_home();
+    let creds = home.join(".claude").join(".credentials.json");
+    if !creds.exists() {
+        return Err(format!(
+            "Claude Code credentials not found at {} — log in with `claude login`",
+            creds.display()
+        ));
+    }
+    Ok(())
+}
+
+/// PRD #77 Decision 26 runtime-skip helper for OpenCode. Mirrors
+/// [`check_claude_available`] — checks for the CLI on PATH and an
+/// OpenCode auth.json (or analogous credential the user logged in
+/// with).
+pub fn check_opencode_available() -> Result<(), String> {
+    if std::process::Command::new("opencode")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        .not()
+    {
+        return Err("OpenCode CLI not installed (could not invoke `opencode --version`)".into());
+    }
+    let home = host_home();
+    // OpenCode stores creds under the data dir. Per the PRD task spec
+    // we check the legacy / new shapes the M2.1 + M3 audit identified;
+    // first found wins. If neither is present, surface the canonical
+    // path so the operator knows where to log in.
+    let candidates = [
+        home.join(".local")
+            .join("share")
+            .join("opencode")
+            .join("auth.json"),
+        home.join(".opencode").join("auth.json"),
+        home.join(".config").join("opencode").join("auth.json"),
+    ];
+    if candidates.iter().any(|p| p.exists()) {
+        return Ok(());
+    }
+    Err(format!(
+        "OpenCode credentials not found at {} — log in with `opencode auth login`",
+        candidates[0].display()
+    ))
+}
+
+/// Body of the `skip_unless!` early-return: if `result` is `Err`,
+/// print `SKIP: <reason>` to stderr and indicate to the caller it
+/// should return. Pairs with the `skip_unless!` macro below.
+#[doc(hidden)]
+pub fn _skip_if_err(result: Result<(), String>) -> bool {
+    match result {
+        Ok(()) => false,
+        Err(reason) => {
+            eprintln!("SKIP: {reason}");
+            true
+        }
+    }
+}
+
+/// Decision 26 / Decision 8 runtime-skip shorthand. Use at the top
+/// of a chain-smoke test:
+///
+/// ```ignore
+/// skip_unless!(common::check_claude_available());
+/// ```
+///
+/// Prints `SKIP: <reason>` to stderr and returns from the calling
+/// function when the environment isn't capable of running the test.
+#[macro_export]
+macro_rules! skip_unless {
+    ($expr:expr) => {
+        if $crate::common::_skip_if_err($expr) {
+            return;
+        }
+    };
+}
+
+/// Host user's HOME directory at test-runner launch time, used by
+/// the credential-availability checks and the credential-import copy
+/// path. Resolved from the parent process's env (not from the
+/// already-redirected per-test tempdir HOME).
+fn host_home() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").expect("HOME is set on the host"))
+}
+
+trait BoolNot {
+    fn not(self) -> Self;
+}
+impl BoolNot for bool {
+    fn not(self) -> bool {
+        !self
+    }
+}
+
+/// Copy the host user's Claude Code credentials + settings into the
+/// per-test tempdir HOME. Strips any `hooks` entries from the
+/// imported `settings.json` (the deck auto-installs its own hooks
+/// pointing at the per-test socket — leaving the host's hook entries
+/// in place would invoke the developer's real hook commands inside
+/// the test). Re-stamps the credentials file mode to 0o600 after
+/// copy.
+fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
+    let src_root = host_home().join(".claude");
+    let dst_root = test_home.join(".claude");
+    std::fs::create_dir_all(&dst_root)?;
+
+    let src_creds = src_root.join(".credentials.json");
+    if !src_creds.is_file() {
+        return Err(std::io::Error::other(format!(
+            "Claude Code credentials not found at {} — log in with `claude login`",
+            src_creds.display()
+        )));
+    }
+    let dst_creds = dst_root.join(".credentials.json");
+    std::fs::copy(&src_creds, &dst_creds)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dst_creds, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    // settings.json: copy if present, with `hooks` stripped.
+    let src_settings = src_root.join("settings.json");
+    if src_settings.is_file() {
+        let raw = std::fs::read_to_string(&src_settings)?;
+        let dst_text = strip_hooks_from_claude_settings(&raw);
+        std::fs::write(dst_root.join("settings.json"), dst_text)?;
+    }
+
+    // plugins/ (and any other supporting dirs) — best-effort copy if
+    // present. `copy_dir_recursively` refuses symlinks (M2.1 auditor
+    // Nit 3); the user's plugins dir should be regular files / dirs.
+    let src_plugins = src_root.join("plugins");
+    if src_plugins.is_dir() {
+        copy_dir_recursively(&src_plugins, &dst_root.join("plugins"))?;
+    }
+    Ok(())
+}
+
+/// Strip the top-level `hooks` key from a Claude Code settings.json.
+/// Best-effort textual edit when the file is valid JSON; on parse
+/// failure we fall back to returning the original (worst case, the
+/// host's hooks fire inside the test).
+fn strip_hooks_from_claude_settings(raw: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("hooks");
+            }
+            serde_json::to_string_pretty(&v).unwrap_or_else(|_| raw.to_string())
+        }
+        Err(_) => raw.to_string(),
+    }
+}
+
+/// Copy the host user's OpenCode credentials into the per-test
+/// tempdir HOME. Mirrors [`import_claude_credentials`] — copies the
+/// auth state but NOT any `plugin/` directory (the deck installs its
+/// own OpenCode plugin pointing at the per-test paths). Touches
+/// whichever of the legacy / new credential paths exist on the host.
+fn import_opencode_credentials(test_home: &Path) -> std::io::Result<()> {
+    let mut imported_any = false;
+
+    // Possible source roots for the auth state. The first directory
+    // that exists is copied wholesale (sans `plugin/`); if none
+    // exists we surface the canonical path.
+    let source_roots = [
+        host_home().join(".local").join("share").join("opencode"),
+        host_home().join(".opencode"),
+    ];
+    for src in &source_roots {
+        if src.is_dir() {
+            let rel = src
+                .strip_prefix(host_home())
+                .expect("HOME-relative source path");
+            let dst = test_home.join(rel);
+            copy_dir_excluding_plugin_subdir(src, &dst)?;
+            imported_any = true;
+        }
+    }
+
+    // ~/.config/opencode/opencode.jsonc is the user-editable config.
+    let src_cfg = host_home()
+        .join(".config")
+        .join("opencode")
+        .join("opencode.jsonc");
+    if src_cfg.is_file() {
+        let dst_cfg_dir = test_home.join(".config").join("opencode");
+        std::fs::create_dir_all(&dst_cfg_dir)?;
+        std::fs::copy(&src_cfg, dst_cfg_dir.join("opencode.jsonc"))?;
+        imported_any = true;
+    }
+
+    if !imported_any {
+        return Err(std::io::Error::other(format!(
+            "OpenCode credentials not found under {} — log in with `opencode auth login`",
+            source_roots[0].display()
+        )));
+    }
+    Ok(())
+}
+
+/// Like `copy_dir_recursively` but skips any top-level `plugin/`
+/// child — the deck auto-installs its own OpenCode plugin into the
+/// tempdir HOME and we do NOT want the host's plugin firing too.
+fn copy_dir_excluding_plugin_subdir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            if entry.file_name() == "plugin" {
+                continue;
+            }
+            copy_dir_recursively(&from, &to)?;
+        } else if ty.is_file() {
+            std::fs::copy(&from, &to)?;
+            #[cfg(unix)]
+            if entry.file_name() == "auth.json" {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o600))?;
+            }
+        } else {
+            return Err(std::io::Error::other(format!(
+                "OpenCode credential entry {} is not a regular file or directory \
+                 (symlinks/sockets/FIFOs are not supported)",
+                from.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Write a minimal `session.toml` containing exactly one pane that
+/// runs `command` in `work_dir`. The deck reads this when launched
+/// with `--continue`.
+fn write_continue_session_file(
+    session_toml_path: &Path,
+    work_dir: &Path,
+    pane_name: &str,
+    command: &str,
+) -> std::io::Result<()> {
+    // Hand-rolled TOML so we don't need a runtime dep on toml in the
+    // harness module. Field names match `dot_agent_deck::config::SavedPane`.
+    let mut s = String::new();
+    s.push_str("[[panes]]\n");
+    s.push_str(&format!(
+        "dir = \"{}\"\n",
+        toml_escape(work_dir.to_str().expect("work dir is UTF-8"))
+    ));
+    s.push_str(&format!("name = \"{}\"\n", toml_escape(pane_name)));
+    s.push_str(&format!("command = \"{}\"\n", toml_escape(command)));
+    std::fs::write(session_toml_path, s)
+}
+
+fn toml_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Helper for L2 tests: send a single JSON line to the deck's hook
