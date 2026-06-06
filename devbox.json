@@ -7,6 +7,8 @@
     "git@2.53.0",
     "upcloud-cli@3.29.0",
     "gh@2.92.0",
+    "asciinema@3.2.0",
+    "cargo-nextest@0.9.137",
     "rustc@1.94.1",
     "cargo@1.94.1",
     "clippy@1.94.1",
@@ -28,6 +30,7 @@
       "agent-coder":        ["claude --model opus"],
       "agent-reviewer":     ["claude --model opus"],
       "agent-auditor":      ["claude --model opus"],
+      "agent-tester":       ["claude --model opus"],
       "agent-release":      ["claude --model sonnet"],
       "oc-release":         ["opencode --model openai/gpt-5.4-mini"],
       "oc-kimi":            ["opencode --model openrouter/moonshotai/kimi-k2.6"]

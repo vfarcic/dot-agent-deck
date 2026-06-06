@@ -1,0 +1,126 @@
+# PRD #77 Decision 7 check 1: catalog IDs that are exempt from the
+# 'must have a test' rule at M2 time. M4+ deletes entries from this
+# allowlist as it lands tests. Re-generate the seed list from the
+# catalog with:
+#
+#   awk '/^## Test Case Catalog/{p=1;next} /^## /{p=0} p && /^##### /' \
+#       prds/77-tui-testing-harness.md \
+#     | grep -oE '[a-z-]+/[a-z-]+/[0-9]{3}' | sort -u
+
+# chain-smoke/claude/001 — covered by tests/e2e_chain_smoke_claude.rs (M3).
+# chain-smoke/opencode/001 — blocked at M3 by a deck-side bug: current
+# OpenCode 1.x does not auto-discover plugins at
+# <config>/plugin/<name>/index.js (the path src/opencode_manage.rs
+# installs to), so the deck's hook events never fire end-to-end.
+# Remove this allowlist entry once src/opencode_manage.rs is updated to
+# match OpenCode 1.x's plugin discovery and the e2e test lands.
+chain-smoke/opencode/001
+dashboard/config-gen/001
+dashboard/config-gen/002
+dashboard/density/001
+dashboard/density/002
+dashboard/density/003
+dashboard/filter/001
+dashboard/filter/002
+dashboard/help/001
+dashboard/help/002
+dashboard/pane/001
+dashboard/pane/002
+dashboard/pane/003
+dashboard/pane/005
+dashboard/rename/001
+dashboard/rename/002
+dashboard/selection/001
+dashboard/selection/002
+dashboard/selection/003
+dashboard/selection/004
+embed/attach/001
+embed/attach/002
+embed/attach/003
+embed/attach/004
+embed/attach/005
+error/agent-spawn/001
+error/config/001
+error/config/002
+error/socket/001
+error/socket/002
+focus/dashboard/001
+focus/mode-tab/001
+focus/mode-tab/002
+focus/orchestration/001
+focus/orchestration/002
+hooks/delivery/002
+hooks/delivery/003
+hooks/delivery/004
+hooks/delivery/005
+hooks/delivery/006
+hooks/install/001
+hooks/install/002
+hooks/install/003
+lifecycle/daemon-idle/001
+lifecycle/daemon-idle/002
+lifecycle/handshake/001
+lifecycle/handshake/002
+lifecycle/handshake/003
+lifecycle/handshake/004
+lifecycle/handshake/005
+lifecycle/restart/001
+lifecycle/start/001
+lifecycle/start/002
+lifecycle/stop/001
+lifecycle/stop/002
+lifecycle/stop/003
+lifecycle/stop/004
+orchestration/delegate/001
+orchestration/delegate/002
+orchestration/delegate/003
+orchestration/delegate/004
+prompt/dir-picker/001
+prompt/dir-picker/002
+prompt/dir-picker/003
+prompt/dir-picker/004
+prompt/dir-picker/005
+prompt/dir-picker/006
+prompt/dir-picker/007
+prompt/new-pane/001
+prompt/new-pane/002
+prompt/new-pane/003
+prompt/new-pane/004
+prompt/new-pane/005
+prompt/new-pane/006
+prompt/pane-input/001
+prompt/pane-input/002
+prompt/pane-input/003
+prompt/permission/001
+prompt/permission/002
+prompt/permission/003
+prompt/quit/001
+prompt/quit/002
+prompt/quit/003
+prompt/quit/004
+prompt/quit/005
+resize/layout/001
+resize/sigwinch/001
+resize/sigwinch/002
+resize/sigwinch/003
+session/restore/001
+session/restore/002
+session/restore/003
+session/restore/004
+status/badge/001
+status/transition/001
+status/transition/002
+status/transition/003
+status/transition/004
+status/transition/005
+status/transition/006
+status/transition/007
+tabs/mode/001
+tabs/mode/002
+tabs/mode/003
+tabs/mode/004
+tabs/navigation/001
+tabs/navigation/002
+tabs/navigation/003
+tabs/orchestration/001
+tabs/orchestration/002

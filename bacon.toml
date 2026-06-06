@@ -1,0 +1,17 @@
+default_job = "test-fast"
+
+[jobs.test-fast]
+command = ["cargo", "nextest", "run"]
+need_stdout = true
+
+[jobs.test-e2e]
+command = ["cargo", "nextest", "run", "--features", "e2e"]
+need_stdout = true
+
+[jobs.clippy]
+command = ["cargo", "clippy", "--", "-D", "warnings"]
+need_stdout = false
+
+[jobs.fmt]
+command = ["cargo", "fmt", "--check"]
+need_stdout = false

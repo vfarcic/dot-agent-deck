@@ -1,0 +1,22 @@
+[package]
+name = "xtask-linkage-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# PRD #77 Decision 7: enforces the catalog↔test linkage and Decision 21's
+# no-raw-sleep rule. Invoked as `cargo xtask linkage-check` via the
+# alias defined in `.cargo/config.toml`.
+
+[[bin]]
+name = "xtask-linkage-check"
+path = "src/main.rs"
+
+[dependencies]
+proc-macro2 = "1"
+regex = "1"
+syn = { version = "2", features = ["full", "parsing"] }
+xtask-docs = { path = "../docs" }
+
+[dev-dependencies]
+tempfile = "3"

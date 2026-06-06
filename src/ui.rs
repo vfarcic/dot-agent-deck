@@ -7356,6 +7356,102 @@ fn update_idle_art(
     }
 }
 
+// ---------------------------------------------------------------------------
+// PRD #77 — L1 harness public surface
+// ---------------------------------------------------------------------------
+//
+// Stable test-only entry points consumed by `tests/render_dashboard.rs`.
+// They are `pub` because Rust integration tests cannot enable a crate
+// feature on demand, but `#[doc(hidden)]` so they do not surface in
+// `cargo doc` output — they are not a library API surface for
+// downstream consumers. See PRD #77 Decision 2 for the L1 / L2 split
+// and M2.1 auditor Nit 1 for why this is hidden rather than
+// `pub(crate)`-gated.
+
+/// Card density tier picked by the dashboard's adaptive layout
+/// (`choose_density`). Hidden-public so L1 snapshot tests can pin a
+/// specific tier rather than depending on the runtime calculation.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardDensityKind {
+    Compact,
+    Normal,
+    Spacious,
+}
+
+impl From<CardDensityKind> for CardDensity {
+    fn from(kind: CardDensityKind) -> Self {
+        match kind {
+            CardDensityKind::Compact => CardDensity::Compact,
+            CardDensityKind::Normal => CardDensity::Normal,
+            CardDensityKind::Spacious => CardDensity::Spacious,
+        }
+    }
+}
+
+impl CardDensityKind {
+    /// Rendered card height in rows at this density. `wide = true`
+    /// matches the in-process layout's "card is wide enough to show
+    /// the stats row inline" branch; the L1 snapshot test uses this
+    /// to size its `TestBackend` rather than hardcoding the value
+    /// (M2.1 reviewer S3).
+    #[doc(hidden)]
+    pub fn rendered_height(self, wide: bool) -> u16 {
+        CardDensity::from(self).card_height(wide)
+    }
+}
+
+/// L1 harness helper — render exactly one session card at the requested
+/// density into a fresh `TestBackend` buffer and return it for snapshot
+/// assertions.
+///
+/// Wraps the internal `render_session_card` so the L1 snapshot test in
+/// `tests/render_dashboard.rs` can pin a card's text layout without
+/// re-implementing the renderer. See PRD #77 catalog entry
+/// `dashboard/pane/004`.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn render_card_to_buffer(
+    session: &SessionState,
+    display_name: Option<&str>,
+    card_number: Option<u8>,
+    density: CardDensityKind,
+    palette: ColorPalette,
+    tick: u64,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let display_name_owned = display_name.map(str::to_string);
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            render_session_card(
+                frame,
+                area,
+                session,
+                tick,
+                false,
+                display_name_owned.as_ref(),
+                card_number,
+                density.into(),
+                palette,
+                None,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

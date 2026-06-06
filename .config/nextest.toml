@@ -1,0 +1,19 @@
+[profile.default]
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 3 }
+fail-fast = false
+
+[profile.default.junit]
+path = "target/nextest/default/junit.xml"
+
+[profile.e2e]
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+# Decision 28 + M4.3: recording dumps land under
+# `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see
+# `tests/common/mod.rs`). That tree is gitignored dev-time state, so
+# no setup-script wipe is needed — a re-run simply replaces the prior
+# per-test artifacts. The per-run subdir from M2.1 is gone: concurrent
+# `cargo test-e2e` invocations on one checkout aren't a real-world
+# workflow, and the per-test path with atomic writes means a
+# last-writer-wins outcome is fine for local debugging.

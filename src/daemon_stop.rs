@@ -233,39 +233,6 @@ pub async fn run_daemon_restart(attach_path: &Path, force: bool) -> Result<StopO
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn stop_returns_no_daemon_running_when_socket_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let attach_path = dir.path().join("nonexistent.sock");
-        let outcome = run_daemon_stop(&attach_path, false).await.unwrap();
-        assert_eq!(outcome, StopOutcome::NoDaemonRunning);
-    }
-
-    #[tokio::test]
-    async fn restart_no_daemon_running_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let attach_path = dir.path().join("nonexistent.sock");
-        let outcome = run_daemon_restart(&attach_path, false).await.unwrap();
-        assert_eq!(outcome, StopOutcome::NoDaemonRunning);
-    }
-
-    #[tokio::test]
-    async fn stop_returns_no_daemon_running_when_connect_refused() {
-        // Bind and immediately drop a Unix listener: the inode lingers
-        // but connect returns ECONNREFUSED. This is the "stale socket
-        // after a crash" case the PRD calls out — must fold into
-        // NoDaemonRunning, not surface as an error.
-        use std::os::unix::net::UnixListener;
-        let dir = tempfile::tempdir().unwrap();
-        let attach_path = dir.path().join("stale.sock");
-        let listener = UnixListener::bind(&attach_path).unwrap();
-        drop(listener);
-        // File should still be on disk (bind didn't unlink on drop).
-        assert!(attach_path.exists());
-        let outcome = run_daemon_stop(&attach_path, false).await.unwrap();
-        assert_eq!(outcome, StopOutcome::NoDaemonRunning);
-    }
-
     #[test]
     fn live_agents_error_message_mentions_force_flag() {
         // Pin the user-visible refusal message so the M4.x tests

@@ -1,3 +1,11 @@
+[workspace]
+members = [
+    ".",
+    "xtask/docs",
+    "xtask/linkage-check",
+    "xtask/spec",
+]
+
 [package]
 name = "dot-agent-deck"
 version = "0.1.0"
@@ -30,6 +38,21 @@ unicode-width = "0.2"
 tempfile = "3"
 tokio-test = "0.4"
 serial_test = "3"
+# PRD #77 Decision 22: insta pinned to a specific version, not `latest`,
+# so a future patch release cannot silently reshape snapshot diffs.
+insta = { version = "=1.47.2", features = ["yaml"] }
+spec = { path = "xtask/spec" }
+# PRD #77 Decision 30 / M4: the L2 harness's recording dump also
+# regenerates the paired .md so local DOT_AGENT_DECK_RECORD=1 runs
+# keep the docs in sync without a separate `cargo xtask docs --tests`.
+xtask-docs = { path = "xtask/docs" }
+
+[features]
+# PRD #77 Decision 6: `cargo test-e2e` (alias) enables this feature so
+# the L2 PTY suite compiles in. CI runs `cargo test-fast` only and never
+# sees these tests. Each `tests/e2e_*.rs` file opens with
+# `#![cfg(feature = "e2e")]`.
+e2e = []
 
 [[example]]
 name = "send_event"

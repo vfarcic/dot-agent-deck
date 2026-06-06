@@ -1,0 +1,4 @@
+# Chain-smoke fixture for the real-Claude-Code L2 test
+# (PRD #77 catalog `chain-smoke/claude/001`). No project config — the
+# harness drives the agent via a generated `session.toml` so the deck
+# auto-opens one pane running `claude -p` on launch.
