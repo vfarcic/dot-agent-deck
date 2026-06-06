@@ -486,15 +486,25 @@ Both checks run alongside the original six in `cargo xtask linkage-check` and ar
 
 **Why syntactic step extraction over per-statement comments:** the syntactic approach works on existing tests with zero author retrofit. New harness methods need a one-line entry in the method-name → step-template map, with a raw-call fallback so absence isn't a failure. Per-statement comments can be a future enhancement if quality demands it.
 
-### Decision 31: Tester role + synthetic-test inventory in pre-merge surface
+### Decision 31: Plan-first orchestrator workflow + tester role + synthetic-test inventory
 
-**Added 2026-06-06.** The orchestrator multi-agent setup gains a `tester` role specialized for TDD-style synthetic-test authoring + verification. The orchestrator delegates to tester when a feature or bug request involves observable behavior change cataloged by PRD #77; tester writes/extends/modifies tests (bias: extend > modify > new) and reports back with the failure mode. Coder then implements; tester verifies green. The chain replaces "coder writes both test and implementation" for the harness-relevant slice of work.
+**Added 2026-06-06, refined at the M4.4 stop.**
 
-Before opening the foundation PR or any subsequent merge, the orchestrator runs `cargo xtask list-tests` and surfaces the synthetic-test inventory (catalog IDs created/modified/touched, allowlist deltas) to the user. This makes "which tests changed in this PR" answerable in one command at PR review time.
+The orchestrator multi-agent setup gains a `tester` role specialized for TDD-style synthetic-test authoring + verification, and a plan-first workflow that decides upfront which work uses the TDD chain vs. coder-direct.
 
-Tester's binding instruction (full text in `.dot-agent-deck.toml`'s role definition) requires that every test added or modified ship with a `/// Scenario:` doc comment per Decision 30 + CLAUDE.md rule 7.
+**Plan phase.** When starting work on a PRD, the orchestrator analyzes the PRD scope and produces a *test plan* listing catalog entries affected, test tier per entry, action (extend / modify / create / skip), and a one-sentence Scenario summary. The plan is surfaced to the user *before* any test or implementation work begins; the user approves or refines.
 
-**Why now:** at M4's close PRD #77 hands the harness off to per-PRD test maintenance. Without a dedicated tester role, "write the test alongside the fix" rides on the coder's discretion under time pressure — exactly when it's most likely to be skipped. Splitting the test-author seat out makes the TDD step a delegation boundary the orchestrator can't accidentally walk past. Pairing it with `cargo xtask list-tests` makes the synthetic-test delta a structural artifact of every PR rather than something the reviewer has to derive from the diff.
+**Execution.** Per the approved plan:
+- L2 synthetic + L1 widget items → TDD chain: tester (RED) → coder → tester (GREEN).
+- Pure-data / chain-smoke / no-test items → coder direct.
+
+These two paths can interleave within a single PRD; the orchestrator picks per item.
+
+**Pre-merge inventory.** Before delegating release, the orchestrator runs `cargo xtask list-tests` and surfaces the synthetic-test inventory (catalog IDs created/modified, allowlist deltas) to the user as the final pre-merge confirmation.
+
+**Tester binding instruction** (full text in `.dot-agent-deck.toml`): write *failing* synthetic tests per the approved plan; bias is extend > modify > new; every test ships with a `/// Scenario:` doc comment per Decision 30 + CLAUDE.md rule 7. Tester ignores chain-smoke (real-agent integration is not TDD-suited) and pure-data fixes (those belong with coder).
+
+**Why now:** at M4's close PRD #77 hands the harness off to per-PRD test maintenance. Without a dedicated tester role, "write the test alongside the fix" rides on the coder's discretion under time pressure — exactly when it's most likely to be skipped. Splitting the test-author seat out makes the TDD step a delegation boundary the orchestrator can't accidentally walk past. The plan-first framing keeps the orchestrator from defaulting to either "everything is TDD" or "TDD only when convenient" — the plan, agreed with the user up front, is what decides per item. Pairing the workflow with `cargo xtask list-tests` makes the synthetic-test delta a structural artifact of every PR rather than something the reviewer has to derive from the diff.
 
 **Scope guardrails for tester:**
 - Sweet spot: L2 synthetic flows (hooks, status transitions, prompts, focus, lifecycle, resize, error paths) and L1 widget redesigns where rendering changes are observable in `TestBackend`.

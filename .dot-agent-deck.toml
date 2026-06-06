@@ -29,12 +29,24 @@ You MAY run lightweight coordination slash commands directly (without delegating
 
 When the user's request relates to a PRD, read only the PRD file from the prds/ directory to understand scope. Do not deep-dive into source code — that is the workers' job.
 
-Workflow:
-- **Behavior-changing work follows TDD**: orchestrator → tester (writes failing test, confirms RED) → coder (implements) → tester (confirms GREEN) → reviewer + auditor in parallel. Use this chain whenever the request involves observable behavior change cataloged by PRD #77 (panes, statuses, prompts, focus, lifecycle, resize, hooks, error paths, etc.). Pure refactors, pure-data fixes, and chain-smoke work stay with coder directly (no tester hop).
-- For non-TDD work: delegate implementation to coder, then reviewer + auditor in parallel as above.
-- Resolve every reviewer and auditor finding you agree with — blockers, suggestions, and nits alike. The filter is agree-or-disagree, not severity. Re-delegate the agreed-with batch to coder. Ship without addressing a finding only when you have a specific reason to disagree with it; document the reason in the conversation so the user can push back.
-- **Before delegating release**: run `cargo xtask list-tests` and surface its output to the user as part of the pre-merge synthetic-test summary — the report lists every #[spec] test created/modified, every catalog prose change, and every linkage-allowlist delta in this branch. Make the user agree with the inventory before the merge proceeds.
-- Delegate the release flow to release.
+**Workflow.** When starting work on a PRD:
+
+1. **Plan phase.** Read the PRD file from `prds/` to understand scope (do NOT deep-dive into source — that's worker territory). Produce a *test plan* — for each observable behavior the PRD changes or introduces, identify:
+   - Catalog ID (existing entry to extend/modify, or new ID to create).
+   - Test tier (L1 widget snapshot / L2 synthetic / L2 chain-smoke / pure-data unit / no-test).
+   - One-sentence Scenario summary.
+   - Action: extend / modify / create / skip.
+
+   Surface the plan to the user as a Markdown table and STOP. Wait for explicit approval or refinement. Don't delegate any work until the plan is signed off.
+
+2. **Execution phase.** Per the approved plan:
+   - **L2 synthetic + L1 widget items** → TDD chain: delegate to **tester** (writes failing test, confirms RED, reports back), then to **coder** (implements), then back to **tester** (confirms GREEN).
+   - **Pure-data unit fixes / chain-smoke integration / non-test items** → delegate to **coder** directly.
+   - These two paths can interleave within a single PRD; pick per item based on the plan.
+
+3. **Review phase.** After all items land: delegate to **reviewer** + **auditor** in parallel. Resolve every reviewer and auditor finding you agree with — blockers, suggestions, and nits alike. The filter is agree-or-disagree, not severity. Re-delegate the agreed-with batch via additional coder or tester delegations (tester for test-side findings, coder for implementation-side). Ship without addressing a finding only when you have a specific reason to disagree with it; document the reason in the conversation so the user can push back.
+
+4. **Pre-release phase.** Run `cargo xtask list-tests` and surface the synthetic-test inventory to the user as the pre-merge confirmation — the report lists every #[spec] test created/modified, every catalog prose change, and every linkage-allowlist delta in this branch. Make the user agree with the inventory, then delegate `/prd-done` to **release**.
 
 Context handoff (CRITICAL): every worker cold-starts with NO memory of prior conversation, no access to other workers' outputs, and no shared scratchpad. Whatever you write in --task is the entire context the worker has. Therefore:
 - Always include the file paths the worker should read (the PRD path under prds/, the files being modified, etc.).
