@@ -1000,6 +1000,67 @@ The OpenCode test was written, run, and **failed because the deck's plugin insta
 1. **OpenCode deck-side fix.** Recommend a follow-up PRD or in-PRD-77 issue to align `src/opencode_manage.rs::auto_install` with OpenCode 1.x's plugin loader. Once that lands, the M3 chain-smoke test will need to be re-introduced — the harness side is already done.
 2. **Snapshot fixture's `last_activity` was time-pinned to a fixed past instant.** This worked for the M2 commit but the snapshot drifts as the date rolls (the rendered `Last: Xs ago` is `Utc::now() - last_activity`). I switched `tests/render_dashboard.rs::working_session_fixture` to use `Utc::now()` so elapsed always reads `0s ago`. Not a catalog-level change; documenting so future contributors don't reintroduce the pin.
 
+## M4: Implementation Notes
+
+Recorded at the M4 user-validation handoff so the validation reviewer has the generator shape, the method-template map, and the open notes in one place.
+
+### Deliverables shipped
+
+- **`xtask/docs/`** — new workspace member (library + binary). Library is the single source of truth for both `cargo xtask docs --tests` and CI's rule 7 byte-identity check; binary is the developer-facing entrypoint. Decision 30's full machinery sits here.
+- **`cargo xtask docs --tests`** wired through the existing `xtask-linkage-check` binary, which is now a subcommand multiplexer (first argv slot selects `docs` vs `linkage-check`, default to the latter for back-compat). Keeps the existing `cargo xtask` alias untouched.
+- **Linkage-check rule 7** lives in `xtask/linkage-check/src/main.rs` alongside the six existing rules; calls `xtask_docs::check_in_sync` and surfaces missing `/// Scenario:` doc comments + drifted `.md` files. Success line bumped to "… 7 rules".
+- **Harness regen-on-record hook** in `tests/common/mod.rs` — when the L2 harness's Drop dumps recordings (panic OR `DOT_AGENT_DECK_RECORD=1`), it also regenerates the paired `.md` for the running test via `xtask_docs::generate_all`. Best-effort: errors log to stderr but don't poison the test result; CI's rule 7 is the load-bearing enforcement.
+- **CLAUDE.md rule 7** + **CONTRIBUTING.md "how to add a new test"** updated to call out the Scenario doc comment + `cargo xtask docs --tests` regen step.
+- **Retrofit:** the three existing `#[spec]` tests (`dashboard/pane/004`, `hooks/delivery/001`, `chain-smoke/claude/001`) gain Scenario doc comments + paired `.md` files under `.dot-agent-deck/m2-recordings/` (L1 + L2 synthetic) and `.dot-agent-deck/m3-recordings/` (chain-smoke).
+
+### Method-name → step-template map
+
+The maintenance surface Decision 30 calls out. Initial entries (all in `xtask/docs/src/lib.rs::step_for_method` + `step_for_macro` + `step_for_free_call`):
+
+| Source | Method / macro | Step template |
+|---|---|---|
+| method | `launch_with_fixture(F)` | `Launch the deck with fixture F` |
+| method | `try_launch_with_fixture(F)` | `Launch the deck with fixture F (fallible variant)` |
+| method | `wait_for_string(S)` | `Wait for S to appear on screen` |
+| method | `wait_until_quiescent()` | `Wait until the deck stops emitting output` |
+| method | `with_imported_claude_credentials()` | `Import Claude credentials into the test HOME` |
+| method | `with_imported_opencode_credentials()` | `Import OpenCode credentials into the test HOME` |
+| method | `with_continue_session(N, C)` | `Stage a saved session N running C` |
+| method | `with_env(K, V)` | `Override env K=V` |
+| method | `with_pty_size(C, R)` | `Set the PTY to C×R` |
+| method | `resize(C, R)` | `Resize the PTY to C×R` |
+| method | `builder` / `hook_socket_path` / `attach_socket_path` / `snapshot_grid` | _(skipped — plumbing)_ |
+| free | `write_hook_line(_, P)` | `Write P to the hook socket` |
+| free | `render_card_to_buffer(...)` | `Render the session card into a ratatui::TestBackend buffer` |
+| free | `Some` / `None` / `Ok` / `Err` / `String` / `Vec` / `PathBuf` / `Default` / `format` / `builder` | _(skipped — language / plumbing)_ |
+| macro | `skip_unless!(check_claude_available())` | `Skip unless Claude Code CLI is available` |
+| macro | `skip_unless!(check_opencode_available())` | `Skip unless OpenCode CLI is available` |
+| macro | `assert_snapshot!(buf)` | `Snapshot the rendered buffer (insta)` |
+| method (unknown) | _any other_ | `Call: name(...)` fallback |
+| free (unknown) | _any other not in skip list_ | `Call: name(...)` fallback |
+
+Adding a new harness method later is a one-line edit in the corresponding match arm.
+
+### Cross-xtask code-sharing decisions
+
+- The docs generator's catalog parser is *richer* than linkage-check's existing ID-only one (extracts the full `Layer/Agent/Asserts/Does not assert/Platform coverage/Cost note` body), so I kept them separate rather than extracting a shared `xtask-catalog` crate. The linkage-check parser stays simple; the docs parser owns the richer model. If a third xtask needs the rich shape, that's the trigger to extract — not now.
+- The `xtask-linkage-check` binary still owns the `cargo xtask` alias because that's the simplest path. Renaming to `xtask-cli` (umbrella) is a nice-to-have for after PRD #77 closes.
+
+### Recording-dir mapping
+
+The current pin-by-area heuristic in `xtask_docs::resolve_output_path`:
+- `dashboard/* + hooks/*` → `.dot-agent-deck/m2-recordings/`
+- `chain-smoke/*` → `.dot-agent-deck/m3-recordings/`
+- anything else → `.dot-agent-deck/unmapped-recordings/`
+
+Future PRDs that land catalog tests under new areas pin their own milestone dir by extending this match arm in a one-line PR (or by simply adding the `unmapped-recordings/` rename to whatever the PRD scopes).
+
+### Second-opinion flags for the M4 stop
+
+1. **L1 doc steps include `Call: …` lines for author helpers.** Tests like `pane_004_card_title_row` call `working_session_fixture()` and `resolve_palette(Dark)` — both author-local helpers, not harness API. The generator surfaces them via the `Call:` fallback for visibility. That's per spec, but the resulting L1 `.md` "Steps" section reads a little noisy. The test author can either (a) inline those helper calls, (b) extend the skip list, or (c) live with the noise. M4 ships as-is; future polish in M5+.
+2. **The `xtask-linkage-check` binary is the subcommand multiplexer.** The package name is a slight misnomer now that it also runs `cargo xtask docs --tests`. Rename to `xtask-cli` (or similar umbrella) is suggested for a post-PRD-77 polish PR — but the current shape works and keeps the alias stable, so deferring.
+3. **`generate_for_spec` re-parses all tests for one regen.** The harness regen-on-record hook calls `generate_all` and filters by fn name. With ~3 tests today this is microseconds; if the test count grows to hundreds, a per-file `parse_one(path, spec_id)` shortcut would be worth adding. Flag for M5+ when the catalog actually fills out.
+
 ## Test Case Catalog
 
 This is the authoritative list of test cases the harness must cover. IDs are stable per Decision 7; tests reference them via `#[spec("…")]` annotations once the harness exists in M2. Coverage is enumerated from the code as it ships today (Decision 27 — "code is authoritative"); documented behaviors with no catalog entry are listed as deliberate skips at the end of this section.
