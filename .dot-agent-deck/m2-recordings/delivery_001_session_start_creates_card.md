@@ -10,12 +10,10 @@ Launch the deck against the `minimal` fixture, wait for the empty dashboard to r
 
 ## Steps
 
-1. Call: launch_with_fixture(`minimal`)
+1. Launch the deck with fixture `minimal`
 2. Wait for `No active sessions` to appear on screen
-3. Call: to_string()
-4. Write `to_string(…)` to the hook socket
-5. Call: expect(`write SessionStart hook to per-test socket`)
-6. Wait for `m2demo` to appear on screen
+3. Write `to_string(…)` to the hook socket
+4. Wait for `m2demo` to appear on screen
 
 ## Catalog spec
 

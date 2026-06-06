@@ -24,6 +24,12 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use syn::spanned::Spanned;
 
+/// Single source of truth for the catalog-pointer line in every
+/// generated `.md`. Reviewer Nit 2 — was duplicated literally in
+/// the renderer; pulled here so a future location change doesn't
+/// fork.
+const CATALOG_REF: &str = "PRD #77 `## Test Case Catalog`";
+
 // ---------------------------------------------------------------------------
 // Public surface
 // ---------------------------------------------------------------------------
@@ -127,17 +133,38 @@ pub fn generate_for_spec(
     Ok(all.into_iter().find(|d| d.spec_id == spec_id))
 }
 
-/// Write every generated doc to disk under its `output_path`. Creates
-/// parent dirs as needed. Returns the list of paths written.
+/// Write every generated doc to disk under its `output_path`.
+/// Creates parent dirs as needed. M4.1 auditor S3: each file is
+/// written via a `NamedTempFile::new_in(parent)` followed by
+/// `persist(dst)`, so concurrent invocations (e.g. one
+/// `cargo xtask docs --tests` racing the harness's regen-on-record
+/// hook) cannot race-corrupt a `.md` mid-write — the rename is
+/// atomic on Unix because the tempfile lives in the same parent
+/// directory as the destination.
 pub fn write_all(generated: &[GeneratedDoc]) -> Result<Vec<PathBuf>, String> {
+    use std::io::Write;
     let mut paths = Vec::with_capacity(generated.len());
     for g in generated {
-        if let Some(parent) = g.output_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create parent dir {}: {e}", parent.display()))?;
-        }
-        std::fs::write(&g.output_path, &g.content)
-            .map_err(|e| format!("write {}: {e}", g.output_path.display()))?;
+        let parent = g.output_path.parent().ok_or_else(|| {
+            format!(
+                "output path has no parent directory: {}",
+                g.output_path.display()
+            )
+        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create parent dir {}: {e}", parent.display()))?;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".xtask-docs-")
+            .suffix(".md.tmp")
+            .tempfile_in(parent)
+            .map_err(|e| format!("create tempfile in {}: {e}", parent.display()))?;
+        tmp.write_all(g.content.as_bytes())
+            .map_err(|e| format!("write tempfile for {}: {e}", g.output_path.display()))?;
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| format!("sync tempfile for {}: {e}", g.output_path.display()))?;
+        tmp.persist(&g.output_path)
+            .map_err(|e| format!("rename into place {}: {e}", g.output_path.display()))?;
         paths.push(g.output_path.clone());
     }
     Ok(paths)
@@ -187,6 +214,24 @@ pub struct CatalogEntry {
 /// out of the PRD's `## Test Case Catalog` section. Returns a map
 /// keyed by catalog id.
 pub fn parse_catalog(prd_path: &Path) -> Result<BTreeMap<String, CatalogEntry>, String> {
+    // M4.1 auditor S1: refuse a symlinked PRD path with a redacted,
+    // specific error — matches the M3.1 auditor S3 stance on
+    // symlinked credential / fixture sources.
+    let meta = std::fs::symlink_metadata(prd_path)
+        .map_err(|e| format!("stat {}: {e}", prd_path.display()))?;
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        return Err(format!(
+            "expected real file at {}, found symlink",
+            prd_path.display()
+        ));
+    }
+    if !file_type.is_file() {
+        return Err(format!(
+            "expected real file at {}, found {file_type:?}",
+            prd_path.display()
+        ));
+    }
     let text = std::fs::read_to_string(prd_path)
         .map_err(|e| format!("read {}: {e}", prd_path.display()))?;
     let header_re = Regex::new(r"^#####\s+([a-z][a-z0-9-]*/[a-z][a-z0-9-]*/\d{3})\s*[—-]\s*(.+)$")
@@ -256,7 +301,7 @@ pub fn parse_catalog(prd_path: &Path) -> Result<BTreeMap<String, CatalogEntry>, 
 /// test fn we find, sorted by spec id for determinism.
 pub fn discover_tests(tests_dir: &Path) -> Result<Vec<DiscoveredTest>, String> {
     let mut files: Vec<PathBuf> = Vec::new();
-    collect_rs_files(tests_dir, &mut files);
+    collect_rs_files(tests_dir, &mut files)?;
     files.sort();
     let mut out: Vec<DiscoveredTest> = Vec::new();
     for path in files {
@@ -292,19 +337,35 @@ pub fn discover_tests(tests_dir: &Path) -> Result<Vec<DiscoveredTest>, String> {
     Ok(out)
 }
 
-fn collect_rs_files(dir: &Path, acc: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
+fn collect_rs_files(dir: &Path, acc: &mut Vec<PathBuf>) -> Result<(), String> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("read_dir {}: {e}", dir.display())),
     };
-    for entry in rd.flatten() {
+    for entry in rd {
+        let entry = entry.map_err(|e| format!("read_dir entry under {}: {e}", dir.display()))?;
         let p = entry.path();
-        let Ok(ft) = entry.file_type() else { continue };
+        // M4.1 auditor S2: refuse symlinks LOUDLY under `tests/` —
+        // matches the M3 copy_dir_recursively stance. A fixture or
+        // test should never be a symlink; loud refusal catches
+        // accidents instead of silently skipping them.
+        let meta = std::fs::symlink_metadata(&p)
+            .map_err(|e| format!("symlink_metadata {}: {e}", p.display()))?;
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            return Err(format!(
+                "refusing to follow symlink under tests/: {}",
+                p.display()
+            ));
+        }
         if ft.is_dir() {
-            collect_rs_files(&p, acc);
+            collect_rs_files(&p, acc)?;
         } else if ft.is_file() && p.extension().and_then(|e| e.to_str()) == Some("rs") {
             acc.push(p);
         }
     }
+    Ok(())
 }
 
 fn read_spec_attr(attrs: &[syn::Attribute]) -> Option<String> {
@@ -322,10 +383,13 @@ fn read_spec_attr(attrs: &[syn::Attribute]) -> Option<String> {
 }
 
 /// Scan the function's doc attributes for the first `/// Scenario:`
-/// line and capture everything from there until a blank doc line
-/// (which terminates the paragraph) or the end of the doc block.
-/// Tolerates the variants the task spec calls out:
-/// `///Scenario:`, `/// Scenario`, `/// scenario:`, etc.
+/// line and capture everything from there until a non-doc-comment
+/// boundary. M4.1 reviewer S2: blank doc lines inside the Scenario
+/// become paragraph breaks (`\n\n`) in the rendered .md, so the
+/// extractor no longer silently truncates multi-paragraph
+/// Scenarios. M4.1 reviewer Nit 3: the regex now matches the
+/// singular form only — `/// Scenarios:` (plural) does NOT trigger,
+/// because the author asked for "Scenario" exactly.
 fn read_scenario_doc(attrs: &[syn::Attribute]) -> Option<String> {
     let lines: Vec<String> = attrs
         .iter()
@@ -343,39 +407,63 @@ fn read_scenario_doc(attrs: &[syn::Attribute]) -> Option<String> {
             }
         })
         .collect();
-    let mut iter = lines.iter().enumerate();
-    let scenario_marker = Regex::new(r"(?i)^\s*scenario\b\s*:?\s*").expect("scenario regex");
-    let start_idx = loop {
-        let (i, line) = iter.next()?;
-        if scenario_marker.is_match(line) {
-            break (i, line);
-        }
-    };
-    let (i, line) = start_idx;
-    let mut paragraph: Vec<String> = Vec::new();
-    // The first line may carry inline content after `Scenario:`.
-    let head = scenario_marker.replace(line, "").trim().to_string();
-    if !head.is_empty() {
-        paragraph.push(head);
+    extract_scenario_from_doc_lines(&lines)
+}
+
+/// Pure helper extracted for unit testing: takes the doc-comment
+/// lines (already stripped of `///`) and returns the Scenario body
+/// with blank-line-driven paragraph breaks preserved as `\n\n`.
+fn extract_scenario_from_doc_lines(lines: &[String]) -> Option<String> {
+    // Match exactly the singular `scenario` token; the negative
+    // lookahead pattern Rust's regex crate doesn't support, so we
+    // assert the following char (after `scenario`) is NOT another
+    // word char by checking word-end with a colon or whitespace.
+    // The pattern: case-insensitive `scenario` followed by `:` or
+    // whitespace or end-of-string — NOT `s` / further letters.
+    let scenario_marker = Regex::new(r"(?i)^\s*scenario(?:\s*:|\s+|\s*$)").expect("scenario regex");
+    let start = lines
+        .iter()
+        .position(|line| scenario_marker.is_match(line))?;
+    // Strip the `Scenario:` prefix from the first line — leaves
+    // whatever inline content followed.
+    let first_line = scenario_marker
+        .replace(&lines[start], "")
+        .trim()
+        .to_string();
+
+    let mut paragraphs: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    if !first_line.is_empty() {
+        current.push(first_line);
     }
-    // Continue across subsequent doc lines until a blank doc line
-    // ends the paragraph.
-    for line in lines.iter().skip(i + 1) {
-        if line.trim().is_empty() {
+    for line in lines.iter().skip(start + 1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !current.is_empty() {
+                paragraphs.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        // A second `Scenario:` marker terminates this scenario —
+        // one Scenario per test.
+        if scenario_marker.is_match(line) {
             break;
         }
-        // Skip if it's a new `Scenario:` block (defensive — only
-        // one paragraph per test).
-        if scenario_marker.is_match(line) {
-            break;
-        }
-        paragraph.push(line.trim().to_string());
+        current.push(trimmed.to_string());
     }
-    if paragraph.is_empty() {
-        None
-    } else {
-        Some(paragraph.join(" "))
+    if !current.is_empty() {
+        paragraphs.push(current);
     }
+    if paragraphs.is_empty() {
+        return None;
+    }
+    Some(
+        paragraphs
+            .into_iter()
+            .map(|p| p.join(" "))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -413,9 +501,13 @@ fn collect_steps_from_stmt(stmt: &syn::Stmt, steps: &mut Vec<String>) {
 }
 
 fn walk_expr_for_steps(expr: &syn::Expr, steps: &mut Vec<String>) {
+    // M4.1 reviewer S1: a call records ONE step for the outer
+    // invocation. We do NOT recurse into its arguments — the recipe
+    // is "what the test did," not "every helper invoked." Method
+    // chains still walk the receiver because each link in the
+    // chain is itself a test action (`.with_imported_…()`
+    // ‑> `.with_continue_session(…)` etc.).
     match expr {
-        // Method chain on a builder / deck handle. Walk the
-        // receiver first (recursive) so chain order is left-to-right.
         syn::Expr::MethodCall(call) => {
             walk_expr_for_steps(&call.receiver, steps);
             let name = call.method.to_string();
@@ -426,10 +518,6 @@ fn walk_expr_for_steps(expr: &syn::Expr, steps: &mut Vec<String>) {
         }
         // Free-standing call like `write_hook_line(socket, payload)`.
         syn::Expr::Call(call) => {
-            // Walk into args first (e.g. `format!(...)` inside a call).
-            for a in &call.args {
-                walk_expr_for_steps(a, steps);
-            }
             if let syn::Expr::Path(p) = &*call.func
                 && let Some(name) = p.path.segments.last().map(|s| s.ident.to_string())
             {
@@ -480,8 +568,15 @@ fn step_for_method(name: &str, args: &[String]) -> Option<String> {
         "with_env" => format!("Override env {}={}", arg_or(args, 0), arg_or(args, 1)),
         "with_pty_size" => format!("Set the PTY to {}×{}", arg_or(args, 0), arg_or(args, 1)),
         "resize" => format!("Resize the PTY to {}×{}", arg_or(args, 0), arg_or(args, 1)),
-        "builder" | "hook_socket_path" | "attach_socket_path" | "snapshot_grid" => {
-            // Plumbing — no plain-English step.
+        // Plumbing — no plain-English step. M4.1 reviewer S1
+        // extends the skip list with the common language-level
+        // method-call noise (`.expect`, `.unwrap`, `.to_string`,
+        // `.into`, `.as_ref`, `.clone`) and the test-data-builder
+        // helpers used by the L1 test (`rendered_height` is a
+        // value lookup on the density enum).
+        "builder" | "hook_socket_path" | "attach_socket_path" | "snapshot_grid" | "expect"
+        | "unwrap" | "to_string" | "into" | "as_ref" | "as_str" | "as_path" | "clone"
+        | "to_owned" | "rendered_height" => {
             return None;
         }
         _ => format!("Call: {name}({})", args.join(", ")),
@@ -490,10 +585,13 @@ fn step_for_method(name: &str, args: &[String]) -> Option<String> {
 }
 
 fn step_for_free_call(name: &str, args: &[String]) -> Option<String> {
-    // Skip a small allowlist of language-level helpers and harness
-    // entry-point plumbing that are structural noise (Some/None/Ok/
-    // Err constructors, TuiDeck::builder() that just starts the
-    // builder chain, etc. — these aren't load-bearing test steps).
+    // Skip language-level helpers and harness-entry plumbing that
+    // are structural noise (Some/None/Ok/Err constructors,
+    // TuiDeck::builder() that just starts the builder chain, etc.).
+    // M4.1 reviewer S1: also skip the L1 test-data builders + lib
+    // helpers (`resolve_palette`, `working_session_fixture`,
+    // `buffer_to_text`) that appear in `tests/render_dashboard.rs`
+    // and aren't test actions.
     if matches!(
         name,
         "Some"
@@ -506,6 +604,18 @@ fn step_for_free_call(name: &str, args: &[String]) -> Option<String> {
             | "Default"
             | "format"
             | "builder"
+            | "resolve_palette"
+            | "working_session_fixture"
+            | "buffer_to_text"
+            // M4.1 reviewer S1 follow-on: `Utc::now()` and similar
+            // clock/value lookups appear inline in test fixtures and
+            // are not test actions — skip them so the Steps section
+            // stays focused on what the test DID.
+            | "now"
+            | "from"
+            | "from_str"
+            | "new"
+            | "default"
     ) {
         return None;
     }
@@ -518,6 +628,14 @@ fn step_for_free_call(name: &str, args: &[String]) -> Option<String> {
         "render_card_to_buffer" => {
             "Render the session card into a `ratatui::TestBackend` buffer".to_string()
         }
+        // M4.1 reviewer S1: `launch_with_fixture` can appear as a
+        // free-function call (UFCS / static-method form) too. Mirror
+        // the method-form step so both paths produce the same text.
+        "launch_with_fixture" => format!("Launch the deck with fixture {}", arg_or(args, 0)),
+        "try_launch_with_fixture" => format!(
+            "Launch the deck with fixture {} (fallible variant)",
+            arg_or(args, 0)
+        ),
         // Decision 30 fallback: any other free call surfaces as a
         // raw `Call: name(...)` line so the author can see what was
         // recognized — and so adding a new harness function is
@@ -560,15 +678,15 @@ fn display_expr(expr: &syn::Expr) -> String {
         syn::Expr::Lit(syn::ExprLit {
             lit: syn::Lit::Str(s),
             ..
-        }) => format!("`{}`", s.value()),
-        syn::Expr::Lit(syn::ExprLit { lit, .. }) => format!("`{}`", lit_to_string(lit)),
+        }) => inline_code(&s.value()),
+        syn::Expr::Lit(syn::ExprLit { lit, .. }) => inline_code(&lit_to_string(lit)),
         syn::Expr::Path(p) => {
             // Render the path's last segment to keep it short.
             p.path
                 .segments
                 .last()
-                .map(|s| format!("`{}`", s.ident))
-                .unwrap_or_else(|| "`_`".to_string())
+                .map(|s| inline_code(&s.ident.to_string()))
+                .unwrap_or_else(|| inline_code("_"))
         }
         syn::Expr::Reference(r) => display_expr(&r.expr),
         syn::Expr::Paren(p) => display_expr(&p.expr),
@@ -576,7 +694,7 @@ fn display_expr(expr: &syn::Expr) -> String {
         syn::Expr::MethodCall(m) => {
             // E.g. `&agent_command` or `cmd.as_str()` — show the
             // method name.
-            format!("`{}(…)`", m.method)
+            inline_code(&format!("{}(…)", m.method))
         }
         syn::Expr::Macro(m) => {
             // E.g. format!("…") — show the macro path's last segment.
@@ -584,8 +702,8 @@ fn display_expr(expr: &syn::Expr) -> String {
                 .path
                 .segments
                 .last()
-                .map(|s| format!("`{}!(…)`", s.ident))
-                .unwrap_or_else(|| "`_!(…)`".to_string())
+                .map(|s| inline_code(&format!("{}!(…)", s.ident)))
+                .unwrap_or_else(|| inline_code("_!(…)"))
         }
         other => {
             let span = other.span();
@@ -608,6 +726,66 @@ fn lit_to_string(lit: &syn::Lit) -> String {
         syn::Lit::Char(c) => c.value().to_string(),
         _ => "_".to_string(),
     }
+}
+
+/// Wrap `value` as a CommonMark inline-code span, picking a
+/// backtick run length that's longer than the longest run of
+/// backticks already present in `value` (M4.1 auditor S6). For
+/// the common case (no backticks) the result is the familiar
+/// single-backtick form `` `value` ``.
+fn inline_code(value: &str) -> String {
+    let longest_run = value
+        .as_bytes()
+        .iter()
+        .fold((0usize, 0usize), |(longest, current), &b| {
+            if b == b'`' {
+                let c = current + 1;
+                (longest.max(c), c)
+            } else {
+                (longest, 0)
+            }
+        })
+        .0;
+    let fence = "`".repeat(longest_run + 1);
+    // CommonMark requires a single space of padding when the code
+    // span starts or ends with a backtick; cheap to always add for
+    // multi-backtick fences.
+    if longest_run > 0 {
+        format!("{fence} {value} {fence}")
+    } else {
+        format!("{fence}{value}{fence}")
+    }
+}
+
+/// Sanitize Scenario doc-comment content before it lands in the
+/// generated `.md`. M4.1 auditor S5: a hostile contributor could
+/// otherwise smuggle:
+/// - Raw HTML (`<script>…</script>`, `<img onerror=…>`) — GitHub's
+///   markdown renderer strips most of it but some inline HTML
+///   passes through into PR review surfaces.
+/// - Markdown link syntax (`[click](javascript:…)`, `[exfil](https://…)`).
+/// - Image syntax (`![x](https://…)`) which auto-fetches at render
+///   time, leaking IP / UA.
+///
+/// This pass:
+/// - HTML-escapes `<` and `>`.
+/// - Escapes `[` and `]` so link/image syntax appears as literal
+///   text (the author can put real links after the generated
+///   block; the regenerated content stays sanitized).
+/// - Leaves backticks, parens, em dashes, and ASCII alone so plain
+///   prose passes through unchanged.
+fn sanitize_scenario_for_markdown(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '[' => out.push_str("&#91;"),
+            ']' => out.push_str("&#93;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Flatten a macro's TokenStream into top-level arguments,
@@ -683,7 +861,7 @@ fn render_markdown(
         "**Source:** `tests/{}::{}`\n",
         rel_src, test.fn_name
     ));
-    s.push_str("**Catalog:** PRD #77 `## Test Case Catalog`\n");
+    s.push_str(&format!("**Catalog:** {CATALOG_REF}\n"));
     let layer_is_l2 = entry
         .layer
         .as_deref()
@@ -695,7 +873,7 @@ fn render_markdown(
     s.push('\n');
 
     s.push_str("## Scenario\n\n");
-    s.push_str(scenario);
+    s.push_str(&sanitize_scenario_for_markdown(scenario));
     s.push_str("\n\n");
 
     s.push_str("## Steps\n\n");
@@ -762,4 +940,96 @@ fn sub_area_filter(spec_id: &str, fn_name: &str) -> String {
         return format!("{}_{nnn}", sub.replace('-', "_"));
     }
     fn_name.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc_lines(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn scenario_extractor_accepts_singular_form() {
+        let lines = doc_lines(&[" Scenario: launch the deck and assert"]);
+        let out = extract_scenario_from_doc_lines(&lines).expect("scenario extracted");
+        assert_eq!(out, "launch the deck and assert");
+    }
+
+    #[test]
+    fn scenario_extractor_rejects_plural_form() {
+        // M4.1 reviewer Nit 3 — the regex must not match
+        // `/// Scenarios:` (plural). The whole doc block is just
+        // a plural mention, so the extractor returns None.
+        let lines = doc_lines(&[" Scenarios: the test covers two cases"]);
+        assert!(extract_scenario_from_doc_lines(&lines).is_none());
+    }
+
+    #[test]
+    fn scenario_extractor_preserves_paragraph_breaks() {
+        // M4.1 reviewer S2 — a blank doc-comment line inside the
+        // Scenario should become a `\n\n` paragraph break in the
+        // rendered output, not silent truncation.
+        let lines = doc_lines(&[
+            " Scenario: first paragraph",
+            " continues here.",
+            "",
+            " Second paragraph after a blank doc line.",
+        ]);
+        let out = extract_scenario_from_doc_lines(&lines).expect("scenario extracted");
+        assert_eq!(
+            out,
+            "first paragraph continues here.\n\nSecond paragraph after a blank doc line."
+        );
+    }
+
+    #[test]
+    fn sanitize_scenario_escapes_html_and_link_brackets() {
+        let raw = "click [here](javascript:alert(1)) and <script>boom</script>";
+        let out = sanitize_scenario_for_markdown(raw);
+        // Brackets escaped — no clickable markdown link possible.
+        assert!(!out.contains('['));
+        assert!(!out.contains(']'));
+        // Angle brackets escaped — no raw HTML smuggling.
+        assert!(!out.contains('<'));
+        assert!(!out.contains('>'));
+        // The literal text is still visible to a human reader.
+        assert!(out.contains("javascript:alert(1)"));
+        assert!(out.contains("script"));
+    }
+
+    #[test]
+    fn sanitize_scenario_passes_plain_prose_unchanged() {
+        // M4.1 stop-flag: spot-check that ordinary Scenario prose
+        // — backticks, parentheses, em dashes, Unicode arrows —
+        // is not mangled by the sanitizer.
+        let raw =
+            "Drive the agent through Thinking → Working → Idle. Card shows `Bash` during Working.";
+        assert_eq!(sanitize_scenario_for_markdown(raw), raw);
+    }
+
+    #[test]
+    fn inline_code_wraps_with_single_backtick_by_default() {
+        assert_eq!(inline_code("Bash"), "`Bash`");
+    }
+
+    #[test]
+    fn inline_code_escapes_internal_backticks() {
+        // M4.1 auditor S6 — when the value already contains
+        // backticks, pick a fence longer than the longest internal
+        // run and pad with a single space on each side per
+        // CommonMark inline-code rules.
+        let out = inline_code("use `pwd`");
+        assert_eq!(out, "`` use `pwd` ``");
+    }
+
+    #[test]
+    fn inline_code_handles_multiple_backtick_runs() {
+        let out = inline_code("a ` b `` c ``` d");
+        // Longest run is 3, so the fence is 4 backticks.
+        assert!(out.starts_with("```` "));
+        assert!(out.ends_with(" ````"));
+        assert!(out.contains("a ` b `` c ``` d"));
+    }
 }

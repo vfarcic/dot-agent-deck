@@ -5,15 +5,12 @@
 
 ## Scenario
 
-Render a single dashboard card for a Working agent session (with a Read tool active and a recent user prompt) into a `ratatui::TestBackend` buffer at 80 columns × Normal-density height, then snapshot the buffer with `insta`. The card title row should carry the card number (1), the display name (`example-coder`), and the `● Working` status badge — and the stats line should show the wide layout's inline `Last: … Tools: …` because 80 cells crosses the wide-layout width threshold.
+Render a single dashboard card for a Working agent session (with a Read tool active and a recent user prompt) into a `ratatui::TestBackend` buffer at 80 columns × Normal-density height, then snapshot the buffer with `insta`. The card title row should carry the card number (1), the display name `example-coder`, and the `● Working` status badge — and the stats line should show the wide layout's inline `Last: … Tools: …` because 80 cells crosses the wide-layout width threshold.
 
 ## Steps
 
-1. Call: working_session_fixture()
-2. Call: resolve_palette(`Dark`)
-3. Call: rendered_height(`wide`)
-4. Render the session card into a `ratatui::TestBackend` buffer
-5. Snapshot the rendered buffer (insta)
+1. Render the session card into a `ratatui::TestBackend` buffer
+2. Snapshot the rendered buffer (insta)
 
 ## Catalog spec
 

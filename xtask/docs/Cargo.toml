@@ -21,3 +21,8 @@ path = "src/main.rs"
 proc-macro2 = "1"
 regex = "1"
 syn = { version = "2", features = ["full", "parsing"] }
+# M4.1 auditor S3: `write_all` now writes via a tempfile in the
+# destination's parent directory + atomic rename, so concurrent
+# `cargo xtask docs --tests` invocations cannot race-corrupt a .md
+# mid-write.
+tempfile = "3"

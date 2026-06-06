@@ -23,38 +23,12 @@ use spec::spec;
 /// a stale snapshot the next time the test runs).
 const RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH: u16 = 60;
 
-/// Construct a deterministic `SessionState` for snapshot tests.
-/// `last_activity` is set to `Utc::now()` so the rendered
-/// `Last: Xs ago` line always reads `0s ago` — pinning it to a fixed
-/// past instant would let calendar drift turn the elapsed render
-/// into `262h ago` once the date rolls past the pin (M3 surfaced
-/// exactly that failure mode).
-fn working_session_fixture() -> SessionState {
-    let now = chrono::Utc::now();
-    SessionState {
-        session_id: "sess-abc123".to_string(),
-        agent_type: AgentType::ClaudeCode,
-        cwd: Some("/home/dev/example-project".to_string()),
-        status: SessionStatus::Working,
-        active_tool: Some(ActiveTool {
-            name: "Read".to_string(),
-            detail: Some("src/main.rs".to_string()),
-        }),
-        started_at: now,
-        last_activity: now,
-        recent_events: VecDeque::new(),
-        tool_count: 7,
-        last_user_prompt: Some("fix the login bug".to_string()),
-        first_prompts: vec!["fix the login bug".to_string()],
-        pane_id: Some("pane-1".to_string()),
-        agent_id: Some("1".to_string()),
-    }
-}
-
 /// Stringify the rendered buffer — one line per row, with cells joined
 /// into the symbol layer. `insta` then captures this representation, so
 /// snapshot diffs read like the rendered card itself rather than as
-/// opaque byte streams.
+/// opaque byte streams. Helper extracted only because it's slightly
+/// awkward inline; the docs generator skip-lists it so it doesn't
+/// appear in the .md Steps section.
 fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
     let area = buffer.area();
     let mut out = String::with_capacity((area.width as usize + 1) * area.height as usize);
@@ -72,7 +46,7 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// a `ratatui::TestBackend` buffer at 80 columns × Normal-density
 /// height, then snapshot the buffer with `insta`. The card title
 /// row should carry the card number (1), the display name
-/// (`example-coder`), and the `● Working` status badge — and the
+/// `example-coder`, and the `● Working` status badge — and the
 /// stats line should show the wide layout's inline
 /// `Last: … Tools: …` because 80 cells crosses the wide-layout
 /// width threshold.
@@ -81,18 +55,43 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
 fn pane_004_card_title_row() {
     // PRD #77 catalog: dashboard/pane/004 — Card title row carries
     // card number, display name, and a status badge. Snapshot a single
-    // Working session in Normal density.
+    // Working session in Normal density. The session fixture is
+    // inlined per M4.1 reviewer S1 (single-use test-data builder
+    // doesn't need its own fn — keeping the test body
+    // self-contained also reads as cleaner generated `.md` Steps).
     //
-    // PTY size + color env are not strictly needed in-process (no PTY
-    // is involved), but pinning palette resolution at Dark prevents the
-    // ratatui rendering from drifting if the host environment somehow
-    // reaches it.
-    let session = working_session_fixture();
+    // `last_activity = Utc::now()` so the rendered `Last: Xs ago`
+    // line always reads `0s ago`; pinning it to a fixed past
+    // instant let calendar drift turn the rendered elapsed into
+    // `262h ago` once the date rolled past the pin (M3 fix).
+    let now = chrono::Utc::now();
+    let session = SessionState {
+        session_id: "sess-abc123".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        cwd: Some("/home/dev/example-project".to_string()),
+        status: SessionStatus::Working,
+        active_tool: Some(ActiveTool {
+            name: "Read".to_string(),
+            detail: Some("src/main.rs".to_string()),
+        }),
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 7,
+        last_user_prompt: Some("fix the login bug".to_string()),
+        first_prompts: vec!["fix the login bug".to_string()],
+        pane_id: Some("pane-1".to_string()),
+        agent_id: Some("1".to_string()),
+    };
+    // Dark palette pin: PTY-size + color env aren't strictly
+    // relevant in-process, but resolving against Dark prevents the
+    // ratatui rendering from drifting if the host environment
+    // somehow leaks in.
     let palette: ColorPalette = resolve_palette(Theme::Dark);
-    // 80-cell-wide buffer triggers the layout's "wide" branch (inline
-    // stats row). The height comes from the density tier itself so
-    // the snapshot's geometry tracks the production layout module —
-    // M2.1 reviewer S3 (no magic numbers).
+    // 80-cell-wide buffer triggers the layout's "wide" branch
+    // (inline stats row). The height comes from the density tier
+    // itself so the snapshot's geometry tracks the production
+    // layout module — M2.1 reviewer S3 (no magic numbers).
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
     let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
