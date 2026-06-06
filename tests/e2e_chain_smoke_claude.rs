@@ -1,0 +1,72 @@
+#![cfg(feature = "e2e")]
+
+//! L2 chain-smoke test for the real Claude Code CLI path.
+//! PRD #77 catalog `chain-smoke/claude/001`.
+//!
+//! Cost note (Decision 23): one Haiku-4.5 invocation with a small
+//! Bash-tool prompt — ≲500 input + 200 output tokens, well under
+//! the <$0.05/run bound. Local-only (Decision 8) — CI runs only
+//! `cargo test-fast` and never compiles this file.
+
+mod common;
+
+use common::TuiDeck;
+use spec::spec;
+
+const CHAIN_SMOKE_PROMPT: &str = "Use the Bash tool to run the command `pwd`. Make exactly one tool call, \
+     then stop without further analysis.";
+
+const PINNED_MODEL: &str = "claude-haiku-4-5-20251001";
+
+#[spec("chain-smoke/claude/001")]
+#[test]
+fn claude_001_thinking_working_idle() {
+    // Decision 26 runtime-skip: missing CLI or credentials is an
+    // environmental condition, not a broken test. Decision 8 forbids
+    // silent fallback to a different model — we pass the pinned model
+    // verbatim and let Claude Code's CLI surface a clear error if it
+    // disappears (cost: zero LLM tokens on a startup-time rejection).
+    skip_unless!(common::check_claude_available());
+
+    // The deck's restore path will spawn this command inside the
+    // per-test tempdir. `--dangerously-skip-permissions` is required
+    // because the prompt asks for a Bash tool call and there is no
+    // interactive permission acceptor in this PTY (the harness
+    // can't drive `y` answers without entanglement with the deck's
+    // permission-prompt rendering). The bound is a single one-shot
+    // `claude -p` invocation, so the skip is safe for the run scope.
+    // `--allowedTools Bash` whitelists Bash tool calls so the agent
+    // doesn't sit on an interactive permission prompt (the harness
+    // can't drive a `y` answer without entangling with the deck's
+    // permission-prompt rendering). We deliberately avoid
+    // `--dangerously-skip-permissions` because Claude Code refuses
+    // it under root/sudo (test environments are often containerized
+    // and run as root); the explicit allow-list is the supported path.
+    let agent_command = format!(
+        "claude -p \"{prompt}\" --model {model} --allowedTools Bash",
+        prompt = CHAIN_SMOKE_PROMPT.replace('"', "\\\""),
+        model = PINNED_MODEL,
+    );
+
+    let deck = TuiDeck::builder()
+        .with_imported_claude_credentials()
+        .with_continue_session("claude-smoke", &agent_command)
+        .launch_with_fixture("chain-smoke-claude");
+
+    // The pane card appears as soon as the deck restores the saved
+    // session — the agent's name `claude-smoke` is what's shown on
+    // the card title row, so its presence is a reliable starting
+    // anchor and uses no LLM tokens.
+    deck.wait_for_string("claude-smoke");
+
+    // Decision 21 (amended): use wait_for_string everywhere. The deck
+    // re-renders the card on each AgentEvent so each status label
+    // appears in order on the dashboard.
+    //
+    // Catalog assertion: status traverses Thinking → Working → Idle,
+    // and the Bash tool name appears on the card during Working.
+    deck.wait_for_string("Thinking");
+    deck.wait_for_string("Working");
+    deck.wait_for_string("Bash");
+    deck.wait_for_string("Idle");
+}
