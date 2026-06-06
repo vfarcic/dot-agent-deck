@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.27.1] - 2026-06-06
+
+### Fixed
+
+- **Scrollback No Longer Scrambled After Reconnect**
+  Reconnecting to a `dot-agent-deck connect` session no longer corrupts scrollback in agent panes. Previously, every reconnect caused overlapping text, narrow vertical text strips on the right edge, and duplicated inner-TUI status lines when scrolling up to read prior model output — sometimes making history unreadable for the rest of the session.
+  The root cause was that the client's vt100 parser was always initialized at a hard-coded 24×80 during snapshot replay, even when the daemon's PTY was opened at the terminal's real dimensions (e.g. 120 columns × 40 rows). Absolute cursor-position and line-wrap sequences sized for the real geometry were mis-parsed at the wrong width, permanently baking the corruption into scrollback. The live viewport recovered automatically on SIGWINCH redraw, hiding the bug until the user scrolled up.
+  The daemon now records each agent's current PTY dimensions and reports them via `list_agents` (added `rows`/`cols` to `AgentRecord` with `serde(default)` for backward compatibility with older daemons). The client initializes the vt100 parser at those dimensions before replaying the snapshot, with a defensive clamp and fallback to 24×80 when talking to a legacy daemon. The daemon also clears its scrollback ring on every real PTY resize, ensuring every snapshot delivered to a reconnecting client covers a single consistent (rows, cols) epoch.
+- **Orchestrator spawn-time role prompt now submits reliably**
+  Fixes the orchestrator's spawn-time role prompt failing to submit in slower or remote-daemon environments. After PRD #100's interleave-race fix shipped in v0.27.0, the role prompt payload still arrived in the orchestrator's input box as un-dispatched text — the trailing Enter was interpreted as a literal newline rather than a submit.
+  The root cause is a timing race: Claude Code's `SessionStart` hook fires early in its boot sequence, before its TUI input is ready to interpret `\r` as submit. The spawn-time path, which sends the role prompt immediately after detecting `SessionStart`, was writing into a pane that had not yet entered submit-aware mode. The fix adds a 500ms readiness buffer (`SPAWN_TIME_READINESS_BUFFER`) between `SessionStart` detection and the role-prompt write, giving Claude Code's TUI input time to reach a submit-ready state. A regression test (`tests/spawn_time_role_prompt_submit_after_session_start.rs`) drives a Python slow-readiness agent stub and toggle-verifies the fix: the test fails at `BUFFER=0` and passes at `BUFFER=500`.
+  Daemon-side `RUST_LOG=pane_write=trace`-gated trace instrumentation is also included, adding four trace events across the PTY write path (payload, submit terminator, notice terminator, and `STREAM_IN` forwarding). Each event carries `pane_id` and `agent_id` for future cross-path debugging.
+
+### Miscellaneous
+
+- **TUI Testing Harness**
+  A two-layer automated test harness for the dot-agent-deck TUI, replacing manual regression testing with reproducible, reviewable assertions.
+  **L1 (in-process)** uses ratatui `TestBackend` + `insta` snapshots for pure widget and layout regressions — no subprocess, millisecond-fast, runs on every `cargo test-fast`. **L2 (end-to-end)** spawns the real binary in an isolated PTY via `portable-pty`, parses the rendered screen through a `vt100` parser, and asserts on the deck's observable state (panes, statuses, focus, hook delivery, attach stream presence) — never on agent text. L2 tests are gated by `--features e2e` and run as `cargo test-e2e` before each release.
+  Two seed tests ship with the harness: `dashboard/pane/004` (L1, new-pane appears in layout) and `hooks/delivery/001` (L2, hook fires and deck receives it). A chain-smoke test (`chain-smoke/claude/001`) validates a real Claude Code session end-to-end. Test documentation is auto-generated from `/// Scenario:` comments via `cargo xtask docs --tests`, with `cargo xtask linkage-check` enforcing that every `#[spec(...)]` annotation references a valid catalog entry.
+
+
+
 ## [0.27.0] - 2026-05-25
 
 ### Added
