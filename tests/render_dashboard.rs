@@ -8,8 +8,6 @@
 
 use std::collections::VecDeque;
 
-use chrono::TimeZone;
-
 use dot_agent_deck::event::AgentType;
 use dot_agent_deck::state::{ActiveTool, SessionState, SessionStatus};
 use dot_agent_deck::theme::{ColorPalette, Theme, resolve_palette};
@@ -23,14 +21,14 @@ use spec::spec;
 /// pin a numeric constant.
 const WIDE_CARD_THRESHOLD: u16 = 60;
 
-/// Construct a deterministic `SessionState` for snapshot tests. All
-/// time-bearing fields are pinned to a fixed `Utc` instant so the
-/// `Last:` elapsed-time line renders the same value across runs.
+/// Construct a deterministic `SessionState` for snapshot tests.
+/// `last_activity` is set to `Utc::now()` so the rendered
+/// `Last: Xs ago` line always reads `0s ago` — pinning it to a fixed
+/// past instant would let calendar drift turn the elapsed render
+/// into `262h ago` once the date rolls past the pin (M3 surfaced
+/// exactly that failure mode).
 fn working_session_fixture() -> SessionState {
-    let pinned = chrono::Utc
-        .with_ymd_and_hms(2026, 5, 26, 12, 0, 0)
-        .single()
-        .expect("pinned timestamp is valid");
+    let now = chrono::Utc::now();
     SessionState {
         session_id: "sess-abc123".to_string(),
         agent_type: AgentType::ClaudeCode,
@@ -40,8 +38,8 @@ fn working_session_fixture() -> SessionState {
             name: "Read".to_string(),
             detail: Some("src/main.rs".to_string()),
         }),
-        started_at: pinned,
-        last_activity: pinned,
+        started_at: now,
+        last_activity: now,
         recent_events: VecDeque::new(),
         tool_count: 7,
         last_user_prompt: Some("fix the login bug".to_string()),
