@@ -581,6 +581,47 @@ impl Drop for TuiDeck {
             if let Err(e) = self.dump_recordings(&recordings_dir) {
                 eprintln!("[tui-harness] failed to write recordings to {recordings_dir:?}: {e}");
             }
+            // PRD #77 Decision 30 / M4: regenerate the paired `.md`
+            // for this test so a `DOT_AGENT_DECK_RECORD=1` run keeps
+            // the doc next to the freshly-written cast in sync with
+            // the test source. Cheap (~3 files to parse today);
+            // best-effort — a generator error is surfaced to stderr
+            // but does NOT poison the test result, because rule 7
+            // already catches drift in CI.
+            regenerate_paired_doc(&self.test_name);
+        }
+    }
+}
+
+/// Best-effort: regenerate the paired `.md` for the currently-running
+/// test. Looks up the test by its Rust thread-name (which is the fn
+/// name in cargo test), maps that to a spec id via the discovered
+/// `#[spec]` set, and writes the resulting doc. Any error is logged
+/// to stderr without panicking — CI's linkage-check rule 7 is the
+/// load-bearing enforcement.
+fn regenerate_paired_doc(test_name: &str) {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config = xtask_docs::DocsConfig::from_workspace(&workspace_root);
+    let generated = match xtask_docs::generate_all(&config) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[tui-harness] regenerate paired .md failed: {e}");
+            return;
+        }
+    };
+    let target = generated.into_iter().find(|d| d.fn_name == test_name);
+    match target {
+        Some(g) => {
+            if let Err(e) = xtask_docs::write_all(std::slice::from_ref(&g)) {
+                eprintln!(
+                    "[tui-harness] regenerate paired .md write failed for `{test_name}`: {e}"
+                );
+            }
+        }
+        None => {
+            eprintln!(
+                "[tui-harness] no #[spec(...)] test matches fn name `{test_name}` — skipping doc regeneration"
+            );
         }
     }
 }

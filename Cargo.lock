@@ -503,6 +503,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "vt100",
+ "xtask-docs",
 ]
 
 [[package]]

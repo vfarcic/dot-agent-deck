@@ -490,13 +490,39 @@ fn step_for_method(name: &str, args: &[String]) -> Option<String> {
 }
 
 fn step_for_free_call(name: &str, args: &[String]) -> Option<String> {
+    // Skip a small allowlist of language-level helpers and harness
+    // entry-point plumbing that are structural noise (Some/None/Ok/
+    // Err constructors, TuiDeck::builder() that just starts the
+    // builder chain, etc. — these aren't load-bearing test steps).
+    if matches!(
+        name,
+        "Some"
+            | "None"
+            | "Ok"
+            | "Err"
+            | "String"
+            | "Vec"
+            | "PathBuf"
+            | "Default"
+            | "format"
+            | "builder"
+    ) {
+        return None;
+    }
     let s = match name {
         "write_hook_line" => {
             // Args: socket, payload. The payload is the
             // interesting one; the socket comes from the harness.
             format!("Write {} to the hook socket", arg_or(args, 1))
         }
-        _ => return None,
+        "render_card_to_buffer" => {
+            "Render the session card into a `ratatui::TestBackend` buffer".to_string()
+        }
+        // Decision 30 fallback: any other free call surfaces as a
+        // raw `Call: name(...)` line so the author can see what was
+        // recognized — and so adding a new harness function is
+        // visible even before its step template lands in the map.
+        other => format!("Call: {other}({})", args.join(", ")),
     };
     Some(s)
 }

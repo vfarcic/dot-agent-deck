@@ -42,6 +42,10 @@ serial_test = "3"
 # so a future patch release cannot silently reshape snapshot diffs.
 insta = { version = "=1.47.2", features = ["yaml"] }
 spec = { path = "xtask/spec" }
+# PRD #77 Decision 30 / M4: the L2 harness's recording dump also
+# regenerates the paired .md so local DOT_AGENT_DECK_RECORD=1 runs
+# keep the docs in sync without a separate `cargo xtask docs --tests`.
+xtask-docs = { path = "xtask/docs" }
 
 [features]
 # PRD #77 Decision 6: `cargo test-e2e` (alias) enables this feature so
