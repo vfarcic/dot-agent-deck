@@ -7,7 +7,13 @@
 #       prds/77-tui-testing-harness.md \
 #     | grep -oE '[a-z-]+/[a-z-]+/[0-9]{3}' | sort -u
 
-chain-smoke/claude/001
+# chain-smoke/claude/001 — covered by tests/e2e_chain_smoke_claude.rs (M3).
+# chain-smoke/opencode/001 — blocked at M3 by a deck-side bug: current
+# OpenCode 1.x does not auto-discover plugins at
+# <config>/plugin/<name>/index.js (the path src/opencode_manage.rs
+# installs to), so the deck's hook events never fire end-to-end.
+# Remove this allowlist entry once src/opencode_manage.rs is updated to
+# match OpenCode 1.x's plugin discovery and the e2e test lands.
 chain-smoke/opencode/001
 dashboard/config-gen/001
 dashboard/config-gen/002
