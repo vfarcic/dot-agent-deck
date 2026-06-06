@@ -1896,7 +1896,7 @@ Entry format (per Decision 25):
 
 | ID | Catalog ref | Description | Severity | Status |
 |---|---|---|---|---|
-| *(empty until M2+)* | | | | |
+| di-001 | chain-smoke/opencode/001 | OpenCode 1.15.10's plugin loader does not auto-discover the deck's installed plugin at `<config>/plugin/dot-agent-deck/index.js`. Hooks never fire end-to-end, so the chain-smoke status traversal cannot be observed. Deck install path in `src/opencode_manage.rs` needs to align with OpenCode 1.x's loader (npm-package register OR package.json import). | major | escalated — pending deck install-path fix; tracked at M3 stop |
 
 `Severity` is one of: `blocker`, `major`, `minor`.
 `Status` is one of: `fixed in <milestone>`, `filed as #NNN`, `won't-fix: <rationale>`, `escalated to PRD #NNN`.

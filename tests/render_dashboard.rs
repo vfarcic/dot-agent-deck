@@ -14,12 +14,14 @@ use dot_agent_deck::theme::{ColorPalette, Theme, resolve_palette};
 use dot_agent_deck::ui::{CardDensityKind, render_card_to_buffer};
 use spec::spec;
 
-/// Width threshold at which the card switches into the "wide" layout
-/// (inline stats row). Tracks the internal `render_session_card`'s
-/// `let wide = w >= 60;` branch — keep in sync. Lives here rather than
-/// in the lib so tests don't pull in another exported symbol just to
-/// pin a numeric constant.
-const WIDE_CARD_THRESHOLD: u16 = 60;
+/// Width (in terminal cells) at which `render_session_card` flips
+/// into its "wide" branch — the rendered card gains an inline
+/// `Last: … Tools: …` stats row instead of a stacked one, and the
+/// inner card height grows by one row. The constant in the lib's
+/// renderer is `let wide = w >= 60;`; keep this mirror in sync
+/// (changing it on the lib side without updating here will produce
+/// a stale snapshot the next time the test runs).
+const RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH: u16 = 60;
 
 /// Construct a deterministic `SessionState` for snapshot tests.
 /// `last_activity` is set to `Utc::now()` so the rendered
@@ -84,7 +86,7 @@ fn pane_004_card_title_row() {
     // M2.1 reviewer S3 (no magic numbers).
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
-    let wide = width >= WIDE_CARD_THRESHOLD;
+    let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
     let height = density.rendered_height(wide);
     let buffer = render_card_to_buffer(
         &session,

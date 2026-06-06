@@ -59,10 +59,12 @@ struct ContinueSession {
     command: String,
 }
 
-/// Which agent's credential set the test wants imported from the host
-/// HOME into the per-test tempdir HOME. Both variants are real
-/// `std::fs::copy` (M2.1 auditor S3 — no symlinks across fixtures);
-/// the credentials file is re-stamped to 0o600 after copy.
+/// Which agent's credential set the test wants imported from the
+/// host HOME into the per-test tempdir HOME. M3.1 auditor Nit 1 —
+/// the M2.1 N3 attribution was misleading: M2.1 banned symlinks in
+/// the fixture-copy path, and M3.1 carries that ban forward into
+/// the credential-copy path with a hard refuse (source symlink ->
+/// Err) and atomic 0o600 creation on the destination (S2 + S3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CredentialImport {
     ClaudeCode,
@@ -117,14 +119,18 @@ impl TuiDeckBuilder {
     /// the per-test tempdir HOME so a spawned `claude` CLI can
     /// authenticate. Hook entries in the imported `settings.json` are
     /// stripped — the deck installs its own hooks pointing at the
-    /// per-test paths. Real `fs::copy` (no symlinks per M2.1 auditor
-    /// S3); 0o600 is preserved on the credentials file.
+    /// per-test paths. The destination credential file is created
+    /// atomically with mode 0o600 (M3.1 auditor S2) and the source
+    /// path is refused if it's a symlink (M3.1 auditor S3).
     ///
-    /// The actual copy happens at launch time; if a required source
-    /// file is missing the launch panics with the per-Decision-26
-    /// skip message. Tests should pair this with
-    /// [`check_claude_available`] and [`skip_unless!`] to convert that
-    /// panic into a clean runtime skip.
+    /// The actual copy happens at launch time. Missing or
+    /// unreadable credentials surface through
+    /// [`try_launch_with_fixture`](Self::try_launch_with_fixture)
+    /// as `Err(reason)`; the convenience
+    /// [`launch_with_fixture`](Self::launch_with_fixture) panics
+    /// instead. Pair with [`check_claude_available`] and
+    /// [`skip_unless!`] to convert that into a clean
+    /// Decision-26 runtime skip.
     pub fn with_imported_claude_credentials(mut self) -> Self {
         self.credential_imports.push(CredentialImport::ClaudeCode);
         self
@@ -143,8 +149,22 @@ impl TuiDeckBuilder {
     /// `tests/fixtures/`. The fixture is copied into the per-test
     /// tempdir at launch (Decision 12); the deck's `HOME`, hook socket,
     /// and attach socket all point inside that tempdir.
+    ///
+    /// Panics on credential-import / setup failure. For tests that
+    /// would rather surface those errors as a `Result`, call
+    /// [`try_launch_with_fixture`](Self::try_launch_with_fixture).
     pub fn launch_with_fixture(self, fixture_name: &str) -> TuiDeck {
-        TuiDeck::launch_inner(self, fixture_name)
+        self.try_launch_with_fixture(fixture_name)
+            .unwrap_or_else(|e| panic!("launch_with_fixture failed: {e}"))
+    }
+
+    /// Fallible variant of [`launch_with_fixture`]. Returns
+    /// `Err(reason)` on credential-import or other setup failures
+    /// where the reason is the same user-facing string the
+    /// `check_*_available()` helpers produce (per Decision 26
+    /// runtime-skip wording — M3.1 reviewer Nit 3).
+    pub fn try_launch_with_fixture(self, fixture_name: &str) -> Result<TuiDeck, String> {
+        TuiDeck::try_launch_inner(self, fixture_name)
     }
 }
 
@@ -186,22 +206,45 @@ impl TuiDeck {
         }
     }
 
-    fn launch_inner(builder: TuiDeckBuilder, fixture_name: &str) -> Self {
+    fn try_launch_inner(builder: TuiDeckBuilder, fixture_name: &str) -> Result<Self, String> {
         let test_name = current_test_name();
 
-        let tempdir = tempfile::tempdir().expect("create per-test tempdir");
+        // M2.1 auditor S1 + M3.1 auditor S4: create the per-test
+        // tempdir with mode 0o700 atomically. `tempfile::tempdir()`
+        // followed by `set_permissions(0o700)` had a small umask-derived
+        // 0o755 window between creation and chmod — closed here by
+        // asking tempfile to apply 0o700 at creation.
+        let tempdir = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tempfile::Builder::new()
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir()
+                    .expect("create per-test tempdir")
+            }
+            #[cfg(not(unix))]
+            {
+                tempfile::tempdir().expect("create per-test tempdir")
+            }
+        };
         let work = tempdir.path().to_path_buf();
 
-        // M2.1 auditor S1: lock the per-test tempdir to 0o700 so a
-        // co-located uid on a shared developer machine cannot list
-        // per-test HOME contents, fixtures, or failure recordings.
-        // The sockets themselves are already 0o600; the parent dir
-        // needs to match.
+        // Verify the atomic-creation 0o700 mode actually stuck —
+        // catches a future tempfile API rename that would silently
+        // skip the permission application.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            std::fs::set_permissions(&work, perms).expect("set tempdir mode to 0o700");
+            let mode = std::fs::metadata(&work)
+                .expect("stat tempdir")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "tempdir mode is 0o{mode:o}, expected 0o700 (M3.1 auditor S4 — atomic creation should have stamped this)"
+            );
         }
 
         // Decision 12: copy fixture into the tempdir, then `git init`
@@ -220,16 +263,17 @@ impl TuiDeck {
         // Chain-smoke credential imports (PRD #77 Decision 8). Tests
         // pair these with `check_*_available()` + `skip_unless!`; if
         // the credentials disappeared between the precheck and here,
-        // we panic with the Decision-26-shaped skip message so the
-        // failure surfaces explicitly rather than running a logged-out
-        // CLI that would burn the test budget on a 401 storm.
+        // we surface a Decision-26-shaped error through `try_launch_*`
+        // (M3.1 reviewer Nit 3) so the test's harness frame doesn't
+        // panic mid-suite — callers can choose whether to skip or
+        // bubble up.
         for kind in &builder.credential_imports {
             match kind {
                 CredentialImport::ClaudeCode => {
-                    import_claude_credentials(&home).expect("import Claude credentials");
+                    import_claude_credentials(&home).map_err(|e| e.to_string())?;
                 }
                 CredentialImport::OpenCode => {
-                    import_opencode_credentials(&home).expect("import OpenCode credentials");
+                    import_opencode_credentials(&home).map_err(|e| e.to_string())?;
                 }
             }
         }
@@ -399,7 +443,7 @@ impl TuiDeck {
 
         let record_on_success = std::env::var_os("DOT_AGENT_DECK_RECORD").is_some();
 
-        TuiDeck {
+        Ok(TuiDeck {
             pty_master: pair.master,
             parser,
             last_byte_at,
@@ -417,7 +461,7 @@ impl TuiDeck {
             cols: builder.cols,
             rows: builder.rows,
             record_on_success,
-        }
+        })
     }
 
     /// Resize the PTY mid-run. Exercises the SIGWINCH path covered by
@@ -718,25 +762,20 @@ fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 /// file; `Err(reason)` with a stable user-facing message otherwise.
 /// Tests pair this with [`skip_unless!`].
 pub fn check_claude_available() -> Result<(), String> {
-    if std::process::Command::new("claude")
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-        .not()
-    {
+    if !cli_invocable("claude") {
         return Err("Claude Code CLI not installed (could not invoke `claude --version`)".into());
     }
     let home = host_home();
     let creds = home.join(".claude").join(".credentials.json");
     if !creds.exists() {
-        return Err(format!(
-            "Claude Code credentials not found at {} — log in with `claude login`",
-            creds.display()
-        ));
+        // M3.1 auditor S1: surface the abstract path so the message
+        // doesn't leak whether the operator is on `/Users/<name>` vs
+        // `/root` vs `/home/<name>`.
+        return Err(
+            "Claude Code credentials not found at ~/.claude/.credentials.json — \
+             log in with `claude login`"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -746,23 +785,10 @@ pub fn check_claude_available() -> Result<(), String> {
 /// OpenCode auth.json (or analogous credential the user logged in
 /// with).
 pub fn check_opencode_available() -> Result<(), String> {
-    if std::process::Command::new("opencode")
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-        .not()
-    {
+    if !cli_invocable("opencode") {
         return Err("OpenCode CLI not installed (could not invoke `opencode --version`)".into());
     }
     let home = host_home();
-    // OpenCode stores creds under the data dir. Per the PRD task spec
-    // we check the legacy / new shapes the M2.1 + M3 audit identified;
-    // first found wins. If neither is present, surface the canonical
-    // path so the operator knows where to log in.
     let candidates = [
         home.join(".local")
             .join("share")
@@ -774,10 +800,27 @@ pub fn check_opencode_available() -> Result<(), String> {
     if candidates.iter().any(|p| p.exists()) {
         return Ok(());
     }
-    Err(format!(
-        "OpenCode credentials not found at {} — log in with `opencode auth login`",
-        candidates[0].display()
-    ))
+    // M3.1 auditor S1: redact $HOME in the surfaced path.
+    Err(
+        "OpenCode credentials not found at ~/.local/share/opencode/auth.json — \
+         log in with `opencode auth login`"
+            .into(),
+    )
+}
+
+/// Helper: returns true when `bin --version` exits 0, false otherwise
+/// (binary missing, returns non-zero, etc.). Used by the
+/// `check_*_available()` helpers — extracted so the BoolNot trait
+/// from M2 can be retired (M3.1 auditor Nit 5).
+fn cli_invocable(bin: &str) -> bool {
+    std::process::Command::new(bin)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Body of the `skip_unless!` early-return: if `result` is `Err`,
@@ -820,100 +863,315 @@ fn host_home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").expect("HOME is set on the host"))
 }
 
-trait BoolNot {
-    fn not(self) -> Self;
-}
-impl BoolNot for bool {
-    fn not(self) -> bool {
-        !self
-    }
-}
-
 /// Copy the host user's Claude Code credentials + settings into the
 /// per-test tempdir HOME. Strips any `hooks` entries from the
 /// imported `settings.json` (the deck auto-installs its own hooks
 /// pointing at the per-test socket — leaving the host's hook entries
 /// in place would invoke the developer's real hook commands inside
-/// the test). Re-stamps the credentials file mode to 0o600 after
-/// copy.
+/// the test). M3.1 auditor S2 + S3: write the destination with mode
+/// 0o600 atomically; refuse source files that are symlinks.
 fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
     let src_root = host_home().join(".claude");
     let dst_root = test_home.join(".claude");
     std::fs::create_dir_all(&dst_root)?;
 
     let src_creds = src_root.join(".credentials.json");
-    if !src_creds.is_file() {
-        return Err(std::io::Error::other(format!(
-            "Claude Code credentials not found at {} — log in with `claude login`",
-            src_creds.display()
-        )));
-    }
-    let dst_creds = dst_root.join(".credentials.json");
-    std::fs::copy(&src_creds, &dst_creds)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dst_creds, std::fs::Permissions::from_mode(0o600))?;
-    }
+    let creds_bytes = read_credential_file_no_symlink(
+        &src_creds,
+        "Claude Code credentials not found at ~/.claude/.credentials.json — \
+         log in with `claude login`",
+        "~/.claude/.credentials.json",
+    )?;
+    write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &creds_bytes)?;
 
-    // settings.json: copy if present, with `hooks` stripped.
+    // settings.json: copy if present, with `hooks` stripped. Claude's
+    // settings.json is JSONC (line + block comments) — M3.1 auditor
+    // S0 fix: strip comments before serde_json parse so the strip is
+    // never a no-op on a real settings.json with `// foo` lines.
     let src_settings = src_root.join("settings.json");
-    if src_settings.is_file() {
+    if src_settings.exists() {
+        require_regular_file_no_symlink(&src_settings, "~/.claude/settings.json")?;
         let raw = std::fs::read_to_string(&src_settings)?;
-        let dst_text = strip_hooks_from_claude_settings(&raw);
+        let dst_text = strip_hooks_from_claude_settings(&raw)?;
         std::fs::write(dst_root.join("settings.json"), dst_text)?;
     }
 
     // plugins/ (and any other supporting dirs) — best-effort copy if
-    // present. `copy_dir_recursively` refuses symlinks (M2.1 auditor
-    // Nit 3); the user's plugins dir should be regular files / dirs.
+    // present. `copy_dir_recursively` was further tightened in M3
+    // from M2.1 Nit 3's "silent skip" to a hard refuse on any
+    // non-regular entry (symlinks/sockets/FIFOs), so this branch
+    // already shares the credential-side stance on symlinks.
     let src_plugins = src_root.join("plugins");
     if src_plugins.is_dir() {
+        require_regular_dir_no_symlink(&src_plugins, "~/.claude/plugins")?;
         copy_dir_recursively(&src_plugins, &dst_root.join("plugins"))?;
     }
     Ok(())
 }
 
 /// Strip the top-level `hooks` key from a Claude Code settings.json.
-/// Best-effort textual edit when the file is valid JSON; on parse
-/// failure we fall back to returning the original (worst case, the
-/// host's hooks fire inside the test).
-fn strip_hooks_from_claude_settings(raw: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(raw) {
-        Ok(mut v) => {
-            if let Some(obj) = v.as_object_mut() {
-                obj.remove("hooks");
-            }
-            serde_json::to_string_pretty(&v).unwrap_or_else(|_| raw.to_string())
-        }
-        Err(_) => raw.to_string(),
+/// settings.json is JSONC: line (`// foo`) and block (`/* foo */`)
+/// comments are tolerated by Claude's own loader. M3.1 auditor S0
+/// fixes the fail-open path: comments are stripped before parsing so
+/// real-world settings.json files (which carry `//` comments) are
+/// rewritten with their hook block removed rather than passed
+/// through unchanged. A truly-malformed settings.json (still invalid
+/// after comment stripping) is now fail-CLOSED — we refuse to
+/// continue rather than risk shipping the host's hook commands into
+/// the test.
+fn strip_hooks_from_claude_settings(raw: &str) -> std::io::Result<String> {
+    let cleaned = strip_jsonc_comments(raw);
+    let mut v: serde_json::Value = serde_json::from_str(&cleaned).map_err(|e| {
+        std::io::Error::other(format!(
+            "refusing to import host settings.json: not valid JSON(C) after \
+             comment-stripping ({e}). Leaving the host's hook entries in place \
+             would let them fire inside the test."
+        ))
+    })?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("hooks");
     }
+    serde_json::to_string_pretty(&v)
+        .map_err(|e| std::io::Error::other(format!("serialize sanitized settings.json: {e}")))
+}
+
+/// Strip `//` line comments and `/* … */` block comments from a
+/// JSONC string. Preserves string literals (so `"//"` and `"/*"`
+/// inside a quoted value are left alone) and keeps newlines so any
+/// downstream parse-error line numbers still align.
+fn strip_jsonc_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut block_depth: usize = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        let next = bytes.get(i + 1).map(|b| *b as char);
+
+        if block_depth > 0 {
+            if c == '*' && next == Some('/') {
+                block_depth -= 1;
+                out.push(' ');
+                out.push(' ');
+                i += 2;
+                continue;
+            }
+            if c == '\n' {
+                out.push('\n');
+            } else {
+                out.push(' ');
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_string {
+            out.push(c);
+            if c == '\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if c == '/' && next == Some('/') {
+            // Line comment: eat until newline.
+            while i < bytes.len() && bytes[i] as char != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && next == Some('*') {
+            block_depth = 1;
+            out.push(' ');
+            out.push(' ');
+            i += 2;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Read a credential file, refusing symlinks at the source path
+/// (M3.1 auditor S3). Returns the file bytes on success, or a
+/// redacted `io::Error` on failure with the abstract `~/` path so
+/// the stderr output doesn't leak the host's real $HOME.
+fn read_credential_file_no_symlink(
+    real_path: &Path,
+    not_found_message: &str,
+    redacted_display: &str,
+) -> std::io::Result<Vec<u8>> {
+    let meta = match std::fs::symlink_metadata(real_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(std::io::Error::other(not_found_message.to_string()));
+        }
+        Err(e) => {
+            return Err(std::io::Error::other(format!(
+                "failed to stat {redacted_display}: {e}"
+            )));
+        }
+    };
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "refusing to import {redacted_display}: expected a regular file, found a symlink"
+        )));
+    }
+    if !file_type.is_file() {
+        return Err(std::io::Error::other(format!(
+            "refusing to import {redacted_display}: expected a regular file, found {:?}",
+            file_type
+        )));
+    }
+    std::fs::read(real_path)
+        .map_err(|e| std::io::Error::other(format!("read {redacted_display}: {e}")))
+}
+
+/// Validate that a source path is a regular file (not a symlink),
+/// without reading it. Used by paths where we want to surface
+/// symlink-rejection before delegating the actual copy/read to a
+/// caller.
+fn require_regular_file_no_symlink(
+    real_path: &Path,
+    redacted_display: &str,
+) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(real_path)?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "refusing to import {redacted_display}: expected a regular file, found a symlink"
+        )));
+    }
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::other(format!(
+            "refusing to import {redacted_display}: expected a regular file"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate that a source path is a regular directory (not a
+/// symlink). Mirrors [`require_regular_file_no_symlink`] for the
+/// `~/.claude/plugins` directory copy.
+fn require_regular_dir_no_symlink(real_path: &Path, redacted_display: &str) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(real_path)?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "refusing to import {redacted_display}: expected a regular directory, found a symlink"
+        )));
+    }
+    if !meta.file_type().is_dir() {
+        return Err(std::io::Error::other(format!(
+            "refusing to import {redacted_display}: expected a regular directory"
+        )));
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `dst` atomically with mode 0o600 — the
+/// destination is `open`ed with `O_CREAT | O_WRONLY | O_TRUNC` AND
+/// the mode flag set to 0o600 in the same syscall (M3.1 auditor S2),
+/// so there is no umask-derived 0o666 window between create and
+/// chmod. Refuses to follow if `dst` already exists as a symlink.
+fn write_credential_file_atomic_0o600(dst: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // Pre-remove any existing entry — `OpenOptions::create + mode` on
+    // an existing file does not re-stamp the mode, and we want a
+    // freshly-zeroed credential file with the strict mode regardless
+    // of what was there before.
+    match std::fs::symlink_metadata(dst) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::other(format!(
+                "refusing to write credential into existing symlink at {}",
+                dst.display()
+            )));
+        }
+        Ok(_) => {
+            std::fs::remove_file(dst).ok();
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dst)?;
+        f.write_all(bytes)?;
+        f.sync_all().ok();
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(dst, bytes)?;
+    }
+    Ok(())
 }
 
 /// Copy the host user's OpenCode credentials into the per-test
 /// tempdir HOME. Mirrors [`import_claude_credentials`] — copies the
 /// auth state but NOT any `plugin/` directory (the deck installs its
-/// own OpenCode plugin pointing at the per-test paths). Touches
-/// whichever of the legacy / new credential paths exist on the host.
+/// own OpenCode plugin pointing at the per-test paths). M3.1
+/// auditor S2 + S3: atomic 0o600 creation for `auth.json`, and
+/// source-path symlinks are refused with a redacted error.
+///
+/// This helper is currently dead code (no `chain-smoke/opencode/*`
+/// test calls it — see PRD § Discovered Issues `di-001`). Kept so
+/// the OpenCode chain-smoke test can be added without harness
+/// changes once the deck install-path bug is fixed.
 fn import_opencode_credentials(test_home: &Path) -> std::io::Result<()> {
     let mut imported_any = false;
 
-    // Possible source roots for the auth state. The first directory
-    // that exists is copied wholesale (sans `plugin/`); if none
-    // exists we surface the canonical path.
     let source_roots = [
         host_home().join(".local").join("share").join("opencode"),
         host_home().join(".opencode"),
     ];
-    for src in &source_roots {
-        if src.is_dir() {
-            let rel = src
-                .strip_prefix(host_home())
-                .expect("HOME-relative source path");
-            let dst = test_home.join(rel);
-            copy_dir_excluding_plugin_subdir(src, &dst)?;
-            imported_any = true;
+    let redacted_roots = ["~/.local/share/opencode", "~/.opencode"];
+    for (src, redacted) in source_roots.iter().zip(redacted_roots.iter()) {
+        // Stat with symlink_metadata so a symlinked root is refused
+        // rather than silently followed.
+        let Ok(meta) = std::fs::symlink_metadata(src) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::other(format!(
+                "refusing to import {redacted}: expected a regular directory, found a symlink"
+            )));
         }
+        if !meta.file_type().is_dir() {
+            continue;
+        }
+        let rel = src
+            .strip_prefix(host_home())
+            .expect("HOME-relative source path");
+        let dst = test_home.join(rel);
+        copy_dir_excluding_plugin_subdir(src, &dst)?;
+        // Re-stamp auth.json with the strict mode atomically — the
+        // dir-copy walks regular files via fs::copy which inherits
+        // host mode bits.
+        let dst_auth = dst.join("auth.json");
+        if dst_auth.is_file() {
+            let bytes = std::fs::read(&dst_auth)?;
+            write_credential_file_atomic_0o600(&dst_auth, &bytes)?;
+        }
+        imported_any = true;
     }
 
     // ~/.config/opencode/opencode.jsonc is the user-editable config.
@@ -921,7 +1179,8 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<()> {
         .join(".config")
         .join("opencode")
         .join("opencode.jsonc");
-    if src_cfg.is_file() {
+    if src_cfg.exists() {
+        require_regular_file_no_symlink(&src_cfg, "~/.config/opencode/opencode.jsonc")?;
         let dst_cfg_dir = test_home.join(".config").join("opencode");
         std::fs::create_dir_all(&dst_cfg_dir)?;
         std::fs::copy(&src_cfg, dst_cfg_dir.join("opencode.jsonc"))?;
@@ -929,10 +1188,11 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<()> {
     }
 
     if !imported_any {
-        return Err(std::io::Error::other(format!(
-            "OpenCode credentials not found under {} — log in with `opencode auth login`",
-            source_roots[0].display()
-        )));
+        return Err(std::io::Error::other(
+            "OpenCode credentials not found under ~/.local/share/opencode or ~/.opencode — \
+             log in with `opencode auth login`"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -954,11 +1214,6 @@ fn copy_dir_excluding_plugin_subdir(src: &Path, dst: &Path) -> std::io::Result<(
             copy_dir_recursively(&from, &to)?;
         } else if ty.is_file() {
             std::fs::copy(&from, &to)?;
-            #[cfg(unix)]
-            if entry.file_name() == "auth.json" {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o600))?;
-            }
         } else {
             return Err(std::io::Error::other(format!(
                 "OpenCode credential entry {} is not a regular file or directory \
@@ -992,8 +1247,32 @@ fn write_continue_session_file(
     std::fs::write(session_toml_path, s)
 }
 
+/// Escape `s` so it can be embedded as a TOML basic string between
+/// `"…"`. M3.1 auditor Nit 3 — the original two-replace shape missed
+/// control characters and BS/FF/LF/CR/TAB, any of which would
+/// produce an invalid TOML file. We follow the TOML 1.0 spec: `\b`,
+/// `\t`, `\n`, `\f`, `\r`, `\\`, `\"` are the literal escapes; other
+/// control chars (U+0000..=U+001F minus the named ones, plus U+007F)
+/// take the `\uXXXX` form. UTF-8 codepoints above the C0 range are
+/// allowed in basic strings as-is.
 fn toml_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{0008}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{000c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Helper for L2 tests: send a single JSON line to the deck's hook
@@ -1022,4 +1301,89 @@ pub fn write_hook_line(socket: &Path, json_line: &str) -> std::io::Result<()> {
         }
     }
     Err(last_err.unwrap_or_else(|| std::io::Error::other("timed out waiting for hook socket")))
+}
+
+#[cfg(test)]
+mod harness_unit_tests {
+    use super::*;
+
+    #[test]
+    fn strip_jsonc_comments_drops_line_and_block_comments() {
+        let input = "{\n  // line comment\n  /* block\n  comment */ \"a\": 1\n}";
+        let out = strip_jsonc_comments(input);
+        // serde_json must be able to parse the result without the
+        // JSONC comment tokens.
+        let v: serde_json::Value = serde_json::from_str(&out).expect("stripped output parses");
+        assert_eq!(v["a"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn strip_jsonc_comments_preserves_string_literal_slashes() {
+        let input = r#"{"url": "https://example.com/path", "marker": "//keep" }"#;
+        let out = strip_jsonc_comments(input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("parses");
+        assert_eq!(v["url"], "https://example.com/path");
+        assert_eq!(v["marker"], "//keep");
+    }
+
+    #[test]
+    fn strip_hooks_from_claude_settings_jsonc_input_strips_hooks() {
+        // M3.1 auditor S0 regression: a `//`-comment-bearing
+        // settings.json must round-trip through the stripper with
+        // its `hooks` key removed, NOT pass through unchanged.
+        let raw = "{\n  // top-level comment\n  \"hooks\": {\"PostToolUse\": []},\n  \"theme\": \"dark\"\n}";
+        let out = strip_hooks_from_claude_settings(raw).expect("jsonc parses after stripping");
+        assert!(
+            !out.contains("hooks"),
+            "stripped settings must not still mention `hooks`: {out}"
+        );
+        assert!(
+            out.contains("\"theme\""),
+            "stripped settings must keep non-hook keys: {out}"
+        );
+    }
+
+    #[test]
+    fn strip_hooks_from_claude_settings_truly_malformed_fails_closed() {
+        // Garbage that isn't valid JSON even after comment stripping
+        // is rejected with an Err — fail-CLOSED rather than letting
+        // the host's hooks survive into the test (M3.1 auditor S0).
+        let result = strip_hooks_from_claude_settings("{ this is not valid json at all");
+        assert!(result.is_err());
+        let err_text = result.unwrap_err().to_string();
+        assert!(
+            err_text.contains("not valid JSON"),
+            "error must explain why the file was rejected: {err_text}"
+        );
+    }
+
+    #[test]
+    fn toml_escape_passes_plain_strings_through() {
+        assert_eq!(toml_escape("simple"), "simple");
+        assert_eq!(toml_escape("with spaces"), "with spaces");
+    }
+
+    #[test]
+    fn toml_escape_quotes_and_backslashes_use_basic_escapes() {
+        assert_eq!(toml_escape(r#"quote " inside"#), r#"quote \" inside"#);
+        assert_eq!(toml_escape(r"back \ slash"), r"back \\ slash");
+    }
+
+    #[test]
+    fn toml_escape_handles_named_control_chars() {
+        assert_eq!(toml_escape("line\nbreak"), r"line\nbreak");
+        assert_eq!(toml_escape("tab\there"), r"tab\there");
+        assert_eq!(toml_escape("cr\rback"), r"cr\rback");
+        assert_eq!(toml_escape("bel\x08"), r"bel\b");
+        assert_eq!(toml_escape("ff\x0c"), r"ff\f");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn toml_escape_emits_uXXXX_for_unnamed_control_chars() {
+        // NUL, ESC, DEL.
+        assert_eq!(toml_escape("\0"), "\\u0000");
+        assert_eq!(toml_escape("\x1b"), "\\u001B");
+        assert_eq!(toml_escape("\x7f"), "\\u007F");
+    }
 }

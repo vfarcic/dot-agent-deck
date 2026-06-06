@@ -13,7 +13,11 @@ mod common;
 use common::TuiDeck;
 use spec::spec;
 
-const CHAIN_SMOKE_PROMPT: &str = "Use the Bash tool to run the command `pwd`. Make exactly one tool call, \
+// Backticks in the prompt are deliberately avoided: the deck's
+// daemon spawns the pane via `sh -c <command>`, and a backtick in
+// the unquoted region would trigger shell command substitution
+// before the prompt ever reaches Claude (M3.1 reviewer S3).
+const CHAIN_SMOKE_PROMPT: &str = "Use the Bash tool to run the command pwd. Make exactly one tool call, \
      then stop without further analysis.";
 
 const PINNED_MODEL: &str = "claude-haiku-4-5-20251001";
@@ -28,19 +32,12 @@ fn claude_001_thinking_working_idle() {
     // disappears (cost: zero LLM tokens on a startup-time rejection).
     skip_unless!(common::check_claude_available());
 
-    // The deck's restore path will spawn this command inside the
-    // per-test tempdir. `--dangerously-skip-permissions` is required
-    // because the prompt asks for a Bash tool call and there is no
-    // interactive permission acceptor in this PTY (the harness
-    // can't drive `y` answers without entanglement with the deck's
-    // permission-prompt rendering). The bound is a single one-shot
-    // `claude -p` invocation, so the skip is safe for the run scope.
-    // `--allowedTools Bash` whitelists Bash tool calls so the agent
-    // doesn't sit on an interactive permission prompt (the harness
+    // `--allowedTools Bash` whitelists the Bash tool so the agent
+    // doesn't sit on an interactive permission prompt — the harness
     // can't drive a `y` answer without entangling with the deck's
-    // permission-prompt rendering). We deliberately avoid
-    // `--dangerously-skip-permissions` because Claude Code refuses
-    // it under root/sudo (test environments are often containerized
+    // permission-prompt rendering. We deliberately avoid
+    // `--dangerously-skip-permissions`: Claude Code refuses it
+    // under root/sudo (test environments are often containerized
     // and run as root); the explicit allow-list is the supported path.
     let agent_command = format!(
         "claude -p \"{prompt}\" --model {model} --allowedTools Bash",
