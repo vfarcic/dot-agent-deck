@@ -1074,3 +1074,65 @@ async fn dead_role_stays_visible_on_reconnect_as_placeholder_card() {
         let _ = server.registry.close_agent(id);
     }
 }
+
+// ---------------------------------------------------------------------------
+// PRD #104 R1 (reviewer): the M4 reproducer in `tests/snapshot_replay_dims.rs`
+// pins `parser_init_dims` in isolation, but a regression that swapped the
+// helper out for hard-coded `24, 80` at the `hydrate_from_daemon` call-site
+// would still pass that test (it only proves the helper itself is correct).
+//
+// This test exercises the actual call-site: spawn a real agent at 40×120 on
+// the in-process daemon, hydrate via `EmbeddedPaneController::hydrate_from_daemon`,
+// and assert the pane's vt100 parser is sized to the daemon-reported dims.
+// A regression that re-introduces the hard-coded fall-back would fail here
+// even if `parser_init_dims` itself stayed correct.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydrate_sizes_parser_to_daemon_reported_pty_dims() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    // Daemon-side spawn at non-default 40×120. Pre-PRD the client's parser
+    // would have been built at 24×80 regardless; the fix wires `record.rows`
+    // / `record.cols` through `parser_init_dims` into `vt100::Parser::new`.
+    let agent_id = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            rows: 40,
+            cols: 120,
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent should succeed");
+
+    let ctrl = Arc::new(EmbeddedPaneController::new(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+    assert_eq!(hydrated.len(), 1, "single agent should hydrate as one pane");
+    let pane_id = hydrated[0].pane_id.clone();
+
+    let screen = ctrl
+        .get_screen(&pane_id)
+        .expect("hydrated pane must expose its vt100 parser");
+    let size = {
+        let parser = screen.lock().unwrap();
+        parser.screen().size()
+    };
+    assert_eq!(
+        size,
+        (40, 120),
+        "PRD #104 R1: hydrate_from_daemon must size the parser to AgentRecord.rows/cols, \
+         not the pre-PRD hard-coded 24×80 placeholder"
+    );
+
+    drop(ctrl);
+    let _ = server.registry.close_agent(&agent_id);
+}
