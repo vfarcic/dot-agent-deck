@@ -67,6 +67,15 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
     out
 }
 
+/// Scenario: Render a single dashboard card for a Working agent
+/// session (with a Read tool active and a recent user prompt) into
+/// a `ratatui::TestBackend` buffer at 80 columns × Normal-density
+/// height, then snapshot the buffer with `insta`. The card title
+/// row should carry the card number (1), the display name
+/// (`example-coder`), and the `● Working` status badge — and the
+/// stats line should show the wide layout's inline
+/// `Last: … Tools: …` because 80 cells crosses the wide-layout
+/// width threshold.
 #[spec("dashboard/pane/004")]
 #[test]
 fn pane_004_card_title_row() {

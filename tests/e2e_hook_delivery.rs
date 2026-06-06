@@ -13,6 +13,15 @@ mod common;
 use common::{TuiDeck, write_hook_line};
 use spec::spec;
 
+/// Scenario: Launch the deck against the `minimal` fixture, wait
+/// for the empty dashboard to render, then write a synthetic
+/// Claude Code `SessionStart` hook payload (with `pane_id =
+/// pane-m2-001`, `session_id = m2demo`, `agent_type = claude_code`)
+/// directly to the per-test hook socket. The deck's daemon auto-
+/// registers the unknown pane on its first `SessionStart` event,
+/// so a card titled `m2demo` should appear on the dashboard within
+/// the test budget. No real LLM tokens are spent — the harness
+/// injects the event in-process.
 #[spec("hooks/delivery/001")]
 #[test]
 fn delivery_001_session_start_creates_card() {

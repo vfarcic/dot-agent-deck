@@ -22,6 +22,15 @@ const CHAIN_SMOKE_PROMPT: &str = "Use the Bash tool to run the command pwd. Make
 
 const PINNED_MODEL: &str = "claude-haiku-4-5-20251001";
 
+/// Scenario: Import the host's Claude Code credentials into a
+/// per-test HOME, stage a saved session whose pane runs
+/// `claude -p "…use the Bash tool to run pwd…" --model
+/// claude-haiku-4-5-20251001 --allowedTools Bash`, then launch the
+/// deck with `--continue` so the agent process auto-starts. As the
+/// real Claude run unfolds, the deck's hook plugin posts events
+/// that drive the card through Thinking → Working → Idle, with the
+/// `Bash` tool name visible on the card during Working. Runs against
+/// the real Anthropic API; cost is bounded at one Haiku invocation.
 #[spec("chain-smoke/claude/001")]
 #[test]
 fn claude_001_thinking_working_idle() {
