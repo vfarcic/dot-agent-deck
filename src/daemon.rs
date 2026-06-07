@@ -10,7 +10,10 @@ use tokio::net::UnixListener;
 use tokio::sync::{Notify, broadcast};
 use tracing::{error, info, warn};
 
-use crate::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS};
+use crate::agent_pty::{
+    AgentPtyRegistry, DOT_AGENT_DECK_EXIT_WHEN_ORPHANED, DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS,
+    DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS,
+};
 use crate::error::DaemonError;
 use crate::event::{AgentEvent, BroadcastMsg, DaemonMessage};
 use crate::scheduler::Scheduler;
@@ -38,6 +41,50 @@ pub fn idle_shutdown_from_env() -> Option<Duration> {
     } else {
         Some(Duration::from_secs(secs))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test-only self-defense: orphan watchdog + max-lifetime backstop.
+//
+// These exist so an idle-disabled TEST daemon (`IDLE_SHUTDOWN_SECS=0`) can't
+// leak to PID 1 when the test process dies without running its cleanup `Drop`
+// (SIGKILL / panic-abort / nextest timeout / Ctrl-C). Both are env-gated and
+// OFF by default, so production detached/lazy-spawned daemons are unaffected.
+// ---------------------------------------------------------------------------
+
+/// Parse a truthy env flag value: `1` / `true` / `yes` / `on`
+/// (case-insensitive, surrounding whitespace ignored). Everything else
+/// (including unset → empty, `0`, `false`) is false.
+pub fn parse_bool_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Parse the max-lifetime backstop: `Some(Duration)` for a positive integer
+/// number of seconds, `None` otherwise (unset, empty, `0`, or unparseable —
+/// meaning "no cap").
+pub fn parse_max_lifetime_secs(value: &str) -> Option<Duration> {
+    match value.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Some(Duration::from_secs(secs)),
+        _ => None,
+    }
+}
+
+/// The orphan decision: a daemon should exit when its current parent is `init`
+/// (pid 1 — reparented after the original parent died) OR differs from the
+/// parent captured at startup (covers a sub-reaper that isn't pid 1). Pure so
+/// the policy is unit-testable without a real fork.
+pub fn should_exit_orphaned(original_ppid: i32, current_ppid: i32) -> bool {
+    current_ppid == 1 || current_ppid != original_ppid
+}
+
+/// The calling process's parent pid. Wraps `getppid(2)` (async-signal-safe,
+/// infallible) so the single `unsafe` lives in one place.
+fn current_ppid() -> i32 {
+    // SAFETY: `getppid(2)` has no failure mode and no side effects.
+    unsafe { libc::getppid() }
 }
 
 /// Daemon-wide broadcast capacity for hook-event `BroadcastMsg`s forwarded
@@ -428,6 +475,62 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // expires, the hook loop's `select!` arm wakes up, and the loop exits.
     let shutdown = Arc::new(Notify::new());
 
+    // Test-only orphan watchdog: when `DOT_AGENT_DECK_EXIT_WHEN_ORPHANED` is
+    // truthy, gracefully shut down (via the SAME `shutdown` signal the idle
+    // monitor uses — so sockets/agents tear down cleanly) once this daemon is
+    // orphaned. OFF by default; production daemons never set the var.
+    let orphan_handle = if std::env::var(DOT_AGENT_DECK_EXIT_WHEN_ORPHANED)
+        .map(|v| parse_bool_flag(&v))
+        .unwrap_or(false)
+    {
+        let original_ppid = current_ppid();
+        let shutdown_signal = shutdown.clone();
+        info!(
+            original_ppid,
+            "exit-when-orphaned watchdog armed (test-only safety net)"
+        );
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let cur = current_ppid();
+                if should_exit_orphaned(original_ppid, cur) {
+                    warn!(
+                        original_ppid,
+                        current_ppid = cur,
+                        "daemon orphaned (parent died/changed); initiating graceful shutdown"
+                    );
+                    shutdown_signal.notify_one();
+                    break;
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Test-only max-lifetime backstop: when set, gracefully self-exit after the
+    // configured seconds no matter what (catches anything the orphan watchdog
+    // misses, e.g. a detached daemon whose parent is already PID 1). Unset in
+    // production → no cap.
+    let max_lifetime_handle = std::env::var(DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS)
+        .ok()
+        .and_then(|v| parse_max_lifetime_secs(&v))
+        .map(|dur| {
+            let shutdown_signal = shutdown.clone();
+            info!(
+                secs = dur.as_secs(),
+                "test max-lifetime backstop armed (test-only safety net)"
+            );
+            tokio::spawn(async move {
+                tokio::time::sleep(dur).await;
+                warn!(
+                    secs = dur.as_secs(),
+                    "daemon test max-lifetime reached; initiating graceful shutdown"
+                );
+                shutdown_signal.notify_one();
+            })
+        });
+
     // Optionally start the M1.2 streaming attach server with the shared
     // client counter. We hold its JoinHandle and abort it on exit so it
     // doesn't outlive the daemon.
@@ -511,6 +614,12 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         h.abort();
     }
     scheduler_handle.abort();
+    if let Some(h) = orphan_handle {
+        h.abort();
+    }
+    if let Some(h) = max_lifetime_handle {
+        h.abort();
+    }
     drop(pty_registry);
 
     result
@@ -773,5 +882,54 @@ async fn run_hook_loop(
             }
             } // end accept_res match
         } // end tokio::select!
+    }
+}
+
+#[cfg(test)]
+mod orphan_watchdog_tests {
+    use super::*;
+
+    #[test]
+    fn parse_bool_flag_accepts_truthy_values() {
+        for v in ["1", "true", "TRUE", "Yes", " on ", "On"] {
+            assert!(parse_bool_flag(v), "{v:?} should be truthy");
+        }
+        for v in ["", "0", "false", "no", "off", "2", "enabled"] {
+            assert!(!parse_bool_flag(v), "{v:?} should be falsey");
+        }
+    }
+
+    #[test]
+    fn parse_max_lifetime_secs_only_positive_ints() {
+        assert_eq!(
+            parse_max_lifetime_secs("300"),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(parse_max_lifetime_secs(" 5 "), Some(Duration::from_secs(5)));
+        // Unset/empty/zero/garbage → no cap.
+        assert_eq!(parse_max_lifetime_secs(""), None);
+        assert_eq!(parse_max_lifetime_secs("0"), None);
+        assert_eq!(parse_max_lifetime_secs("-1"), None);
+        assert_eq!(parse_max_lifetime_secs("abc"), None);
+    }
+
+    #[test]
+    fn should_exit_orphaned_when_reparented_to_init_or_changed() {
+        let original = 4242;
+        // Reparented to init (pid 1) → orphaned.
+        assert!(should_exit_orphaned(original, 1));
+        // Parent changed to some other pid (sub-reaper) → orphaned.
+        assert!(should_exit_orphaned(original, 9999));
+        // Same original parent still alive → not orphaned.
+        assert!(!should_exit_orphaned(original, original));
+    }
+
+    #[test]
+    fn should_exit_orphaned_handles_init_originated_daemon() {
+        // A daemon whose original parent was already init (detached) and stays
+        // there: current == original == 1. The `== 1` clause reports orphaned,
+        // which is WHY the watchdog must be left OFF for detached production /
+        // TuiDeck daemons — only the harness's non-detached daemons enable it.
+        assert!(should_exit_orphaned(1, 1));
     }
 }

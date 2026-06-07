@@ -772,6 +772,15 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** any fire behavior of the schedule, nor reuse-tab semantics.
 - **Platform coverage:** mac+linux.
 
+#### lifecycle/orphan-exit
+
+##### lifecycle/orphan-exit/001 — An idle-disabled daemon with `DOT_AGENT_DECK_EXIT_WHEN_ORPHANED=1` self-exits gracefully once its parent dies (orphaned to init), instead of leaking to PID 1.
+- **Layer:** L2.
+- **Agent:** none (the daemon runs under a short-lived intermediate `sh` parent the test can kill without killing itself).
+- **Asserts:** after SIGKILLing the intermediate parent, the daemon process terminates within a few seconds, even though idle shutdown is disabled so only the orphan watchdog can end it.
+- **Does not assert:** the max-lifetime backstop (`DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, covered by the daemon pure-data unit tests) or production daemons (the watchdog is OFF unless the env var is set).
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/handshake
 
 ##### lifecycle/handshake/001 — Build-version match on attach proceeds silently into the dashboard.

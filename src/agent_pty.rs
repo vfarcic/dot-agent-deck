@@ -54,6 +54,22 @@ pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
 /// literals can't drift apart.
 pub const DOT_AGENT_DECK_AGENT_ID: &str = "DOT_AGENT_DECK_AGENT_ID";
 
+/// Test-only safety watchdog: when set truthy (`1`/`true`/`yes`/`on`), a
+/// `daemon serve` captures its parent pid at startup and gracefully exits once
+/// it is orphaned (parent becomes `init`/pid 1, or otherwise changes). OFF by
+/// default — production daemons are intentionally detached/lazy-spawned and
+/// would be orphaned from birth, so the watchdog only runs when a test sets
+/// this. Stops idle-disabled test daemons from leaking to PID 1 when the test
+/// process dies without running `Drop` (SIGKILL / panic-abort / nextest
+/// timeout / Ctrl-C).
+pub const DOT_AGENT_DECK_EXIT_WHEN_ORPHANED: &str = "DOT_AGENT_DECK_EXIT_WHEN_ORPHANED";
+
+/// Test-only backstop: when set to a positive integer, a `daemon serve`
+/// gracefully self-exits after that many seconds no matter what. Unset = no cap
+/// (production unaffected). Belt-and-suspenders for anything that slips past the
+/// orphan watchdog (e.g. a detached test daemon whose parent is already PID 1).
+pub const DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS: &str = "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS";
+
 /// Hard upper bound on PTY rows/cols accepted by the daemon. Larger values
 /// are clamped down before reaching `MasterPty::resize`. The cap defends
 /// against a same-uid attach-socket peer perturbing an existing agent's
