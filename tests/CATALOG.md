@@ -419,6 +419,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the dashboard's selection cursor location on return.
 - **Platform coverage:** mac+linux.
 
+##### prompt/new-pane/007 — The new-deck dialog surfaces a built-in `schedule` authoring option, visually separated from the workload modes (PRD #127 M3.2).
+- **Layer:** L2 (re-sequenced from L1: the dialog renderer + `NewPaneFormState` are private and there is no public L1 render seam, so the real dialog is driven via PTY keystrokes and asserted on the rendered vt100 grid).
+- **Agent:** none (drives Ctrl+n → dir-picker → new-pane form, then cycles the Mode field).
+- **Asserts:** after cycling the Mode field to the end, the dialog shows a selectable `schedule` option AND an authoring-session affordance (an `authoring` label/section) marking it as a throwaway authoring session distinct from the workload modes.
+- **Does not assert:** the authoring seed-prompt delivery (covered by `tabs/mode/005`); the manager dialog's add/edit path (Phase 3B-ii); the exact separator glyphs.
+- **Platform coverage:** mac+linux.
+
 ### Focus / navigation
 
 #### focus/dashboard
@@ -515,6 +522,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Agent:** none.
 - **Asserts:** three distinct matches against a 2-slot pool leave the second and third matches visible; the first is gone.
 - **Does not assert:** slot reuse ordering beyond "oldest first".
+- **Platform coverage:** mac+linux.
+
+##### tabs/mode/005 — A `[[modes]]` mode carrying a `seed_prompt` auto-delivers it to the agent pane once the agent is ready (gated, like orchestrations); a mode without one delivers nothing (PRD #127 M3.1).
+- **Layer:** L2.
+- **Agent:** none — a fixture "recorder" agent that self-posts `SessionStart` (the readiness signal) via the real `dot-agent-deck hook` path, then records every prompt written into its PTY stdin.
+- **Asserts:** spawning the seeded mode via the new-pane dialog delivers the configured `seed_prompt` into the agent pane after the agent signals readiness (the marker is recorded); spawning a mode without a `seed_prompt` starts the agent but records no auto-delivered prompt.
+- **Does not assert:** which gate path fires (SessionStart fast path vs the slow-path fallback) — only that delivery is gated on readiness, not ungated/immediate; the serde round-trip of `seed_prompt` (covered by a coder unit test).
 - **Platform coverage:** mac+linux.
 
 #### tabs/orchestration
@@ -749,6 +763,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Agent:** none.
 - **Asserts:** after a window comfortably longer than the default, the daemon still answers.
 - **Does not assert:** indefinite lifetime (capped by the test timeout).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/daemon-idle/003 — A registered enabled schedule keeps the daemon alive past the idle window (PRD #127 M1.4 carve-out); removing it lets the daemon idle-exit.
+- **Layer:** L2.
+- **Agent:** none (a global `schedules.toml` with one enabled task; fast `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS`).
+- **Asserts:** with zero clients and zero live agents the daemon survives well past the idle window while an enabled schedule is registered (covers the before-first-fire and after-agent-exit gaps); after the schedule is cleared and reloaded the daemon exits within the window plus margin.
+- **Does not assert:** any fire behavior of the schedule, nor reuse-tab semantics.
 - **Platform coverage:** mac+linux.
 
 #### lifecycle/handshake
@@ -1221,6 +1242,109 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** `src/ui.rs` contains none of `bg(Color::Rgb`, `bg(palette.terminal_bg)`, `bg(palette.selected_bg)`, `bg(palette.tab_bar_bg)` — guarding the `render_frame` canvas/tab-bar fills that paint the whole window and aren't cheaply reachable through a render seam.
 - **Does not assert:** runtime rendering behavior (covered by `theme/guard/001` and `theme/contrast/001`); absolute colors in other source files.
 - **Platform coverage:** mac+linux+windows.
+
+
+### Scheduled tasks (PRD #127)
+
+#### scheduler/reload
+
+##### scheduler/reload/001 — A `ReloadSchedules` control message re-reads the global config and diff/replaces the registered task set without a daemon restart (PRD #127 M1.3).
+- **Layer:** L2.
+- **Agent:** none (drives `daemon serve` over the attach socket).
+- **Asserts:** after editing the global `schedules.toml` to drop one task and add another and sending `ReloadSchedules`, the response is ok and the registered (enabled) task set contains the added task and not the removed one — with the same daemon process.
+- **Does not assert:** persistence across an actual daemon restart (out of scope per PRD #127); the cron-firing behavior of the reloaded tasks.
+- **Platform coverage:** mac+linux.
+
+#### scheduler/cli
+
+##### scheduler/cli/002 — `dot-agent-deck schedule add` from an arbitrary cwd writes the global `schedules.toml` and triggers a live daemon reload (PRD #127 M1.5).
+- **Layer:** L2.
+- **Agent:** none (runs the `schedule` CLI subprocess against a live `daemon serve`).
+- **Asserts:** running `schedule add` from a directory that is not the global config dir writes the entry to the fixed global path (and not under the cwd), and the running daemon registers the new task via the add-triggered reload (probed via `schedule run-now`).
+- **Does not assert:** cron validation / rename rejection / atomic-write internals (covered by the pure-data `scheduler/cli/001` unit tests alongside the CLI).
+- **Platform coverage:** mac+linux.
+
+#### scheduler/spawn
+
+##### scheduler/spawn/001 — A fire into a missing working_dir creates it (`mkdir -p`) then spawns; a fire into an uncreatable path surfaces a notification without crashing the daemon, and other tasks keep working (PRD #127 M2.1).
+- **Layer:** L2.
+- **Agent:** none (run-now drives the fire; observes the daemon registry + on-disk effects + daemon stderr).
+- **Asserts:** firing a task whose working_dir does not exist creates the directory and spawns an agent; firing a task whose working_dir is uncreatable (parent is a regular file) leaves the daemon alive, does not create the path, surfaces a failure notification, and a sibling healthy task still spawns afterward.
+- **Does not assert:** the exact notification message text (loose substring on the offending path).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/spawn/002 — A fire into a dir with `[[orchestrations]]` opens an orchestration tab and delivers the prompt to the `orchestrator` role; a fire into a dir without one opens a single-agent card with the prompt delivered (PRD #127 M2.1).
+- **Layer:** L2.
+- **Agent:** none (run-now; observes `ListAgents` tab_membership + PTY prompt echo).
+- **Asserts:** the orchestration fire registers an agent tagged as the orchestration's `orchestrator` role and the prompt is echoed by its PTY; the plain fire registers a non-orchestration single-agent card and the prompt is echoed by its PTY.
+- **Does not assert:** orchestration role layout beyond the orchestrator slot; any LLM behavior (commands are plain `cat`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/spawn/003 — A fire with `command` set spawns that command; with `command` omitted it falls back to `$SHELL` (PRD #127 M2.1).
+- **Layer:** L2.
+- **Agent:** none (run-now; observes on-disk marker side effects of each spawned command).
+- **Asserts:** a task with an explicit `command` runs that command (its marker file appears); a task with no `command` spawns the pinned `$SHELL` (its marker file appears).
+- **Does not assert:** prompt delivery for this case (covered by spawn/002 + spawn/004).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/spawn/004 — A single fire calls spawn exactly once and delivers the configured prompt (no double-spawn, no missed delivery) (PRD #127 M2.3).
+- **Layer:** L2.
+- **Agent:** none (run-now; observes registry agent count + PTY prompt echo).
+- **Asserts:** one run-now spawns exactly one agent (count stays at 1 across a short window) and the configured prompt is echoed by that agent's PTY.
+- **Does not assert:** tab-reuse vs `new_tab_per_fire` semantics (Phase 2B).
+- **Platform coverage:** mac+linux.
+
+#### scheduler/reuse
+
+##### scheduler/reuse/001 — Two fires of a `new_tab_per_fire = false` task reuse one tab and re-deliver the prompt into the same pane (PRD #127 M2.2).
+- **Layer:** L2.
+- **Agent:** none (run-now ×2; observes registry agent count + PTY prompt-echo occurrence count).
+- **Asserts:** across two fires the agent count for the task stays at 1 (never grows to 2), and the prompt marker is echoed twice by the single reused PTY (the second fire delivers into the existing pane).
+- **Does not assert:** behavior after the reused tab is closed (stale-entry eviction is unit-tested by the coder).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/reuse/002 — Two fires of a `new_tab_per_fire = true` task open two distinct tabs, each receiving the prompt (PRD #127 M2.2).
+- **Layer:** L2.
+- **Agent:** none (run-now ×2; observes registry agent count + per-pane prompt echo).
+- **Asserts:** the agent count goes 1 → 2 (two distinct panes) and each pane receives the prompt.
+- **Does not assert:** ordering of the two tabs; tab titles.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/reuse/003 — On a reuse fire, a recent user keystroke debounces delivery until the pane goes idle; with no recent input the prompt is delivered immediately (PRD #127 M2.2, Q6).
+- **Layer:** L2.
+- **Agent:** none (run-now + simulated STREAM_IN keystroke; observes PTY prompt-echo occurrence count over time). Debounce window injected via `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` so the test is fast.
+- **Asserts:** after a simulated keystroke, a reuse fire's prompt is NOT delivered within the debounce window and IS delivered into the same pane once the window elapses; a later fire with no recent input is delivered immediately.
+- **Does not assert:** the production default debounce duration (the test injects a short one); queue depth beyond the latest prompt.
+- **Platform coverage:** mac+linux.
+
+#### scheduler/manager
+
+##### scheduler/manager/001 — The "Scheduled Tasks" manager dialog lists schedules with a live/idle/disabled status indicator and a next-fire time (PRD #127 M3.3).
+- **Layer:** L2 (no public L1 dialog render seam — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid). Opened with the `S` keybinding.
+- **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`).
+- **Asserts:** pressing `S` opens a "Scheduled Tasks" dialog listing the configured tasks; an enabled-but-not-live task shows an `idle` status; a disabled task shows the `disabled` indicator with a `—` next-fire placeholder.
+- **Does not assert:** the exact next-fire timestamp formatting for enabled tasks; live-status rendering when a reused tab exists.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/002 — `a` (add) / `Enter`/`e` (edit) spawn the seeded authoring agent; edit pre-fills the row's current values (PRD #127 M3.3).
+- **Layer:** L2 (same no-L1-seam reason). `claude` is shimmed to a recorder agent that posts SessionStart and records its delivered seed.
+- **Agent:** the shimmed authoring agent (records the gated-delivered seed, mirroring how `tabs/mode/005` observes seed delivery).
+- **Asserts:** pressing `e` on a row spawns the seeded authoring agent and the edit context is pre-filled — the agent receives the authoring seed carrying the row's current prompt value.
+- **Does not assert:** the full authoring seed-prompt text; that the agent ultimately calls `schedule update` (covered by the CLI + seed-delivery mechanism); the add (blank) path beyond reuse of the same seam.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/003 — `d` + confirm removes the schedule definition but does NOT close an already-open tab for it (PRD #127 M3.3).
+- **Layer:** L2 (same no-L1-seam reason). Drives the real dialog + observes the global `schedules.toml` and the daemon registry.
+- **Agent:** none (the schedule's own `cat` agent, opened by a prior run-now, stands in for an open tab).
+- **Asserts:** after `d` then confirm (`y`), the definition is gone from `schedules.toml`, AND a tab/agent opened for that task before the delete is still live in the registry.
+- **Does not assert:** the confirmation dialog's exact wording; rename behavior (forbidden, unit-tested).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/004 — `r` on a row triggers an immediate run-now fire of the selected task (PRD #127 M3.3).
+- **Layer:** L2 (same no-L1-seam reason). Drives the real dialog + observes the daemon registry.
+- **Asserts:** pressing `r` in the manager fires the selected task, which spawns its tab/agent (registered under the task's display name).
+- **Does not assert:** prompt delivery content (covered by `scheduler/spawn/004`); reuse vs new-tab on the fire.
+- **Platform coverage:** mac+linux.
 
 
 ### Docs cross-reference skips
