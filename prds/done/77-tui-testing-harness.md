@@ -2019,20 +2019,31 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 
 ### Theme contrast
 
+Under PRD #13's terminal-relative color model there is no baked light/dark palette, so the per-theme snapshot *pairs* collapse into structural-property assertions: the dashboard may emit no absolute `Color::Rgb(..)` on any contrast-critical surface — backgrounds resolve to `Color::Reset` (the terminal's own background) and selection/active-tab highlights use `Modifier::REVERSED` instead of an absolute background tint.
+
 #### theme/contrast
 
-##### theme/contrast/001 — Overlay/prompt surfaces render on-palette under the dark theme.
+##### theme/contrast/001 — Overlay/prompt surfaces render in the terminal's reference frame (Reset background, Reset/ANSI foregrounds, no absolute Rgb).
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none.
-- **Asserts:** each of the six surfaces (stats bar, Quit-confirm, Stop-confirm, star prompt, config-gen prompt, "No agent" empty card) rendered with the dark palette matches its committed color-aware snapshot — neutral text resolves to the dark palette (White / Gray).
-- **Does not assert:** accent/status colors (Cyan/Green/Yellow/Red/Blue/Magenta), which terminal themes remap and the palette deliberately leaves fixed; popup geometry beyond what the buffer captures.
+- **Asserts:** the five overlay/prompt surfaces (stats bar, Quit-confirm, Stop-confirm, star prompt, config-gen prompt) emit no absolute `Color::Rgb(..)` token (foreground or background) — every cell is `Color::Reset` or a named ANSI color, so the surfaces inherit the terminal's own background and theme.
+- **Does not assert:** accent/status colors (Cyan/Green/Yellow/Red/Blue/Magenta), which are named ANSI and remain by design; popup geometry beyond what the buffer captures.
 - **Platform coverage:** mac+linux+windows.
 
-##### theme/contrast/002 — The same surfaces render on-palette under the light theme (no hardcoded White/Gray/DarkGray).
+#### theme/guard
+
+##### theme/guard/001 — No absolute background on any cheaply-seamable surface; selection highlight uses Modifier::REVERSED.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none.
-- **Asserts:** the same six surfaces rendered with the light palette match their committed color-aware snapshots — neutral text resolves to the light palette (Black / DarkGray), so no surface leaves a hardcoded White/Gray/DarkGray that is unreadable on a white background.
-- **Does not assert:** accent/status colors (left fixed by design); OSC-11 auto-detection (covered by the pure-data `theme` unit tests).
+- **Asserts:** rendering the five overlay seams plus a session card in both the unselected and selected states, (a) no cell carries a `Color::Rgb(..)` background — backgrounds must be `Color::Reset`; and (b) the selected card draws its highlight with `Modifier::REVERSED` rather than an absolute `selected_bg` fill.
+- **Does not assert:** named-ANSI accents/status colors; the `render_frame` canvas/tab-bar fills (not cheaply reachable through a render seam — guarded by `theme/guard/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### theme/guard/002 — `src/ui.rs` carries no forbidden absolute-background patterns (source lint).
+- **Layer:** L1 (source lint — reads `src/ui.rs` from disk; no rendering).
+- **Agent:** none.
+- **Asserts:** `src/ui.rs` contains none of `bg(Color::Rgb`, `bg(palette.terminal_bg)`, `bg(palette.selected_bg)`, `bg(palette.tab_bar_bg)` — guarding the `render_frame` canvas/tab-bar fills that paint the whole window and aren't cheaply reachable through a render seam.
+- **Does not assert:** runtime rendering behavior (covered by `theme/guard/001` and `theme/contrast/001`); absolute colors in other source files.
 - **Platform coverage:** mac+linux+windows.
 
 ### Docs cross-reference skips

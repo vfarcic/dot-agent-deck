@@ -1,6 +1,0 @@
----
-source: tests/render_dashboard.rs
-assertion_line: 181
-expression: buffer_to_color_text(&buf)
----
-[Cyan/Reset]" 6 active" [Gray/Reset]"  │  " [Green/Reset]"1 working" [Gray/Reset]"  │  " [Blue/Reset]"1 thinking" [Gray/Reset]"  │  " [Magenta/Reset]"1 compacting" [Gray/Reset]"  │  " [Yellow/Reset]"1 waiting" [Gray/Reset]"  │  " [Red/Reset]"1 error" [Gray/Reset]"  │  1 idle  │  42 tools  │  " [LightMagenta/Reset]"mode: plan"

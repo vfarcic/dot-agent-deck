@@ -10,13 +10,12 @@ use std::collections::VecDeque;
 
 use dot_agent_deck::event::AgentType;
 use dot_agent_deck::state::{ActiveTool, DashboardStats, SessionState, SessionStatus};
-use dot_agent_deck::theme::{ColorPalette, Theme, resolve_palette};
 use dot_agent_deck::ui::{
     CardDensityKind, render_card_to_buffer, render_config_gen_prompt_to_buffer,
     render_quit_confirm_to_buffer, render_star_prompt_to_buffer, render_stats_bar_to_buffer,
     render_stop_confirm_to_buffer,
 };
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier};
 use spec::spec;
 
 /// Width (in terminal cells) at which `render_session_card` flips
@@ -88,11 +87,6 @@ fn pane_004_card_title_row() {
         pane_id: Some("pane-1".to_string()),
         agent_id: Some("1".to_string()),
     };
-    // Dark palette pin: PTY-size + color env aren't strictly
-    // relevant in-process, but resolving against Dark prevents the
-    // ratatui rendering from drifting if the host environment
-    // somehow leaks in.
-    let palette: ColorPalette = resolve_palette(Theme::Dark);
     // 80-cell-wide buffer triggers the layout's "wide" branch
     // (inline stats row). The height comes from the density tier
     // itself so the snapshot's geometry tracks the production
@@ -106,8 +100,8 @@ fn pane_004_card_title_row() {
         Some("example-coder"),
         Some(1),
         density,
-        palette,
-        0, // animation tick
+        0,     // animation tick
+        false, // not selected
         width,
         height,
     );
@@ -156,13 +150,14 @@ fn buffer_to_color_text(buffer: &ratatui::buffer::Buffer) -> String {
     out
 }
 
-/// Render all six PRD #13 overlay/prompt surfaces with `palette` and emit one
-/// named, color-aware `insta` snapshot per surface (suffixed `_{theme}`). The
-/// two `#[spec]` tests below differ only by the palette + suffix they pass in,
-/// so dark-vs-light is a pure palette swap over identical fixtures.
-fn snapshot_overlay_surfaces(palette: ColorPalette, theme: &str) {
-    // 1. Stats bar — a representative mix so every status segment renders
-    //    plus the `mode:` tail (the separator that is hardcoded DarkGray today).
+/// Render the five PRD #13 overlay/prompt surfaces — stats bar, Quit and Stop
+/// confirm dialogs, star prompt, config-generation prompt — into color-aware
+/// buffers and return one `(label, buffer)` per surface. Both
+/// `theme/contrast/001` and `theme/guard/001` drive these same seams; the
+/// label is only used to point assertion failures at the offending surface.
+fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
+    // Representative mix so every status segment renders, 140 cells wide so the
+    // whole bar fits without truncation (mirrors the prior contrast fixtures).
     let stats = DashboardStats {
         active: 6,
         working: 1,
@@ -173,48 +168,21 @@ fn snapshot_overlay_surfaces(palette: ColorPalette, theme: &str) {
         compacting: 1,
         total_tools: 42,
     };
-    // 140 cells wide so the full bar fits without truncation — at 80 the
-    // line clipped at "1 erro", hiding the `idle`/`tools` segments AND the
-    // `mode:` separator (the cell migrated off hardcoded DarkGray @ src
-    // 6123), leaving surface #1's whole point unpinned.
-    let buf = render_stats_bar_to_buffer(&stats, Some("plan"), palette, 140, 1);
-    insta::assert_snapshot!(
-        format!("theme_contrast__stats_{theme}"),
-        buffer_to_color_text(&buf)
-    );
+    vec![
+        (
+            "stats",
+            render_stats_bar_to_buffer(&stats, Some("plan"), 140, 1),
+        ),
+        ("quit", render_quit_confirm_to_buffer(0, 80, 24)),
+        ("stop", render_stop_confirm_to_buffer(0, 2, 80, 24)),
+        ("star", render_star_prompt_to_buffer(80, 24)),
+        ("config_gen", render_config_gen_prompt_to_buffer(0, 80, 24)),
+    ]
+}
 
-    // 2. Quit-confirm overlay — Detach default-selected (index 0).
-    let buf = render_quit_confirm_to_buffer(0, palette, 80, 24);
-    insta::assert_snapshot!(
-        format!("theme_contrast__quit_{theme}"),
-        buffer_to_color_text(&buf)
-    );
-
-    // 3. Stop-confirm overlay — No default-selected (index 0), 2 agents.
-    let buf = render_stop_confirm_to_buffer(0, 2, palette, 80, 24);
-    insta::assert_snapshot!(
-        format!("theme_contrast__stop_{theme}"),
-        buffer_to_color_text(&buf)
-    );
-
-    // 4. Star prompt.
-    let buf = render_star_prompt_to_buffer(palette, 80, 24);
-    insta::assert_snapshot!(
-        format!("theme_contrast__star_{theme}"),
-        buffer_to_color_text(&buf)
-    );
-
-    // 5. Config-generation prompt — Yes default-selected (index 0).
-    let buf = render_config_gen_prompt_to_buffer(0, palette, 80, 24);
-    insta::assert_snapshot!(
-        format!("theme_contrast__config_gen_{theme}"),
-        buffer_to_color_text(&buf)
-    );
-
-    // 6. "No agent" empty card — a placeholder session (agent_type None)
-    //    routed through the public `render_card_to_buffer` seam. Narrow width
-    //    keeps it in the stacked (non-wide) branch. `last_activity = now` so
-    //    any rendered elapsed reads `0s ago` (mirrors `pane_004`).
+/// Build a placeholder ("No agent") session card fixture. `last_activity = now`
+/// so any rendered elapsed reads `0s ago` (mirrors `pane_004`).
+fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
     let now = chrono::Utc::now();
     let placeholder = SessionState {
         session_id: String::new(),
@@ -235,34 +203,104 @@ fn snapshot_overlay_surfaces(palette: ColorPalette, theme: &str) {
     let density = CardDensityKind::Normal;
     let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
     let height = density.rendered_height(wide);
-    let buf = render_card_to_buffer(&placeholder, None, None, density, palette, 0, width, height);
-    insta::assert_snapshot!(
-        format!("theme_contrast__no_agent_{theme}"),
-        buffer_to_color_text(&buf)
+    render_card_to_buffer(
+        &placeholder,
+        None,
+        None,
+        density,
+        0,
+        selected,
+        width,
+        height,
+    )
+}
+
+/// Scenario: Render the five dot-agent-deck overlay/prompt surfaces — the stats
+/// bar, the Quit and Stop confirm dialogs, the star prompt, and the
+/// config-generation prompt — into color-aware buffers and assert that NO cell
+/// carries an absolute `Color::Rgb(..)` foreground or background. Under the
+/// PRD #13 terminal-relative model every overlay must paint its canvas with
+/// `Color::Reset` (inheriting the terminal's own background) and use only
+/// `Reset` / named-ANSI foregrounds, so any `Rgb` token in the color dump is a
+/// reference-frame violation. A regression that reintroduced an absolute fill
+/// (e.g. `bg(Color::Rgb(..))`) would surface as an `Rgb` token and fail here.
+#[spec("theme/contrast/001")]
+#[test]
+fn contrast_001_overlays_reference_frame() {
+    for (label, buf) in overlay_buffers() {
+        let dump = buffer_to_color_text(&buf);
+        assert!(
+            !dump.contains("Rgb"),
+            "overlay `{label}` emits an absolute Color::Rgb(..) — \
+             terminal-relative surfaces must use Reset/ANSI only:\n{dump}"
+        );
+    }
+}
+
+/// Scenario: Render the five overlay seams plus a session card in both the
+/// unselected and SELECTED states, then assert two terminal-relative
+/// properties. (a) NO rendered cell across any surface has a `Color::Rgb(..)`
+/// background — backgrounds must be `Color::Reset` so the terminal's own
+/// background shows through. (b) The selected card draws its highlight with
+/// `Modifier::REVERSED` (a self-contained, single-frame contrast pair) rather
+/// than an absolute `selected_bg` fill. A regression that filled any surface
+/// with an absolute background, or that reverted the selection highlight to an
+/// absolute `selected_bg` tint instead of `REVERSED`, would fail one of these
+/// assertions.
+#[spec("theme/guard/001")]
+#[test]
+fn guard_001_no_absolute_backgrounds() {
+    // (a) No Color::Rgb(..) BACKGROUND on any cheaply-seamable surface. The
+    //     color dump renders each cell as `[fg/bg]"text"`, so an Rgb background
+    //     shows up as the `/Rgb(` token (Rgb in the bg position after the `/`).
+    let mut surfaces = overlay_buffers();
+    surfaces.push(("card", placeholder_card(false)));
+    surfaces.push(("card_selected", placeholder_card(true)));
+    for (label, buf) in &surfaces {
+        let dump = buffer_to_color_text(buf);
+        assert!(
+            !dump.contains("/Rgb"),
+            "surface `{label}` paints an absolute Color::Rgb(..) background — \
+             backgrounds must be Color::Reset:\n{dump}"
+        );
+    }
+
+    // (b) The selected card's highlight is Modifier::REVERSED, not an absolute
+    //     background tint. Modifiers aren't captured in the color dump, so
+    //     inspect cells directly.
+    let selected = placeholder_card(true);
+    let area = selected.area();
+    let has_reversed = (0..area.height)
+        .any(|y| (0..area.width).any(|x| selected[(x, y)].modifier.contains(Modifier::REVERSED)));
+    assert!(
+        has_reversed,
+        "selected card must signal its highlight with Modifier::REVERSED \
+         instead of an absolute selected_bg fill"
     );
 }
 
-/// Scenario: Render all six dot-agent-deck overlay/prompt surfaces — the
-/// stats bar, the Quit and Stop confirm dialogs, the star prompt, the
-/// config-generation prompt, and the "No agent" empty card — with the DARK
-/// palette, capturing each into a color-aware buffer snapshot. Pins that on a
-/// dark terminal background every neutral-text cell resolves to the dark
-/// palette (White / Gray) so a future change can't silently shift these
-/// surfaces off-palette.
-#[spec("theme/contrast/001")]
+/// Scenario: Read `src/ui.rs` from disk and assert it contains none of the
+/// forbidden absolute-background patterns — `bg(Color::Rgb`,
+/// `bg(palette.terminal_bg)`, `bg(palette.selected_bg)`, `bg(palette.tab_bar_bg)`.
+/// This source lint guards the `render_frame` canvas/tab-bar fills, which paint
+/// the whole window and aren't cheaply reachable through a render seam. Under
+/// the PRD #13 terminal-relative model none of these absolute fills may remain.
+/// Reintroducing any of the four patterns in `src/ui.rs` would fail this lint.
+#[spec("theme/guard/002")]
 #[test]
-fn contrast_001_overlays_dark() {
-    snapshot_overlay_surfaces(resolve_palette(Theme::Dark), "dark");
-}
-
-/// Scenario: Render the same six overlay/prompt surfaces with the LIGHT
-/// palette and snapshot each color-aware buffer. On a light terminal
-/// background the neutral text must resolve to the light palette (Black /
-/// DarkGray); any surface still emitting a hardcoded White / Gray / DarkGray
-/// is unreadable on white, and that mismatch is the regression this test
-/// guards.
-#[spec("theme/contrast/002")]
-#[test]
-fn contrast_002_overlays_light() {
-    snapshot_overlay_surfaces(resolve_palette(Theme::Light), "light");
+fn guard_002_no_absolute_bg_in_source() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui.rs");
+    let src = std::fs::read_to_string(path).expect("src/ui.rs should be readable");
+    for forbidden in [
+        "bg(Color::Rgb",
+        "bg(palette.terminal_bg)",
+        "bg(palette.selected_bg)",
+        "bg(palette.tab_bar_bg)",
+    ] {
+        assert!(
+            !src.contains(forbidden),
+            "src/ui.rs still contains forbidden absolute-background pattern `{forbidden}` — \
+             terminal-relative surfaces must use Color::Reset / Modifier::REVERSED"
+        );
+    }
 }

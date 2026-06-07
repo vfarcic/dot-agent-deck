@@ -29,7 +29,6 @@ pub mod state;
 pub mod tab;
 pub mod tab_layout;
 pub mod terminal_widget;
-pub mod theme;
 pub mod ui;
 pub mod version;
 pub mod watch;

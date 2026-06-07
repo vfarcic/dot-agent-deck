@@ -25,7 +25,33 @@ use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, Shared
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
 use crate::tab_layout::fit_tab_labels;
 use crate::terminal_widget::TerminalWidget;
-use crate::theme::ColorPalette;
+
+// ---------------------------------------------------------------------------
+// Terminal-relative text styles (PRD #13)
+// ---------------------------------------------------------------------------
+//
+// Every neutral color the dashboard emits is expressed in the terminal's own
+// frame of reference, so it stays legible on both light and dark terminals —
+// no absolute `Color::Rgb(..)` is painted on text or contrast-critical
+// surfaces. Backgrounds are left as the terminal default (`Color::Reset`),
+// primary text uses the terminal's default foreground, secondary/muted text
+// dims that same foreground (rather than hardcoding a gray), and selection /
+// active-tab highlights invert in place via `Modifier::REVERSED`. Semantic
+// accent/status colors stay as named ANSI (Cyan/Yellow/Red/Green/Blue/
+// Magenta), which terminal themes already remap.
+
+/// Primary / body text: the terminal's default foreground.
+fn text_primary() -> Style {
+    Style::default().fg(Color::Reset)
+}
+
+/// Secondary / muted text: the terminal foreground, dimmed *relative* to it
+/// (not a hardcoded gray) so it reads as de-emphasized on any background.
+fn text_dim() -> Style {
+    Style::default()
+        .fg(Color::Reset)
+        .add_modifier(Modifier::DIM)
+}
 
 impl fmt::Display for crate::event::AgentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -579,7 +605,6 @@ struct UiState {
     /// Maps pane_id → launch metadata for auto-save/restore.
     pane_metadata: HashMap<String, config::SavedPane>,
     config: DashboardConfig,
-    palette: ColorPalette,
     /// Tracks last-seen status per session for bell transition detection.
     last_bell_status: HashMap<String, SessionStatus>,
     /// Populated by the background version-check task when a newer release is available.
@@ -660,7 +685,7 @@ struct TextSelection {
 }
 
 impl UiState {
-    fn new(config: DashboardConfig, palette: ColorPalette) -> Self {
+    fn new(config: DashboardConfig) -> Self {
         Self {
             mode: UiMode::Normal,
             selected_index: 0,
@@ -676,7 +701,6 @@ impl UiState {
             pane_display_names: HashMap::new(),
             pane_metadata: HashMap::new(),
             config,
-            palette,
             last_bell_status: HashMap::new(),
             update_available: None,
             pane_layout: PaneLayout::Stacked,
@@ -705,7 +729,7 @@ impl UiState {
 
 impl Default for UiState {
     fn default() -> Self {
-        Self::new(DashboardConfig::default(), ColorPalette::dark())
+        Self::new(DashboardConfig::default())
     }
 }
 
@@ -2699,7 +2723,6 @@ pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
     config: DashboardConfig,
-    palette: ColorPalette,
     continue_session: bool,
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
@@ -2722,7 +2745,7 @@ pub fn run_tui(
 
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
-    let mut ui = UiState::new(config, palette);
+    let mut ui = UiState::new(config);
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -5434,7 +5457,6 @@ fn render_frame(
     tab_bar: &TabBarInfo,
 ) {
     let area = frame.area();
-    let palette = ui.palette;
     ui.side_pane_rects.clear();
     ui.agent_pane_rect = None;
 
@@ -5443,12 +5465,9 @@ fn render_frame(
         ActiveTabView::Mode { mode_name, .. } => Some(mode_name.as_str()),
     };
 
-    // Fill entire frame with terminal background so nothing falls through
-    // to the alternate screen default (which may be black on light themes).
-    frame.render_widget(
-        Block::default().style(Style::default().bg(palette.terminal_bg)),
-        area,
-    );
+    // PRD #13: the canvas is left unpainted so the terminal's own background
+    // shows through (`Color::Reset`). Filling it with an absolute color was
+    // the original light-terminal bug — a black slab over a light theme.
 
     // Layout: optional tab bar at top, main content, hints bar at bottom.
     let (main_area, hints_area) = if tab_bar.show {
@@ -5467,20 +5486,19 @@ fn render_frame(
             .iter()
             .map(|l| Line::from(format!(" {l} ")))
             .collect();
-        // Fill tab bar row with distinct background.
-        frame.render_widget(
-            Block::default().style(Style::default().bg(palette.tab_bar_bg)),
-            chunks[0],
-        );
-        // Active tab: inverted colors for high contrast.
+        // Active tab: REVERSED inverts the terminal's own fg/bg in place — a
+        // self-contained, single-frame highlight that needs no absolute color
+        // and so reads correctly on light and dark terminals alike. Inactive
+        // tabs stay dimmed via the base style; the highlight clears that DIM
+        // (ratatui patches highlight_style onto the base) so the active tab
+        // reads at full strength rather than a dimmed REVERSED.
         let tabs_widget = Tabs::new(titles)
             .select(tab_bar.active_index)
-            .style(Style::default().fg(palette.text_muted))
+            .style(text_dim())
             .highlight_style(
                 Style::default()
-                    .fg(palette.terminal_bg)
-                    .bg(palette.text_secondary)
-                    .add_modifier(Modifier::BOLD),
+                    .remove_modifier(Modifier::DIM)
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD),
             )
             .divider("│");
         frame.render_widget(tabs_widget, chunks[0]);
@@ -5572,7 +5590,7 @@ fn render_frame(
         let msg = Paragraph::new(format!(
             "No active sessions. Press {MOD_KEY}+n to create a pane."
         ))
-        .style(Style::default().fg(palette.text_secondary))
+        .style(text_dim())
         .centered();
         frame.render_widget(msg, vertical[1]);
         render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
@@ -5586,12 +5604,11 @@ fn render_frame(
                 pane_layout,
                 &ui.pane_display_names,
                 &ui.selection,
-                palette,
                 None,
             );
         }
 
-        render_overlays(frame, ui, active_mode_name, palette);
+        render_overlays(frame, ui, active_mode_name);
         return;
     }
 
@@ -5632,7 +5649,7 @@ fn render_frame(
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(title_text, Style::default().fg(palette.text_secondary)),
+        Span::styled(title_text, text_dim()),
     ]));
 
     if sessions.is_empty() {
@@ -5646,7 +5663,7 @@ fn render_frame(
         frame.render_widget(title, vertical[0]);
 
         let msg = Paragraph::new("No sessions match filter.")
-            .style(Style::default().fg(palette.text_secondary))
+            .style(text_dim())
             .centered();
         let inner = Layout::vertical([
             Constraint::Fill(1),
@@ -5661,7 +5678,6 @@ fn render_frame(
             &state.aggregate_stats(),
             vertical[2],
             active_mode_name,
-            palette,
         );
         render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
         // Still render live terminal panes even when filter matches zero sessions.
@@ -5674,11 +5690,10 @@ fn render_frame(
                 pane_layout,
                 &ui.pane_display_names,
                 &ui.selection,
-                palette,
                 None,
             );
         }
-        render_overlays(frame, ui, active_mode_name, palette);
+        render_overlays(frame, ui, active_mode_name);
         return;
     }
 
@@ -5736,7 +5751,6 @@ fn render_frame(
                 display_name,
                 card_number,
                 density,
-                palette,
                 idle_art,
             );
         }
@@ -5749,7 +5763,6 @@ fn render_frame(
         &state.aggregate_stats(),
         stats_area,
         active_mode_name,
-        palette,
     );
 
     // Full-width hints bar
@@ -5765,49 +5778,38 @@ fn render_frame(
             pane_layout,
             &ui.pane_display_names,
             &ui.selection,
-            palette,
             None,
         );
     }
 
-    render_overlays(frame, ui, active_mode_name, palette);
+    render_overlays(frame, ui, active_mode_name);
 }
 
-fn render_overlays(
-    frame: &mut Frame,
-    ui: &mut UiState,
-    active_mode_name: Option<&str>,
-    palette: ColorPalette,
-) {
+fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option<&str>) {
     if ui.mode == UiMode::Help {
-        render_help_overlay(frame, active_mode_name, palette);
+        render_help_overlay(frame, active_mode_name);
     }
     if ui.mode == UiMode::DirPicker
         && let Some(picker) = ui.dir_picker.as_mut()
     {
-        render_dir_picker(frame, picker, palette);
+        render_dir_picker(frame, picker);
     }
     if ui.mode == UiMode::NewPaneForm
         && let Some(ref form) = ui.new_pane_form
     {
-        render_new_pane_form(frame, form, palette);
+        render_new_pane_form(frame, form);
     }
     if ui.mode == UiMode::StarPrompt {
-        render_star_prompt(frame, palette);
+        render_star_prompt(frame);
     }
     if ui.mode == UiMode::ConfigGenPrompt {
-        render_config_gen_prompt(frame, ui.config_gen_selected, palette);
+        render_config_gen_prompt(frame, ui.config_gen_selected);
     }
     if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame, ui.quit_confirm_selected, palette);
+        render_quit_confirm(frame, ui.quit_confirm_selected);
     }
     if ui.mode == UiMode::StopConfirm {
-        render_stop_confirm(
-            frame,
-            ui.stop_confirm_selected,
-            ui.stop_confirm_agent_count,
-            palette,
-        );
+        render_stop_confirm(frame, ui.stop_confirm_selected, ui.stop_confirm_agent_count);
     }
 }
 
@@ -5820,7 +5822,6 @@ fn render_terminal_panes(
     layout: PaneLayout,
     display_names: &HashMap<String, String>,
     selection: &Option<TextSelection>,
-    palette: ColorPalette,
     visual_focus_id: Option<&str>,
 ) -> Option<Rect> {
     let ctrl = embedded?;
@@ -5860,7 +5861,7 @@ fn render_terminal_panes(
                 if let Some(screen) = ctrl.get_screen(pane_id) {
                     let focused = focused_id.as_deref() == Some(pane_id.as_str());
                     let title = pane_name(pane_id);
-                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused, palette);
+                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused);
                     if focused {
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
@@ -5898,8 +5899,7 @@ fn render_terminal_panes(
                 if is_expanded {
                     if let Some(screen) = ctrl.get_screen(pane_id) {
                         let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
-                        let widget =
-                            TerminalWidget::new(Arc::clone(&screen), title, is_focused, palette);
+                        let widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused);
                         if is_focused {
                             focused_pane_rect = Some(chunks[i]);
                             focused_screen = Some(screen);
@@ -5910,7 +5910,7 @@ fn render_terminal_panes(
                     // Collapsed: show a titled border block.
                     let block = Block::default()
                         .borders(Borders::TOP)
-                        .border_style(Style::default().fg(palette.text_secondary))
+                        .border_style(text_dim())
                         .title(format!(" {title} "));
                     frame.render_widget(block, chunks[i]);
                 }
@@ -5993,8 +5993,6 @@ fn render_mode_tab(
     show_tab_bar: bool,
     focused_side_pane_index: Option<usize>,
 ) {
-    let palette = ui.palette;
-
     // Determine which pane ID should appear visually focused.
     let agent_visual_focus: Option<&str> = if focused_side_pane_index.is_none() {
         Some(agent_pane_id)
@@ -6024,7 +6022,6 @@ fn render_mode_tab(
             PaneLayout::Stacked,
             &ui.pane_display_names,
             &ui.selection,
-            palette,
             agent_visual_focus,
         );
         if rect.is_some() {
@@ -6042,7 +6039,6 @@ fn render_mode_tab(
             PaneLayout::Tiled,
             &ui.pane_display_names,
             &ui.selection,
-            palette,
             side_visual_focus.as_deref(),
         );
         // Use side pane rect when a side pane is visually focused, or as fallback.
@@ -6065,7 +6061,7 @@ fn render_mode_tab(
     // Full-width hints bar
     render_bottom_bar(frame, ui, hints_area, has_pane_control, show_tab_bar, true);
 
-    render_overlays(frame, ui, active_mode_name, palette);
+    render_overlays(frame, ui, active_mode_name);
 }
 
 fn render_stats_bar(
@@ -6073,7 +6069,6 @@ fn render_stats_bar(
     stats: &DashboardStats,
     area: Rect,
     active_mode_name: Option<&str>,
-    palette: ColorPalette,
 ) {
     let mut spans: Vec<Span> = Vec::new();
 
@@ -6085,43 +6080,37 @@ fn render_stats_bar(
             .add_modifier(Modifier::BOLD),
     ));
 
-    let segments: &[(usize, &str, Color)] = &[
-        (stats.working, "working", Color::Green),
-        (stats.thinking, "thinking", Color::Blue),
-        (stats.compacting, "compacting", Color::Magenta),
-        (stats.waiting, "waiting", Color::Yellow),
-        (stats.errors, "error", Color::Red),
-        (stats.idle, "idle", palette.text_secondary),
+    // Semantic statuses keep their named-ANSI accent; idle is neutral, so it
+    // dims the terminal foreground (text_dim) rather than carrying a color.
+    let segments: &[(usize, &str, Style)] = &[
+        (stats.working, "working", Style::default().fg(Color::Green)),
+        (stats.thinking, "thinking", Style::default().fg(Color::Blue)),
+        (
+            stats.compacting,
+            "compacting",
+            Style::default().fg(Color::Magenta),
+        ),
+        (stats.waiting, "waiting", Style::default().fg(Color::Yellow)),
+        (stats.errors, "error", Style::default().fg(Color::Red)),
+        (stats.idle, "idle", text_dim()),
     ];
 
-    for &(count, label, color) in segments {
+    for &(count, label, style) in segments {
         if count > 0 {
-            spans.push(Span::styled(
-                "  \u{2502}  ",
-                Style::default().fg(palette.text_muted),
-            ));
-            spans.push(Span::styled(
-                format!("{count} {label}"),
-                Style::default().fg(color),
-            ));
+            spans.push(Span::styled("  \u{2502}  ", text_dim()));
+            spans.push(Span::styled(format!("{count} {label}"), style));
         }
     }
 
     // Always show total tools
-    spans.push(Span::styled(
-        "  \u{2502}  ",
-        Style::default().fg(palette.text_muted),
-    ));
+    spans.push(Span::styled("  \u{2502}  ", text_dim()));
     spans.push(Span::styled(
         format!("{} tools", stats.total_tools),
-        Style::default().fg(palette.text_secondary),
+        text_dim(),
     ));
 
     if let Some(name) = active_mode_name {
-        spans.push(Span::styled(
-            "  \u{2502}  ",
-            Style::default().fg(palette.text_muted),
-        ));
+        spans.push(Span::styled("  \u{2502}  ", text_dim()));
         spans.push(Span::styled(
             format!("mode: {name}"),
             Style::default()
@@ -6192,10 +6181,7 @@ fn render_bottom_bar(
                 } else {
                     format!("?: help  1-9: jump  {MOD_KEY}+c: quit{tab_hint}")
                 };
-                let mut spans = vec![Span::styled(
-                    hints,
-                    Style::default().fg(ui.palette.text_secondary),
-                )];
+                let mut spans = vec![Span::styled(hints, text_dim())];
                 if let Some(ref latest) = ui.update_available {
                     spans.push(Span::raw("  "));
                     spans.push(Span::styled(
@@ -6216,7 +6202,7 @@ fn render_bottom_bar(
     }
 }
 
-fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette) {
+fn render_quit_confirm(frame: &mut Frame, selected: usize) {
     let area = frame.area();
     let popup_width = 64u16.min(area.width.saturating_sub(4));
     let popup_height = 10u16.min(area.height.saturating_sub(4));
@@ -6255,7 +6241,7 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(palette.text_secondary)
+            text_dim()
         };
         text.push(Line::styled(
             format!("  {cursor} {label:<7} \u{2014} {desc}"),
@@ -6266,7 +6252,7 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
     text.push(Line::from(""));
     text.push(Line::styled(
         "  Up/Down: navigate  Enter: confirm  Esc: cancel",
-        Style::default().fg(palette.text_secondary),
+        text_dim(),
     ));
 
     let block = Block::default()
@@ -6277,8 +6263,7 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
                 .add_modifier(Modifier::BOLD),
         )
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(palette.terminal_bg));
+        .border_style(Style::default().fg(Color::Yellow));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
@@ -6287,12 +6272,7 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
 /// Stop with at least one managed agent alive. Renders the count
 /// explicitly so the user sees exactly how many agents are about to be
 /// terminated. Default selection is No (index 0).
-fn render_stop_confirm(
-    frame: &mut Frame,
-    selected: usize,
-    agent_count: usize,
-    palette: ColorPalette,
-) {
+fn render_stop_confirm(frame: &mut Frame, selected: usize, agent_count: usize) {
     let area = frame.area();
     let popup_width = 68u16.min(area.width.saturating_sub(4));
     let popup_height = 10u16.min(area.height.saturating_sub(4));
@@ -6329,7 +6309,7 @@ fn render_stop_confirm(
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(palette.text_secondary)
+            text_dim()
         };
         text.push(Line::styled(
             format!("  {cursor} {label:<5} \u{2014} {desc}"),
@@ -6340,20 +6320,19 @@ fn render_stop_confirm(
     text.push(Line::from(""));
     text.push(Line::styled(
         "  y / Enter on Yes confirms  ·  n / Esc / Enter on No returns to Quit dialog",
-        Style::default().fg(palette.text_secondary),
+        text_dim(),
     ));
 
     let block = Block::default()
         .title(" Stop ")
         .title_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
-        .style(Style::default().bg(palette.terminal_bg));
+        .border_style(Style::default().fg(Color::Red));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
+fn render_star_prompt(frame: &mut Frame) {
     let area = frame.area();
     let popup_width = 50u16.min(area.width.saturating_sub(4));
     let popup_height = 10u16.min(area.height.saturating_sub(4));
@@ -6365,14 +6344,8 @@ fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
 
     let text = vec![
         Line::from(""),
-        Line::styled(
-            "  If you find dot-agent-deck useful,",
-            Style::default().fg(palette.text_primary),
-        ),
-        Line::styled(
-            "  please consider starring the repo!",
-            Style::default().fg(palette.text_primary),
-        ),
+        Line::styled("  If you find dot-agent-deck useful,", text_primary()),
+        Line::styled("  please consider starring the repo!", text_primary()),
         Line::from(""),
         Line::styled(
             "  github.com/vfarcic/dot-agent-deck",
@@ -6381,10 +6354,7 @@ fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
                 .add_modifier(Modifier::UNDERLINED),
         ),
         Line::from(""),
-        Line::styled(
-            "  s Star  l Later  d Don't ask again",
-            Style::default().fg(palette.text_secondary),
-        ),
+        Line::styled("  s Star  l Later  d Don't ask again", text_dim()),
     ];
 
     let block = Block::default()
@@ -6395,14 +6365,13 @@ fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
                 .add_modifier(Modifier::BOLD),
         )
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(palette.terminal_bg));
+        .border_style(Style::default().fg(Color::Yellow));
 
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPalette) {
+fn render_config_gen_prompt(frame: &mut Frame, selected: usize) {
     let area = frame.area();
     let popup_width = 60u16.min(area.width.saturating_sub(4));
     let popup_height = 14u16.min(area.height.saturating_sub(4));
@@ -6420,18 +6389,9 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPa
 
     let mut text = vec![
         Line::from(""),
-        Line::styled(
-            "  No workspace modes config found for this",
-            Style::default().fg(palette.text_primary),
-        ),
-        Line::styled(
-            "  project. Want to instruct your agent to",
-            Style::default().fg(palette.text_primary),
-        ),
-        Line::styled(
-            "  analyze the project and create one?",
-            Style::default().fg(palette.text_primary),
-        ),
+        Line::styled("  No workspace modes config found for this", text_primary()),
+        Line::styled("  project. Want to instruct your agent to", text_primary()),
+        Line::styled("  analyze the project and create one?", text_primary()),
         Line::from(""),
     ];
 
@@ -6442,7 +6402,7 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPa
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(palette.text_secondary)
+            text_dim()
         };
         text.push(Line::styled(
             format!("  {cursor} {label:<6} \u{2014} {desc}"),
@@ -6453,12 +6413,12 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPa
     text.push(Line::from(""));
     text.push(Line::styled(
         "  Disable: dot-agent-deck config set auto_config_prompt false",
-        Style::default().fg(palette.text_secondary),
+        text_dim(),
     ));
     text.push(Line::from(""));
     text.push(Line::styled(
         "  Up/Down: navigate  Enter: confirm  Esc: cancel",
-        Style::default().fg(palette.text_secondary),
+        text_dim(),
     ));
 
     let block = Block::default()
@@ -6469,14 +6429,13 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPa
                 .add_modifier(Modifier::BOLD),
         )
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(palette.terminal_bg));
+        .border_style(Style::default().fg(Color::Cyan));
 
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_help_overlay(frame: &mut Frame, active_mode_name: Option<&str>, palette: ColorPalette) {
+fn render_help_overlay(frame: &mut Frame, active_mode_name: Option<&str>) {
     let cyan = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
@@ -6567,8 +6526,7 @@ fn render_help_overlay(frame: &mut Frame, active_mode_name: Option<&str>, palett
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Help ")
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(palette.terminal_bg));
+        .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
@@ -6590,15 +6548,12 @@ fn render_help_overlay(frame: &mut Frame, active_mode_name: Option<&str>, palett
 
     let footer = Paragraph::new(vec![
         Line::from(""),
-        Line::styled(
-            "  Press ? or Esc to close",
-            Style::default().fg(palette.text_secondary),
-        ),
+        Line::styled("  Press ? or Esc to close", text_dim()),
     ]);
     frame.render_widget(footer, footer_area);
 }
 
-fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: ColorPalette) {
+fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) {
     let area = frame.area();
     let popup_width = 60.min(area.width.saturating_sub(4));
     let popup_height = 20u16.min(area.height.saturating_sub(4));
@@ -6627,14 +6582,8 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
     )];
 
     if show_filter_row {
-        let mut spans = vec![Span::styled(
-            "  / ",
-            Style::default().fg(palette.text_secondary),
-        )];
-        spans.push(Span::styled(
-            picker.filter_text.clone(),
-            Style::default().fg(palette.text_primary),
-        ));
+        let mut spans = vec![Span::styled("  / ", text_dim())];
+        spans.push(Span::styled(picker.filter_text.clone(), text_primary()));
         if picker.filtering {
             spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
         }
@@ -6649,10 +6598,7 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
         } else {
             "  (no matching directories)"
         };
-        lines.push(Line::styled(
-            message,
-            Style::default().fg(palette.text_muted),
-        ));
+        lines.push(Line::styled(message, text_dim()));
     } else {
         for (i, entry_idx) in picker
             .filtered_indices
@@ -6677,7 +6623,7 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                text_primary()
             };
             let suffix = if is_parent { "" } else { "/" };
             lines.push(Line::styled(format!("{prefix}{name}{suffix}"), style));
@@ -6690,10 +6636,7 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
     } else {
         "  j/k or ↑↓: navigate  l/Enter: open  Space: select  h/Backspace: up"
     };
-    lines.push(Line::styled(
-        nav_footer,
-        Style::default().fg(palette.text_secondary),
-    ));
+    lines.push(Line::styled(nav_footer, text_dim()));
     let mode_footer = if picker.filtering {
         "  Typing: add characters  Enter: accept filter  Esc: clear"
     } else if !picker.filter_text.is_empty() {
@@ -6701,16 +6644,12 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
     } else {
         "  /: filter directories  Esc or q: cancel"
     };
-    lines.push(Line::styled(
-        mode_footer,
-        Style::default().fg(palette.text_secondary),
-    ));
+    lines.push(Line::styled(mode_footer, text_dim()));
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Select Directory ")
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(palette.terminal_bg));
+        .border_style(Style::default().fg(Color::Cyan));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 }
@@ -6731,7 +6670,7 @@ fn new_pane_form_footer_hint(has_mode_field: bool, name_submits: bool) -> &'stat
     }
 }
 
-fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: ColorPalette) {
+fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) {
     let area = frame.area();
     let popup_width = 56.min(area.width.saturating_sub(4));
     // The mode field (when modes exist) or the tip line (when they don't)
@@ -6753,7 +6692,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
     let focused_label = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
-    let unfocused_label = Style::default().fg(palette.text_secondary);
+    let unfocused_label = text_dim();
 
     let mode_style = if form.focused == FormField::Mode {
         focused_label
@@ -6786,7 +6725,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
         lines.push(Line::styled(
             "  Tip: press g on dashboard to create modes",
             Style::default()
-                .fg(palette.hint_accent)
+                .fg(Color::Yellow)
                 .add_modifier(Modifier::ITALIC),
         ));
         lines.push(Line::from(""));
@@ -6799,7 +6738,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
             mode_name.to_string()
         };
         let mode_value_style = if form.focused == FormField::Mode {
-            Style::default().fg(palette.text_primary)
+            text_primary()
         } else {
             unfocused_label
         };
@@ -6819,7 +6758,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
                 width = inner_width.saturating_sub(11)
             ),
             if form.focused == FormField::Name {
-                Style::default().fg(palette.text_primary)
+                text_primary()
             } else {
                 unfocused_label
             },
@@ -6836,7 +6775,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
                     width = inner_width.saturating_sub(11)
                 ),
                 if form.focused == FormField::Command {
-                    Style::default().fg(palette.text_primary)
+                    text_primary()
                 } else {
                     unfocused_label
                 },
@@ -6851,10 +6790,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
     // the generic "Enter: next" wording, which is misleading in that state.
     let name_submits = form.focused == FormField::Name && !cmd_visible;
     let footer = new_pane_form_footer_hint(form.has_mode_field, name_submits);
-    lines.push(Line::styled(
-        footer,
-        Style::default().fg(palette.text_secondary),
-    ));
+    lines.push(Line::styled(footer, text_dim()));
 
     let title = match form.selected_mode() {
         Some(cfg) => format!(" New Agent \u{2014} {} mode ", cfg.name),
@@ -6863,8 +6799,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(palette.terminal_bg));
+        .border_style(Style::default().fg(Color::Cyan));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 
@@ -6917,16 +6852,15 @@ fn render_session_card(
     display_name: Option<&String>,
     card_number: Option<u8>,
     density: CardDensity,
-    palette: ColorPalette,
     idle_art: Option<&IdleArtEntry>,
 ) {
     let is_placeholder = session.agent_type == crate::event::AgentType::None;
     let (status_label, status_style) = if is_placeholder {
-        ("No agent", Style::default().fg(palette.text_secondary))
+        ("No agent", text_dim())
     } else {
         status_style(&session.status)
     };
-    let status_color = status_style.fg.unwrap_or(palette.text_secondary);
+    let status_color = status_style.fg.unwrap_or(Color::Reset);
 
     let id_display = if session.session_id.len() > 11 {
         &session.session_id[..11]
@@ -6958,6 +6892,11 @@ fn render_session_card(
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
+    } else if is_placeholder {
+        // Placeholder ("No agent") cards read as secondary: dim the terminal's
+        // own foreground (matching the prior DarkGray intent) so the empty slot
+        // doesn't draw a full-strength border like a live agent.
+        text_dim()
     } else {
         Style::default().fg(status_color)
     };
@@ -6967,9 +6906,7 @@ fn render_session_card(
         .border_style(border_style)
         .title(Span::styled(
             title_left,
-            Style::default()
-                .fg(palette.text_primary)
-                .add_modifier(Modifier::BOLD),
+            text_primary().add_modifier(Modifier::BOLD),
         ))
         .title_alignment(ratatui::layout::Alignment::Left)
         .title(
@@ -6978,7 +6915,10 @@ fn render_session_card(
         );
 
     if is_selected {
-        block = block.style(Style::default().bg(palette.selected_bg));
+        // REVERSED inverts the terminal's own fg/bg for the whole card — a
+        // self-contained highlight that needs no absolute `selected_bg` tint
+        // and reads correctly on light and dark terminals (PRD #13).
+        block = block.style(Style::default().add_modifier(Modifier::REVERSED));
     }
 
     let inner = block.inner(area);
@@ -7000,9 +6940,9 @@ fn render_session_card(
 
     if wide {
         let right_spans = vec![
-            Span::styled("Last: ", Style::default().fg(palette.text_secondary)),
+            Span::styled("Last: ", text_dim()),
             Span::raw(format!("{}  ", elapsed)),
-            Span::styled("Tools: ", Style::default().fg(palette.text_secondary)),
+            Span::styled("Tools: ", text_dim()),
             Span::raw(session.tool_count.to_string()),
         ];
         let right_len: usize = right_spans.iter().map(|s| s.width()).sum();
@@ -7012,16 +6952,13 @@ fn render_session_card(
         let dir_display = truncate_with_ellipsis(cwd_display.as_ref(), max_dir);
 
         lines.push(padded_line(
-            vec![
-                Span::styled("Dir:  ", Style::default().fg(palette.text_secondary)),
-                Span::raw(dir_display),
-            ],
+            vec![Span::styled("Dir:  ", text_dim()), Span::raw(dir_display)],
             right_spans,
             w,
         ));
     } else {
         lines.push(Line::from(vec![
-            Span::styled("Dir:  ", Style::default().fg(palette.text_secondary)),
+            Span::styled("Dir:  ", text_dim()),
             Span::raw(cwd_display),
         ]));
     }
@@ -7029,7 +6966,7 @@ fn render_session_card(
     if is_placeholder {
         lines.push(Line::from(Span::styled(
             "Launch an agent to get started",
-            Style::default().fg(palette.text_muted),
+            text_dim(),
         )));
     } else {
         let prompts = collect_recent_prompts(session, density.max_prompts());
@@ -7038,7 +6975,7 @@ fn render_session_card(
             let max_prompt = w.saturating_sub(6);
             let display = truncate_with_ellipsis(prompt, max_prompt);
             lines.push(Line::from(vec![
-                Span::styled(prefix, Style::default().fg(palette.text_secondary)),
+                Span::styled(prefix, text_dim()),
                 Span::raw(display),
             ]));
         }
@@ -7046,9 +6983,9 @@ fn render_session_card(
 
     if !wide {
         lines.push(Line::from(vec![
-            Span::styled("Last: ", Style::default().fg(palette.text_secondary)),
+            Span::styled("Last: ", text_dim()),
             Span::raw(format!("{}  ", elapsed)),
-            Span::styled("Tools: ", Style::default().fg(palette.text_secondary)),
+            Span::styled("Tools: ", text_dim()),
             Span::raw(session.tool_count.to_string()),
         ]));
     }
@@ -7056,7 +6993,7 @@ fn render_session_card(
     if density != CardDensity::Compact {
         lines.push(Line::from(""));
     }
-    let tool_lines = recent_tool_lines(session, density.max_tools(), palette);
+    let tool_lines = recent_tool_lines(session, density.max_tools());
     lines.extend(tool_lines);
 
     let content = Paragraph::new(lines);
@@ -7074,12 +7011,7 @@ fn render_session_card(
         let frame_index = (tick / 120) as usize % art.frames.len();
         let art_lines: Vec<Line<'_>> = art.frames[frame_index]
             .lines()
-            .map(|l| {
-                Line::from(Span::styled(
-                    l.to_string(),
-                    Style::default().fg(palette.text_primary),
-                ))
-            })
+            .map(|l| Line::from(Span::styled(l.to_string(), text_primary())))
             .collect();
         let art_widget = Paragraph::new(art_lines);
         frame.render_widget(art_widget, inner);
@@ -7130,11 +7062,7 @@ fn collect_recent_prompts(session: &SessionState, max: usize) -> Vec<String> {
     prompts
 }
 
-fn recent_tool_lines(
-    session: &SessionState,
-    max_tools: usize,
-    palette: ColorPalette,
-) -> Vec<Line<'static>> {
+fn recent_tool_lines(session: &SessionState, max_tools: usize) -> Vec<Line<'static>> {
     let tool_events: Vec<_> = session
         .recent_events
         .iter()
@@ -7156,7 +7084,7 @@ fn recent_tool_lines(
             } else {
                 format!("  {} — {}", name, detail)
             };
-            Line::styled(text, Style::default().fg(palette.text_muted))
+            Line::styled(text, text_dim())
         })
         .collect()
 }
@@ -7430,7 +7358,6 @@ where
 pub fn render_stats_bar_to_buffer(
     stats: &DashboardStats,
     active_mode_name: Option<&str>,
-    palette: ColorPalette,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -7441,7 +7368,7 @@ pub fn render_stats_bar_to_buffer(
             width,
             height,
         };
-        render_stats_bar(frame, stats, area, active_mode_name, palette);
+        render_stats_bar(frame, stats, area, active_mode_name);
     })
 }
 
@@ -7450,12 +7377,11 @@ pub fn render_stats_bar_to_buffer(
 #[doc(hidden)]
 pub fn render_quit_confirm_to_buffer(
     selected: usize,
-    palette: ColorPalette,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        render_quit_confirm(frame, selected, palette);
+        render_quit_confirm(frame, selected);
     })
 }
 
@@ -7465,25 +7391,20 @@ pub fn render_quit_confirm_to_buffer(
 pub fn render_stop_confirm_to_buffer(
     selected: usize,
     agent_count: usize,
-    palette: ColorPalette,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        render_stop_confirm(frame, selected, agent_count, palette);
+        render_stop_confirm(frame, selected, agent_count);
     })
 }
 
 /// L1 test seam: render `render_star_prompt` into a standalone Buffer.
 /// See `render_stats_bar_to_buffer` for the rationale.
 #[doc(hidden)]
-pub fn render_star_prompt_to_buffer(
-    palette: ColorPalette,
-    width: u16,
-    height: u16,
-) -> ratatui::buffer::Buffer {
+pub fn render_star_prompt_to_buffer(width: u16, height: u16) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        render_star_prompt(frame, palette);
+        render_star_prompt(frame);
     })
 }
 
@@ -7492,12 +7413,11 @@ pub fn render_star_prompt_to_buffer(
 #[doc(hidden)]
 pub fn render_config_gen_prompt_to_buffer(
     selected: usize,
-    palette: ColorPalette,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        render_config_gen_prompt(frame, selected, palette);
+        render_config_gen_prompt(frame, selected);
     })
 }
 
@@ -7508,7 +7428,9 @@ pub fn render_config_gen_prompt_to_buffer(
 /// Wraps the internal `render_session_card` so the L1 snapshot test in
 /// `tests/render_dashboard.rs` can pin a card's text layout without
 /// re-implementing the renderer. See PRD #77 catalog entry
-/// `dashboard/pane/004`.
+/// `dashboard/pane/004`. The `selected` flag drives the renderer's
+/// selection-highlight path so tests can pin the highlight styling
+/// (PRD #13 `theme/guard/001`).
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_card_to_buffer(
@@ -7516,8 +7438,8 @@ pub fn render_card_to_buffer(
     display_name: Option<&str>,
     card_number: Option<u8>,
     density: CardDensityKind,
-    palette: ColorPalette,
     tick: u64,
+    selected: bool,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -7540,11 +7462,10 @@ pub fn render_card_to_buffer(
                 area,
                 session,
                 tick,
-                false,
+                selected,
                 display_name_owned.as_ref(),
                 card_number,
                 density.into(),
-                palette,
                 None,
             );
         })
@@ -9247,8 +9168,7 @@ mod tests {
             agent_id: None,
         };
 
-        let palette = ColorPalette::dark();
-        let lines = recent_tool_lines(&session, 3, palette);
+        let lines = recent_tool_lines(&session, 3);
         assert_eq!(lines.len(), 3);
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert_eq!(text[0], "  Write — out.txt");
@@ -9256,7 +9176,7 @@ mod tests {
         assert_eq!(text[2], "  Grep — pattern");
 
         // Compact mode: only 1 tool (most recent)
-        let lines_compact = recent_tool_lines(&session, 1, palette);
+        let lines_compact = recent_tool_lines(&session, 1);
         assert_eq!(lines_compact.len(), 1);
         assert_eq!(lines_compact[0].to_string(), "  Grep — pattern");
     }

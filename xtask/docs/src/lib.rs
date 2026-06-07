@@ -636,7 +636,6 @@ fn step_for_free_call(name: &str, args: &[String]) -> Option<String> {
             | "Default"
             | "format"
             | "builder"
-            | "resolve_palette"
             | "working_session_fixture"
             | "buffer_to_text"
             // M4.1 reviewer S1 follow-on: `Utc::now()` and similar

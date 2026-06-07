@@ -6,8 +6,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
-use crate::theme::ColorPalette;
-
 /// Converts a vt100 color to a ratatui Color.
 fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
     match color {
@@ -49,38 +47,36 @@ pub struct TerminalWidget {
     parser: Arc<Mutex<vt100::Parser>>,
     title: String,
     focused: bool,
-    palette: ColorPalette,
 }
 
 impl TerminalWidget {
-    pub fn new(
-        parser: Arc<Mutex<vt100::Parser>>,
-        title: String,
-        focused: bool,
-        palette: ColorPalette,
-    ) -> Self {
+    pub fn new(parser: Arc<Mutex<vt100::Parser>>, title: String, focused: bool) -> Self {
         Self {
             parser,
             title,
             focused,
-            palette,
         }
     }
 }
 
 impl Widget for TerminalWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // PRD #13: terminal-relative styling. Focused panes get a Cyan accent
+        // border; unfocused panes dim the terminal's own foreground rather than
+        // painting an absolute gray. The pane block is left unfilled so the
+        // terminal's background shows through (no absolute `terminal_bg` slab).
         let border_style = if self.focused {
             Style::default().fg(Color::Cyan)
         } else {
-            Style::default().fg(self.palette.text_secondary)
+            Style::default()
+                .fg(Color::Reset)
+                .add_modifier(Modifier::DIM)
         };
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
-            .title(self.title)
-            .style(Style::default().bg(self.palette.terminal_bg));
+            .title(self.title);
 
         let inner = block.inner(area);
         block.render(area, buf);
