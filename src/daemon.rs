@@ -13,6 +13,7 @@ use tracing::{error, info, warn};
 use crate::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS};
 use crate::error::DaemonError;
 use crate::event::{AgentEvent, BroadcastMsg, DaemonMessage};
+use crate::scheduler::Scheduler;
 use crate::state::SharedState;
 
 /// PRD #93 M1.2: default idle-shutdown window. The daemon exits this many
@@ -236,6 +237,19 @@ pub struct Daemon {
     /// environment, so the env-var fallback in `lock_root` continues
     /// to serve them.
     pub lock_dir_override: Option<PathBuf>,
+    /// PRD #127 M1.3/M1.4: the daemon-hosted scheduler. `run_daemon_with`
+    /// loads the global `schedules.toml`, registers each enabled task on this
+    /// scheduler, spawns its firing loop, and shares it with the attach server
+    /// (for `ReloadSchedules`/`RunNow`) and the idle monitor (a registered
+    /// enabled task is a third keep-alive condition). Constructed empty; tests
+    /// that don't serve schedules simply never populate the config.
+    pub scheduler: Arc<Scheduler>,
+    /// PRD #127 M2.2: in-memory tab-reuse registry keyed by scheduled task
+    /// name. A `new_tab_per_fire = false` task reuses the same tab each fire;
+    /// shared between the startup registration and the `ReloadSchedules`
+    /// handler so a reloaded task keeps reusing its tab. Wiped on restart
+    /// (not persisted) — the first post-restart fire spawns fresh.
+    pub reuse_registry: crate::spawn::ReuseRegistry,
 }
 
 impl Daemon {
@@ -255,6 +269,8 @@ impl Daemon {
             // that want it can opt in via [`with_idle_shutdown`].
             idle_shutdown: None,
             lock_dir_override: None,
+            scheduler: Arc::new(Scheduler::with_stderr_notifier()),
+            reuse_registry: crate::spawn::new_reuse_registry(),
         }
     }
 
@@ -277,6 +293,8 @@ impl Daemon {
             client_count: Arc::new(AtomicUsize::new(0)),
             idle_shutdown: idle_shutdown_from_env(),
             lock_dir_override: None,
+            scheduler: Arc::new(Scheduler::with_stderr_notifier()),
+            reuse_registry: crate::spawn::new_reuse_registry(),
         }
     }
 
@@ -379,6 +397,31 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let event_tx = daemon.event_tx;
     let client_count = daemon.client_count;
     let idle_shutdown = daemon.idle_shutdown;
+    let scheduler = daemon.scheduler;
+    let reuse_registry = daemon.reuse_registry;
+
+    // PRD #127 M1.3/M1.4: load the global `schedules.toml` and register each
+    // enabled task before the idle monitor starts, so a registered schedule is
+    // visible as a keep-alive condition from the daemon's first idle check.
+    // Config-load errors are surfaced via the scheduler's notifier; a malformed
+    // entry never blocks the daemon or the other entries. Each fire runs the
+    // spawn-or-reuse path (PRD #127 M2.2).
+    {
+        let loaded = crate::config::LoadedSchedules::load();
+        scheduler.report_config_errors(&loaded.errors);
+        scheduler.reload_apply(
+            &loaded.tasks,
+            schedule_callback_factory(pty_registry.clone(), reuse_registry.clone()),
+        );
+    }
+    // Start the per-second cron firing loop. Held as a JoinHandle and aborted
+    // on exit so it doesn't outlive the daemon.
+    let scheduler_handle = {
+        let scheduler = scheduler.clone();
+        tokio::spawn(async move {
+            scheduler.run().await;
+        })
+    };
 
     // PRD #93 M1.2 shutdown signal — `Notify` is single-shot/level-triggered
     // enough for our needs: the idle monitor notifies once when the timer
@@ -412,6 +455,8 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         // hook loop exits, run_daemon_with returns, and the registry's
         // Drop impl kills any survivors.
         let attach_shutdown = shutdown.clone();
+        let attach_scheduler = scheduler.clone();
+        let attach_reuse = reuse_registry.clone();
         Some(tokio::spawn(async move {
             if let Err(e) = crate::daemon_protocol::serve_attach_with_counter(
                 listener,
@@ -420,6 +465,8 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 attach_counter,
                 attach_state,
                 Some(attach_shutdown),
+                attach_scheduler,
+                attach_reuse,
             )
             .await
             {
@@ -441,8 +488,17 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         let registry = pty_registry.clone();
         let shutdown_signal = shutdown.clone();
         let notify = pty_registry.change_notify();
+        let idle_scheduler = scheduler.clone();
         tokio::spawn(async move {
-            run_idle_monitor(counter, registry, window, shutdown_signal, notify).await;
+            run_idle_monitor(
+                counter,
+                registry,
+                window,
+                shutdown_signal,
+                notify,
+                idle_scheduler,
+            )
+            .await;
         })
     });
 
@@ -454,9 +510,67 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     if let Some(h) = idle_handle {
         h.abort();
     }
+    scheduler_handle.abort();
     drop(pty_registry);
 
     result
+}
+
+/// Build a `reload_apply`-compatible callback factory bound to `registry`
+/// (PRD #127 M2.3). Each enabled task gets a callback that, on every fire (cron
+/// tick or run-now), calls the spawn primitive EXACTLY once with the task's
+/// configured values. The registry is the daemon's live PTY registry — the
+/// scheduler runs in-process in the daemon, so spawning goes straight through
+/// it rather than over the attach socket.
+pub(crate) fn schedule_callback_factory(
+    registry: Arc<AgentPtyRegistry>,
+    reuse: crate::spawn::ReuseRegistry,
+) -> impl FnMut(&crate::config::ScheduledTask) -> crate::scheduler::Callback {
+    move |task| make_schedule_callback(task, registry.clone(), reuse.clone())
+}
+
+/// One task's firing callback: rebuild the [`crate::spawn::SpawnRequest`] from
+/// the task's configured values and fire it via
+/// [`crate::spawn::spawn_or_reuse`] (PRD #127 M2.2) — which reuses the task's
+/// existing tab when `new_tab_per_fire == false` and a live tab is recorded,
+/// or spawns a fresh one otherwise. Spawn failures (mkdir / agent-spawn) are
+/// surfaced through the `StderrNotifier` seam and logged here; they never crash
+/// the daemon, so a bad task's fire can't take the scheduler (or sibling tasks)
+/// down. The deliver-on-idle debounce is read per-fire from the environment.
+fn make_schedule_callback(
+    task: &crate::config::ScheduledTask,
+    registry: Arc<AgentPtyRegistry>,
+    reuse: crate::spawn::ReuseRegistry,
+) -> crate::scheduler::Callback {
+    let req = crate::spawn::SpawnRequest {
+        task_name: task.name.clone(),
+        working_dir: task.working_dir.clone(),
+        command: task.command.clone(),
+        prompt: task.prompt.clone(),
+    };
+    let new_tab_per_fire = task.new_tab_per_fire;
+    Arc::new(move || {
+        let registry = registry.clone();
+        let reuse = reuse.clone();
+        let req = req.clone();
+        Box::pin(async move {
+            let notifier = crate::scheduler::StderrNotifier;
+            let debounce = crate::spawn::reuse_debounce();
+            if let Err(e) = crate::spawn::spawn_or_reuse(
+                req,
+                new_tab_per_fire,
+                &registry,
+                &reuse,
+                &notifier,
+                debounce,
+            )
+            .await
+            {
+                // Already surfaced via the notifier; log for the operator.
+                warn!(error = %e, "scheduled spawn failed");
+            }
+        })
+    })
 }
 
 /// PRD #93 M1.2 idle monitor — edge-triggered, generation-gated.
@@ -490,6 +604,7 @@ async fn run_idle_monitor(
     threshold: Duration,
     shutdown: Arc<Notify>,
     change_notify: Arc<Notify>,
+    scheduler: Arc<Scheduler>,
 ) {
     // Generation counter shared with every in-flight timer task. Each
     // task captures the value it was spawned with; on wake it compares
@@ -502,7 +617,12 @@ async fn run_idle_monitor(
     loop {
         let clients = client_count.load(Ordering::SeqCst);
         let agents = pty_registry.live_count();
-        let is_idle = clients == 0 && agents == 0;
+        // PRD #127 M1.4 idle carve-out: a registered ENABLED scheduled task is
+        // a third keep-alive condition, so the daemon doesn't idle-GC itself
+        // between fires (or before the first fire). The scheduler only ever
+        // holds enabled tasks, so `is_empty()` is `no_pending_schedules`.
+        let no_pending_schedules = scheduler.is_empty();
+        let is_idle = clients == 0 && agents == 0 && no_pending_schedules;
 
         if is_idle {
             if !armed {
@@ -515,6 +635,7 @@ async fn run_idle_monitor(
                 let registry = pty_registry.clone();
                 let shutdown_signal = shutdown.clone();
                 let gen_check = generation.clone();
+                let timer_scheduler = scheduler.clone();
                 let dur = threshold;
                 tokio::spawn(async move {
                     tokio::time::sleep(dur).await;
@@ -531,10 +652,13 @@ async fn run_idle_monitor(
                     // the generation (the increment happens on the next
                     // `change_notify` wake-up, not synchronously with
                     // the counter mutation).
-                    if counter.load(Ordering::SeqCst) == 0 && registry.live_count() == 0 {
+                    if counter.load(Ordering::SeqCst) == 0
+                        && registry.live_count() == 0
+                        && timer_scheduler.is_empty()
+                    {
                         info!(
                             threshold_secs = dur.as_secs(),
-                            "Daemon idle window elapsed (no clients, no agents); signaling shutdown"
+                            "Daemon idle window elapsed (no clients, no agents, no pending schedules); signaling shutdown"
                         );
                         shutdown_signal.notify_one();
                     }

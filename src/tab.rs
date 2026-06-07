@@ -1014,6 +1014,7 @@ mod tests {
         ModeConfig {
             name: name.to_string(),
             init_command: None,
+            seed_prompt: None,
             panes: (0..side_pane_count)
                 .map(|i| ModePersistentPane {
                     command: format!("echo side-{i}"),

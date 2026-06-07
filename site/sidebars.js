@@ -7,6 +7,7 @@ const sidebars = {
     'keyboard-shortcuts',
     'orchestration',
     'workspace-modes',
+    'scheduled-tasks',
     'configuration',
     'troubleshooting',
     'license',

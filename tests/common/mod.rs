@@ -730,6 +730,13 @@ impl TuiDeck {
         &self.attach_socket
     }
 
+    /// The deck's working directory (the copied fixture root, and the deck's
+    /// cwd). Tests use it to drop runtime files (agent scripts, record files)
+    /// the spawned agent can reach via a cwd-relative path.
+    pub fn workdir(&self) -> &Path {
+        &self.fixture_path
+    }
+
     /// Return the parsed grid contents — used by `wait_for_string`
     /// internally and by tests that want to assert on full-screen
     /// state.
@@ -1688,6 +1695,679 @@ pub fn race_safe_tempdir() -> tempfile::TempDir {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
         .expect("chmod tempdir to 0o700");
     dir
+}
+
+// ---------------------------------------------------------------------------
+// PRD #127 Phase 1 — headless `daemon serve` harness
+// ---------------------------------------------------------------------------
+//
+// The scheduler lives in the daemon, not the TUI, so its L2 tests drive the
+// real `dot-agent-deck daemon serve` process directly (no PTY / vt100 grid —
+// there is no TUI surface to render) and observe it through three channels:
+//   - OS process liveness (`try_wait`) for the idle-shutdown carve-out;
+//   - the attach socket's `AttachRequest`/`AttachResponse` control protocol
+//     for `ReloadSchedules`;
+//   - the `dot-agent-deck schedule …` CLI subprocess for the writer + reload
+//     trigger.
+//
+// All sleeping / polling lives in these helpers (in `common`, NOT in an
+// `e2e_*.rs` body) so linkage-check Decision 21 (no raw sleeps / fixed-count
+// polling in e2e test bodies) is satisfied by construction.
+
+/// A spawned headless `dot-agent-deck daemon serve` process plus the per-test
+/// tempdir paths it was pointed at. Drop kills the child so a hung daemon
+/// never leaks past the test.
+#[allow(dead_code)]
+pub struct DaemonProc {
+    child: std::process::Child,
+    /// Hook-ingestion socket (`DOT_AGENT_DECK_SOCKET`).
+    pub hook_socket: PathBuf,
+    /// Streaming attach / control socket (`DOT_AGENT_DECK_ATTACH_SOCKET`).
+    pub attach_socket: PathBuf,
+    /// Global schedules config (`DOT_AGENT_DECK_SCHEDULES`); the writer's
+    /// fixed target regardless of cwd.
+    pub schedules_path: PathBuf,
+    /// Per-test HOME.
+    pub home: PathBuf,
+    /// Env the daemon was launched with, replayed onto every `schedule` CLI
+    /// subprocess so the CLI and daemon share sockets + the schedules path.
+    env: Vec<(String, String)>,
+    /// Captured daemon stderr (the `StderrNotifier` failure-surfacing seam
+    /// writes here via `eprintln!`).
+    stderr_path: PathBuf,
+    _tempdir: tempfile::TempDir,
+}
+
+#[allow(dead_code)]
+impl Drop for DaemonProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Spawn `dot-agent-deck daemon serve` headlessly against an isolated tempdir.
+///
+/// `initial_schedules_toml` seeds the global `schedules.toml` (None = no file,
+/// i.e. an empty schedule set). `idle_shutdown_secs` is passed verbatim as
+/// `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` ("0" disables idle shutdown; a small
+/// number arms a fast idle window for the carve-out test). Blocks until the
+/// attach socket appears so callers can immediately drive the control protocol.
+#[allow(dead_code)]
+pub fn spawn_daemon_serve(
+    initial_schedules_toml: Option<&str>,
+    idle_shutdown_secs: &str,
+) -> DaemonProc {
+    spawn_daemon_serve_with_env(initial_schedules_toml, idle_shutdown_secs, &[])
+}
+
+/// Like [`spawn_daemon_serve`] but layers `extra_env` onto the daemon's
+/// environment (and onto every `schedule` CLI subprocess). Used by the spawn
+/// tests to pin `SHELL` for the `$SHELL`-fallback case.
+#[allow(dead_code)]
+pub fn spawn_daemon_serve_with_env(
+    initial_schedules_toml: Option<&str>,
+    idle_shutdown_secs: &str,
+    extra_env: &[(&str, &str)],
+) -> DaemonProc {
+    let tempdir = race_safe_tempdir();
+    let work = tempdir.path().to_path_buf();
+    let home = work.join("home");
+    std::fs::create_dir_all(&home).expect("create per-test HOME");
+    let state_dir = work.join("state");
+    let hook_socket = work.join("hook.sock");
+    let attach_socket = work.join("attach.sock");
+    let schedules_path = work.join("schedules.toml");
+    if let Some(toml) = initial_schedules_toml {
+        std::fs::write(&schedules_path, toml).expect("seed schedules.toml");
+    }
+
+    let mut env: Vec<(String, String)> = Vec::new();
+    if let Ok(p) = std::env::var("PATH") {
+        env.push(("PATH".into(), p));
+    }
+    env.push(("HOME".into(), home.to_string_lossy().into_owned()));
+    env.push(("TERM".into(), "xterm-256color".into()));
+    env.push((
+        "DOT_AGENT_DECK_SOCKET".into(),
+        hook_socket.to_string_lossy().into_owned(),
+    ));
+    env.push((
+        "DOT_AGENT_DECK_ATTACH_SOCKET".into(),
+        attach_socket.to_string_lossy().into_owned(),
+    ));
+    env.push((
+        "DOT_AGENT_DECK_STATE_DIR".into(),
+        state_dir.to_string_lossy().into_owned(),
+    ));
+    env.push((
+        "DOT_AGENT_DECK_SCHEDULES".into(),
+        schedules_path.to_string_lossy().into_owned(),
+    ));
+    env.push((
+        "DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS".into(),
+        idle_shutdown_secs.to_string(),
+    ));
+    for (k, v) in extra_env {
+        env.push(((*k).to_string(), (*v).to_string()));
+    }
+
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("daemon").arg("serve");
+    cmd.env_clear();
+    for (k, v) in &env {
+        cmd.env(k, v);
+    }
+    // Capture stderr to a file so tests can observe the scheduler's
+    // failure-surfacing notifications (`StderrNotifier` → `eprintln!`).
+    let stderr_path = work.join("daemon-stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create daemon stderr log");
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::from(stderr_file));
+    let child = cmd.spawn().expect("spawn `dot-agent-deck daemon serve`");
+
+    let proc = DaemonProc {
+        child,
+        hook_socket,
+        attach_socket,
+        schedules_path,
+        home,
+        env,
+        stderr_path,
+        _tempdir: tempdir,
+    };
+    proc.wait_for_attach_socket();
+    proc
+}
+
+#[allow(dead_code)]
+impl DaemonProc {
+    /// Block until the attach socket file exists (the daemon finished
+    /// binding) or a bounded timeout elapses.
+    fn wait_for_attach_socket(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.attach_socket.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "daemon never bound its attach socket at {} within 10s",
+            self.attach_socket.display()
+        );
+    }
+
+    /// Whether the daemon process is still running.
+    fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Public point-in-time liveness check (the daemon process has not exited).
+    pub fn is_alive_public(&mut self) -> bool {
+        self.is_alive()
+    }
+
+    /// Assert the daemon stays alive for the whole `window` — polls
+    /// throughout so an early exit fails fast with a clear message rather
+    /// than passing on a lucky end-of-window sample.
+    pub fn assert_alive_for(&mut self, window: Duration) {
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            if !self.is_alive() {
+                panic!(
+                    "daemon exited within {window:?} but was expected to stay alive \
+                     (idle-shutdown carve-out for a registered enabled schedule)"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Poll until the daemon process exits, returning `true` if it exited
+    /// within `timeout` and `false` otherwise.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !self.is_alive() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        !self.is_alive()
+    }
+
+    /// Send one `AttachRequest` over the control socket and read back the
+    /// single `AttachResponse`. Blocking; used to drive `ReloadSchedules`.
+    pub fn send_attach_request(
+        &self,
+        req: &dot_agent_deck::daemon_protocol::AttachRequest,
+    ) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
+        attach_request_on(&self.attach_socket, req)
+    }
+
+    /// Run `dot-agent-deck schedule <args…>` with the daemon's env, from the
+    /// tempdir's HOME as cwd. Returns the captured process output.
+    pub fn run_schedule_cli(&self, args: &[&str]) -> std::process::Output {
+        self.run_schedule_cli_from(&self.home.clone(), args)
+    }
+
+    /// Run `dot-agent-deck schedule <args…>` from an explicit `cwd` (used to
+    /// prove the writer targets the global path regardless of cwd).
+    pub fn run_schedule_cli_from(&self, cwd: &Path, args: &[&str]) -> std::process::Output {
+        let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("schedule");
+        cmd.args(args);
+        cmd.current_dir(cwd);
+        cmd.env_clear();
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+        cmd.output()
+            .expect("run `dot-agent-deck schedule` subprocess")
+    }
+
+    /// Probe the daemon's in-memory registry by issuing `schedule run-now
+    /// --name <name>` until it exits 0 (task registered) or a bounded timeout
+    /// elapses. `run-now` hits the daemon over the socket and errors on an
+    /// unknown task, so a clean exit proves the task is live in the registry.
+    pub fn wait_for_schedule_registered(&self, name: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let out = self.run_schedule_cli(&["run-now", "--name", name]);
+            if out.status.success() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// Fire a registered task immediately via the `RunNow` control message
+    /// (no file write). Returns the daemon's response.
+    pub fn run_now(
+        &self,
+        name: &str,
+    ) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
+        self.send_attach_request(&dot_agent_deck::daemon_protocol::AttachRequest::RunNow {
+            name: name.to_string(),
+        })
+    }
+
+    /// Snapshot the daemon's live agent registry via `ListAgents`.
+    pub fn agent_records(&self) -> Vec<dot_agent_deck::agent_pty::AgentRecord> {
+        let resp = self
+            .send_attach_request(&dot_agent_deck::daemon_protocol::AttachRequest::ListAgents)
+            .expect("ListAgents over the attach socket");
+        resp.agent_records.unwrap_or_default()
+    }
+
+    /// Poll `ListAgents` until at least `n` agents are registered (or a bounded
+    /// timeout elapses), then return the current snapshot. The returned vec may
+    /// be shorter than `n` if the timeout fired — callers assert on `.len()`.
+    pub fn wait_for_agent_count(
+        &self,
+        n: usize,
+        timeout: Duration,
+    ) -> Vec<dot_agent_deck::agent_pty::AgentRecord> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let records = self.agent_records();
+            if records.len() >= n || Instant::now() >= deadline {
+                return records;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Poll `ListAgents` until a registered agent matches `pred` (or a bounded
+    /// timeout elapses); returns the first match. Lets a test wait for a
+    /// specific KIND of agent (e.g. a non-orchestration single-agent card)
+    /// without an inline poll loop in the e2e body (Decision 21).
+    pub fn wait_for_agent_where(
+        &self,
+        pred: impl Fn(&dot_agent_deck::agent_pty::AgentRecord) -> bool,
+        timeout: Duration,
+    ) -> Option<dot_agent_deck::agent_pty::AgentRecord> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(r) = self.agent_records().into_iter().find(&pred) {
+                return Some(r);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Assert the registered agent count does NOT exceed `max` for the whole
+    /// `window` — used to catch a double-spawn (a fire that opens two tabs).
+    pub fn assert_agent_count_stays_at_most(&self, max: usize, window: Duration) {
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            let n = self.agent_records().len();
+            assert!(
+                n <= max,
+                "agent count grew to {n}, expected at most {max} (double-spawn?)"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Attach to an agent's PTY stream and read STREAM_OUT bytes until `needle`
+    /// appears in the cumulative output (proving the daemon delivered/echoed
+    /// the prompt) or a bounded timeout elapses. Returns whether it was seen.
+    pub fn attach_and_wait_for_output(
+        &self,
+        agent_id: &str,
+        needle: &str,
+        timeout: Duration,
+    ) -> bool {
+        self.attach_and_wait_for_occurrences(agent_id, needle, 1, timeout)
+    }
+
+    /// Like [`attach_and_wait_for_output`] but waits until `needle` has appeared
+    /// at least `want` (non-overlapping) times in the cumulative STREAM_OUT —
+    /// used to prove a SECOND delivery landed in a REUSED pane (the prompt text
+    /// is fixed per task, so a reuse fire shows the same marker twice).
+    ///
+    /// A fresh attach replays the daemon's scrollback first, so the count
+    /// reflects every delivery the pane has seen, not just live bytes.
+    pub fn attach_and_wait_for_occurrences(
+        &self,
+        agent_id: &str,
+        needle: &str,
+        want: usize,
+        timeout: Duration,
+    ) -> bool {
+        use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, KIND_STREAM_OUT};
+        use std::io::{Read, Write};
+
+        let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&self.attach_socket) else {
+            return false;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .ok();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+        let req = dot_agent_deck::daemon_protocol::AttachRequest::AttachStream {
+            id: agent_id.to_string(),
+        };
+        let payload = serde_json::to_vec(&req).expect("serialize AttachStream");
+        let mut header = [0u8; 5];
+        header[0] = KIND_REQ;
+        header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        if stream.write_all(&header).is_err() || stream.write_all(&payload).is_err() {
+            return false;
+        }
+        let _ = stream.flush();
+
+        let mut acc: Vec<u8> = Vec::new();
+        let needle_bytes = needle.as_bytes();
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let mut fh = [0u8; 5];
+            match stream.read_exact(&mut fh) {
+                Ok(()) => {}
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(_) => return false,
+            }
+            let kind = fh[0];
+            let len = u32::from_be_bytes([fh[1], fh[2], fh[3], fh[4]]) as usize;
+            let mut body = vec![0u8; len];
+            if len > 0 && read_exact_with_deadline(&mut stream, &mut body, deadline).is_err() {
+                return false;
+            }
+            if kind == KIND_STREAM_OUT {
+                acc.extend_from_slice(&body);
+                if count_occurrences(&acc, needle_bytes) >= want {
+                    return true;
+                }
+            } else if kind == KIND_RESP {
+                continue;
+            }
+        }
+        false
+    }
+
+    /// Simulate a user keystroke into a pane: attach to `agent_id` and send one
+    /// STREAM_IN frame carrying `input`. The daemon forwards it to the PTY
+    /// stdin; for the deliver-on-idle contract the daemon also records this as
+    /// the pane's most-recent USER input (the debounce clock). Confirms the
+    /// input reached the PTY by waiting for its echo before returning, which
+    /// also guarantees the daemon has processed (and timestamped) it.
+    pub fn send_pane_input(&self, agent_id: &str, input: &str) -> bool {
+        use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_STREAM_IN};
+        use std::io::Write;
+
+        let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&self.attach_socket) else {
+            return false;
+        };
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .ok();
+
+        let req = dot_agent_deck::daemon_protocol::AttachRequest::AttachStream {
+            id: agent_id.to_string(),
+        };
+        let payload = serde_json::to_vec(&req).expect("serialize AttachStream");
+        let mut header = [0u8; 5];
+        header[0] = KIND_REQ;
+        header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        if stream.write_all(&header).is_err() || stream.write_all(&payload).is_err() {
+            return false;
+        }
+        // STREAM_IN frame with the keystroke bytes.
+        let inb = input.as_bytes();
+        let mut ih = [0u8; 5];
+        ih[0] = KIND_STREAM_IN;
+        ih[1..5].copy_from_slice(&(inb.len() as u32).to_be_bytes());
+        if stream.write_all(&ih).is_err() || stream.write_all(inb).is_err() {
+            return false;
+        }
+        let _ = stream.flush();
+        // Hold the connection open briefly so the daemon drains the STREAM_IN
+        // before the socket closes (defensive; the kernel buffers regardless).
+        std::thread::sleep(Duration::from_millis(50));
+        drop(stream);
+        // Confirm the keystroke reached the PTY (and was timestamped) by
+        // observing its echo on a fresh attach.
+        self.attach_and_wait_for_output(agent_id, input, Duration::from_secs(5))
+    }
+
+    /// Whether the captured daemon stderr currently contains `needle`.
+    pub fn stderr_contains(&self, needle: &str) -> bool {
+        std::fs::read_to_string(&self.stderr_path)
+            .map(|s| s.contains(needle))
+            .unwrap_or(false)
+    }
+
+    /// Poll the captured daemon stderr until it contains `needle` or a bounded
+    /// timeout elapses.
+    pub fn wait_for_stderr_contains(&self, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.stderr_contains(needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+}
+
+/// Count non-overlapping occurrences of `needle` in `hay`.
+#[allow(dead_code)]
+fn count_occurrences(hay: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        if &hay[i..i + needle.len()] == needle {
+            count += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+/// Send one `AttachRequest` over a daemon attach socket and read back the
+/// single `AttachResponse`. Blocking; shared by `DaemonProc` and the
+/// `TuiDeck`-driven tests (which pass `deck.attach_socket_path()`).
+#[allow(dead_code)]
+pub fn attach_request_on(
+    socket: &Path,
+    req: &dot_agent_deck::daemon_protocol::AttachRequest,
+) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
+    use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP};
+    use std::io::{Read, Write};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+
+    let payload = serde_json::to_vec(req).expect("serialize AttachRequest");
+    let mut header = [0u8; 5];
+    header[0] = KIND_REQ;
+    header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    stream.write_all(&header)?;
+    stream.write_all(&payload)?;
+    stream.flush()?;
+
+    let mut resp_header = [0u8; 5];
+    stream.read_exact(&mut resp_header)?;
+    if resp_header[0] != KIND_RESP {
+        return Err(std::io::Error::other(format!(
+            "expected RESP frame, got kind 0x{:02x}",
+            resp_header[0]
+        )));
+    }
+    let len = u32::from_be_bytes([
+        resp_header[1],
+        resp_header[2],
+        resp_header[3],
+        resp_header[4],
+    ]) as usize;
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body)?;
+    serde_json::from_slice(&body).map_err(std::io::Error::other)
+}
+
+/// Snapshot a daemon's live agent registry via `ListAgents` over `socket`.
+#[allow(dead_code)]
+pub fn agent_records_on(socket: &Path) -> Vec<dot_agent_deck::agent_pty::AgentRecord> {
+    match attach_request_on(
+        socket,
+        &dot_agent_deck::daemon_protocol::AttachRequest::ListAgents,
+    ) {
+        Ok(resp) => resp.agent_records.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Poll `ListAgents` until an agent whose `display_name` equals `name` is
+/// present (`want_present = true`) or absent (`want_present = false`), or the
+/// timeout elapses. Returns whether the desired condition held.
+#[allow(dead_code)]
+pub fn wait_for_agent_display_name(
+    socket: &Path,
+    name: &str,
+    want_present: bool,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let present = agent_records_on(socket)
+            .iter()
+            .any(|r| r.display_name.as_deref() == Some(name));
+        if present == want_present {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Count occurrences of `needle` in a file's contents (lossy UTF-8). Returns 0
+/// if the file is missing/unreadable. Used to count prompt deliveries recorded
+/// by a per-pane "recorder" command (one appended line per delivered prompt),
+/// which is immune to PTY echo doubling.
+#[allow(dead_code)]
+pub fn count_file_substr(path: &Path, needle: &str) -> usize {
+    match std::fs::read(path) {
+        Ok(bytes) => count_occurrences(&bytes, needle.as_bytes()),
+        Err(_) => 0,
+    }
+}
+
+/// Poll until `needle` appears at least `want` times in `path` (or a bounded
+/// timeout elapses). Returns whether the count was reached.
+#[allow(dead_code)]
+pub fn wait_for_file_substr_count(
+    path: &Path,
+    needle: &str,
+    want: usize,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if count_file_substr(path, needle) >= want {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Poll until `name` no longer appears in the file at `path` (e.g. a schedule
+/// definition removed from `schedules.toml`), or the timeout elapses.
+#[allow(dead_code)]
+pub fn wait_for_schedule_absent_from_file(path: &Path, name: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let absent = match std::fs::read_to_string(path) {
+            Ok(s) => !s.contains(name),
+            Err(_) => true, // file gone entirely → definitely absent
+        };
+        if absent {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Bounded poll for a filesystem path to appear. Kept in `common` so e2e test
+/// bodies don't carry a raw sleep loop (linkage-check Decision 21).
+#[allow(dead_code)]
+pub fn wait_for_path(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    path.exists()
+}
+
+/// Blocking `read_exact` bounded by a wall-clock `deadline`, tolerating the
+/// per-read timeout set on the stream. Returns `Err` on EOF / hard error / the
+/// deadline passing before the buffer fills.
+#[allow(dead_code)]
+fn read_exact_with_deadline(
+    stream: &mut std::os::unix::net::UnixStream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut filled = 0;
+    while filled < buf.len() {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "deadline elapsed mid-frame",
+            ));
+        }
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "eof",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

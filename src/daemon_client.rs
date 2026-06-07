@@ -41,6 +41,26 @@ pub enum ClientError {
     Malformed(String),
 }
 
+/// PRD #127 C5: the distinct outcomes of a `run-now`. Both mean the task is
+/// registered (the request succeeded); they differ only in whether a fire
+/// actually started or was skipped because a prior run is still active, so the
+/// caller can report a non-confusing message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunNowOutcome {
+    Started,
+    SkippedStillRunning,
+}
+
+/// Map the `agents` token the daemon's `RunNow` handler returns to a
+/// [`RunNowOutcome`]. `"skipped"` → skipped; anything else (incl. a stale
+/// daemon that omits the token) → started. Pure so it is unit-testable.
+pub fn run_now_outcome_from_agents(agents: &Option<Vec<String>>) -> RunNowOutcome {
+    match agents {
+        Some(tokens) if tokens.iter().any(|t| t == "skipped") => RunNowOutcome::SkippedStillRunning,
+        _ => RunNowOutcome::Started,
+    }
+}
+
 /// Owned counterpart of [`AttachRequest::StartAgent`]. Owned (vs. borrowed)
 /// because callers are typically blocking threads that need to hand the
 /// options off to an async task running on the tokio runtime.
@@ -237,6 +257,46 @@ impl DaemonClient {
                 cols: 0,
             })
             .collect())
+    }
+
+    /// PRD #127 M1.3: ask a running daemon to re-read the global
+    /// `schedules.toml` and diff/replace its registered task set without a
+    /// restart. Returns the now-registered ENABLED task names. The CLI's
+    /// mutating subcommands call this after an atomic write so the daemon picks
+    /// the change up live.
+    pub async fn reload_schedules(&self) -> Result<Vec<String>, ClientError> {
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ReloadSchedules).await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "reload-schedules failed".into()),
+            ));
+        }
+        Ok(resp.agents.unwrap_or_default())
+    }
+
+    /// PRD #127 M1.5: fire a registered scheduled task now (the
+    /// `schedule run-now` door). Errors if no such task is registered.
+    pub async fn run_now(&self, name: &str) -> Result<RunNowOutcome, ClientError> {
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::RunNow {
+                name: name.to_string(),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "run-now failed".into()),
+            ));
+        }
+        // PRD #127 C5: surface started vs skipped-still-running to the caller.
+        Ok(run_now_outcome_from_agents(&resp.agents))
     }
 
     pub async fn start_agent(&self, opts: StartAgentOptions) -> Result<String, ClientError> {
@@ -738,6 +798,27 @@ mod tests {
                 is_start_role: false,
                 orchestration_cwd: None,
             }),
+        );
+    }
+
+    // PRD #127 C5 — run-now outcome parsing: the `agents` token distinguishes a
+    // started fire from a skipped-still-running one; a stale daemon that omits
+    // the token is treated as started.
+    #[test]
+    fn run_now_outcome_parses_started_vs_skipped() {
+        assert_eq!(
+            run_now_outcome_from_agents(&Some(vec!["started".to_string()])),
+            RunNowOutcome::Started
+        );
+        assert_eq!(
+            run_now_outcome_from_agents(&Some(vec!["skipped".to_string()])),
+            RunNowOutcome::SkippedStillRunning
+        );
+        // Missing token (older daemon) → started.
+        assert_eq!(run_now_outcome_from_agents(&None), RunNowOutcome::Started);
+        assert_eq!(
+            run_now_outcome_from_agents(&Some(vec![])),
+            RunNowOutcome::Started
         );
     }
 }

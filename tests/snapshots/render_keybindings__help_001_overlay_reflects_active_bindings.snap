@@ -1,6 +1,5 @@
 ---
 source: tests/render_keybindings.rs
-assertion_line: 84
 expression: text
 ---
                                                                                                                         
@@ -34,8 +33,8 @@ expression: text
         │  r                  Rename session                  Space           Confirm current directory       │         
         │  g                  Generate .dot-agent-deck.toml   /               Filter (case-insensitive)       │         
         │  y / n              Approve / deny permission       Esc             Clear filter (twice = close)    │         
-        │  F1                 Toggle this help                q               Cancel                          │         
-        │                                                                                                     │         
+        │  S                  Scheduled Tasks manager         q               Cancel                          │         
+        │  F1                 Toggle this help                                                                │         
         │                                                     Session                                         │         
         │                                                                                                     │         
         │                                                     Panes auto-saved on exit.                       │         

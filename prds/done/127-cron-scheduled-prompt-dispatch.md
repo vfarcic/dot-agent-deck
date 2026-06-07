@@ -1,9 +1,9 @@
 # PRD #127: Cron-scheduled prompt dispatch (general scheduler primitive)
 
-**Status**: Planning
+**Status**: Complete (2026-06-07)
 **Priority**: Medium
 **Created**: 2026-05-25
-**Updated**: 2026-06-07 (revised after architecture/design discussion — see Design Decisions log)
+**Updated**: 2026-06-07 (M1–M3 + M4.1/M4.2 + M5.1/M5.4 implemented and reviewed; see Design Decisions log)
 **GitHub Issue**: [#127](https://github.com/vfarcic/dot-agent-deck/issues/127)
 **Depends on**: [#126](https://github.com/vfarcic/dot-agent-deck/issues/126) (agent-driven notifications — used for failure surfacing)
 **Prerequisite for**: [#120](https://github.com/vfarcic/dot-agent-deck/issues/120) (issue-dispatch — composes the primitives here with GitHub-specific logic)
@@ -197,36 +197,36 @@ For positioning (not a dependency): Claude Code already has cloud-side **`/sched
 
 ### Phase 1: Cron primitive + global config + daemon lifecycle
 
-- [ ] **M1.1** — Pick the cron crate (`cargo tree` weight). Implement cron-expression evaluation and a daemon-side tokio loop firing registered callbacks. Decide timezone (Q2).
-- [ ] **M1.2** — Add the global `~/.config/dot-agent-deck/schedules.toml` schema (`name`, `cron`, `working_dir`, `prompt`, `new_tab_per_fire`, `enabled`). Load at `daemon serve` startup; surface load/parse errors via notifications (PRD #126); a bad entry doesn't block others.
-- [ ] **M1.3** — Skip-if-prior-run-still-active. `ReloadSchedules` control message + reload-on-startup.
-- [ ] **M1.4** — **Idle-shutdown carve-out**: extend the idle gate so a registered enabled scheduled task keeps the daemon alive (`clients == 0 && live_count == 0 && no_pending_schedules`). Test the before-first-fire and after-agent-exit gaps.
-- [ ] **M1.5** — CLI: `schedule add|update|remove|list|enable|disable|run-now|reload` — single validated writer (cron validation, path expansion, atomic global-path write regardless of cwd, triggers reload).
+- [x] **M1.1** — Pick the cron crate (`cargo tree` weight). Implement cron-expression evaluation and a daemon-side tokio loop firing registered callbacks. Decide timezone (Q2).
+- [x] **M1.2** — Add the global `~/.config/dot-agent-deck/schedules.toml` schema (`name`, `cron`, `working_dir`, `prompt`, `new_tab_per_fire`, `enabled`). Load at `daemon serve` startup; surface load/parse errors via notifications (PRD #126); a bad entry doesn't block others.
+- [x] **M1.3** — Skip-if-prior-run-still-active. `ReloadSchedules` control message + reload-on-startup.
+- [x] **M1.4** — **Idle-shutdown carve-out**: extend the idle gate so a registered enabled scheduled task keeps the daemon alive (`clients == 0 && live_count == 0 && no_pending_schedules`). Test the before-first-fire and after-agent-exit gaps.
+- [x] **M1.5** — CLI: `schedule add|update|remove|list|enable|disable|run-now|reload` — single validated writer (cron validation, path expansion, atomic global-path write regardless of cwd, triggers reload).
 
 ### Phase 2: Spawn primitive + lifecycle
 
-- [ ] **M2.1** — `spawn(working_dir, prompt) → handle`. Auto-create working_dir; fail-loud. Branch on target `.dot-agent-deck.toml` (orchestration tab vs single-agent card). Single-agent card uses the schedule's `command` field, mirroring the dialog (Q3 resolved). Isolate the config lookup behind `load_config_for_dir(path) → Config`.
-- [ ] **M2.2** — Tab lifecycle: reuse-by-default. Named-tab registry (in-memory, keyed by task name) + mid-interaction deliver-on-idle. Document the wipe-on-restart behavior.
-- [ ] **M2.3** — Wire the cron callback for the static-prompt case: a fire calls `spawn(working_dir, prompt)` exactly once with the configured values.
+- [x] **M2.1** — `spawn(working_dir, prompt) → handle`. Auto-create working_dir; fail-loud. Branch on target `.dot-agent-deck.toml` (orchestration tab vs single-agent card). Single-agent card uses the schedule's `command` field, mirroring the dialog (Q3 resolved). Isolate the config lookup behind `load_config_for_dir(path) → Config`.
+- [x] **M2.2** — Tab lifecycle: reuse-by-default. Named-tab registry (in-memory, keyed by task name) + mid-interaction deliver-on-idle. Document the wipe-on-restart behavior.
+- [x] **M2.3** — Wire the cron callback for the static-prompt case: a fire calls `spawn(working_dir, prompt)` exactly once with the configured values.
 
 ### Phase 3: Creation + management UX
 
-- [ ] **M3.1** — Add `seed_prompt: Option<String>` to `ModeConfig`; thread through `NewPaneRequest`; deliver to the spawned agent via the orchestration delivery path (agent-ready gate + buffer delay).
-- [ ] **M3.2** — Add the "schedule" mode to the new-deck dialog with its authoring seed prompt (field list, `schedule add` invocation, validation rules, confirm-before-write). Subtle visual separation marking it as an authoring session.
-- [ ] **M3.3** — "Scheduled Tasks" management dialog behind a keybinding: list (status + next-fire), add/edit (spawn seeded agent), delete-with-confirm (definition only), run-now. Forbid rename via the edit path. TUI tests (L1; L2 where the spawned binary/daemon is involved).
+- [x] **M3.1** — Add `seed_prompt: Option<String>` to `ModeConfig`; thread through `NewPaneRequest`; deliver to the spawned agent via the orchestration delivery path (agent-ready gate + buffer delay).
+- [x] **M3.2** — Add the "schedule" mode to the new-deck dialog with its authoring seed prompt (field list, `schedule add` invocation, validation rules, confirm-before-write). Subtle visual separation marking it as an authoring session.
+- [x] **M3.3** — "Scheduled Tasks" management dialog behind a keybinding: list (status + next-fire), add/edit (spawn seeded agent), delete-with-confirm (definition only), run-now. Forbid rename via the edit path. TUI tests (L1; L2 where the spawned binary/daemon is involved).
 
 ### Phase 4: Tests + integration with notifications
 
-- [ ] **M4.1** — Unit tests: cron evaluation, skip-if-running, idle carve-out, working_dir create success/failure, spawn branching, tab reuse vs new_tab_per_fire, CLI validation, config load with a malformed entry.
-- [ ] **M4.2** — Integration: fixture global config with a fast-cron task; assert spawn fires and prompt is delivered. Trigger a working_dir creation failure; assert a notification fires (PRD #126) and other tasks keep running. Assert the daemon stays up with a registered schedule and zero clients/agents.
+- [x] **M4.1** — Unit tests: cron evaluation, skip-if-running, idle carve-out, working_dir create success/failure, spawn branching, tab reuse vs new_tab_per_fire, CLI validation, config load with a malformed entry.
+- [x] **M4.2** — Integration: fixture global config with a fast-cron task; assert spawn fires and prompt is delivered. Trigger a working_dir creation failure; assert a notification fires (PRD #126) and other tasks keep running. Assert the daemon stays up with a registered schedule and zero clients/agents.
 - [ ] **M4.3** — Manual validation: a real task firing every ~2 min — spawn happens, prompt delivered, notification arrives. Toggle `new_tab_per_fire`. Trigger a typo'd working_dir on a nonexistent mount; verify notification + no crash. Stop/restart the daemon mid-day; verify definitions reload on next start and behavior matches the documented caveat.
 
 ### Phase 5: Docs and ship
 
-- [ ] **M5.1** — Documentation under `site/`: global `schedules.toml` reference; the three edit doors; the "schedule" mode + management dialog; the daemon-must-be-running caveat (restart/upgrade/reboot, no catch-up); reuse model; mid-interaction queue; an optional daemon-supervision recipe (Q4); a complete example with a scheduled task plus orchestrations.
+- [x] **M5.1** — Documentation under `site/`: global `schedules.toml` reference; the three edit doors; the "schedule" mode + management dialog; the daemon-must-be-running caveat (restart/upgrade/reboot, no catch-up); reuse model; mid-interaction queue; an optional daemon-supervision recipe (Q4); a complete example with a scheduled task plus orchestrations.
 - [ ] **M5.2** — Changelog fragment via `dot-ai-changelog-fragment`. Frame as "you can now schedule prompts to run on a cron and land in the deck."
 - [ ] **M5.3** — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` green (incl. `cargo test-e2e` pre-PR). PR, review, audit, merge.
-- [ ] **M5.4** — Open the follow-up PRD #120 update: revise its Phase 1 scope to consume this scheduler's primitives instead of duplicating them.
+- [x] **M5.4** — Open the follow-up PRD #120 update: revise its Phase 1 scope to consume this scheduler's primitives instead of duplicating them.
 
 ## Key Files
 
@@ -311,3 +311,14 @@ Captured from the design discussion that produced this revision:
 7. **Creation via an agent-seeded "schedule" mode** in the existing new-deck dialog — reuses the orchestration seed-prompt-on-spawn pattern; lets the user craft (and test) the prompt conversationally; needs `seed_prompt` on `ModeConfig`.
 8. **Management via a read-only-plus-actions "Scheduled Tasks" dialog** — list + add/edit (agent) + delete-with-confirm (definition only) + run-now. **No inline toggle/field-edit** (keeps the terminal dialog simple); pausing is via agent/CLI/file. **Rename forbidden** via the edit path (reuse-key orphaning).
 9. **Per-schedule `command` field** — each schedule specifies its single-agent command, mirroring the new-deck dialog, instead of a deck-wide "default agent." Consistent UX; no hidden global; works for users without a default agent. Ignored for the orchestration branch; `$SHELL` fallback when omitted.
+
+## Open Questions — resolutions (2026-06-07, captured during implementation)
+
+- **Q1 (cron crate): resolved → `cron` v0.16** (pure-Rust) + a daemon-side tokio per-second loop we own. Light deps (phf/once_cell/winnow; chrono/serde already present). `tokio-cron-scheduler` rejected as heavier. The crate requires 6/7-field expressions, so `normalize_cron_expr()` prepends a `0` seconds field to the 5-field POSIX form the config uses.
+- **Q2 (timezone): resolved → local time** (`chrono::Local`), documented in `src/scheduler.rs` and `docs/scheduled-tasks.md`. Per-schedule `timezone` field deferred until demand appears. DST under local time (a transition can double- or skip-fire) is an accepted, documented tradeoff; the per-second loop uses a wall-clock catch-up that won't drop a due fire on a late wake-up and won't double-fire within the same second.
+- **Q3 (single-agent command): resolved (in PRD)** → per-schedule `command`, `$SHELL` fallback, ignored under `[[orchestrations]]`. Implementation matches the new-deck dialog: the `-c` shell wrap is applied only when the command needs wrapping, and the wrapper-choice `SHELL` is not leaked into the spawned agent's child env.
+- **Q5 (reload mechanism): resolved → `ReloadSchedules` control message** over the daemon socket + reload-on-startup (no file-watch). A companion `RunNow{name}` variant backs run-now.
+- **Q6 (mid-interaction "idle"): resolved → option (a)** — no PTY user keystroke for a debounce window; default 5000 ms, overridable via `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS`. Last-keystroke is tracked only from the STREAM_IN path (daemon-initiated writes don't reset it). A hard timeout caps the total wait so continuous typing can't starve a queued reuse prompt; single-slot "latest wins" semantics fall out of skip-if-prior-run-still-active.
+- **Q7 (path expansion): resolved →** `~` and `$VAR`/`${VAR}` expanded by the CLI/loader at write/load time; relative paths resolved against `$HOME`, never the authoring agent's cwd.
+- **Q8 (reuse handle identity): resolved →** in-memory daemon registry keyed by scheduled task **name**; eviction is liveness-at-fire-time of the **specific delivery pane** (orchestrator role pane / single-agent pane), not "any agent live"; wiped on daemon restart (no persistence). `SpawnHandle` carries an `on_tab_closed` seam for PRD #120 worktree cleanup.
+- **Q4 (daemon supervision): documented, not built** — `docs/scheduled-tasks.md` ships an optional systemd-user / launchd recipe (setting `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`) for genuinely unattended scheduling; a built-in `daemon install`/service remains a follow-up.
