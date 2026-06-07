@@ -1,6 +1,6 @@
 # PRD #80: Mouse Parity for Keyboard Actions
 
-**Status**: Not started
+**Status**: Done
 **Priority**: Medium
 **Created**: 2026-05-10
 **GitHub Issue**: [#80](https://github.com/vfarcic/dot-agent-deck/issues/80)
@@ -39,80 +39,80 @@ Existing mouse interactions (click-to-focus pane, scroll, text selection, Ctrl+c
 
 Region-based; each is independently shippable and validated.
 
-- [ ] **M1 — Action layer + button widget foundation.** Refactor every keyboard-only action into a single dispatch table (`fn dispatch_action(Action)`); the existing keystroke handler becomes a thin keystroke→Action mapper. Introduce a `Button` widget (label, shortcut, action, enabled) with a render+hit-test pair that follows the existing `*_rect` pattern. No behavioral change yet; the foundation tests prove key/click both invoke `dispatch_action`.
-- [ ] **M2 — Global button bar.** Persistent bottom-row button bar in every UI mode exposing New Pane, Close, Toggle Layout, Help, Quit. Removes redundant status-bar legend text. Includes the narrow-terminal fallback (shortcut-only labels).
-- [ ] **M3 — Tab strip clicks.** Click-to-switch on every tab header (Dashboard, Mode, Orchestration). Per-mode-tab `[×]` close affordance reusing Ctrl+W's existing semantics. Dashboard tab has no close.
-- [ ] **M4 — Dashboard mouse parity.** Card click-to-select / double-click-to-focus. Clickable Filter / Rename / Generate-config buttons. Existing `?`/Tab/Shift+Tab/keystrokes continue to work.
-- [ ] **M5 — Modal mouse parity.** Quit-confirm, config-gen, star-prompt, and help overlay each gain explicit clickable buttons (`[Quit][Detach][Cancel]`, `[Yes][No][Never]`, `[Star][Snooze][Dismiss]`, `[Close]`). Keystrokes preserved.
-- [ ] **M6 — Inline edit (filter / rename) Apply/Cancel buttons.** Click in the field to focus; explicit `[Apply]`/`[Save]` and `[Cancel]` buttons next to the input. Enter/Esc preserved. Also adds the PaneInput-mode `[Detach Ctrl+D]` affordance.
-- [ ] **M7 — Directory picker mouse parity.** Clickable rows (single = select, double = enter), clickable parent / breadcrumb, `[Confirm]`/`[Cancel]` buttons, clickable filter entry.
-- [ ] **M8 — New-pane form mouse parity.** Click-to-focus fields, clickable mode chips, `[Submit]`/`[Cancel]` buttons. Tab/Shift+Tab preserved.
-- [ ] **M9 — Tests.** Coverage for click→action and key→action paths through `dispatch_action`. Coverage that existing mouse behavior (pane focus, scroll, text selection, hyperlinks, child-app forwarding) is preserved. Coverage that buttons short-circuit the click before falling through to pane logic. (Depends on PRD #77 if its harness lands first; otherwise reuses current test infrastructure.)
-- [ ] **M10 — Help overlay refresh + docs.** Update `?` overlay content to match the post-button-bar shortcut set (overlay remains the canonical reference). Update any user-facing docs / screenshots impacted by the new bar (coordinate with PRD #51).
+- [x] **M1 — Action layer + button widget foundation.** Refactor every keyboard-only action into a single dispatch table (`fn dispatch_action(Action)`); the existing keystroke handler becomes a thin keystroke→Action mapper. Introduce a `Button` widget (label, shortcut, action, enabled) with a render+hit-test pair that follows the existing `*_rect` pattern. No behavioral change yet; the foundation tests prove key/click both invoke `dispatch_action`.
+- [x] **M2 — Global button bar.** Persistent bottom-row button bar in every UI mode exposing New Pane, Close, Toggle Layout, Help, Quit. Removes redundant status-bar legend text. Includes the narrow-terminal fallback (shortcut-only labels).
+- [x] **M3 — Tab strip clicks.** Click-to-switch on every tab header (Dashboard, Mode, Orchestration). Per-mode-tab `[×]` close affordance reusing Ctrl+W's existing semantics. Dashboard tab has no close.
+- [x] **M4 — Dashboard mouse parity.** Card click-to-select / double-click-to-focus. Clickable Filter / Rename / Generate-config buttons. Existing `?`/Tab/Shift+Tab/keystrokes continue to work.
+- [x] **M5 — Modal mouse parity.** Quit-confirm, config-gen, star-prompt, and help overlay each gain explicit clickable buttons (`[Quit][Detach][Cancel]`, `[Yes][No][Never]`, `[Star][Snooze][Dismiss]`, `[Close]`). Keystrokes preserved.
+- [x] **M6 — Inline edit (filter / rename) Apply/Cancel buttons.** Click in the field to focus; explicit `[Apply]`/`[Save]` and `[Cancel]` buttons next to the input. Enter/Esc preserved. Also adds the PaneInput-mode `[Detach Ctrl+D]` affordance.
+- [x] **M7 — Directory picker mouse parity.** Clickable rows (single = select, double = enter), clickable parent / breadcrumb, `[Confirm]`/`[Cancel]` buttons, clickable filter entry.
+- [x] **M8 — New-pane form mouse parity.** Click-to-focus fields, clickable mode chips, `[Submit]`/`[Cancel]` buttons. Tab/Shift+Tab preserved.
+- [x] **M9 — Tests.** Coverage for click→action and key→action paths through `dispatch_action`. Coverage that existing mouse behavior (pane focus, scroll, text selection, hyperlinks, child-app forwarding) is preserved. Coverage that buttons short-circuit the click before falling through to pane logic. (Depends on PRD #77 if its harness lands first; otherwise reuses current test infrastructure.)
+- [x] **M10 — Help overlay refresh + docs.** Update `?` overlay content to match the post-button-bar shortcut set (overlay remains the canonical reference). Update any user-facing docs / screenshots impacted by the new bar (coordinate with PRD #51).
 
 ## Acceptance Criteria
 
 ### Global controls (always visible)
-- [ ] A persistent button bar exposes the global commands: New Pane, Close, Toggle Layout, Help, Quit.
-- [ ] Each button label shows its keyboard shortcut inline (e.g., `[New Pane Ctrl+N]`).
-- [ ] Clicking each button triggers the same action as the corresponding keystroke.
-- [ ] All keystrokes (Ctrl+N/W/T/C, ?) continue to work unchanged.
+- [x] A persistent button bar exposes the global commands: New Pane, Close, Toggle Layout, Help, Quit.
+- [x] Each button label shows its keyboard shortcut inline (e.g., `[New Pane Ctrl+N]`).
+- [x] Clicking each button triggers the same action as the corresponding keystroke.
+- [x] All keystrokes (Ctrl+N/W/T/C, ?) continue to work unchanged.
 
 ### Tab strip
-- [ ] Clicking a tab header switches to that tab — equivalent to Tab / Shift+Tab / Ctrl+PageDown / Ctrl+PageUp.
-- [ ] Mode and Orchestration tabs carry a clickable close affordance (e.g., `[×]`) — equivalent to Ctrl+W on the tab. Dashboard tab has no close affordance.
-- [ ] Tab / Shift+Tab / Ctrl+PageDown / Ctrl+PageUp continue to work unchanged.
+- [x] Clicking a tab header switches to that tab — equivalent to Tab / Shift+Tab / Ctrl+PageDown / Ctrl+PageUp.
+- [x] Mode and Orchestration tabs carry a clickable close affordance (e.g., `[×]`) — equivalent to Ctrl+W on the tab. Dashboard tab has no close affordance.
+- [x] Tab / Shift+Tab / Ctrl+PageDown / Ctrl+PageUp continue to work unchanged.
 
 ### Dashboard / Normal mode
-- [ ] Clicking a session card moves selection to that card — equivalent to j/k navigation.
-- [ ] Double-clicking a session card focuses the underlying pane (enters PaneInput) — equivalent to Enter on a selected card.
-- [ ] A clickable Filter button enters filter mode (equivalent to `/`).
-- [ ] A clickable Rename button on a selected card enters rename mode (equivalent to `r`).
-- [ ] A clickable Generate-config button triggers the config-gen prompt (equivalent to `g`).
-- [ ] j/k/1-9/Enter/r/g/`/` keystrokes continue to work unchanged.
+- [x] Clicking a session card moves selection to that card — equivalent to j/k navigation.
+- [x] Double-clicking a session card focuses the underlying pane (enters PaneInput) — equivalent to Enter on a selected card.
+- [x] A clickable Filter button enters filter mode (equivalent to `/`).
+- [x] A clickable Rename button on a selected card enters rename mode (equivalent to `r`).
+- [x] A clickable Generate-config button triggers the config-gen prompt (equivalent to `g`).
+- [x] j/k/1-9/Enter/r/g/`/` keystrokes continue to work unchanged.
 
 ### Mode tab (in-tab navigation)
-- [ ] Existing click-to-focus side pane / agent pane behavior is preserved unchanged.
-- [ ] Ctrl+D (exit PaneInput) is exposed as a clickable affordance (e.g., a `[Detach Ctrl+D]` button visible while in PaneInput).
-- [ ] Existing scroll forwarding to child apps with `mouse_mode_enabled` is preserved unchanged.
+- [x] Existing click-to-focus side pane / agent pane behavior is preserved unchanged.
+- [x] Ctrl+D (exit PaneInput) is exposed as a clickable affordance (e.g., a `[Detach Ctrl+D]` button visible while in PaneInput).
+- [x] Existing scroll forwarding to child apps with `mouse_mode_enabled` is preserved unchanged.
 
 ### Modal dialogs
-- [ ] Quit-confirm modal exposes clickable `[Quit]`, `[Detach]`, `[Cancel]` buttons. j/k/Enter/Esc still work.
-- [ ] Config-gen modal exposes clickable `[Yes]`, `[No]`, `[Never]` buttons. Keystrokes still work.
-- [ ] Star-prompt exposes clickable `[Star]`, `[Snooze]`, `[Dismiss]` buttons. `s`/`l`/`d` still work.
-- [ ] Help overlay (`?`) has a clickable close button. `?`/`q`/`Esc` still work.
+- [x] Quit-confirm modal exposes clickable `[Quit]`, `[Detach]`, `[Cancel]` buttons. j/k/Enter/Esc still work.
+- [x] Config-gen modal exposes clickable `[Yes]`, `[No]`, `[Never]` buttons. Keystrokes still work.
+- [x] Star-prompt exposes clickable `[Star]`, `[Snooze]`, `[Dismiss]` buttons. `s`/`l`/`d` still work.
+- [x] Help overlay (`?`) has a clickable close button. `?`/`q`/`Esc` still work.
 
 ### Inline edit (filter / rename)
-- [ ] Filter row exposes clickable `[Apply]` and `[Cancel]` buttons. Enter/Esc still work.
-- [ ] Rename row exposes clickable `[Save]` and `[Cancel]` buttons. Enter/Esc still work.
-- [ ] Clicking inside the text field places the cursor / focuses the field (typing remains keyboard).
+- [x] Filter row exposes clickable `[Apply]` and `[Cancel]` buttons. Enter/Esc still work.
+- [x] Rename row exposes clickable `[Save]` and `[Cancel]` buttons. Enter/Esc still work.
+- [x] Clicking inside the text field places the cursor / focuses the field (typing remains keyboard).
 
 ### Directory picker
-- [ ] Each directory row is clickable: single-click selects, double-click enters.
-- [ ] A breadcrumb / parent-directory affordance is clickable (equivalent to `h` / Backspace / Left).
-- [ ] `[Confirm]` and `[Cancel]` buttons are clickable. Space / q / Esc still work.
-- [ ] A clickable Filter button or input opens the picker filter (equivalent to `/`).
+- [x] Each directory row is clickable: single-click selects, double-click enters.
+- [x] A breadcrumb / parent-directory affordance is clickable (equivalent to `h` / Backspace / Left).
+- [x] `[Confirm]` and `[Cancel]` buttons are clickable. Space / q / Esc still work.
+- [x] A clickable Filter button or input opens the picker filter (equivalent to `/`).
 
 ### New-pane form
-- [ ] Each form field is clickable to receive focus. Tab / Shift+Tab still work.
-- [ ] The mode chip selector exposes clickable chips (equivalent to Left / Right / h / l).
-- [ ] `[Submit]` and `[Cancel]` buttons are clickable. Enter / Esc still work.
+- [x] Each form field is clickable to receive focus. Tab / Shift+Tab still work.
+- [x] The mode chip selector exposes clickable chips (equivalent to Left / Right / h / l).
+- [x] `[Submit]` and `[Cancel]` buttons are clickable. Enter / Esc still work.
 
 ### Visual / layout
-- [ ] Buttons render with consistent styling across all surfaces.
-- [ ] On terminals narrow enough that the full button bar doesn't fit, button labels degrade gracefully (shortcut-only fallback) — no truncation that makes a button unidentifiable.
-- [ ] Existing status-bar legend text is removed where a button now exposes the same action. No duplication.
+- [x] Buttons render with consistent styling across all surfaces.
+- [x] On terminals narrow enough that the full button bar doesn't fit, button labels degrade gracefully (shortcut-only fallback) — no truncation that makes a button unidentifiable.
+- [x] Existing status-bar legend text is removed where a button now exposes the same action. No duplication.
 
 ### Preservation of existing mouse behavior
-- [ ] Click-to-focus side pane / agent pane in mode tabs is preserved.
-- [ ] Scroll (and SGR-mode forwarding to child apps) is preserved.
-- [ ] Text selection (single-click drag, double-click word, triple-click paragraph) and OSC 52 copy is preserved.
-- [ ] Ctrl+click hyperlink opening is preserved.
-- [ ] Buttons are hit-tested before pane-region logic; a click that misses every button falls through to the existing pane / selection path.
+- [x] Click-to-focus side pane / agent pane in mode tabs is preserved.
+- [x] Scroll (and SGR-mode forwarding to child apps) is preserved.
+- [x] Text selection (single-click drag, double-click word, triple-click paragraph) and OSC 52 copy is preserved.
+- [x] Ctrl+click hyperlink opening is preserved.
+- [x] Buttons are hit-tested before pane-region logic; a click that misses every button falls through to the existing pane / selection path.
 
 ### Keystroke preservation
-- [ ] No keystroke is removed; keyboard-only operation remains complete.
-- [ ] The `?` help overlay reflects the same shortcut set after the change.
+- [x] No keystroke is removed; keyboard-only operation remains complete.
+- [x] The `?` help overlay reflects the same shortcut set after the change.
 
 ## Out of Scope
 
