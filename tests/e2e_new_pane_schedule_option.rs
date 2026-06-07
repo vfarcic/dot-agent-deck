@@ -69,3 +69,61 @@ fn new_pane_007_schedule_authoring_option_visually_separated() {
          authoring-session affordance (an `authoring` label/section).\nGrid:\n{grid}"
     );
 }
+
+/// Scenario: Launch the deck in the `schedule-mode` fixture, open the new-pane
+/// form (Ctrl+n → Space confirms the dir), cycle the Mode field to the built-in
+/// `schedule` authoring option, and submit it. Assert the authoring session
+/// lands as a single-agent DASHBOARD CARD — the dashboard's
+/// `dot-agent-deck — N session(s)` title renders (it shows only on the Dashboard
+/// tab) and no `×` tab-close glyph appears — NOT as a 50/50 mode tab, which would
+/// open a second tab whose strip carries a `×` and hide the dashboard title. RED
+/// today: the `schedule` option opens via `render_mode_tab` as a mode tab, so a
+/// `×` appears and the dashboard title is absent.
+#[spec("prompt/new-pane/008")]
+#[test]
+fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
+    let deck = TuiDeck::launch_with_fixture("schedule-mode");
+    deck.wait_for_string("No active sessions");
+
+    // Open the new-pane form and cycle the Mode field to the built-in
+    // `schedule` authoring option (the cycler caps at the last option) —
+    // mirroring `new_pane_007`'s drive.
+    deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    deck.send_keys(b" "); // Space → confirm current dir → new-pane form
+    deck.wait_for_string("No mode"); // Mode field is up (cycler at "No mode")
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8
+    deck.wait_for_string("schedule mode"); // selection landed on the schedule mode
+
+    // Submit via the [Submit] button (deterministic — the schedule mode still
+    // shows a Command field, so an Enter-count would be fragile). That field is
+    // empty for the built-in option, so the spawn falls back to $SHELL — no real
+    // LLM, and the card-vs-mode-tab layout renders independent of the agent.
+    let (scol, srow) = deck
+        .find_in_grid("[Submit]")
+        .expect("the new-pane form should render a [Submit] button");
+    deck.click(scol, srow);
+
+    // Submitting closes the form; wait for the resulting layout to settle into
+    // one of the two observable end-states: a single-agent dashboard card (the
+    // dashboard's session-count title renders only on the Dashboard tab) or a
+    // 50/50 mode tab (a second tab whose strip carries a `×` close glyph).
+    deck.wait_for_absence("[Submit]"); // form closed
+    deck.wait_until_grid("schedule submit settles into a card or a mode tab", |g| {
+        g.contains("dot-agent-deck \u{2014}") || g.contains("×")
+    });
+
+    let grid = deck.snapshot_grid();
+    assert!(
+        grid.contains("dot-agent-deck \u{2014}"),
+        "the `schedule` authoring session must open as a single-agent DASHBOARD CARD: the \
+         dashboard's `dot-agent-deck — N session(s)` title renders only on the Dashboard \
+         tab, so its presence is what proves the authoring session stayed a card.\nGrid:\n{grid}"
+    );
+    assert!(
+        !grid.contains("×"),
+        "the `schedule` authoring session must NOT open as a 50/50 mode tab: a mode tab \
+         creates a second tab whose strip carries a `×` close glyph. A `×` on screen means \
+         the authoring agent was (wrongly) routed through `render_mode_tab` instead of \
+         landing as a dashboard card.\nGrid:\n{grid}"
+    );
+}
