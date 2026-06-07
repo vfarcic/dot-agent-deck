@@ -629,6 +629,16 @@ struct UiState {
     /// is topmost, these are hit-tested FIRST (and exclusively) while a modal
     /// is active, ahead of the bottom-bar / tab / card rects behind it.
     modal_button_rects: Vec<(Action, Rect)>,
+    /// PRD #80 M7: directory-picker `[Confirm]`/`[Cancel]`/`[Filter]` button
+    /// rects, paired with the [`Action`] each fires. Populated by
+    /// `render_overlays` while the picker is shown, cleared otherwise.
+    picker_button_rects: Vec<(Action, Rect)>,
+    /// PRD #80 M7: directory-picker row rects, paired with the row's index
+    /// into `DirPickerState.filtered_indices` (matching `selected`). A single
+    /// click selects the row, a double-click descends, and a click on the
+    /// `..` row goes up. Populated while the picker is shown, cleared
+    /// otherwise.
+    picker_row_rects: Vec<(usize, Rect)>,
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
     /// Per-session idle ASCII art cache. Key = session_id.
@@ -735,6 +745,8 @@ impl UiState {
             tab_header_rects: Vec::new(),
             card_rects: Vec::new(),
             modal_button_rects: Vec::new(),
+            picker_button_rects: Vec::new(),
+            picker_row_rects: Vec::new(),
         }
     }
 }
@@ -1870,6 +1882,23 @@ pub enum Action {
     /// PRD #80 M6: rename-row `[Cancel]` — abandon the rename and return to
     /// Normal, leaving the existing name untouched (== Esc in rename mode).
     CancelRename,
+    /// PRD #80 M7: single-click a directory-picker row — set the picker's
+    /// selection to this filtered-list index (== j/k landing on it).
+    PickerSelectRow(usize),
+    /// PRD #80 M7: double-click a directory-picker row — select it then
+    /// descend into it (== Enter / l). The `..` row is handled via
+    /// [`Action::PickerParent`] instead.
+    PickerEnterRow(usize),
+    /// PRD #80 M7: click the `..` row / breadcrumb — go up one directory
+    /// (== h / Backspace / Left).
+    PickerParent,
+    /// PRD #80 M7: picker `[Confirm]` — confirm the current directory and
+    /// advance to the new-pane form (== Space).
+    PickerConfirm,
+    /// PRD #80 M7: picker `[Cancel]` — close the picker (== q / Esc).
+    PickerCancel,
+    /// PRD #80 M7: picker `[Filter]` — open the picker's filter input (== `/`).
+    PickerFilter,
     /// PRD #80: Normal-mode digit `1`-`9` — jump to card N and focus its pane.
     FocusCard(usize),
     /// PRD #80: on a mode tab, move the in-tab side-pane focus down (j/Down).
@@ -4194,6 +4223,52 @@ fn dispatch_action(
             ui.rename_text.clear();
             ui.mode = UiMode::Normal;
         }
+        // ===== PRD #80 M7: directory-picker click actions =====
+        // single-click a row → select it (== j/k landing on it).
+        Action::PickerSelectRow(idx) => {
+            if let Some(picker) = ui.dir_picker.as_mut()
+                && idx < picker.filtered_indices.len()
+            {
+                picker.selected = idx;
+            }
+        }
+        // double-click a row → select then descend (== Enter / l).
+        Action::PickerEnterRow(idx) => {
+            let Some(picker) = ui.dir_picker.as_mut() else {
+                return Flow::Continue;
+            };
+            if idx < picker.filtered_indices.len() {
+                picker.selected = idx;
+            }
+            // Mirror the l/Enter key arm: with no subdirs, confirm the current
+            // directory; otherwise descend into the (now-selected) row.
+            if !picker.has_subdirs() {
+                transition_after_dir_pick(ui);
+            } else if !picker.filtered_indices.is_empty() {
+                picker.enter_selected();
+            }
+        }
+        // click the `..` row / breadcrumb → go up (== h / Backspace / Left).
+        Action::PickerParent => {
+            if let Some(picker) = ui.dir_picker.as_mut() {
+                picker.go_up();
+            }
+        }
+        // [Confirm] → confirm the current directory → new-pane form (== Space).
+        Action::PickerConfirm => {
+            transition_after_dir_pick(ui);
+        }
+        // [Cancel] → close the picker (== q / Esc).
+        Action::PickerCancel => {
+            ui.dir_picker = None;
+            ui.mode = UiMode::Normal;
+        }
+        // [Filter] → open the picker's filter input (== `/`).
+        Action::PickerFilter => {
+            if let Some(picker) = ui.dir_picker.as_mut() {
+                picker.filtering = true;
+            }
+        }
         Action::ForwardToPane(bytes) => {
             if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
                 && let Some(pane_id) = embedded.focused_pane_id()
@@ -5453,6 +5528,89 @@ pub fn run_tui(
                     mouse.kind,
                     crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
                 );
+
+                // PRD #80 M7: the directory picker is a topmost overlay — when
+                // it's open, its [Confirm]/[Cancel]/[Filter] buttons and row
+                // rects are the only click targets, hit-tested here and
+                // exclusively (a miss inside the picker is consumed, never
+                // falling through to the dashboard behind it).
+                if ui.mode == UiMode::DirPicker && (is_down || is_up) {
+                    let col = mouse.column;
+                    let row = mouse.row;
+                    // Buttons first.
+                    let mut picker_action = hit_test_button(&ui.picker_button_rects, col, row);
+                    // Then rows (single = select, double = enter, `..` = up).
+                    if picker_action.is_none()
+                        && let Some(&(i, _)) = ui
+                            .picker_row_rects
+                            .iter()
+                            .find(|(_, r)| point_in_rect(r, col, row))
+                    {
+                        // Is this the parent (`..`) row? Then a click of any
+                        // kind navigates up.
+                        let is_parent = ui.dir_picker.as_ref().is_some_and(|p| {
+                            p.filtered_indices
+                                .get(i)
+                                .and_then(|&ei| p.entries.get(ei))
+                                .map(|e| e == Path::new(".."))
+                                .unwrap_or(false)
+                        });
+                        if is_parent {
+                            picker_action = Some(Action::PickerParent);
+                        } else {
+                            // Single vs double click via the shared last_click
+                            // multi-click discrimination (400ms / same row /
+                            // within 3 cols).
+                            let now = std::time::Instant::now();
+                            let click_count = if let Some((t, lc, lr, cnt)) = ui.last_click {
+                                if now.duration_since(t).as_millis() < 400
+                                    && lr == row
+                                    && col.abs_diff(lc) <= 3
+                                {
+                                    (cnt + 1).min(3)
+                                } else {
+                                    1
+                                }
+                            } else {
+                                1
+                            };
+                            if is_down {
+                                ui.last_click = Some((now, col, row, click_count));
+                            }
+                            picker_action = Some(if click_count >= 2 {
+                                Action::PickerEnterRow(i)
+                            } else {
+                                Action::PickerSelectRow(i)
+                            });
+                        }
+                    }
+                    if let Some(action) = picker_action
+                        && is_down
+                    {
+                        let frame_area = terminal.get_frame().area();
+                        let flow = dispatch_action(
+                            action,
+                            &mut ui,
+                            &*pane,
+                            &state,
+                            &mut tab_manager,
+                            &snapshot,
+                            &filtered,
+                            None,
+                            frame_area,
+                        );
+                        if flow == Flow::Break {
+                            break 'outer;
+                        }
+                    }
+                    // Consume every Down/Up while the picker is open — don't
+                    // fall through to the dashboard pane/selection logic.
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
                 // PRD #80 M5: when a modal/overlay is active it is topmost, so
                 // its buttons are hit-tested FIRST and exclusively — the
                 // bottom-bar / tab / card rects behind it are not clickable.
@@ -6659,16 +6817,26 @@ fn render_overlays(
     active_mode_name: Option<&str>,
     palette: ColorPalette,
 ) {
-    // PRD #80 M5: rebuilt below for whichever modal is shown; cleared here so a
-    // click can't hit a modal button from a prior frame once the modal closes.
+    // PRD #80 M5/M7: rebuilt below for whichever modal/overlay is shown;
+    // cleared here so a click can't hit an affordance from a prior frame once
+    // the overlay closes.
     ui.modal_button_rects.clear();
+    ui.picker_button_rects.clear();
+    ui.picker_row_rects.clear();
     if ui.mode == UiMode::Help {
         ui.modal_button_rects = render_help_overlay(frame, active_mode_name, palette);
     }
-    if ui.mode == UiMode::DirPicker
-        && let Some(picker) = ui.dir_picker.as_mut()
-    {
-        render_dir_picker(frame, picker, palette);
+    if ui.mode == UiMode::DirPicker {
+        // Capture the picker's row/button rects after the `dir_picker` borrow
+        // ends so they can be stored back on `ui`.
+        let captured = ui
+            .dir_picker
+            .as_mut()
+            .map(|picker| render_dir_picker(frame, picker, palette));
+        if let Some((rows, buttons)) = captured {
+            ui.picker_row_rects = rows;
+            ui.picker_button_rects = buttons;
+        }
     }
     if ui.mode == UiMode::NewPaneForm
         && let Some(ref form) = ui.new_pane_form
@@ -7747,7 +7915,21 @@ fn render_help_overlay(
     render_modal_button_row(frame, &close_button, btn_row, 2, &palette)
 }
 
-fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: ColorPalette) {
+/// PRD #80 M7: clickable geometry returned by [`render_dir_picker`] — the row
+/// rects (each paired with its index into `DirPickerState.filtered_indices`)
+/// and the `[Confirm]`/`[Cancel]`/`[Filter]` button rects.
+type PickerClickTargets = (Vec<(usize, Rect)>, Vec<(Action, Rect)>);
+
+/// Renders the directory picker and returns its clickable geometry:
+/// `(row_rects, button_rects)`. `row_rects` pairs each visible entry's screen
+/// `Rect` with its index into `filtered_indices` (matching
+/// `DirPickerState.selected`); `button_rects` carries the `[Confirm]` /
+/// `[Cancel]` / `[Filter]` affordances. PRD #80 M7.
+fn render_dir_picker(
+    frame: &mut Frame,
+    picker: &mut DirPickerState,
+    palette: ColorPalette,
+) -> PickerClickTargets {
     let area = frame.area();
     let popup_width = 60.min(area.width.saturating_sub(4));
     let popup_height = 20u16.min(area.height.saturating_sub(4));
@@ -7758,8 +7940,10 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
     frame.render_widget(Clear, popup_area);
 
     // Reserve lines so controls remain visible regardless of list length.
+    // PRD #80 M7 adds one reserved line for the [Confirm]/[Cancel]/[Filter]
+    // button row.
     let show_filter_row = picker.filtering || !picker.filter_text.is_empty();
-    let mut reserved_lines = 5; // current dir + blank + blank + two footer lines
+    let mut reserved_lines = 6; // current dir + blank + blank + button row + two footers
     if show_filter_row {
         reserved_lines += 1;
     }
@@ -7791,6 +7975,12 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
     }
 
     lines.push(Line::from(""));
+
+    // Screen y of line index `n` within the popup (inside the top border).
+    let line_y = |n: usize| popup_area.y + 1 + n as u16;
+    let row_x = popup_area.x + 1;
+    let row_width = popup_area.width.saturating_sub(2);
+    let mut row_rects: Vec<(usize, Rect)> = Vec::new();
 
     if picker.filtered_indices.is_empty() {
         let message = if picker.entries.is_empty() {
@@ -7829,10 +8019,25 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
                 Style::default()
             };
             let suffix = if is_parent { "" } else { "/" };
+            let line_idx = lines.len();
             lines.push(Line::styled(format!("{prefix}{name}{suffix}"), style));
+            // Record this row's clickable rect, keyed by its filtered-list
+            // index `i` (== what `picker.selected` holds).
+            row_rects.push((
+                i,
+                Rect {
+                    x: row_x,
+                    y: line_y(line_idx),
+                    width: row_width,
+                    height: 1,
+                },
+            ));
         }
     }
 
+    lines.push(Line::from(""));
+    // PRD #80 M7: reserved button row (rendered over after the Paragraph).
+    let button_line_idx = lines.len();
     lines.push(Line::from(""));
     let nav_footer = if picker.filtering {
         "  ↑↓: move between matches  Backspace: delete  q: cancel"
@@ -7862,6 +8067,23 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
         .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
+
+    // PRD #80 M7: clickable [Confirm] / [Cancel] / [Filter] affordances on the
+    // reserved button row, alongside the footer hints.
+    let buttons = [
+        Button::new("Confirm", "", Action::PickerConfirm, true),
+        Button::new("Cancel", "", Action::PickerCancel, true),
+        Button::new("Filter", "", Action::PickerFilter, true),
+    ];
+    let btn_row = Rect {
+        x: row_x,
+        y: line_y(button_line_idx),
+        width: row_width,
+        height: 1,
+    };
+    let button_rects = render_modal_button_row(frame, &buttons, btn_row, 1, &palette);
+
+    (row_rects, button_rects)
 }
 
 /// Footer-hint string for the unified new-pane form. Factored out so the
@@ -8791,6 +9013,23 @@ pub fn render_help_overlay_to_buffer(
 ) -> ratatui::buffer::Buffer {
     render_overlay_to_buffer(width, height, |frame| {
         render_help_overlay(frame, None, palette);
+    })
+}
+
+/// PRD #80 M7 L1 seam: render the directory picker rooted at `start` into a
+/// `Buffer`. Drives the production `render_dir_picker` through a
+/// `TestBackend`; after M7 the picker chrome carries clickable `[Confirm]` /
+/// `[Cancel]` / filter affordances, which this seam's buffer then shows.
+/// Mirrors [`render_button_bar_to_buffer`].
+pub fn render_dir_picker_to_buffer(
+    start: std::path::PathBuf,
+    width: u16,
+    height: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    let mut picker = DirPickerState::new(start);
+    render_overlay_to_buffer(width, height, |frame| {
+        render_dir_picker(frame, &mut picker, palette);
     })
 }
 
