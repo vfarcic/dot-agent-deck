@@ -2467,7 +2467,10 @@ fn focus_deck(
                 Ok(()) => {
                     ui.mode = UiMode::PaneInput;
                     ui.status_message = Some((
-                        "PaneInput mode — type to interact, Ctrl+d for dashboard".to_string(),
+                        format!(
+                            "PaneInput mode — type to interact, {} for dashboard",
+                            display_notation(&ui.keybindings, KbAction::Dashboard)
+                        ),
                         std::time::Instant::now(),
                     ));
                     // PRD #76 M2.15 fixup F2: the post-focus resize sweep is
@@ -3691,7 +3694,8 @@ fn dispatch_action(
                             );
                             ui.status_message = Some((
                                 format!(
-                                    "Failed to close pane {closed_pane_id}: {e} — press Ctrl+W to retry"
+                                    "Failed to close pane {closed_pane_id}: {e} — press {} to retry",
+                                    display_notation(&ui.keybindings, KbAction::ClosePane)
                                 ),
                                 std::time::Instant::now(),
                             ));
@@ -3903,7 +3907,10 @@ fn dispatch_action(
                             .write_to_pane(&target_pane_id, "export PS1='$ ' PS2='> ' PROMPT='$ '");
                     }
                     ui.status_message = Some((
-                        "PaneInput mode — type to interact, Ctrl+d for dashboard".to_string(),
+                        format!(
+                            "PaneInput mode — type to interact, {} for dashboard",
+                            display_notation(&ui.keybindings, KbAction::Dashboard)
+                        ),
                         std::time::Instant::now(),
                     ));
                 }
@@ -3994,8 +4001,10 @@ fn dispatch_action(
                                 entry.dismissed = false;
                             }
                             ui.status_message = Some((
-                                "PaneInput mode — type to interact, Ctrl+d for dashboard"
-                                    .to_string(),
+                                format!(
+                                    "PaneInput mode — type to interact, {} for dashboard",
+                                    display_notation(&ui.keybindings, KbAction::Dashboard)
+                                ),
                                 std::time::Instant::now(),
                             ));
                         }
