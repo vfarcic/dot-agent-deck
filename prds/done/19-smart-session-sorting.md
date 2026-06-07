@@ -1,8 +1,10 @@
 # PRD #19: Smart Session Sorting and Pinning
 
-**Status**: Draft
+**Status**: No Longer Needed
 **Priority**: Medium
 **Created**: 2026-03-31
+**Last Updated**: 2026-06-07
+**Closed**: 2026-06-07
 **GitHub Issue**: [#19](https://github.com/vfarcic/dot-agent-deck/issues/19)
 
 ## Problem Statement
