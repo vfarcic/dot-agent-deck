@@ -77,6 +77,7 @@ pub enum Action {
     ClearFilter,
     ApprovePermission,
     DenyPermission,
+    GenerateConfig,
 }
 
 /// Static description of one action: which section it lives in, its config
@@ -272,6 +273,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "deny_permission",
         default: "n",
         description: "Deny permission",
+    },
+    ActionSpec {
+        action: Action::GenerateConfig,
+        section: Section::Dashboard,
+        name: "generate_config",
+        default: "g",
+        description: "Generate config",
     },
 ];
 
@@ -791,8 +799,8 @@ fn render_chord(code: KeyCode, mods: KeyModifiers) -> String {
 /// `~/.config/dot-agent-deck/keybindings.toml`, matching the `config.toml`
 /// path convention in `DashboardConfig`.
 fn keybindings_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("DOT_AGENT_DECK_KEYBINDINGS") {
-        return PathBuf::from(dir);
+    if let Ok(path) = std::env::var("DOT_AGENT_DECK_KEYBINDINGS") {
+        return PathBuf::from(path);
     }
     dirs_home().join(".config/dot-agent-deck/keybindings.toml")
 }
@@ -1160,6 +1168,48 @@ close_pane = "Ctrl+x"
         assert!(c.binding(Action::ClosePane).is_unbound());
         assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
         assert!(warnings[0].contains("conflict"));
+    }
+
+    #[test]
+    fn generate_config_conflicts_when_another_action_takes_g() {
+        // Greptile R5 / PRD #40: generate-config is now a first-class action
+        // (default `g`), so binding another dashboard action to `g` is caught
+        // by conflict detection instead of silently double-firing. clear_filter
+        // is earlier in canonical ACTIONS order than generate_config, so it
+        // wins `g`; generate_config is unbound with a warning.
+        let toml = r#"
+[dashboard]
+clear_filter = "g"
+"#;
+        let (c, warnings) = KeybindingConfig::from_toml_str(toml).unwrap();
+        assert!(c.matches(
+            Action::ClearFilter,
+            &ev(KeyCode::Char('g'), KeyModifiers::NONE)
+        ));
+        assert!(
+            c.binding(Action::GenerateConfig).is_unbound(),
+            "generate_config must lose its default 'g' to the earlier clear_filter binding"
+        );
+        assert_eq!(
+            warnings.iter().filter(|w| w.contains("conflict")).count(),
+            1,
+            "expected exactly one conflict warning: {warnings:?}"
+        );
+        // Dispatch is unique: only one action fires for the `g` event.
+        assert_eq!(
+            c.action_for(&ev(KeyCode::Char('g'), KeyModifiers::NONE)),
+            Some(Action::ClearFilter)
+        );
+    }
+
+    #[test]
+    fn generate_config_default_is_g() {
+        let c = KeybindingConfig::default();
+        assert!(c.matches(
+            Action::GenerateConfig,
+            &ev(KeyCode::Char('g'), KeyModifiers::NONE)
+        ));
+        assert_eq!(c.notation(Action::GenerateConfig), "g");
     }
 
     #[test]

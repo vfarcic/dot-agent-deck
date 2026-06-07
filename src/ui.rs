@@ -2546,9 +2546,10 @@ fn dispatch_normal_mode_key(
     selected_status: Option<SessionStatus>,
     filtered: &[(&String, &SessionState)],
     pane: &dyn PaneController,
+    kb: &KeybindingConfig,
 ) -> Action {
     let prev_selected_index = ui.selected_index;
-    let result = handle_normal_key(key, ui, total, selected_status);
+    let result = handle_normal_key(key, ui, total, selected_status, kb);
     mirror_selection_into_focus(prev_selected_index, ui, filtered, pane);
     result
 }
@@ -2660,6 +2661,7 @@ fn handle_normal_key(
     ui: &mut UiState,
     total: usize,
     selected_status: Option<SessionStatus>,
+    kb: &KeybindingConfig,
 ) -> Action {
     // Ctrl+C from dashboard: show quit confirmation. PRD #40 safety net —
     // hardcoded and checked first so it can never be remapped or unbound.
@@ -2670,15 +2672,14 @@ fn handle_normal_key(
     }
 
     // PRD #40: dashboard (command-mode) shortcuts resolve from the active
-    // keybinding config. Cloned up front so the `&mut ui` mutations below don't
-    // conflict with an immutable borrow of `ui.keybindings`. PRD #80: the
+    // keybinding config. `kb` is the single per-keypress snapshot taken by the
+    // caller (passed by reference so we don't re-clone — it exists to avoid a
+    // `&ui` borrow conflict with the `&mut ui` mutations below). PRD #80: the
     // mode-changing shortcuts return shared `Action`s (EnterFilter/ToggleHelp/
     // EnterRename/Focus) so a keypress and the button-bar funnel into the same
     // `dispatch_action` path. The non-configurable arrow-key aliases (Down/Up)
     // are kept alongside move_down/move_up so default nav is byte-for-byte
     // unchanged.
-    let kb = ui.keybindings.clone();
-
     if kb.matches(KbAction::MoveDown, &key) || key.code == KeyCode::Down {
         if total > 0 {
             ui.selected_index = (ui.selected_index + 1) % total;
@@ -2705,9 +2706,9 @@ fn handle_normal_key(
     if kb.matches(KbAction::FocusPane, &key) && total > 0 {
         return Action::Focus;
     }
-    // `g` generates a project config — not part of the PRD #40 action set, so
-    // it stays hardcoded.
-    if key.code == KeyCode::Char('g') && total > 0 {
+    // generate_config (default `g`) — a first-class remappable action so it
+    // participates in conflict detection and renders via display_notation.
+    if kb.matches(KbAction::GenerateConfig, &key) && total > 0 {
         return Action::RequestConfigGen;
     }
     // PRD #92 F2 (PRD #18 follow-through): approve / deny permission. Only
@@ -6649,6 +6650,7 @@ pub fn run_tui(
                             selected_status,
                             &filtered,
                             &*pane,
+                            &kb,
                         )
                     }
                     UiMode::Filter => handle_filter_key(key, &mut ui),
@@ -8466,7 +8468,10 @@ fn render_help_overlay(
         help_key_line(&n(KbAction::Filter), "Filter sessions"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
         help_key_line(&n(KbAction::Rename), "Rename session"),
-        help_key_line("g", "Generate .dot-agent-deck.toml"),
+        help_key_line(
+            &n(KbAction::GenerateConfig),
+            "Generate .dot-agent-deck.toml",
+        ),
         help_key_line(
             &format!(
                 "{} / {}",
@@ -12464,6 +12469,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(filter_action, Action::EnterFilter));
         ui.mode = UiMode::Filter;
@@ -12483,6 +12489,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(help_action, Action::ToggleHelp));
         ui.mode = UiMode::Help;
@@ -12500,6 +12507,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(rename_action, Action::EnterRename));
         ui.mode = UiMode::Rename;
@@ -12623,6 +12631,7 @@ mod tests {
             &mut ui,
             5,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(ui.filter_text.is_empty());
     }
@@ -12636,6 +12645,7 @@ mod tests {
             &mut ui,
             0,
             None,
+            &KeybindingConfig::default(),
         );
         assert_eq!(ui.mode, UiMode::Normal);
     }
@@ -12659,6 +12669,7 @@ mod tests {
             &mut ui,
             1,
             Some(SessionStatus::WaitingForInput),
+            &KeybindingConfig::default(),
         );
         assert!(
             matches!(result, Action::SendPermissionResponse(true)),
@@ -12674,6 +12685,7 @@ mod tests {
             &mut ui,
             1,
             Some(SessionStatus::WaitingForInput),
+            &KeybindingConfig::default(),
         );
         assert!(
             matches!(result, Action::SendPermissionResponse(false)),
@@ -12700,6 +12712,7 @@ mod tests {
                 &mut ui,
                 1,
                 Some(status.clone()),
+                &KeybindingConfig::default(),
             );
             assert!(
                 matches!(result_y, Action::Continue),
@@ -12710,6 +12723,7 @@ mod tests {
                 &mut ui,
                 1,
                 Some(status.clone()),
+                &KeybindingConfig::default(),
             );
             assert!(
                 matches!(result_n, Action::Continue),
@@ -12729,6 +12743,7 @@ mod tests {
             &mut ui,
             0,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(result_y, Action::Continue));
         let result_n = handle_normal_key(
@@ -12736,6 +12751,7 @@ mod tests {
             &mut ui,
             0,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(result_n, Action::Continue));
         // Also exercise the case where `total > 0` but `selected_status` is
@@ -12746,6 +12762,7 @@ mod tests {
             &mut ui,
             1,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(result_y_no_status, Action::Continue));
     }
@@ -12779,6 +12796,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 1);
@@ -12789,6 +12807,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 2);
@@ -12799,6 +12818,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 0);
@@ -12815,6 +12835,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 2);
@@ -12825,6 +12846,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 1);
@@ -12841,7 +12863,13 @@ mod tests {
             KeyCode::Down,
             KeyCode::Up,
         ] {
-            let r = handle_normal_key(KeyEvent::new(code, KeyModifiers::NONE), &mut ui, 0, None);
+            let r = handle_normal_key(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &mut ui,
+                0,
+                None,
+                &KeybindingConfig::default(),
+            );
             assert!(matches!(r, Action::Continue));
             assert_eq!(ui.selected_index, 0);
         }
@@ -12974,8 +13002,9 @@ mod tests {
         let mut ui = default_ui();
         ui.selected_index = 0;
 
+        let kb = KeybindingConfig::default();
         let press = |ui: &mut UiState, key: KeyEvent| {
-            dispatch_normal_mode_key(key, ui, total, None, &filtered, &pc);
+            dispatch_normal_mode_key(key, ui, total, None, &filtered, &pc, &kb);
         };
 
         // j: 0 → 1, focus mirrored to p1.

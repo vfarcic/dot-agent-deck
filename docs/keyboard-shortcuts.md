@@ -166,6 +166,7 @@ help = "F1"                      # open help with F1 instead of ?
 | `clear_filter` | `Esc` | Clear active filter |
 | `approve_permission` | `y` | Approve a pending permission request |
 | `deny_permission` | `n` | Deny a pending permission request |
+| `generate_config` | `g` | Generate `.dot-agent-deck.toml` (config-generation prompt) |
 
 The `Down`/`Up`/`Tab`/`Shift+Tab`/`Left`/`Right` aliases and `Ctrl+PageUp` / `Ctrl+PageDown` tab navigation are not remappable and always work alongside your bindings.
 
