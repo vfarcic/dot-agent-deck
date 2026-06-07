@@ -6404,7 +6404,9 @@ fn render_bottom_bar(
                 };
                 let hints = if is_mode_tab {
                     format!(
-                        "j/k: navigate panes  Enter: interact  Esc: agent pane  {}: close tab  {}: help  {MOD_KEY}+c: quit{tab_hint}",
+                        "{}/{}: navigate panes  Enter: interact  Esc: agent pane  {}: close tab  {}: help  {MOD_KEY}+c: quit{tab_hint}",
+                        display_notation(&ui.keybindings, Action::MoveDown),
+                        display_notation(&ui.keybindings, Action::MoveUp),
                         display_notation(&ui.keybindings, Action::ClosePane),
                         display_notation(&ui.keybindings, Action::Help),
                     )
