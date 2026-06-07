@@ -645,6 +645,18 @@ impl TuiDeck {
         self.send_bytes(format!("\x1b[<0;{cx};{cy}m").as_bytes());
     }
 
+    /// Send a mouse wheel scroll at the given 0-based grid cell as an SGR
+    /// (1006) report (button code 64 = wheel up, 65 = wheel down), matching
+    /// what crossterm decodes to `MouseEventKind::ScrollUp`/`ScrollDown`.
+    /// Lets tests assert that scroll events reach the scroll path rather than
+    /// being intercepted by the button hit-test layer.
+    pub fn scroll(&self, col: u16, row: u16, down: bool) {
+        let cb = if down { 65 } else { 64 };
+        let cx = col + 1;
+        let cy = row + 1;
+        self.send_bytes(format!("\x1b[<{cb};{cx};{cy}M").as_bytes());
+    }
+
     /// Locate the first occurrence of `needle` in the current rendered
     /// grid, returning its 0-based `(col, row)` start cell, or `None` if it
     /// is not on screen. Used by click tests to find a button's on-screen
