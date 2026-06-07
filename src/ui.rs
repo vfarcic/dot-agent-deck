@@ -1774,6 +1774,9 @@ pub enum Action {
     /// PRD #80: leave `PaneInput` and return to Normal (command) mode on the
     /// current tab (Ctrl+D).
     DetachToNormal,
+    /// PRD #80 M2: open the help overlay (or close it if already open) — the
+    /// `?` key and the `[Help ?]` button share this one path.
+    ToggleHelp,
     /// PRD #80: Ctrl+PageDown — advance to the next tab (clamped, gated on a
     /// visible tab bar). Distinct from [`Action::CycleTabNext`], which wraps.
     GlobalNextTab,
@@ -2369,10 +2372,9 @@ fn handle_normal_key(
             ui.filter_text.clear();
             Action::Continue
         }
-        KeyCode::Char('?') => {
-            ui.mode = UiMode::Help;
-            Action::Continue
-        }
+        // PRD #80 M2: route `?` through the shared action so the key and the
+        // `[Help ?]` button funnel into the same `dispatch_action` path.
+        KeyCode::Char('?') => Action::ToggleHelp,
         KeyCode::Char('r') if total > 0 => {
             ui.mode = UiMode::Rename;
             ui.rename_text.clear();
@@ -2861,6 +2863,18 @@ impl Button {
         }
     }
 
+    /// The narrow-terminal fallback label: just the bracketed shortcut, e.g.
+    /// `[Ctrl+N]` (or `[New Pane]` if the button has no shortcut). Used by the
+    /// button bar when the full `[Label Shortcut]` set doesn't fit, so every
+    /// command stays identifiable without a mid-label truncation.
+    pub fn shortcut_only_label(&self) -> String {
+        if self.shortcut.is_empty() {
+            format!("[{}]", self.label)
+        } else {
+            format!("[{}]", self.shortcut)
+        }
+    }
+
     /// The `(Action, Rect)` pair to record in `UiState::button_rects` for the
     /// button placed at `area` — the same pair [`Button::render`] returns,
     /// exposed without a `Buffer` so hit-test recording (and unit tests) need
@@ -2871,12 +2885,10 @@ impl Button {
         (self.action.clone(), area)
     }
 
-    /// Render the button into `buf` at `area` and return the `(Action, Rect)`
-    /// pair the caller records in `UiState::button_rects`, so a later click in
-    /// `area` hit-tests back to this button's action via [`hit_test_button`].
-    /// (Unused until the M2 bar renders.)
-    pub fn render(&self, area: Rect, buf: &mut Buffer, palette: &ColorPalette) -> (Action, Rect) {
-        let style = if self.enabled {
+    /// Styling for the button text — normal for an enabled button, dimmed for
+    /// a disabled one.
+    fn style(&self, palette: &ColorPalette) -> Style {
+        if self.enabled {
             Style::default()
                 .fg(palette.text_primary)
                 .bg(palette.tab_bar_bg)
@@ -2885,10 +2897,38 @@ impl Button {
                 .fg(palette.text_muted)
                 .bg(palette.tab_bar_bg)
                 .add_modifier(Modifier::DIM)
-        };
-        let span = Span::styled(self.display_label(), style);
+        }
+    }
+
+    /// Render `text` (an already-chosen full or shortcut-only label) into `buf`
+    /// at `area` and return the `(Action, Rect)` pair to record in
+    /// `UiState::button_rects`. Keeping render and the recorded rect in one
+    /// call is what stops the click target from drifting from what's drawn.
+    fn render_text(
+        &self,
+        text: &str,
+        area: Rect,
+        buf: &mut Buffer,
+        palette: &ColorPalette,
+    ) -> (Action, Rect) {
+        let span = Span::styled(text.to_string(), self.style(palette));
         buf.set_span(area.x, area.y, &span, area.width);
         self.pair(area)
+    }
+
+    /// Render the full `[Label Shortcut]` button into `buf` at `area`.
+    pub fn render(&self, area: Rect, buf: &mut Buffer, palette: &ColorPalette) -> (Action, Rect) {
+        self.render_text(&self.display_label(), area, buf, palette)
+    }
+
+    /// Render the narrow-terminal `[Shortcut]` fallback into `buf` at `area`.
+    pub fn render_compact(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        palette: &ColorPalette,
+    ) -> (Action, Rect) {
+        self.render_text(&self.shortcut_only_label(), area, buf, palette)
     }
 }
 
@@ -2976,6 +3016,15 @@ fn dispatch_action(
             }
             ui.mode = UiMode::Normal;
             ui.status_message = None;
+        }
+        // `?` / [Help ?] button: open the help overlay, or close it if already
+        // open. Both key and button reach this one arm.
+        Action::ToggleHelp => {
+            ui.mode = if ui.mode == UiMode::Help {
+                UiMode::Normal
+            } else {
+                UiMode::Help
+            };
         }
         // Ctrl+w: close selected pane (or entire mode tab if it's the agent pane).
         //
@@ -5034,6 +5083,52 @@ pub fn run_tui(
 
             // Handle mouse events: scroll, text selection, and copy.
             if let Event::Mouse(mouse) = ev {
+                // PRD #80 M2: button bar takes precedence. A left-button Down
+                // on a recorded button rect fires its Action through the SAME
+                // `dispatch_action` funnel as the keystroke, then short-circuits
+                // the rest of mouse handling. The paired Up on a button is also
+                // consumed (without re-dispatching) so it can't fall through to
+                // the selection/copy path. Scroll events are not Down/Up, so
+                // they bypass this layer entirely and reach the forwarding
+                // branch unchanged.
+                let is_down = matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                );
+                let is_up = matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                );
+                if (is_down || is_up)
+                    && let Some(action) = hit_test_button(&ui.button_rects, mouse.column, mouse.row)
+                {
+                    if is_down {
+                        let frame_area = terminal.get_frame().area();
+                        let selected_id: Option<String> =
+                            filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+                        let flow = dispatch_action(
+                            action,
+                            &mut ui,
+                            &*pane,
+                            &state,
+                            &mut tab_manager,
+                            &snapshot,
+                            &filtered,
+                            selected_id.as_deref(),
+                            frame_area,
+                        );
+                        if flow == Flow::Break {
+                            break 'outer;
+                        }
+                    }
+                    // Consume the event (both Down and Up) — do not fall through
+                    // to pane focus / selection / scroll logic.
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
                 // Side pane scroll: works in any UI mode by hit-testing rects
                 let mut side_scrolled = false;
                 if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
@@ -5719,7 +5814,6 @@ fn render_frame(
             hints_area,
             has_pane_control,
             active_mode_name,
-            tab_bar.show,
             *focused_side_pane_index,
         );
         return;
@@ -5780,7 +5874,7 @@ fn render_frame(
         .style(Style::default().fg(palette.text_secondary))
         .centered();
         frame.render_widget(msg, vertical[1]);
-        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
+        render_bottom_bar(frame, ui, hints_area, has_pane_control);
 
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -5868,7 +5962,7 @@ fn render_frame(
             active_mode_name,
             palette,
         );
-        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
+        render_bottom_bar(frame, ui, hints_area, has_pane_control);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -5958,7 +6052,7 @@ fn render_frame(
     );
 
     // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
+    render_bottom_bar(frame, ui, hints_area, has_pane_control);
 
     // Render terminal panes on the right side
     if let Some(right) = panes_area {
@@ -6195,7 +6289,6 @@ fn render_mode_tab(
     hints_area: Rect,
     has_pane_control: bool,
     active_mode_name: Option<&str>,
-    show_tab_bar: bool,
     focused_side_pane_index: Option<usize>,
 ) {
     let palette = ui.palette;
@@ -6268,7 +6361,7 @@ fn render_mode_tab(
     }
 
     // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control, show_tab_bar, true);
+    render_bottom_bar(frame, ui, hints_area, has_pane_control);
 
     render_overlays(frame, ui, active_mode_name, palette);
 }
@@ -6338,14 +6431,89 @@ fn render_stats_bar(
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_bottom_bar(
+/// PRD #80 M2: the five global commands the persistent button bar exposes,
+/// each carrying its inline keyboard shortcut (so the bar doubles as the
+/// legend it replaced). The pane-dependent commands (New Pane / Close /
+/// Toggle Layout) are disabled — rendered dimmed — when no pane controller is
+/// available; Help and Quit are always actionable. Shortcuts mirror the
+/// keyboard handlers: `global_ctrl_action` (Ctrl+N/W/T), `?` → Help,
+/// Ctrl+C → Quit.
+fn global_bar_buttons(has_pane_control: bool) -> Vec<Button> {
+    vec![
+        Button::new("New Pane", "Ctrl+N", Action::NewPane, has_pane_control),
+        Button::new("Close", "Ctrl+W", Action::CloseSelected, has_pane_control),
+        Button::new(
+            "Toggle Layout",
+            "Ctrl+T",
+            Action::ToggleLayout,
+            has_pane_control,
+        ),
+        Button::new("Help", "?", Action::ToggleHelp, true),
+        Button::new("Quit", "Ctrl+C", Action::Quit, true),
+    ]
+}
+
+/// PRD #80 M2: render the persistent global button bar into `area` (one row)
+/// and return the `(Action, Rect)` pairs to record in `UiState::button_rects`
+/// so a later click hit-tests back to the right action. Two-tier labels: the
+/// full `[Label Shortcut]` set when it fits the row width, otherwise the
+/// shortcut-only `[Shortcut]` fallback (the same width-pressure approach the
+/// old status legend faced). Buttons are separated by one space and laid out
+/// left to right; a button that would overflow the row is dropped whole rather
+/// than truncated mid-label, so every rendered button stays identifiable.
+fn render_button_bar(
     frame: &mut Frame,
-    ui: &UiState,
+    palette: &ColorPalette,
     area: Rect,
     has_pane_control: bool,
-    show_tab_bar: bool,
-    is_mode_tab: bool,
-) {
+) -> Vec<(Action, Rect)> {
+    const SEP: u16 = 1;
+    let buttons = global_bar_buttons(has_pane_control);
+
+    // Choose full vs shortcut-only based on whether the full set fits the row.
+    let full_width: u16 = buttons
+        .iter()
+        .map(|b| b.display_label().chars().count() as u16)
+        .sum::<u16>()
+        + SEP * (buttons.len().saturating_sub(1) as u16);
+    let use_full = full_width <= area.width;
+
+    let end = area.x.saturating_add(area.width);
+    let mut rects = Vec::with_capacity(buttons.len());
+    let buf = frame.buffer_mut();
+    let mut x = area.x;
+    for (i, button) in buttons.iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(SEP);
+        }
+        let label = if use_full {
+            button.display_label()
+        } else {
+            button.shortcut_only_label()
+        };
+        let w = label.chars().count() as u16;
+        if x.saturating_add(w) > end {
+            // Would overflow the row — drop this (and every later) button whole.
+            break;
+        }
+        let rect = Rect {
+            x,
+            y: area.y,
+            width: w,
+            height: 1,
+        };
+        let pair = if use_full {
+            button.render(rect, buf, palette)
+        } else {
+            button.render_compact(rect, buf, palette)
+        };
+        rects.push(pair);
+        x = x.saturating_add(w);
+    }
+    rects
+}
+
+fn render_bottom_bar(frame: &mut Frame, ui: &mut UiState, area: Rect, has_pane_control: bool) {
     match ui.mode {
         UiMode::Filter => {
             let line = Line::from(vec![
@@ -6361,6 +6529,10 @@ fn render_bottom_bar(
             // Show cursor
             let cursor_x = area.x + 2 + ui.filter_text.len() as u16;
             frame.set_cursor_position(Position::new(cursor_x, area.y));
+            // The filter input owns the bar row — no global buttons here (M6
+            // adds the inline Apply/Cancel buttons). Clear stale rects so a
+            // click in this mode can't hit a button from a prior render.
+            ui.button_rects.clear();
         }
         UiMode::Rename => {
             let line = Line::from(vec![
@@ -6375,47 +6547,49 @@ fn render_bottom_bar(
             frame.render_widget(Paragraph::new(line), area);
             let cursor_x = area.x + 8 + ui.rename_text.len() as u16;
             frame.set_cursor_position(Position::new(cursor_x, area.y));
+            ui.button_rects.clear();
         }
         _ => {
             if let Some((ref msg, _)) = ui.status_message {
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
+                // A transient status message occupies the bar row this frame;
+                // no buttons are drawn, so nothing is hit-testable.
+                ui.button_rects.clear();
             } else {
-                let tab_hint = if show_tab_bar {
-                    format!("  {MOD_KEY}+PgUp/PgDn: tabs")
-                } else {
-                    String::new()
-                };
-                let hints = if is_mode_tab {
-                    format!(
-                        "j/k: navigate panes  Enter: interact  Esc: agent pane  {MOD_KEY}+w: close tab  ?: help  {MOD_KEY}+c: quit{tab_hint}"
-                    )
-                } else if has_pane_control {
-                    format!(
-                        "{MOD_KEY}+n: new  {MOD_KEY}+w: close  {MOD_KEY}+t: layout  {MOD_KEY}+d: dashboard (1-9 ? /)  {MOD_KEY}+c: quit{tab_hint}"
-                    )
-                } else {
-                    format!("?: help  1-9: jump  {MOD_KEY}+c: quit{tab_hint}")
-                };
-                let mut spans = vec![Span::styled(
-                    hints,
-                    Style::default().fg(ui.palette.text_secondary),
-                )];
+                // PRD #80 M2: the persistent global button bar replaces the
+                // legacy status legend (no duplication — each button carries
+                // the same shortcut the legend used to show inline).
+                let rects = render_button_bar(frame, &ui.palette, area, has_pane_control);
+                // Preserve the "update available" badge by right-aligning it
+                // after the bar when set (it's a separate notification, not the
+                // removed legend text).
                 if let Some(ref latest) = ui.update_available {
-                    spans.push(Span::raw("  "));
-                    spans.push(Span::styled(
-                        format!(
-                            " Update available: v{latest} (current: v{}) ",
-                            env!("DAD_VERSION")
-                        ),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ));
+                    let badge = format!(
+                        " Update available: v{latest} (current: v{}) ",
+                        env!("DAD_VERSION")
+                    );
+                    let bw = badge.chars().count() as u16;
+                    if bw < area.width {
+                        let badge_area = Rect {
+                            x: area.x + area.width - bw,
+                            y: area.y,
+                            width: bw,
+                            height: 1,
+                        };
+                        frame.render_widget(
+                            Paragraph::new(Line::styled(
+                                badge,
+                                Style::default()
+                                    .fg(Color::Black)
+                                    .bg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                            badge_area,
+                        );
+                    }
                 }
-                let line = Line::from(spans);
-                frame.render_widget(Paragraph::new(line), area);
+                ui.button_rects = rects;
             }
         }
     }
@@ -7652,6 +7826,36 @@ pub fn render_card_to_buffer(
                 palette,
                 None,
             );
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #80 M2: render the persistent global button bar into a one-row
+/// `Buffer` for L1 tests, mirroring [`render_card_to_buffer`]. Drives the
+/// production bottom-bar renderer (`render_bottom_bar`) through a
+/// `TestBackend` so a test can assert on the rendered cells without a PTY.
+/// `width` is the terminal width — vary it to exercise the comfortable-width
+/// full-label layout and the narrow-terminal shortcut-only fallback. The bar
+/// occupies a single row, so the returned buffer is `width × 1`.
+pub fn render_button_bar_to_buffer(width: u16, palette: ColorPalette) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, 1);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let mut ui = UiState::new(DashboardConfig::default(), palette);
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 1,
+            };
+            // has_pane_control = true → the richest legacy legend today;
+            // after M2 this site renders the always-visible global button bar.
+            render_bottom_bar(frame, &mut ui, area, true);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -10212,13 +10416,19 @@ mod tests {
         handle_filter_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
         assert_eq!(ui.mode, UiMode::Normal);
 
-        // Normal -> Help
-        handle_normal_key(
+        // Normal -> Help: PRD #80 M2 routes `?` through `dispatch_action`
+        // (shared by the `[Help ?]` button), so the handler now returns
+        // `Action::ToggleHelp` rather than flipping the mode inline. Apply the
+        // transition the way `dispatch_action` would so the test continues from
+        // Help mode.
+        let help_action = handle_normal_key(
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
             &mut ui,
             3,
             None,
         );
+        assert!(matches!(help_action, Action::ToggleHelp));
+        ui.mode = UiMode::Help;
         assert_eq!(ui.mode, UiMode::Help);
 
         // Help -> Normal

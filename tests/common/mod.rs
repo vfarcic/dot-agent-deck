@@ -619,6 +619,47 @@ impl TuiDeck {
     pub fn snapshot_grid(&self) -> String {
         self.parser.lock().unwrap().screen().contents()
     }
+
+    /// Write raw bytes to the deck's PTY master — the input side of the
+    /// terminal. Lets L2 tests drive the deck the way a user's keyboard or
+    /// mouse would (key bytes, SGR mouse reports). Flushes so the deck sees
+    /// the input promptly.
+    pub fn send_bytes(&self, bytes: &[u8]) {
+        let mut writer = self
+            .pty_master
+            .take_writer()
+            .expect("take PTY master writer");
+        writer.write_all(bytes).expect("write to PTY master");
+        writer.flush().expect("flush PTY master");
+    }
+
+    /// Send a left-button mouse click at the given 0-based grid cell
+    /// (`col`, `row`) as an SGR (1006) extended mouse report — press then
+    /// release — matching what crossterm's `EnableMouseCapture` makes the
+    /// deck decode. SGR coordinates are 1-based, so each is offset by one.
+    pub fn click(&self, col: u16, row: u16) {
+        let cx = col + 1;
+        let cy = row + 1;
+        // \x1b[<0;cx;cyM = left-button press; trailing `m` = release.
+        self.send_bytes(format!("\x1b[<0;{cx};{cy}M").as_bytes());
+        self.send_bytes(format!("\x1b[<0;{cx};{cy}m").as_bytes());
+    }
+
+    /// Locate the first occurrence of `needle` in the current rendered
+    /// grid, returning its 0-based `(col, row)` start cell, or `None` if it
+    /// is not on screen. Used by click tests to find a button's on-screen
+    /// position before clicking it (so the test follows the real layout
+    /// rather than hard-coding coordinates).
+    pub fn find_in_grid(&self, needle: &str) -> Option<(u16, u16)> {
+        let grid = self.snapshot_grid();
+        for (row, line) in grid.lines().enumerate() {
+            if let Some(byte_idx) = line.find(needle) {
+                let col = line[..byte_idx].chars().count();
+                return Some((col as u16, row as u16));
+            }
+        }
+        None
+    }
 }
 
 impl Drop for TuiDeck {
