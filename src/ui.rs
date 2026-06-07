@@ -1858,6 +1858,18 @@ pub enum Action {
     StarSnooze,
     /// PRD #80 M5: star-prompt `[Dismiss]` — stop asking permanently (== `d`).
     StarDismiss,
+    /// PRD #80 M6: filter-row `[Apply]` — commit the filter and return to
+    /// Normal, KEEPING the typed filter text (== Enter in filter mode).
+    ApplyFilter,
+    /// PRD #80 M6: filter-row `[Cancel]` — clear the filter and return to
+    /// Normal (== Esc in filter mode).
+    CancelFilter,
+    /// PRD #80 M6: rename-row `[Save]` — commit the rename on the selected
+    /// card and return to Normal (== Enter in rename mode).
+    SaveRename,
+    /// PRD #80 M6: rename-row `[Cancel]` — abandon the rename and return to
+    /// Normal, leaving the existing name untouched (== Esc in rename mode).
+    CancelRename,
     /// PRD #80: Normal-mode digit `1`-`9` — jump to card N and focus its pane.
     FocusCard(usize),
     /// PRD #80: on a mode tab, move the in-tab side-pane focus down (j/Down).
@@ -3193,6 +3205,42 @@ fn send_config_gen_prompt(
     }
 }
 
+/// PRD #80 M6: commit a rename for the selected card — push `new_name` to the
+/// daemon via `PaneController::rename_pane` and mirror the controller-resolved
+/// outcome into the dashboard's display-name maps. Shared by the `Rename`-mode
+/// Enter key (via `run_tui`) and the `[Save]` button (`Action::SaveRename`) so
+/// click and key resolve identically. Best-effort: `rename_pane`'s own error
+/// path logs and swallows transient daemon failures.
+fn commit_rename(
+    new_name: &str,
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    snapshot: &AppState,
+    selected_id: Option<&str>,
+) {
+    if let Some(sid) = selected_id
+        && let Some(session) = snapshot.sessions.get(sid)
+        && let Some(ref pane_id) = session.pane_id
+    {
+        match pane.rename_pane(pane_id, new_name) {
+            Ok(outcome) => apply_rename_outcome(
+                &mut ui.display_names,
+                &mut ui.pane_display_names,
+                sid,
+                pane_id,
+                outcome,
+            ),
+            Err(e) => {
+                tracing::debug!(
+                    pane_id = %pane_id,
+                    error = %e,
+                    "rename_pane returned an error; UI maps unchanged"
+                );
+            }
+        }
+    }
+}
+
 /// PRD #80: the single funnel. Every command [`Action`] — whether it came from
 /// a keystroke (today) or a button click (M2 on) — executes here and nowhere
 /// else. The keystroke branch in `run_tui` is a thin `KeyEvent -> Option<
@@ -4122,6 +4170,28 @@ fn dispatch_action(
         // star-prompt [Dismiss]: stop asking permanently (== `d`).
         Action::StarDismiss => {
             ui.star_prompt_state.dismiss_permanently();
+            ui.mode = UiMode::Normal;
+        }
+        // ===== PRD #80 M6: inline-edit button actions =====
+        // filter [Apply]: commit and keep the typed filter (== Enter).
+        Action::ApplyFilter => {
+            ui.mode = UiMode::Normal;
+        }
+        // filter [Cancel]: clear the filter (== Esc).
+        Action::CancelFilter => {
+            ui.filter_text.clear();
+            ui.mode = UiMode::Normal;
+        }
+        // rename [Save]: commit the rename on the selected card (== Enter).
+        Action::SaveRename => {
+            let new_name = ui.rename_text.clone();
+            ui.rename_text.clear();
+            ui.mode = UiMode::Normal;
+            commit_rename(&new_name, ui, pane, snapshot, selected_id);
+        }
+        // rename [Cancel]: abandon, leaving the existing name (== Esc).
+        Action::CancelRename => {
+            ui.rename_text.clear();
             ui.mode = UiMode::Normal;
         }
         Action::ForwardToPane(bytes) => {
@@ -5395,6 +5465,11 @@ pub fn run_tui(
                         | UiMode::StarPrompt
                         | UiMode::Help
                 );
+                // PRD #80 M6: in the inline-edit modes the bottom row IS the
+                // input; its [Apply]/[Cancel] / [Save]/[Cancel] buttons live in
+                // `button_rects`, and any other click is consumed below so it
+                // keeps the field focused instead of exiting the mode.
+                let text_input_mode = matches!(ui.mode, UiMode::Filter | UiMode::Rename);
                 let mouse_action = if !(is_down || is_up) {
                     None
                 } else if modal_active {
@@ -5444,6 +5519,7 @@ pub fn run_tui(
                 // Up is consumed. Cards are their own rect region, so this
                 // coexists with the in-pane text-selection multi-click path.
                 if !modal_active
+                    && !text_input_mode
                     && (is_down || is_up)
                     && let Some(card_idx) = hit_test_card(&ui.card_rects, mouse.column, mouse.row)
                 {
@@ -5501,6 +5577,18 @@ pub fn run_tui(
                     }
                     // Consume both Down and Up — don't fall through to the
                     // pane-focus / selection / scroll logic below.
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
+                // PRD #80 M6: in filter / rename mode, a click that missed the
+                // [Apply]/[Cancel] / [Save]/[Cancel] buttons lands "in the
+                // field" — consume it so the field stays focused (typing stays
+                // keyboard) rather than falling through to pane/selection logic
+                // that could exit the edit.
+                if text_input_mode && (is_down || is_up) {
                     if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                         break;
                     }
@@ -5953,32 +6041,15 @@ pub fn run_tui(
                         // label (PRD #76 M2.11 reviewer P1).
                         let commit = rename_commit_value(key, &ui.rename_text);
                         let r = handle_rename_key(key, &mut ui, selected_id.as_deref());
-                        if let Some(new_name) = commit
-                            && let Some(ref sid) = selected_id
-                            && let Some(session) = snapshot.sessions.get(sid)
-                            && let Some(ref pane_id) = session.pane_id
-                        {
-                            // Best-effort daemon update — rename_pane's
-                            // own error path already logs and swallows
-                            // transient daemon failures, and the daemon
-                            // RPC is spawned off the UI thread so a
-                            // wedged daemon can't freeze the renderer.
-                            match pane.rename_pane(pane_id, &new_name) {
-                                Ok(outcome) => apply_rename_outcome(
-                                    &mut ui.display_names,
-                                    &mut ui.pane_display_names,
-                                    sid,
-                                    pane_id,
-                                    outcome,
-                                ),
-                                Err(e) => {
-                                    tracing::debug!(
-                                        pane_id = %pane_id,
-                                        error = %e,
-                                        "rename_pane returned an error; UI maps unchanged"
-                                    );
-                                }
-                            }
+                        if let Some(new_name) = commit {
+                            // Shared with the `[Save]` button (Action::SaveRename).
+                            commit_rename(
+                                &new_name,
+                                &mut ui,
+                                &*pane,
+                                &snapshot,
+                                selected_id.as_deref(),
+                            );
                         }
                         r
                     }
@@ -7068,10 +7139,14 @@ fn render_bottom_bar(
             // Show cursor
             let cursor_x = area.x + 2 + ui.filter_text.len() as u16;
             frame.set_cursor_position(Position::new(cursor_x, area.y));
-            // The filter input owns the bar row — no global buttons here (M6
-            // adds the inline Apply/Cancel buttons). Clear stale rects so a
-            // click in this mode can't hit a button from a prior render.
-            ui.button_rects.clear();
+            // PRD #80 M6: inline [Apply] / [Cancel] buttons at the right edge,
+            // alongside the `/ <text>` input. Typing stays keyboard; clicking
+            // the field keeps it focused (handled in the mouse branch).
+            let buttons = [
+                Button::new("Apply", "", Action::ApplyFilter, true),
+                Button::new("Cancel", "", Action::CancelFilter, true),
+            ];
+            ui.button_rects = render_right_aligned_buttons(frame, &buttons, area, &ui.palette);
         }
         UiMode::Rename => {
             let line = Line::from(vec![
@@ -7086,7 +7161,30 @@ fn render_bottom_bar(
             frame.render_widget(Paragraph::new(line), area);
             let cursor_x = area.x + 8 + ui.rename_text.len() as u16;
             frame.set_cursor_position(Position::new(cursor_x, area.y));
-            ui.button_rects.clear();
+            // PRD #80 M6: inline [Save] / [Cancel] buttons at the right edge,
+            // alongside the `Rename: <text>` input.
+            let buttons = [
+                Button::new("Save", "", Action::SaveRename, true),
+                Button::new("Cancel", "", Action::CancelRename, true),
+            ];
+            ui.button_rects = render_right_aligned_buttons(frame, &buttons, area, &ui.palette);
+        }
+        UiMode::PaneInput => {
+            // PRD #80 M6: while interacting with a pane, keep the status
+            // message (e.g. "PaneInput mode …") on the left and expose the
+            // [Detach Ctrl+D] affordance at the right edge — clicking it
+            // returns to the dashboard exactly as Ctrl+D does.
+            if let Some((ref msg, _)) = ui.status_message {
+                let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
+                frame.render_widget(Paragraph::new(line), area);
+            }
+            let buttons = [Button::new(
+                "Detach",
+                "Ctrl+D",
+                Action::DetachToNormal,
+                true,
+            )];
+            ui.button_rects = render_right_aligned_buttons(frame, &buttons, area, &ui.palette);
         }
         _ => {
             if let Some((ref msg, _)) = ui.status_message {
@@ -7170,6 +7268,32 @@ fn render_modal_button_row(
         x = x.saturating_add(w);
     }
     rects
+}
+
+/// PRD #80 M6: render `buttons` right-aligned within `area` (one row) and
+/// return their `(Action, Rect)` pairs. Used by the inline-edit rows
+/// (filter / rename) and the PaneInput detach affordance, which keep their
+/// prompt / status text on the left and place the buttons at the right edge.
+fn render_right_aligned_buttons(
+    frame: &mut Frame,
+    buttons: &[Button],
+    area: Rect,
+    palette: &ColorPalette,
+) -> Vec<(Action, Rect)> {
+    const SEP: u16 = 1;
+    let total: u16 = buttons
+        .iter()
+        .map(|b| b.display_label().chars().count() as u16)
+        .sum::<u16>()
+        + SEP * (buttons.len().saturating_sub(1) as u16);
+    let bx = area.x + area.width.saturating_sub(total);
+    let row = Rect {
+        x: bx,
+        y: area.y,
+        width: total,
+        height: 1,
+    };
+    render_modal_button_row(frame, buttons, row, 0, palette)
 }
 
 fn render_quit_confirm(
@@ -8502,6 +8626,68 @@ pub fn render_button_bar_to_buffer(width: u16, palette: ColorPalette) -> ratatui
             // has_pane_control = true → the richest legacy legend today;
             // after M2 this site renders the always-visible global button bar.
             render_bottom_bar(frame, &mut ui, area, true, &[]);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #80 M6 L1 seam: render the filter-mode bottom row (the inline filter
+/// input carrying `filter_text`) into a one-row `Buffer`. After M6 this row
+/// also renders the inline `[Apply]` / `[Cancel]` buttons at its right edge.
+/// Mirrors [`render_button_bar_to_buffer`].
+pub fn render_filter_bar_to_buffer(
+    filter_text: &str,
+    width: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, 1);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let mut ui = UiState::new(DashboardConfig::default(), palette);
+    ui.mode = UiMode::Filter;
+    ui.filter_text = filter_text.to_string();
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 1,
+            };
+            render_bottom_bar(frame, &mut ui, area, false, &[]);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #80 M6 L1 seam: render the rename-mode bottom row (the inline rename
+/// input carrying `rename_text`) into a one-row `Buffer`. After M6 this row
+/// also renders the inline `[Save]` / `[Cancel]` buttons at its right edge.
+/// Mirrors [`render_button_bar_to_buffer`].
+pub fn render_rename_bar_to_buffer(
+    rename_text: &str,
+    width: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, 1);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let mut ui = UiState::new(DashboardConfig::default(), palette);
+    ui.mode = UiMode::Rename;
+    ui.rename_text = rename_text.to_string();
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 1,
+            };
+            render_bottom_bar(frame, &mut ui, area, false, &[]);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
