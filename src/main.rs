@@ -669,6 +669,14 @@ async fn run_tui_session(continue_session: bool) -> ExitCode {
 
     let config = dot_agent_deck::config::DashboardConfig::load();
 
+    // PRD #40: resolve keybindings client-side, *before* entering the
+    // alternate screen, so any malformed-config / conflict / unknown-action
+    // warnings land on stderr in the normal terminal (and, under a PTY, in
+    // the byte stream that precedes the alt-screen switch) where they are
+    // actually visible. `run_tui` (via `ratatui::init`) is what flips into
+    // the alt-screen, so loading here keeps the warnings ahead of it.
+    let keybindings = dot_agent_deck::keybindings::KeybindingConfig::load();
+
     // Auto-install hooks for detected agents (silent, best-effort)
     hooks_manage::auto_install();
     dot_agent_deck::opencode_manage::auto_install();
@@ -679,7 +687,13 @@ async fn run_tui_session(continue_session: bool) -> ExitCode {
     ));
     let tui_state = state.clone();
     let tui_result = tokio::task::spawn_blocking(move || {
-        run_tui(tui_state, pane_controller, config, continue_session)
+        run_tui(
+            tui_state,
+            pane_controller,
+            config,
+            keybindings,
+            continue_session,
+        )
     })
     .await;
 

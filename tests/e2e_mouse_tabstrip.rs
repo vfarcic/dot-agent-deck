@@ -10,6 +10,7 @@
 //!   - mouse/tabstrip/002 (click→close half) — clicking a Mode tab's `[×]`
 //!     closes it (same outcome as Ctrl+W). The presence/absence of `[×]`
 //!     across tab kinds is pinned by the L1 spec in `render_tab_strip.rs`.
+//!
 //! Decision 6: gated behind the `e2e` feature so `cargo test-fast` never
 //! compiles it.
 

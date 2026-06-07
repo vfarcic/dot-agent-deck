@@ -20,6 +20,11 @@ use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
 use crate::event::{AgentType, EventType};
+// PRD #80 introduced a UI-dispatch `Action` enum in this module (the renamed
+// `KeyResult`), which collides with the keybinding-action enum. Import the
+// latter under an alias so both coexist: `Action` = the UI dispatch action,
+// `KbAction` = a remappable keybinding action (MoveDown, Help, …).
+use crate::keybindings::{Action as KbAction, KeybindingConfig};
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
@@ -613,6 +618,10 @@ struct UiState {
     /// Maps pane_id → launch metadata for auto-save/restore.
     pane_metadata: HashMap<String, config::SavedPane>,
     config: DashboardConfig,
+    /// PRD #40: active keybinding config (resolved client-side at startup).
+    /// Drives command-mode key dispatch and the dynamically-generated help
+    /// overlay / hints bar. Defaults reproduce today's hardcoded bindings.
+    keybindings: KeybindingConfig,
     /// Tracks last-seen status per session for bell transition detection.
     last_bell_status: HashMap<String, SessionStatus>,
     /// Populated by the background version-check task when a newer release is available.
@@ -796,7 +805,7 @@ struct TextSelection {
 }
 
 impl UiState {
-    fn new(config: DashboardConfig) -> Self {
+    fn new(config: DashboardConfig, keybindings: KeybindingConfig) -> Self {
         Self {
             mode: UiMode::Normal,
             selected_index: 0,
@@ -812,6 +821,7 @@ impl UiState {
             pane_display_names: HashMap::new(),
             pane_metadata: HashMap::new(),
             config,
+            keybindings,
             last_bell_status: HashMap::new(),
             update_available: None,
             pane_layout: PaneLayout::Stacked,
@@ -850,7 +860,7 @@ impl UiState {
 
 impl Default for UiState {
     fn default() -> Self {
-        Self::new(DashboardConfig::default())
+        Self::new(DashboardConfig::default(), KeybindingConfig::default())
     }
 }
 
@@ -2477,7 +2487,10 @@ fn focus_deck(
                 Ok(()) => {
                     ui.mode = UiMode::PaneInput;
                     ui.status_message = Some((
-                        "PaneInput mode — type to interact, Ctrl+d for dashboard".to_string(),
+                        format!(
+                            "PaneInput mode — type to interact, {} for dashboard",
+                            display_notation(&ui.keybindings, KbAction::Dashboard)
+                        ),
                         std::time::Instant::now(),
                     ));
                     // PRD #76 M2.15 fixup F2: the post-focus resize sweep is
@@ -2553,9 +2566,10 @@ fn dispatch_normal_mode_key(
     selected_status: Option<SessionStatus>,
     filtered: &[(&String, &SessionState)],
     pane: &dyn PaneController,
+    kb: &KeybindingConfig,
 ) -> Action {
     let prev_selected_index = ui.selected_index;
-    let result = handle_normal_key(key, ui, total, selected_status);
+    let result = handle_normal_key(key, ui, total, selected_status, kb);
     mirror_selection_into_focus(prev_selected_index, ui, filtered, pane);
     result
 }
@@ -2667,68 +2681,80 @@ fn handle_normal_key(
     ui: &mut UiState,
     total: usize,
     selected_status: Option<SessionStatus>,
+    kb: &KeybindingConfig,
 ) -> Action {
-    // Ctrl+C from dashboard: show quit confirmation
+    // Ctrl+C from dashboard: show quit confirmation. PRD #40 safety net —
+    // hardcoded and checked first so it can never be remapped or unbound.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
         return Action::Continue;
     }
-    match key.code {
-        // Dashboard card navigation (linear cycling)
-        KeyCode::Char('j') | KeyCode::Down => {
-            if total > 0 {
-                ui.selected_index = (ui.selected_index + 1) % total;
-            }
-            Action::Continue
+
+    // PRD #40: dashboard (command-mode) shortcuts resolve from the active
+    // keybinding config. `kb` is the single per-keypress snapshot taken by the
+    // caller (passed by reference so we don't re-clone — it exists to avoid a
+    // `&ui` borrow conflict with the `&mut ui` mutations below). PRD #80: the
+    // mode-changing shortcuts return shared `Action`s (EnterFilter/ToggleHelp/
+    // EnterRename/Focus) so a keypress and the button-bar funnel into the same
+    // `dispatch_action` path. The non-configurable arrow-key aliases (Down/Up)
+    // are kept alongside move_down/move_up so default nav is byte-for-byte
+    // unchanged.
+    if kb.matches(KbAction::MoveDown, &key) || key.code == KeyCode::Down {
+        if total > 0 {
+            ui.selected_index = (ui.selected_index + 1) % total;
         }
-        KeyCode::Char('k') | KeyCode::Up => {
-            if total > 0 {
-                ui.selected_index = (ui.selected_index + total - 1) % total;
-            }
-            Action::Continue
-        }
-        // Left/Right/h/l handled in main loop for tab switching
-        // PRD #80 M4: route `/` through the shared action so the key and the
-        // `[Filter /]` button funnel into the same `dispatch_action` path.
-        KeyCode::Char('/') => Action::EnterFilter,
-        // PRD #80 M2: route `?` through the shared action so the key and the
-        // `[Help ?]` button funnel into the same `dispatch_action` path.
-        KeyCode::Char('?') => Action::ToggleHelp,
-        // PRD #80 M4: route `r` through the shared action so the key and the
-        // `[Rename r]` button funnel into the same `dispatch_action` path. The
-        // `total > 0` guard mirrors the prior behavior (rename needs a card).
-        KeyCode::Char('r') if total > 0 => Action::EnterRename,
-        KeyCode::Enter if total > 0 => Action::Focus,
-        KeyCode::Char('g') if total > 0 => Action::RequestConfigGen,
-        // PRD #92 F2 (PRD #18 follow-through): y / n approve / deny permission.
-        // Only fires when the selected card is in `WaitingForInput` — any
-        // other status, or no card selected, no-ops silently so y / n don't
-        // accidentally clobber some future keybinding. `KeyModifiers::NONE`
-        // is required so Ctrl+n (new pane, handled in the outer dispatch
-        // loop) still wins.
-        KeyCode::Char('y')
-            if total > 0
-                && key.modifiers == KeyModifiers::NONE
-                && selected_status == Some(SessionStatus::WaitingForInput) =>
-        {
-            Action::SendPermissionResponse(true)
-        }
-        KeyCode::Char('n')
-            if total > 0
-                && key.modifiers == KeyModifiers::NONE
-                && selected_status == Some(SessionStatus::WaitingForInput) =>
-        {
-            Action::SendPermissionResponse(false)
-        }
-        KeyCode::Esc => {
-            if !ui.filter_text.is_empty() {
-                ui.filter_text.clear();
-            }
-            Action::Continue
-        }
-        _ => Action::Continue,
+        return Action::Continue;
     }
+    if kb.matches(KbAction::MoveUp, &key) || key.code == KeyCode::Up {
+        if total > 0 {
+            ui.selected_index = (ui.selected_index + total - 1) % total;
+        }
+        return Action::Continue;
+    }
+    // move_left / move_right (defaults h / l) are handled in the main loop for
+    // tab switching.
+    if kb.matches(KbAction::Filter, &key) {
+        return Action::EnterFilter;
+    }
+    if kb.matches(KbAction::Help, &key) {
+        return Action::ToggleHelp;
+    }
+    if kb.matches(KbAction::Rename, &key) && total > 0 {
+        return Action::EnterRename;
+    }
+    if kb.matches(KbAction::FocusPane, &key) && total > 0 {
+        return Action::Focus;
+    }
+    // generate_config (default `g`) — a first-class remappable action so it
+    // participates in conflict detection and renders via display_notation.
+    if kb.matches(KbAction::GenerateConfig, &key) && total > 0 {
+        return Action::RequestConfigGen;
+    }
+    // PRD #92 F2 (PRD #18 follow-through): approve / deny permission. Only
+    // fires when the selected card is in `WaitingForInput` — any other status,
+    // or no card selected, no-ops silently. The bindings (defaults y / n)
+    // carry their own modifier requirement via `matches`, so Ctrl+n (new
+    // pane, handled in the outer dispatch loop) still wins.
+    if kb.matches(KbAction::ApprovePermission, &key)
+        && total > 0
+        && selected_status == Some(SessionStatus::WaitingForInput)
+    {
+        return Action::SendPermissionResponse(true);
+    }
+    if kb.matches(KbAction::DenyPermission, &key)
+        && total > 0
+        && selected_status == Some(SessionStatus::WaitingForInput)
+    {
+        return Action::SendPermissionResponse(false);
+    }
+    if kb.matches(KbAction::ClearFilter, &key) {
+        if !ui.filter_text.is_empty() {
+            ui.filter_text.clear();
+        }
+        return Action::Continue;
+    }
+    Action::Continue
 }
 
 fn handle_filter_key(key: KeyEvent, ui: &mut UiState) -> Action {
@@ -3097,43 +3123,61 @@ enum Flow {
 /// the thin `KeyEvent -> Option<Action>` mapper that pairs with
 /// [`dispatch_action`]; the M2 button bar produces the SAME variants from a
 /// click, so key and click cannot drift.
-pub fn global_ctrl_action(key: &KeyEvent) -> Option<Action> {
-    if !key.modifiers.contains(KeyModifiers::CONTROL) {
-        return None;
+pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
+    // PRD #40: the four configurable global commands resolve from the active
+    // keybinding config (any chord, any mode), defaulting to Ctrl+d/t/n/w. The
+    // caller excludes Ctrl+C before calling this, so a binding to Ctrl+C can't
+    // win here.
+    if kb.matches(KbAction::Dashboard, key) {
+        return Some(Action::DetachToNormal);
     }
-    match key.code {
-        // Ctrl+d: enter Normal (command) mode, stay on current tab.
-        KeyCode::Char('d') => Some(Action::DetachToNormal),
-        // Ctrl+t: toggle layout.
-        KeyCode::Char('t') => Some(Action::ToggleLayout),
-        // Ctrl+n: new pane (open directory picker).
-        KeyCode::Char('n') => Some(Action::NewPane),
-        // Ctrl+w: close selected pane (or entire mode/orchestration tab).
-        KeyCode::Char('w') => Some(Action::CloseSelected),
-        // Ctrl+PageDown / Ctrl+PageUp: move between tabs.
-        KeyCode::PageDown => Some(Action::GlobalNextTab),
-        KeyCode::PageUp => Some(Action::GlobalPrevTab),
-        _ => None,
+    if kb.matches(KbAction::ToggleLayout, key) {
+        return Some(Action::ToggleLayout);
     }
+    if kb.matches(KbAction::NewPane, key) {
+        return Some(Action::NewPane);
+    }
+    if kb.matches(KbAction::ClosePane, key) {
+        return Some(Action::CloseSelected);
+    }
+    // Ctrl+PageDown / Ctrl+PageUp: non-configurable tab navigation.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::PageDown => return Some(Action::GlobalNextTab),
+            KeyCode::PageUp => return Some(Action::GlobalPrevTab),
+            _ => {}
+        }
+    }
+    None
 }
 
-/// PRD #80: map a Normal-mode tab-cycling key (Tab / Shift+Tab / Left / Right /
-/// h / l) to its [`Action`]. Returns `None` for anything else.
-fn cycle_tab_action(key: &KeyEvent) -> Option<Action> {
-    match key.code {
-        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => Some(Action::CycleTabNext),
-        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => Some(Action::CycleTabPrev),
-        _ => None,
+/// PRD #80 / #40: map a Normal-mode tab-cycling key to its [`Action`]. The
+/// configurable move_right/move_left actions (defaults `l`/`h`) drive this,
+/// alongside the non-configurable Tab / Shift+Tab / Left / Right aliases.
+/// Returns `None` for anything else.
+fn cycle_tab_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
+    if kb.matches(KbAction::MoveRight, key) || matches!(key.code, KeyCode::Tab | KeyCode::Right) {
+        return Some(Action::CycleTabNext);
     }
+    if kb.matches(KbAction::MoveLeft, key) || matches!(key.code, KeyCode::BackTab | KeyCode::Left) {
+        return Some(Action::CycleTabPrev);
+    }
+    None
 }
 
-/// PRD #80: map an in-tab navigation key on a mode tab (j/k/Up/Down/Enter/Esc)
-/// to its [`Action`]. The caller only invokes this when the active tab is a
-/// `Tab::Mode`, so the returned action is always meaningful there.
-fn mode_tab_nav_action(key: &KeyEvent) -> Option<Action> {
+/// PRD #80 / #40: map an in-tab navigation key on a mode tab to its [`Action`].
+/// The configurable move_down/move_up actions (defaults `j`/`k`) drive
+/// selection, with the Down/Up arrows kept as non-configurable aliases;
+/// Enter/Esc are mode-fixed. The caller only invokes this when the active tab
+/// is a `Tab::Mode`, so the returned action is always meaningful there.
+fn mode_tab_nav_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
+    if kb.matches(KbAction::MoveDown, key) || key.code == KeyCode::Down {
+        return Some(Action::ModeTabSelectNext);
+    }
+    if kb.matches(KbAction::MoveUp, key) || key.code == KeyCode::Up {
+        return Some(Action::ModeTabSelectPrev);
+    }
     match key.code {
-        KeyCode::Char('j') | KeyCode::Down => Some(Action::ModeTabSelectNext),
-        KeyCode::Char('k') | KeyCode::Up => Some(Action::ModeTabSelectPrev),
         KeyCode::Enter => Some(Action::ModeTabFocus),
         KeyCode::Esc => Some(Action::ModeTabReset),
         _ => None,
@@ -3658,7 +3702,8 @@ fn dispatch_action(
                             );
                             ui.status_message = Some((
                                 format!(
-                                    "Failed to close pane {closed_pane_id}: {e} — press Ctrl+W to retry"
+                                    "Failed to close pane {closed_pane_id}: {e} — press {} to retry",
+                                    display_notation(&ui.keybindings, KbAction::ClosePane)
                                 ),
                                 std::time::Instant::now(),
                             ));
@@ -3870,7 +3915,10 @@ fn dispatch_action(
                             .write_to_pane(&target_pane_id, "export PS1='$ ' PS2='> ' PROMPT='$ '");
                     }
                     ui.status_message = Some((
-                        "PaneInput mode — type to interact, Ctrl+d for dashboard".to_string(),
+                        format!(
+                            "PaneInput mode — type to interact, {} for dashboard",
+                            display_notation(&ui.keybindings, KbAction::Dashboard)
+                        ),
                         std::time::Instant::now(),
                     ));
                 }
@@ -3961,8 +4009,10 @@ fn dispatch_action(
                                 entry.dismissed = false;
                             }
                             ui.status_message = Some((
-                                "PaneInput mode — type to interact, Ctrl+d for dashboard"
-                                    .to_string(),
+                                format!(
+                                    "PaneInput mode — type to interact, {} for dashboard",
+                                    display_notation(&ui.keybindings, KbAction::Dashboard)
+                                ),
                                 std::time::Instant::now(),
                             ));
                         }
@@ -4574,6 +4624,7 @@ pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
     config: DashboardConfig,
+    keybindings: KeybindingConfig,
     continue_session: bool,
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
@@ -4596,7 +4647,7 @@ pub fn run_tui(
 
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
-    let mut ui = UiState::new(config);
+    let mut ui = UiState::new(config, keybindings);
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -6534,34 +6585,60 @@ pub fn run_tui(
             let frame_area = terminal.get_frame().area();
             let mut action: Option<Action> = None;
 
-            // 1..9 in Normal mode: jump to card N and focus its pane.
-            if ui.mode == UiMode::Normal
-                && let KeyCode::Char(c @ '1'..='9') = key.code
-                && key.modifiers == KeyModifiers::NONE
-            {
-                action = Some(Action::FocusCard((c as usize) - ('1' as usize)));
+            // PRD #40: snapshot the active keybindings for this keypress (cheap
+            // HashMap clone; config is immutable for the session) so the mapper
+            // blocks below resolve shortcuts from config. `is_ctrl_c` marks the
+            // non-overridable quit trigger — it is NEVER mapped to a config
+            // action; it falls through to the per-mode handlers (which open the
+            // quit flow), so no user binding can hijack the emergency quit.
+            let kb = ui.keybindings.clone();
+            let is_ctrl_c =
+                key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+
+            // Jump-to-card in Normal mode (defaults 1..9): focus card N. PRD #40
+            // resolves the digits from config so they can be remapped.
+            if !is_ctrl_c && ui.mode == UiMode::Normal {
+                const JUMP_ACTIONS: [KbAction; 9] = [
+                    KbAction::Jump1,
+                    KbAction::Jump2,
+                    KbAction::Jump3,
+                    KbAction::Jump4,
+                    KbAction::Jump5,
+                    KbAction::Jump6,
+                    KbAction::Jump7,
+                    KbAction::Jump8,
+                    KbAction::Jump9,
+                ];
+                if let Some(idx) = JUMP_ACTIONS.iter().position(|a| kb.matches(*a, &key)) {
+                    action = Some(Action::FocusCard(idx));
+                }
             }
 
-            // Global Ctrl+key shortcuts (work from any mode / future pane focus).
-            if action.is_none() && key.modifiers.contains(KeyModifiers::CONTROL) {
-                action = global_ctrl_action(&key);
+            // Global configurable shortcuts (work from any mode). PRD #40:
+            // resolved from config (any chord, not just Ctrl+key); `is_ctrl_c`
+            // excluded so it can't be hijacked away from the quit flow.
+            if action.is_none() && !is_ctrl_c {
+                action = global_action(&kb, &key);
             }
 
-            // Tab / Shift+Tab / Left / Right / h / l: cycle tabs in Normal mode.
-            if action.is_none() && ui.mode == UiMode::Normal {
-                action = cycle_tab_action(&key);
+            // Tab cycling in Normal mode: move_left/move_right (defaults h/l)
+            // plus the non-configurable Tab / Shift+Tab / Left / Right aliases.
+            if action.is_none() && !is_ctrl_c && ui.mode == UiMode::Normal {
+                action = cycle_tab_action(&kb, &key);
             }
 
             let selected_id: Option<String> =
                 filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
 
-            // On a mode tab in Normal mode, j/k navigate side panes, Enter
-            // focuses, Esc resets.
+            // On a mode tab in Normal mode, move_down/move_up (defaults j/k,
+            // plus Down/Up arrows) navigate side panes, Enter focuses, Esc
+            // resets. `is_ctrl_c` excluded for the same safety-net reason.
             if action.is_none()
+                && !is_ctrl_c
                 && ui.mode == UiMode::Normal
                 && matches!(tab_manager.active_tab(), Tab::Mode { .. })
             {
-                action = mode_tab_nav_action(&key);
+                action = mode_tab_nav_action(&kb, &key);
             }
 
             // Mode-specific key handling (only when no shortcut claimed the key).
@@ -6579,6 +6656,7 @@ pub fn run_tui(
                             selected_status,
                             &filtered,
                             &*pane,
+                            &kb,
                         )
                     }
                     UiMode::Filter => handle_filter_key(key, &mut ui),
@@ -6980,13 +7058,8 @@ fn render_frame(
         .style(text_primary())
         .centered();
         frame.render_widget(msg, vertical[1]);
-        render_bottom_bar(
-            frame,
-            ui,
-            hints_area,
-            has_pane_control,
-            &dashboard_context_buttons(!filtered.is_empty()),
-        );
+        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -7072,13 +7145,8 @@ fn render_frame(
             vertical[2],
             active_mode_name,
         );
-        render_bottom_bar(
-            frame,
-            ui,
-            hints_area,
-            has_pane_control,
-            &dashboard_context_buttons(!filtered.is_empty()),
-        );
+        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -7171,13 +7239,8 @@ fn render_frame(
     );
 
     // Full-width hints bar
-    render_bottom_bar(
-        frame,
-        ui,
-        hints_area,
-        has_pane_control,
-        &dashboard_context_buttons(!filtered.is_empty()),
-    );
+    let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+    render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
     // Render terminal panes on the right side
     if let Some(right) = panes_area {
@@ -7207,7 +7270,7 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
     ui.form_chip_rects.clear();
     ui.form_button_rects.clear();
     if ui.mode == UiMode::Help {
-        ui.modal_button_rects = render_help_overlay(frame, active_mode_name);
+        ui.modal_button_rects = render_help_overlay(frame, &ui.keybindings, active_mode_name);
     }
     if ui.mode == UiMode::DirPicker {
         // Capture the picker's row/button rects after the `dir_picker` borrow
@@ -7569,33 +7632,88 @@ fn render_stats_bar(
 /// available; Help and Quit are always actionable. Shortcuts mirror the
 /// keyboard handlers: `global_ctrl_action` (Ctrl+N/W/T), `?` → Help,
 /// Ctrl+C → Quit.
-fn global_bar_buttons(has_pane_control: bool) -> Vec<Button> {
+/// PRD #40: format a keybinding's notation for a BUTTON label. Buttons use the
+/// prd-80 convention of `Ctrl+<UPPERCASE letter>` (e.g. `Ctrl+N`), while
+/// `notation()` emits lowercase (`Ctrl+n`). Uppercase ONLY the trailing single
+/// ASCII letter of a modifier combo (one containing `+`); bare keys (`r`, `g`,
+/// `?`, `/`) and non-letter tails are left untouched. So under the default
+/// config every button label is byte-for-byte identical to the old hardcoded
+/// strings, while a remap (e.g. `new_pane = "Alt+p"`) renders `Alt+P`. An
+/// unbound action renders `(unbound)` (via `display_notation`).
+fn button_shortcut_label(keybindings: &KeybindingConfig, action: KbAction) -> String {
+    let s = display_notation(keybindings, action);
+    if let Some(plus) = s.rfind('+') {
+        let (head, tail) = s.split_at(plus + 1);
+        let mut tail_chars = tail.chars();
+        if let Some(c) = tail_chars.next()
+            && tail_chars.next().is_none()
+            && c.is_ascii_alphabetic()
+        {
+            return format!("{head}{}", c.to_ascii_uppercase());
+        }
+    }
+    s
+}
+
+fn global_bar_buttons(keybindings: &KeybindingConfig, has_pane_control: bool) -> Vec<Button> {
     vec![
         // PRD #80 review FIX 3: New Pane is ALWAYS enabled — you can always
         // create the first pane, even with no panes / controller yet.
-        Button::new("New Pane", "Ctrl+N", Action::NewPane, true),
-        Button::new("Close", "Ctrl+W", Action::CloseSelected, has_pane_control),
+        Button::new(
+            "New Pane",
+            button_shortcut_label(keybindings, KbAction::NewPane),
+            Action::NewPane,
+            true,
+        ),
+        Button::new(
+            "Close",
+            button_shortcut_label(keybindings, KbAction::ClosePane),
+            Action::CloseSelected,
+            has_pane_control,
+        ),
         Button::new(
             "Toggle Layout",
-            "Ctrl+T",
+            button_shortcut_label(keybindings, KbAction::ToggleLayout),
             Action::ToggleLayout,
             has_pane_control,
         ),
-        Button::new("Help", "?", Action::ToggleHelp, true),
+        Button::new(
+            "Help",
+            button_shortcut_label(keybindings, KbAction::Help),
+            Action::ToggleHelp,
+            true,
+        ),
+        // Quit is the non-overridable Ctrl+C modal trigger — not a remappable
+        // KbAction, so its label stays fixed.
         Button::new("Quit", "Ctrl+C", Action::Quit, true),
     ]
 }
 
 /// PRD #80 M4: the dashboard-only context buttons appended to the global bar
-/// while on the dashboard in Normal mode, each carrying its inline shortcut.
-/// Filter is always actionable; Rename / Generate-config act on the selected
-/// card, so they're disabled (dimmed) when there are no cards — matching the
-/// `r` / `g` keys' `total > 0` guard.
-fn dashboard_context_buttons(has_cards: bool) -> Vec<Button> {
+/// while on the dashboard in Normal mode, each carrying its (live) inline
+/// shortcut. Filter is always actionable; Rename / Generate-config act on the
+/// selected card, so they're disabled (dimmed) when there are no cards —
+/// matching the keys' `total > 0` guard.
+fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) -> Vec<Button> {
     vec![
-        Button::new("Filter", "/", Action::EnterFilter, true),
-        Button::new("Rename", "r", Action::EnterRename, has_cards),
-        Button::new("Generate", "g", Action::RequestConfigGen, has_cards),
+        Button::new(
+            "Filter",
+            button_shortcut_label(keybindings, KbAction::Filter),
+            Action::EnterFilter,
+            true,
+        ),
+        Button::new(
+            "Rename",
+            button_shortcut_label(keybindings, KbAction::Rename),
+            Action::EnterRename,
+            has_cards,
+        ),
+        Button::new(
+            "Generate",
+            button_shortcut_label(keybindings, KbAction::GenerateConfig),
+            Action::RequestConfigGen,
+            has_cards,
+        ),
     ]
 }
 
@@ -7609,6 +7727,7 @@ fn dashboard_context_buttons(has_cards: bool) -> Vec<Button> {
 /// than truncated mid-label, so every rendered button stays identifiable.
 fn render_button_bar(
     frame: &mut Frame,
+    keybindings: &KeybindingConfig,
     area: Rect,
     has_pane_control: bool,
     extra_buttons: &[Button],
@@ -7616,7 +7735,7 @@ fn render_button_bar(
     const SEP: u16 = 1;
     // Global commands first, then any context-specific buttons (e.g. the
     // dashboard's Filter / Rename / Generate). One funnel, one bar.
-    let mut buttons = global_bar_buttons(has_pane_control);
+    let mut buttons = global_bar_buttons(keybindings, has_pane_control);
     buttons.extend(extra_buttons.iter().cloned());
 
     // Choose full vs shortcut-only based on whether the full set fits the row.
@@ -7728,9 +7847,10 @@ fn render_bottom_bar(
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
             }
+            let detach_label = button_shortcut_label(&ui.keybindings, KbAction::Dashboard);
             let buttons = [Button::new(
                 "Detach",
-                "Ctrl+D",
+                detach_label,
                 Action::DetachToNormal,
                 true,
             )];
@@ -7747,7 +7867,13 @@ fn render_bottom_bar(
                 // PRD #80 M2: the persistent global button bar replaces the
                 // legacy status legend (no duplication — each button carries
                 // the same shortcut the legend used to show inline).
-                let rects = render_button_bar(frame, area, has_pane_control, extra_buttons);
+                let rects = render_button_bar(
+                    frame,
+                    &ui.keybindings,
+                    area,
+                    has_pane_control,
+                    extra_buttons,
+                );
                 // Preserve the "update available" badge by right-aligning it
                 // after the bar when set (it's a separate notification, not the
                 // removed legend text).
@@ -8127,53 +8253,225 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize) -> Vec<(Action, 
     render_modal_button_row(frame, &buttons, btn_row, 1)
 }
 
-fn render_help_overlay(frame: &mut Frame, active_mode_name: Option<&str>) -> Vec<(Action, Rect)> {
+/// Format one help row: a key column (left-padded to a fixed width so the
+/// description column lines up) followed by the description. PRD #40 — the
+/// key column is sourced from the active [`KeybindingConfig`] so the overlay
+/// always reflects the user's real bindings.
+fn help_key_line(keys: &str, desc: &str) -> Line<'static> {
+    Line::from(format!("  {keys:<18} {desc}"))
+}
+
+/// PRD #40: an action's active key notation for *display* in the help overlay
+/// and hints bar, with `(unbound)` substituted for the empty string so an
+/// unbound action never renders as a bare key column (`: new`). Shared by both
+/// renderers so they can't drift (Greptile P2).
+fn display_notation(keybindings: &KeybindingConfig, action: KbAction) -> String {
+    let s = keybindings.notation(action);
+    if s.is_empty() {
+        "(unbound)".to_string()
+    } else {
+        s
+    }
+}
+
+/// PRD #40: the displayed jump-key hint for `Jump1..Jump9`. When every jump is
+/// at its bare-digit default (`1`..`9`) this returns the compact `"1-9"` so the
+/// default help/hints stay byte-for-byte unchanged; once any jump is remapped
+/// it lists the actual notations (slash-joined) so the remap is visible.
+fn jump_range_notation(keybindings: &KeybindingConfig) -> String {
+    const JUMPS: [KbAction; 9] = [
+        KbAction::Jump1,
+        KbAction::Jump2,
+        KbAction::Jump3,
+        KbAction::Jump4,
+        KbAction::Jump5,
+        KbAction::Jump6,
+        KbAction::Jump7,
+        KbAction::Jump8,
+        KbAction::Jump9,
+    ];
+    let all_default = JUMPS
+        .iter()
+        .enumerate()
+        .all(|(i, &a)| keybindings.notation(a) == (i + 1).to_string());
+    if all_default {
+        "1-9".to_string()
+    } else {
+        JUMPS
+            .iter()
+            .map(|&a| display_notation(keybindings, a))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+}
+
+/// PRD #40: build the dashboard hints-bar text from the active keybinding
+/// config. With the default config this reproduces the previous hardcoded
+/// string byte-for-byte (`Ctrl+n: new  …  Ctrl+c: quit`); a remapped action
+/// shows the user's key (e.g. `Alt+Shift+l: layout`), and an unbound action
+/// shows `(unbound)` rather than a bare `: new`. Single source of truth for
+/// both the live hints bar (`render_bottom_bar`) and the standalone
+/// [`render_hints_bar_to_buffer`] snapshot entrypoint.
+fn dashboard_hints_string(keybindings: &KeybindingConfig) -> String {
+    // `Ctrl+c: quit` is hardcoded: quit is not a remappable action — Ctrl+C is
+    // the non-overridable modal trigger (Detach/Stop/Cancel), so the hint is a
+    // fixed string rather than a config-derived notation.
+    format!(
+        "{}: new  {}: close  {}: layout  {}: dashboard ({} {} {})  Ctrl+c: quit",
+        display_notation(keybindings, KbAction::NewPane),
+        display_notation(keybindings, KbAction::ClosePane),
+        display_notation(keybindings, KbAction::ToggleLayout),
+        display_notation(keybindings, KbAction::Dashboard),
+        jump_range_notation(keybindings),
+        display_notation(keybindings, KbAction::Help),
+        display_notation(keybindings, KbAction::Filter),
+    )
+}
+
+/// PRD #40 (L1 `keybindings/help/001`): render the help overlay against an
+/// arbitrary [`KeybindingConfig`] into a standalone `Buffer` for snapshot
+/// testing. Mirrors [`render_card_to_buffer`] — a `TestBackend` of the given
+/// size, drawn through the *same* `render_help_overlay` code path the live UI
+/// uses, so the snapshot and the running overlay can never drift. (The
+/// default-bindings PRD #80 seam is [`render_help_overlay_to_buffer`].)
+pub fn render_help_overlay_with_bindings_to_buffer(
+    keybindings: &KeybindingConfig,
+    active_mode_name: Option<&str>,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            // The live overlay returns its clickable button rects; the
+            // snapshot path doesn't need them.
+            let _ = render_help_overlay(frame, keybindings, active_mode_name);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #40 (L1 `keybindings/hints/001`): render the dashboard hints bar
+/// against an arbitrary [`KeybindingConfig`] into a standalone `Buffer` for
+/// snapshot testing. Uses the shared [`dashboard_hints_string`] builder so the
+/// snapshot matches the live bar's content.
+pub fn render_hints_bar_to_buffer(
+    keybindings: &KeybindingConfig,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let hints = dashboard_hints_string(keybindings);
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            // PRD #13: hint text is read, so it renders full-contrast
+            // (text_primary), not dimmed.
+            let line = Line::from(Span::styled(hints, text_primary()));
+            frame.render_widget(Paragraph::new(line), area);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+fn render_help_overlay(
+    frame: &mut Frame,
+    keybindings: &KeybindingConfig,
+    active_mode_name: Option<&str>,
+) -> Vec<(Action, Rect)> {
     let cyan = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
 
+    // PRD #40: notation for a remappable action, or "(unbound)" when the user
+    // has cleared the binding (`action = ""`), so the overlay is honest about
+    // a key that no longer fires. Shared with the hints bar via
+    // `display_notation` so the two renderers can't drift.
+    let n = |action: KbAction| -> String { display_notation(keybindings, action) };
+
     let left: Vec<Line> = vec![
         Line::styled("  Global (works from any pane)", cyan),
         Line::from(""),
-        Line::from(format!("  {MOD_KEY}+D           Command mode (dashboard)")),
-        Line::from(format!("  {MOD_KEY}+N           Create new pane")),
-        Line::from(format!("  {MOD_KEY}+W           Close selected pane")),
-        Line::from(format!(
-            "  {MOD_KEY}+T           Toggle layout (stacked/tiled)"
-        )),
-        Line::from(format!("  {MOD_KEY}+C           Quit")),
+        help_key_line(&n(KbAction::Dashboard), "Command mode (dashboard)"),
+        help_key_line(&n(KbAction::NewPane), "Create new pane"),
+        help_key_line(&n(KbAction::ClosePane), "Close selected pane"),
+        help_key_line(&n(KbAction::ToggleLayout), "Toggle layout (stacked/tiled)"),
+        // Quit is not a remappable action: Ctrl+C (non-overridable) opens the
+        // Detach/Stop/Cancel modal, so the help row is a fixed string.
+        help_key_line("Ctrl+c", "Quit"),
         Line::from(""),
         Line::styled("  Tab Navigation", cyan),
         Line::from(""),
-        Line::from("  Tab / Right / l       Next tab"),
-        Line::from("  Shift+Tab / Left / h  Prev tab"),
-        Line::from(format!("  {MOD_KEY}+PgDn            Next tab")),
-        Line::from(format!("  {MOD_KEY}+PgUp            Prev tab")),
+        help_key_line(
+            &format!("Tab / Right / {}", n(KbAction::MoveRight)),
+            "Next tab",
+        ),
+        help_key_line(
+            &format!("Shift+Tab / Left / {}", n(KbAction::MoveLeft)),
+            "Prev tab",
+        ),
+        help_key_line(&format!("{MOD_KEY}+PgDn"), "Next tab"),
+        help_key_line(&format!("{MOD_KEY}+PgUp"), "Prev tab"),
         Line::from(""),
         Line::styled("  Dashboard (command mode)", cyan),
         Line::from(""),
-        Line::from("  j / Down        Select next card"),
-        Line::from("  k / Up          Select previous card"),
-        Line::from("  1-9             Jump to pane N"),
-        Line::from("  Enter           Focus selected pane"),
-        Line::from("  /               Filter sessions"),
-        Line::from("  Esc             Clear filter"),
-        Line::from("  r               Rename session"),
-        Line::from("  g               Generate .dot-agent-deck.toml"),
-        Line::from("  y / n           Approve / deny permission"),
-        Line::from("  ?               Toggle this help"),
+        help_key_line(
+            &format!("{} / Down", n(KbAction::MoveDown)),
+            "Select next card",
+        ),
+        help_key_line(
+            &format!("{} / Up", n(KbAction::MoveUp)),
+            "Select previous card",
+        ),
+        help_key_line(&jump_range_notation(keybindings), "Jump to pane N"),
+        help_key_line(&n(KbAction::FocusPane), "Focus selected pane"),
+        help_key_line(&n(KbAction::Filter), "Filter sessions"),
+        help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
+        help_key_line(&n(KbAction::Rename), "Rename session"),
+        help_key_line(
+            &n(KbAction::GenerateConfig),
+            "Generate .dot-agent-deck.toml",
+        ),
+        help_key_line(
+            &format!(
+                "{} / {}",
+                n(KbAction::ApprovePermission),
+                n(KbAction::DenyPermission)
+            ),
+            "Approve / deny permission",
+        ),
+        help_key_line(&n(KbAction::Help), "Toggle this help"),
     ];
 
     let mut right: Vec<Line> = vec![
         Line::styled("  Mode Tab (in-tab navigation)", cyan),
         Line::from(""),
-        Line::from("  j / Down        Focus next pane"),
-        Line::from("  k / Up          Focus previous pane"),
+        help_key_line(
+            &format!("{} / Down", n(KbAction::MoveDown)),
+            "Focus next pane",
+        ),
+        help_key_line(
+            &format!("{} / Up", n(KbAction::MoveUp)),
+            "Focus previous pane",
+        ),
         Line::from("  Enter           Enter PaneInput on selected"),
         Line::from("  Esc             Deselect side pane"),
         Line::from("  Mouse click     Focus pane"),
         Line::from("  Ctrl+click      Open hyperlink"),
-        Line::from(format!("  {MOD_KEY}+D            Return to Normal mode")),
+        help_key_line(&n(KbAction::Dashboard), "Return to Normal mode"),
         Line::from(""),
         Line::styled("  New Agent Form", cyan),
         Line::from(""),
@@ -9403,7 +9701,7 @@ pub fn render_button_bar_to_buffer(width: u16) -> ratatui::buffer::Buffer {
 
     let backend = TestBackend::new(width, 1);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
-    let mut ui = UiState::new(DashboardConfig::default());
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
     terminal
         .draw(|frame| {
             let area = Rect {
@@ -9420,6 +9718,38 @@ pub fn render_button_bar_to_buffer(width: u16) -> ratatui::buffer::Buffer {
     terminal.backend().buffer().clone()
 }
 
+/// PRD #40 L1 seam: render the dashboard button bar (global + dashboard
+/// context buttons) against an arbitrary [`KeybindingConfig`] into a `Buffer`,
+/// so a test can assert the button labels track a remapped config. Mirrors
+/// [`render_hints_bar_to_buffer`]'s shape. `has_pane_control` is `true` and the
+/// dashboard context buttons are included so every remappable label is
+/// exercised; the bar is one row but `height` is honored for layout headroom.
+pub fn render_button_bar_with_bindings_to_buffer(
+    keybindings: &KeybindingConfig,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let ctx_buttons = dashboard_context_buttons(keybindings, true);
+    let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            render_bottom_bar(frame, &mut ui, area, true, &ctx_buttons);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
 /// PRD #80 M6 L1 seam: render the filter-mode bottom row (the inline filter
 /// input carrying `filter_text`) into a one-row `Buffer`. After M6 this row
 /// also renders the inline `[Apply]` / `[Cancel]` buttons at its right edge.
@@ -9430,7 +9760,7 @@ pub fn render_filter_bar_to_buffer(filter_text: &str, width: u16) -> ratatui::bu
 
     let backend = TestBackend::new(width, 1);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
-    let mut ui = UiState::new(DashboardConfig::default());
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
     ui.mode = UiMode::Filter;
     ui.filter_text = filter_text.to_string();
     terminal
@@ -9457,7 +9787,7 @@ pub fn render_rename_bar_to_buffer(rename_text: &str, width: u16) -> ratatui::bu
 
     let backend = TestBackend::new(width, 1);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
-    let mut ui = UiState::new(DashboardConfig::default());
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
     ui.mode = UiMode::Rename;
     ui.rename_text = rename_text.to_string();
     terminal
@@ -9532,10 +9862,12 @@ fn render_overlay_to_buffer(
 // `#[doc(hidden)]` ones defined earlier (PRD #13 Phase 2); the per-modal seams
 // below cover the surfaces PRD #80 added on top.
 
-/// PRD #80 M5 L1 seam: render the help overlay.
+/// PRD #80 M5 L1 seam: render the help overlay (default keybindings). The
+/// PRD #40 keybinding-aware seam is [`render_help_overlay_with_bindings_to_buffer`].
 pub fn render_help_overlay_to_buffer(width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let keybindings = KeybindingConfig::default();
     render_overlay_to_buffer(width, height, |frame| {
-        render_help_overlay(frame, None);
+        let _ = render_help_overlay(frame, &keybindings, None);
     })
 }
 
@@ -12136,6 +12468,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(filter_action, Action::EnterFilter));
         ui.mode = UiMode::Filter;
@@ -12155,6 +12488,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(help_action, Action::ToggleHelp));
         ui.mode = UiMode::Help;
@@ -12172,6 +12506,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(rename_action, Action::EnterRename));
         ui.mode = UiMode::Rename;
@@ -12295,6 +12630,7 @@ mod tests {
             &mut ui,
             5,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(ui.filter_text.is_empty());
     }
@@ -12308,6 +12644,7 @@ mod tests {
             &mut ui,
             0,
             None,
+            &KeybindingConfig::default(),
         );
         assert_eq!(ui.mode, UiMode::Normal);
     }
@@ -12331,6 +12668,7 @@ mod tests {
             &mut ui,
             1,
             Some(SessionStatus::WaitingForInput),
+            &KeybindingConfig::default(),
         );
         assert!(
             matches!(result, Action::SendPermissionResponse(true)),
@@ -12346,6 +12684,7 @@ mod tests {
             &mut ui,
             1,
             Some(SessionStatus::WaitingForInput),
+            &KeybindingConfig::default(),
         );
         assert!(
             matches!(result, Action::SendPermissionResponse(false)),
@@ -12372,6 +12711,7 @@ mod tests {
                 &mut ui,
                 1,
                 Some(status.clone()),
+                &KeybindingConfig::default(),
             );
             assert!(
                 matches!(result_y, Action::Continue),
@@ -12382,6 +12722,7 @@ mod tests {
                 &mut ui,
                 1,
                 Some(status.clone()),
+                &KeybindingConfig::default(),
             );
             assert!(
                 matches!(result_n, Action::Continue),
@@ -12401,6 +12742,7 @@ mod tests {
             &mut ui,
             0,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(result_y, Action::Continue));
         let result_n = handle_normal_key(
@@ -12408,6 +12750,7 @@ mod tests {
             &mut ui,
             0,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(result_n, Action::Continue));
         // Also exercise the case where `total > 0` but `selected_status` is
@@ -12418,6 +12761,7 @@ mod tests {
             &mut ui,
             1,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(result_y_no_status, Action::Continue));
     }
@@ -12451,6 +12795,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 1);
@@ -12461,6 +12806,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 2);
@@ -12471,6 +12817,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 0);
@@ -12487,6 +12834,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 2);
@@ -12497,6 +12845,7 @@ mod tests {
             &mut ui,
             3,
             None,
+            &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 1);
@@ -12513,7 +12862,13 @@ mod tests {
             KeyCode::Down,
             KeyCode::Up,
         ] {
-            let r = handle_normal_key(KeyEvent::new(code, KeyModifiers::NONE), &mut ui, 0, None);
+            let r = handle_normal_key(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &mut ui,
+                0,
+                None,
+                &KeybindingConfig::default(),
+            );
             assert!(matches!(r, Action::Continue));
             assert_eq!(ui.selected_index, 0);
         }
@@ -12646,8 +13001,9 @@ mod tests {
         let mut ui = default_ui();
         ui.selected_index = 0;
 
+        let kb = KeybindingConfig::default();
         let press = |ui: &mut UiState, key: KeyEvent| {
-            dispatch_normal_mode_key(key, ui, total, None, &filtered, &pc);
+            dispatch_normal_mode_key(key, ui, total, None, &filtered, &pc, &kb);
         };
 
         // j: 0 → 1, focus mirrored to p1.
