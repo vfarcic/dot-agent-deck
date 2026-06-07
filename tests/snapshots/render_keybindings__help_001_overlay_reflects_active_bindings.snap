@@ -1,6 +1,6 @@
 ---
 source: tests/render_keybindings.rs
-assertion_line: 90
+assertion_line: 84
 expression: text
 ---
                                                                                                                         
@@ -40,6 +40,6 @@ expression: text
         │                                                                                                     │         
         │                                                     Panes auto-saved on exit.                       │         
         │                                                     Restore: dot-agent-deck --continue              │         
-        │                                                                                                     │         
+        │  [Close]                                                                                            │         
         │  Press ? or Esc to close                                                                            │         
         └─────────────────────────────────────────────────────────────────────────────────────────────────────┘

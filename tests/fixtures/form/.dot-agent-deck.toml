@@ -1,0 +1,11 @@
+# Fixture for PRD #80 M8 new-pane-form L2 tests. Two modes so the form
+# shows a Mode chip selector with >=2 real chips (demo, demo2) plus the
+# implicit "No mode" option, making click-to-select-chip observable.
+# reactive_panes=0 keeps a selected mode-backed pane lightweight (no LLM).
+[[modes]]
+name = "demo"
+reactive_panes = 0
+
+[[modes]]
+name = "demo2"
+reactive_panes = 0

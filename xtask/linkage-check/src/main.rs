@@ -40,10 +40,10 @@ use std::process::ExitCode;
 
 use regex::Regex;
 
-// PRD #77 was archived to `prds/done/` (commit 637eb37); the catalog
-// is the source of truth for the linkage check, so this points at the
-// archived location, not the original `prds/77-tui-testing-harness.md`.
-const PRD_PATH: &str = "prds/done/77-tui-testing-harness.md";
+// The Test-Case Catalog's permanent home. Relocated out of
+// `prds/77-tui-testing-harness.md` (PRD #77 was archived to `prds/done/`,
+// which broke the old hardcoded path) into a PRD-lifecycle-independent file.
+const CATALOG_PATH: &str = "tests/CATALOG.md";
 const ALLOWLIST_PATH: &str = "xtask/linkage-check/m2.allowlist";
 const TESTS_DIR: &str = "tests";
 
@@ -62,16 +62,16 @@ fn main() -> ExitCode {
     }
 
     let root = repo_root();
-    let prd_path = root.join(PRD_PATH);
+    let catalog_path = root.join(CATALOG_PATH);
     let allowlist_path = root.join(ALLOWLIST_PATH);
     let tests_dir = root.join(TESTS_DIR);
 
     let mut failures: Vec<String> = Vec::new();
 
-    let catalog_ids = match parse_catalog_ids(&prd_path) {
+    let catalog_ids = match parse_catalog_ids(&catalog_path) {
         Ok(ids) => ids,
         Err(e) => {
-            eprintln!("failed to parse catalog at {}: {e}", prd_path.display());
+            eprintln!("failed to parse catalog at {}: {e}", catalog_path.display());
             return ExitCode::from(2);
         }
     };
@@ -393,8 +393,8 @@ fn repo_root() -> PathBuf {
 /// occurrence of `##### <area>/<sub>/<NNN>` (the catalog entry header
 /// form). The deliberate-skips table at the bottom uses table rows,
 /// not headers, so it is excluded by construction.
-fn parse_catalog_ids(prd_path: &Path) -> std::io::Result<BTreeSet<String>> {
-    let text = std::fs::read_to_string(prd_path)?;
+fn parse_catalog_ids(catalog_path: &Path) -> std::io::Result<BTreeSet<String>> {
+    let text = std::fs::read_to_string(catalog_path)?;
     let mut in_catalog = false;
     let header_re = Regex::new(r"^#####\s+([a-z][a-z0-9-]*/[a-z][a-z0-9-]*/\d{3})\b")
         .expect("catalog header regex compiles");

@@ -17,7 +17,7 @@
 
 use dot_agent_deck::keybindings::{Action, KeybindingConfig, parse_binding};
 use dot_agent_deck::theme::{ColorPalette, Theme, resolve_palette};
-use dot_agent_deck::ui::{render_help_overlay_to_buffer, render_hints_bar_to_buffer};
+use dot_agent_deck::ui::{render_help_overlay_with_bindings_to_buffer, render_hints_bar_to_buffer};
 use spec::spec;
 
 /// Stringify the rendered buffer — one line per row, cells joined into
@@ -68,7 +68,7 @@ fn help_001_overlay_reflects_active_bindings() {
     // clipped (120×44 comfortably fits the help columns + footer).
     let width: u16 = 120;
     let height: u16 = 44;
-    let buffer = render_help_overlay_to_buffer(&config, None, palette, width, height);
+    let buffer = render_help_overlay_with_bindings_to_buffer(&config, None, palette, width, height);
 
     let text = buffer_to_text(&buffer);
     assert!(

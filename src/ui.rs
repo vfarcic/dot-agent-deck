@@ -7,10 +7,11 @@ use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Tabs},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use crate::agent_pty::TabMembership;
@@ -19,7 +20,11 @@ use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
 use crate::event::{AgentType, EventType};
-use crate::keybindings::{Action, KeybindingConfig};
+// PRD #80 introduced a UI-dispatch `Action` enum in this module (the renamed
+// `KeyResult`), which collides with the keybinding-action enum. Import the
+// latter under an alias so both coexist: `Action` = the UI dispatch action,
+// `KbAction` = a remappable keybinding action (MoveDown, Help, …).
+use crate::keybindings::{Action as KbAction, KeybindingConfig};
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
@@ -313,8 +318,11 @@ impl DirPickerState {
 // Unified new-pane form (mode selection + name/command in one modal)
 // ---------------------------------------------------------------------------
 
+/// PRD #80 M8: which new-pane-form field is focused. Public because it rides
+/// in [`Action::FormFocusField`] (a click on a field's row focuses it, the
+/// same as Tab landing there).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FormField {
+pub enum FormField {
     Mode,
     Name,
     Command,
@@ -411,13 +419,16 @@ impl NewPaneFormState {
         }
     }
 
-    fn mode_display_name(&self) -> String {
-        if self.selection_index == 0 {
+    /// PRD #80 M8: display name for the mode option at `idx` (0 = "No mode",
+    /// 1..=modes = mode names, then orchestrations). Used to render one
+    /// clickable chip per option.
+    fn mode_option_name(&self, idx: usize) -> String {
+        if idx == 0 {
             "No mode".to_string()
-        } else if self.selection_index <= self.modes.len() {
-            self.modes[self.selection_index - 1].name.clone()
+        } else if idx <= self.modes.len() {
+            self.modes[idx - 1].name.clone()
         } else {
-            let orch_idx = self.selection_index - 1 - self.modes.len();
+            let orch_idx = idx - 1 - self.modes.len();
             let name = &self.orchestrations[orch_idx].name;
             if name.is_empty() {
                 "Orchestration".to_string()
@@ -603,7 +614,57 @@ struct UiState {
     /// Screen rect of the agent pane in mode tabs (set during render, used for click-to-focus).
     agent_pane_rect: Option<Rect>,
     /// Tracks last click time and position for double/triple-click detection.
-    last_click: Option<(std::time::Instant, u16, u16, u8)>, // (time, col, row, click_count)
+    last_click: Option<LastClick>, // PRD #80 review FIX 4: region-aware multi-click state
+    /// PRD #80: screen rects of the clickable buttons rendered this frame,
+    /// paired with the [`Action`] each one triggers. Populated during render
+    /// and consulted FIRST on a mouse Down/Up so a button click short-circuits
+    /// before the existing pane/selection/scroll/hyperlink logic. Empty until
+    /// M2 renders the button bar — the foundation (field + hit-test) lands in
+    /// M1 so the render side has a stable home to populate.
+    #[allow(dead_code)]
+    button_rects: Vec<(Action, Rect)>,
+    /// PRD #80 M3: screen rects of each tab's `[×]` close affordance, paired
+    /// with the tab index to close (only closeable Mode/Orchestration tabs;
+    /// the Dashboard at index 0 is excluded). Populated each render, consulted
+    /// on a mouse Down/Up AFTER `button_rects` but BEFORE `tab_header_rects`,
+    /// so the `[×]` beats the surrounding header.
+    tab_close_rects: Vec<(usize, Rect)>,
+    /// PRD #80 M3: screen rects of each tab's clickable header, paired with the
+    /// tab index to switch to. Populated each render; a click here that missed
+    /// the `[×]` switches tabs.
+    tab_header_rects: Vec<(usize, Rect)>,
+    /// PRD #80 M4: screen rects of each rendered dashboard card, paired with
+    /// its flat selection index. Populated each dashboard render; consulted on
+    /// a mouse Down/Up AFTER the button/tab rects — a single click selects the
+    /// card, a double-click focuses its pane.
+    card_rects: Vec<(usize, Rect)>,
+    /// PRD #80 M5: screen rects of the clickable buttons in the currently
+    /// shown modal/overlay (quit-confirm, config-gen, star-prompt, help),
+    /// paired with the [`Action`] each fires. Repopulated each render by
+    /// `render_overlays` and cleared when no modal is shown. Because the modal
+    /// is topmost, these are hit-tested FIRST (and exclusively) while a modal
+    /// is active, ahead of the bottom-bar / tab / card rects behind it.
+    modal_button_rects: Vec<(Action, Rect)>,
+    /// PRD #80 M7: directory-picker `[Confirm]`/`[Cancel]`/`[Filter]` button
+    /// rects, paired with the [`Action`] each fires. Populated by
+    /// `render_overlays` while the picker is shown, cleared otherwise.
+    picker_button_rects: Vec<(Action, Rect)>,
+    /// PRD #80 M7: directory-picker row rects, paired with the row's index
+    /// into `DirPickerState.filtered_indices` (matching `selected`). A single
+    /// click selects the row, a double-click descends, and a click on the
+    /// `..` row goes up. Populated while the picker is shown, cleared
+    /// otherwise.
+    picker_row_rects: Vec<(usize, Rect)>,
+    /// PRD #80 M8: new-pane-form clickable field rows, paired with the
+    /// [`FormField`] each focuses. Populated while the form is shown, cleared
+    /// otherwise.
+    form_field_rects: Vec<(FormField, Rect)>,
+    /// PRD #80 M8: new-pane-form mode chips, paired with the mode-option index
+    /// each selects (0 = "No mode", 1.. = modes/orchestrations).
+    form_chip_rects: Vec<(usize, Rect)>,
+    /// PRD #80 M8: new-pane-form `[Submit]`/`[Cancel]` button rects, paired
+    /// with the [`Action`] each fires.
+    form_button_rects: Vec<(Action, Rect)>,
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
     /// Per-session idle ASCII art cache. Key = session_id.
@@ -648,6 +709,59 @@ struct UiState {
     /// (matches `write_to_pane`'s SUBMIT_DELAY rationale at
     /// src/embedded_pane.rs:199).
     last_pane_keystroke_at: Option<std::time::Instant>,
+}
+
+/// PRD #80 review FIX 4: which click region produced a [`LastClick`]. Multi-
+/// click (double/triple) detection only fires when the current click is in the
+/// SAME region as the previous one, so a cross-region click within the 400ms
+/// window can't mis-classify — e.g. a dashboard card click (screen coords)
+/// followed by an in-pane click (pane-relative coords) resets to a single
+/// click instead of being read as a double.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClickRegion {
+    /// In-pane text selection (pane-relative coordinates).
+    Pane,
+    /// A dashboard card (screen coordinates).
+    Card,
+    /// A directory-picker row (screen coordinates).
+    PickerRow,
+}
+
+/// PRD #80 review FIX 4: the previous left-button-down, used for region-aware
+/// double/triple-click detection.
+#[derive(Debug, Clone, Copy)]
+struct LastClick {
+    at: std::time::Instant,
+    col: u16,
+    row: u16,
+    count: u8,
+    region: ClickRegion,
+}
+
+impl LastClick {
+    /// The multi-click count for a click at `(col, row)` in `region` given the
+    /// previous click `prev`. Returns `(prev.count + 1).min(3)` only when the
+    /// previous click was in the SAME region, within 400ms, on the same row,
+    /// and within 3 columns; otherwise `1` (a fresh single click).
+    fn next_count(
+        prev: Option<LastClick>,
+        now: std::time::Instant,
+        col: u16,
+        row: u16,
+        region: ClickRegion,
+    ) -> u8 {
+        match prev {
+            Some(p)
+                if p.region == region
+                    && now.duration_since(p.at).as_millis() < 400
+                    && p.row == row
+                    && col.abs_diff(p.col) <= 3 =>
+            {
+                (p.count + 1).min(3)
+            }
+            _ => 1,
+        }
+    }
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -706,6 +820,16 @@ impl UiState {
             orchestration_ready_since: HashMap::new(),
             pending_dispatches: Vec::new(),
             last_pane_keystroke_at: None,
+            button_rects: Vec::new(),
+            tab_close_rects: Vec::new(),
+            tab_header_rects: Vec::new(),
+            card_rects: Vec::new(),
+            modal_button_rects: Vec::new(),
+            picker_button_rects: Vec::new(),
+            picker_row_rects: Vec::new(),
+            form_field_rects: Vec::new(),
+            form_chip_rects: Vec::new(),
+            form_button_rects: Vec::new(),
         }
     }
 }
@@ -1729,8 +1853,8 @@ fn compute_bell_needed(
 // Key handling
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-struct NewPaneRequest {
+#[derive(Debug, Clone)]
+pub struct NewPaneRequest {
     dir: PathBuf,
     name: String,
     command: String,
@@ -1738,8 +1862,21 @@ struct NewPaneRequest {
     orchestration_config: Option<OrchestrationConfig>,
 }
 
-#[derive(Debug)]
-enum KeyResult {
+/// PRD #80: the single action layer. Every keyboard-only command and (from
+/// M2 onward) every clickable affordance maps to exactly one `Action`
+/// variant, and [`dispatch_action`] is the one place each variant executes.
+/// The keystroke branch in `run_tui` is a thin `KeyEvent -> Option<Action>`
+/// mapper; a future mouse Down on a button rect produces the *same* variant,
+/// so key and click cannot drift apart.
+///
+/// Text input (typing into the filter/rename fields, the new-pane form) stays
+/// keyboard-driven by design — the per-mode handlers keep applying those
+/// local-state mutations inline and return [`Action::Continue`] when there is
+/// nothing for the dispatcher to do.
+#[derive(Debug, Clone)]
+pub enum Action {
+    /// Nothing for the dispatcher to do — the per-mode handler already
+    /// applied any local-state mutation (e.g. a typed character).
     Continue,
     Quit,
     /// PRD #76, M2.5: detach every stream-backed pane (sending an explicit
@@ -1748,7 +1885,135 @@ enum KeyResult {
     /// down by the normal quit path — they can't survive process exit.
     DetachAndQuit,
     Focus,
-    NewPane(NewPaneRequest),
+    /// PRD #80: open the directory picker to start a new pane (Ctrl+N). This
+    /// is the global "New Pane" command and the target of the M2 button bar's
+    /// `[New Pane Ctrl+N]` button — distinct from [`Action::SpawnPane`], which
+    /// is the *result* of submitting the new-pane form.
+    NewPane,
+    /// PRD #80: close the selected pane — or the entire mode/orchestration tab
+    /// it belongs to (Ctrl+W).
+    CloseSelected,
+    /// PRD #80: toggle the embedded-pane layout between stacked and tiled
+    /// (Ctrl+T).
+    ToggleLayout,
+    /// PRD #80: leave `PaneInput` and return to Normal (command) mode on the
+    /// current tab (Ctrl+D).
+    DetachToNormal,
+    /// PRD #80 M2: open the help overlay (or close it if already open) — the
+    /// `?` key and the `[Help ?]` button share this one path.
+    ToggleHelp,
+    /// PRD #80: Ctrl+PageDown — advance to the next tab (clamped, gated on a
+    /// visible tab bar). Distinct from [`Action::CycleTabNext`], which wraps.
+    GlobalNextTab,
+    /// PRD #80: Ctrl+PageUp — go to the previous tab (clamped, gated on a
+    /// visible tab bar).
+    GlobalPrevTab,
+    /// PRD #80: Normal-mode Tab / Right / `l` — cycle to the next tab (wraps).
+    CycleTabNext,
+    /// PRD #80: Normal-mode BackTab / Left / `h` — cycle to the previous tab
+    /// (wraps).
+    CycleTabPrev,
+    /// PRD #80 M3: switch to the tab at this index — the outcome of clicking a
+    /// tab header in the strip (the keyboard equivalent of Tab / Ctrl+PageDown
+    /// landing on that tab). The index is from the most recent render, stable
+    /// for the click that produced it.
+    SelectTab(usize),
+    /// PRD #80 M3: close the tab at this index — the outcome of clicking a
+    /// Mode/Orchestration tab's `[×]` affordance, reusing Ctrl+W's tab-teardown
+    /// semantics for the clicked tab (not necessarily the active one).
+    CloseTab(usize),
+    /// PRD #80 M4: select the dashboard card at this index — the outcome of a
+    /// single click on a card. Per PRD #68 a click selects exactly card N (the
+    /// same card a j/k linear-cycle would land on), mirroring the selection
+    /// into the embedded focus the way `dispatch_normal_mode_key` does.
+    SelectCard(usize),
+    /// PRD #80 M4: enter filter mode (the `/` key and the `[Filter /]` button
+    /// share this path).
+    EnterFilter,
+    /// PRD #80 M4: enter rename mode for the selected card (the `r` key and the
+    /// `[Rename r]` button share this path; a no-op when no card is selected).
+    EnterRename,
+    /// PRD #80 M5: quit-confirm `[Stop]` button — resolve exactly as Enter-on-
+    /// Stop does: go straight to shutdown when there are no managed agents,
+    /// otherwise step through the secondary Stop-confirm dialog. The agent
+    /// count is computed in `dispatch_action` (which has the snapshot).
+    RequestStop,
+    /// PRD #80 M5: dismiss the current modal back to Normal (quit-confirm
+    /// `[Cancel]`).
+    DismissModal,
+    /// PRD #80 M5: config-gen `[Yes]` — send the config-gen prompt to the
+    /// pending target pane (same outcome as Enter-on-Yes).
+    ConfigGenConfirm,
+    /// PRD #80 M5: config-gen `[No]` — dismiss the prompt for now (clears the
+    /// target, returns to Normal).
+    ConfigGenDismiss,
+    /// PRD #80 M5: config-gen `[Never]` — suppress the prompt for this
+    /// directory and return to Normal.
+    ConfigGenSuppress,
+    /// PRD #80 M5: star-prompt `[Star]` — open the repo URL and stop asking
+    /// (== `s`).
+    StarConfirm,
+    /// PRD #80 M5: star-prompt `[Snooze]` — snooze the prompt (== `l` / Esc).
+    StarSnooze,
+    /// PRD #80 M5: star-prompt `[Dismiss]` — stop asking permanently (== `d`).
+    StarDismiss,
+    /// PRD #80 M6: filter-row `[Apply]` — commit the filter and return to
+    /// Normal, KEEPING the typed filter text (== Enter in filter mode).
+    ApplyFilter,
+    /// PRD #80 M6: filter-row `[Cancel]` — clear the filter and return to
+    /// Normal (== Esc in filter mode).
+    CancelFilter,
+    /// PRD #80 M6: rename-row `[Save]` — commit the rename on the selected
+    /// card and return to Normal (== Enter in rename mode).
+    SaveRename,
+    /// PRD #80 M6: rename-row `[Cancel]` — abandon the rename and return to
+    /// Normal, leaving the existing name untouched (== Esc in rename mode).
+    CancelRename,
+    /// PRD #80 M7: single-click a directory-picker row — set the picker's
+    /// selection to this filtered-list index (== j/k landing on it).
+    PickerSelectRow(usize),
+    /// PRD #80 M7: double-click a directory-picker row — select it then
+    /// descend into it (== Enter / l). The `..` row is handled via
+    /// [`Action::PickerParent`] instead.
+    PickerEnterRow(usize),
+    /// PRD #80 M7: click the `..` row / breadcrumb — go up one directory
+    /// (== h / Backspace / Left).
+    PickerParent,
+    /// PRD #80 M7: picker `[Confirm]` — confirm the current directory and
+    /// advance to the new-pane form (== Space).
+    PickerConfirm,
+    /// PRD #80 M7: picker `[Cancel]` — close the picker (== q / Esc).
+    PickerCancel,
+    /// PRD #80 M7: picker `[Filter]` — open the picker's filter input (== `/`).
+    PickerFilter,
+    /// PRD #80 M8: click a new-pane-form field row — focus that field (== Tab /
+    /// Shift+Tab landing on it). Typing stays keyboard.
+    FormFocusField(FormField),
+    /// PRD #80 M8: click a mode chip — select that mode option by index into
+    /// the option list (0 = "No mode", 1.. = modes/orchestrations), == the
+    /// Left/Right/h/l cycler landing on it.
+    FormSelectMode(usize),
+    /// PRD #80 M8: form `[Submit]` — spawn the pane from the form values
+    /// (== Enter on the final field).
+    FormSubmit,
+    /// PRD #80 M8: form `[Cancel]` — close the form without spawning (== Esc).
+    FormCancel,
+    /// PRD #80: Normal-mode digit `1`-`9` — jump to card N and focus its pane.
+    FocusCard(usize),
+    /// PRD #80: on a mode tab, move the in-tab side-pane focus down (j/Down).
+    ModeTabSelectNext,
+    /// PRD #80: on a mode tab, move the in-tab side-pane focus up (k/Up).
+    ModeTabSelectPrev,
+    /// PRD #80: on a mode tab, enter `PaneInput` on the focused side/agent
+    /// pane (Enter).
+    ModeTabFocus,
+    /// PRD #80: on a mode tab, reset in-tab focus back to the agent pane
+    /// (Esc).
+    ModeTabReset,
+    /// PRD #80: the new-pane form was submitted — spawn the requested pane.
+    /// This is the *outcome* of the form, distinct from [`Action::NewPane`],
+    /// which merely opens the picker that leads to the form.
+    SpawnPane(NewPaneRequest),
     SendConfigGenPrompt {
         pane_id: String,
         cwd: String,
@@ -1977,19 +2242,15 @@ fn word_bounds_at(screen: &vt100::Screen, row: u16, col: u16, row_offset: u16) -
     (start, end)
 }
 
-fn handle_pane_input_key(key: KeyEvent) -> KeyResult {
+fn handle_pane_input_key(key: KeyEvent) -> Action {
     if let Some(bytes) = keyevent_to_bytes(&key) {
-        KeyResult::ForwardToPane(bytes)
+        Action::ForwardToPane(bytes)
     } else {
-        KeyResult::Continue
+        Action::Continue
     }
 }
 
-fn handle_quit_confirm_key(
-    key: KeyEvent,
-    ui: &mut UiState,
-    managed_agents_count: usize,
-) -> KeyResult {
+fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState, managed_agents_count: usize) -> Action {
     // PRD #93 Phase 2 / M4.2: dialog was Detach/Cancel — every pane is
     // daemon-backed so quitting the TUI was always a detach, never a kill.
     // PRD #92 F1: Stop joins the dialog as a third option. Order is
@@ -2002,41 +2263,41 @@ fn handle_quit_confirm_key(
         // implicit detach, so agents still survive — the difference vs
         // DetachAndQuit is purely about the daemon-side log
         // distinguishing voluntary detach from EOF.
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyResult::Quit,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
         KeyCode::Up | KeyCode::Char('k') => {
             ui.quit_confirm_selected = ui.quit_confirm_selected.saturating_sub(1);
-            KeyResult::Continue
+            Action::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if ui.quit_confirm_selected + 1 < QUIT_OPTION_COUNT {
                 ui.quit_confirm_selected += 1;
             }
-            KeyResult::Continue
+            Action::Continue
         }
         KeyCode::Enter => match ui.quit_confirm_selected {
-            0 => KeyResult::DetachAndQuit,
+            0 => Action::DetachAndQuit,
             1 => {
                 // PRD #92 F1 Stop: if no managed agents, proceed directly;
                 // otherwise step through the secondary y/n dialog so the
                 // user has to confirm the destructive action explicitly.
                 if managed_agents_count == 0 {
-                    KeyResult::StopAndQuit
+                    Action::StopAndQuit
                 } else {
-                    KeyResult::StopConfirmPrompt {
+                    Action::StopConfirmPrompt {
                         agent_count: managed_agents_count,
                     }
                 }
             }
             _ => {
                 ui.mode = UiMode::Normal;
-                KeyResult::Continue
+                Action::Continue
             }
         },
         KeyCode::Esc => {
             ui.mode = UiMode::Normal;
-            KeyResult::Continue
+            Action::Continue
         }
-        _ => KeyResult::Continue,
+        _ => Action::Continue,
     }
 }
 
@@ -2048,53 +2309,53 @@ fn handle_quit_confirm_key(
 /// with Stop still highlighted so the user can pick a different option
 /// without restarting the Ctrl+C sequence. Layout: index 0 = No,
 /// index 1 = Yes.
-fn handle_stop_confirm_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+fn handle_stop_confirm_key(key: KeyEvent, ui: &mut UiState) -> Action {
     const STOP_OPTION_COUNT: usize = 2;
     match key.code {
         // Ctrl+C inside the secondary dialog: same hard-quit semantic as
         // the primary dialog. Daemon sees the implicit detach.
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyResult::Quit,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
         KeyCode::Up | KeyCode::Char('k') => {
             ui.stop_confirm_selected = ui.stop_confirm_selected.saturating_sub(1);
-            KeyResult::Continue
+            Action::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if ui.stop_confirm_selected + 1 < STOP_OPTION_COUNT {
                 ui.stop_confirm_selected += 1;
             }
-            KeyResult::Continue
+            Action::Continue
         }
         // `y` is a shortcut for Yes regardless of which option is
         // highlighted — matches the convention from similar dialogs.
-        KeyCode::Char('y') | KeyCode::Char('Y') => KeyResult::StopAndQuit,
+        KeyCode::Char('y') | KeyCode::Char('Y') => Action::StopAndQuit,
         // `n` is a shortcut for No: return to the primary dialog with
         // Stop selected, so the user can pick Detach or Cancel without
         // re-opening anything.
         KeyCode::Char('n') | KeyCode::Char('N') => {
             ui.stop_confirm_selected = 0;
             ui.mode = UiMode::QuitConfirm;
-            KeyResult::Continue
+            Action::Continue
         }
         KeyCode::Enter => match ui.stop_confirm_selected {
             // Index 1 == Yes
-            1 => KeyResult::StopAndQuit,
+            1 => Action::StopAndQuit,
             // Index 0 == No: return to primary dialog (Stop still highlighted).
             _ => {
                 ui.stop_confirm_selected = 0;
                 ui.mode = UiMode::QuitConfirm;
-                KeyResult::Continue
+                Action::Continue
             }
         },
         KeyCode::Esc => {
             ui.stop_confirm_selected = 0;
             ui.mode = UiMode::QuitConfirm;
-            KeyResult::Continue
+            Action::Continue
         }
-        _ => KeyResult::Continue,
+        _ => Action::Continue,
     }
 }
 
-fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
     match key.code {
         KeyCode::Char('s') => {
             let msg = if open::that("https://github.com/vfarcic/dot-agent-deck").is_ok() {
@@ -2105,48 +2366,48 @@ fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
             ui.status_message = Some((msg, std::time::Instant::now()));
-            KeyResult::Continue
+            Action::Continue
         }
         KeyCode::Char('l') | KeyCode::Esc => {
             ui.star_prompt_state.snooze();
             ui.mode = UiMode::Normal;
-            KeyResult::Continue
+            Action::Continue
         }
         KeyCode::Char('d') => {
             ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
-            KeyResult::Continue
+            Action::Continue
         }
-        _ => KeyResult::Continue,
+        _ => Action::Continue,
     }
 }
 
-fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
             ui.config_gen_selected = ui.config_gen_selected.saturating_sub(1);
-            KeyResult::Continue
+            Action::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if ui.config_gen_selected < 2 {
                 ui.config_gen_selected += 1;
             }
-            KeyResult::Continue
+            Action::Continue
         }
         KeyCode::Enter => match ui.config_gen_selected {
             0 => {
                 // Yes — send prompt and focus pane.
                 ui.mode = UiMode::Normal;
                 if let Some((pane_id, cwd)) = ui.config_gen_target.take() {
-                    return KeyResult::SendConfigGenPrompt { pane_id, cwd };
+                    return Action::SendConfigGenPrompt { pane_id, cwd };
                 }
-                KeyResult::Continue
+                Action::Continue
             }
             1 => {
                 // No — dismiss for now, hint stays on card.
                 ui.config_gen_target = None;
                 ui.mode = UiMode::Normal;
-                KeyResult::Continue
+                Action::Continue
             }
             _ => {
                 // Never — suppress hint permanently for this directory.
@@ -2159,15 +2420,15 @@ fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
                     "Config prompt suppressed for this directory.".to_string(),
                     std::time::Instant::now(),
                 ));
-                KeyResult::Continue
+                Action::Continue
             }
         },
         KeyCode::Esc => {
             ui.config_gen_target = None;
             ui.mode = UiMode::Normal;
-            KeyResult::Continue
+            Action::Continue
         }
-        _ => KeyResult::Continue,
+        _ => Action::Continue,
     }
 }
 
@@ -2282,7 +2543,7 @@ fn dispatch_normal_mode_key(
     selected_status: Option<SessionStatus>,
     filtered: &[(&String, &SessionState)],
     pane: &dyn PaneController,
-) -> KeyResult {
+) -> Action {
     let prev_selected_index = ui.selected_index;
     let result = handle_normal_key(key, ui, total, selected_status);
     mirror_selection_into_focus(prev_selected_index, ui, filtered, pane);
@@ -2396,91 +2657,87 @@ fn handle_normal_key(
     ui: &mut UiState,
     total: usize,
     selected_status: Option<SessionStatus>,
-) -> KeyResult {
+) -> Action {
     // Ctrl+C from dashboard: show quit confirmation. PRD #40 safety net —
     // hardcoded and checked first so it can never be remapped or unbound.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
-        return KeyResult::Continue;
+        return Action::Continue;
     }
 
-    // PRD #40: resolve dashboard actions from the active keybinding config.
-    // Cloned up front so the `&mut ui` mutations below don't conflict with an
-    // immutable borrow of `ui.keybindings`.
+    // PRD #40: dashboard (command-mode) shortcuts resolve from the active
+    // keybinding config. Cloned up front so the `&mut ui` mutations below don't
+    // conflict with an immutable borrow of `ui.keybindings`. PRD #80: the
+    // mode-changing shortcuts return shared `Action`s (EnterFilter/ToggleHelp/
+    // EnterRename/Focus) so a keypress and the button-bar funnel into the same
+    // `dispatch_action` path. The non-configurable arrow-key aliases (Down/Up)
+    // are kept alongside move_down/move_up so default nav is byte-for-byte
+    // unchanged.
     let kb = ui.keybindings.clone();
 
-    // PRD #40: dashboard (command-mode) actions resolve from the keybinding
-    // config. The non-configurable arrow-key aliases (Down/Up) are kept
-    // alongside the move_down/move_up bindings so default navigation is
-    // byte-for-byte unchanged.
-    if kb.matches(Action::MoveDown, &key) || key.code == KeyCode::Down {
+    if kb.matches(KbAction::MoveDown, &key) || key.code == KeyCode::Down {
         if total > 0 {
             ui.selected_index = (ui.selected_index + 1) % total;
         }
-        return KeyResult::Continue;
+        return Action::Continue;
     }
-    if kb.matches(Action::MoveUp, &key) || key.code == KeyCode::Up {
+    if kb.matches(KbAction::MoveUp, &key) || key.code == KeyCode::Up {
         if total > 0 {
             ui.selected_index = (ui.selected_index + total - 1) % total;
         }
-        return KeyResult::Continue;
+        return Action::Continue;
     }
     // move_left / move_right (defaults h / l) are handled in the main loop for
     // tab switching.
-    if kb.matches(Action::Filter, &key) {
-        ui.mode = UiMode::Filter;
-        ui.filter_text.clear();
-        return KeyResult::Continue;
+    if kb.matches(KbAction::Filter, &key) {
+        return Action::EnterFilter;
     }
-    if kb.matches(Action::Help, &key) {
-        ui.mode = UiMode::Help;
-        return KeyResult::Continue;
+    if kb.matches(KbAction::Help, &key) {
+        return Action::ToggleHelp;
     }
-    if kb.matches(Action::Rename, &key) && total > 0 {
-        ui.mode = UiMode::Rename;
-        ui.rename_text.clear();
-        return KeyResult::Continue;
+    if kb.matches(KbAction::Rename, &key) && total > 0 {
+        return Action::EnterRename;
     }
-    if kb.matches(Action::FocusPane, &key) && total > 0 {
-        return KeyResult::Focus;
+    if kb.matches(KbAction::FocusPane, &key) && total > 0 {
+        return Action::Focus;
     }
     // `g` generates a project config — not part of the PRD #40 action set, so
     // it stays hardcoded.
     if key.code == KeyCode::Char('g') && total > 0 {
-        return KeyResult::RequestConfigGen;
+        return Action::RequestConfigGen;
     }
     // PRD #92 F2 (PRD #18 follow-through): approve / deny permission. Only
     // fires when the selected card is in `WaitingForInput` — any other status,
     // or no card selected, no-ops silently. The bindings (defaults y / n)
     // carry their own modifier requirement via `matches`, so Ctrl+n (new
     // pane, handled in the outer dispatch loop) still wins.
-    if kb.matches(Action::ApprovePermission, &key)
+    if kb.matches(KbAction::ApprovePermission, &key)
         && total > 0
         && selected_status == Some(SessionStatus::WaitingForInput)
     {
-        return KeyResult::SendPermissionResponse(true);
+        return Action::SendPermissionResponse(true);
     }
-    if kb.matches(Action::DenyPermission, &key)
+    if kb.matches(KbAction::DenyPermission, &key)
         && total > 0
         && selected_status == Some(SessionStatus::WaitingForInput)
     {
-        return KeyResult::SendPermissionResponse(false);
+        return Action::SendPermissionResponse(false);
     }
-    if kb.matches(Action::ClearFilter, &key) {
+    if kb.matches(KbAction::ClearFilter, &key) {
         if !ui.filter_text.is_empty() {
             ui.filter_text.clear();
         }
-        return KeyResult::Continue;
+        return Action::Continue;
     }
-    KeyResult::Continue
+    Action::Continue
 }
 
-fn handle_filter_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+fn handle_filter_key(key: KeyEvent, ui: &mut UiState) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
-        return KeyResult::Continue;
+        return Action::Continue;
     }
     match key.code {
         KeyCode::Esc => {
@@ -2498,17 +2755,17 @@ fn handle_filter_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         }
         _ => {}
     }
-    KeyResult::Continue
+    Action::Continue
 }
 
-fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> Action {
     match key.code {
         KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
             ui.mode = UiMode::Normal;
         }
         _ => {}
     }
-    KeyResult::Continue
+    Action::Continue
 }
 
 /// Decide what value to push to the daemon on a Rename-mode keypress.
@@ -2573,11 +2830,11 @@ fn handle_rename_key(
     key: KeyEvent,
     ui: &mut UiState,
     _selected_session_id: Option<&str>,
-) -> KeyResult {
+) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
-        return KeyResult::Continue;
+        return Action::Continue;
     }
     match key.code {
         KeyCode::Esc => {
@@ -2605,20 +2862,20 @@ fn handle_rename_key(
         }
         _ => {}
     }
-    KeyResult::Continue
+    Action::Continue
 }
 
-fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
-        return KeyResult::Continue;
+        return Action::Continue;
     }
     let picker = match ui.dir_picker.as_mut() {
         Some(p) => p,
         None => {
             ui.mode = UiMode::Normal;
-            return KeyResult::Continue;
+            return Action::Continue;
         }
     };
 
@@ -2655,7 +2912,7 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             },
             _ => {}
         }
-        return KeyResult::Continue;
+        return Action::Continue;
     }
 
     match key.code {
@@ -2681,10 +2938,10 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             // If no subdirs, select current directory
             if !picker.has_subdirs() {
                 transition_after_dir_pick(ui);
-                return KeyResult::Continue;
+                return Action::Continue;
             }
             if picker.filtered_indices.is_empty() {
-                return KeyResult::Continue;
+                return Action::Continue;
             }
             picker.enter_selected();
         }
@@ -2696,11 +2953,11 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         }
         KeyCode::Char(' ') => {
             transition_after_dir_pick(ui);
-            return KeyResult::Continue;
+            return Action::Continue;
         }
         _ => {}
     }
-    KeyResult::Continue
+    Action::Continue
 }
 
 /// Check for `.dot-agent-deck.toml` in the selected directory.
@@ -2734,17 +2991,30 @@ fn transition_after_dir_pick(ui: &mut UiState) {
     ui.mode = UiMode::NewPaneForm;
 }
 
-fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+/// PRD #80 M8: build the [`NewPaneRequest`] from the current form values.
+/// Shared by the Enter-submit key arm and the `[Submit]` button
+/// ([`Action::FormSubmit`]) so click and key spawn an identical pane.
+fn build_new_pane_request(form: &NewPaneFormState) -> NewPaneRequest {
+    NewPaneRequest {
+        dir: form.dir.clone(),
+        name: form.name.clone(),
+        command: form.command.clone(),
+        mode_config: form.selected_mode().cloned(),
+        orchestration_config: form.selected_orchestration().cloned(),
+    }
+}
+
+fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
-        return KeyResult::Continue;
+        return Action::Continue;
     }
     let form = match ui.new_pane_form.as_mut() {
         Some(f) => f,
         None => {
             ui.mode = UiMode::Normal;
-            return KeyResult::Continue;
+            return Action::Continue;
         }
     };
     match key.code {
@@ -2776,16 +3046,10 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
             // selected), pressing Enter on Name submits — there's no later
             // field to advance to.
             FormField::Name | FormField::Command => {
-                let req = NewPaneRequest {
-                    dir: form.dir.clone(),
-                    name: form.name.clone(),
-                    command: form.command.clone(),
-                    mode_config: form.selected_mode().cloned(),
-                    orchestration_config: form.selected_orchestration().cloned(),
-                };
+                let req = build_new_pane_request(form);
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
-                return KeyResult::NewPane(req);
+                return Action::SpawnPane(req);
             }
         },
         KeyCode::Backspace if form.focused != FormField::Mode => {
@@ -2806,7 +3070,7 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         }
         _ => {}
     }
-    KeyResult::Continue
+    Action::Continue
 }
 
 // ---------------------------------------------------------------------------
@@ -2820,6 +3084,1525 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
 /// Tear down every non-dashboard tab (mode + orchestration) and unregister
 /// their pane IDs from `state`.
 ///
+/// PRD #80: control-flow signal returned by [`dispatch_action`]. Most actions
+/// mutate state and yield [`Flow::Continue`]; the quit/stop/detach actions
+/// yield [`Flow::Break`] so the caller breaks the TUI's outer loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Break,
+}
+
+/// PRD #80: map a Ctrl-modified `KeyEvent` to the global command [`Action`] it
+/// triggers (works from any UI mode). Returns `None` for any key this layer
+/// does not own, so it falls through to the per-mode handlers. This is part of
+/// the thin `KeyEvent -> Option<Action>` mapper that pairs with
+/// [`dispatch_action`]; the M2 button bar produces the SAME variants from a
+/// click, so key and click cannot drift.
+pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
+    // PRD #40: the four configurable global commands resolve from the active
+    // keybinding config (any chord, any mode), defaulting to Ctrl+d/t/n/w. The
+    // caller excludes Ctrl+C before calling this, so a binding to Ctrl+C can't
+    // win here.
+    if kb.matches(KbAction::Dashboard, key) {
+        return Some(Action::DetachToNormal);
+    }
+    if kb.matches(KbAction::ToggleLayout, key) {
+        return Some(Action::ToggleLayout);
+    }
+    if kb.matches(KbAction::NewPane, key) {
+        return Some(Action::NewPane);
+    }
+    if kb.matches(KbAction::ClosePane, key) {
+        return Some(Action::CloseSelected);
+    }
+    // Ctrl+PageDown / Ctrl+PageUp: non-configurable tab navigation.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::PageDown => return Some(Action::GlobalNextTab),
+            KeyCode::PageUp => return Some(Action::GlobalPrevTab),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// PRD #80 / #40: map a Normal-mode tab-cycling key to its [`Action`]. The
+/// configurable move_right/move_left actions (defaults `l`/`h`) drive this,
+/// alongside the non-configurable Tab / Shift+Tab / Left / Right aliases.
+/// Returns `None` for anything else.
+fn cycle_tab_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
+    if kb.matches(KbAction::MoveRight, key) || matches!(key.code, KeyCode::Tab | KeyCode::Right) {
+        return Some(Action::CycleTabNext);
+    }
+    if kb.matches(KbAction::MoveLeft, key) || matches!(key.code, KeyCode::BackTab | KeyCode::Left) {
+        return Some(Action::CycleTabPrev);
+    }
+    None
+}
+
+/// PRD #80 / #40: map an in-tab navigation key on a mode tab to its [`Action`].
+/// The configurable move_down/move_up actions (defaults `j`/`k`) drive
+/// selection, with the Down/Up arrows kept as non-configurable aliases;
+/// Enter/Esc are mode-fixed. The caller only invokes this when the active tab
+/// is a `Tab::Mode`, so the returned action is always meaningful there.
+fn mode_tab_nav_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
+    if kb.matches(KbAction::MoveDown, key) || key.code == KeyCode::Down {
+        return Some(Action::ModeTabSelectNext);
+    }
+    if kb.matches(KbAction::MoveUp, key) || key.code == KeyCode::Up {
+        return Some(Action::ModeTabSelectPrev);
+    }
+    match key.code {
+        KeyCode::Enter => Some(Action::ModeTabFocus),
+        KeyCode::Esc => Some(Action::ModeTabReset),
+        _ => None,
+    }
+}
+
+/// PRD #80: a clickable affordance that carries its keyboard shortcut inline
+/// (e.g. `[New Pane Ctrl+N]`) plus the [`Action`] it triggers. Render and
+/// hit-test live together (see [`Button::render`] and [`hit_test_button`]) so
+/// they cannot drift. From M2 the button bar renders these and records each
+/// one's screen rect in `UiState::button_rects`; a mouse Down hit-tested
+/// against those rects produces exactly the same `Action` the keyboard maps
+/// to, which is what makes the mouse/keyboard parity self-evident in code.
+#[derive(Debug, Clone)]
+pub struct Button {
+    /// Human-readable command name, e.g. `New Pane`.
+    pub label: String,
+    /// The keyboard shortcut shown inline, e.g. `Ctrl+N`. Empty for buttons
+    /// that have no keyboard equivalent (none in the parity-only PRD #80).
+    pub shortcut: String,
+    /// The action this button triggers when clicked — identical to the action
+    /// the inline shortcut maps to.
+    pub action: Action,
+    /// Whether the button is currently actionable. A disabled button renders
+    /// dimmed and is INERT: the bar renderers do not record its rect, so a
+    /// click on it is a no-op — matching the keyboard, where the bound key is
+    /// a silent no-op (PRD #80 review FIX 3).
+    pub enabled: bool,
+}
+
+impl Button {
+    /// Construct a button. `label`/`shortcut` accept anything `Into<String>`.
+    pub fn new(
+        label: impl Into<String>,
+        shortcut: impl Into<String>,
+        action: Action,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            shortcut: shortcut.into(),
+            action,
+            enabled,
+        }
+    }
+
+    /// The full on-screen text: `[Label Shortcut]`, or `[Label]` when the
+    /// button has no shortcut. The narrow-terminal fallback (shortcut-only)
+    /// arrives with the M2 button bar.
+    pub fn display_label(&self) -> String {
+        if self.shortcut.is_empty() {
+            format!("[{}]", self.label)
+        } else {
+            format!("[{} {}]", self.label, self.shortcut)
+        }
+    }
+
+    /// The narrow-terminal fallback label: just the bracketed shortcut, e.g.
+    /// `[Ctrl+N]` (or `[New Pane]` if the button has no shortcut). Used by the
+    /// button bar when the full `[Label Shortcut]` set doesn't fit, so every
+    /// command stays identifiable without a mid-label truncation.
+    pub fn shortcut_only_label(&self) -> String {
+        if self.shortcut.is_empty() {
+            format!("[{}]", self.label)
+        } else {
+            format!("[{}]", self.shortcut)
+        }
+    }
+
+    /// The `(Action, Rect)` pair to record in `UiState::button_rects` for the
+    /// button placed at `area` — the same pair [`Button::render`] returns,
+    /// exposed without a `Buffer` so hit-test recording (and unit tests) need
+    /// not render. A click in `area` resolves back to `action` via
+    /// [`hit_test_button`], which is what keeps render and hit-test in
+    /// lockstep.
+    pub fn pair(&self, area: Rect) -> (Action, Rect) {
+        (self.action.clone(), area)
+    }
+
+    /// Styling for the button text — normal for an enabled button, dimmed for
+    /// a disabled one.
+    fn style(&self, palette: &ColorPalette) -> Style {
+        if self.enabled {
+            Style::default()
+                .fg(palette.text_primary)
+                .bg(palette.tab_bar_bg)
+        } else {
+            Style::default()
+                .fg(palette.text_muted)
+                .bg(palette.tab_bar_bg)
+                .add_modifier(Modifier::DIM)
+        }
+    }
+
+    /// Render `text` (an already-chosen full or shortcut-only label) into `buf`
+    /// at `area` and return the `(Action, Rect)` pair to record in
+    /// `UiState::button_rects`. Keeping render and the recorded rect in one
+    /// call is what stops the click target from drifting from what's drawn.
+    fn render_text(
+        &self,
+        text: &str,
+        area: Rect,
+        buf: &mut Buffer,
+        palette: &ColorPalette,
+    ) -> (Action, Rect) {
+        let span = Span::styled(text.to_string(), self.style(palette));
+        buf.set_span(area.x, area.y, &span, area.width);
+        self.pair(area)
+    }
+
+    /// Render the full `[Label Shortcut]` button into `buf` at `area`.
+    pub fn render(&self, area: Rect, buf: &mut Buffer, palette: &ColorPalette) -> (Action, Rect) {
+        self.render_text(&self.display_label(), area, buf, palette)
+    }
+
+    /// Render the narrow-terminal `[Shortcut]` fallback into `buf` at `area`.
+    pub fn render_compact(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        palette: &ColorPalette,
+    ) -> (Action, Rect) {
+        self.render_text(&self.shortcut_only_label(), area, buf, palette)
+    }
+}
+
+/// PRD #80: hit-test a mouse Down/Up position against the button rects recorded
+/// during render. Returns the [`Action`] of the first button whose rect
+/// contains the point, or `None` if the click misses every button — in which
+/// case the caller falls through to the existing pane/selection/scroll/
+/// hyperlink logic. Per the PRD's hit-test order, this runs BEFORE pane-region
+/// logic so a button click short-circuits.
+pub fn hit_test_button(button_rects: &[(Action, Rect)], col: u16, row: u16) -> Option<Action> {
+    button_rects
+        .iter()
+        .find_map(|(action, rect)| point_in_rect(rect, col, row).then(|| action.clone()))
+}
+
+/// Whether the cell `(col, row)` falls inside `rect` (upper bounds exclusive).
+fn point_in_rect(rect: &Rect, col: u16, row: u16) -> bool {
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+/// PRD #80 M3: hit-test a click against the tab `[×]` close rects, returning a
+/// [`Action::CloseTab`] for the first match. Checked AFTER `button_rects` but
+/// BEFORE the header rects so the `[×]` beats the surrounding tab header.
+fn hit_test_tab_close(tab_close_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<Action> {
+    tab_close_rects
+        .iter()
+        .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(Action::CloseTab(*idx)))
+}
+
+/// PRD #80 M3: hit-test a click against the tab header rects, returning a
+/// [`Action::SelectTab`] for the first match (a click that missed the `[×]`).
+fn hit_test_tab_header(tab_header_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<Action> {
+    tab_header_rects
+        .iter()
+        .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(Action::SelectTab(*idx)))
+}
+
+/// PRD #80 M4: hit-test a click against the dashboard card rects, returning the
+/// flat selection index of the first card whose rect contains the point.
+/// Checked AFTER the button/tab affordances; single vs double click handling
+/// (select vs focus) is decided by the caller using `UiState::last_click`.
+fn hit_test_card(card_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usize> {
+    card_rects
+        .iter()
+        .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(*idx))
+}
+
+/// PRD #80 M3: close the tab at `idx` and reconcile shared state, reusing the
+/// same teardown the Ctrl+W tab-close path performs — unregister every
+/// successfully-closed pane, drop the matching sessions (keeping any that
+/// failed to close so the user can retry), clean their metadata, and resweep
+/// the dashboard layout. Used by [`Action::CloseTab`] (a `[×]` click); the
+/// Ctrl+W card path keeps its own inline message that names the specific pane.
+fn close_tab_by_index(
+    idx: usize,
+    ui: &mut UiState,
+    state: &SharedState,
+    tab_manager: &mut TabManager,
+    pane: &dyn PaneController,
+    frame_area: Rect,
+) {
+    match tab_manager.close_tab(idx) {
+        Ok(outcome) => {
+            let mut st = state.blocking_write();
+            for id in &outcome.closed {
+                st.unregister_pane(id);
+            }
+            // Drop only the sessions whose pane was actually closed; failed
+            // panes keep their card/session so the user can retry.
+            let closed_set: std::collections::HashSet<&str> =
+                outcome.closed.iter().map(String::as_str).collect();
+            st.sessions.retain(|_, s| {
+                s.pane_id
+                    .as_ref()
+                    .is_none_or(|pid| !closed_set.contains(pid.as_str()))
+            });
+            drop(st);
+            for id in &outcome.closed {
+                ui.pane_metadata.remove(id);
+            }
+            if outcome.is_clean() {
+                ui.status_message = Some(("Closed tab".to_string(), std::time::Instant::now()));
+            } else {
+                let failed_ids: Vec<&str> =
+                    outcome.failed.iter().map(|(id, _)| id.as_str()).collect();
+                let first_err = outcome
+                    .failed
+                    .first()
+                    .map(|(_, e)| e.as_str())
+                    .unwrap_or("");
+                for (id, e) in &outcome.failed {
+                    tracing::warn!(
+                        pane_id = %id,
+                        error = %e,
+                        "M3: close_pane failed during [×] tab teardown — card preserved"
+                    );
+                }
+                ui.status_message = Some((
+                    format!(
+                        "Close partially failed for {} pane(s) — first error: {first_err}",
+                        failed_ids.len()
+                    ),
+                    std::time::Instant::now(),
+                ));
+            }
+            resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+        }
+        Err(e) => {
+            ui.status_message = Some((
+                format!("Failed to close tab: {e}"),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+    // Closing the active mode/orchestration tab returns focus to the
+    // dashboard, so leave PaneInput just like the Ctrl+W path does.
+    if ui.mode == UiMode::PaneInput {
+        ui.mode = UiMode::Normal;
+    }
+    if ui.selected_index > 0 {
+        ui.selected_index = ui.selected_index.saturating_sub(1);
+    }
+}
+
+/// PRD #92 F1 / PRD #80 M5: finalise Stop — tell the daemon to terminate every
+/// managed agent and exit. Returns [`Flow::Break`] on success (the TUI's outer
+/// loop unwinds into the normal session-save + exit path); on a shutdown error
+/// it surfaces the failure, returns to Normal mode, and yields
+/// [`Flow::Continue`] so the user can retry or Detach. Shared by the
+/// `Action::StopAndQuit` arm (Enter/`y` on Yes) and `Action::RequestStop`
+/// (the `[Stop]` button) when there are no managed agents.
+fn perform_stop_and_quit(ui: &mut UiState, pane: &dyn PaneController) -> Flow {
+    let shutdown_result = pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .map(|embedded| embedded.shutdown_daemon());
+    match shutdown_result {
+        Some(Ok(())) | None => Flow::Break,
+        Some(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                "shutdown_daemon failed — staying in the TUI so the user can retry or Detach"
+            );
+            ui.status_message = Some((
+                format!(
+                    "Stop failed: {e} — daemon may be incompatible or unresponsive. Try Detach or restart the daemon manually."
+                ),
+                std::time::Instant::now(),
+            ));
+            ui.mode = UiMode::Normal;
+            ui.stop_confirm_selected = 0;
+            ui.quit_confirm_selected = 0;
+            Flow::Continue
+        }
+    }
+}
+
+/// PRD #80 M5: send the config-gen prompt to `pane_id`, focus it for execution,
+/// and surface the outcome. Shared by the `Action::SendConfigGenPrompt` arm
+/// (Enter-on-Yes via the key handler) and `Action::ConfigGenConfirm` (the
+/// `[Yes]` button).
+fn send_config_gen_prompt(
+    pane_id: &str,
+    cwd: &str,
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    tab_manager: &mut TabManager,
+    frame_area: Rect,
+) {
+    let prompt = crate::config_gen::config_gen_prompt(cwd);
+    match pane.write_to_pane(pane_id, &prompt) {
+        Ok(()) => {
+            // Focus the pane so the user can press Enter to execute.
+            if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
+                // PRD #83: snapshot the SOURCE tab's focus before leaving it,
+                // mirroring `switch_tab_with_focus` (capture-out → switch_to →
+                // record). Capture is a no-op when the source is the Dashboard
+                // (its selection is session-id keyed), but adding it keeps every
+                // switch site uniform. `capture_focus_on_switch_out` only reads
+                // the controller's focused pane id — no `focus_pane` — so the
+                // destination focus below is unaffected.
+                tab_manager.capture_focus_on_switch_out();
+                tab_manager.switch_to(tab_idx);
+                tab_manager.record_focus(pane_id);
+                resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                resize_mode_tab_panes(pane, tab_manager, frame_area);
+            }
+            let _ = pane.focus_pane(pane_id);
+            ui.mode = UiMode::PaneInput;
+            ui.status_message = Some((
+                "Config prompt sent — press Enter to execute.".to_string(),
+                std::time::Instant::now(),
+            ));
+        }
+        Err(e) => {
+            ui.status_message = Some((
+                format!("Failed to send config prompt: {e}"),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+}
+
+/// PRD #80 M6: commit a rename for the selected card — push `new_name` to the
+/// daemon via `PaneController::rename_pane` and mirror the controller-resolved
+/// outcome into the dashboard's display-name maps. Shared by the `Rename`-mode
+/// Enter key (via `run_tui`) and the `[Save]` button (`Action::SaveRename`) so
+/// click and key resolve identically. Best-effort: `rename_pane`'s own error
+/// path logs and swallows transient daemon failures.
+fn commit_rename(
+    new_name: &str,
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    snapshot: &AppState,
+    selected_id: Option<&str>,
+) {
+    if let Some(sid) = selected_id
+        && let Some(session) = snapshot.sessions.get(sid)
+        && let Some(ref pane_id) = session.pane_id
+    {
+        match pane.rename_pane(pane_id, new_name) {
+            Ok(outcome) => apply_rename_outcome(
+                &mut ui.display_names,
+                &mut ui.pane_display_names,
+                sid,
+                pane_id,
+                outcome,
+            ),
+            Err(e) => {
+                tracing::debug!(
+                    pane_id = %pane_id,
+                    error = %e,
+                    "rename_pane returned an error; UI maps unchanged"
+                );
+            }
+        }
+    }
+}
+
+/// PRD #80: the single funnel. Every command [`Action`] — whether it came from
+/// a keystroke (today) or a button click (M2 on) — executes here and nowhere
+/// else. The keystroke branch in `run_tui` is a thin `KeyEvent -> Option<
+/// Action>` mapper that hands the chosen action to this function. New actions
+/// add one arm here and one mapping entry; that is the structural guarantee
+/// that key and click stay in parity.
+///
+/// `frame_area` is the current frame area captured by the caller (constant
+/// within a render iteration), standing in for the `terminal.get_frame().
+/// area()` reads the inlined code used. Returns [`Flow::Break`] when the action
+/// should break the TUI's outer loop (quit / detach-and-quit / stop-and-quit).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_action(
+    action: Action,
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    state: &SharedState,
+    tab_manager: &mut TabManager,
+    snapshot: &AppState,
+    filtered: &[(&String, &SessionState)],
+    selected_id: Option<&str>,
+    frame_area: Rect,
+) -> Flow {
+    match action {
+        // ===== PRD #80 global command actions (formerly inline in run_tui) =====
+        // Ctrl+n: new pane (open directory picker).
+        Action::NewPane => {
+            ui.mode = UiMode::DirPicker;
+            ui.dir_picker = Some(DirPickerState::new(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            ));
+        }
+        // Ctrl+t: toggle layout.
+        Action::ToggleLayout => {
+            ui.pane_layout = match ui.pane_layout {
+                PaneLayout::Stacked => PaneLayout::Tiled,
+                PaneLayout::Tiled => PaneLayout::Stacked,
+            };
+            let mode_name = match ui.pane_layout {
+                PaneLayout::Stacked => "stacked",
+                PaneLayout::Tiled => "tiled",
+            };
+            // PRD #76 M2.15 fixup F2: route through the same SSOT sweep helpers
+            // that handle spawn / tab-switch resize.
+            if tab_manager.active_mode_name().is_some() {
+                resize_mode_tab_panes(pane, tab_manager, frame_area);
+            } else {
+                resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+            }
+            ui.status_message = Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
+        }
+        // Ctrl+d: enter Normal (command) mode, stay on current tab.
+        Action::DetachToNormal => {
+            // Re-suppress the prompt in reactive panes when leaving PaneInput
+            // so automated output stays clean.
+            if ui.mode == UiMode::PaneInput
+                && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                && let Some(focused_id) = embedded.focused_pane_id()
+                && let Tab::Mode { mode_manager, .. } = tab_manager.active_tab_mut()
+                && mode_manager.is_reactive_pane(&focused_id)
+            {
+                let _ = pane.write_to_pane(
+                    &focused_id,
+                    "export PS1= PS2= PROMPT= && printf '\\x1b[3J\\x1b[2J\\x1b[H'",
+                );
+            }
+            ui.mode = UiMode::Normal;
+            ui.status_message = None;
+        }
+        // `?` / [Help ?] button: open the help overlay, or close it if already
+        // open. Both key and button reach this one arm.
+        Action::ToggleHelp => {
+            ui.mode = if ui.mode == UiMode::Help {
+                UiMode::Normal
+            } else {
+                UiMode::Help
+            };
+        }
+        // Ctrl+w: close selected pane (or entire mode tab if it's the agent pane).
+        //
+        // PRD #92 F4: inspect each close result and preserve the card / session
+        // on failure so the user can see the error and retry.
+        Action::CloseSelected => {
+            if let Some(sid) = filtered.get(ui.selected_index).map(|(id, _)| (*id).clone())
+                && let Some(session) = snapshot.sessions.get(&sid)
+                && let Some(ref pane_id) = session.pane_id
+            {
+                let closed_pane_id = pane_id.clone();
+                // Check if this pane belongs to a mode or orchestration tab.
+                let mode_tab_idx = tab_manager
+                    .tab_index_for_agent_pane(pane_id)
+                    .or_else(|| tab_manager.tab_index_for_pane(pane_id));
+                if let Some(tab_idx) = mode_tab_idx {
+                    // Close the entire tab (agent + side panes, or all role panes).
+                    match tab_manager.close_tab(tab_idx) {
+                        Ok(outcome) => {
+                            let mut st = state.blocking_write();
+                            for id in &outcome.closed {
+                                st.unregister_pane(id);
+                            }
+                            // Remove sessions whose pane_id is in the closed set ONLY.
+                            let closed_set: std::collections::HashSet<&str> =
+                                outcome.closed.iter().map(String::as_str).collect();
+                            st.sessions.retain(|_, s| {
+                                s.pane_id
+                                    .as_ref()
+                                    .is_none_or(|pid| !closed_set.contains(pid.as_str()))
+                            });
+                            drop(st);
+                            // Clean pane_metadata only for the successfully-closed panes.
+                            for id in &outcome.closed {
+                                ui.pane_metadata.remove(id);
+                            }
+                            if outcome.is_clean() {
+                                ui.status_message = Some((
+                                    format!("Closed tab containing pane {closed_pane_id}"),
+                                    std::time::Instant::now(),
+                                ));
+                            } else {
+                                let failed_ids: Vec<&str> =
+                                    outcome.failed.iter().map(|(id, _)| id.as_str()).collect();
+                                let first_err = outcome
+                                    .failed
+                                    .first()
+                                    .map(|(_, e)| e.as_str())
+                                    .unwrap_or("");
+                                for (id, e) in &outcome.failed {
+                                    tracing::warn!(
+                                        pane_id = %id,
+                                        error = %e,
+                                        "F4: close_pane failed during tab teardown — card preserved"
+                                    );
+                                }
+                                ui.status_message = Some((
+                                    format!(
+                                        "Close partially failed for {} pane(s) — first error: {first_err}",
+                                        failed_ids.len()
+                                    ),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                            resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                        }
+                        Err(e) => {
+                            ui.status_message = Some((
+                                format!("Failed to close tab: {e}"),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                } else {
+                    // Plain dashboard pane — close just this one and inspect the result.
+                    match pane.close_pane(pane_id) {
+                        Ok(()) => {
+                            let mut st = state.blocking_write();
+                            st.sessions.remove(&sid);
+                            st.unregister_pane(&closed_pane_id);
+                            drop(st);
+                            ui.pane_metadata.remove(&closed_pane_id);
+                            ui.status_message = Some((
+                                format!("Closed pane {closed_pane_id}"),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                pane_id = %closed_pane_id,
+                                error = %e,
+                                "F4: close_pane failed — card preserved for retry"
+                            );
+                            ui.status_message = Some((
+                                format!(
+                                    "Failed to close pane {closed_pane_id}: {e} — press Ctrl+W to retry"
+                                ),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                }
+                if ui.mode == UiMode::PaneInput {
+                    ui.mode = UiMode::Normal;
+                }
+                // Clamp selected_index so it doesn't point past the now-shorter list.
+                if ui.selected_index > 0 {
+                    ui.selected_index = ui.selected_index.saturating_sub(1);
+                }
+            }
+        }
+        // Ctrl+PageDown: next tab (clamped, gated on a visible tab bar).
+        // PRD #83: route through `switch_tab_with_focus` so the source tab's
+        // focused pane is captured and the destination tab's remembered focus
+        // is restored.
+        Action::GlobalNextTab => {
+            if tab_manager.show_tab_bar() {
+                let prev_idx = tab_manager.active_index();
+                if switch_tab_with_focus(tab_manager, prev_idx + 1, pane, snapshot) {
+                    resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                    resize_mode_tab_panes(pane, tab_manager, frame_area);
+                }
+            }
+        }
+        // Ctrl+PageUp: previous tab (clamped, gated on a visible tab bar).
+        Action::GlobalPrevTab => {
+            if tab_manager.show_tab_bar() {
+                let prev_idx = tab_manager.active_index();
+                if prev_idx > 0 && switch_tab_with_focus(tab_manager, prev_idx - 1, pane, snapshot)
+                {
+                    resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                    resize_mode_tab_panes(pane, tab_manager, frame_area);
+                }
+            }
+        }
+        // Normal-mode Tab / Right / l: cycle to the next tab (wraps).
+        Action::CycleTabNext => {
+            let count = tab_manager.tab_count();
+            if count > 0 {
+                let prev_idx = tab_manager.active_index();
+                let next = (prev_idx + 1) % count;
+                if switch_tab_with_focus(tab_manager, next, pane, snapshot) {
+                    resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                    resize_mode_tab_panes(pane, tab_manager, frame_area);
+                }
+            }
+        }
+        // Normal-mode BackTab / Left / h: cycle to the previous tab (wraps).
+        Action::CycleTabPrev => {
+            let count = tab_manager.tab_count();
+            if count > 0 {
+                let prev_idx = tab_manager.active_index();
+                let prev = (prev_idx + count - 1) % count;
+                if switch_tab_with_focus(tab_manager, prev, pane, snapshot) {
+                    resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                    resize_mode_tab_panes(pane, tab_manager, frame_area);
+                }
+            }
+        }
+        // PRD #80 M3: click a tab header → switch to that tab (same resize
+        // sweep as the keyboard tab-switch paths). PRD #83: preserve per-tab
+        // focus across the switch.
+        Action::SelectTab(idx) => {
+            if switch_tab_with_focus(tab_manager, idx, pane, snapshot) {
+                resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                resize_mode_tab_panes(pane, tab_manager, frame_area);
+            }
+        }
+        // PRD #80 M3: click a tab's [×] → close that tab, reusing Ctrl+W's
+        // tab-teardown semantics for the clicked tab.
+        Action::CloseTab(idx) => {
+            close_tab_by_index(idx, ui, state, tab_manager, pane, frame_area);
+        }
+        // PRD #80 M4 / PRD #83: single-click a card → select exactly that card
+        // (PRD #68). Under #83 the Dashboard's selection is keyed by session id
+        // in the active tab (`selected_session_id`), and `selected_index` is
+        // derived from it each frame by `sync_and_derive_selection`. Write the
+        // clicked card's session id straight into that store so the selection
+        // survives the per-frame sync even for cards with no embedded pane;
+        // then mirror the move into the embedded focus (the same pattern
+        // `dispatch_normal_mode_key` uses for j/k) so a focused pane follows.
+        Action::SelectCard(idx) => {
+            if idx < filtered.len() {
+                let prev = ui.selected_index;
+                ui.selected_index = idx;
+                if let Tab::Dashboard {
+                    selected_session_id,
+                } = tab_manager.active_tab_mut()
+                {
+                    *selected_session_id = Some(filtered[idx].0.clone());
+                }
+                mirror_selection_into_focus(prev, ui, filtered, pane);
+            }
+        }
+        // PRD #80 M4: `/` key or [Filter /] button → filter mode.
+        Action::EnterFilter => {
+            ui.mode = UiMode::Filter;
+            ui.filter_text.clear();
+        }
+        // PRD #80 M4: `r` key or [Rename r] button → rename mode for the
+        // selected card. No-op with no cards, matching the `r` key's guard.
+        Action::EnterRename => {
+            if !filtered.is_empty() {
+                ui.mode = UiMode::Rename;
+                ui.rename_text.clear();
+            }
+        }
+        // Normal-mode digit 1-9: jump to card N and focus its pane.
+        Action::FocusCard(idx) => {
+            // Dismiss idle art on the target card.
+            if let Some((sid, _)) = filtered.get(idx)
+                && let Some(entry) = ui.idle_art_cache.get_mut(*sid)
+            {
+                entry.dismissed = true;
+            }
+            focus_deck(idx, ui, filtered, snapshot, state, pane);
+            resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+        }
+        // Mode tab in-tab navigation (j/Down): move side-pane focus down.
+        // PRD #83: focus is tracked by stable pane id (`focused_pane_id`), so
+        // translate it to a positional slot for the j/k arithmetic, step, then
+        // store the new id back.
+        Action::ModeTabSelectNext => {
+            if let Tab::Mode {
+                focused_pane_id,
+                mode_manager,
+                agent_pane_id,
+                ..
+            } = tab_manager.active_tab_mut()
+            {
+                let side_ids = mode_manager.managed_pane_ids();
+                let side_count = side_ids.len();
+                let cur: Option<usize> = focused_pane_id
+                    .as_ref()
+                    .and_then(|id| side_ids.iter().position(|s| s == id));
+                let next = match cur {
+                    None => {
+                        if side_count > 0 {
+                            Some(0)
+                        } else {
+                            None
+                        }
+                    }
+                    Some(i) if i + 1 < side_count => Some(i + 1),
+                    Some(_) => None, // wrap back to agent pane
+                };
+                *focused_pane_id = next.map(|i| side_ids[i].clone());
+                let focus_id = focused_pane_id
+                    .clone()
+                    .unwrap_or_else(|| agent_pane_id.clone());
+                let _ = pane.focus_pane(&focus_id);
+            }
+        }
+        // Mode tab in-tab navigation (k/Up): move side-pane focus up.
+        Action::ModeTabSelectPrev => {
+            if let Tab::Mode {
+                focused_pane_id,
+                mode_manager,
+                agent_pane_id,
+                ..
+            } = tab_manager.active_tab_mut()
+            {
+                let side_ids = mode_manager.managed_pane_ids();
+                let side_count = side_ids.len();
+                let cur: Option<usize> = focused_pane_id
+                    .as_ref()
+                    .and_then(|id| side_ids.iter().position(|s| s == id));
+                let next = match cur {
+                    None => {
+                        if side_count > 0 {
+                            Some(side_count - 1)
+                        } else {
+                            None
+                        }
+                    }
+                    Some(0) => None,
+                    Some(i) => Some(i - 1),
+                };
+                *focused_pane_id = next.map(|i| side_ids[i].clone());
+                let focus_id = focused_pane_id
+                    .clone()
+                    .unwrap_or_else(|| agent_pane_id.clone());
+                let _ = pane.focus_pane(&focus_id);
+            }
+        }
+        // Mode tab in-tab navigation (Enter): focus the selected side/agent pane.
+        Action::ModeTabFocus => {
+            if let Tab::Mode {
+                focused_pane_id,
+                mode_manager,
+                agent_pane_id,
+                ..
+            } = tab_manager.active_tab_mut()
+            {
+                let target_pane_id = focused_pane_id
+                    .clone()
+                    .unwrap_or_else(|| agent_pane_id.clone());
+                let is_reactive = mode_manager.is_reactive_pane(&target_pane_id);
+                if pane.focus_pane(&target_pane_id).is_ok() {
+                    ui.mode = UiMode::PaneInput;
+                    // Restore a minimal prompt so the user can interact with the
+                    // shell in this reactive pane.
+                    if is_reactive {
+                        let _ = pane
+                            .write_to_pane(&target_pane_id, "export PS1='$ ' PS2='> ' PROMPT='$ '");
+                    }
+                    ui.status_message = Some((
+                        "PaneInput mode — type to interact, Ctrl+d for dashboard".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
+            }
+        }
+        // Mode tab in-tab navigation (Esc): reset focus back to the agent pane.
+        Action::ModeTabReset => {
+            if let Tab::Mode {
+                focused_pane_id,
+                agent_pane_id,
+                ..
+            } = tab_manager.active_tab_mut()
+            {
+                *focused_pane_id = None;
+                let _ = pane.focus_pane(agent_pane_id);
+            }
+        }
+        Action::Quit => return Flow::Break,
+        Action::DetachAndQuit => {
+            // M2.5: emit explicit `KIND_DETACH` frames for every
+            // stream-backed pane so the daemon distinguishes
+            // voluntary detach from abrupt disconnect, then exit.
+            // Local-PTY panes have nothing to detach from — they
+            // die with the process either way.
+            if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                let errs = embedded.detach_all_streams();
+                if !errs.is_empty() {
+                    tracing::warn!(
+                        error_count = errs.len(),
+                        "detach_all_streams reported errors during quit — proceeding"
+                    );
+                }
+            }
+            return Flow::Break;
+        }
+        Action::StopConfirmPrompt { agent_count } => {
+            // PRD #92 F1: transition to the secondary y/n dialog
+            // with the cached agent count rendered in the prompt.
+            // Default to No (safer default for a destructive
+            // action). Stay in this loop iteration; the next
+            // pass will render `StopConfirm` and route keys to
+            // `handle_stop_confirm_key`.
+            ui.stop_confirm_agent_count = agent_count;
+            ui.stop_confirm_selected = 0;
+            ui.mode = UiMode::StopConfirm;
+        }
+        Action::StopAndQuit => {
+            // PRD #92 F1: user confirmed Stop (either via the primary dialog
+            // with 0 agents or via the secondary y/n with Yes). The shutdown +
+            // error-recovery sequence is shared with the `[Stop]` button (see
+            // [`perform_stop_and_quit`]).
+            return perform_stop_and_quit(ui, pane);
+        }
+        Action::Focus => {
+            // Dismiss idle art on the focused card
+            if let Some(sid) = selected_id
+                && let Some(entry) = ui.idle_art_cache.get_mut(sid)
+            {
+                entry.dismissed = true;
+            }
+            if let Some(sid) = selected_id
+                && let Some(session) = snapshot.sessions.get(sid)
+            {
+                if let Some(ref pane_id) = session.pane_id {
+                    if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
+                        // PRD #83: snapshot the SOURCE tab's focus before
+                        // leaving it, mirroring `switch_tab_with_focus`
+                        // (capture-out → switch_to → record). This path is
+                        // reachable from a focus-bearing Orchestration tab
+                        // (Enter on its card grid), so the source's remembered
+                        // focus must be captured. `capture_focus_on_switch_out`
+                        // only reads the controller's focused pane id into the
+                        // source tab's field — it issues no `focus_pane`, so the
+                        // destination focus below is unaffected.
+                        tab_manager.capture_focus_on_switch_out();
+                        tab_manager.switch_to(tab_idx);
+                        tab_manager.record_focus(pane_id);
+                        let area = frame_area;
+                        resize_dashboard_panes(pane, ui, tab_manager, area);
+                        resize_mode_tab_panes(pane, tab_manager, area);
+                    }
+                    match pane.focus_pane(pane_id) {
+                        Ok(()) => {
+                            ui.mode = UiMode::PaneInput;
+                            // Reset dismissed flags so art reappears when
+                            // the user returns to the dashboard.
+                            for entry in ui.idle_art_cache.values_mut() {
+                                entry.dismissed = false;
+                            }
+                            ui.status_message = Some((
+                                "PaneInput mode — type to interact, Ctrl+d for dashboard"
+                                    .to_string(),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                        Err(PaneError::CommandFailed(ref msg)) => {
+                            state.blocking_write().sessions.remove(sid);
+                            ui.status_message = Some((
+                                format!("Removed stale session: {msg}"),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                        Err(e) => {
+                            ui.status_message = Some((
+                                format!("Pane focus failed: {e}"),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                } else {
+                    ui.status_message = Some((
+                        format!("No pane linked to session {sid}"),
+                        std::time::Instant::now(),
+                    ));
+                }
+            }
+        }
+        Action::RequestConfigGen => {
+            if let Some(sid) = selected_id
+                && let Some(session) = snapshot.sessions.get(sid)
+                && let Some(ref pane_id) = session.pane_id
+                && let Some(ref cwd) = session.cwd
+            {
+                ui.config_gen_target = Some((pane_id.clone(), cwd.clone()));
+                ui.config_gen_selected = 0;
+                ui.mode = UiMode::ConfigGenPrompt;
+            } else {
+                ui.status_message = Some((
+                    "No active agent session to send prompt to.".to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
+        }
+        Action::SendPermissionResponse(approve) => {
+            // The handler already gated on `WaitingForInput` plus a
+            // non-empty selection; re-resolve the pane here so the
+            // PTY write goes to the right place. If `pane_id` is
+            // missing (placeholder session with no agent yet), this
+            // silently no-ops — same shape as RequestConfigGen.
+            if let Some(sid) = selected_id
+                && let Some(session) = snapshot.sessions.get(sid)
+                && let Some(ref pane_id) = session.pane_id
+            {
+                let key_char = if approve { "y" } else { "n" };
+                match pane.write_to_pane(pane_id, key_char) {
+                    Ok(()) => {
+                        ui.status_message = Some((
+                            format!(
+                                "Permission {}.",
+                                if approve { "approved" } else { "denied" }
+                            ),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                    Err(e) => {
+                        ui.status_message = Some((
+                            format!("Permission response failed: {e}"),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
+            }
+        }
+        Action::SpawnPane(req) => {
+            if pane.is_available() {
+                let dir_str = req.dir.display().to_string();
+
+                // Orchestration path — manage own panes, no agent pane.
+                if let Some(mut orch_config) = req.orchestration_config {
+                    // PRD #107: use the name the user typed in the form, if any,
+                    // so the tab title matches their input rather than always
+                    // falling back to the TOML config name or cwd basename.
+                    if !req.name.is_empty() {
+                        orch_config.name = req.name.clone();
+                    }
+                    let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
+                    // PRD #76 M2.15: pre-compute spawn dims using
+                    // the orchestration-layout helper (right 66%
+                    // column, matching the orchestration
+                    // renderer's `[34%, 66%]` split — fixup F3,
+                    // not the dashboard's `[33%, 67%]`) so role
+                    // PTYs open at the viewport size.
+                    // show_tab_bar=true: opening an orchestration
+                    // adds a new tab next to Dashboard, so the
+                    // post-spawn render has ≥2 tabs.
+                    // All roles share the same spawn dims (Tiled
+                    // layout); pass role_index=0 and
+                    // focused_role_index=None so the helper falls
+                    // back to "role 0 expanded" — matching the
+                    // renderer's "first slot expands" default when
+                    // no role is focused yet (panes haven't been
+                    // created at this point).
+                    // PRD #76 M2.15 fixup pass 2 G2 — `Tiled` is
+                    // hardcoded here so the focused_role_index
+                    // parameter is geometrically a no-op, but pass
+                    // it for symmetry / future safety.
+                    let spawn_dims = orchestration_role_pane_dims(
+                        frame_area,
+                        orch_config.roles.len(),
+                        0,
+                        None,
+                        PaneLayout::Tiled,
+                        true,
+                    );
+                    match tab_manager.open_orchestration_tab(
+                        &orch_config,
+                        &dir_str,
+                        prompt,
+                        spawn_dims,
+                    ) {
+                        Ok((_tab_idx, role_pane_ids)) => {
+                            // PRD #110 followup: snapshot each role
+                            // pane's daemon agent_id before the
+                            // placeholder insert so the strict-
+                            // equality reuse guard accepts each
+                            // role agent's first `SessionStart`.
+                            let role_agent_ids: Vec<Option<String>> = role_pane_ids
+                                .iter()
+                                .map(|id| pane.pane_agent_id(id))
+                                .collect();
+                            {
+                                let mut st = state.blocking_write();
+                                // PRD #76 M2.13: `open_orchestration_tab`
+                                // already tags each role's daemon-bound
+                                // spawn with `AgentType::from_command(...)`,
+                                // so a reconnect's hydration carries the
+                                // right type. The local placeholder stays
+                                // at `None` until each role's first
+                                // `SessionStart` hook fires — preserving
+                                // the orchestration readiness gate's
+                                // 10-second fallback (pre-M2.13 contract).
+                                for (id, agent_id) in
+                                    role_pane_ids.iter().zip(role_agent_ids.iter())
+                                {
+                                    st.register_pane(id.clone());
+                                    st.insert_placeholder_session(
+                                        id.clone(),
+                                        Some(dir_str.clone()),
+                                        None,
+                                        agent_id.clone(),
+                                    );
+                                }
+                                // Register pane-to-role and pane-to-cwd mappings for work-done resolution.
+                                for (i, role) in orch_config.roles.iter().enumerate() {
+                                    st.pane_role_map
+                                        .insert(role_pane_ids[i].clone(), role.name.clone());
+                                    st.pane_cwd_map
+                                        .insert(role_pane_ids[i].clone(), dir_str.clone());
+                                    if role.start {
+                                        st.orchestrator_pane_ids.insert(role_pane_ids[i].clone());
+                                    }
+                                }
+                            }
+                            // Register display names for role panes.
+                            for (i, role) in orch_config.roles.iter().enumerate() {
+                                ui.pane_display_names
+                                    .insert(role_pane_ids[i].clone(), role.name.clone());
+                                ui.pane_names
+                                    .insert(role_pane_ids[i].clone(), role.name.clone());
+                            }
+
+                            // Focus the start role's pane.
+                            let start_idx =
+                                orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                            let _ = pane.focus_pane(&role_pane_ids[start_idx]);
+                            ui.mode = UiMode::PaneInput;
+
+                            // Resize role panes to dashboard layout.
+                            let area = frame_area;
+                            resize_dashboard_panes(pane, ui, tab_manager, area);
+
+                            // Record creation time for delayed prompt injection fallback.
+                            if let Tab::Orchestration { id, .. } = tab_manager.active_tab() {
+                                ui.orchestration_created_at
+                                    .insert(*id, std::time::Instant::now());
+                            }
+
+                            // Role commands are already running — each pane was
+                            // spawned with `role.command` as its initial process
+                            // (see TabManager::open_orchestration_tab in tab.rs).
+                            // Writing the command again here would land its bytes
+                            // in the agent's stdin, polluting the prompt buffer.
+
+                            ui.status_message = Some((
+                                format!("Activated orchestration: {}", orch_config.name),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                        Err(e) => {
+                            ui.status_message = Some((
+                                format!("Orchestration failed: {e}"),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                } else {
+                    // For mode tabs, create the agent pane as an empty
+                    // shell so the PTY can be resized to the correct
+                    // dimensions before the command starts.  This avoids
+                    // the process seeing the default 80×24 size.
+                    let is_mode = req.mode_config.is_some();
+                    let cmd = if req.command.is_empty() || is_mode {
+                        None
+                    } else {
+                        Some(req.command.as_str())
+                    };
+                    // Thread the form's Name through to `StartAgent.display_name`
+                    // so a disconnect or crash between create and rename can't
+                    // persist the command-based fallback label on the daemon
+                    // (PRD #76 M2.11 reviewer P2). The controller resolves the
+                    // form Name + command via `agent_pty::resolve_display_name`
+                    // and returns the canonical string it stored on Pane.name
+                    // (and sent as `StartAgent.display_name` for stream panes)
+                    // so the UI maps below mirror EXACTLY what the daemon has —
+                    // no separate normalization helper to drift (M2.11 fixup 4).
+                    let form_name = Some(req.name.as_str());
+                    // PRD #76 M2.12: tag the agent pane with its
+                    // mode-tab membership so the daemon-side
+                    // registry can echo it back via `list_agents`
+                    // on the next reconnect, letting the
+                    // hydration partition rebuild this mode tab
+                    // instead of stranding the agent on the
+                    // dashboard.
+                    let tab_membership = req.mode_config.as_ref().map(|m| TabMembership::Mode {
+                        name: m.name.clone(),
+                    });
+                    // PRD #76 M2.15: pre-compute spawn dims via the
+                    // shared layout helpers so the agent PTY opens
+                    // at the eventual size (no 24×80 → resize
+                    // hiccup). Mode-tab panes use the mode-agent
+                    // layout (left half × height-minus-chrome);
+                    // dashboard panes use the dashboard right-67%
+                    // column layout with `is_focused=true` (this
+                    // path immediately focuses the new pane via
+                    // `focus_pane(&new_id)` below).
+                    let (spawn_rows, spawn_cols) = if req.mode_config.is_some() {
+                        mode_agent_pane_dims(frame_area)
+                    } else {
+                        let embedded_pane_count = pane
+                            .as_any()
+                            .downcast_ref::<EmbeddedPaneController>()
+                            .map(|e| e.pane_ids().len())
+                            .unwrap_or(0);
+                        let pane_count_after = (embedded_pane_count as u16).saturating_add(1);
+                        dashboard_pane_dims(
+                            frame_area,
+                            pane_count_after,
+                            true,
+                            ui.pane_layout,
+                            tab_manager.show_tab_bar(),
+                        )
+                    };
+                    // PRD #76 M2.13: infer agent_type from the
+                    // form's command (the canonical "what runs in
+                    // this pane" hint) — `cmd` is `None` for mode
+                    // panes (which spawn empty and run the
+                    // command later via `write_to_pane`), so use
+                    // `req.command` directly to cover both flows.
+                    // The inferred type goes ONLY into the daemon-
+                    // bound spawn options so a remote reconnect's
+                    // hydration carries it; the local placeholder
+                    // stays at `None` until the first `SessionStart`
+                    // hook fires (pre-M2.13 contract).
+                    let spawn_agent_type = if req.command.is_empty() {
+                        None
+                    } else {
+                        AgentType::from_command(Some(req.command.as_str()))
+                    };
+                    match pane.create_pane_with_options(
+                        cmd,
+                        Some(&dir_str),
+                        AgentSpawnOptions {
+                            display_name: form_name,
+                            tab_membership,
+                            rows: spawn_rows,
+                            cols: spawn_cols,
+                            agent_type: spawn_agent_type,
+                        },
+                    ) {
+                        Ok((new_id, resolved_name)) => {
+                            // Register so only events from our panes are accepted,
+                            // and create a placeholder session for an immediate dashboard card.
+                            //
+                            // PRD #110 followup: snapshot the daemon
+                            // agent_id so the placeholder survives the
+                            // strict-equality reuse guard on the
+                            // freshly-spawned agent's first
+                            // `SessionStart`.
+                            let new_agent_id = pane.pane_agent_id(&new_id);
+                            {
+                                let mut st = state.blocking_write();
+                                st.register_pane(new_id.clone());
+                                st.insert_placeholder_session(
+                                    new_id.clone(),
+                                    Some(dir_str.clone()),
+                                    None,
+                                    new_agent_id,
+                                );
+                            }
+                            ui.pane_display_names
+                                .insert(new_id.clone(), resolved_name.clone());
+                            ui.pane_names.insert(new_id.clone(), resolved_name);
+                            let mode_name_for_save =
+                                req.mode_config.as_ref().map(|m| m.name.clone());
+                            ui.pane_metadata.insert(
+                                new_id.clone(),
+                                config::SavedPane {
+                                    dir: dir_str.clone(),
+                                    name: req.name.clone(),
+                                    command: req.command,
+                                    mode: mode_name_for_save,
+                                },
+                            );
+
+                            if let Some(mode_config) = req.mode_config {
+                                // Mode selected — open a mode tab.
+                                let mode_name = mode_config.name.clone();
+                                // PRD #76 M2.15 fixup pass 2 G1 — compute
+                                // side-pane dims so the side panes spawn
+                                // at the viewport-derived size, not the
+                                // 24×80 default.
+                                let total_side_count =
+                                    (mode_config.panes.len() + mode_config.reactive_panes) as u16;
+                                let side_pane_dims =
+                                    mode_side_pane_dims(frame_area, total_side_count);
+                                match tab_manager.open_mode_tab(
+                                    &mode_config,
+                                    &dir_str,
+                                    new_id.clone(),
+                                    side_pane_dims,
+                                ) {
+                                    Ok((_tab_idx, side_ids)) => {
+                                        for id in &side_ids {
+                                            state.blocking_write().register_pane(id.clone());
+                                        }
+                                        let _ = pane.focus_pane(&new_id);
+                                        ui.mode = UiMode::PaneInput;
+                                        // PRD #76 M2.15: shared
+                                        // layout helpers — spawn
+                                        // and resize math are now
+                                        // identical.
+                                        resize_mode_tab_panes_for(
+                                            pane, &new_id, &side_ids, frame_area,
+                                        );
+                                        // Start commands now that panes are correctly sized
+                                        let _ = tab_manager.start_mode_commands();
+                                        // Send the agent pane command after resize
+                                        // so it starts at the correct PTY dimensions.
+                                        if let Some(ref init_cmd) = mode_config.init_command {
+                                            let _ = pane.write_to_pane(&new_id, init_cmd);
+                                        }
+                                        if let Some(saved) = ui.pane_metadata.get(&new_id) {
+                                            let agent_cmd = saved.command.clone();
+                                            if !agent_cmd.is_empty() {
+                                                let _ = pane.write_to_pane(&new_id, &agent_cmd);
+                                            }
+                                        }
+                                        ui.status_message = Some((
+                                            format!("Activated mode: {mode_name}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let _ = pane.close_pane(&new_id);
+                                        ui.status_message = Some((
+                                            format!("Mode activation failed: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                // No mode — regular dashboard pane.
+                                let _ = pane.focus_pane(&new_id);
+                                ui.mode = UiMode::PaneInput;
+                                ui.selected_index = filtered.len();
+                                // PRD #76 M2.15: route through the
+                                // shared dashboard-layout helper so
+                                // spawn-time and resize-time math
+                                // can't drift.
+                                resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                                ui.status_message = Some((
+                                    format!("Created pane {new_id} in {dir_str}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            ui.status_message =
+                                Some((format!("New pane failed: {e}"), std::time::Instant::now()));
+                        }
+                    }
+                } // close else (non-orchestration path)
+            }
+        }
+        Action::SendConfigGenPrompt { pane_id, cwd } => {
+            send_config_gen_prompt(&pane_id, &cwd, ui, pane, tab_manager, frame_area);
+        }
+        // ===== PRD #80 M5: modal button actions =====
+        // quit-confirm [Stop]: resolve like Enter-on-Stop — straight to
+        // shutdown with no managed agents, else the secondary Stop dialog.
+        Action::RequestStop => {
+            let count = snapshot
+                .sessions
+                .values()
+                .filter(|s| s.pane_id.is_some())
+                .count();
+            if count == 0 {
+                return perform_stop_and_quit(ui, pane);
+            }
+            ui.stop_confirm_agent_count = count;
+            ui.stop_confirm_selected = 0;
+            ui.mode = UiMode::StopConfirm;
+        }
+        // quit-confirm [Cancel]: return to the dashboard.
+        Action::DismissModal => {
+            ui.mode = UiMode::Normal;
+        }
+        // config-gen [Yes]: send the prompt to the pending target pane.
+        Action::ConfigGenConfirm => {
+            ui.mode = UiMode::Normal;
+            if let Some((pane_id, cwd)) = ui.config_gen_target.take() {
+                send_config_gen_prompt(&pane_id, &cwd, ui, pane, tab_manager, frame_area);
+            }
+        }
+        // config-gen [No]: dismiss for now (hint stays on the card).
+        Action::ConfigGenDismiss => {
+            ui.config_gen_target = None;
+            ui.mode = UiMode::Normal;
+        }
+        // config-gen [Never]: suppress the prompt for this directory.
+        Action::ConfigGenSuppress => {
+            if let Some((_, ref cwd)) = ui.config_gen_target {
+                ui.config_gen_state.suppress_dir(cwd);
+            }
+            ui.config_gen_target = None;
+            ui.mode = UiMode::Normal;
+            ui.status_message = Some((
+                "Config prompt suppressed for this directory.".to_string(),
+                std::time::Instant::now(),
+            ));
+        }
+        // star-prompt [Star]: open the repo and stop asking (== `s`).
+        Action::StarConfirm => {
+            let msg = if open::that("https://github.com/vfarcic/dot-agent-deck").is_ok() {
+                "Thanks for starring! ⭐".to_string()
+            } else {
+                "Visit github.com/vfarcic/dot-agent-deck to star ⭐".to_string()
+            };
+            ui.star_prompt_state.dismiss_permanently();
+            ui.mode = UiMode::Normal;
+            ui.status_message = Some((msg, std::time::Instant::now()));
+        }
+        // star-prompt [Snooze]: snooze (== `l` / Esc).
+        Action::StarSnooze => {
+            ui.star_prompt_state.snooze();
+            ui.mode = UiMode::Normal;
+        }
+        // star-prompt [Dismiss]: stop asking permanently (== `d`).
+        Action::StarDismiss => {
+            ui.star_prompt_state.dismiss_permanently();
+            ui.mode = UiMode::Normal;
+        }
+        // ===== PRD #80 M6: inline-edit button actions =====
+        // filter [Apply]: commit and keep the typed filter (== Enter).
+        Action::ApplyFilter => {
+            ui.mode = UiMode::Normal;
+        }
+        // filter [Cancel]: clear the filter (== Esc).
+        Action::CancelFilter => {
+            ui.filter_text.clear();
+            ui.mode = UiMode::Normal;
+        }
+        // rename [Save]: commit the rename on the selected card (== Enter).
+        Action::SaveRename => {
+            let new_name = ui.rename_text.clone();
+            ui.rename_text.clear();
+            ui.mode = UiMode::Normal;
+            commit_rename(&new_name, ui, pane, snapshot, selected_id);
+        }
+        // rename [Cancel]: abandon, leaving the existing name (== Esc).
+        Action::CancelRename => {
+            ui.rename_text.clear();
+            ui.mode = UiMode::Normal;
+        }
+        // ===== PRD #80 M7: directory-picker click actions =====
+        // single-click a row → select it (== j/k landing on it).
+        Action::PickerSelectRow(idx) => {
+            if let Some(picker) = ui.dir_picker.as_mut()
+                && idx < picker.filtered_indices.len()
+            {
+                picker.selected = idx;
+            }
+        }
+        // double-click a row → select then descend (== Enter / l).
+        Action::PickerEnterRow(idx) => {
+            let Some(picker) = ui.dir_picker.as_mut() else {
+                return Flow::Continue;
+            };
+            if idx < picker.filtered_indices.len() {
+                picker.selected = idx;
+            }
+            // Mirror the l/Enter key arm: with no subdirs, confirm the current
+            // directory; otherwise descend into the (now-selected) row.
+            if !picker.has_subdirs() {
+                transition_after_dir_pick(ui);
+            } else if !picker.filtered_indices.is_empty() {
+                picker.enter_selected();
+            }
+        }
+        // click the `..` row / breadcrumb → go up (== h / Backspace / Left).
+        Action::PickerParent => {
+            if let Some(picker) = ui.dir_picker.as_mut() {
+                picker.go_up();
+            }
+        }
+        // [Confirm] → confirm the current directory → new-pane form (== Space).
+        Action::PickerConfirm => {
+            transition_after_dir_pick(ui);
+        }
+        // [Cancel] → close the picker (== q / Esc).
+        Action::PickerCancel => {
+            ui.dir_picker = None;
+            ui.mode = UiMode::Normal;
+        }
+        // [Filter] → open the picker's filter input (== `/`).
+        Action::PickerFilter => {
+            if let Some(picker) = ui.dir_picker.as_mut() {
+                picker.filtering = true;
+            }
+        }
+        // ===== PRD #80 M8: new-pane-form click actions =====
+        // click a field row → focus it (== Tab / Shift+Tab landing).
+        Action::FormFocusField(field) => {
+            if let Some(form) = ui.new_pane_form.as_mut() {
+                form.focused = field;
+            }
+        }
+        // click a mode chip → select that option (== Left/Right/h/l cycler).
+        Action::FormSelectMode(idx) => {
+            if let Some(form) = ui.new_pane_form.as_mut()
+                && idx < form.mode_option_count()
+            {
+                form.selection_index = idx;
+                form.focused = FormField::Mode;
+            }
+        }
+        // [Submit] → spawn the pane from the form values (== Enter on the final
+        // field). Reuses the SpawnPane arm so click and key spawn identically.
+        Action::FormSubmit => {
+            if let Some(form) = ui.new_pane_form.take() {
+                ui.mode = UiMode::Normal;
+                let req = build_new_pane_request(&form);
+                return dispatch_action(
+                    Action::SpawnPane(req),
+                    ui,
+                    pane,
+                    state,
+                    tab_manager,
+                    snapshot,
+                    filtered,
+                    selected_id,
+                    frame_area,
+                );
+            }
+        }
+        // [Cancel] → close the form without spawning (== Esc).
+        Action::FormCancel => {
+            ui.new_pane_form = None;
+            ui.mode = UiMode::Normal;
+        }
+        Action::ForwardToPane(bytes) => {
+            if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                && let Some(pane_id) = embedded.focused_pane_id()
+            {
+                // Reset scrollback to live output on any keystroke.
+                embedded.reset_scrollback(&pane_id);
+                // PRD #76 M2.20: separate a CR-bearing keystroke from
+                // the preceding typed bytes so the agent TUI treats it
+                // as a standalone submit, not newline-in-input.
+                let sleep = submit_debounce_duration(
+                    std::time::Instant::now(),
+                    ui.last_pane_keystroke_at,
+                    &bytes,
+                );
+                if !sleep.is_zero() {
+                    std::thread::sleep(sleep);
+                }
+                if let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes) {
+                    ui.status_message =
+                        Some((format!("PTY write failed: {e}"), std::time::Instant::now()));
+                }
+                ui.last_pane_keystroke_at = Some(std::time::Instant::now());
+            }
+        }
+        Action::Continue => {}
+    }
+    Flow::Continue
+}
+
 pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
@@ -4038,6 +5821,371 @@ pub fn run_tui(
 
             // Handle mouse events: scroll, text selection, and copy.
             if let Event::Mouse(mouse) = ev {
+                // PRD #80 M2/M3: clickable affordances take precedence. A
+                // left-button Down on a recorded rect fires its Action through
+                // the SAME `dispatch_action` funnel as the keystroke, then
+                // short-circuits the rest of mouse handling. The paired Up on a
+                // rect is consumed (without re-dispatching) so it can't fall
+                // through to the selection/copy path. Scroll events are not
+                // Down/Up, so they bypass this layer entirely and reach the
+                // forwarding branch unchanged.
+                //
+                // Hit-test order: button bar FIRST, then each tab's `[×]`
+                // close rect (so `[×]` beats the surrounding header), then the
+                // tab header rects (switch). A miss falls through to the
+                // existing pane/selection/scroll logic below.
+                let is_down = matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                );
+                let is_up = matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                );
+
+                // PRD #80 review FIX 5: when a blocking overlay (any modal, the
+                // directory picker, or the new-pane form) is the topmost layer,
+                // swallow scroll-wheel events so they don't scroll the pane
+                // behind the overlay. Scroll in Normal / PaneInput is left
+                // untouched below (pane scroll + child-app forwarding).
+                let blocking_overlay = matches!(
+                    ui.mode,
+                    UiMode::QuitConfirm
+                        | UiMode::StopConfirm
+                        | UiMode::ConfigGenPrompt
+                        | UiMode::StarPrompt
+                        | UiMode::Help
+                        | UiMode::DirPicker
+                        | UiMode::NewPaneForm
+                );
+                let is_scroll = matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::ScrollUp
+                        | crossterm::event::MouseEventKind::ScrollDown
+                );
+                if is_scroll && blocking_overlay {
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
+                // PRD #80 M7: the directory picker is a topmost overlay — when
+                // it's open, its [Confirm]/[Cancel]/[Filter] buttons and row
+                // rects are the only click targets, hit-tested here and
+                // exclusively (a miss inside the picker is consumed, never
+                // falling through to the dashboard behind it).
+                if ui.mode == UiMode::DirPicker && (is_down || is_up) {
+                    let col = mouse.column;
+                    let row = mouse.row;
+                    // Buttons first.
+                    let mut picker_action = hit_test_button(&ui.picker_button_rects, col, row);
+                    // Then rows (single = select, double = enter, `..` = up).
+                    if picker_action.is_none()
+                        && let Some(&(i, _)) = ui
+                            .picker_row_rects
+                            .iter()
+                            .find(|(_, r)| point_in_rect(r, col, row))
+                    {
+                        // Is this the parent (`..`) row? Then a click of any
+                        // kind navigates up.
+                        let is_parent = ui.dir_picker.as_ref().is_some_and(|p| {
+                            p.filtered_indices
+                                .get(i)
+                                .and_then(|&ei| p.entries.get(ei))
+                                .map(|e| e == Path::new(".."))
+                                .unwrap_or(false)
+                        });
+                        if is_parent {
+                            picker_action = Some(Action::PickerParent);
+                        } else {
+                            // Single vs double click via the shared, region-aware
+                            // last_click discrimination (400ms / same row / within
+                            // 3 cols / same region — PRD #80 review FIX 4).
+                            let now = std::time::Instant::now();
+                            let click_count = LastClick::next_count(
+                                ui.last_click,
+                                now,
+                                col,
+                                row,
+                                ClickRegion::PickerRow,
+                            );
+                            if is_down {
+                                ui.last_click = Some(LastClick {
+                                    at: now,
+                                    col,
+                                    row,
+                                    count: click_count,
+                                    region: ClickRegion::PickerRow,
+                                });
+                            }
+                            picker_action = Some(if click_count >= 2 {
+                                Action::PickerEnterRow(i)
+                            } else {
+                                Action::PickerSelectRow(i)
+                            });
+                        }
+                    }
+                    if let Some(action) = picker_action
+                        && is_down
+                    {
+                        let frame_area = terminal.get_frame().area();
+                        let flow = dispatch_action(
+                            action,
+                            &mut ui,
+                            &*pane,
+                            &state,
+                            &mut tab_manager,
+                            &snapshot,
+                            &filtered,
+                            None,
+                            frame_area,
+                        );
+                        if flow == Flow::Break {
+                            break 'outer;
+                        }
+                    }
+                    // Consume every Down/Up while the picker is open — don't
+                    // fall through to the dashboard pane/selection logic.
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
+                // PRD #80 M8: the new-pane form is a topmost overlay — when
+                // open, its [Submit]/[Cancel] buttons, mode chips, and field
+                // rows are the only click targets (buttons first, then chips,
+                // then field rows), and a miss inside the form is consumed so
+                // it never falls through to the dashboard behind it.
+                if ui.mode == UiMode::NewPaneForm && (is_down || is_up) {
+                    let col = mouse.column;
+                    let row = mouse.row;
+                    let mut form_action = hit_test_button(&ui.form_button_rects, col, row);
+                    if form_action.is_none()
+                        && let Some(&(idx, _)) = ui
+                            .form_chip_rects
+                            .iter()
+                            .find(|(_, r)| point_in_rect(r, col, row))
+                    {
+                        form_action = Some(Action::FormSelectMode(idx));
+                    }
+                    if form_action.is_none()
+                        && let Some(&(field, _)) = ui
+                            .form_field_rects
+                            .iter()
+                            .find(|(_, r)| point_in_rect(r, col, row))
+                    {
+                        form_action = Some(Action::FormFocusField(field));
+                    }
+                    if let Some(action) = form_action
+                        && is_down
+                    {
+                        let frame_area = terminal.get_frame().area();
+                        let flow = dispatch_action(
+                            action,
+                            &mut ui,
+                            &*pane,
+                            &state,
+                            &mut tab_manager,
+                            &snapshot,
+                            &filtered,
+                            None,
+                            frame_area,
+                        );
+                        if flow == Flow::Break {
+                            break 'outer;
+                        }
+                    }
+                    // Consume every Down/Up while the form is open.
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
+                let modal_active = matches!(
+                    ui.mode,
+                    UiMode::QuitConfirm
+                        | UiMode::StopConfirm
+                        | UiMode::ConfigGenPrompt
+                        | UiMode::StarPrompt
+                        | UiMode::Help
+                );
+                // PRD #80 M6: in the inline-edit modes the bottom row IS the
+                // input; its [Apply]/[Cancel] / [Save]/[Cancel] buttons live in
+                // `button_rects`, and any other click is consumed below so it
+                // keeps the field focused instead of exiting the mode.
+                let text_input_mode = matches!(ui.mode, UiMode::Filter | UiMode::Rename);
+
+                // PRD #80 M5 + review FIX 1: a modal/overlay is the topmost
+                // layer, so its buttons are the ONLY click targets and every
+                // Down/Up is consumed here — a miss must NOT fall through to the
+                // pane selection/scroll logic behind the popup (which could
+                // start a text selection / copy). Matches the picker/form
+                // branches above.
+                if modal_active && (is_down || is_up) {
+                    if let Some(action) =
+                        hit_test_button(&ui.modal_button_rects, mouse.column, mouse.row)
+                        && is_down
+                    {
+                        let frame_area = terminal.get_frame().area();
+                        let selected_id: Option<String> =
+                            filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+                        let flow = dispatch_action(
+                            action,
+                            &mut ui,
+                            &*pane,
+                            &state,
+                            &mut tab_manager,
+                            &snapshot,
+                            &filtered,
+                            selected_id.as_deref(),
+                            frame_area,
+                        );
+                        if flow == Flow::Break {
+                            break 'outer;
+                        }
+                    }
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
+                // No modal up: the M2/M3 chain — global button bar first, then
+                // the tab affordances. PRD #80 review FIX 2: the tab rects are
+                // hit-tested ONLY when NOT in a text-input row mode, so a tab
+                // click is inert while Filter/Rename is active (matching the
+                // keyboard, where tab-cycling is Normal-mode-only). The global
+                // button_rects (which carry the inline-edit Apply/Save/Cancel
+                // buttons in those modes) stay active.
+                let mouse_action = if !(is_down || is_up) {
+                    None
+                } else {
+                    let mut action = hit_test_button(&ui.button_rects, mouse.column, mouse.row);
+                    if action.is_none() && !text_input_mode {
+                        action = hit_test_tab_close(&ui.tab_close_rects, mouse.column, mouse.row)
+                            .or_else(|| {
+                                hit_test_tab_header(&ui.tab_header_rects, mouse.column, mouse.row)
+                            });
+                    }
+                    action
+                };
+                if let Some(action) = mouse_action {
+                    if is_down {
+                        let frame_area = terminal.get_frame().area();
+                        let selected_id: Option<String> =
+                            filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+                        let flow = dispatch_action(
+                            action,
+                            &mut ui,
+                            &*pane,
+                            &state,
+                            &mut tab_manager,
+                            &snapshot,
+                            &filtered,
+                            selected_id.as_deref(),
+                            frame_area,
+                        );
+                        if flow == Flow::Break {
+                            break 'outer;
+                        }
+                    }
+                    // Consume the event (both Down and Up) — do not fall through
+                    // to pane focus / selection / scroll logic.
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
+                // PRD #80 M4: dashboard card click — checked AFTER the button /
+                // tab affordances and BEFORE the existing pane/selection logic.
+                // A single click selects exactly that card (PRD #68); a
+                // double-click within the multi-click window focuses its pane
+                // (the same Action::Focus the Enter key dispatches). The paired
+                // Up is consumed. Cards are their own rect region, so this
+                // coexists with the in-pane text-selection multi-click path.
+                if !modal_active
+                    && !text_input_mode
+                    && (is_down || is_up)
+                    && let Some(card_idx) = hit_test_card(&ui.card_rects, mouse.column, mouse.row)
+                {
+                    if is_down {
+                        // Region-aware double-click discrimination: same row,
+                        // within 3 columns, inside the 400ms window, AND the
+                        // previous click was also on a card (PRD #80 review
+                        // FIX 4).
+                        let now = std::time::Instant::now();
+                        let click_count = LastClick::next_count(
+                            ui.last_click,
+                            now,
+                            mouse.column,
+                            mouse.row,
+                            ClickRegion::Card,
+                        );
+                        ui.last_click = Some(LastClick {
+                            at: now,
+                            col: mouse.column,
+                            row: mouse.row,
+                            count: click_count,
+                            region: ClickRegion::Card,
+                        });
+
+                        let frame_area = terminal.get_frame().area();
+                        // Single click → select exactly this card.
+                        dispatch_action(
+                            Action::SelectCard(card_idx),
+                            &mut ui,
+                            &*pane,
+                            &state,
+                            &mut tab_manager,
+                            &snapshot,
+                            &filtered,
+                            None,
+                            frame_area,
+                        );
+                        // Double click → focus the now-selected card's pane.
+                        if click_count >= 2 {
+                            let selected_id: Option<String> =
+                                filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+                            let flow = dispatch_action(
+                                Action::Focus,
+                                &mut ui,
+                                &*pane,
+                                &state,
+                                &mut tab_manager,
+                                &snapshot,
+                                &filtered,
+                                selected_id.as_deref(),
+                                frame_area,
+                            );
+                            if flow == Flow::Break {
+                                break 'outer;
+                            }
+                        }
+                    }
+                    // Consume both Down and Up — don't fall through to the
+                    // pane-focus / selection / scroll logic below.
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
+                // PRD #80 M6: in filter / rename mode, a click that missed the
+                // [Apply]/[Cancel] / [Save]/[Cancel] buttons lands "in the
+                // field" — consume it so the field stays focused (typing stays
+                // keyboard) rather than falling through to pane/selection logic
+                // that could exit the edit.
+                if text_input_mode && (is_down || is_up) {
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
                 // Side pane scroll: works in any UI mode by hit-testing rects
                 let mut side_scrolled = false;
                 if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
@@ -4200,22 +6348,26 @@ pub fn run_tui(
 
                                     // Detect multi-click (double/triple).
                                     // Require same row and nearby column (within 3 cells)
-                                    // to handle slight mouse movement between clicks.
+                                    // to handle slight mouse movement between clicks, AND
+                                    // the same click region (PRD #80 review FIX 4) so a
+                                    // card/picker click can't seed a pane double-click.
+                                    // These coords are pane-relative — a distinct region
+                                    // from the screen-coord card/picker clicks.
                                     let now = std::time::Instant::now();
-                                    let click_count = if let Some((t, lc, lr, cnt)) = ui.last_click
-                                    {
-                                        if now.duration_since(t).as_millis() < 400
-                                            && lr == row
-                                            && col.abs_diff(lc) <= 3
-                                        {
-                                            (cnt + 1).min(3)
-                                        } else {
-                                            1
-                                        }
-                                    } else {
-                                        1
-                                    };
-                                    ui.last_click = Some((now, col, row, click_count));
+                                    let click_count = LastClick::next_count(
+                                        ui.last_click,
+                                        now,
+                                        col,
+                                        row,
+                                        ClickRegion::Pane,
+                                    );
+                                    ui.last_click = Some(LastClick {
+                                        at: now,
+                                        col,
+                                        row,
+                                        count: click_count,
+                                        region: ClickRegion::Pane,
+                                    });
 
                                     match click_count {
                                         2 => {
@@ -4322,10 +6474,8 @@ pub fn run_tui(
                         crossterm::event::MouseEventKind::Up(
                             crossterm::event::MouseButton::Left,
                         ) => {
-                            let was_multiclick = ui
-                                .last_click
-                                .map(|(_, _, _, cnt)| cnt >= 2)
-                                .unwrap_or(false);
+                            let was_multiclick =
+                                ui.last_click.map(|l| l.count >= 2).unwrap_or(false);
                             // Only copy when the selection is a real drag or multi-click,
                             // not a plain single click.
                             if let Some(ref sel) = ui.selection
@@ -4381,7 +6531,7 @@ pub fn run_tui(
                     let _ = embedded.write_raw_bytes(&pane_id, &payload);
                     // PRD #76 M2.20: a paste is a forwarded keystroke event
                     // too — mark the timestamp so a following Enter
-                    // (`KeyResult::ForwardToPane(b"\r")`) is debounced and
+                    // (`Action::ForwardToPane(b"\r")`) is debounced and
                     // arrives at the agent as a standalone submit, not fused
                     // with the paste tail.
                     ui.last_pane_keystroke_at = Some(std::time::Instant::now());
@@ -4407,450 +6557,77 @@ pub fn run_tui(
                 continue;
             }
 
-            // PRD #40: snapshot the active keybindings for this keypress so
-            // the (mutable) `ui` borrows below don't fight an immutable borrow
-            // of `ui.keybindings`. Cheap (a small HashMap) and the config is
-            // immutable for the session.
-            let kb = ui.keybindings.clone();
+            // ---------------------------------------------------------------
+            // PRD #80: map this KeyEvent to one `Action`, then run it through
+            // `dispatch_action` — the single place every command action
+            // executes (keystroke today, mouse click from M2 on). The blocks
+            // below are the thin `KeyEvent -> Option<Action>` mapper. Text
+            // input (filter / rename / new-pane-form typing) stays
+            // keyboard-driven inside the per-mode handlers, which mutate their
+            // own field and return `Action::Continue`.
+            // ---------------------------------------------------------------
+            let frame_area = terminal.get_frame().area();
+            let mut action: Option<Action> = None;
 
-            // PRD #40 safety net: Ctrl+C is non-overridable and is NEVER
-            // routed through the config dispatch — it falls through to the
-            // mode-specific handlers (which open the quit flow). This guards
-            // every config-driven block below so a user binding like
-            // `new_pane = "Ctrl+C"` can't hijack the emergency quit.
+            // PRD #40: snapshot the active keybindings for this keypress (cheap
+            // HashMap clone; config is immutable for the session) so the mapper
+            // blocks below resolve shortcuts from config. `is_ctrl_c` marks the
+            // non-overridable quit trigger — it is NEVER mapped to a config
+            // action; it falls through to the per-mode handlers (which open the
+            // quit flow), so no user binding can hijack the emergency quit.
+            let kb = ui.keybindings.clone();
             let is_ctrl_c =
                 key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
 
-            // Jump-to-card actions in Normal mode (defaults: 1..9): focus the
-            // Nth card's pane. Resolved from config so the digits can be
-            // remapped.
-            let mut shortcut_handled = false;
-            const JUMP_ACTIONS: [Action; 9] = [
-                Action::Jump1,
-                Action::Jump2,
-                Action::Jump3,
-                Action::Jump4,
-                Action::Jump5,
-                Action::Jump6,
-                Action::Jump7,
-                Action::Jump8,
-                Action::Jump9,
-            ];
-            if !is_ctrl_c
-                && ui.mode == UiMode::Normal
-                && let Some(idx) = JUMP_ACTIONS.iter().position(|a| kb.matches(*a, &key))
-            {
-                // Dismiss idle art on the target card
-                if let Some((sid, _)) = filtered.get(idx)
-                    && let Some(entry) = ui.idle_art_cache.get_mut(*sid)
-                {
-                    entry.dismissed = true;
-                }
-                focus_deck(idx, &mut ui, &filtered, &snapshot, &state, &*pane);
-                let area = terminal.get_frame().area();
-                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
-                shortcut_handled = true;
-            }
-
-            // ---------------------------------------------------------------
-            // Global configurable shortcuts (PRD #40): resolved client-side
-            // from the keybinding config so they work from any mode and can be
-            // remapped to any chord (not just Ctrl+key). Ctrl+C is excluded
-            // (`is_ctrl_c`) so it can never be hijacked away from the quit flow.
-            // ---------------------------------------------------------------
-            if !shortcut_handled && !is_ctrl_c {
-                // dashboard (command mode) — default Ctrl+d
-                if kb.matches(Action::Dashboard, &key) {
-                    {
-                        // Re-suppress the prompt in reactive panes when
-                        // leaving PaneInput so automated output stays clean.
-                        // (inner block kept to preserve original arm body)
-                        if ui.mode == UiMode::PaneInput
-                            && let Some(embedded) =
-                                pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                            && let Some(focused_id) = embedded.focused_pane_id()
-                            && let Tab::Mode { mode_manager, .. } = tab_manager.active_tab_mut()
-                            && mode_manager.is_reactive_pane(&focused_id)
-                        {
-                            let _ = pane.write_to_pane(
-                                &focused_id,
-                                "export PS1= PS2= PROMPT= && printf '\\x1b[3J\\x1b[2J\\x1b[H'",
-                            );
-                        }
-                        ui.mode = UiMode::Normal;
-                        ui.status_message = None;
-                        shortcut_handled = true;
-                    }
-                } else if kb.matches(Action::ToggleLayout, &key) {
-                    // toggle layout (stacked/tiled) — default Ctrl+t
-                    ui.pane_layout = match ui.pane_layout {
-                        PaneLayout::Stacked => PaneLayout::Tiled,
-                        PaneLayout::Tiled => PaneLayout::Stacked,
-                    };
-                    let mode_name = match ui.pane_layout {
-                        PaneLayout::Stacked => "stacked",
-                        PaneLayout::Tiled => "tiled",
-                    };
-                    // PRD #76 M2.15 fixup F2: route through the same
-                    // SSOT sweep helpers that handle spawn / tab-switch
-                    // resize, so a layout toggle can't end up with a
-                    // different geometry than the rest of the
-                    // codebase. The previous inline math used 67%
-                    // (dashboard) for the non-mode-tab branch, which
-                    // silently produced a 1-col-wider PTY for
-                    // orchestration tabs (66%); it also skipped the
-                    // `show_tab_bar` chrome accounting.
-                    let frame_area = terminal.get_frame().area();
-                    if tab_manager.active_mode_name().is_some() {
-                        resize_mode_tab_panes(&*pane, &tab_manager, frame_area);
-                    } else {
-                        resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
-                    }
-                    ui.status_message =
-                        Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
-                    shortcut_handled = true;
-                } else if kb.matches(Action::NewPane, &key) {
-                    // new pane (open directory picker) — default Ctrl+n
-                    ui.mode = UiMode::DirPicker;
-                    ui.dir_picker = Some(DirPickerState::new(
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-                    ));
-                    shortcut_handled = true;
-                } else if kb.matches(Action::ClosePane, &key) {
-                    // close selected pane (or entire mode tab if it's the agent
-                    // pane) — default Ctrl+w
-                    //
-                    // PRD #92 F4: previously the result of `close_pane` was
-                    // discarded with `let _ =` and the card / session was
-                    // removed unconditionally. A failed `StopAgent` RPC then
-                    // left the underlying agent alive in the daemon
-                    // registry while the dashboard card vanished — the user
-                    // had no visibility and no retry. We now inspect each
-                    // close result and preserve the card / session on
-                    // failure so the user can see the error in
-                    // `ui.status_message` and try again. For group-close
-                    // (mode-tab teardown / orchestration tab teardown) we
-                    // consume `CloseTabOutcome::closed` to remove
-                    // successfully-closed cards and `CloseTabOutcome::failed`
-                    // to keep failed cards with a status-bar summary.
-                    if let Some(sid) = filtered.get(ui.selected_index).map(|(id, _)| (*id).clone())
-                        && let Some(session) = snapshot.sessions.get(&sid)
-                        && let Some(ref pane_id) = session.pane_id
-                    {
-                        let closed_pane_id = pane_id.clone();
-                        // Check if this pane belongs to a mode or orchestration tab.
-                        let mode_tab_idx = tab_manager
-                            .tab_index_for_agent_pane(pane_id)
-                            .or_else(|| tab_manager.tab_index_for_pane(pane_id));
-                        if let Some(tab_idx) = mode_tab_idx {
-                            // Close the entire tab (agent + side panes, or all role panes).
-                            // close_tab returns a per-pane outcome — successful closes
-                            // get their cards removed, failed closes keep theirs.
-                            match tab_manager.close_tab(tab_idx) {
-                                Ok(outcome) => {
-                                    let mut st = state.blocking_write();
-                                    for id in &outcome.closed {
-                                        st.unregister_pane(id);
-                                    }
-                                    // Remove sessions whose pane_id is in the closed set ONLY.
-                                    // Failed panes retain their sessions so the user can retry.
-                                    let closed_set: std::collections::HashSet<&str> =
-                                        outcome.closed.iter().map(String::as_str).collect();
-                                    st.sessions.retain(|_, s| {
-                                        s.pane_id
-                                            .as_ref()
-                                            .is_none_or(|pid| !closed_set.contains(pid.as_str()))
-                                    });
-                                    drop(st);
-                                    // Clean pane_metadata only for the successfully-closed panes.
-                                    for id in &outcome.closed {
-                                        ui.pane_metadata.remove(id);
-                                    }
-                                    if outcome.is_clean() {
-                                        ui.status_message = Some((
-                                            format!("Closed tab containing pane {closed_pane_id}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                    } else {
-                                        // List which panes failed plus the first error so the
-                                        // status bar stays readable (single-line). Full per-pane
-                                        // errors are tracing-logged for the daemon log.
-                                        let failed_ids: Vec<&str> = outcome
-                                            .failed
-                                            .iter()
-                                            .map(|(id, _)| id.as_str())
-                                            .collect();
-                                        let first_err = outcome
-                                            .failed
-                                            .first()
-                                            .map(|(_, e)| e.as_str())
-                                            .unwrap_or("");
-                                        for (id, e) in &outcome.failed {
-                                            tracing::warn!(
-                                                pane_id = %id,
-                                                error = %e,
-                                                "F4: close_pane failed during tab teardown — card preserved"
-                                            );
-                                        }
-                                        ui.status_message = Some((
-                                            format!(
-                                                "Close partially failed for {} pane(s) — first error: {first_err}",
-                                                failed_ids.len()
-                                            ),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                    let area = terminal.get_frame().area();
-                                    resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
-                                }
-                                Err(e) => {
-                                    ui.status_message = Some((
-                                        format!("Failed to close tab: {e}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            // Plain dashboard pane — close just this one and inspect
-                            // the result. On Err the controller has already restored
-                            // the local pane state (see EmbeddedPaneController::close_pane),
-                            // so we leave the card / session in place for retry.
-                            match pane.close_pane(pane_id) {
-                                Ok(()) => {
-                                    let mut st = state.blocking_write();
-                                    st.sessions.remove(&sid);
-                                    st.unregister_pane(&closed_pane_id);
-                                    drop(st);
-                                    ui.pane_metadata.remove(&closed_pane_id);
-                                    ui.status_message = Some((
-                                        format!("Closed pane {closed_pane_id}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        pane_id = %closed_pane_id,
-                                        error = %e,
-                                        "F4: close_pane failed — card preserved for retry"
-                                    );
-                                    ui.status_message = Some((
-                                        format!(
-                                            "Failed to close pane {closed_pane_id}: {e} — press {} to retry",
-                                            kb.notation(Action::ClosePane)
-                                        ),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                        }
-                        if ui.mode == UiMode::PaneInput {
-                            ui.mode = UiMode::Normal;
-                        }
-                        // Clamp selected_index so it doesn't point past
-                        // the now-shorter card list. (Only meaningful if
-                        // at least one pane was actually removed; on a
-                        // pure-failure close the card count is unchanged
-                        // and this is a no-op since selected_index
-                        // already points at the (preserved) card.)
-                        if ui.selected_index > 0 {
-                            ui.selected_index = ui.selected_index.saturating_sub(1);
-                        }
-                    }
-                    shortcut_handled = true;
+            // Jump-to-card in Normal mode (defaults 1..9): focus card N. PRD #40
+            // resolves the digits from config so they can be remapped.
+            if !is_ctrl_c && ui.mode == UiMode::Normal {
+                const JUMP_ACTIONS: [KbAction; 9] = [
+                    KbAction::Jump1,
+                    KbAction::Jump2,
+                    KbAction::Jump3,
+                    KbAction::Jump4,
+                    KbAction::Jump5,
+                    KbAction::Jump6,
+                    KbAction::Jump7,
+                    KbAction::Jump8,
+                    KbAction::Jump9,
+                ];
+                if let Some(idx) = JUMP_ACTIONS.iter().position(|a| kb.matches(*a, &key)) {
+                    action = Some(Action::FocusCard(idx));
                 }
             }
 
-            // ---------------------------------------------------------------
-            // Non-configurable global tab navigation: Ctrl+PageUp / PageDown
-            // (not part of the PRD #40 action set — kept hardcoded under the
-            // CONTROL gate).
-            // ---------------------------------------------------------------
-            if !shortcut_handled && key.modifiers.contains(KeyModifiers::CONTROL) {
-                match key.code {
-                    // Ctrl+PageDown: next tab
-                    KeyCode::PageDown => {
-                        if tab_manager.show_tab_bar() {
-                            let prev_idx = tab_manager.active_index();
-                            switch_tab_with_focus(
-                                &mut tab_manager,
-                                prev_idx + 1,
-                                &*pane,
-                                &snapshot,
-                            );
-                            if prev_idx != tab_manager.active_index() {
-                                let area = terminal.get_frame().area();
-                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
-                                resize_mode_tab_panes(&*pane, &tab_manager, area);
-                            }
-                        }
-                        shortcut_handled = true;
-                    }
-                    // Ctrl+PageUp: previous tab
-                    KeyCode::PageUp => {
-                        if tab_manager.show_tab_bar() {
-                            let prev_idx = tab_manager.active_index();
-                            if prev_idx > 0 {
-                                switch_tab_with_focus(
-                                    &mut tab_manager,
-                                    prev_idx - 1,
-                                    &*pane,
-                                    &snapshot,
-                                );
-                                if prev_idx != tab_manager.active_index() {
-                                    let area = terminal.get_frame().area();
-                                    resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
-                                    resize_mode_tab_panes(&*pane, &tab_manager, area);
-                                }
-                            }
-                        }
-                        shortcut_handled = true;
-                    }
-                    _ => {}
-                }
+            // Global configurable shortcuts (work from any mode). PRD #40:
+            // resolved from config (any chord, not just Ctrl+key); `is_ctrl_c`
+            // excluded so it can't be hijacked away from the quit flow.
+            if action.is_none() && !is_ctrl_c {
+                action = global_action(&kb, &key);
             }
 
-            // Cycle tabs in Normal mode. The configurable move_right /
-            // move_left actions (defaults `l` / `h`) drive this, alongside the
-            // non-configurable Tab / Shift+Tab / Right / Left aliases that are
-            // kept hardcoded so default navigation is byte-for-byte unchanged.
-            // `!is_ctrl_c` keeps Ctrl+C out of this config-dispatch path too
-            // (e.g. move_left = "Ctrl+C" must never switch tabs) so the
-            // non-overridable quit safety net always wins. PRD #83: tab
-            // switches go through `switch_tab_with_focus` so each tab's
-            // per-tab selection state is restored on switch.
-            if !shortcut_handled && !is_ctrl_c && ui.mode == UiMode::Normal {
-                let go_next = kb.matches(Action::MoveRight, &key)
-                    || matches!(key.code, KeyCode::Tab | KeyCode::Right);
-                let go_prev = kb.matches(Action::MoveLeft, &key)
-                    || matches!(key.code, KeyCode::BackTab | KeyCode::Left);
-                if go_next {
-                    let count = tab_manager.tab_count();
-                    if count > 0 {
-                        let prev_idx = tab_manager.active_index();
-                        let next = (prev_idx + 1) % count;
-                        switch_tab_with_focus(&mut tab_manager, next, &*pane, &snapshot);
-                        if prev_idx != tab_manager.active_index() {
-                            let area = terminal.get_frame().area();
-                            resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
-                            resize_mode_tab_panes(&*pane, &tab_manager, area);
-                        }
-                    }
-                    shortcut_handled = true;
-                } else if go_prev {
-                    let count = tab_manager.tab_count();
-                    if count > 0 {
-                        let prev_idx = tab_manager.active_index();
-                        let prev = (prev_idx + count - 1) % count;
-                        switch_tab_with_focus(&mut tab_manager, prev, &*pane, &snapshot);
-                        if prev_idx != tab_manager.active_index() {
-                            let area = terminal.get_frame().area();
-                            resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
-                            resize_mode_tab_panes(&*pane, &tab_manager, area);
-                        }
-                    }
-                    shortcut_handled = true;
-                }
+            // Tab cycling in Normal mode: move_left/move_right (defaults h/l)
+            // plus the non-configurable Tab / Shift+Tab / Left / Right aliases.
+            if action.is_none() && !is_ctrl_c && ui.mode == UiMode::Normal {
+                action = cycle_tab_action(&kb, &key);
             }
 
             let selected_id: Option<String> =
                 filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
 
             // On a mode tab in Normal mode, move_down/move_up (defaults j/k,
-            // plus the Down/Up arrows) navigate side panes, Enter focuses, Esc
-            // resets. `!is_ctrl_c` keeps the quit safety net non-overridable
-            // here too.
-            if !shortcut_handled
+            // plus Down/Up arrows) navigate side panes, Enter focuses, Esc
+            // resets. `is_ctrl_c` excluded for the same safety-net reason.
+            if action.is_none()
                 && !is_ctrl_c
                 && ui.mode == UiMode::Normal
-                && let Tab::Mode {
-                    focused_pane_id,
-                    mode_manager,
-                    agent_pane_id,
-                    ..
-                } = tab_manager.active_tab_mut()
+                && matches!(tab_manager.active_tab(), Tab::Mode { .. })
             {
-                let side_ids = mode_manager.managed_pane_ids();
-                let side_count = side_ids.len();
-                // PRD #83: translate the stable focused pane id to its
-                // positional slot for the move_down/move_up step arithmetic.
-                // `None` (agent pane) or a stale id maps to "no side pane".
-                // PRD #40: the move_down/move_up actions (defaults j/k) drive
-                // navigation, with the Down/Up arrows kept as non-configurable
-                // aliases so default behaviour is byte-for-byte unchanged.
-                let cur: Option<usize> = focused_pane_id
-                    .as_ref()
-                    .and_then(|id| side_ids.iter().position(|s| s == id));
-                if kb.matches(Action::MoveDown, &key) || key.code == KeyCode::Down {
-                    let next = match cur {
-                        None => {
-                            if side_count > 0 {
-                                Some(0)
-                            } else {
-                                None
-                            }
-                        }
-                        Some(i) if i + 1 < side_count => Some(i + 1),
-                        Some(_) => None, // wrap back to agent pane
-                    };
-                    *focused_pane_id = next.map(|i| side_ids[i].clone());
-                    // Sync embedded controller focus so the visual highlight
-                    // matches (prevents stale cyan border on a previous pane).
-                    let focus_id = focused_pane_id
-                        .clone()
-                        .unwrap_or_else(|| agent_pane_id.clone());
-                    let _ = pane.focus_pane(&focus_id);
-                    shortcut_handled = true;
-                } else if kb.matches(Action::MoveUp, &key) || key.code == KeyCode::Up {
-                    let next = match cur {
-                        None => {
-                            if side_count > 0 {
-                                Some(side_count - 1)
-                            } else {
-                                None
-                            }
-                        }
-                        Some(0) => None,
-                        Some(i) => Some(i - 1),
-                    };
-                    *focused_pane_id = next.map(|i| side_ids[i].clone());
-                    let focus_id = focused_pane_id
-                        .clone()
-                        .unwrap_or_else(|| agent_pane_id.clone());
-                    let _ = pane.focus_pane(&focus_id);
-                    shortcut_handled = true;
-                } else if key.code == KeyCode::Enter {
-                    let target_pane_id = focused_pane_id
-                        .clone()
-                        .unwrap_or_else(|| agent_pane_id.clone());
-                    let is_reactive = mode_manager.is_reactive_pane(&target_pane_id);
-                    if pane.focus_pane(&target_pane_id).is_ok() {
-                        ui.mode = UiMode::PaneInput;
-                        // Restore a minimal prompt so the user can
-                        // interact with the shell in this reactive pane.
-                        if is_reactive {
-                            let _ = pane.write_to_pane(
-                                &target_pane_id,
-                                "export PS1='$ ' PS2='> ' PROMPT='$ '",
-                            );
-                        }
-                        ui.status_message = Some((
-                            "PaneInput mode — type to interact, Ctrl+d for dashboard".to_string(),
-                            std::time::Instant::now(),
-                        ));
-                    }
-                    shortcut_handled = true;
-                } else if key.code == KeyCode::Esc {
-                    *focused_pane_id = None;
-                    let _ = pane.focus_pane(agent_pane_id);
-                    shortcut_handled = true;
-                }
+                action = mode_tab_nav_action(&kb, &key);
             }
 
-            // Mode-specific key handling (skip if a global shortcut was handled).
-            let result = if shortcut_handled {
-                KeyResult::Continue
-            } else {
-                match ui.mode {
+            // Mode-specific key handling (only when no shortcut claimed the key).
+            if action.is_none() {
+                action = Some(match ui.mode {
                     UiMode::Normal => {
                         let selected_status = selected_id
                             .as_ref()
@@ -4882,32 +6659,15 @@ pub fn run_tui(
                         // label (PRD #76 M2.11 reviewer P1).
                         let commit = rename_commit_value(key, &ui.rename_text);
                         let r = handle_rename_key(key, &mut ui, selected_id.as_deref());
-                        if let Some(new_name) = commit
-                            && let Some(ref sid) = selected_id
-                            && let Some(session) = snapshot.sessions.get(sid)
-                            && let Some(ref pane_id) = session.pane_id
-                        {
-                            // Best-effort daemon update — rename_pane's
-                            // own error path already logs and swallows
-                            // transient daemon failures, and the daemon
-                            // RPC is spawned off the UI thread so a
-                            // wedged daemon can't freeze the renderer.
-                            match pane.rename_pane(pane_id, &new_name) {
-                                Ok(outcome) => apply_rename_outcome(
-                                    &mut ui.display_names,
-                                    &mut ui.pane_display_names,
-                                    sid,
-                                    pane_id,
-                                    outcome,
-                                ),
-                                Err(e) => {
-                                    tracing::debug!(
-                                        pane_id = %pane_id,
-                                        error = %e,
-                                        "rename_pane returned an error; UI maps unchanged"
-                                    );
-                                }
-                            }
+                        if let Some(new_name) = commit {
+                            // Shared with the `[Save]` button (Action::SaveRename).
+                            commit_rename(
+                                &new_name,
+                                &mut ui,
+                                &*pane,
+                                &snapshot,
+                                selected_id.as_deref(),
+                            );
                         }
                         r
                     }
@@ -4935,633 +6695,22 @@ pub fn run_tui(
                         handle_quit_confirm_key(key, &mut ui, managed_agents_count)
                     }
                     UiMode::StopConfirm => handle_stop_confirm_key(key, &mut ui),
-                }
-            };
+                });
+            }
 
-            match result {
-                KeyResult::Quit => break 'outer,
-                KeyResult::DetachAndQuit => {
-                    // M2.5: emit explicit `KIND_DETACH` frames for every
-                    // stream-backed pane so the daemon distinguishes
-                    // voluntary detach from abrupt disconnect, then exit.
-                    // Local-PTY panes have nothing to detach from — they
-                    // die with the process either way.
-                    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-                        let errs = embedded.detach_all_streams();
-                        if !errs.is_empty() {
-                            tracing::warn!(
-                                error_count = errs.len(),
-                                "detach_all_streams reported errors during quit — proceeding"
-                            );
-                        }
-                    }
-                    break 'outer;
-                }
-                KeyResult::StopConfirmPrompt { agent_count } => {
-                    // PRD #92 F1: transition to the secondary y/n dialog
-                    // with the cached agent count rendered in the prompt.
-                    // Default to No (safer default for a destructive
-                    // action). Stay in this loop iteration; the next
-                    // pass will render `StopConfirm` and route keys to
-                    // `handle_stop_confirm_key`.
-                    ui.stop_confirm_agent_count = agent_count;
-                    ui.stop_confirm_selected = 0;
-                    ui.mode = UiMode::StopConfirm;
-                }
-                KeyResult::StopAndQuit => {
-                    // PRD #92 F1: user confirmed Stop (either via the
-                    // primary dialog with 0 agents or via the secondary
-                    // y/n with Yes). Tell the daemon to terminate every
-                    // managed agent and exit, then break the TUI loop.
-                    // Session save happens via the normal exit path
-                    // (the `'outer` break unwinds into the existing
-                    // session-save site so `--continue` is not poisoned).
-                    //
-                    // PRD #92 F1 followup: `shutdown_daemon` now waits
-                    // for an explicit `KIND_SHUTDOWN_ACK` from the
-                    // daemon. The original wire used socket-close as
-                    // the implicit ack, which an old daemon (predating
-                    // `PROTOCOL_VERSION = 2`) would also satisfy by
-                    // closing the connection on an unknown frame —
-                    // making the upgrade-mismatch case look like a
-                    // successful shutdown. On `Err` we now do NOT exit
-                    // the TUI; we dismiss the dialogs, surface the
-                    // error via `ui.status_message`, and return to
-                    // Normal mode so the user can retry, Detach, or
-                    // `pkill` from a shell.
-                    let shutdown_result = pane
-                        .as_any()
-                        .downcast_ref::<EmbeddedPaneController>()
-                        .map(|embedded| embedded.shutdown_daemon());
-                    match shutdown_result {
-                        Some(Ok(())) | None => {
-                            // Ack received (or non-stream backend, which
-                            // can't actually shut down anything). Proceed
-                            // to TUI exit via the existing `'outer`
-                            // break.
-                            break 'outer;
-                        }
-                        Some(Err(e)) => {
-                            tracing::warn!(
-                                error = %e,
-                                "shutdown_daemon failed — staying in the TUI so the user can retry or Detach"
-                            );
-                            ui.status_message = Some((
-                                format!(
-                                    "Stop failed: {e} — daemon may be incompatible or unresponsive. Try Detach or restart the daemon manually."
-                                ),
-                                std::time::Instant::now(),
-                            ));
-                            // Dismiss dialogs and return to Normal mode.
-                            // Reset the primary-dialog selection to
-                            // Detach so a hammer-Enter recovery picks
-                            // the safe option, not Stop again.
-                            ui.mode = UiMode::Normal;
-                            ui.stop_confirm_selected = 0;
-                            ui.quit_confirm_selected = 0;
-                        }
-                    }
-                }
-                KeyResult::Focus => {
-                    // Dismiss idle art on the focused card
-                    if let Some(ref sid) = selected_id
-                        && let Some(entry) = ui.idle_art_cache.get_mut(sid)
-                    {
-                        entry.dismissed = true;
-                    }
-                    if let Some(ref sid) = selected_id
-                        && let Some(session) = snapshot.sessions.get(sid)
-                    {
-                        if let Some(ref pane_id) = session.pane_id {
-                            if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
-                                // PRD #83: snapshot the SOURCE tab's focus
-                                // before leaving it, mirroring
-                                // `switch_tab_with_focus` (capture-out →
-                                // switch_to → record/restore). This path
-                                // is reachable from a focus-bearing
-                                // Orchestration tab (Enter on its card
-                                // grid), so the source's remembered focus
-                                // must be captured. `capture_focus_on_switch_out`
-                                // only reads the controller's focused pane
-                                // id into the source tab's field — it
-                                // issues no `focus_pane`, so the
-                                // destination focus below is unaffected.
-                                tab_manager.capture_focus_on_switch_out();
-                                tab_manager.switch_to(tab_idx);
-                                // PRD #83: keep the destination tab's
-                                // remembered focus in step with the
-                                // explicit focus below.
-                                tab_manager.record_focus(pane_id);
-                                let area = terminal.get_frame().area();
-                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
-                                resize_mode_tab_panes(&*pane, &tab_manager, area);
-                            }
-                            match pane.focus_pane(pane_id) {
-                                Ok(()) => {
-                                    ui.mode = UiMode::PaneInput;
-                                    // Reset dismissed flags so art reappears when
-                                    // the user returns to the dashboard.
-                                    for entry in ui.idle_art_cache.values_mut() {
-                                        entry.dismissed = false;
-                                    }
-                                    ui.status_message = Some((
-                                        "PaneInput mode — type to interact, Ctrl+d for dashboard"
-                                            .to_string(),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                                Err(PaneError::CommandFailed(ref msg)) => {
-                                    state.blocking_write().sessions.remove(sid);
-                                    ui.status_message = Some((
-                                        format!("Removed stale session: {msg}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                                Err(e) => {
-                                    ui.status_message = Some((
-                                        format!("Pane focus failed: {e}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            ui.status_message = Some((
-                                format!("No pane linked to session {sid}"),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                    }
-                }
-                KeyResult::RequestConfigGen => {
-                    if let Some(ref sid) = selected_id
-                        && let Some(session) = snapshot.sessions.get(sid)
-                        && let Some(ref pane_id) = session.pane_id
-                        && let Some(ref cwd) = session.cwd
-                    {
-                        ui.config_gen_target = Some((pane_id.clone(), cwd.clone()));
-                        ui.config_gen_selected = 0;
-                        ui.mode = UiMode::ConfigGenPrompt;
-                    } else {
-                        ui.status_message = Some((
-                            "No active agent session to send prompt to.".to_string(),
-                            std::time::Instant::now(),
-                        ));
-                    }
-                }
-                KeyResult::SendPermissionResponse(approve) => {
-                    // The handler already gated on `WaitingForInput` plus a
-                    // non-empty selection; re-resolve the pane here so the
-                    // PTY write goes to the right place. If `pane_id` is
-                    // missing (placeholder session with no agent yet), this
-                    // silently no-ops — same shape as RequestConfigGen.
-                    if let Some(ref sid) = selected_id
-                        && let Some(session) = snapshot.sessions.get(sid)
-                        && let Some(ref pane_id) = session.pane_id
-                    {
-                        let key_char = if approve { "y" } else { "n" };
-                        match pane.write_to_pane(pane_id, key_char) {
-                            Ok(()) => {
-                                ui.status_message = Some((
-                                    format!(
-                                        "Permission {}.",
-                                        if approve { "approved" } else { "denied" }
-                                    ),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                            Err(e) => {
-                                ui.status_message = Some((
-                                    format!("Permission response failed: {e}"),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                        }
-                    }
-                }
-                KeyResult::NewPane(req) => {
-                    if pane.is_available() {
-                        let dir_str = req.dir.display().to_string();
-
-                        // Orchestration path — manage own panes, no agent pane.
-                        if let Some(mut orch_config) = req.orchestration_config {
-                            // PRD #107: use the name the user typed in the form, if any,
-                            // so the tab title matches their input rather than always
-                            // falling back to the TOML config name or cwd basename.
-                            if !req.name.is_empty() {
-                                orch_config.name = req.name.clone();
-                            }
-                            let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
-                            // PRD #76 M2.15: pre-compute spawn dims using
-                            // the orchestration-layout helper (right 66%
-                            // column, matching the orchestration
-                            // renderer's `[34%, 66%]` split — fixup F3,
-                            // not the dashboard's `[33%, 67%]`) so role
-                            // PTYs open at the viewport size.
-                            let frame_area = terminal.get_frame().area();
-                            // show_tab_bar=true: opening an orchestration
-                            // adds a new tab next to Dashboard, so the
-                            // post-spawn render has ≥2 tabs.
-                            // All roles share the same spawn dims (Tiled
-                            // layout); pass role_index=0 and
-                            // focused_role_index=None so the helper falls
-                            // back to "role 0 expanded" — matching the
-                            // renderer's "first slot expands" default when
-                            // no role is focused yet (panes haven't been
-                            // created at this point).
-                            // PRD #76 M2.15 fixup pass 2 G2 — `Tiled` is
-                            // hardcoded here so the focused_role_index
-                            // parameter is geometrically a no-op, but pass
-                            // it for symmetry / future safety.
-                            let spawn_dims = orchestration_role_pane_dims(
-                                frame_area,
-                                orch_config.roles.len(),
-                                0,
-                                None,
-                                PaneLayout::Tiled,
-                                true,
-                            );
-                            match tab_manager.open_orchestration_tab(
-                                &orch_config,
-                                &dir_str,
-                                prompt,
-                                spawn_dims,
-                            ) {
-                                Ok((_tab_idx, role_pane_ids)) => {
-                                    // PRD #110 followup: snapshot each role
-                                    // pane's daemon agent_id before the
-                                    // placeholder insert so the strict-
-                                    // equality reuse guard accepts each
-                                    // role agent's first `SessionStart`.
-                                    let role_agent_ids: Vec<Option<String>> = role_pane_ids
-                                        .iter()
-                                        .map(|id| pane.pane_agent_id(id))
-                                        .collect();
-                                    {
-                                        let mut st = state.blocking_write();
-                                        // PRD #76 M2.13: `open_orchestration_tab`
-                                        // already tags each role's daemon-bound
-                                        // spawn with `AgentType::from_command(...)`,
-                                        // so a reconnect's hydration carries the
-                                        // right type. The local placeholder stays
-                                        // at `None` until each role's first
-                                        // `SessionStart` hook fires — preserving
-                                        // the orchestration readiness gate's
-                                        // 10-second fallback (pre-M2.13 contract).
-                                        for (id, agent_id) in
-                                            role_pane_ids.iter().zip(role_agent_ids.iter())
-                                        {
-                                            st.register_pane(id.clone());
-                                            st.insert_placeholder_session(
-                                                id.clone(),
-                                                Some(dir_str.clone()),
-                                                None,
-                                                agent_id.clone(),
-                                            );
-                                        }
-                                        // Register pane-to-role and pane-to-cwd mappings for work-done resolution.
-                                        for (i, role) in orch_config.roles.iter().enumerate() {
-                                            st.pane_role_map.insert(
-                                                role_pane_ids[i].clone(),
-                                                role.name.clone(),
-                                            );
-                                            st.pane_cwd_map
-                                                .insert(role_pane_ids[i].clone(), dir_str.clone());
-                                            if role.start {
-                                                st.orchestrator_pane_ids
-                                                    .insert(role_pane_ids[i].clone());
-                                            }
-                                        }
-                                    }
-                                    // Register display names for role panes.
-                                    for (i, role) in orch_config.roles.iter().enumerate() {
-                                        ui.pane_display_names
-                                            .insert(role_pane_ids[i].clone(), role.name.clone());
-                                        ui.pane_names
-                                            .insert(role_pane_ids[i].clone(), role.name.clone());
-                                    }
-
-                                    // Focus the start role's pane.
-                                    let start_idx =
-                                        orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
-                                    let _ = pane.focus_pane(&role_pane_ids[start_idx]);
-                                    ui.mode = UiMode::PaneInput;
-
-                                    // Resize role panes to dashboard layout.
-                                    let area = terminal.get_frame().area();
-                                    resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
-
-                                    // Record creation time for delayed prompt injection fallback.
-                                    if let Tab::Orchestration { id, .. } = tab_manager.active_tab()
-                                    {
-                                        ui.orchestration_created_at
-                                            .insert(*id, std::time::Instant::now());
-                                    }
-
-                                    // Role commands are already running — each pane was
-                                    // spawned with `role.command` as its initial process
-                                    // (see TabManager::open_orchestration_tab in tab.rs).
-                                    // Writing the command again here would land its bytes
-                                    // in the agent's stdin, polluting the prompt buffer.
-
-                                    ui.status_message = Some((
-                                        format!("Activated orchestration: {}", orch_config.name),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                                Err(e) => {
-                                    ui.status_message = Some((
-                                        format!("Orchestration failed: {e}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            // For mode tabs, create the agent pane as an empty
-                            // shell so the PTY can be resized to the correct
-                            // dimensions before the command starts.  This avoids
-                            // the process seeing the default 80×24 size.
-                            let is_mode = req.mode_config.is_some();
-                            let cmd = if req.command.is_empty() || is_mode {
-                                None
-                            } else {
-                                Some(req.command.as_str())
-                            };
-                            // Thread the form's Name through to `StartAgent.display_name`
-                            // so a disconnect or crash between create and rename can't
-                            // persist the command-based fallback label on the daemon
-                            // (PRD #76 M2.11 reviewer P2). The controller resolves the
-                            // form Name + command via `agent_pty::resolve_display_name`
-                            // and returns the canonical string it stored on Pane.name
-                            // (and sent as `StartAgent.display_name` for stream panes)
-                            // so the UI maps below mirror EXACTLY what the daemon has —
-                            // no separate normalization helper to drift (M2.11 fixup 4).
-                            let form_name = Some(req.name.as_str());
-                            // PRD #76 M2.12: tag the agent pane with its
-                            // mode-tab membership so the daemon-side
-                            // registry can echo it back via `list_agents`
-                            // on the next reconnect, letting the
-                            // hydration partition rebuild this mode tab
-                            // instead of stranding the agent on the
-                            // dashboard.
-                            let tab_membership =
-                                req.mode_config.as_ref().map(|m| TabMembership::Mode {
-                                    name: m.name.clone(),
-                                });
-                            // PRD #76 M2.15: pre-compute spawn dims via the
-                            // shared layout helpers so the agent PTY opens
-                            // at the eventual size (no 24×80 → resize
-                            // hiccup). Mode-tab panes use the mode-agent
-                            // layout (left half × height-minus-chrome);
-                            // dashboard panes use the dashboard right-67%
-                            // column layout with `is_focused=true` (this
-                            // path immediately focuses the new pane via
-                            // `focus_pane(&new_id)` below).
-                            let frame_area = terminal.get_frame().area();
-                            let (spawn_rows, spawn_cols) = if req.mode_config.is_some() {
-                                mode_agent_pane_dims(frame_area)
-                            } else {
-                                let embedded_pane_count = pane
-                                    .as_any()
-                                    .downcast_ref::<EmbeddedPaneController>()
-                                    .map(|e| e.pane_ids().len())
-                                    .unwrap_or(0);
-                                let pane_count_after =
-                                    (embedded_pane_count as u16).saturating_add(1);
-                                dashboard_pane_dims(
-                                    frame_area,
-                                    pane_count_after,
-                                    true,
-                                    ui.pane_layout,
-                                    tab_manager.show_tab_bar(),
-                                )
-                            };
-                            // PRD #76 M2.13: infer agent_type from the
-                            // form's command (the canonical "what runs in
-                            // this pane" hint) — `cmd` is `None` for mode
-                            // panes (which spawn empty and run the
-                            // command later via `write_to_pane`), so use
-                            // `req.command` directly to cover both flows.
-                            // The inferred type goes ONLY into the daemon-
-                            // bound spawn options so a remote reconnect's
-                            // hydration carries it; the local placeholder
-                            // stays at `None` until the first `SessionStart`
-                            // hook fires (pre-M2.13 contract).
-                            let spawn_agent_type = if req.command.is_empty() {
-                                None
-                            } else {
-                                AgentType::from_command(Some(req.command.as_str()))
-                            };
-                            match pane.create_pane_with_options(
-                                cmd,
-                                Some(&dir_str),
-                                AgentSpawnOptions {
-                                    display_name: form_name,
-                                    tab_membership,
-                                    rows: spawn_rows,
-                                    cols: spawn_cols,
-                                    agent_type: spawn_agent_type,
-                                },
-                            ) {
-                                Ok((new_id, resolved_name)) => {
-                                    // Register so only events from our panes are accepted,
-                                    // and create a placeholder session for an immediate dashboard card.
-                                    //
-                                    // PRD #110 followup: snapshot the daemon
-                                    // agent_id so the placeholder survives the
-                                    // strict-equality reuse guard on the
-                                    // freshly-spawned agent's first
-                                    // `SessionStart`.
-                                    let new_agent_id = pane.pane_agent_id(&new_id);
-                                    {
-                                        let mut st = state.blocking_write();
-                                        st.register_pane(new_id.clone());
-                                        st.insert_placeholder_session(
-                                            new_id.clone(),
-                                            Some(dir_str.clone()),
-                                            None,
-                                            new_agent_id,
-                                        );
-                                    }
-                                    ui.pane_display_names
-                                        .insert(new_id.clone(), resolved_name.clone());
-                                    ui.pane_names.insert(new_id.clone(), resolved_name);
-                                    let mode_name_for_save =
-                                        req.mode_config.as_ref().map(|m| m.name.clone());
-                                    ui.pane_metadata.insert(
-                                        new_id.clone(),
-                                        config::SavedPane {
-                                            dir: dir_str.clone(),
-                                            name: req.name.clone(),
-                                            command: req.command,
-                                            mode: mode_name_for_save,
-                                        },
-                                    );
-
-                                    if let Some(mode_config) = req.mode_config {
-                                        // Mode selected — open a mode tab.
-                                        let mode_name = mode_config.name.clone();
-                                        // PRD #76 M2.15 fixup pass 2 G1 — compute
-                                        // side-pane dims so the side panes spawn
-                                        // at the viewport-derived size, not the
-                                        // 24×80 default.
-                                        let total_side_count = (mode_config.panes.len()
-                                            + mode_config.reactive_panes)
-                                            as u16;
-                                        let side_pane_dims = mode_side_pane_dims(
-                                            terminal.get_frame().area(),
-                                            total_side_count,
-                                        );
-                                        match tab_manager.open_mode_tab(
-                                            &mode_config,
-                                            &dir_str,
-                                            new_id.clone(),
-                                            side_pane_dims,
-                                        ) {
-                                            Ok((_tab_idx, side_ids)) => {
-                                                for id in &side_ids {
-                                                    state
-                                                        .blocking_write()
-                                                        .register_pane(id.clone());
-                                                }
-                                                let _ = pane.focus_pane(&new_id);
-                                                ui.mode = UiMode::PaneInput;
-                                                // PRD #76 M2.15: shared
-                                                // layout helpers — spawn
-                                                // and resize math are now
-                                                // identical.
-                                                let frame_area = terminal.get_frame().area();
-                                                resize_mode_tab_panes_for(
-                                                    &*pane, &new_id, &side_ids, frame_area,
-                                                );
-                                                // Start commands now that panes are correctly sized
-                                                let _ = tab_manager.start_mode_commands();
-                                                // Send the agent pane command after resize
-                                                // so it starts at the correct PTY dimensions.
-                                                if let Some(ref init_cmd) = mode_config.init_command
-                                                {
-                                                    let _ = pane.write_to_pane(&new_id, init_cmd);
-                                                }
-                                                if let Some(saved) = ui.pane_metadata.get(&new_id) {
-                                                    let agent_cmd = saved.command.clone();
-                                                    if !agent_cmd.is_empty() {
-                                                        let _ =
-                                                            pane.write_to_pane(&new_id, &agent_cmd);
-                                                    }
-                                                }
-                                                ui.status_message = Some((
-                                                    format!("Activated mode: {mode_name}"),
-                                                    std::time::Instant::now(),
-                                                ));
-                                            }
-                                            Err(e) => {
-                                                let _ = pane.close_pane(&new_id);
-                                                ui.status_message = Some((
-                                                    format!("Mode activation failed: {e}"),
-                                                    std::time::Instant::now(),
-                                                ));
-                                            }
-                                        }
-                                    } else {
-                                        // No mode — regular dashboard pane.
-                                        let _ = pane.focus_pane(&new_id);
-                                        ui.mode = UiMode::PaneInput;
-                                        ui.selected_index = filtered.len();
-                                        // PRD #76 M2.15: route through the
-                                        // shared dashboard-layout helper so
-                                        // spawn-time and resize-time math
-                                        // can't drift.
-                                        let frame_area = terminal.get_frame().area();
-                                        resize_dashboard_panes(
-                                            &*pane,
-                                            &ui,
-                                            &tab_manager,
-                                            frame_area,
-                                        );
-                                        ui.status_message = Some((
-                                            format!("Created pane {new_id} in {dir_str}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                }
-                                Err(e) => {
-                                    ui.status_message = Some((
-                                        format!("New pane failed: {e}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                        } // close else (non-orchestration path)
-                    }
-                }
-                KeyResult::SendConfigGenPrompt { pane_id, cwd } => {
-                    let prompt = crate::config_gen::config_gen_prompt(&cwd);
-                    match pane.write_to_pane(&pane_id, &prompt) {
-                        Ok(()) => {
-                            // Focus the pane so user can press Enter to execute.
-                            if let Some(tab_idx) = tab_manager.tab_index_for_pane(&pane_id) {
-                                // PRD #83: snapshot the SOURCE tab's focus
-                                // before leaving it, mirroring
-                                // `switch_tab_with_focus` (capture-out →
-                                // switch_to → record/restore). Capture is
-                                // a no-op when the source is the Dashboard
-                                // (its selection is session-id keyed), but
-                                // adding it keeps every switch site
-                                // uniform and correct if this path ever
-                                // becomes reachable from a focus-bearing
-                                // tab. `capture_focus_on_switch_out` only
-                                // reads the controller's focused pane id —
-                                // no `focus_pane` — so the destination
-                                // focus below is unaffected.
-                                tab_manager.capture_focus_on_switch_out();
-                                tab_manager.switch_to(tab_idx);
-                                // PRD #83: keep the destination tab's
-                                // remembered focus in step with the
-                                // explicit focus below.
-                                tab_manager.record_focus(&pane_id);
-                                let area = terminal.get_frame().area();
-                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
-                                resize_mode_tab_panes(&*pane, &tab_manager, area);
-                            }
-                            let _ = pane.focus_pane(&pane_id);
-                            ui.mode = UiMode::PaneInput;
-                            ui.status_message = Some((
-                                "Config prompt sent — press Enter to execute.".to_string(),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                        Err(e) => {
-                            ui.status_message = Some((
-                                format!("Failed to send config prompt: {e}"),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                    }
-                }
-                KeyResult::ForwardToPane(bytes) => {
-                    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                        && let Some(pane_id) = embedded.focused_pane_id()
-                    {
-                        // Reset scrollback to live output on any keystroke.
-                        embedded.reset_scrollback(&pane_id);
-                        // PRD #76 M2.20: separate a CR-bearing keystroke from
-                        // the preceding typed bytes so the agent TUI treats it
-                        // as a standalone submit, not newline-in-input.
-                        let sleep = submit_debounce_duration(
-                            std::time::Instant::now(),
-                            ui.last_pane_keystroke_at,
-                            &bytes,
-                        );
-                        if !sleep.is_zero() {
-                            std::thread::sleep(sleep);
-                        }
-                        if let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes) {
-                            ui.status_message =
-                                Some((format!("PTY write failed: {e}"), std::time::Instant::now()));
-                        }
-                        ui.last_pane_keystroke_at = Some(std::time::Instant::now());
-                    }
-                }
-                KeyResult::Continue => {}
+            let flow = dispatch_action(
+                action.unwrap_or(Action::Continue),
+                &mut ui,
+                &*pane,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &filtered,
+                selected_id.as_deref(),
+                frame_area,
+            );
+            if flow == Flow::Break {
+                break 'outer;
             }
 
             // M2.11 fixup 5 — the deferred display_names ↔
@@ -5638,6 +6787,116 @@ pub fn run_tui(
 // Rendering
 // ---------------------------------------------------------------------------
 
+/// PRD #80: render the top tab strip into `area`. `labels` are the per-tab
+/// titles (already in tab order, Dashboard at index 0); `closeable` marks,
+/// per tab, whether it carries a `[×]` close affordance (Dashboard never
+/// does — see the M3 acceptance criteria). Extracted from `render_frame` so
+/// both the live render and the L1 `render_tab_bar_to_buffer` seam exercise
+/// the same code path, keeping render and (M3) hit-test in lockstep the way
+/// the button bar does.
+/// The clickable rects produced by [`render_tab_strip`], keyed by tab index
+/// (Dashboard = 0). `headers` covers every visible tab (click → switch);
+/// `closes` covers only the closeable tabs' `[×]` glyphs (click → close).
+struct TabStripRects {
+    headers: Vec<(usize, Rect)>,
+    closes: Vec<(usize, Rect)>,
+}
+
+fn render_tab_strip(
+    frame: &mut Frame,
+    area: Rect,
+    labels: &[String],
+    closeable: &[bool],
+    active_index: usize,
+    palette: &ColorPalette,
+) -> TabStripRects {
+    // Fill the tab-bar row with the distinct background first.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.tab_bar_bg)),
+        area,
+    );
+
+    // Cap long labels so trailing tabs stay at least partially visible for
+    // click-to-switch (same width-fitting the `Tabs` widget previously used).
+    let fitted_labels = fit_tab_labels(labels, area.width);
+
+    let base_style = Style::default()
+        .fg(palette.text_muted)
+        .bg(palette.tab_bar_bg);
+    // Active tab: inverted colors for high contrast (matches the prior look).
+    let active_style = Style::default()
+        .fg(palette.terminal_bg)
+        .bg(palette.text_secondary)
+        .add_modifier(Modifier::BOLD);
+
+    let mut headers = Vec::with_capacity(fitted_labels.len());
+    let mut closes = Vec::new();
+    let end = area.x.saturating_add(area.width);
+    let buf = frame.buffer_mut();
+    let mut x = area.x;
+
+    for (i, label) in fitted_labels.iter().enumerate() {
+        if x >= end {
+            break;
+        }
+        let style = if i == active_index {
+            active_style
+        } else {
+            base_style
+        };
+
+        // Divider between tabs (not before the first).
+        if i > 0 {
+            let (after, _) = buf.set_span(x, area.y, &Span::styled("│", base_style), end - x);
+            x = after;
+            if x >= end {
+                break;
+            }
+        }
+
+        let header_start = x;
+
+        // Label segment, padded with a space on each side.
+        let (after, _) = buf.set_span(
+            x,
+            area.y,
+            &Span::styled(format!(" {label} "), style),
+            end - x,
+        );
+        x = after;
+
+        // Close affordance for Mode/Orchestration tabs (never the Dashboard).
+        if *closeable.get(i).unwrap_or(&false) && x < end {
+            let glyph_start = x;
+            let (after, _) = buf.set_span(x, area.y, &Span::styled("[×]", style), end - x);
+            x = after;
+            closes.push((
+                i,
+                Rect {
+                    x: glyph_start,
+                    y: area.y,
+                    width: x.saturating_sub(glyph_start),
+                    height: 1,
+                },
+            ));
+        }
+
+        // The whole tab segment (label + any close glyph) is the click target
+        // for switching; the `[×]` rect is hit-tested first so it wins there.
+        headers.push((
+            i,
+            Rect {
+                x: header_start,
+                y: area.y,
+                width: x.saturating_sub(header_start),
+                height: 1,
+            },
+        ));
+    }
+
+    TabStripRects { headers, closes }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     frame: &mut Frame,
@@ -5655,6 +6914,10 @@ fn render_frame(
     let palette = ui.palette;
     ui.side_pane_rects.clear();
     ui.agent_pane_rect = None;
+    // PRD #80 M4: rebuilt below only for the dashboard card grid; clearing here
+    // means non-dashboard views (and the zero-card dashboard) leave no stale
+    // card rects for the mouse hit-test.
+    ui.card_rects.clear();
 
     let active_mode_name = match tab_view {
         ActiveTabView::Dashboard { .. } | ActiveTabView::Orchestration { .. } => None,
@@ -5677,34 +6940,28 @@ fn render_frame(
         ])
         .split(area);
 
-        // Render the tab bar. Cap long labels so trailing tabs don't clip
-        // off the right edge of `Tabs`'s clipped output — every tab stays
-        // at least partially visible for click-to-switch.
-        let fitted_labels = fit_tab_labels(&tab_bar.labels, chunks[0].width);
-        let titles: Vec<Line> = fitted_labels
-            .iter()
-            .map(|l| Line::from(format!(" {l} ")))
-            .collect();
-        // Fill tab bar row with distinct background.
-        frame.render_widget(
-            Block::default().style(Style::default().bg(palette.tab_bar_bg)),
+        // PRD #80 M3: the Dashboard tab (always index 0) carries no close
+        // affordance; Mode and Orchestration tabs do. Pass the per-tab
+        // closeable mask to the tab-strip renderer, and record the clickable
+        // header / [×] rects for the mouse hit-test.
+        let closeable: Vec<bool> = (0..tab_bar.labels.len()).map(|i| i != 0).collect();
+        let strip = render_tab_strip(
+            frame,
             chunks[0],
+            &tab_bar.labels,
+            &closeable,
+            tab_bar.active_index,
+            &palette,
         );
-        // Active tab: inverted colors for high contrast.
-        let tabs_widget = Tabs::new(titles)
-            .select(tab_bar.active_index)
-            .style(Style::default().fg(palette.text_muted))
-            .highlight_style(
-                Style::default()
-                    .fg(palette.terminal_bg)
-                    .bg(palette.text_secondary)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .divider("│");
-        frame.render_widget(tabs_widget, chunks[0]);
+        ui.tab_header_rects = strip.headers;
+        ui.tab_close_rects = strip.closes;
 
         (chunks[1], chunks[2])
     } else {
+        // No tab strip this frame — drop any stale rects so a click can't hit a
+        // tab affordance that isn't on screen.
+        ui.tab_header_rects.clear();
+        ui.tab_close_rects.clear();
         let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
         (chunks[0], chunks[1])
     };
@@ -5732,7 +6989,6 @@ fn render_frame(
             hints_area,
             has_pane_control,
             active_mode_name,
-            tab_bar.show,
             focused_pane_id.as_deref(),
         );
         return;
@@ -5793,7 +7049,13 @@ fn render_frame(
         .style(Style::default().fg(palette.text_secondary))
         .centered();
         frame.render_widget(msg, vertical[1]);
-        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
+        render_bottom_bar(
+            frame,
+            ui,
+            hints_area,
+            has_pane_control,
+            &dashboard_context_buttons(!filtered.is_empty()),
+        );
 
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -5881,7 +7143,13 @@ fn render_frame(
             active_mode_name,
             palette,
         );
-        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
+        render_bottom_bar(
+            frame,
+            ui,
+            hints_area,
+            has_pane_control,
+            &dashboard_context_buttons(!filtered.is_empty()),
+        );
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -5945,9 +7213,10 @@ fn render_frame(
                 if n <= 9 { Some(n as u8) } else { None }
             };
             let idle_art = ids.get(col_idx).and_then(|id| ui.idle_art_cache.get(*id));
+            let card_area = col_chunks[col_idx];
             render_session_card(
                 frame,
-                col_chunks[col_idx],
+                card_area,
                 session,
                 tick,
                 is_selected,
@@ -5957,6 +7226,11 @@ fn render_frame(
                 palette,
                 idle_art,
             );
+            // PRD #80 M4: record this card's screen rect (paired with its flat
+            // selection index) for the mouse hit-test. Safe to mutate `ui` here
+            // — `display_name` / `idle_art` were the only live `ui` borrows and
+            // their last use was the `render_session_card` call above.
+            ui.card_rects.push((flat_index, card_area));
         }
     }
 
@@ -5971,7 +7245,13 @@ fn render_frame(
     );
 
     // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
+    render_bottom_bar(
+        frame,
+        ui,
+        hints_area,
+        has_pane_control,
+        &dashboard_context_buttons(!filtered.is_empty()),
+    );
 
     // Render terminal panes on the right side
     if let Some(right) = panes_area {
@@ -5997,29 +7277,56 @@ fn render_overlays(
     active_mode_name: Option<&str>,
     palette: ColorPalette,
 ) {
+    // PRD #80 M5/M7: rebuilt below for whichever modal/overlay is shown;
+    // cleared here so a click can't hit an affordance from a prior frame once
+    // the overlay closes.
+    ui.modal_button_rects.clear();
+    ui.picker_button_rects.clear();
+    ui.picker_row_rects.clear();
+    ui.form_field_rects.clear();
+    ui.form_chip_rects.clear();
+    ui.form_button_rects.clear();
     if ui.mode == UiMode::Help {
-        render_help_overlay(frame, &ui.keybindings, active_mode_name, palette);
+        ui.modal_button_rects =
+            render_help_overlay(frame, &ui.keybindings, active_mode_name, palette);
     }
-    if ui.mode == UiMode::DirPicker
-        && let Some(picker) = ui.dir_picker.as_mut()
-    {
-        render_dir_picker(frame, picker, palette);
+    if ui.mode == UiMode::DirPicker {
+        // Capture the picker's row/button rects after the `dir_picker` borrow
+        // ends so they can be stored back on `ui`.
+        let captured = ui
+            .dir_picker
+            .as_mut()
+            .map(|picker| render_dir_picker(frame, picker, palette));
+        if let Some((rows, buttons)) = captured {
+            ui.picker_row_rects = rows;
+            ui.picker_button_rects = buttons;
+        }
     }
-    if ui.mode == UiMode::NewPaneForm
-        && let Some(ref form) = ui.new_pane_form
-    {
-        render_new_pane_form(frame, form, palette);
+    if ui.mode == UiMode::NewPaneForm {
+        // Capture the form's field/chip/button rects after the `new_pane_form`
+        // borrow ends so they can be stored back on `ui`.
+        let captured = ui
+            .new_pane_form
+            .as_ref()
+            .map(|form| render_new_pane_form(frame, form, palette));
+        if let Some((fields, chips, buttons)) = captured {
+            ui.form_field_rects = fields;
+            ui.form_chip_rects = chips;
+            ui.form_button_rects = buttons;
+        }
     }
     if ui.mode == UiMode::StarPrompt {
-        render_star_prompt(frame, palette);
+        ui.modal_button_rects = render_star_prompt(frame, palette);
     }
     if ui.mode == UiMode::ConfigGenPrompt {
-        render_config_gen_prompt(frame, ui.config_gen_selected, palette);
+        ui.modal_button_rects = render_config_gen_prompt(frame, ui.config_gen_selected, palette);
     }
     if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame, ui.quit_confirm_selected, palette);
+        ui.modal_button_rects = render_quit_confirm(frame, ui.quit_confirm_selected, palette);
     }
     if ui.mode == UiMode::StopConfirm {
+        // M5 adds no buttons to the secondary Stop-confirm dialog (not in the
+        // contract); its keystrokes (y/n/Enter/Esc) remain the only path.
         render_stop_confirm(
             frame,
             ui.stop_confirm_selected,
@@ -6208,7 +7515,6 @@ fn render_mode_tab(
     hints_area: Rect,
     has_pane_control: bool,
     active_mode_name: Option<&str>,
-    show_tab_bar: bool,
     focused_pane_id: Option<&str>,
 ) {
     let palette = ui.palette;
@@ -6283,8 +7589,9 @@ fn render_mode_tab(
         }
     }
 
-    // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control, show_tab_bar, true);
+    // Full-width hints bar — mode tabs show only the global buttons (no
+    // dashboard context buttons).
+    render_bottom_bar(frame, ui, hints_area, has_pane_control, &[]);
 
     render_overlays(frame, ui, active_mode_name, palette);
 }
@@ -6354,13 +7661,118 @@ fn render_stats_bar(
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_bottom_bar(
+/// PRD #80 M2: the five global commands the persistent button bar exposes,
+/// each carrying its inline keyboard shortcut (so the bar doubles as the
+/// legend it replaced). The pane-dependent commands (New Pane / Close /
+/// Toggle Layout) are disabled — rendered dimmed — when no pane controller is
+/// available; Help and Quit are always actionable. Shortcuts mirror the
+/// keyboard handlers: `global_ctrl_action` (Ctrl+N/W/T), `?` → Help,
+/// Ctrl+C → Quit.
+fn global_bar_buttons(has_pane_control: bool) -> Vec<Button> {
+    vec![
+        // PRD #80 review FIX 3: New Pane is ALWAYS enabled — you can always
+        // create the first pane, even with no panes / controller yet.
+        Button::new("New Pane", "Ctrl+N", Action::NewPane, true),
+        Button::new("Close", "Ctrl+W", Action::CloseSelected, has_pane_control),
+        Button::new(
+            "Toggle Layout",
+            "Ctrl+T",
+            Action::ToggleLayout,
+            has_pane_control,
+        ),
+        Button::new("Help", "?", Action::ToggleHelp, true),
+        Button::new("Quit", "Ctrl+C", Action::Quit, true),
+    ]
+}
+
+/// PRD #80 M4: the dashboard-only context buttons appended to the global bar
+/// while on the dashboard in Normal mode, each carrying its inline shortcut.
+/// Filter is always actionable; Rename / Generate-config act on the selected
+/// card, so they're disabled (dimmed) when there are no cards — matching the
+/// `r` / `g` keys' `total > 0` guard.
+fn dashboard_context_buttons(has_cards: bool) -> Vec<Button> {
+    vec![
+        Button::new("Filter", "/", Action::EnterFilter, true),
+        Button::new("Rename", "r", Action::EnterRename, has_cards),
+        Button::new("Generate", "g", Action::RequestConfigGen, has_cards),
+    ]
+}
+
+/// PRD #80 M2: render the persistent global button bar into `area` (one row)
+/// and return the `(Action, Rect)` pairs to record in `UiState::button_rects`
+/// so a later click hit-tests back to the right action. Two-tier labels: the
+/// full `[Label Shortcut]` set when it fits the row width, otherwise the
+/// shortcut-only `[Shortcut]` fallback (the same width-pressure approach the
+/// old status legend faced). Buttons are separated by one space and laid out
+/// left to right; a button that would overflow the row is dropped whole rather
+/// than truncated mid-label, so every rendered button stays identifiable.
+fn render_button_bar(
     frame: &mut Frame,
-    ui: &UiState,
+    palette: &ColorPalette,
     area: Rect,
     has_pane_control: bool,
-    show_tab_bar: bool,
-    is_mode_tab: bool,
+    extra_buttons: &[Button],
+) -> Vec<(Action, Rect)> {
+    const SEP: u16 = 1;
+    // Global commands first, then any context-specific buttons (e.g. the
+    // dashboard's Filter / Rename / Generate). One funnel, one bar.
+    let mut buttons = global_bar_buttons(has_pane_control);
+    buttons.extend(extra_buttons.iter().cloned());
+
+    // Choose full vs shortcut-only based on whether the full set fits the row.
+    let full_width: u16 = buttons
+        .iter()
+        .map(|b| b.display_label().chars().count() as u16)
+        .sum::<u16>()
+        + SEP * (buttons.len().saturating_sub(1) as u16);
+    let use_full = full_width <= area.width;
+
+    let end = area.x.saturating_add(area.width);
+    let mut rects = Vec::with_capacity(buttons.len());
+    let buf = frame.buffer_mut();
+    let mut x = area.x;
+    for (i, button) in buttons.iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(SEP);
+        }
+        let label = if use_full {
+            button.display_label()
+        } else {
+            button.shortcut_only_label()
+        };
+        let w = label.chars().count() as u16;
+        if x.saturating_add(w) > end {
+            // Would overflow the row — drop this (and every later) button whole.
+            break;
+        }
+        let rect = Rect {
+            x,
+            y: area.y,
+            width: w,
+            height: 1,
+        };
+        let pair = if use_full {
+            button.render(rect, buf, palette)
+        } else {
+            button.render_compact(rect, buf, palette)
+        };
+        // PRD #80 review FIX 3: a disabled button renders dimmed but is inert —
+        // its rect is NOT recorded, so a click on it is a no-op (matching the
+        // keyboard, where the bound key is a silent no-op).
+        if button.enabled {
+            rects.push(pair);
+        }
+        x = x.saturating_add(w);
+    }
+    rects
+}
+
+fn render_bottom_bar(
+    frame: &mut Frame,
+    ui: &mut UiState,
+    area: Rect,
+    has_pane_control: bool,
+    extra_buttons: &[Button],
 ) {
     match ui.mode {
         UiMode::Filter => {
@@ -6377,6 +7789,14 @@ fn render_bottom_bar(
             // Show cursor
             let cursor_x = area.x + 2 + ui.filter_text.len() as u16;
             frame.set_cursor_position(Position::new(cursor_x, area.y));
+            // PRD #80 M6: inline [Apply] / [Cancel] buttons at the right edge,
+            // alongside the `/ <text>` input. Typing stays keyboard; clicking
+            // the field keeps it focused (handled in the mouse branch).
+            let buttons = [
+                Button::new("Apply", "", Action::ApplyFilter, true),
+                Button::new("Cancel", "", Action::CancelFilter, true),
+            ];
+            ui.button_rects = render_right_aligned_buttons(frame, &buttons, area, &ui.palette);
         }
         UiMode::Rename => {
             let line = Line::from(vec![
@@ -6391,55 +7811,151 @@ fn render_bottom_bar(
             frame.render_widget(Paragraph::new(line), area);
             let cursor_x = area.x + 8 + ui.rename_text.len() as u16;
             frame.set_cursor_position(Position::new(cursor_x, area.y));
+            // PRD #80 M6: inline [Save] / [Cancel] buttons at the right edge,
+            // alongside the `Rename: <text>` input.
+            let buttons = [
+                Button::new("Save", "", Action::SaveRename, true),
+                Button::new("Cancel", "", Action::CancelRename, true),
+            ];
+            ui.button_rects = render_right_aligned_buttons(frame, &buttons, area, &ui.palette);
+        }
+        UiMode::PaneInput => {
+            // PRD #80 M6: while interacting with a pane, keep the status
+            // message (e.g. "PaneInput mode …") on the left and expose the
+            // [Detach Ctrl+D] affordance at the right edge — clicking it
+            // returns to the dashboard exactly as Ctrl+D does.
+            if let Some((ref msg, _)) = ui.status_message {
+                let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
+                frame.render_widget(Paragraph::new(line), area);
+            }
+            let buttons = [Button::new(
+                "Detach",
+                "Ctrl+D",
+                Action::DetachToNormal,
+                true,
+            )];
+            ui.button_rects = render_right_aligned_buttons(frame, &buttons, area, &ui.palette);
         }
         _ => {
             if let Some((ref msg, _)) = ui.status_message {
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
+                // A transient status message occupies the bar row this frame;
+                // no buttons are drawn, so nothing is hit-testable.
+                ui.button_rects.clear();
             } else {
-                let tab_hint = if show_tab_bar {
-                    format!("  {MOD_KEY}+PgUp/PgDn: tabs")
-                } else {
-                    String::new()
-                };
-                let hints = if is_mode_tab {
-                    format!(
-                        "{}/{}: navigate panes  Enter: interact  Esc: agent pane  {}: close tab  {}: help  {MOD_KEY}+c: quit{tab_hint}",
-                        display_notation(&ui.keybindings, Action::MoveDown),
-                        display_notation(&ui.keybindings, Action::MoveUp),
-                        display_notation(&ui.keybindings, Action::ClosePane),
-                        display_notation(&ui.keybindings, Action::Help),
-                    )
-                } else if has_pane_control {
-                    format!("{}{tab_hint}", dashboard_hints_string(&ui.keybindings))
-                } else {
-                    format!("?: help  1-9: jump  {MOD_KEY}+c: quit{tab_hint}")
-                };
-                let mut spans = vec![Span::styled(
-                    hints,
-                    Style::default().fg(ui.palette.text_secondary),
-                )];
+                // PRD #80 M2: the persistent global button bar replaces the
+                // legacy status legend (no duplication — each button carries
+                // the same shortcut the legend used to show inline).
+                let rects =
+                    render_button_bar(frame, &ui.palette, area, has_pane_control, extra_buttons);
+                // Preserve the "update available" badge by right-aligning it
+                // after the bar when set (it's a separate notification, not the
+                // removed legend text).
                 if let Some(ref latest) = ui.update_available {
-                    spans.push(Span::raw("  "));
-                    spans.push(Span::styled(
-                        format!(
-                            " Update available: v{latest} (current: v{}) ",
-                            env!("DAD_VERSION")
-                        ),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ));
+                    let badge = format!(
+                        " Update available: v{latest} (current: v{}) ",
+                        env!("DAD_VERSION")
+                    );
+                    let bw = badge.chars().count() as u16;
+                    if bw < area.width {
+                        let badge_area = Rect {
+                            x: area.x + area.width - bw,
+                            y: area.y,
+                            width: bw,
+                            height: 1,
+                        };
+                        frame.render_widget(
+                            Paragraph::new(Line::styled(
+                                badge,
+                                Style::default()
+                                    .fg(Color::Black)
+                                    .bg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                            badge_area,
+                        );
+                    }
                 }
-                let line = Line::from(spans);
-                frame.render_widget(Paragraph::new(line), area);
+                ui.button_rects = rects;
             }
         }
     }
 }
 
-fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette) {
+/// PRD #80 M5: render a left-aligned row of modal buttons into `row` and
+/// return their `(Action, Rect)` pairs for the mouse hit-test. Modal buttons
+/// always use full `[Label]` labels (the popups are sized to fit them); a
+/// button that would overflow `row` is dropped whole. Indented by `indent`
+/// cells to align with the popup's body text.
+fn render_modal_button_row(
+    frame: &mut Frame,
+    buttons: &[Button],
+    row: Rect,
+    indent: u16,
+    palette: &ColorPalette,
+) -> Vec<(Action, Rect)> {
+    const SEP: u16 = 1;
+    let end = row.x.saturating_add(row.width);
+    let mut rects = Vec::with_capacity(buttons.len());
+    let buf = frame.buffer_mut();
+    let mut x = row.x.saturating_add(indent);
+    for (i, button) in buttons.iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(SEP);
+        }
+        let w = button.display_label().chars().count() as u16;
+        if x.saturating_add(w) > end {
+            break;
+        }
+        let rect = Rect {
+            x,
+            y: row.y,
+            width: w,
+            height: 1,
+        };
+        let pair = button.render(rect, buf, palette);
+        // PRD #80 review FIX 3: disabled buttons render dimmed but are inert —
+        // don't record their rect.
+        if button.enabled {
+            rects.push(pair);
+        }
+        x = x.saturating_add(w);
+    }
+    rects
+}
+
+/// PRD #80 M6: render `buttons` right-aligned within `area` (one row) and
+/// return their `(Action, Rect)` pairs. Used by the inline-edit rows
+/// (filter / rename) and the PaneInput detach affordance, which keep their
+/// prompt / status text on the left and place the buttons at the right edge.
+fn render_right_aligned_buttons(
+    frame: &mut Frame,
+    buttons: &[Button],
+    area: Rect,
+    palette: &ColorPalette,
+) -> Vec<(Action, Rect)> {
+    const SEP: u16 = 1;
+    let total: u16 = buttons
+        .iter()
+        .map(|b| b.display_label().chars().count() as u16)
+        .sum::<u16>()
+        + SEP * (buttons.len().saturating_sub(1) as u16);
+    let bx = area.x + area.width.saturating_sub(total);
+    let row = Rect {
+        x: bx,
+        y: area.y,
+        width: total,
+        height: 1,
+    };
+    render_modal_button_row(frame, buttons, row, 0, palette)
+}
+
+fn render_quit_confirm(
+    frame: &mut Frame,
+    selected: usize,
+    palette: ColorPalette,
+) -> Vec<(Action, Rect)> {
     let area = frame.area();
     let popup_width = 64u16.min(area.width.saturating_sub(4));
     let popup_height = 10u16.min(area.height.saturating_sub(4));
@@ -6504,6 +8020,22 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
         .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
+
+    // PRD #80 M5: explicit clickable buttons ALONGSIDE the option list above.
+    // Drawn on the blank row just above the keyboard hint. [Stop] resolves
+    // like Enter-on-Stop (see Action::RequestStop).
+    let buttons = [
+        Button::new("Detach", "", Action::DetachAndQuit, true),
+        Button::new("Stop", "", Action::RequestStop, true),
+        Button::new("Cancel", "", Action::DismissModal, true),
+    ];
+    let btn_row = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + popup_area.height.saturating_sub(3),
+        width: popup_area.width.saturating_sub(2),
+        height: 1,
+    };
+    render_modal_button_row(frame, &buttons, btn_row, 1, &palette)
 }
 
 /// PRD #92 F1: secondary y/n confirmation dialog when the user picked
@@ -6576,7 +8108,7 @@ fn render_stop_confirm(
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
+fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) -> Vec<(Action, Rect)> {
     let area = frame.area();
     let popup_width = 50u16.min(area.width.saturating_sub(4));
     let popup_height = 10u16.min(area.height.saturating_sub(4));
@@ -6623,9 +8155,29 @@ fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
 
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
+
+    // PRD #80 M5: explicit clickable buttons alongside the existing hint line
+    // (the `s Star  l Later  d Don't ask again` row stays). Drawn on the last
+    // inner row so neither the URL nor the hint is clobbered.
+    let buttons = [
+        Button::new("Star", "", Action::StarConfirm, true),
+        Button::new("Snooze", "", Action::StarSnooze, true),
+        Button::new("Dismiss", "", Action::StarDismiss, true),
+    ];
+    let btn_row = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + popup_area.height.saturating_sub(2),
+        width: popup_area.width.saturating_sub(2),
+        height: 1,
+    };
+    render_modal_button_row(frame, &buttons, btn_row, 1, &palette)
 }
 
-fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPalette) {
+fn render_config_gen_prompt(
+    frame: &mut Frame,
+    selected: usize,
+    palette: ColorPalette,
+) -> Vec<(Action, Rect)> {
     let area = frame.area();
     let popup_width = 60u16.min(area.width.saturating_sub(4));
     let popup_height = 14u16.min(area.height.saturating_sub(4));
@@ -6697,6 +8249,20 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPa
 
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
+
+    // PRD #80 M5: explicit clickable buttons alongside the option list.
+    let buttons = [
+        Button::new("Yes", "", Action::ConfigGenConfirm, true),
+        Button::new("No", "", Action::ConfigGenDismiss, true),
+        Button::new("Never", "", Action::ConfigGenSuppress, true),
+    ];
+    let btn_row = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + popup_area.height.saturating_sub(3),
+        width: popup_area.width.saturating_sub(2),
+        height: 1,
+    };
+    render_modal_button_row(frame, &buttons, btn_row, 1, &palette)
 }
 
 /// Format one help row: a key column (left-padded to a fixed width so the
@@ -6711,7 +8277,7 @@ fn help_key_line(keys: &str, desc: &str) -> Line<'static> {
 /// and hints bar, with `(unbound)` substituted for the empty string so an
 /// unbound action never renders as a bare key column (`: new`). Shared by both
 /// renderers so they can't drift (Greptile P2).
-fn display_notation(keybindings: &KeybindingConfig, action: Action) -> String {
+fn display_notation(keybindings: &KeybindingConfig, action: KbAction) -> String {
     let s = keybindings.notation(action);
     if s.is_empty() {
         "(unbound)".to_string()
@@ -6725,16 +8291,16 @@ fn display_notation(keybindings: &KeybindingConfig, action: Action) -> String {
 /// default help/hints stay byte-for-byte unchanged; once any jump is remapped
 /// it lists the actual notations (slash-joined) so the remap is visible.
 fn jump_range_notation(keybindings: &KeybindingConfig) -> String {
-    const JUMPS: [Action; 9] = [
-        Action::Jump1,
-        Action::Jump2,
-        Action::Jump3,
-        Action::Jump4,
-        Action::Jump5,
-        Action::Jump6,
-        Action::Jump7,
-        Action::Jump8,
-        Action::Jump9,
+    const JUMPS: [KbAction; 9] = [
+        KbAction::Jump1,
+        KbAction::Jump2,
+        KbAction::Jump3,
+        KbAction::Jump4,
+        KbAction::Jump5,
+        KbAction::Jump6,
+        KbAction::Jump7,
+        KbAction::Jump8,
+        KbAction::Jump9,
     ];
     let all_default = JUMPS
         .iter()
@@ -6764,13 +8330,13 @@ fn dashboard_hints_string(keybindings: &KeybindingConfig) -> String {
     // fixed string rather than a config-derived notation.
     format!(
         "{}: new  {}: close  {}: layout  {}: dashboard ({} {} {})  Ctrl+c: quit",
-        display_notation(keybindings, Action::NewPane),
-        display_notation(keybindings, Action::ClosePane),
-        display_notation(keybindings, Action::ToggleLayout),
-        display_notation(keybindings, Action::Dashboard),
+        display_notation(keybindings, KbAction::NewPane),
+        display_notation(keybindings, KbAction::ClosePane),
+        display_notation(keybindings, KbAction::ToggleLayout),
+        display_notation(keybindings, KbAction::Dashboard),
         jump_range_notation(keybindings),
-        display_notation(keybindings, Action::Help),
-        display_notation(keybindings, Action::Filter),
+        display_notation(keybindings, KbAction::Help),
+        display_notation(keybindings, KbAction::Filter),
     )
 }
 
@@ -6778,8 +8344,9 @@ fn dashboard_hints_string(keybindings: &KeybindingConfig) -> String {
 /// arbitrary [`KeybindingConfig`] into a standalone `Buffer` for snapshot
 /// testing. Mirrors [`render_card_to_buffer`] — a `TestBackend` of the given
 /// size, drawn through the *same* `render_help_overlay` code path the live UI
-/// uses, so the snapshot and the running overlay can never drift.
-pub fn render_help_overlay_to_buffer(
+/// uses, so the snapshot and the running overlay can never drift. (The
+/// default-bindings PRD #80 seam is [`render_help_overlay_to_buffer`].)
+pub fn render_help_overlay_with_bindings_to_buffer(
     keybindings: &KeybindingConfig,
     active_mode_name: Option<&str>,
     palette: ColorPalette,
@@ -6793,7 +8360,9 @@ pub fn render_help_overlay_to_buffer(
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     terminal
         .draw(|frame| {
-            render_help_overlay(frame, keybindings, active_mode_name, palette);
+            // The live overlay returns its clickable button rects; the
+            // snapshot path doesn't need them.
+            let _ = render_help_overlay(frame, keybindings, active_mode_name, palette);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -6838,7 +8407,7 @@ fn render_help_overlay(
     keybindings: &KeybindingConfig,
     active_mode_name: Option<&str>,
     palette: ColorPalette,
-) {
+) -> Vec<(Action, Rect)> {
     let cyan = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
@@ -6847,15 +8416,15 @@ fn render_help_overlay(
     // has cleared the binding (`action = ""`), so the overlay is honest about
     // a key that no longer fires. Shared with the hints bar via
     // `display_notation` so the two renderers can't drift.
-    let n = |action: Action| -> String { display_notation(keybindings, action) };
+    let n = |action: KbAction| -> String { display_notation(keybindings, action) };
 
     let left: Vec<Line> = vec![
         Line::styled("  Global (works from any pane)", cyan),
         Line::from(""),
-        help_key_line(&n(Action::Dashboard), "Command mode (dashboard)"),
-        help_key_line(&n(Action::NewPane), "Create new pane"),
-        help_key_line(&n(Action::ClosePane), "Close selected pane"),
-        help_key_line(&n(Action::ToggleLayout), "Toggle layout (stacked/tiled)"),
+        help_key_line(&n(KbAction::Dashboard), "Command mode (dashboard)"),
+        help_key_line(&n(KbAction::NewPane), "Create new pane"),
+        help_key_line(&n(KbAction::ClosePane), "Close selected pane"),
+        help_key_line(&n(KbAction::ToggleLayout), "Toggle layout (stacked/tiled)"),
         // Quit is not a remappable action: Ctrl+C (non-overridable) opens the
         // Detach/Stop/Cancel modal, so the help row is a fixed string.
         help_key_line("Ctrl+c", "Quit"),
@@ -6863,11 +8432,11 @@ fn render_help_overlay(
         Line::styled("  Tab Navigation", cyan),
         Line::from(""),
         help_key_line(
-            &format!("Tab / Right / {}", n(Action::MoveRight)),
+            &format!("Tab / Right / {}", n(KbAction::MoveRight)),
             "Next tab",
         ),
         help_key_line(
-            &format!("Shift+Tab / Left / {}", n(Action::MoveLeft)),
+            &format!("Shift+Tab / Left / {}", n(KbAction::MoveLeft)),
             "Prev tab",
         ),
         help_key_line(&format!("{MOD_KEY}+PgDn"), "Next tab"),
@@ -6876,46 +8445,46 @@ fn render_help_overlay(
         Line::styled("  Dashboard (command mode)", cyan),
         Line::from(""),
         help_key_line(
-            &format!("{} / Down", n(Action::MoveDown)),
+            &format!("{} / Down", n(KbAction::MoveDown)),
             "Select next card",
         ),
         help_key_line(
-            &format!("{} / Up", n(Action::MoveUp)),
+            &format!("{} / Up", n(KbAction::MoveUp)),
             "Select previous card",
         ),
         help_key_line(&jump_range_notation(keybindings), "Jump to pane N"),
-        help_key_line(&n(Action::FocusPane), "Focus selected pane"),
-        help_key_line(&n(Action::Filter), "Filter sessions"),
-        help_key_line(&n(Action::ClearFilter), "Clear filter"),
-        help_key_line(&n(Action::Rename), "Rename session"),
+        help_key_line(&n(KbAction::FocusPane), "Focus selected pane"),
+        help_key_line(&n(KbAction::Filter), "Filter sessions"),
+        help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
+        help_key_line(&n(KbAction::Rename), "Rename session"),
         help_key_line("g", "Generate .dot-agent-deck.toml"),
         help_key_line(
             &format!(
                 "{} / {}",
-                n(Action::ApprovePermission),
-                n(Action::DenyPermission)
+                n(KbAction::ApprovePermission),
+                n(KbAction::DenyPermission)
             ),
             "Approve / deny permission",
         ),
-        help_key_line(&n(Action::Help), "Toggle this help"),
+        help_key_line(&n(KbAction::Help), "Toggle this help"),
     ];
 
     let mut right: Vec<Line> = vec![
         Line::styled("  Mode Tab (in-tab navigation)", cyan),
         Line::from(""),
         help_key_line(
-            &format!("{} / Down", n(Action::MoveDown)),
+            &format!("{} / Down", n(KbAction::MoveDown)),
             "Focus next pane",
         ),
         help_key_line(
-            &format!("{} / Up", n(Action::MoveUp)),
+            &format!("{} / Up", n(KbAction::MoveUp)),
             "Focus previous pane",
         ),
         Line::from("  Enter           Enter PaneInput on selected"),
         Line::from("  Esc             Deselect side pane"),
         Line::from("  Mouse click     Focus pane"),
         Line::from("  Ctrl+click      Open hyperlink"),
-        help_key_line(&n(Action::Dashboard), "Return to Normal mode"),
+        help_key_line(&n(KbAction::Dashboard), "Return to Normal mode"),
         Line::from(""),
         Line::styled("  New Agent Form", cyan),
         Line::from(""),
@@ -6989,9 +8558,34 @@ fn render_help_overlay(
         ),
     ]);
     frame.render_widget(footer, footer_area);
+
+    // PRD #80 M5: explicit clickable [Close] button alongside the existing
+    // "Press ? or Esc to close" hint. Drawn on the footer's blank first row.
+    let close_button = [Button::new("Close", "", Action::ToggleHelp, true)];
+    let btn_row = Rect {
+        x: footer_area.x,
+        y: footer_area.y,
+        width: footer_area.width,
+        height: 1,
+    };
+    render_modal_button_row(frame, &close_button, btn_row, 2, &palette)
 }
 
-fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: ColorPalette) {
+/// PRD #80 M7: clickable geometry returned by [`render_dir_picker`] — the row
+/// rects (each paired with its index into `DirPickerState.filtered_indices`)
+/// and the `[Confirm]`/`[Cancel]`/`[Filter]` button rects.
+type PickerClickTargets = (Vec<(usize, Rect)>, Vec<(Action, Rect)>);
+
+/// Renders the directory picker and returns its clickable geometry:
+/// `(row_rects, button_rects)`. `row_rects` pairs each visible entry's screen
+/// `Rect` with its index into `filtered_indices` (matching
+/// `DirPickerState.selected`); `button_rects` carries the `[Confirm]` /
+/// `[Cancel]` / `[Filter]` affordances. PRD #80 M7.
+fn render_dir_picker(
+    frame: &mut Frame,
+    picker: &mut DirPickerState,
+    palette: ColorPalette,
+) -> PickerClickTargets {
     let area = frame.area();
     let popup_width = 60.min(area.width.saturating_sub(4));
     let popup_height = 20u16.min(area.height.saturating_sub(4));
@@ -7002,8 +8596,10 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
     frame.render_widget(Clear, popup_area);
 
     // Reserve lines so controls remain visible regardless of list length.
+    // PRD #80 M7 adds one reserved line for the [Confirm]/[Cancel]/[Filter]
+    // button row.
     let show_filter_row = picker.filtering || !picker.filter_text.is_empty();
-    let mut reserved_lines = 5; // current dir + blank + blank + two footer lines
+    let mut reserved_lines = 6; // current dir + blank + blank + button row + two footers
     if show_filter_row {
         reserved_lines += 1;
     }
@@ -7035,6 +8631,12 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
     }
 
     lines.push(Line::from(""));
+
+    // Screen y of line index `n` within the popup (inside the top border).
+    let line_y = |n: usize| popup_area.y + 1 + n as u16;
+    let row_x = popup_area.x + 1;
+    let row_width = popup_area.width.saturating_sub(2);
+    let mut row_rects: Vec<(usize, Rect)> = Vec::new();
 
     if picker.filtered_indices.is_empty() {
         let message = if picker.entries.is_empty() {
@@ -7073,10 +8675,25 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
                 Style::default()
             };
             let suffix = if is_parent { "" } else { "/" };
+            let line_idx = lines.len();
             lines.push(Line::styled(format!("{prefix}{name}{suffix}"), style));
+            // Record this row's clickable rect, keyed by its filtered-list
+            // index `i` (== what `picker.selected` holds).
+            row_rects.push((
+                i,
+                Rect {
+                    x: row_x,
+                    y: line_y(line_idx),
+                    width: row_width,
+                    height: 1,
+                },
+            ));
         }
     }
 
+    lines.push(Line::from(""));
+    // PRD #80 M7: reserved button row (rendered over after the Paragraph).
+    let button_line_idx = lines.len();
     lines.push(Line::from(""));
     let nav_footer = if picker.filtering {
         "  ↑↓: move between matches  Backspace: delete  q: cancel"
@@ -7106,6 +8723,23 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: Co
         .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
+
+    // PRD #80 M7: clickable [Confirm] / [Cancel] / [Filter] affordances on the
+    // reserved button row, alongside the footer hints.
+    let buttons = [
+        Button::new("Confirm", "", Action::PickerConfirm, true),
+        Button::new("Cancel", "", Action::PickerCancel, true),
+        Button::new("Filter", "", Action::PickerFilter, true),
+    ];
+    let btn_row = Rect {
+        x: row_x,
+        y: line_y(button_line_idx),
+        width: row_width,
+        height: 1,
+    };
+    let button_rects = render_modal_button_row(frame, &buttons, btn_row, 1, &palette);
+
+    (row_rects, button_rects)
 }
 
 /// Footer-hint string for the unified new-pane form. Factored out so the
@@ -7124,7 +8758,21 @@ fn new_pane_form_footer_hint(has_mode_field: bool, name_submits: bool) -> &'stat
     }
 }
 
-fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: ColorPalette) {
+/// PRD #80 M8: clickable geometry returned by [`render_new_pane_form`] — the
+/// field rows (each paired with the [`FormField`] it focuses), the mode chips
+/// (each paired with its option index), and the `[Submit]`/`[Cancel]` button
+/// rects.
+type FormClickTargets = (
+    Vec<(FormField, Rect)>,
+    Vec<(usize, Rect)>,
+    Vec<(Action, Rect)>,
+);
+
+fn render_new_pane_form(
+    frame: &mut Frame,
+    form: &NewPaneFormState,
+    palette: ColorPalette,
+) -> FormClickTargets {
     let area = frame.area();
     let popup_width = 56.min(area.width.saturating_sub(4));
     // The mode field (when modes exist) or the tip line (when they don't)
@@ -7148,11 +8796,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
         .add_modifier(Modifier::BOLD);
     let unfocused_label = Style::default().fg(palette.text_secondary);
 
-    let mode_style = if form.focused == FormField::Mode {
-        focused_label
-    } else {
-        unfocused_label
-    };
     let name_style = if form.focused == FormField::Name {
         focused_label
     } else {
@@ -7173,8 +8816,15 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
         Line::from(""),
     ];
 
-    // Mode field (only when modes are available)
-    if !form.has_mode_field {
+    // PRD #80 M8: the Mode field is now a row of clickable chips (one per
+    // option, including "No mode"), overlaid after the Paragraph render so each
+    // chip gets its own rect. Reserve its blank line here.
+    let mut mode_line_idx: Option<usize> = None;
+    if form.has_mode_field {
+        mode_line_idx = Some(lines.len());
+        lines.push(Line::from(""));
+        lines.push(Line::from(""));
+    } else {
         // No .dot-agent-deck.toml or no modes — show a contextual hint.
         lines.push(Line::styled(
             "  Tip: press g on dashboard to create modes",
@@ -7184,25 +8834,8 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
         ));
         lines.push(Line::from(""));
     }
-    if form.has_mode_field {
-        let mode_name = form.mode_display_name();
-        let mode_value = if form.focused == FormField::Mode {
-            format!("\u{25c0} {mode_name} \u{25b6}")
-        } else {
-            mode_name.to_string()
-        };
-        let mode_value_style = if form.focused == FormField::Mode {
-            Style::default().fg(palette.text_primary)
-        } else {
-            unfocused_label
-        };
-        lines.push(Line::from(vec![
-            Span::styled("  Mode:    ", mode_style),
-            Span::styled(mode_value, mode_value_style),
-        ]));
-        lines.push(Line::from(""));
-    }
 
+    let name_line_idx = lines.len();
     lines.push(Line::from(vec![
         Span::styled("  Name:    ", name_style),
         Span::styled(
@@ -7218,8 +8851,10 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
             },
         ),
     ]));
+    let mut cmd_line_idx: Option<usize> = None;
     if cmd_visible {
         lines.push(Line::from(""));
+        cmd_line_idx = Some(lines.len());
         lines.push(Line::from(vec![
             Span::styled("  Command: ", cmd_style),
             Span::styled(
@@ -7237,6 +8872,8 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
         ]));
     }
     lines.push(Line::from(""));
+    // PRD #80 M8: reserve a row for the [Submit]/[Cancel] buttons (overlaid).
+    let submit_line_idx = lines.len();
     lines.push(Line::from(""));
 
     // PRD #106 follow-up: when the Command field is hidden (orchestration
@@ -7261,21 +8898,122 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 
-    // Show cursor in the active text field (not for Mode which uses arrow cycling)
-    if form.focused != FormField::Mode {
-        let cursor_y = match form.focused {
-            FormField::Name => popup_area.y + 3 + mode_extra,
-            FormField::Command => popup_area.y + 5 + mode_extra,
-            FormField::Mode => unreachable!(),
-        };
-        let field_text = match form.focused {
-            FormField::Name => &form.name,
-            FormField::Command => &form.command,
-            FormField::Mode => unreachable!(),
-        };
-        let cursor_x = popup_area.x + 12 + field_text.len() as u16;
-        frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    // ── Clickable geometry (overlaid / computed after the Paragraph) ────────
+    let line_y = |n: usize| popup_area.y + 1 + n as u16;
+    let row_x = popup_area.x + 1;
+    let row_width = popup_area.width.saturating_sub(2);
+    let inner_end = row_x + row_width;
+
+    let mut field_rects: Vec<(FormField, Rect)> = Vec::new();
+    field_rects.push((
+        FormField::Name,
+        Rect {
+            x: row_x,
+            y: line_y(name_line_idx),
+            width: row_width,
+            height: 1,
+        },
+    ));
+    if let Some(ci) = cmd_line_idx {
+        field_rects.push((
+            FormField::Command,
+            Rect {
+                x: row_x,
+                y: line_y(ci),
+                width: row_width,
+                height: 1,
+            },
+        ));
     }
+
+    // Mode chip row: render `  Mode: ` then one `[name]` chip per option, the
+    // selected one highlighted. Each chip records its own clickable rect.
+    let mut chip_rects: Vec<(usize, Rect)> = Vec::new();
+    if let Some(mi) = mode_line_idx {
+        let mode_y = line_y(mi);
+        // Whole row (off-chip clicks focus the Mode field).
+        field_rects.push((
+            FormField::Mode,
+            Rect {
+                x: row_x,
+                y: mode_y,
+                width: row_width,
+                height: 1,
+            },
+        ));
+        let mode_label_style = if form.focused == FormField::Mode {
+            focused_label
+        } else {
+            unfocused_label
+        };
+        let selected_style = Style::default()
+            .fg(palette.terminal_bg)
+            .bg(palette.text_secondary)
+            .add_modifier(Modifier::BOLD);
+        let chip_style = Style::default().fg(palette.text_secondary);
+        let buf = frame.buffer_mut();
+        let mut cx = row_x;
+        let (after, _) = buf.set_span(
+            cx,
+            mode_y,
+            &Span::styled("  Mode: ", mode_label_style),
+            inner_end.saturating_sub(cx),
+        );
+        cx = after;
+        for i in 0..form.mode_option_count() {
+            if cx >= inner_end {
+                break;
+            }
+            cx += 1; // space between chips
+            let chip = format!("[{}]", form.mode_option_name(i));
+            let w = chip.chars().count() as u16;
+            if cx.saturating_add(w) > inner_end {
+                break;
+            }
+            let style = if i == form.selection_index {
+                selected_style
+            } else {
+                chip_style
+            };
+            let (after, _) = buf.set_span(cx, mode_y, &Span::styled(chip, style), inner_end - cx);
+            chip_rects.push((
+                i,
+                Rect {
+                    x: cx,
+                    y: mode_y,
+                    width: w,
+                    height: 1,
+                },
+            ));
+            cx = after;
+        }
+    }
+
+    // [Submit] / [Cancel] buttons on the reserved row.
+    let buttons = [
+        Button::new("Submit", "", Action::FormSubmit, true),
+        Button::new("Cancel", "", Action::FormCancel, true),
+    ];
+    let btn_row = Rect {
+        x: row_x,
+        y: line_y(submit_line_idx),
+        width: row_width,
+        height: 1,
+    };
+    let button_rects = render_modal_button_row(frame, &buttons, btn_row, 1, &palette);
+
+    // Cursor in the active text field (Mode uses chips, so no cursor there).
+    if form.focused == FormField::Name {
+        let cursor_x = popup_area.x + 12 + form.name.len() as u16;
+        frame.set_cursor_position(Position::new(cursor_x, line_y(name_line_idx)));
+    } else if form.focused == FormField::Command
+        && let Some(ci) = cmd_line_idx
+    {
+        let cursor_x = popup_area.x + 12 + form.command.len() as u16;
+        frame.set_cursor_position(Position::new(cursor_x, line_y(ci)));
+    }
+
+    (field_rects, chip_rects, button_rects)
 }
 
 /// Convert screen-absolute mouse coordinates to pane-relative coordinates.
@@ -7845,16 +9583,11 @@ pub fn render_card_to_buffer(
     terminal.backend().buffer().clone()
 }
 
-/// L1 harness helper — render a vertical stack of dashboard cards into a
-/// fresh `TestBackend` buffer, highlighting the card at `selected_index`
-/// exactly as the live grid does (`is_selected = flat_index ==
-/// selected_index`, see `render_frame`). Mirrors `render_card_to_buffer`
-/// but for the multi-card selection case, so an L1 snapshot can prove the
-/// highlight follows the derived selection rather than defaulting to the
-/// top card. See PRD #83 catalog entry `dashboard/pane/005`.
-///
-/// `cards` is the visible card list as `(session, display_name)` pairs in
-/// render order; one column, one card per row.
+/// PRD #83 M3/M4 seam: render a vertical stack of dashboard cards into a
+/// `Buffer` for L1 tests, highlighting the card at `selected_index`. Mirrors
+/// [`render_card_to_buffer`] but lays out multiple cards exactly as the live
+/// dashboard does, so a test can assert that the selection highlight follows
+/// the derived `selected_index` (see `sync_and_derive_selection`).
 #[doc(hidden)]
 pub fn render_dashboard_cards_to_buffer(
     cards: &[(&SessionState, Option<&str>)],
@@ -7913,6 +9646,263 @@ pub fn render_dashboard_cards_to_buffer(
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
+}
+
+/// PRD #80 M2: render the persistent global button bar into a one-row
+/// `Buffer` for L1 tests, mirroring [`render_card_to_buffer`]. Drives the
+/// production bottom-bar renderer (`render_bottom_bar`) through a
+/// `TestBackend` so a test can assert on the rendered cells without a PTY.
+/// `width` is the terminal width — vary it to exercise the comfortable-width
+/// full-label layout and the narrow-terminal shortcut-only fallback. The bar
+/// occupies a single row, so the returned buffer is `width × 1`.
+pub fn render_button_bar_to_buffer(width: u16, palette: ColorPalette) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, 1);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let mut ui = UiState::new(
+        DashboardConfig::default(),
+        palette,
+        KeybindingConfig::default(),
+    );
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 1,
+            };
+            // has_pane_control = true → the richest legacy legend today;
+            // after M2 this site renders the always-visible global button bar.
+            render_bottom_bar(frame, &mut ui, area, true, &[]);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #80 M6 L1 seam: render the filter-mode bottom row (the inline filter
+/// input carrying `filter_text`) into a one-row `Buffer`. After M6 this row
+/// also renders the inline `[Apply]` / `[Cancel]` buttons at its right edge.
+/// Mirrors [`render_button_bar_to_buffer`].
+pub fn render_filter_bar_to_buffer(
+    filter_text: &str,
+    width: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, 1);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let mut ui = UiState::new(
+        DashboardConfig::default(),
+        palette,
+        KeybindingConfig::default(),
+    );
+    ui.mode = UiMode::Filter;
+    ui.filter_text = filter_text.to_string();
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 1,
+            };
+            render_bottom_bar(frame, &mut ui, area, false, &[]);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #80 M6 L1 seam: render the rename-mode bottom row (the inline rename
+/// input carrying `rename_text`) into a one-row `Buffer`. After M6 this row
+/// also renders the inline `[Save]` / `[Cancel]` buttons at its right edge.
+/// Mirrors [`render_button_bar_to_buffer`].
+pub fn render_rename_bar_to_buffer(
+    rename_text: &str,
+    width: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, 1);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let mut ui = UiState::new(
+        DashboardConfig::default(),
+        palette,
+        KeybindingConfig::default(),
+    );
+    ui.mode = UiMode::Rename;
+    ui.rename_text = rename_text.to_string();
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 1,
+            };
+            render_bottom_bar(frame, &mut ui, area, false, &[]);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #80 M3: render the top tab strip into a one-row `Buffer` for L1
+/// tests, mirroring [`render_button_bar_to_buffer`]. Drives the production
+/// [`render_tab_strip`] through a `TestBackend` so a test can assert on the
+/// rendered cells (e.g. the presence of a `[×]` close glyph on Mode /
+/// Orchestration tabs and its absence on the Dashboard tab) without a PTY.
+/// `closeable[i]` marks whether tab `i` carries a close affordance.
+pub fn render_tab_bar_to_buffer(
+    labels: &[&str],
+    closeable: &[bool],
+    active_index: usize,
+    width: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let owned: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
+    let backend = TestBackend::new(width, 1);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 1,
+            };
+            render_tab_strip(frame, area, &owned, closeable, active_index, &palette);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #80 M5: render a full-screen frame and run `draw_fn` inside it,
+/// returning the resulting `Buffer`. Backs the per-modal L1 render seams
+/// below so each one drives the *production* modal renderer through a
+/// `TestBackend` — when M5 adds clickable buttons to a modal renderer, the
+/// matching seam's buffer shows them automatically. Mirrors
+/// [`render_button_bar_to_buffer`] / [`render_tab_bar_to_buffer`].
+fn render_overlay_to_buffer(
+    width: u16,
+    height: u16,
+    draw_fn: impl FnOnce(&mut Frame),
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| draw_fn(frame))
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #80 M5 L1 seam: render the quit-confirm modal (option `selected`).
+pub fn render_quit_confirm_to_buffer(
+    selected: usize,
+    width: u16,
+    height: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    render_overlay_to_buffer(width, height, |frame| {
+        render_quit_confirm(frame, selected, palette);
+    })
+}
+
+/// PRD #80 M5 L1 seam: render the config-generation prompt (option `selected`).
+pub fn render_config_gen_prompt_to_buffer(
+    selected: usize,
+    width: u16,
+    height: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    render_overlay_to_buffer(width, height, |frame| {
+        render_config_gen_prompt(frame, selected, palette);
+    })
+}
+
+/// PRD #80 M5 L1 seam: render the star-prompt modal.
+pub fn render_star_prompt_to_buffer(
+    width: u16,
+    height: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    render_overlay_to_buffer(width, height, |frame| {
+        render_star_prompt(frame, palette);
+    })
+}
+
+/// PRD #80 M5 L1 seam: render the help overlay (default keybindings). The
+/// PRD #40 keybinding-aware seam is [`render_help_overlay_with_bindings_to_buffer`].
+pub fn render_help_overlay_to_buffer(
+    width: u16,
+    height: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    let keybindings = KeybindingConfig::default();
+    render_overlay_to_buffer(width, height, |frame| {
+        let _ = render_help_overlay(frame, &keybindings, None, palette);
+    })
+}
+
+/// PRD #80 M7 L1 seam: render the directory picker rooted at `start` into a
+/// `Buffer`. Drives the production `render_dir_picker` through a
+/// `TestBackend`; after M7 the picker chrome carries clickable `[Confirm]` /
+/// `[Cancel]` / filter affordances, which this seam's buffer then shows.
+/// Mirrors [`render_button_bar_to_buffer`].
+pub fn render_dir_picker_to_buffer(
+    start: std::path::PathBuf,
+    width: u16,
+    height: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    let mut picker = DirPickerState::new(start);
+    render_overlay_to_buffer(width, height, |frame| {
+        render_dir_picker(frame, &mut picker, palette);
+    })
+}
+
+/// PRD #80 M8 L1 seam: render the new-pane form with the given `modes` as
+/// selectable mode options into a `Buffer`. Drives the production
+/// `render_new_pane_form` through a `TestBackend`; after M8 the form renders
+/// clickable mode chips and `[Submit]` / `[Cancel]` buttons, which this
+/// seam's buffer then shows. Mirrors [`render_button_bar_to_buffer`].
+pub fn render_new_pane_form_to_buffer(
+    mode_names: &[&str],
+    width: u16,
+    height: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    let modes: Vec<ModeConfig> = mode_names
+        .iter()
+        .map(|n| ModeConfig {
+            name: (*n).to_string(),
+            init_command: None,
+            panes: Vec::new(),
+            rules: Vec::new(),
+            reactive_panes: 0,
+        })
+        .collect();
+    let form = NewPaneFormState::new(
+        std::path::PathBuf::from("/tmp/project"),
+        "myname".to_string(),
+        "mycmd".to_string(),
+        modes,
+        Vec::new(),
+    );
+    render_overlay_to_buffer(width, height, |frame| {
+        render_new_pane_form(frame, &form, palette);
+    })
 }
 
 #[cfg(test)]
@@ -10457,39 +12447,53 @@ mod tests {
         let mut ui = default_ui();
         assert_eq!(ui.mode, UiMode::Normal);
 
-        // Normal -> Filter
-        handle_normal_key(
+        // Normal -> Filter: PRD #80 M4 routes `/` through `dispatch_action`
+        // (shared by the `[Filter /]` button), so the handler returns
+        // `Action::EnterFilter` rather than flipping the mode inline.
+        let filter_action = handle_normal_key(
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
             &mut ui,
             3,
             None,
         );
+        assert!(matches!(filter_action, Action::EnterFilter));
+        ui.mode = UiMode::Filter;
         assert_eq!(ui.mode, UiMode::Filter);
 
         // Filter -> Normal (Esc)
         handle_filter_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
         assert_eq!(ui.mode, UiMode::Normal);
 
-        // Normal -> Help
-        handle_normal_key(
+        // Normal -> Help: PRD #80 M2 routes `?` through `dispatch_action`
+        // (shared by the `[Help ?]` button), so the handler now returns
+        // `Action::ToggleHelp` rather than flipping the mode inline. Apply the
+        // transition the way `dispatch_action` would so the test continues from
+        // Help mode.
+        let help_action = handle_normal_key(
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
             &mut ui,
             3,
             None,
         );
+        assert!(matches!(help_action, Action::ToggleHelp));
+        ui.mode = UiMode::Help;
         assert_eq!(ui.mode, UiMode::Help);
 
         // Help -> Normal
         handle_help_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
         assert_eq!(ui.mode, UiMode::Normal);
 
-        // Normal -> Rename
-        handle_normal_key(
+        // Normal -> Rename: PRD #80 M4 routes `r` through `dispatch_action`
+        // (shared by the `[Rename r]` button), so the handler returns
+        // `Action::EnterRename` rather than flipping the mode inline.
+        let rename_action = handle_normal_key(
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             3,
             None,
         );
+        assert!(matches!(rename_action, Action::EnterRename));
+        ui.mode = UiMode::Rename;
         assert_eq!(ui.mode, UiMode::Rename);
 
         // Rename -> Normal (Esc)
@@ -10631,10 +12635,10 @@ mod tests {
     // PRD #92 F2 — y / n permission key tests
     //
     // Behavior: pressing `y` on a dashboard card whose selected session is in
-    // `WaitingForInput` returns `KeyResult::SendPermissionResponse(true)` so
+    // `WaitingForInput` returns `Action::SendPermissionResponse(true)` so
     // the dispatcher forwards `y` to the agent's PTY. Pressing `n` returns
     // `SendPermissionResponse(false)`. Any other status, or `total == 0`,
-    // falls through to `KeyResult::Continue`. PRD #18 documented these keys
+    // falls through to `Action::Continue`. PRD #18 documented these keys
     // on the help overlay since baseline but no handler existed until now.
     // -----------------------------------------------------------------------
 
@@ -10648,7 +12652,7 @@ mod tests {
             Some(SessionStatus::WaitingForInput),
         );
         assert!(
-            matches!(result, KeyResult::SendPermissionResponse(true)),
+            matches!(result, Action::SendPermissionResponse(true)),
             "y on a WaitingForInput card must approve, got {result:?}"
         );
     }
@@ -10663,7 +12667,7 @@ mod tests {
             Some(SessionStatus::WaitingForInput),
         );
         assert!(
-            matches!(result, KeyResult::SendPermissionResponse(false)),
+            matches!(result, Action::SendPermissionResponse(false)),
             "n on a WaitingForInput card must deny, got {result:?}"
         );
     }
@@ -10689,7 +12693,7 @@ mod tests {
                 Some(status.clone()),
             );
             assert!(
-                matches!(result_y, KeyResult::Continue),
+                matches!(result_y, Action::Continue),
                 "y on status {status:?} must no-op, got {result_y:?}"
             );
             let result_n = handle_normal_key(
@@ -10699,7 +12703,7 @@ mod tests {
                 Some(status.clone()),
             );
             assert!(
-                matches!(result_n, KeyResult::Continue),
+                matches!(result_n, Action::Continue),
                 "n on status {status:?} must no-op, got {result_n:?}"
             );
         }
@@ -10717,14 +12721,14 @@ mod tests {
             0,
             None,
         );
-        assert!(matches!(result_y, KeyResult::Continue));
+        assert!(matches!(result_y, Action::Continue));
         let result_n = handle_normal_key(
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
             &mut ui,
             0,
             None,
         );
-        assert!(matches!(result_n, KeyResult::Continue));
+        assert!(matches!(result_n, Action::Continue));
         // Also exercise the case where `total > 0` but `selected_status` is
         // None (the selected session is missing from the snapshot — a race we
         // tolerate gracefully).
@@ -10734,7 +12738,7 @@ mod tests {
             1,
             None,
         );
-        assert!(matches!(result_y_no_status, KeyResult::Continue));
+        assert!(matches!(result_y_no_status, Action::Continue));
     }
 
     // -----------------------------------------------------------------------
@@ -10767,7 +12771,7 @@ mod tests {
             3,
             None,
         );
-        assert!(matches!(r, KeyResult::Continue));
+        assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 1);
 
         // Down advances 1 → 2
@@ -10777,7 +12781,7 @@ mod tests {
             3,
             None,
         );
-        assert!(matches!(r, KeyResult::Continue));
+        assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 2);
 
         // wraps 2 → 0
@@ -10787,7 +12791,7 @@ mod tests {
             3,
             None,
         );
-        assert!(matches!(r, KeyResult::Continue));
+        assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 0);
     }
 
@@ -10803,7 +12807,7 @@ mod tests {
             3,
             None,
         );
-        assert!(matches!(r, KeyResult::Continue));
+        assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 2);
 
         // Up retreats 2 → 1
@@ -10813,7 +12817,7 @@ mod tests {
             3,
             None,
         );
-        assert!(matches!(r, KeyResult::Continue));
+        assert!(matches!(r, Action::Continue));
         assert_eq!(ui.selected_index, 1);
     }
 
@@ -10829,7 +12833,7 @@ mod tests {
             KeyCode::Up,
         ] {
             let r = handle_normal_key(KeyEvent::new(code, KeyModifiers::NONE), &mut ui, 0, None);
-            assert!(matches!(r, KeyResult::Continue));
+            assert!(matches!(r, Action::Continue));
             assert_eq!(ui.selected_index, 0);
         }
     }
@@ -11378,7 +13382,7 @@ mod tests {
     fn handle_pane_input_forwards_printable() {
         let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
         match handle_pane_input_key(key) {
-            KeyResult::ForwardToPane(bytes) => assert_eq!(bytes, vec![b'l']),
+            Action::ForwardToPane(bytes) => assert_eq!(bytes, vec![b'l']),
             other => panic!("Expected ForwardToPane, got {:?}", other),
         }
     }
@@ -11604,11 +13608,11 @@ mod tests {
 
         // Index 0 = "No mode"
         assert!(f.selected_mode().is_none());
-        assert_eq!(f.mode_display_name(), "No mode");
+        assert_eq!(f.mode_option_name(f.selection_index), "No mode");
 
         f.selection_index = 1;
         assert_eq!(f.selected_mode().unwrap().name, "k8s");
-        assert_eq!(f.mode_display_name(), "k8s");
+        assert_eq!(f.mode_option_name(f.selection_index), "k8s");
 
         f.selection_index = 2;
         assert_eq!(f.selected_mode().unwrap().name, "rust-tdd");
@@ -11635,11 +13639,11 @@ mod tests {
         f.selection_index = 2;
         assert!(f.selected_mode().is_none());
         assert_eq!(f.selected_orchestration().unwrap().name, "tdd");
-        assert_eq!(f.mode_display_name(), "Orch: tdd");
+        assert_eq!(f.mode_option_name(f.selection_index), "Orch: tdd");
 
         f.selection_index = 3;
         assert_eq!(f.selected_orchestration().unwrap().name, "review");
-        assert_eq!(f.mode_display_name(), "Orch: review");
+        assert_eq!(f.mode_option_name(f.selection_index), "Orch: review");
     }
 
     #[test]
@@ -11786,7 +13790,7 @@ mod tests {
         let result = handle_new_pane_form_key(key, &mut ui);
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.new_pane_form.is_none());
-        assert!(matches!(result, KeyResult::NewPane(_)));
+        assert!(matches!(result, Action::SpawnPane(_)));
     }
 
     #[test]
@@ -11812,7 +13816,7 @@ mod tests {
         let result = handle_new_pane_form_key(enter, &mut ui); // submit
 
         match result {
-            KeyResult::NewPane(req) => {
+            Action::SpawnPane(req) => {
                 assert_eq!(req.dir, PathBuf::from("/tmp/proj"));
                 assert!(
                     req.mode_config
@@ -11843,7 +13847,7 @@ mod tests {
         let result = handle_new_pane_form_key(enter, &mut ui);
 
         match result {
-            KeyResult::NewPane(req) => {
+            Action::SpawnPane(req) => {
                 assert!(req.mode_config.is_none());
             }
             other => panic!("Expected NewPane, got {:?}", other),
@@ -11883,14 +13887,14 @@ mod tests {
         let result = handle_new_pane_form_key(enter, &mut ui); // submit
 
         let req = match result {
-            KeyResult::NewPane(r) => r,
+            Action::SpawnPane(r) => r,
             other => panic!("Expected NewPane, got {:?}", other),
         };
 
         // The form must carry the user's input in req.name.
         assert_eq!(req.name, "user-typed-name");
 
-        // Simulate the handler fix (ui.rs KeyResult::NewPane branch):
+        // Simulate the handler fix (ui.rs Action::NewPane branch):
         // when req.name is non-empty, orch_config.name is overridden before
         // open_orchestration_tab is called, so the tab label matches user input.
         let mut orch = req.orchestration_config.unwrap();
@@ -11925,7 +13929,7 @@ mod tests {
         let result = handle_new_pane_form_key(enter, &mut ui); // submit
 
         let req = match result {
-            KeyResult::NewPane(r) => r,
+            Action::SpawnPane(r) => r,
             other => panic!("Expected NewPane, got {:?}", other),
         };
 
@@ -12121,10 +14125,10 @@ mod tests {
 
         // Enter on Name should submit directly, not advance to a hidden field.
         let result = handle_new_pane_form_key(enter, &mut ui);
-        assert!(matches!(result, KeyResult::NewPane(_)));
+        assert!(matches!(result, Action::SpawnPane(_)));
         assert!(ui.new_pane_form.is_none());
         assert_eq!(ui.mode, UiMode::Normal);
-        if let KeyResult::NewPane(req) = result {
+        if let Action::SpawnPane(req) = result {
             assert!(req.orchestration_config.is_some());
             assert!(req.mode_config.is_none());
         }
@@ -12220,7 +14224,7 @@ mod tests {
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_new_pane_form_key(enter, &mut ui); // Mode → Name
         let result = handle_new_pane_form_key(enter, &mut ui); // Name → Command
-        assert!(matches!(result, KeyResult::Continue));
+        assert!(matches!(result, Action::Continue));
         assert_eq!(
             ui.new_pane_form.as_ref().unwrap().focused,
             FormField::Command
@@ -12240,7 +14244,7 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.config_gen_target.is_none());
         assert!(
-            matches!(result, KeyResult::SendConfigGenPrompt { ref pane_id, ref cwd }
+            matches!(result, Action::SendConfigGenPrompt { ref pane_id, ref cwd }
                 if pane_id == "pane-1" && cwd == "/my/project")
         );
     }
@@ -12477,7 +14481,7 @@ mod tests {
 
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.config_gen_target.is_none());
-        assert!(matches!(result, KeyResult::Continue));
+        assert!(matches!(result, Action::Continue));
     }
 
     #[test]
@@ -12505,7 +14509,7 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.config_gen_target.is_none());
         assert!(ui.config_gen_state.is_suppressed("/my/project"));
-        assert!(matches!(result, KeyResult::Continue));
+        assert!(matches!(result, Action::Continue));
         assert!(ui.status_message.is_some());
     }
 
@@ -12541,7 +14545,7 @@ mod tests {
         let result = handle_config_gen_prompt_key(esc, &mut ui);
 
         assert_eq!(ui.mode, UiMode::Normal);
-        assert!(matches!(result, KeyResult::Continue));
+        assert!(matches!(result, Action::Continue));
     }
 
     #[test]
@@ -12601,7 +14605,7 @@ mod tests {
             &mut ui,
             0,
         );
-        assert!(matches!(result, KeyResult::DetachAndQuit));
+        assert!(matches!(result, Action::DetachAndQuit));
     }
 
     #[test]
@@ -12617,7 +14621,7 @@ mod tests {
             &mut ui,
             0,
         );
-        assert!(matches!(result, KeyResult::Continue));
+        assert!(matches!(result, Action::Continue));
         assert_eq!(ui.mode, UiMode::Normal);
     }
 
@@ -12644,7 +14648,7 @@ mod tests {
     // / Cancel). Picking Stop with no agents proceeds directly; with
     // agents alive the secondary y/n dialog confirms first. The secondary
     // dialog defaults to No; No returns to the primary dialog; Yes is
-    // KeyResult::StopAndQuit. KIND_SHUTDOWN side effects and registry
+    // Action::StopAndQuit. KIND_SHUTDOWN side effects and registry
     // teardown are exercised by tests/stop_dialog.rs.
     // -----------------------------------------------------------------------
 
@@ -12660,7 +14664,7 @@ mod tests {
             0, // no agents
         );
         assert!(
-            matches!(result, KeyResult::StopAndQuit),
+            matches!(result, Action::StopAndQuit),
             "Stop with 0 agents must skip the secondary dialog, got {result:?}"
         );
     }
@@ -12677,7 +14681,7 @@ mod tests {
             3, // three agents alive
         );
         assert!(
-            matches!(result, KeyResult::StopConfirmPrompt { agent_count: 3 }),
+            matches!(result, Action::StopConfirmPrompt { agent_count: 3 }),
             "Stop with N>0 agents must request secondary confirmation with N rendered, got {result:?}"
         );
     }
@@ -12704,7 +14708,7 @@ mod tests {
         let result =
             handle_stop_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
         assert!(
-            matches!(result, KeyResult::StopAndQuit),
+            matches!(result, Action::StopAndQuit),
             "Enter on Yes must confirm Stop, got {result:?}"
         );
     }
@@ -12723,7 +14727,7 @@ mod tests {
             &mut ui,
         );
         assert!(
-            matches!(result, KeyResult::StopAndQuit),
+            matches!(result, Action::StopAndQuit),
             "y must confirm Stop even when No is highlighted, got {result:?}"
         );
     }
@@ -12745,7 +14749,7 @@ mod tests {
 
             let result = handle_stop_confirm_key(key, &mut ui);
             assert!(
-                matches!(result, KeyResult::Continue),
+                matches!(result, Action::Continue),
                 "{key:?} on No path must Continue, got {result:?}"
             );
             assert_eq!(

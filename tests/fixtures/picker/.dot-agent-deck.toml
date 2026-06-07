@@ -1,0 +1,4 @@
+# Fixture for PRD #80 M7 directory-picker L2 tests. No modes — the picker
+# opens at the launch cwd (this tempdir), which contains a known nested
+# subdir childdir/grandkid so single-click select, double-click descend, and
+# parent navigation are deterministic.
