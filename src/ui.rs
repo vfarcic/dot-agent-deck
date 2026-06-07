@@ -312,8 +312,11 @@ impl DirPickerState {
 // Unified new-pane form (mode selection + name/command in one modal)
 // ---------------------------------------------------------------------------
 
+/// PRD #80 M8: which new-pane-form field is focused. Public because it rides
+/// in [`Action::FormFocusField`] (a click on a field's row focuses it, the
+/// same as Tab landing there).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FormField {
+pub enum FormField {
     Mode,
     Name,
     Command,
@@ -410,13 +413,16 @@ impl NewPaneFormState {
         }
     }
 
-    fn mode_display_name(&self) -> String {
-        if self.selection_index == 0 {
+    /// PRD #80 M8: display name for the mode option at `idx` (0 = "No mode",
+    /// 1..=modes = mode names, then orchestrations). Used to render one
+    /// clickable chip per option.
+    fn mode_option_name(&self, idx: usize) -> String {
+        if idx == 0 {
             "No mode".to_string()
-        } else if self.selection_index <= self.modes.len() {
-            self.modes[self.selection_index - 1].name.clone()
+        } else if idx <= self.modes.len() {
+            self.modes[idx - 1].name.clone()
         } else {
-            let orch_idx = self.selection_index - 1 - self.modes.len();
+            let orch_idx = idx - 1 - self.modes.len();
             let name = &self.orchestrations[orch_idx].name;
             if name.is_empty() {
                 "Orchestration".to_string()
@@ -639,6 +645,16 @@ struct UiState {
     /// `..` row goes up. Populated while the picker is shown, cleared
     /// otherwise.
     picker_row_rects: Vec<(usize, Rect)>,
+    /// PRD #80 M8: new-pane-form clickable field rows, paired with the
+    /// [`FormField`] each focuses. Populated while the form is shown, cleared
+    /// otherwise.
+    form_field_rects: Vec<(FormField, Rect)>,
+    /// PRD #80 M8: new-pane-form mode chips, paired with the mode-option index
+    /// each selects (0 = "No mode", 1.. = modes/orchestrations).
+    form_chip_rects: Vec<(usize, Rect)>,
+    /// PRD #80 M8: new-pane-form `[Submit]`/`[Cancel]` button rects, paired
+    /// with the [`Action`] each fires.
+    form_button_rects: Vec<(Action, Rect)>,
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
     /// Per-session idle ASCII art cache. Key = session_id.
@@ -747,6 +763,9 @@ impl UiState {
             modal_button_rects: Vec::new(),
             picker_button_rects: Vec::new(),
             picker_row_rects: Vec::new(),
+            form_field_rects: Vec::new(),
+            form_chip_rects: Vec::new(),
+            form_button_rects: Vec::new(),
         }
     }
 }
@@ -1899,6 +1918,18 @@ pub enum Action {
     PickerCancel,
     /// PRD #80 M7: picker `[Filter]` — open the picker's filter input (== `/`).
     PickerFilter,
+    /// PRD #80 M8: click a new-pane-form field row — focus that field (== Tab /
+    /// Shift+Tab landing on it). Typing stays keyboard.
+    FormFocusField(FormField),
+    /// PRD #80 M8: click a mode chip — select that mode option by index into
+    /// the option list (0 = "No mode", 1.. = modes/orchestrations), == the
+    /// Left/Right/h/l cycler landing on it.
+    FormSelectMode(usize),
+    /// PRD #80 M8: form `[Submit]` — spawn the pane from the form values
+    /// (== Enter on the final field).
+    FormSubmit,
+    /// PRD #80 M8: form `[Cancel]` — close the form without spawning (== Esc).
+    FormCancel,
     /// PRD #80: Normal-mode digit `1`-`9` — jump to card N and focus its pane.
     FocusCard(usize),
     /// PRD #80: on a mode tab, move the in-tab side-pane focus down (j/Down).
@@ -2778,6 +2809,19 @@ fn transition_after_dir_pick(ui: &mut UiState) {
     ui.mode = UiMode::NewPaneForm;
 }
 
+/// PRD #80 M8: build the [`NewPaneRequest`] from the current form values.
+/// Shared by the Enter-submit key arm and the `[Submit]` button
+/// ([`Action::FormSubmit`]) so click and key spawn an identical pane.
+fn build_new_pane_request(form: &NewPaneFormState) -> NewPaneRequest {
+    NewPaneRequest {
+        dir: form.dir.clone(),
+        name: form.name.clone(),
+        command: form.command.clone(),
+        mode_config: form.selected_mode().cloned(),
+        orchestration_config: form.selected_orchestration().cloned(),
+    }
+}
+
 fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
@@ -2820,13 +2864,7 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
             // selected), pressing Enter on Name submits — there's no later
             // field to advance to.
             FormField::Name | FormField::Command => {
-                let req = NewPaneRequest {
-                    dir: form.dir.clone(),
-                    name: form.name.clone(),
-                    command: form.command.clone(),
-                    mode_config: form.selected_mode().cloned(),
-                    orchestration_config: form.selected_orchestration().cloned(),
-                };
+                let req = build_new_pane_request(form);
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
                 return Action::SpawnPane(req);
@@ -4269,6 +4307,46 @@ fn dispatch_action(
                 picker.filtering = true;
             }
         }
+        // ===== PRD #80 M8: new-pane-form click actions =====
+        // click a field row → focus it (== Tab / Shift+Tab landing).
+        Action::FormFocusField(field) => {
+            if let Some(form) = ui.new_pane_form.as_mut() {
+                form.focused = field;
+            }
+        }
+        // click a mode chip → select that option (== Left/Right/h/l cycler).
+        Action::FormSelectMode(idx) => {
+            if let Some(form) = ui.new_pane_form.as_mut()
+                && idx < form.mode_option_count()
+            {
+                form.selection_index = idx;
+                form.focused = FormField::Mode;
+            }
+        }
+        // [Submit] → spawn the pane from the form values (== Enter on the final
+        // field). Reuses the SpawnPane arm so click and key spawn identically.
+        Action::FormSubmit => {
+            if let Some(form) = ui.new_pane_form.take() {
+                ui.mode = UiMode::Normal;
+                let req = build_new_pane_request(&form);
+                return dispatch_action(
+                    Action::SpawnPane(req),
+                    ui,
+                    pane,
+                    state,
+                    tab_manager,
+                    snapshot,
+                    filtered,
+                    selected_id,
+                    frame_area,
+                );
+            }
+        }
+        // [Cancel] → close the form without spawning (== Esc).
+        Action::FormCancel => {
+            ui.new_pane_form = None;
+            ui.mode = UiMode::Normal;
+        }
         Action::ForwardToPane(bytes) => {
             if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
                 && let Some(pane_id) = embedded.focused_pane_id()
@@ -5611,6 +5689,57 @@ pub fn run_tui(
                     continue;
                 }
 
+                // PRD #80 M8: the new-pane form is a topmost overlay — when
+                // open, its [Submit]/[Cancel] buttons, mode chips, and field
+                // rows are the only click targets (buttons first, then chips,
+                // then field rows), and a miss inside the form is consumed so
+                // it never falls through to the dashboard behind it.
+                if ui.mode == UiMode::NewPaneForm && (is_down || is_up) {
+                    let col = mouse.column;
+                    let row = mouse.row;
+                    let mut form_action = hit_test_button(&ui.form_button_rects, col, row);
+                    if form_action.is_none()
+                        && let Some(&(idx, _)) = ui
+                            .form_chip_rects
+                            .iter()
+                            .find(|(_, r)| point_in_rect(r, col, row))
+                    {
+                        form_action = Some(Action::FormSelectMode(idx));
+                    }
+                    if form_action.is_none()
+                        && let Some(&(field, _)) = ui
+                            .form_field_rects
+                            .iter()
+                            .find(|(_, r)| point_in_rect(r, col, row))
+                    {
+                        form_action = Some(Action::FormFocusField(field));
+                    }
+                    if let Some(action) = form_action
+                        && is_down
+                    {
+                        let frame_area = terminal.get_frame().area();
+                        let flow = dispatch_action(
+                            action,
+                            &mut ui,
+                            &*pane,
+                            &state,
+                            &mut tab_manager,
+                            &snapshot,
+                            &filtered,
+                            None,
+                            frame_area,
+                        );
+                        if flow == Flow::Break {
+                            break 'outer;
+                        }
+                    }
+                    // Consume every Down/Up while the form is open.
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
                 // PRD #80 M5: when a modal/overlay is active it is topmost, so
                 // its buttons are hit-tested FIRST and exclusively — the
                 // bottom-bar / tab / card rects behind it are not clickable.
@@ -6823,6 +6952,9 @@ fn render_overlays(
     ui.modal_button_rects.clear();
     ui.picker_button_rects.clear();
     ui.picker_row_rects.clear();
+    ui.form_field_rects.clear();
+    ui.form_chip_rects.clear();
+    ui.form_button_rects.clear();
     if ui.mode == UiMode::Help {
         ui.modal_button_rects = render_help_overlay(frame, active_mode_name, palette);
     }
@@ -6838,10 +6970,18 @@ fn render_overlays(
             ui.picker_button_rects = buttons;
         }
     }
-    if ui.mode == UiMode::NewPaneForm
-        && let Some(ref form) = ui.new_pane_form
-    {
-        render_new_pane_form(frame, form, palette);
+    if ui.mode == UiMode::NewPaneForm {
+        // Capture the form's field/chip/button rects after the `new_pane_form`
+        // borrow ends so they can be stored back on `ui`.
+        let captured = ui
+            .new_pane_form
+            .as_ref()
+            .map(|form| render_new_pane_form(frame, form, palette));
+        if let Some((fields, chips, buttons)) = captured {
+            ui.form_field_rects = fields;
+            ui.form_chip_rects = chips;
+            ui.form_button_rects = buttons;
+        }
     }
     if ui.mode == UiMode::StarPrompt {
         ui.modal_button_rects = render_star_prompt(frame, palette);
@@ -8102,7 +8242,21 @@ fn new_pane_form_footer_hint(has_mode_field: bool, name_submits: bool) -> &'stat
     }
 }
 
-fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: ColorPalette) {
+/// PRD #80 M8: clickable geometry returned by [`render_new_pane_form`] — the
+/// field rows (each paired with the [`FormField`] it focuses), the mode chips
+/// (each paired with its option index), and the `[Submit]`/`[Cancel]` button
+/// rects.
+type FormClickTargets = (
+    Vec<(FormField, Rect)>,
+    Vec<(usize, Rect)>,
+    Vec<(Action, Rect)>,
+);
+
+fn render_new_pane_form(
+    frame: &mut Frame,
+    form: &NewPaneFormState,
+    palette: ColorPalette,
+) -> FormClickTargets {
     let area = frame.area();
     let popup_width = 56.min(area.width.saturating_sub(4));
     // The mode field (when modes exist) or the tip line (when they don't)
@@ -8126,11 +8280,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
         .add_modifier(Modifier::BOLD);
     let unfocused_label = Style::default().fg(palette.text_secondary);
 
-    let mode_style = if form.focused == FormField::Mode {
-        focused_label
-    } else {
-        unfocused_label
-    };
     let name_style = if form.focused == FormField::Name {
         focused_label
     } else {
@@ -8151,8 +8300,15 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
         Line::from(""),
     ];
 
-    // Mode field (only when modes are available)
-    if !form.has_mode_field {
+    // PRD #80 M8: the Mode field is now a row of clickable chips (one per
+    // option, including "No mode"), overlaid after the Paragraph render so each
+    // chip gets its own rect. Reserve its blank line here.
+    let mut mode_line_idx: Option<usize> = None;
+    if form.has_mode_field {
+        mode_line_idx = Some(lines.len());
+        lines.push(Line::from(""));
+        lines.push(Line::from(""));
+    } else {
         // No .dot-agent-deck.toml or no modes — show a contextual hint.
         lines.push(Line::styled(
             "  Tip: press g on dashboard to create modes",
@@ -8162,25 +8318,8 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
         ));
         lines.push(Line::from(""));
     }
-    if form.has_mode_field {
-        let mode_name = form.mode_display_name();
-        let mode_value = if form.focused == FormField::Mode {
-            format!("\u{25c0} {mode_name} \u{25b6}")
-        } else {
-            mode_name.to_string()
-        };
-        let mode_value_style = if form.focused == FormField::Mode {
-            Style::default().fg(palette.text_primary)
-        } else {
-            unfocused_label
-        };
-        lines.push(Line::from(vec![
-            Span::styled("  Mode:    ", mode_style),
-            Span::styled(mode_value, mode_value_style),
-        ]));
-        lines.push(Line::from(""));
-    }
 
+    let name_line_idx = lines.len();
     lines.push(Line::from(vec![
         Span::styled("  Name:    ", name_style),
         Span::styled(
@@ -8196,8 +8335,10 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
             },
         ),
     ]));
+    let mut cmd_line_idx: Option<usize> = None;
     if cmd_visible {
         lines.push(Line::from(""));
+        cmd_line_idx = Some(lines.len());
         lines.push(Line::from(vec![
             Span::styled("  Command: ", cmd_style),
             Span::styled(
@@ -8215,6 +8356,8 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
         ]));
     }
     lines.push(Line::from(""));
+    // PRD #80 M8: reserve a row for the [Submit]/[Cancel] buttons (overlaid).
+    let submit_line_idx = lines.len();
     lines.push(Line::from(""));
 
     // PRD #106 follow-up: when the Command field is hidden (orchestration
@@ -8239,21 +8382,122 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState, palette: Col
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 
-    // Show cursor in the active text field (not for Mode which uses arrow cycling)
-    if form.focused != FormField::Mode {
-        let cursor_y = match form.focused {
-            FormField::Name => popup_area.y + 3 + mode_extra,
-            FormField::Command => popup_area.y + 5 + mode_extra,
-            FormField::Mode => unreachable!(),
-        };
-        let field_text = match form.focused {
-            FormField::Name => &form.name,
-            FormField::Command => &form.command,
-            FormField::Mode => unreachable!(),
-        };
-        let cursor_x = popup_area.x + 12 + field_text.len() as u16;
-        frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    // ── Clickable geometry (overlaid / computed after the Paragraph) ────────
+    let line_y = |n: usize| popup_area.y + 1 + n as u16;
+    let row_x = popup_area.x + 1;
+    let row_width = popup_area.width.saturating_sub(2);
+    let inner_end = row_x + row_width;
+
+    let mut field_rects: Vec<(FormField, Rect)> = Vec::new();
+    field_rects.push((
+        FormField::Name,
+        Rect {
+            x: row_x,
+            y: line_y(name_line_idx),
+            width: row_width,
+            height: 1,
+        },
+    ));
+    if let Some(ci) = cmd_line_idx {
+        field_rects.push((
+            FormField::Command,
+            Rect {
+                x: row_x,
+                y: line_y(ci),
+                width: row_width,
+                height: 1,
+            },
+        ));
     }
+
+    // Mode chip row: render `  Mode: ` then one `[name]` chip per option, the
+    // selected one highlighted. Each chip records its own clickable rect.
+    let mut chip_rects: Vec<(usize, Rect)> = Vec::new();
+    if let Some(mi) = mode_line_idx {
+        let mode_y = line_y(mi);
+        // Whole row (off-chip clicks focus the Mode field).
+        field_rects.push((
+            FormField::Mode,
+            Rect {
+                x: row_x,
+                y: mode_y,
+                width: row_width,
+                height: 1,
+            },
+        ));
+        let mode_label_style = if form.focused == FormField::Mode {
+            focused_label
+        } else {
+            unfocused_label
+        };
+        let selected_style = Style::default()
+            .fg(palette.terminal_bg)
+            .bg(palette.text_secondary)
+            .add_modifier(Modifier::BOLD);
+        let chip_style = Style::default().fg(palette.text_secondary);
+        let buf = frame.buffer_mut();
+        let mut cx = row_x;
+        let (after, _) = buf.set_span(
+            cx,
+            mode_y,
+            &Span::styled("  Mode: ", mode_label_style),
+            inner_end.saturating_sub(cx),
+        );
+        cx = after;
+        for i in 0..form.mode_option_count() {
+            if cx >= inner_end {
+                break;
+            }
+            cx += 1; // space between chips
+            let chip = format!("[{}]", form.mode_option_name(i));
+            let w = chip.chars().count() as u16;
+            if cx.saturating_add(w) > inner_end {
+                break;
+            }
+            let style = if i == form.selection_index {
+                selected_style
+            } else {
+                chip_style
+            };
+            let (after, _) = buf.set_span(cx, mode_y, &Span::styled(chip, style), inner_end - cx);
+            chip_rects.push((
+                i,
+                Rect {
+                    x: cx,
+                    y: mode_y,
+                    width: w,
+                    height: 1,
+                },
+            ));
+            cx = after;
+        }
+    }
+
+    // [Submit] / [Cancel] buttons on the reserved row.
+    let buttons = [
+        Button::new("Submit", "", Action::FormSubmit, true),
+        Button::new("Cancel", "", Action::FormCancel, true),
+    ];
+    let btn_row = Rect {
+        x: row_x,
+        y: line_y(submit_line_idx),
+        width: row_width,
+        height: 1,
+    };
+    let button_rects = render_modal_button_row(frame, &buttons, btn_row, 1, &palette);
+
+    // Cursor in the active text field (Mode uses chips, so no cursor there).
+    if form.focused == FormField::Name {
+        let cursor_x = popup_area.x + 12 + form.name.len() as u16;
+        frame.set_cursor_position(Position::new(cursor_x, line_y(name_line_idx)));
+    } else if form.focused == FormField::Command
+        && let Some(ci) = cmd_line_idx
+    {
+        let cursor_x = popup_area.x + 12 + form.command.len() as u16;
+        frame.set_cursor_position(Position::new(cursor_x, line_y(ci)));
+    }
+
+    (field_rects, chip_rects, button_rects)
 }
 
 /// Convert screen-absolute mouse coordinates to pane-relative coordinates.
@@ -9030,6 +9274,39 @@ pub fn render_dir_picker_to_buffer(
     let mut picker = DirPickerState::new(start);
     render_overlay_to_buffer(width, height, |frame| {
         render_dir_picker(frame, &mut picker, palette);
+    })
+}
+
+/// PRD #80 M8 L1 seam: render the new-pane form with the given `modes` as
+/// selectable mode options into a `Buffer`. Drives the production
+/// `render_new_pane_form` through a `TestBackend`; after M8 the form renders
+/// clickable mode chips and `[Submit]` / `[Cancel]` buttons, which this
+/// seam's buffer then shows. Mirrors [`render_button_bar_to_buffer`].
+pub fn render_new_pane_form_to_buffer(
+    mode_names: &[&str],
+    width: u16,
+    height: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    let modes: Vec<ModeConfig> = mode_names
+        .iter()
+        .map(|n| ModeConfig {
+            name: (*n).to_string(),
+            init_command: None,
+            panes: Vec::new(),
+            rules: Vec::new(),
+            reactive_panes: 0,
+        })
+        .collect();
+    let form = NewPaneFormState::new(
+        std::path::PathBuf::from("/tmp/project"),
+        "myname".to_string(),
+        "mycmd".to_string(),
+        modes,
+        Vec::new(),
+    );
+    render_overlay_to_buffer(width, height, |frame| {
+        render_new_pane_form(frame, &form, palette);
     })
 }
 
@@ -12736,11 +13013,11 @@ mod tests {
 
         // Index 0 = "No mode"
         assert!(f.selected_mode().is_none());
-        assert_eq!(f.mode_display_name(), "No mode");
+        assert_eq!(f.mode_option_name(f.selection_index), "No mode");
 
         f.selection_index = 1;
         assert_eq!(f.selected_mode().unwrap().name, "k8s");
-        assert_eq!(f.mode_display_name(), "k8s");
+        assert_eq!(f.mode_option_name(f.selection_index), "k8s");
 
         f.selection_index = 2;
         assert_eq!(f.selected_mode().unwrap().name, "rust-tdd");
@@ -12767,11 +13044,11 @@ mod tests {
         f.selection_index = 2;
         assert!(f.selected_mode().is_none());
         assert_eq!(f.selected_orchestration().unwrap().name, "tdd");
-        assert_eq!(f.mode_display_name(), "Orch: tdd");
+        assert_eq!(f.mode_option_name(f.selection_index), "Orch: tdd");
 
         f.selection_index = 3;
         assert_eq!(f.selected_orchestration().unwrap().name, "review");
-        assert_eq!(f.mode_display_name(), "Orch: review");
+        assert_eq!(f.mode_option_name(f.selection_index), "Orch: review");
     }
 
     #[test]
