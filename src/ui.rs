@@ -6759,8 +6759,11 @@ fn jump_range_notation(keybindings: &KeybindingConfig) -> String {
 /// both the live hints bar (`render_bottom_bar`) and the standalone
 /// [`render_hints_bar_to_buffer`] snapshot entrypoint.
 fn dashboard_hints_string(keybindings: &KeybindingConfig) -> String {
+    // `Ctrl+c: quit` is hardcoded: quit is not a remappable action — Ctrl+C is
+    // the non-overridable modal trigger (Detach/Stop/Cancel), so the hint is a
+    // fixed string rather than a config-derived notation.
     format!(
-        "{}: new  {}: close  {}: layout  {}: dashboard ({} {} {})  {}: quit",
+        "{}: new  {}: close  {}: layout  {}: dashboard ({} {} {})  Ctrl+c: quit",
         display_notation(keybindings, Action::NewPane),
         display_notation(keybindings, Action::ClosePane),
         display_notation(keybindings, Action::ToggleLayout),
@@ -6768,7 +6771,6 @@ fn dashboard_hints_string(keybindings: &KeybindingConfig) -> String {
         jump_range_notation(keybindings),
         display_notation(keybindings, Action::Help),
         display_notation(keybindings, Action::Filter),
-        display_notation(keybindings, Action::Quit),
     )
 }
 
@@ -6854,7 +6856,9 @@ fn render_help_overlay(
         help_key_line(&n(Action::NewPane), "Create new pane"),
         help_key_line(&n(Action::ClosePane), "Close selected pane"),
         help_key_line(&n(Action::ToggleLayout), "Toggle layout (stacked/tiled)"),
-        help_key_line(&n(Action::Quit), "Quit"),
+        // Quit is not a remappable action: Ctrl+C (non-overridable) opens the
+        // Detach/Stop/Cancel modal, so the help row is a fixed string.
+        help_key_line("Ctrl+c", "Quit"),
         Line::from(""),
         Line::styled("  Tab Navigation", cyan),
         Line::from(""),

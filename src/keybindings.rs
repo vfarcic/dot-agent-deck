@@ -45,7 +45,13 @@ impl Section {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     // [global]
-    Quit,
+    //
+    // NOTE: quit is intentionally NOT an action here. There is no key that
+    // directly quits — Ctrl+C (hardcoded + non-overridable in the event loop)
+    // opens the Detach/Stop/Cancel modal. Modeling quit as a remappable action
+    // would falsely imply a rebindable quit key, so it is omitted; a
+    // `quit = "…"` line in a user config is treated as an unknown action and
+    // ignored with the usual warning.
     Dashboard,
     NewPane,
     ClosePane,
@@ -91,19 +97,13 @@ pub struct ActionSpec {
 /// The `default` notations mirror the authoritative hardcoded checks in
 /// `src/ui.rs` as of this branch:
 /// - global Ctrl+ shortcuts: `Ctrl+d` (dashboard/command mode), `Ctrl+n`
-///   (new pane), `Ctrl+w` (close pane), `Ctrl+t` (toggle layout); quit is
-///   `Ctrl+c` (opens the quit-confirm flow); `1`..`9` jump to a card.
+///   (new pane), `Ctrl+w` (close pane), `Ctrl+t` (toggle layout); `1`..`9`
+///   jump to a card. (Quit is deliberately absent — `Ctrl+C` is a hardcoded,
+///   non-overridable modal trigger, not a remappable action.)
 /// - dashboard Normal-mode keys: `j`/`k`/`h`/`l`, `/`, `r`, `?`, `Enter`,
 ///   `Esc`, `y`, `n`.
 pub const ACTIONS: &[ActionSpec] = &[
     // [global]
-    ActionSpec {
-        action: Action::Quit,
-        section: Section::Global,
-        name: "quit",
-        default: "Ctrl+c",
-        description: "Quit",
-    },
     ActionSpec {
         action: Action::Dashboard,
         section: Section::Global,
@@ -912,7 +912,7 @@ mod tests {
         assert_eq!(parse_binding("?").unwrap().notation(), "?");
         assert_eq!(parse_binding("").unwrap().notation(), "");
         let c = KeybindingConfig::default();
-        assert_eq!(c.notation(Action::Quit), "Ctrl+c");
+        assert_eq!(c.notation(Action::ToggleLayout), "Ctrl+t");
         assert_eq!(c.notation(Action::Help), "?");
     }
 
@@ -934,7 +934,6 @@ mod tests {
     #[test]
     fn defaults_match_current_hardcoded_keys() {
         let c = KeybindingConfig::default();
-        assert!(c.matches(Action::Quit, &ev(KeyCode::Char('c'), KeyModifiers::CONTROL)));
         assert!(c.matches(
             Action::Dashboard,
             &ev(KeyCode::Char('d'), KeyModifiers::CONTROL)

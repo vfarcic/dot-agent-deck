@@ -134,7 +134,6 @@ help = "F1"                      # open help with F1 instead of ?
 
 | Action | Default | Description |
 |---|---|---|
-| `quit` | `Ctrl+c` | Open the quit-confirmation dialog |
 | `dashboard` | `Ctrl+d` | Enter command / navigation mode |
 | `new_pane` | `Ctrl+n` | New pane (directory picker → name + command) |
 | `close_pane` | `Ctrl+w` | Close selected pane / tear down mode tab |
@@ -159,6 +158,8 @@ help = "F1"                      # open help with F1 instead of ?
 
 The `Down`/`Up`/`Tab`/`Shift+Tab`/`Left`/`Right` aliases and `Ctrl+PageUp` / `Ctrl+PageDown` tab navigation are not remappable and always work alongside your bindings.
 
+**Quit is not a remappable action.** No key directly quits — `Ctrl+C` (hardcoded, non-overridable) opens the quit/detach modal (Detach / Stop / Cancel). There is no `quit` config key; a `quit = "…"` line is treated as an unknown action and ignored with a warning.
+
 ### Edge cases
 
 - **No config file** → all defaults (current behavior, nothing changes).
@@ -166,4 +167,4 @@ The `Down`/`Up`/`Tab`/`Shift+Tab`/`Left`/`Right` aliases and `Ctrl+PageUp` / `Ct
 - **Conflicting bindings** (two actions on the same key) → a warning is printed and the first-defined action wins; the later one is left unbound.
 - **Unknown action name** → ignored with a warning.
 - **Empty binding** (`action = ""`) → that action is unbound and its default key does nothing.
-- **`Ctrl+c` always quits.** It is a non-overridable safety net: even if you unbind `quit` or bind another action to `Ctrl+c`, pressing `Ctrl+c` from command mode always opens the quit flow — it is never routed through your config (so it can't be turned into "new pane", "switch tab", etc.).
+- **`Ctrl+c` always quits.** It is a non-overridable safety net: quit is not a configurable action, and even if you bind another action to `Ctrl+c`, pressing `Ctrl+c` from command mode always opens the quit/detach modal — it is never routed through your config (so it can't be turned into "new pane", "switch tab", etc.).

@@ -8,7 +8,8 @@
 ### Implementation notes / divergences from this draft
 
 - **Keybindings resolve client-side.** Bindings are interpreted in the TUI event loop (`run_tui` / `src/ui.rs`), never in the daemon. The config file lives on the machine running the TUI client; the daemon stays binding-agnostic, so multiple clients attached to one remote daemon can each have their own bindings.
-- **Authoritative defaults are Ctrl-based, not Alt-based.** The `Alt+…` notation in the draft example below predates inspection of the real code. Actual defaults: `dashboard = Ctrl+d`, `new_pane = Ctrl+n`, `close_pane = Ctrl+w`, `toggle_layout = Ctrl+t`; jump keys are **bare** `1`–`9`; dashboard keys `j/k/h/l`, `/`, `r`, `?`, `Enter`, `Esc`, `y`, `n`. **`Ctrl+C` always opens the quit flow and is non-overridable** — it can never be remapped, unbound, or hijacked by binding another action to it. See `docs/keyboard-shortcuts.md` for the full defaults table.
+- **Authoritative defaults are Ctrl-based, not Alt-based.** The `Alt+…` notation in the draft example below predates inspection of the real code. Actual defaults: `dashboard = Ctrl+d`, `new_pane = Ctrl+n`, `close_pane = Ctrl+w`, `toggle_layout = Ctrl+t`; jump keys are **bare** `1`–`9`; dashboard keys `j/k/h/l`, `/`, `r`, `?`, `Enter`, `Esc`, `y`, `n`. See `docs/keyboard-shortcuts.md` for the full defaults table.
+- **Quit is NOT a remappable action.** No key directly quits: `Ctrl+C` (hardcoded, non-overridable) opens the quit/detach modal (Detach / Stop / Cancel) and you quit by selecting in it. Because no rebindable key triggers quit, `quit` was dropped from the action set entirely — there is no `quit` config key (a `quit = "…"` line is treated as an unknown action and ignored with a warning), and `Ctrl+C` can never be remapped, unbound, or hijacked by binding another action to it.
 
 ## Problem
 
@@ -44,7 +45,6 @@ Add a keybinding configuration system that allows users to remap all keyboard sh
 # Only override what you need — defaults apply for everything else.
 
 [global]
-quit = "Alt+q"
 dashboard = "Alt+d"
 new_pane = "Alt+n"
 close_pane = "Alt+w"
@@ -109,8 +109,8 @@ Support a simple key notation:
 - Malformed config → warn on stderr, fall back to defaults for unparseable entries
 - Conflicting bindings (two actions on same key) → warn, first-defined wins
 - Unknown action names in config → warn and ignore
-- Empty binding (`quit = ""`) → action is unbound (no key triggers it)
-- Ctrl+C → always quits regardless of config (safety net, not overridable)
+- Empty binding (e.g. `new_pane = ""`) → action is unbound (no key triggers it)
+- Ctrl+C → always opens the quit/detach modal regardless of config (safety net, not overridable); quit is not a remappable action
 
 ## Milestones
 

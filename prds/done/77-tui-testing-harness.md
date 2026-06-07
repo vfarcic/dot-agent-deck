@@ -1962,17 +1962,17 @@ without depending on the config struct API.
 
 #### keybindings/safety
 
-##### keybindings/safety/001 — `Ctrl+C` always opens the quit flow, even when the config unbinds/rebinds `quit`.
+##### keybindings/safety/001 — `Ctrl+C` always opens the quit modal, even when another action is bound to `Ctrl+C`.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** with a `keybindings.toml` that both unbinds `[global] quit = ""` and tries to hijack `Ctrl+C` for another action (`new_pane = "Ctrl+C"`), pressing `Ctrl+C` still opens the quit-confirmation dialog ("Quit dot-agent-deck?"). `Ctrl+C` is a non-overridable safety net that outranks both the unbind and the reassignment. Guard test — must stay green through the implementation so config can never disable emergency quit.
-- **Does not assert:** which quit option is selected by default, the dialog layout, the rebound `quit` key's behaviour.
+- **Asserts:** with a `keybindings.toml` that tries to hijack `Ctrl+C` for another action (`[global] new_pane = "Ctrl+C"`), pressing `Ctrl+C` still opens the quit/detach modal ("Quit dot-agent-deck?"). `Ctrl+C` is a non-overridable safety net — quit is not a configurable action (it is hardcoded in the event loop), so no action bound to `Ctrl+C` can hijack it. Exercises the GLOBAL-block `Ctrl+C` exclusion path. Guard test — must stay green so config can never disable emergency quit.
+- **Does not assert:** which quit option is selected by default, the dialog layout.
 - **Platform coverage:** mac+linux.
 
-##### keybindings/safety/002 — `Ctrl+C` always opens the quit flow, even when a tab-navigation action is bound to `Ctrl+C`.
+##### keybindings/safety/002 — `Ctrl+C` always opens the quit modal, even when a tab-navigation action is bound to `Ctrl+C`.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** with a `keybindings.toml` that unbinds `[global] quit = ""` and binds both `[dashboard] move_left = "Ctrl+C"` and `move_right = "Ctrl+C"`, pressing `Ctrl+C` still opens the quit-confirmation dialog ("Quit dot-agent-deck?"). Complements safety/001 by covering the Normal-mode tab-cycle dispatch path: `Ctrl+C` is never routed through the configurable `move_left`/`move_right` matching, so it can't be turned into a tab switch. Regression guard for the `!is_ctrl_c` gate on that dispatch path.
+- **Asserts:** with a `keybindings.toml` that binds both `[dashboard] move_left = "Ctrl+C"` and `move_right = "Ctrl+C"`, pressing `Ctrl+C` still opens the quit/detach modal ("Quit dot-agent-deck?"). Complements safety/001 by covering the Normal-mode tab-cycle dispatch path: `Ctrl+C` is never routed through the configurable `move_left`/`move_right` matching, so it can't be turned into a tab switch. `Ctrl+C` is non-overridable. Regression guard for the `!is_ctrl_c` gate on that dispatch path.
 - **Does not assert:** tab-switch behaviour for non-`Ctrl+C` `move_left`/`move_right` bindings, conflict-resolution warning wording.
 - **Platform coverage:** mac+linux.
 

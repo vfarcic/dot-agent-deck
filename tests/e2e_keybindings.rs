@@ -111,26 +111,24 @@ fn remap_002_dashboard_action_rebind() {
     deck.wait_for_string("Create new pane");
 }
 
-/// Scenario: Stage a `keybindings.toml` that both unbinds `quit`
-/// (`quit = ""`) and tries to hijack `Ctrl+C` for another action
-/// (`new_pane = "Ctrl+C"`), launch against the `minimal` fixture, and
-/// press `Ctrl+C`. The quit-confirmation dialog ("Quit dot-agent-deck?")
-/// must still open — `Ctrl+C` is a non-overridable safety net that
-/// outranks both the unbind and the reassignment. This is a guard test:
-/// it must stay green through the implementation so config can never
-/// disable the emergency quit. (`Ctrl+C` already opens the quit flow in
-/// the current build, so this passes today and must keep passing once
-/// config parsing lands.)
+/// Scenario: Stage a `keybindings.toml` that tries to hijack `Ctrl+C`
+/// for another action (`new_pane = "Ctrl+C"`), launch against the
+/// `minimal` fixture, and press `Ctrl+C`. The quit/detach modal ("Quit
+/// dot-agent-deck?") must still open — `Ctrl+C` is a non-overridable
+/// safety net, so an action bound to it can never hijack it. This is a
+/// guard test: it must stay green so config can never disable the
+/// emergency quit. (Quit is not a configurable action — `Ctrl+C` is
+/// hardcoded in the event loop — so this exercises the GLOBAL-block
+/// Ctrl+C exclusion path.)
 #[spec("keybindings/safety/001")]
 #[test]
 fn safety_001_ctrl_c_always_quits() {
     // PRD #40 catalog: keybindings/safety/001 — Ctrl+C always opens the
-    // quit flow even when the config rebinds/unbinds `quit`. Edge case
+    // quit modal even when another action is bound to Ctrl+C. Edge case
     // from the PRD: "Ctrl+C -> always quits regardless of config".
     let deck = TuiDeck::builder()
         .with_keybindings_toml(
             "[global]\n\
-             quit = \"\"\n\
              new_pane = \"Ctrl+C\"\n",
         )
         .launch_with_fixture("minimal");
@@ -144,29 +142,27 @@ fn safety_001_ctrl_c_always_quits() {
     deck.wait_for_string("Quit dot-agent-deck?");
 }
 
-/// Scenario: Stage a `keybindings.toml` that unbinds `quit` (`quit = ""`)
-/// and tries to hijack `Ctrl+C` through the *tab-navigation* dispatch
-/// path by binding both `move_left` and `move_right` to `Ctrl+C`, launch
-/// against the `minimal` fixture, and press `Ctrl+C`. The
-/// quit-confirmation dialog ("Quit dot-agent-deck?") must still open —
-/// `Ctrl+C` is never routed through the config tab-cycle path, so it can
-/// never be turned into a tab switch. Regression guard for FIX2 (the
-/// `!is_ctrl_c` gate on the Normal-mode move_left/move_right dispatch in
-/// src/ui.rs): before that fix, `move_left = "Ctrl+C"` would have matched
-/// the tab-cycle branch and consumed the keypress, so the quit flow would
-/// not open and this would have been RED.
+/// Scenario: Stage a `keybindings.toml` that tries to hijack `Ctrl+C`
+/// through the *tab-navigation* dispatch path by binding both
+/// `move_left` and `move_right` to `Ctrl+C`, launch against the
+/// `minimal` fixture, and press `Ctrl+C`. The quit/detach modal ("Quit
+/// dot-agent-deck?") must still open — `Ctrl+C` is never routed through
+/// the config tab-cycle path, so it can never be turned into a tab
+/// switch. Regression guard for FIX2 (the `!is_ctrl_c` gate on the
+/// Normal-mode move_left/move_right dispatch in src/ui.rs): before that
+/// fix, `move_left = "Ctrl+C"` would have matched the tab-cycle branch
+/// and consumed the keypress, so the quit modal would not open and this
+/// would have been RED.
 #[spec("keybindings/safety/002")]
 #[test]
 fn safety_002_ctrl_c_survives_tab_nav_hijack() {
     // PRD #40 catalog: keybindings/safety/002 — Ctrl+C always opens the
-    // quit flow even when a TAB-NAV action (move_left / move_right) is
+    // quit modal even when a TAB-NAV action (move_left / move_right) is
     // bound to Ctrl+C. Complements safety/001 (global-block path) by
     // covering the Normal-mode tab-cycle dispatch path.
     let deck = TuiDeck::builder()
         .with_keybindings_toml(
-            "[global]\n\
-             quit = \"\"\n\
-             [dashboard]\n\
+            "[dashboard]\n\
              move_left = \"Ctrl+C\"\n\
              move_right = \"Ctrl+C\"\n",
         )
