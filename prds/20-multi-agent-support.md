@@ -31,12 +31,14 @@ Aider        →  aider adapter (log watcher)            →  AgentEvent  →  d
 - Agent-type visual distinction in the dashboard (colored badges, icons)
 - `dot-agent-deck hooks install --agent <type>` for agents with native hook support
 - Codex CLI adapter as the first non-Claude agent (uses wrapper approach)
+- A per-session **live-target descriptor** so the dashboard can tell a writable session from a view-only one, plus an honest **send result** status when input is delivered (see Liveness & Write Semantics)
 
 ### Out of Scope
 - Feature parity across all agents (each agent exposes different levels of detail)
 - Agent-specific UI panels or detail views
 - Installing or managing the agent tools themselves
 - Permission control for non-Claude agents (PRD #18 is Claude-specific)
+- **Proof-of-consumption machinery** — runtime "generation" tracking and input/output cursor diffing to *prove* a specific keystroke was consumed by the live process. The lightweight `live_target` + `send_result` model below is enough for this Low-priority PRD; cursor/generation proofs are a future hardening step, not a milestone here.
 
 ## Technical Approach
 
@@ -45,6 +47,29 @@ Aider        →  aider adapter (log watcher)            →  AgentEvent  →  d
 - Add `agent_version: Option<String>` field
 - Ensure `agent_type` is a free-form string (not an enum) to support future agents without code changes
 - Add protocol version field for forward compatibility
+- Add `live_target: Option<LiveTarget>` to describe how (and whether) the session can receive input (see Liveness & Write Semantics)
+
+### Liveness & Write Semantics
+
+**Invariant:** a dashboard-visible session is not necessarily a live, writable target. Today's Claude integration delivers input through a PTY/embedded pane and can reasonably assume the session it shows is the session it writes to. Other agents break that assumption — e.g. a Codex session the dashboard knows about from logs may only be *resumable from history*, not driveable live. The adapter contract must carry that distinction so the UI doesn't invite users to type into a card that can't accept input.
+
+Each adapter declares a **live-target descriptor** per session:
+
+- `kind`: `process | pty | tmux | sdk | none` — the concrete handle, if any, that input is delivered through
+- `writable`: `live` | `history-only` | `none` — can we deliver input to the running session now, only resume/replay from history, or neither (view-only)?
+
+When the dashboard delivers input to a session, the adapter returns an honest **send result** rather than fire-and-forget:
+
+- `applied` — delivered to the live target
+- `queued` — accepted, not yet confirmed applied
+- `stale` — target moved on / our view was behind
+- `wrong-session` — the handle no longer maps to the session we meant
+- `history-only` — no live target; only history resume is possible
+- `no-live-target` — nothing to write to
+
+**UI consequence:** non-`live` sessions render visually distinct (e.g. dimmed input affordance / a "view-only" or "history" marker on the badge), and a failed/`stale`/`wrong-session` send surfaces feedback instead of silently dropping. Proving *consumption* of a specific input (generation counters, output-cursor diffing) is explicitly deferred — see Out of Scope.
+
+_Credit: the live-target / send-result distinction was raised by @Snailflyer in [#20](https://github.com/vfarcic/dot-agent-deck/issues/20)._
 
 ### Generic Wrapper (`src/main.rs` or new `src/wrap.rs`)
 - New CLI subcommand: `dot-agent-deck wrap -- codex <args>`
@@ -105,6 +130,8 @@ Aider        →  aider adapter (log watcher)            →  AgentEvent  →  d
 ## Milestones
 
 - [ ] AgentEvent protocol documented with version field and stable JSON schema (`src/event.rs`)
+- [ ] `live_target` descriptor (`kind` + `writable`) on the protocol and `send_result` status returned on input delivery (`src/event.rs`, `src/pane_input.rs`)
+- [ ] UI renders view-only / history-only sessions distinctly and surfaces failed/stale sends (`src/ui.rs`)
 - [ ] Agent type registry with configurable colors/labels (`src/config.rs`)
 - [ ] Agent type badge rendering on cards (`src/ui.rs`)
 - [ ] `dot-agent-deck wrap` CLI subcommand with stdout/stderr pattern detection (`src/wrap.rs`)
@@ -116,7 +143,8 @@ Aider        →  aider adapter (log watcher)            →  AgentEvent  →  d
 
 ## Key Files
 
-- `src/event.rs` — Protocol stabilization, version field
+- `src/event.rs` — Protocol stabilization, version field, `live_target` descriptor, `send_result`
+- `src/pane_input.rs` — Return `send_result` status on input delivery instead of fire-and-forget
 - `src/wrap.rs` (new) — Generic wrapper command
 - `src/config.rs` — Agent type registry
 - `src/ui.rs` — Agent badges, type filtering

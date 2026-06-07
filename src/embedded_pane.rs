@@ -1474,6 +1474,13 @@ impl PaneController for EmbeddedPaneController {
         Ok(())
     }
 
+    /// PRD #83: surface the inherent [`EmbeddedPaneController::focused_pane_id`]
+    /// through the trait so `TabManager`'s tab-switch focus capture can
+    /// read it via `Arc<dyn PaneController>`.
+    fn focused_pane_id(&self) -> Option<String> {
+        EmbeddedPaneController::focused_pane_id(self)
+    }
+
     /// PRD #110 followup: snapshot the daemon-side `agent_id` currently
     /// bound to a pane. Brand-new pane creation sites call this right
     /// after `create_pane_with_options` returns so the local placeholder

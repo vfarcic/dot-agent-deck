@@ -97,8 +97,13 @@ fn main() -> ExitCode {
         }
     }
 
-    // Scan tests/ for `#[spec(...)]` annotations + function defs.
-    let test_files = collect_test_rs_files(&tests_dir);
+    // Scan tests/ AND src/ for `#[spec(...)]` annotations + function
+    // defs. PRD #83 added per-tab-selection `#[spec]` unit tests in
+    // `src/tab.rs`; the e2e-only checks below key off the `e2e_`
+    // filename prefix, so library sources never trip the sleep/polling
+    // rules.
+    let mut test_files = collect_test_rs_files(&tests_dir);
+    test_files.extend(collect_test_rs_files(&root.join("src")));
     let mut annotations: Vec<SpecAnnotation> = Vec::new();
     let mut e2e_violations: Vec<String> = Vec::new();
     let mut ignore_violations: Vec<String> = Vec::new();

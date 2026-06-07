@@ -70,7 +70,15 @@ pub enum OrchestrationRoleStatus {
 // ---------------------------------------------------------------------------
 
 pub enum Tab {
-    Dashboard,
+    Dashboard {
+        /// PRD #83: session id of the dashboard card last selected on this
+        /// tab. `None` = no remembered selection (defaults to the first
+        /// card). Keyed by stable session id, not a positional index, so
+        /// filter/sort changes and session restarts don't move the
+        /// selection to the wrong card. `UiState.selected_index` is
+        /// derived from this each frame.
+        selected_session_id: Option<String>,
+    },
     Mode {
         id: TabId,
         name: String,
@@ -78,8 +86,12 @@ pub enum Tab {
         mode_manager: Box<ModeManager>,
         last_routed_timestamp: HashMap<String, DateTime<Utc>>,
         cwd: String,
-        /// Which side pane has visual focus in Normal mode. `None` = agent pane.
-        focused_side_pane_index: Option<usize>,
+        /// PRD #83: which pane has focus in Normal mode, keyed by stable
+        /// pane id. `None` = the agent pane is focused; `Some(id)` = that
+        /// side pane is focused. Replaces the former positional
+        /// `focused_side_pane_index: Option<usize>` so reactive pane-pool
+        /// changes can't silently point focus at the wrong pane.
+        focused_pane_id: Option<String>,
     },
     Orchestration {
         id: TabId,
@@ -89,6 +101,10 @@ pub enum Tab {
         /// Per-role status for the orchestration sidebar.
         role_statuses: Vec<OrchestrationRoleStatus>,
         cwd: String,
+        /// PRD #83: which role pane has focus on this tab, keyed by stable
+        /// pane id. `None` = default to the start (orchestrator) role pane
+        /// on switch-in.
+        focused_role_pane_id: Option<String>,
         /// Index into `role_pane_ids` for the start (orchestrator) role.
         start_role_index: usize,
         /// Pre-built prompt to inject into the start role once it is ready.
@@ -104,7 +120,7 @@ pub enum Tab {
 impl Tab {
     fn label(&self) -> &str {
         match self {
-            Tab::Dashboard => "Dashboard",
+            Tab::Dashboard { .. } => "Dashboard",
             Tab::Mode { name, .. } => name,
             Tab::Orchestration { name, .. } => name,
         }
@@ -125,7 +141,9 @@ pub struct TabManager {
 impl TabManager {
     pub fn new(pane_controller: Arc<dyn PaneController>) -> Self {
         Self {
-            tabs: vec![Tab::Dashboard],
+            tabs: vec![Tab::Dashboard {
+                selected_session_id: None,
+            }],
             active_index: 0,
             next_id: 1,
             pane_controller,
@@ -154,6 +172,213 @@ impl TabManager {
             true
         } else {
             false
+        }
+    }
+
+    /// PRD #83 M2 — capture the process-wide focused pane id into the
+    /// currently active tab's per-tab selection field, just before a tab
+    /// switch leaves it. Mode tabs record `None` when the agent pane is
+    /// focused and `Some(side_id)` when a managed side pane is focused;
+    /// Orchestration tabs record the focused role pane. A focused pane
+    /// that doesn't belong to the active tab (e.g. focus moved elsewhere
+    /// programmatically) leaves the field unchanged. Dashboard is a
+    /// no-op: its `selected_session_id` is maintained every frame from
+    /// the focused pane by the render loop, which has the session list
+    /// this method lacks.
+    pub fn capture_focus_on_switch_out(&mut self) {
+        let focused = self.pane_controller.focused_pane_id();
+        match &mut self.tabs[self.active_index] {
+            Tab::Dashboard { .. } => {}
+            Tab::Mode {
+                agent_pane_id,
+                mode_manager,
+                focused_pane_id,
+                ..
+            } => {
+                let Some(focused) = focused else { return };
+                if &focused == agent_pane_id {
+                    *focused_pane_id = None;
+                } else if mode_manager.managed_pane_ids().contains(&focused) {
+                    *focused_pane_id = Some(focused);
+                }
+                // Focus belongs to another tab → leave the field as-is.
+            }
+            Tab::Orchestration {
+                role_pane_ids,
+                focused_role_pane_id,
+                ..
+            } => {
+                let Some(focused) = focused else { return };
+                if role_pane_ids.iter().any(|id| id == &focused) {
+                    *focused_role_pane_id = Some(focused);
+                }
+            }
+        }
+    }
+
+    /// PRD #83 M4 — after a reactive pane-pool change, follow EVERY tab's
+    /// remembered focused pane to its successor using the
+    /// `(closed_id, new_id)` pairs from [`Self::route_reactive_commands`].
+    ///
+    /// `route_reactive_commands` iterates over ALL tabs, so a recreated
+    /// reactive pane can be the remembered focus of a BACKGROUND
+    /// (non-active) Mode or Orchestration tab — that tab must follow the
+    /// successor on switch-in, not silently fall back to its default
+    /// pane (the review finding this fixes). For every tab whose
+    /// remembered focus (`Tab::Mode::focused_pane_id` /
+    /// `Tab::Orchestration::focused_role_pane_id`) equals a closed id
+    /// with a known successor, the field is remapped to the new id; a
+    /// remembered id that has vanished from the tab's live pane set with
+    /// no successor is cleared (M4 fallback → agent / start-role pane on
+    /// switch-in). Keyed by stable id, this replaces the former
+    /// positional-index clamp.
+    ///
+    /// Returns the new id for the ACTIVE tab's focused pane when it was
+    /// remapped, so the caller can re-focus the live pane on the
+    /// controller — background tabs need no controller focus until they
+    /// become active and `restore_focus_on_switch_in` runs.
+    pub fn remap_focus_after_reactive_change(
+        &mut self,
+        pane_changes: &[(String, String)],
+    ) -> Option<String> {
+        let active = self.active_index;
+        let mut active_new_id: Option<String> = None;
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            match tab {
+                Tab::Mode {
+                    focused_pane_id,
+                    mode_manager,
+                    ..
+                } => {
+                    let Some(current) = focused_pane_id.clone() else {
+                        continue;
+                    };
+                    if let Some((_, new_id)) = pane_changes.iter().find(|(old, _)| old == &current)
+                    {
+                        *focused_pane_id = Some(new_id.clone());
+                        if i == active {
+                            active_new_id = Some(new_id.clone());
+                        }
+                    } else if !mode_manager.managed_pane_ids().contains(&current) {
+                        *focused_pane_id = None;
+                    }
+                }
+                Tab::Orchestration {
+                    focused_role_pane_id,
+                    role_pane_ids,
+                    ..
+                } => {
+                    let Some(current) = focused_role_pane_id.clone() else {
+                        continue;
+                    };
+                    if let Some((_, new_id)) = pane_changes.iter().find(|(old, _)| old == &current)
+                    {
+                        *focused_role_pane_id = Some(new_id.clone());
+                        if i == active {
+                            active_new_id = Some(new_id.clone());
+                        }
+                    } else if !role_pane_ids.contains(&current) {
+                        *focused_role_pane_id = None;
+                    }
+                }
+                Tab::Dashboard { .. } => {}
+            }
+        }
+        active_new_id
+    }
+
+    /// PRD #83 — record that `pane_id` is now the focused pane of the
+    /// active tab, updating its per-tab selection field. Used by the
+    /// programmatic "jump to the tab owning this pane and focus it"
+    /// paths (Enter-on-card, config-prompt focus) so the tab's remembered
+    /// focus matches the pane the controller was just told to focus —
+    /// otherwise the next render would highlight a stale pane. Mode tabs
+    /// store `None` when the agent pane is focused. Dashboard is a no-op
+    /// (its selection is keyed by session id, synced from the render loop).
+    pub fn record_focus(&mut self, pane_id: &str) {
+        match &mut self.tabs[self.active_index] {
+            Tab::Dashboard { .. } => {}
+            Tab::Mode {
+                agent_pane_id,
+                focused_pane_id,
+                ..
+            } => {
+                *focused_pane_id = if pane_id == agent_pane_id {
+                    None
+                } else {
+                    Some(pane_id.to_string())
+                };
+            }
+            Tab::Orchestration {
+                role_pane_ids,
+                focused_role_pane_id,
+                ..
+            } => {
+                if role_pane_ids.iter().any(|id| id == pane_id) {
+                    *focused_role_pane_id = Some(pane_id.to_string());
+                }
+            }
+        }
+    }
+
+    /// PRD #83 M2/M4 — restore the active tab's remembered pane focus on
+    /// switch-in by calling `focus_pane` on the embedded controller.
+    /// Mode tabs focus their remembered side pane (or the agent pane when
+    /// `None`); Orchestration tabs focus their remembered role pane (or
+    /// the start role pane). A remembered id that no longer exists in the
+    /// tab's live pane set is cleared and the default is focused instead
+    /// (stale-id fallback). Dashboard is a no-op — it has no fixed pane
+    /// to focus and its card selection is derived from
+    /// `selected_session_id` each frame.
+    pub fn restore_focus_on_switch_in(&mut self) {
+        let target: Option<String> = match &mut self.tabs[self.active_index] {
+            Tab::Dashboard { .. } => None,
+            Tab::Mode {
+                agent_pane_id,
+                mode_manager,
+                focused_pane_id,
+                ..
+            } => {
+                // Drop a stale side-pane id so we fall back to the agent pane.
+                if let Some(id) = focused_pane_id.as_ref()
+                    && !mode_manager.managed_pane_ids().contains(id)
+                {
+                    *focused_pane_id = None;
+                }
+                Some(
+                    focused_pane_id
+                        .clone()
+                        .unwrap_or_else(|| agent_pane_id.clone()),
+                )
+            }
+            Tab::Orchestration {
+                role_pane_ids,
+                focused_role_pane_id,
+                start_role_index,
+                ..
+            } => {
+                let is_live = |id: &String| {
+                    !id.is_empty()
+                        && !crate::ui::is_dead_slot_pane_id(id)
+                        && role_pane_ids.iter().any(|p| p == id)
+                };
+                if let Some(id) = focused_role_pane_id.as_ref()
+                    && !is_live(id)
+                {
+                    *focused_role_pane_id = None;
+                }
+                focused_role_pane_id.clone().or_else(|| {
+                    // Default to the start role pane, else the first live role pane.
+                    role_pane_ids
+                        .get(*start_role_index)
+                        .filter(|id| is_live(id))
+                        .cloned()
+                        .or_else(|| role_pane_ids.iter().find(|id| is_live(id)).cloned())
+                })
+            }
+        };
+        if let Some(id) = target {
+            let _ = self.pane_controller.focus_pane(&id);
         }
     }
 
@@ -203,7 +428,7 @@ impl TabManager {
             mode_manager: Box::new(mode_manager),
             last_routed_timestamp: HashMap::new(),
             cwd: cwd.to_string(),
-            focused_side_pane_index: None,
+            focused_pane_id: None,
         });
 
         let index = self.tabs.len() - 1;
@@ -314,6 +539,7 @@ impl TabManager {
             role_pane_ids: role_pane_ids.clone(),
             role_statuses: vec![OrchestrationRoleStatus::Waiting; config.roles.len()],
             cwd: cwd.to_string(),
+            focused_role_pane_id: None,
             start_role_index,
             orchestrator_prompt,
             config: config.clone(),
@@ -431,6 +657,7 @@ impl TabManager {
             role_pane_ids: role_pane_ids_flat.clone(),
             role_statuses,
             cwd: cwd.to_string(),
+            focused_role_pane_id: None,
             start_role_index,
             // Design decision 3: don't replay orchestrator_prompt on
             // reconnect. The orchestrator already received it at start
@@ -508,7 +735,7 @@ impl TabManager {
                 }
                 outcome
             }
-            Tab::Dashboard => CloseTabOutcome::default(),
+            Tab::Dashboard { .. } => CloseTabOutcome::default(),
         };
 
         // Adjust active_index after removal.
@@ -547,7 +774,7 @@ impl TabManager {
                             .cloned(),
                     );
                 }
-                Tab::Dashboard => {}
+                Tab::Dashboard { .. } => {}
             }
         }
         ids
@@ -604,7 +831,7 @@ impl TabManager {
     /// Get the active mode name (None if Dashboard is active).
     pub fn active_mode_name(&self) -> Option<&str> {
         match &self.tabs[self.active_index] {
-            Tab::Dashboard => None,
+            Tab::Dashboard { .. } => None,
             Tab::Mode { name, .. } => Some(name),
             Tab::Orchestration { .. } => None,
         }
@@ -688,3 +915,571 @@ pub(crate) fn extract_new_bash_commands(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pane::{PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome};
+    use crate::project_config::{
+        ModeConfig, ModePersistentPane, OrchestrationConfig, OrchestrationRoleConfig,
+    };
+    use spec::spec;
+    use std::sync::Mutex;
+
+    /// Mock `PaneController` for PRD #83 tab-selection tests. It mints
+    /// sequential pane ids on create, remembers the single focused pane
+    /// (so `focused_pane_id` round-trips the last `focus_pane`), and
+    /// records every `focus_pane` id so tests can assert which pane the
+    /// switch/restore path actually focused.
+    struct MockPaneController {
+        next: Mutex<u32>,
+        focused: Mutex<Option<String>>,
+        focus_calls: Mutex<Vec<String>>,
+    }
+
+    impl MockPaneController {
+        fn new() -> Self {
+            Self {
+                next: Mutex::new(0),
+                focused: Mutex::new(None),
+                focus_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn focus_calls(&self) -> Vec<String> {
+            self.focus_calls.lock().unwrap().clone()
+        }
+
+        fn last_focus(&self) -> Option<String> {
+            self.focus_calls.lock().unwrap().last().cloned()
+        }
+    }
+
+    impl PaneController for MockPaneController {
+        fn create_pane(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<String, PaneError> {
+            let mut n = self.next.lock().unwrap();
+            let id = format!("pane-{n}");
+            *n += 1;
+            Ok(id)
+        }
+        fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+            *self.focused.lock().unwrap() = Some(pane_id.to_string());
+            self.focus_calls.lock().unwrap().push(pane_id.to_string());
+            Ok(())
+        }
+        fn focused_pane_id(&self) -> Option<String> {
+            self.focused.lock().unwrap().clone()
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A mode config with `side_pane_count` persistent (non-watch) side
+    /// panes and no reactive pool, so `managed_pane_ids()` is deterministic.
+    fn mode_config(name: &str, side_pane_count: usize) -> ModeConfig {
+        ModeConfig {
+            name: name.to_string(),
+            init_command: None,
+            panes: (0..side_pane_count)
+                .map(|i| ModePersistentPane {
+                    command: format!("echo side-{i}"),
+                    name: Some(format!("side-{i}")),
+                    watch: false,
+                })
+                .collect(),
+            rules: Vec::new(),
+            reactive_panes: 0,
+        }
+    }
+
+    fn orch_config(name: &str) -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: name.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "echo orch".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    name: "coder".to_string(),
+                    command: "echo coder".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        }
+    }
+
+    /// Scenario: Give the Dashboard, a Mode tab, and an Orchestration tab
+    /// each their own stable-id selection field, switch through every tab
+    /// and back, and assert each tab still holds its own remembered id —
+    /// proving the selection state is per-tab, not a single global value.
+    #[spec("tabs/selection/001")]
+    #[test]
+    fn selection_001_per_tab_field_round_trip() {
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (mode_idx, side_ids) = tm
+            .open_mode_tab(
+                &mode_config("mode", 2),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open mode tab");
+        let (orch_idx, role_ids) = tm
+            .open_orchestration_tab(&orch_config("orch"), "/work", None, (24, 80))
+            .expect("open orchestration tab");
+
+        // Stamp a distinct remembered id onto each tab variant.
+        if let Tab::Dashboard {
+            selected_session_id,
+        } = &mut tm.tabs[0]
+        {
+            *selected_session_id = Some("sess-dashboard".to_string());
+        }
+        if let Tab::Mode {
+            focused_pane_id, ..
+        } = &mut tm.tabs[mode_idx]
+        {
+            *focused_pane_id = Some(side_ids[1].clone());
+        }
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = &mut tm.tabs[orch_idx]
+        {
+            *focused_role_pane_id = Some(role_ids[1].clone());
+        }
+
+        // Walk across every tab and back; switch_to is a pure index move,
+        // so each tab must keep its own id untouched.
+        for idx in [0, mode_idx, orch_idx, mode_idx, 0] {
+            assert!(tm.switch_to(idx));
+        }
+
+        assert!(matches!(
+            &tm.tabs[0],
+            Tab::Dashboard { selected_session_id: Some(s) } if s == "sess-dashboard"
+        ));
+        assert!(matches!(
+            &tm.tabs[mode_idx],
+            Tab::Mode { focused_pane_id: Some(p), .. } if *p == side_ids[1]
+        ));
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == role_ids[1]
+        ));
+    }
+
+    /// Scenario: On a Mode tab focus side pane #2, switch out and assert
+    /// the side pane id was captured into the Mode tab's field; switch
+    /// back and assert `focus_pane` fired with that exact id. Then clear
+    /// the field to `None` and assert switch-in instead focuses the agent
+    /// pane.
+    #[spec("tabs/selection/002")]
+    #[test]
+    fn selection_002_switch_to_focus_restore_and_capture() {
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (mode_idx, side_ids) = tm
+            .open_mode_tab(
+                &mode_config("mode", 2),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open mode tab");
+        // open_mode_tab leaves the mode tab active.
+        assert_eq!(tm.active_index(), mode_idx);
+
+        // User focuses side pane #2 on the mode tab.
+        let target = side_ids[1].clone();
+        pc.focus_pane(&target).unwrap();
+
+        // Switch-out capture records the focused side pane into the tab.
+        tm.capture_focus_on_switch_out();
+        assert!(matches!(
+            &tm.tabs[mode_idx],
+            Tab::Mode { focused_pane_id: Some(p), .. } if *p == target
+        ));
+
+        // Leave to the dashboard, then come back: restore must focus the
+        // remembered side pane.
+        assert!(tm.switch_to(0));
+        assert!(tm.switch_to(mode_idx));
+        tm.restore_focus_on_switch_in();
+        assert_eq!(pc.last_focus().as_deref(), Some(target.as_str()));
+
+        // With no remembered side pane, restore focuses the agent pane.
+        if let Tab::Mode {
+            focused_pane_id, ..
+        } = &mut tm.tabs[mode_idx]
+        {
+            *focused_pane_id = None;
+        }
+        tm.restore_focus_on_switch_in();
+        assert_eq!(pc.last_focus().as_deref(), Some("agent-m"));
+    }
+
+    /// Scenario: On the Dashboard, set `selected_session_id` to the second
+    /// card in a filtered list and assert `sync_and_derive_selection`
+    /// derives that card's index; then assert the same sync run against a
+    /// Mode tab returns `None` and never rewrites the dashboard's id —
+    /// the gating that stops cross-tab selection leaks.
+    #[spec("tabs/selection/003")]
+    #[test]
+    fn selection_003_dashboard_derived_index_and_gated_sync() {
+        let filtered: &[(&str, Option<&str>)] =
+            &[("s1", Some("p1")), ("s2", Some("p2")), ("s3", Some("p3"))];
+
+        let mut dash = Tab::Dashboard {
+            selected_session_id: Some("s2".to_string()),
+        };
+        // No focused pane: index derives purely from the remembered id.
+        let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered);
+        assert_eq!(idx, Some(1));
+
+        // A focused pane that maps to a visible card adopts that card.
+        let idx = crate::ui::sync_and_derive_selection(&mut dash, Some("p3"), filtered);
+        assert_eq!(idx, Some(2));
+        assert!(matches!(
+            &dash,
+            Tab::Dashboard { selected_session_id: Some(s) } if s == "s3"
+        ));
+
+        // Gating: running the sync while a Mode tab is active returns
+        // `None` (selected_index left untouched) and cannot touch the
+        // dashboard's stored id.
+        let mut mode = Tab::Mode {
+            id: 1,
+            name: "mode".to_string(),
+            agent_pane_id: "agent".to_string(),
+            mode_manager: Box::new(ModeManager::new(Arc::new(MockPaneController::new()))),
+            last_routed_timestamp: HashMap::new(),
+            cwd: "/work".to_string(),
+            focused_pane_id: None,
+        };
+        let idx = crate::ui::sync_and_derive_selection(&mut mode, Some("p1"), filtered);
+        assert_eq!(idx, None);
+        assert!(matches!(
+            &dash,
+            Tab::Dashboard { selected_session_id: Some(s) } if s == "s3"
+        ));
+    }
+
+    /// Scenario: A remembered id that's no longer in the filtered list (a
+    /// gone session / removed role pane) is cleared and the selection
+    /// falls back to the first card. A reactive pane recreation remaps the
+    /// focused pane to its successor via the `(closed,new)` pair on BOTH
+    /// the active tab (whose new id is returned for re-focus) and a
+    /// background (non-active) Mode/Orchestration tab; a vanished pane
+    /// with no successor clears the field on either.
+    #[spec("tabs/selection/004")]
+    #[test]
+    fn selection_004_stale_id_fallback_and_reactive_remap() {
+        // Dashboard: remembered session id no longer present → cleared + 0.
+        let filtered: &[(&str, Option<&str>)] = &[("s1", Some("p1")), ("s2", Some("p2"))];
+        let mut dash = Tab::Dashboard {
+            selected_session_id: Some("gone".to_string()),
+        };
+        let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered);
+        assert_eq!(idx, Some(0));
+        assert!(matches!(
+            &dash,
+            Tab::Dashboard {
+                selected_session_id: None
+            }
+        ));
+
+        // Orchestration: remembered role pane gone from the list → cleared.
+        let mut orch = Tab::Orchestration {
+            id: 2,
+            name: "orch".to_string(),
+            role_pane_ids: vec!["p1".to_string(), "p2".to_string()],
+            role_statuses: vec![
+                OrchestrationRoleStatus::Working,
+                OrchestrationRoleStatus::Working,
+            ],
+            cwd: "/work".to_string(),
+            focused_role_pane_id: Some("gone".to_string()),
+            start_role_index: 0,
+            orchestrator_prompt: None,
+            config: orch_config("orch"),
+            status: OrchestrationStatus::WaitingForOrchestrator,
+        };
+        let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered);
+        assert_eq!(idx, Some(0));
+        assert!(matches!(
+            &orch,
+            Tab::Orchestration {
+                focused_role_pane_id: None,
+                ..
+            }
+        ));
+
+        // Reactive remap — ACTIVE tab: the focused side pane was
+        // recreated, so follow it to the successor and re-focus that id.
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (mode_idx, side_ids) = tm
+            .open_mode_tab(
+                &mode_config("mode", 1),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open mode tab");
+        let original = side_ids[0].clone();
+        if let Tab::Mode {
+            focused_pane_id, ..
+        } = &mut tm.tabs[mode_idx]
+        {
+            *focused_pane_id = Some(original.clone());
+        }
+        let remapped =
+            tm.remap_focus_after_reactive_change(&[(original.clone(), "pane-new".to_string())]);
+        assert_eq!(remapped.as_deref(), Some("pane-new"));
+        assert!(matches!(
+            &tm.tabs[mode_idx],
+            Tab::Mode { focused_pane_id: Some(p), .. } if p == "pane-new"
+        ));
+
+        // ACTIVE tab vanished pane with no successor → field cleared,
+        // returns None.
+        if let Tab::Mode {
+            focused_pane_id, ..
+        } = &mut tm.tabs[mode_idx]
+        {
+            *focused_pane_id = Some("ghost".to_string());
+        }
+        let remapped =
+            tm.remap_focus_after_reactive_change(&[("other".to_string(), "x".to_string())]);
+        assert_eq!(remapped, None);
+        assert!(matches!(
+            &tm.tabs[mode_idx],
+            Tab::Mode {
+                focused_pane_id: None,
+                ..
+            }
+        ));
+
+        // Reactive remap — BACKGROUND tabs (the review fix). Build a
+        // second Mode tab and an Orchestration tab; opening them leaves
+        // the LAST-opened tab active, so the earlier Mode tab is now a
+        // background tab whose focused reactive pane can still be
+        // recreated by `route_reactive_commands`.
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (bg_mode, bg_sides) = tm
+            .open_mode_tab(
+                &mode_config("bg-mode", 1),
+                "/work",
+                "agent-bg".to_string(),
+                (24, 80),
+            )
+            .expect("open background mode tab");
+        let (bg_orch, bg_roles) = tm
+            .open_orchestration_tab(&orch_config("bg-orch"), "/work", None, (24, 80))
+            .expect("open background orchestration tab");
+        let (active_mode, active_sides) = tm
+            .open_mode_tab(
+                &mode_config("active-mode", 1),
+                "/work",
+                "agent-active".to_string(),
+                (24, 80),
+            )
+            .expect("open active mode tab");
+        assert_eq!(tm.active_index(), active_mode);
+
+        let bg_side = bg_sides[0].clone();
+        let bg_role = bg_roles[0].clone();
+        let active_side = active_sides[0].clone();
+        if let Tab::Mode {
+            focused_pane_id, ..
+        } = &mut tm.tabs[bg_mode]
+        {
+            *focused_pane_id = Some(bg_side.clone());
+        }
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = &mut tm.tabs[bg_orch]
+        {
+            *focused_role_pane_id = Some(bg_role.clone());
+        }
+        if let Tab::Mode {
+            focused_pane_id, ..
+        } = &mut tm.tabs[active_mode]
+        {
+            *focused_pane_id = Some(active_side.clone());
+        }
+
+        // One reactive pass recreates the focused pane of the background
+        // Mode tab, the background Orchestration tab, AND the active tab.
+        let remapped = tm.remap_focus_after_reactive_change(&[
+            (bg_side.clone(), "bg-mode-new".to_string()),
+            (bg_role.clone(), "bg-orch-new".to_string()),
+            (active_side.clone(), "active-new".to_string()),
+        ]);
+        // Only the ACTIVE tab's new id is returned for controller re-focus.
+        assert_eq!(remapped.as_deref(), Some("active-new"));
+        // Background Mode tab followed its successor (NOT cleared / defaulted).
+        assert!(matches!(
+            &tm.tabs[bg_mode],
+            Tab::Mode { focused_pane_id: Some(p), .. } if p == "bg-mode-new"
+        ));
+        // Background Orchestration tab followed its successor too.
+        assert!(matches!(
+            &tm.tabs[bg_orch],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if p == "bg-orch-new"
+        ));
+        // Active tab remapped as well.
+        assert!(matches!(
+            &tm.tabs[active_mode],
+            Tab::Mode { focused_pane_id: Some(p), .. } if p == "active-new"
+        ));
+
+        // BACKGROUND tab vanished pane with no successor → field cleared,
+        // while a tab whose focus is still a live managed pane is left
+        // untouched. Reset the active tab to its real side pane so it
+        // stays in the managed set, then point the background tab at a
+        // ghost id absent from any pair and from its managed set.
+        if let Tab::Mode {
+            focused_pane_id, ..
+        } = &mut tm.tabs[active_mode]
+        {
+            *focused_pane_id = Some(active_side.clone());
+        }
+        if let Tab::Mode {
+            focused_pane_id, ..
+        } = &mut tm.tabs[bg_mode]
+        {
+            *focused_pane_id = Some("bg-ghost".to_string());
+        }
+        let remapped =
+            tm.remap_focus_after_reactive_change(&[("unrelated".to_string(), "z".to_string())]);
+        // No tab matched a pair, so nothing is returned for re-focus.
+        assert_eq!(remapped, None);
+        // Background tab's stale ghost focus was cleared (M4 fallback).
+        assert!(matches!(
+            &tm.tabs[bg_mode],
+            Tab::Mode {
+                focused_pane_id: None,
+                ..
+            }
+        ));
+        // Active tab's still-live focus was left intact.
+        assert!(matches!(
+            &tm.tabs[active_mode],
+            Tab::Mode { focused_pane_id: Some(p), .. } if *p == active_side
+        ));
+    }
+
+    /// Scenario: Drive the Problem-section walkthrough across a Dashboard,
+    /// two Mode tabs, and one Orchestration tab. Focus a side pane on each
+    /// Mode tab, switch through the tabs, and assert every switch-in
+    /// restores that tab's own remembered pane (or its default) via a
+    /// `focus_pane` call — the cross-tab focus memory the PRD requires.
+    #[spec("tabs/selection/005")]
+    #[test]
+    fn selection_005_integration_multi_tab_walkthrough() {
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (m1, m1_sides) = tm
+            .open_mode_tab(
+                &mode_config("mode-1", 2),
+                "/work",
+                "agent-1".to_string(),
+                (24, 80),
+            )
+            .expect("mode 1");
+        let (m2, m2_sides) = tm
+            .open_mode_tab(
+                &mode_config("mode-2", 2),
+                "/work",
+                "agent-2".to_string(),
+                (24, 80),
+            )
+            .expect("mode 2");
+        let (orch, role_ids) = tm
+            .open_orchestration_tab(&orch_config("orch"), "/work", None, (24, 80))
+            .expect("orch");
+
+        // Land on mode-1 and focus its side pane #1.
+        assert!(tm.switch_to(m1));
+        let m1_target = m1_sides[0].clone();
+        pc.focus_pane(&m1_target).unwrap();
+
+        // Switch to mode-2 (capture m1's focus, restore m2's default agent
+        // pane since it has no remembered pane yet).
+        tm.capture_focus_on_switch_out();
+        assert!(tm.switch_to(m2));
+        tm.restore_focus_on_switch_in();
+        assert_eq!(pc.last_focus().as_deref(), Some("agent-2"));
+
+        // Focus a side pane on mode-2, then jump to the orchestration tab:
+        // its default focus is the start (orchestrator) role pane.
+        let m2_target = m2_sides[1].clone();
+        pc.focus_pane(&m2_target).unwrap();
+        tm.capture_focus_on_switch_out();
+        assert!(tm.switch_to(orch));
+        tm.restore_focus_on_switch_in();
+        assert_eq!(pc.last_focus().as_deref(), Some(role_ids[0].as_str()));
+
+        // Back to mode-1: restore its own remembered side pane.
+        tm.capture_focus_on_switch_out();
+        assert!(tm.switch_to(m1));
+        tm.restore_focus_on_switch_in();
+        assert_eq!(pc.last_focus().as_deref(), Some(m1_target.as_str()));
+
+        // And to mode-2: restore the side pane focused there earlier.
+        tm.capture_focus_on_switch_out();
+        assert!(tm.switch_to(m2));
+        tm.restore_focus_on_switch_in();
+        assert_eq!(pc.last_focus().as_deref(), Some(m2_target.as_str()));
+
+        // Sanity: every assertion above came from a real focus_pane call.
+        assert!(pc.focus_calls().len() >= 6);
+    }
+}

@@ -46,7 +46,14 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** pane content; this is a card layout snapshot only.
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/pane/005 — Card row shows `Dir:` (working directory basename), `Last:` (elapsed since last activity), `Tools:` (tool count), `Prmt:` (latest user prompts).
+##### dashboard/pane/005 — Dashboard card highlight follows the stable `selected_session_id`, not card 0 (PRD #83 M3).
+- **Layer:** L1 (ratatui `TestBackend` + `insta`).
+- **Agent:** none.
+- **Asserts:** with three session cards and a `Tab::Dashboard` whose `selected_session_id` points at the second card (`sess-beta`), `ui::sync_and_derive_selection` derives index 1 (not 0); the rendered snapshot shows the `▸` selection marker and highlighted border on the second card while the first and third stay unselected.
+- **Does not assert:** keyboard-driven selection movement (`dashboard/selection/*`); absolute-time clocks (`Last:` is rendered against a fixed test clock).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/006 — Card row shows `Dir:` (working directory basename), `Last:` (elapsed since last activity), `Tools:` (tool count), `Prmt:` (latest user prompts).
 - **Layer:** L1.
 - **Agent:** none.
 - **Asserts:** rendered card snapshot has all four labels in order with the supplied fixture data.
@@ -525,6 +532,43 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Asserts:** tab disappears; the daemon no longer carries the role agents.
 - **Does not assert:** the order in which roles are closed.
 - **Platform coverage:** mac+linux.
+
+#### tabs/selection
+
+##### tabs/selection/001 — Each tab remembers its own selection by stable id across switch-away/switch-back (PRD #83 M1).
+- **Layer:** L1 (in-process unit test; `src/tab.rs`).
+- **Agent:** none (mock `PaneController`).
+- **Asserts:** stamping a distinct stable id on the Dashboard (`selected_session_id`), a Mode tab (`focused_pane_id`), and an Orchestration tab (`focused_role_pane_id`), then switching through every tab and back, leaves each tab holding its own id unchanged — selection is per-tab, not a single global value.
+- **Does not assert:** rendering of the selection; focus restore (covered by `tabs/selection/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/selection/002 — `switch_to` focus restore + capture round-trips a Mode tab's focused pane (PRD #83 M2).
+- **Layer:** L1 (in-process unit test; `src/tab.rs`).
+- **Agent:** none (mock `PaneController` records `focus_pane` calls).
+- **Asserts:** focusing side pane #2 then switching out captures that pane id into the Mode tab; switching back calls `focus_pane` with the stored id; with the field cleared to `None`, switch-in instead focuses the agent pane.
+- **Does not assert:** Dashboard focus restore (keyed by session id, handled in the UI loop, not `TabManager`).
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/selection/003 — Dashboard `selected_index` is derived from `selected_session_id`; the sync is gated to the active tab (PRD #83 M3).
+- **Layer:** L1 (in-process unit test; `src/tab.rs`).
+- **Agent:** none.
+- **Asserts:** `ui::sync_and_derive_selection` resolves a Dashboard `selected_session_id` to its card index, and adopts a focused pane that maps to a visible card; running the same sync against a Mode tab returns `None` and never rewrites the Dashboard's stored id (no cross-tab leak).
+- **Does not assert:** the per-frame call site in `run_tui` (exercised by the L1 render test `dashboard/pane/005`).
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/selection/004 — Stale-id fallback clears the field and defaults; reactive-pane recreation remaps focus (PRD #83 M4).
+- **Layer:** L1 (in-process unit test; `src/tab.rs`).
+- **Agent:** none (mock `PaneController`).
+- **Asserts:** a remembered session/role id no longer in the filtered list is cleared and the selection falls back to index 0; `remap_focus_after_reactive_change` follows a `(closed_id, new_id)` pair to the successor pane on BOTH the active tab (returning its new id for re-focus) and a background (non-active) Mode/Orchestration tab, and clears the field on either when a focused pane vanished with no successor.
+- **Does not assert:** the controller-level resize that follows a reactive swap.
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/selection/005 — Multi-tab walkthrough: each switch-in restores that tab's own deck/pane (PRD #83 M2/M6).
+- **Layer:** L1 (in-process integration test; `src/tab.rs`).
+- **Agent:** none (mock `PaneController` records `focus_pane` calls).
+- **Asserts:** across a Dashboard, two Mode tabs, and one Orchestration tab, focusing a side pane on each Mode tab and switching between tabs restores each destination tab's own remembered pane (or its default agent / start-role pane) via a `focus_pane` call.
+- **Does not assert:** rendering; this drives the `TabManager` capture/restore path directly.
+- **Platform coverage:** mac+linux+windows.
 
 ### Embedded pane attach
 
