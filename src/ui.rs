@@ -6120,7 +6120,7 @@ fn render_stats_bar(
     if let Some(name) = active_mode_name {
         spans.push(Span::styled(
             "  \u{2502}  ",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette.text_muted),
         ));
         spans.push(Span::styled(
             format!("mode: {name}"),
@@ -6255,7 +6255,7 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(palette.text_secondary)
         };
         text.push(Line::styled(
             format!("  {cursor} {label:<7} \u{2014} {desc}"),
@@ -6266,7 +6266,7 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
     text.push(Line::from(""));
     text.push(Line::styled(
         "  Up/Down: navigate  Enter: confirm  Esc: cancel",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette.text_secondary),
     ));
 
     let block = Block::default()
@@ -6329,7 +6329,7 @@ fn render_stop_confirm(
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(palette.text_secondary)
         };
         text.push(Line::styled(
             format!("  {cursor} {label:<5} \u{2014} {desc}"),
@@ -6340,7 +6340,7 @@ fn render_stop_confirm(
     text.push(Line::from(""));
     text.push(Line::styled(
         "  y / Enter on Yes confirms  ·  n / Esc / Enter on No returns to Quit dialog",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette.text_secondary),
     ));
 
     let block = Block::default()
@@ -6367,11 +6367,11 @@ fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
         Line::from(""),
         Line::styled(
             "  If you find dot-agent-deck useful,",
-            Style::default().fg(Color::White),
+            Style::default().fg(palette.text_primary),
         ),
         Line::styled(
             "  please consider starring the repo!",
-            Style::default().fg(Color::White),
+            Style::default().fg(palette.text_primary),
         ),
         Line::from(""),
         Line::styled(
@@ -6383,7 +6383,7 @@ fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
         Line::from(""),
         Line::styled(
             "  s Star  l Later  d Don't ask again",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(palette.text_secondary),
         ),
     ];
 
@@ -6422,15 +6422,15 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPa
         Line::from(""),
         Line::styled(
             "  No workspace modes config found for this",
-            Style::default().fg(Color::White),
+            Style::default().fg(palette.text_primary),
         ),
         Line::styled(
             "  project. Want to instruct your agent to",
-            Style::default().fg(Color::White),
+            Style::default().fg(palette.text_primary),
         ),
         Line::styled(
             "  analyze the project and create one?",
-            Style::default().fg(Color::White),
+            Style::default().fg(palette.text_primary),
         ),
         Line::from(""),
     ];
@@ -6442,7 +6442,7 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPa
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(palette.text_secondary)
         };
         text.push(Line::styled(
             format!("  {cursor} {label:<6} \u{2014} {desc}"),
@@ -6453,12 +6453,12 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPa
     text.push(Line::from(""));
     text.push(Line::styled(
         "  Disable: dot-agent-deck config set auto_config_prompt false",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette.text_secondary),
     ));
     text.push(Line::from(""));
     text.push(Line::styled(
         "  Up/Down: navigate  Enter: confirm  Esc: cancel",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette.text_secondary),
     ));
 
     let block = Block::default()
@@ -6922,7 +6922,7 @@ fn render_session_card(
 ) {
     let is_placeholder = session.agent_type == crate::event::AgentType::None;
     let (status_label, status_style) = if is_placeholder {
-        ("No agent", Style::default().fg(Color::DarkGray))
+        ("No agent", Style::default().fg(palette.text_secondary))
     } else {
         status_style(&session.status)
     };
@@ -7399,6 +7399,106 @@ impl CardDensityKind {
     pub fn rendered_height(self, wide: bool) -> u16 {
         CardDensity::from(self).card_height(wide)
     }
+}
+
+/// Shared L1-seam plumbing: build a `TestBackend` of the caller-given
+/// size, run `render` against its `Frame`, and return the resulting
+/// buffer. Centralizes the `TestBackend`/`Terminal`/draw/clone
+/// boilerplate (and its `.expect()` calls) so the per-overlay wrappers
+/// below stay one line each.
+fn draw_to_buffer<F>(width: u16, height: u16, render: F) -> ratatui::buffer::Buffer
+where
+    F: FnOnce(&mut Frame),
+{
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(render)
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// L1 test seam: render `render_stats_bar` into a standalone Buffer.
+/// Mirrors `render_card_to_buffer` so integration tests (which can only
+/// reach `pub` items) can pin the stats-bar styling. The underlying
+/// `render_stats_bar` stays private; this wrapper just sets up a
+/// `TestBackend` of the caller-given size and draws into it.
+#[doc(hidden)]
+pub fn render_stats_bar_to_buffer(
+    stats: &DashboardStats,
+    active_mode_name: Option<&str>,
+    palette: ColorPalette,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    draw_to_buffer(width, height, |frame| {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        render_stats_bar(frame, stats, area, active_mode_name, palette);
+    })
+}
+
+/// L1 test seam: render `render_quit_confirm` into a standalone Buffer.
+/// See `render_stats_bar_to_buffer` for the rationale.
+#[doc(hidden)]
+pub fn render_quit_confirm_to_buffer(
+    selected: usize,
+    palette: ColorPalette,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    draw_to_buffer(width, height, |frame| {
+        render_quit_confirm(frame, selected, palette);
+    })
+}
+
+/// L1 test seam: render `render_stop_confirm` into a standalone Buffer.
+/// See `render_stats_bar_to_buffer` for the rationale.
+#[doc(hidden)]
+pub fn render_stop_confirm_to_buffer(
+    selected: usize,
+    agent_count: usize,
+    palette: ColorPalette,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    draw_to_buffer(width, height, |frame| {
+        render_stop_confirm(frame, selected, agent_count, palette);
+    })
+}
+
+/// L1 test seam: render `render_star_prompt` into a standalone Buffer.
+/// See `render_stats_bar_to_buffer` for the rationale.
+#[doc(hidden)]
+pub fn render_star_prompt_to_buffer(
+    palette: ColorPalette,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    draw_to_buffer(width, height, |frame| {
+        render_star_prompt(frame, palette);
+    })
+}
+
+/// L1 test seam: render `render_config_gen_prompt` into a standalone Buffer.
+/// See `render_stats_bar_to_buffer` for the rationale.
+#[doc(hidden)]
+pub fn render_config_gen_prompt_to_buffer(
+    selected: usize,
+    palette: ColorPalette,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    draw_to_buffer(width, height, |frame| {
+        render_config_gen_prompt(frame, selected, palette);
+    })
 }
 
 /// L1 harness helper — render exactly one session card at the requested

@@ -9,9 +9,14 @@
 use std::collections::VecDeque;
 
 use dot_agent_deck::event::AgentType;
-use dot_agent_deck::state::{ActiveTool, SessionState, SessionStatus};
+use dot_agent_deck::state::{ActiveTool, DashboardStats, SessionState, SessionStatus};
 use dot_agent_deck::theme::{ColorPalette, Theme, resolve_palette};
-use dot_agent_deck::ui::{CardDensityKind, render_card_to_buffer};
+use dot_agent_deck::ui::{
+    CardDensityKind, render_card_to_buffer, render_config_gen_prompt_to_buffer,
+    render_quit_confirm_to_buffer, render_star_prompt_to_buffer, render_stats_bar_to_buffer,
+    render_stop_confirm_to_buffer,
+};
+use ratatui::style::Color;
 use spec::spec;
 
 /// Width (in terminal cells) at which `render_session_card` flips
@@ -107,4 +112,157 @@ fn pane_004_card_title_row() {
         height,
     );
     insta::assert_snapshot!(buffer_to_text(&buffer));
+}
+
+/// Color-aware sibling of [`buffer_to_text`]. `buffer_to_text` captures the
+/// symbol layer ONLY, so it cannot detect a foreground/background color
+/// change — exactly the kind of regression PRD #13 is about. This helper
+/// run-length-encodes each row into `[fg/bg]"text"` segments so the snapshot
+/// pins color: a cell painted with a hardcoded `White` shows up as `White`,
+/// distinct from a palette-resolved `Black`. The fully-default terminal
+/// background (Reset fg + Reset bg + whitespace) is dropped so the snapshots
+/// stay focused on the styled glyphs rather than acres of empty margin.
+fn buffer_to_color_text(buffer: &ratatui::buffer::Buffer) -> String {
+    use std::fmt::Write as _;
+
+    fn flush(line: &mut String, fg: Color, bg: Color, run: &str) {
+        if run.trim().is_empty() && fg == Color::Reset && bg == Color::Reset {
+            return;
+        }
+        let _ = write!(line, "[{fg:?}/{bg:?}]{run:?} ");
+    }
+
+    let area = buffer.area();
+    let mut out = String::new();
+    for y in 0..area.height {
+        let mut line = String::new();
+        let mut run = String::new();
+        let mut run_fg = buffer[(0, y)].fg;
+        let mut run_bg = buffer[(0, y)].bg;
+        for x in 0..area.width {
+            let cell = &buffer[(x, y)];
+            if cell.fg != run_fg || cell.bg != run_bg {
+                flush(&mut line, run_fg, run_bg, &run);
+                run.clear();
+                run_fg = cell.fg;
+                run_bg = cell.bg;
+            }
+            run.push_str(cell.symbol());
+        }
+        flush(&mut line, run_fg, run_bg, &run);
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+/// Render all six PRD #13 overlay/prompt surfaces with `palette` and emit one
+/// named, color-aware `insta` snapshot per surface (suffixed `_{theme}`). The
+/// two `#[spec]` tests below differ only by the palette + suffix they pass in,
+/// so dark-vs-light is a pure palette swap over identical fixtures.
+fn snapshot_overlay_surfaces(palette: ColorPalette, theme: &str) {
+    // 1. Stats bar — a representative mix so every status segment renders
+    //    plus the `mode:` tail (the separator that is hardcoded DarkGray today).
+    let stats = DashboardStats {
+        active: 6,
+        working: 1,
+        thinking: 1,
+        waiting: 1,
+        errors: 1,
+        idle: 1,
+        compacting: 1,
+        total_tools: 42,
+    };
+    // 140 cells wide so the full bar fits without truncation — at 80 the
+    // line clipped at "1 erro", hiding the `idle`/`tools` segments AND the
+    // `mode:` separator (the cell migrated off hardcoded DarkGray @ src
+    // 6123), leaving surface #1's whole point unpinned.
+    let buf = render_stats_bar_to_buffer(&stats, Some("plan"), palette, 140, 1);
+    insta::assert_snapshot!(
+        format!("theme_contrast__stats_{theme}"),
+        buffer_to_color_text(&buf)
+    );
+
+    // 2. Quit-confirm overlay — Detach default-selected (index 0).
+    let buf = render_quit_confirm_to_buffer(0, palette, 80, 24);
+    insta::assert_snapshot!(
+        format!("theme_contrast__quit_{theme}"),
+        buffer_to_color_text(&buf)
+    );
+
+    // 3. Stop-confirm overlay — No default-selected (index 0), 2 agents.
+    let buf = render_stop_confirm_to_buffer(0, 2, palette, 80, 24);
+    insta::assert_snapshot!(
+        format!("theme_contrast__stop_{theme}"),
+        buffer_to_color_text(&buf)
+    );
+
+    // 4. Star prompt.
+    let buf = render_star_prompt_to_buffer(palette, 80, 24);
+    insta::assert_snapshot!(
+        format!("theme_contrast__star_{theme}"),
+        buffer_to_color_text(&buf)
+    );
+
+    // 5. Config-generation prompt — Yes default-selected (index 0).
+    let buf = render_config_gen_prompt_to_buffer(0, palette, 80, 24);
+    insta::assert_snapshot!(
+        format!("theme_contrast__config_gen_{theme}"),
+        buffer_to_color_text(&buf)
+    );
+
+    // 6. "No agent" empty card — a placeholder session (agent_type None)
+    //    routed through the public `render_card_to_buffer` seam. Narrow width
+    //    keeps it in the stacked (non-wide) branch. `last_activity = now` so
+    //    any rendered elapsed reads `0s ago` (mirrors `pane_004`).
+    let now = chrono::Utc::now();
+    let placeholder = SessionState {
+        session_id: String::new(),
+        agent_type: AgentType::None,
+        cwd: None,
+        status: SessionStatus::Idle,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: None,
+        first_prompts: Vec::new(),
+        pane_id: None,
+        agent_id: None,
+    };
+    let width: u16 = 40;
+    let density = CardDensityKind::Normal;
+    let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
+    let height = density.rendered_height(wide);
+    let buf = render_card_to_buffer(&placeholder, None, None, density, palette, 0, width, height);
+    insta::assert_snapshot!(
+        format!("theme_contrast__no_agent_{theme}"),
+        buffer_to_color_text(&buf)
+    );
+}
+
+/// Scenario: Render all six dot-agent-deck overlay/prompt surfaces — the
+/// stats bar, the Quit and Stop confirm dialogs, the star prompt, the
+/// config-generation prompt, and the "No agent" empty card — with the DARK
+/// palette, capturing each into a color-aware buffer snapshot. Pins that on a
+/// dark terminal background every neutral-text cell resolves to the dark
+/// palette (White / Gray) so a future change can't silently shift these
+/// surfaces off-palette.
+#[spec("theme/contrast/001")]
+#[test]
+fn contrast_001_overlays_dark() {
+    snapshot_overlay_surfaces(resolve_palette(Theme::Dark), "dark");
+}
+
+/// Scenario: Render the same six overlay/prompt surfaces with the LIGHT
+/// palette and snapshot each color-aware buffer. On a light terminal
+/// background the neutral text must resolve to the light palette (Black /
+/// DarkGray); any surface still emitting a hardcoded White / Gray / DarkGray
+/// is unreadable on white, and that mismatch is the regression this test
+/// guards.
+#[spec("theme/contrast/002")]
+#[test]
+fn contrast_002_overlays_light() {
+    snapshot_overlay_surfaces(resolve_palette(Theme::Light), "light");
 }

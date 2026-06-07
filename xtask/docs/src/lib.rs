@@ -18,7 +18,7 @@
 //! succeeds against the current source + catalog.
 //!
 //! Inputs:
-//!   - The catalog under `prds/77-tui-testing-harness.md` (parsed
+//!   - The catalog under `prds/done/77-tui-testing-harness.md` (parsed
 //!     for entry headlines + body fields).
 //!   - Every `#[spec("…")]`-annotated test fn under `tests/` (parsed
 //!     via `syn` for fn name, doc comments, and statement-level
@@ -61,7 +61,7 @@ impl DocsConfig {
     pub fn from_workspace(workspace_root: impl Into<PathBuf>) -> Self {
         let workspace_root = workspace_root.into();
         Self {
-            prd_path: workspace_root.join("prds/77-tui-testing-harness.md"),
+            prd_path: workspace_root.join("prds/done/77-tui-testing-harness.md"),
             tests_dir: workspace_root.join("tests"),
             recordings_root: workspace_root.join(".dot-agent-deck").join("recordings"),
             workspace_root,

@@ -1,0 +1,22 @@
+---
+source: tests/render_dashboard.rs
+assertion_line: 198
+expression: buffer_to_color_text(&buf)
+---
+
+
+
+
+
+
+
+[Yellow/Rgb(0, 0, 0)]"┌ ⭐" [Yellow/Rgb(0, 0, 0)]" Enjoying dot-agent-deck? ───────────────────┐"
+[Yellow/Rgb(0, 0, 0)]"│" [Reset/Rgb(0, 0, 0)]"                                                " [Yellow/Rgb(0, 0, 0)]"│"
+[Yellow/Rgb(0, 0, 0)]"│" [White/Rgb(0, 0, 0)]"  If you find dot-agent-deck useful," [Reset/Rgb(0, 0, 0)]"            " [Yellow/Rgb(0, 0, 0)]"│"
+[Yellow/Rgb(0, 0, 0)]"│" [White/Rgb(0, 0, 0)]"  please consider starring the repo!" [Reset/Rgb(0, 0, 0)]"            " [Yellow/Rgb(0, 0, 0)]"│"
+[Yellow/Rgb(0, 0, 0)]"│" [Reset/Rgb(0, 0, 0)]"                                                " [Yellow/Rgb(0, 0, 0)]"│"
+[Yellow/Rgb(0, 0, 0)]"│" [Cyan/Rgb(0, 0, 0)]"  github.com/vfarcic/dot-agent-deck" [Reset/Rgb(0, 0, 0)]"             " [Yellow/Rgb(0, 0, 0)]"│"
+[Yellow/Rgb(0, 0, 0)]"│" [Reset/Rgb(0, 0, 0)]"                                                " [Yellow/Rgb(0, 0, 0)]"│"
+[Yellow/Rgb(0, 0, 0)]"│" [Gray/Rgb(0, 0, 0)]"  s Star  l Later  d Don't ask again" [Reset/Rgb(0, 0, 0)]"            " [Yellow/Rgb(0, 0, 0)]"│"
+[Yellow/Rgb(0, 0, 0)]"│" [Reset/Rgb(0, 0, 0)]"                                                " [Yellow/Rgb(0, 0, 0)]"│"
+[Yellow/Rgb(0, 0, 0)]"└────────────────────────────────────────────────┘"

@@ -2017,6 +2017,24 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Platform coverage:** mac+linux.
 - **Cost note:** one Gemini-Flash-Lite invocation via OpenRouter, ≲500 input + 200 output tokens.
 
+### Theme contrast
+
+#### theme/contrast
+
+##### theme/contrast/001 — Overlay/prompt surfaces render on-palette under the dark theme.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
+- **Agent:** none.
+- **Asserts:** each of the six surfaces (stats bar, Quit-confirm, Stop-confirm, star prompt, config-gen prompt, "No agent" empty card) rendered with the dark palette matches its committed color-aware snapshot — neutral text resolves to the dark palette (White / Gray).
+- **Does not assert:** accent/status colors (Cyan/Green/Yellow/Red/Blue/Magenta), which terminal themes remap and the palette deliberately leaves fixed; popup geometry beyond what the buffer captures.
+- **Platform coverage:** mac+linux+windows.
+
+##### theme/contrast/002 — The same surfaces render on-palette under the light theme (no hardcoded White/Gray/DarkGray).
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
+- **Agent:** none.
+- **Asserts:** the same six surfaces rendered with the light palette match their committed color-aware snapshots — neutral text resolves to the light palette (Black / DarkGray), so no surface leaves a hardcoded White/Gray/DarkGray that is unreadable on a white background.
+- **Does not assert:** accent/status colors (left fixed by design); OSC-11 auto-detection (covered by the pure-data `theme` unit tests).
+- **Platform coverage:** mac+linux+windows.
+
 ### Docs cross-reference skips
 
 Per Decision 27, documented user-facing behaviors that are deliberately not catalogued at M1:

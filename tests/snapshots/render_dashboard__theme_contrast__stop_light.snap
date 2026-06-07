@@ -1,0 +1,22 @@
+---
+source: tests/render_dashboard.rs
+assertion_line: 191
+expression: buffer_to_color_text(&buf)
+---
+
+
+
+
+
+
+
+[Red/Rgb(255, 255, 255)]"┌ Stop ────────────────────────────────────────────────────────────┐"
+[Red/Rgb(255, 255, 255)]"│" [Reset/Rgb(255, 255, 255)]"                                                                  " [Red/Rgb(255, 255, 255)]"│"
+[Red/Rgb(255, 255, 255)]"│" [Yellow/Rgb(255, 255, 255)]"  2 managed agents will be terminated and the daemon will shut dow" [Red/Rgb(255, 255, 255)]"│"
+[Red/Rgb(255, 255, 255)]"│" [Reset/Rgb(255, 255, 255)]"  Continue?                                                       " [Red/Rgb(255, 255, 255)]"│"
+[Red/Rgb(255, 255, 255)]"│" [Reset/Rgb(255, 255, 255)]"                                                                  " [Red/Rgb(255, 255, 255)]"│"
+[Red/Rgb(255, 255, 255)]"│" [Yellow/Rgb(255, 255, 255)]"  > No    — return to the previous dialog" [Reset/Rgb(255, 255, 255)]"                         " [Red/Rgb(255, 255, 255)]"│"
+[Red/Rgb(255, 255, 255)]"│" [DarkGray/Rgb(255, 255, 255)]"    Yes   — confirm" [Reset/Rgb(255, 255, 255)]"                                               " [Red/Rgb(255, 255, 255)]"│"
+[Red/Rgb(255, 255, 255)]"│" [Reset/Rgb(255, 255, 255)]"                                                                  " [Red/Rgb(255, 255, 255)]"│"
+[Red/Rgb(255, 255, 255)]"│" [DarkGray/Rgb(255, 255, 255)]"  y / Enter on Yes confirms  ·  n / Esc / Enter on No returns to Q" [Red/Rgb(255, 255, 255)]"│"
+[Red/Rgb(255, 255, 255)]"└──────────────────────────────────────────────────────────────────┘"

@@ -1,0 +1,15 @@
+---
+source: tests/render_dashboard.rs
+assertion_line: 235
+expression: buffer_to_color_text(&buf)
+---
+[Gray/Reset]"┌" [White/Reset]" No agent ·  " [Gray/Reset]"───────────── ● No agent ┐"
+[Gray/Reset]"│Dir:  " [Reset/Reset]"—                               " [Gray/Reset]"│"
+[Gray/Reset]"│Launch an agent to get started" [Gray/Reset]"│"
+[Gray/Reset]"│Last: " [Reset/Reset]"0s ago  " [Gray/Reset]"Tools: " [Reset/Reset]"0                " [Gray/Reset]"│"
+[Gray/Reset]"│" [Gray/Reset]"│"
+[Gray/Reset]"│" [Gray/Reset]"│"
+[Gray/Reset]"│" [Gray/Reset]"│"
+[Gray/Reset]"│" [Gray/Reset]"│"
+[Gray/Reset]"│" [Gray/Reset]"│"
+[Gray/Reset]"└──────────────────────────────────────┘"

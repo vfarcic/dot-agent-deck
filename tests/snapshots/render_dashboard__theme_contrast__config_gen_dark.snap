@@ -1,0 +1,24 @@
+---
+source: tests/render_dashboard.rs
+assertion_line: 205
+expression: buffer_to_color_text(&buf)
+---
+
+
+
+
+
+[Cyan/Rgb(0, 0, 0)]"┌ Generate .dot-agent-deck.toml ───────────────────────────┐"
+[Cyan/Rgb(0, 0, 0)]"│" [Reset/Rgb(0, 0, 0)]"                                                          " [Cyan/Rgb(0, 0, 0)]"│"
+[Cyan/Rgb(0, 0, 0)]"│" [White/Rgb(0, 0, 0)]"  No workspace modes config found for this" [Reset/Rgb(0, 0, 0)]"                " [Cyan/Rgb(0, 0, 0)]"│"
+[Cyan/Rgb(0, 0, 0)]"│" [White/Rgb(0, 0, 0)]"  project. Want to instruct your agent to" [Reset/Rgb(0, 0, 0)]"                 " [Cyan/Rgb(0, 0, 0)]"│"
+[Cyan/Rgb(0, 0, 0)]"│" [White/Rgb(0, 0, 0)]"  analyze the project and create one?" [Reset/Rgb(0, 0, 0)]"                     " [Cyan/Rgb(0, 0, 0)]"│"
+[Cyan/Rgb(0, 0, 0)]"│" [Reset/Rgb(0, 0, 0)]"                                                          " [Cyan/Rgb(0, 0, 0)]"│"
+[Cyan/Rgb(0, 0, 0)]"│" [Green/Rgb(0, 0, 0)]"  > Yes    — generate config for this project" [Reset/Rgb(0, 0, 0)]"             " [Cyan/Rgb(0, 0, 0)]"│"
+[Cyan/Rgb(0, 0, 0)]"│" [Gray/Rgb(0, 0, 0)]"    No     — skip for now" [Reset/Rgb(0, 0, 0)]"                                 " [Cyan/Rgb(0, 0, 0)]"│"
+[Cyan/Rgb(0, 0, 0)]"│" [Gray/Rgb(0, 0, 0)]"    Never  — never ask for this directory" [Reset/Rgb(0, 0, 0)]"                 " [Cyan/Rgb(0, 0, 0)]"│"
+[Cyan/Rgb(0, 0, 0)]"│" [Reset/Rgb(0, 0, 0)]"                                                          " [Cyan/Rgb(0, 0, 0)]"│"
+[Cyan/Rgb(0, 0, 0)]"│" [Gray/Rgb(0, 0, 0)]"  Disable: dot-agent-deck config set auto_config_prompt fa" [Cyan/Rgb(0, 0, 0)]"│"
+[Cyan/Rgb(0, 0, 0)]"│" [Reset/Rgb(0, 0, 0)]"                                                          " [Cyan/Rgb(0, 0, 0)]"│"
+[Cyan/Rgb(0, 0, 0)]"│" [Gray/Rgb(0, 0, 0)]"  Up/Down: navigate  Enter: confirm  Esc: cancel" [Reset/Rgb(0, 0, 0)]"          " [Cyan/Rgb(0, 0, 0)]"│"
+[Cyan/Rgb(0, 0, 0)]"└──────────────────────────────────────────────────────────┘"

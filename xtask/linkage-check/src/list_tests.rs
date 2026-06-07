@@ -648,7 +648,7 @@ fn parse_catalog_at_ref(
     workspace_root: &Path,
     reference: &str,
 ) -> Result<BTreeMap<String, CatalogEntry>, String> {
-    let prd_rel = "prds/77-tui-testing-harness.md";
+    let prd_rel = "prds/done/77-tui-testing-harness.md";
     let body = git_show(reference, prd_rel)?;
     // parse_catalog wants a file path; stage the body in a tempfile.
     let tmp = tempfile_for_catalog(workspace_root, &body)?;

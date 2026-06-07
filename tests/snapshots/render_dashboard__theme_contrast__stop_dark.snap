@@ -1,0 +1,22 @@
+---
+source: tests/render_dashboard.rs
+assertion_line: 191
+expression: buffer_to_color_text(&buf)
+---
+
+
+
+
+
+
+
+[Red/Rgb(0, 0, 0)]"┌ Stop ────────────────────────────────────────────────────────────┐"
+[Red/Rgb(0, 0, 0)]"│" [Reset/Rgb(0, 0, 0)]"                                                                  " [Red/Rgb(0, 0, 0)]"│"
+[Red/Rgb(0, 0, 0)]"│" [Yellow/Rgb(0, 0, 0)]"  2 managed agents will be terminated and the daemon will shut dow" [Red/Rgb(0, 0, 0)]"│"
+[Red/Rgb(0, 0, 0)]"│" [Reset/Rgb(0, 0, 0)]"  Continue?                                                       " [Red/Rgb(0, 0, 0)]"│"
+[Red/Rgb(0, 0, 0)]"│" [Reset/Rgb(0, 0, 0)]"                                                                  " [Red/Rgb(0, 0, 0)]"│"
+[Red/Rgb(0, 0, 0)]"│" [Yellow/Rgb(0, 0, 0)]"  > No    — return to the previous dialog" [Reset/Rgb(0, 0, 0)]"                         " [Red/Rgb(0, 0, 0)]"│"
+[Red/Rgb(0, 0, 0)]"│" [Gray/Rgb(0, 0, 0)]"    Yes   — confirm" [Reset/Rgb(0, 0, 0)]"                                               " [Red/Rgb(0, 0, 0)]"│"
+[Red/Rgb(0, 0, 0)]"│" [Reset/Rgb(0, 0, 0)]"                                                                  " [Red/Rgb(0, 0, 0)]"│"
+[Red/Rgb(0, 0, 0)]"│" [Gray/Rgb(0, 0, 0)]"  y / Enter on Yes confirms  ·  n / Esc / Enter on No returns to Q" [Red/Rgb(0, 0, 0)]"│"
+[Red/Rgb(0, 0, 0)]"└──────────────────────────────────────────────────────────────────┘"
