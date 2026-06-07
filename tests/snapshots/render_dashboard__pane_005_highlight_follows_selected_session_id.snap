@@ -1,0 +1,32 @@
+---
+source: tests/render_dashboard.rs
+assertion_line: 195
+expression: buffer_to_text(&buffer)
+---
+┌ 1 example-alpha ────────────────────────────────────────────────── ● Working ┐
+│Dir:  alpha                                             Last: 0s ago  Tools: 3│
+│Prmt: do the thing                                                            │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ ▸ 2 example-beta ───────────────────────────────────────────────── ● Working ┐
+│Dir:  beta                                              Last: 0s ago  Tools: 3│
+│Prmt: do the thing                                                            │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ 3 example-gamma ────────────────────────────────────────────────── ● Working ┐
+│Dir:  gamma                                             Last: 0s ago  Tools: 3│
+│Prmt: do the thing                                                            │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘

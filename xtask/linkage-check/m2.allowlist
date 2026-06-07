@@ -4,7 +4,7 @@
 # catalog with:
 #
 #   awk '/^## Test Case Catalog/{p=1;next} /^## /{p=0} p && /^##### /' \
-#       prds/77-tui-testing-harness.md \
+#       prds/done/77-tui-testing-harness.md \
 #     | grep -oE '[a-z-]+/[a-z-]+/[0-9]{3}' | sort -u
 
 # chain-smoke/claude/001 — covered by tests/e2e_chain_smoke_claude.rs (M3).
@@ -27,7 +27,11 @@ dashboard/help/002
 dashboard/pane/001
 dashboard/pane/002
 dashboard/pane/003
-dashboard/pane/005
+# dashboard/pane/005 — PRD #83 landed an L1 test
+# (tests/render_dashboard.rs::pane_005_highlight_follows_selected_session_id);
+# the former "Card row shows Dir/Last/Tools/Prmt" plan moved to
+# dashboard/pane/006, which is still untested.
+dashboard/pane/006
 dashboard/rename/001
 dashboard/rename/002
 dashboard/selection/001

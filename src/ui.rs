@@ -142,8 +142,9 @@ enum ActiveTabView {
         mode_name: String,
         agent_pane_id: String,
         side_pane_ids: Vec<String>,
-        /// Which side pane has visual focus (`None` = agent pane).
-        focused_side_pane_index: Option<usize>,
+        /// PRD #83: which pane has visual focus, keyed by stable pane id
+        /// (`None` = agent pane). Mirrors `Tab::Mode::focused_pane_id`.
+        focused_pane_id: Option<String>,
     },
     /// Orchestration tab: same card layout as dashboard, scoped to role panes.
     Orchestration { role_pane_ids: Vec<String> },
@@ -945,7 +946,7 @@ fn resize_dashboard_panes(
     // active tab so each routes through the matching SSOT helper.
     let is_orchestration = matches!(tab_manager.active_tab(), Tab::Orchestration { .. });
     let orch_pane_ids = match tab_manager.active_tab() {
-        Tab::Dashboard => None,
+        Tab::Dashboard { .. } => None,
         Tab::Orchestration { role_pane_ids, .. } => Some(role_pane_ids.clone()),
         _ => return,
     };
@@ -2278,6 +2279,108 @@ fn dispatch_normal_mode_key(
     result
 }
 
+/// PRD #83 M3/M4 — reconcile the active tab's remembered card selection
+/// with the currently focused pane and derive the card index to
+/// highlight. Pure (no controller / no I/O) so it can be unit-tested and
+/// reused by an L1 dashboard render test.
+///
+/// `filtered` is the tab's visible card list as `(session_id, pane_id)`
+/// pairs, in render order. Behaviour by tab:
+/// - **Dashboard**: if the focused pane maps to a visible card, adopt
+///   that card's session id; then resolve `selected_session_id` to its
+///   index (clearing it and returning `0` when it's no longer present).
+/// - **Orchestration**: same, keyed by role pane id.
+/// - **Mode**: returns `None` — mode tabs render via a separate path, so
+///   `selected_index` must be left untouched.
+///
+/// The caller passes the active tab, so a pane focused while another tab
+/// is active can never rewrite a different tab's selection — the gating
+/// the PRD calls for.
+pub fn sync_and_derive_selection(
+    tab: &mut Tab,
+    focused_pane_id: Option<&str>,
+    filtered: &[(&str, Option<&str>)],
+) -> Option<usize> {
+    match tab {
+        Tab::Dashboard {
+            selected_session_id,
+        } => {
+            if let Some(fid) = focused_pane_id
+                && let Some((sid, _)) = filtered.iter().find(|(_, pid)| *pid == Some(fid))
+            {
+                *selected_session_id = Some((*sid).to_string());
+            }
+            match selected_session_id
+                .as_deref()
+                .and_then(|sid| filtered.iter().position(|(id, _)| *id == sid))
+            {
+                Some(idx) => Some(idx),
+                None => {
+                    if selected_session_id.is_some() {
+                        *selected_session_id = None;
+                    }
+                    Some(0)
+                }
+            }
+        }
+        Tab::Orchestration {
+            role_pane_ids,
+            focused_role_pane_id,
+            ..
+        } => {
+            if let Some(fid) = focused_pane_id
+                && role_pane_ids.iter().any(|p| p == fid)
+            {
+                *focused_role_pane_id = Some(fid.to_string());
+            }
+            match focused_role_pane_id
+                .as_deref()
+                .and_then(|pid| filtered.iter().position(|(_, p)| *p == Some(pid)))
+            {
+                Some(idx) => Some(idx),
+                None => {
+                    if focused_role_pane_id.is_some() {
+                        *focused_role_pane_id = None;
+                    }
+                    Some(0)
+                }
+            }
+        }
+        Tab::Mode { .. } => None,
+    }
+}
+
+/// PRD #83 M2 — switch to `target_index` while preserving per-tab focus.
+/// Captures the source tab's focused pane on the way out, switches, then
+/// restores the destination tab's remembered focus on the way in. The
+/// Dashboard's selection is keyed by session id (not a pane id), so its
+/// restore is handled here using the live `snapshot` that `TabManager`
+/// doesn't carry: the remembered card's pane is re-focused so the
+/// per-frame focused-pane→selection sync can't snap the dashboard onto a
+/// pane left focused by another tab. Returns whether the switch happened.
+fn switch_tab_with_focus(
+    tab_manager: &mut TabManager,
+    target_index: usize,
+    pane: &dyn PaneController,
+    snapshot: &AppState,
+) -> bool {
+    tab_manager.capture_focus_on_switch_out();
+    let switched = tab_manager.switch_to(target_index);
+    if switched {
+        tab_manager.restore_focus_on_switch_in();
+        if let Tab::Dashboard {
+            selected_session_id,
+        } = tab_manager.active_tab()
+            && let Some(sid) = selected_session_id
+            && let Some(session) = snapshot.sessions.get(sid)
+            && let Some(pane_id) = session.pane_id.as_ref()
+        {
+            let _ = pane.focus_pane(pane_id);
+        }
+    }
+    switched
+}
+
 fn handle_normal_key(
     key: KeyEvent,
     ui: &mut UiState,
@@ -3173,7 +3276,7 @@ pub fn run_tui(
                         show_tab_bar,
                     );
                 }
-                Tab::Dashboard => {}
+                Tab::Dashboard { .. } => {}
             }
         }
     }
@@ -3604,21 +3707,18 @@ pub fn run_tui(
             }
         }
 
-        // Clamp focused side pane index after reactive pane pool changes.
+        // PRD #83 M4 — remap every tab's focused pane after a reactive
+        // pane-pool change. `route_reactive_commands` recreates reactive
+        // panes across ALL tabs (active and background), returning
+        // `(closed_id, new_id)` pairs, so each tab whose remembered focus
+        // was recreated follows the successor; a focus that vanished with
+        // no successor is cleared (fall back to the default pane on
+        // switch-in). Only the active tab's remapped id comes back here,
+        // and only it needs the live pane re-focused on the controller.
         if !pane_changes.is_empty()
-            && let Tab::Mode {
-                focused_side_pane_index,
-                mode_manager,
-                ..
-            } = tab_manager.active_tab_mut()
-            && let Some(idx) = *focused_side_pane_index
+            && let Some(new_id) = tab_manager.remap_focus_after_reactive_change(&pane_changes)
         {
-            let count = mode_manager.managed_pane_ids().len();
-            if count == 0 {
-                *focused_side_pane_index = None;
-            } else if idx >= count {
-                *focused_side_pane_index = Some(count - 1);
-            }
+            let _ = pane.focus_pane(&new_id);
         }
 
         // Pick up version-check result once
@@ -3652,7 +3752,7 @@ pub fn run_tui(
         let all_filtered = filter_sessions(&snapshot, &ui);
         // Scope sessions to only those visible in the active tab.
         let filtered: Vec<(&String, &SessionState)> = match tab_manager.active_tab() {
-            Tab::Dashboard => {
+            Tab::Dashboard { .. } => {
                 let exclude = tab_manager.all_managed_pane_ids();
                 // Follow-up to 0d5e651 (auditor finding #2): synthetic
                 // dead-slot placeholders live on the orchestration tab
@@ -3699,16 +3799,30 @@ pub fn run_tui(
             ui.selected_index = 0;
         }
 
-        // Sync dashboard card selection with focused pane (handles async pane creation).
-        if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
-            && let Some(focused_pane_id) = embedded.focused_pane_id()
-        {
-            for (i, (_, session)) in filtered.iter().enumerate() {
-                if session.pane_id.as_deref() == Some(focused_pane_id.as_str()) {
-                    ui.selected_index = i;
-                    break;
-                }
-            }
+        // PRD #83 M3/M4 — per-tab card selection. On the Dashboard and
+        // Orchestration tabs the highlighted card is DERIVED each frame
+        // from the tab's remembered stable id (session id / role pane id).
+        // The globally focused pane feeds that remembered id — but ONLY
+        // when its tab is active, so a pane focused on one tab can no
+        // longer snap the selection of another (the cross-tab leak this
+        // PRD fixes). A remembered id that's no longer in the filtered
+        // list is cleared and the selection falls back to the first card.
+        // Mode tabs render via the early-return path below, so
+        // `selected_index` is irrelevant there and left as clamped.
+        let focused_pane_now = pane
+            .as_any()
+            .downcast_ref::<EmbeddedPaneController>()
+            .and_then(|e| e.focused_pane_id());
+        let filtered_ids: Vec<(&str, Option<&str>)> = filtered
+            .iter()
+            .map(|(id, s)| (id.as_str(), s.pane_id.as_deref()))
+            .collect();
+        if let Some(idx) = sync_and_derive_selection(
+            tab_manager.active_tab_mut(),
+            focused_pane_now.as_deref(),
+            &filtered_ids,
+        ) {
+            ui.selected_index = idx;
         }
 
         let term_width = terminal.get_frame().area().width;
@@ -3727,20 +3841,20 @@ pub fn run_tui(
         let has_pane_control = pane.is_available();
         let pane_layout = ui.pane_layout;
         let tab_view = match tab_manager.active_tab() {
-            Tab::Dashboard => ActiveTabView::Dashboard {
+            Tab::Dashboard { .. } => ActiveTabView::Dashboard {
                 exclude_pane_ids: tab_manager.all_managed_pane_ids(),
             },
             Tab::Mode {
                 name,
                 agent_pane_id,
                 mode_manager,
-                focused_side_pane_index,
+                focused_pane_id,
                 ..
             } => ActiveTabView::Mode {
                 mode_name: name.clone(),
                 agent_pane_id: agent_pane_id.clone(),
                 side_pane_ids: mode_manager.managed_pane_ids(),
-                focused_side_pane_index: *focused_side_pane_index,
+                focused_pane_id: focused_pane_id.clone(),
             },
             Tab::Orchestration { role_pane_ids, .. } => ActiveTabView::Orchestration {
                 role_pane_ids: role_pane_ids.clone(),
@@ -3750,7 +3864,7 @@ pub fn run_tui(
             .tabs()
             .iter()
             .map(|tab| match tab {
-                Tab::Dashboard => "Dashboard".to_string(),
+                Tab::Dashboard { .. } => "Dashboard".to_string(),
                 Tab::Mode {
                     name,
                     agent_pane_id,
@@ -3937,7 +4051,7 @@ pub fn run_tui(
                 {
                     let mut clicked_focus = false;
                     // Check side panes.
-                    for (idx, (side_id, rect)) in ui.side_pane_rects.iter().enumerate() {
+                    for (side_id, rect) in ui.side_pane_rects.iter() {
                         if mouse.column >= rect.x
                             && mouse.column < rect.x + rect.width
                             && mouse.row >= rect.y
@@ -3945,11 +4059,10 @@ pub fn run_tui(
                         {
                             let side_id = side_id.clone();
                             if let Tab::Mode {
-                                focused_side_pane_index,
-                                ..
+                                focused_pane_id, ..
                             } = tab_manager.active_tab_mut()
                             {
-                                *focused_side_pane_index = Some(idx);
+                                *focused_pane_id = Some(side_id.clone());
                                 clicked_focus = true;
                             }
                             let _ = pane.focus_pane(&side_id);
@@ -3964,12 +4077,12 @@ pub fn run_tui(
                         && mouse.row >= rect.y
                         && mouse.row < rect.y + rect.height
                         && let Tab::Mode {
-                            focused_side_pane_index,
+                            focused_pane_id,
                             agent_pane_id,
                             ..
                         } = tab_manager.active_tab_mut()
                     {
-                        *focused_side_pane_index = None;
+                        *focused_pane_id = None;
                         let _ = pane.focus_pane(agent_pane_id);
                     }
                 }
@@ -4502,7 +4615,12 @@ pub fn run_tui(
                     KeyCode::PageDown => {
                         if tab_manager.show_tab_bar() {
                             let prev_idx = tab_manager.active_index();
-                            tab_manager.switch_to(prev_idx + 1);
+                            switch_tab_with_focus(
+                                &mut tab_manager,
+                                prev_idx + 1,
+                                &*pane,
+                                &snapshot,
+                            );
                             if prev_idx != tab_manager.active_index() {
                                 let area = terminal.get_frame().area();
                                 resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
@@ -4516,7 +4634,12 @@ pub fn run_tui(
                         if tab_manager.show_tab_bar() {
                             let prev_idx = tab_manager.active_index();
                             if prev_idx > 0 {
-                                tab_manager.switch_to(prev_idx - 1);
+                                switch_tab_with_focus(
+                                    &mut tab_manager,
+                                    prev_idx - 1,
+                                    &*pane,
+                                    &snapshot,
+                                );
                                 if prev_idx != tab_manager.active_index() {
                                     let area = terminal.get_frame().area();
                                     resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
@@ -4538,7 +4661,7 @@ pub fn run_tui(
                         if count > 0 {
                             let prev_idx = tab_manager.active_index();
                             let next = (prev_idx + 1) % count;
-                            tab_manager.switch_to(next);
+                            switch_tab_with_focus(&mut tab_manager, next, &*pane, &snapshot);
                             if prev_idx != tab_manager.active_index() {
                                 let area = terminal.get_frame().area();
                                 resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
@@ -4552,7 +4675,7 @@ pub fn run_tui(
                         if count > 0 {
                             let prev_idx = tab_manager.active_index();
                             let prev = (prev_idx + count - 1) % count;
-                            tab_manager.switch_to(prev);
+                            switch_tab_with_focus(&mut tab_manager, prev, &*pane, &snapshot);
                             if prev_idx != tab_manager.active_index() {
                                 let area = terminal.get_frame().area();
                                 resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
@@ -4572,7 +4695,7 @@ pub fn run_tui(
             if !shortcut_handled
                 && ui.mode == UiMode::Normal
                 && let Tab::Mode {
-                    focused_side_pane_index,
+                    focused_pane_id,
                     mode_manager,
                     agent_pane_id,
                     ..
@@ -4580,9 +4703,15 @@ pub fn run_tui(
             {
                 let side_ids = mode_manager.managed_pane_ids();
                 let side_count = side_ids.len();
+                // PRD #83: translate the stable focused pane id to its
+                // positional slot for the j/k step arithmetic. `None`
+                // (agent pane) or a stale id maps to "no side pane".
+                let cur: Option<usize> = focused_pane_id
+                    .as_ref()
+                    .and_then(|id| side_ids.iter().position(|s| s == id));
                 match key.code {
                     KeyCode::Char('j') | KeyCode::Down => {
-                        *focused_side_pane_index = match *focused_side_pane_index {
+                        let next = match cur {
                             None => {
                                 if side_count > 0 {
                                     Some(0)
@@ -4593,20 +4722,17 @@ pub fn run_tui(
                             Some(i) if i + 1 < side_count => Some(i + 1),
                             Some(_) => None, // wrap back to agent pane
                         };
+                        *focused_pane_id = next.map(|i| side_ids[i].clone());
                         // Sync embedded controller focus so the visual highlight
                         // matches (prevents stale cyan border on a previous pane).
-                        let focus_id = match *focused_side_pane_index {
-                            None => agent_pane_id.clone(),
-                            Some(i) => side_ids
-                                .get(i)
-                                .cloned()
-                                .unwrap_or_else(|| agent_pane_id.clone()),
-                        };
+                        let focus_id = focused_pane_id
+                            .clone()
+                            .unwrap_or_else(|| agent_pane_id.clone());
                         let _ = pane.focus_pane(&focus_id);
                         shortcut_handled = true;
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
-                        *focused_side_pane_index = match *focused_side_pane_index {
+                        let next = match cur {
                             None => {
                                 if side_count > 0 {
                                     Some(side_count - 1)
@@ -4617,24 +4743,17 @@ pub fn run_tui(
                             Some(0) => None,
                             Some(i) => Some(i - 1),
                         };
-                        let focus_id = match *focused_side_pane_index {
-                            None => agent_pane_id.clone(),
-                            Some(i) => side_ids
-                                .get(i)
-                                .cloned()
-                                .unwrap_or_else(|| agent_pane_id.clone()),
-                        };
+                        *focused_pane_id = next.map(|i| side_ids[i].clone());
+                        let focus_id = focused_pane_id
+                            .clone()
+                            .unwrap_or_else(|| agent_pane_id.clone());
                         let _ = pane.focus_pane(&focus_id);
                         shortcut_handled = true;
                     }
                     KeyCode::Enter => {
-                        let target_pane_id = match *focused_side_pane_index {
-                            None => agent_pane_id.clone(),
-                            Some(i) => side_ids
-                                .get(i)
-                                .cloned()
-                                .unwrap_or_else(|| agent_pane_id.clone()),
-                        };
+                        let target_pane_id = focused_pane_id
+                            .clone()
+                            .unwrap_or_else(|| agent_pane_id.clone());
                         let is_reactive = mode_manager.is_reactive_pane(&target_pane_id);
                         if pane.focus_pane(&target_pane_id).is_ok() {
                             ui.mode = UiMode::PaneInput;
@@ -4655,7 +4774,7 @@ pub fn run_tui(
                         shortcut_handled = true;
                     }
                     KeyCode::Esc => {
-                        *focused_side_pane_index = None;
+                        *focused_pane_id = None;
                         let _ = pane.focus_pane(agent_pane_id);
                         shortcut_handled = true;
                     }
@@ -4852,6 +4971,10 @@ pub fn run_tui(
                         if let Some(ref pane_id) = session.pane_id {
                             if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
                                 tab_manager.switch_to(tab_idx);
+                                // PRD #83: keep the destination tab's
+                                // remembered focus in step with the
+                                // explicit focus below.
+                                tab_manager.record_focus(pane_id);
                                 let area = terminal.get_frame().area();
                                 resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
                                 resize_mode_tab_panes(&*pane, &tab_manager, area);
@@ -5300,6 +5423,10 @@ pub fn run_tui(
                             // Focus the pane so user can press Enter to execute.
                             if let Some(tab_idx) = tab_manager.tab_index_for_pane(&pane_id) {
                                 tab_manager.switch_to(tab_idx);
+                                // PRD #83: keep the destination tab's
+                                // remembered focus in step with the
+                                // explicit focus below.
+                                tab_manager.record_focus(&pane_id);
                                 let area = terminal.get_frame().area();
                                 resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
                                 resize_mode_tab_panes(&*pane, &tab_manager, area);
@@ -5500,7 +5627,7 @@ fn render_frame(
     if let ActiveTabView::Mode {
         agent_pane_id,
         side_pane_ids,
-        focused_side_pane_index,
+        focused_pane_id,
         ..
     } = tab_view
     {
@@ -5515,7 +5642,7 @@ fn render_frame(
             has_pane_control,
             active_mode_name,
             tab_bar.show,
-            *focused_side_pane_index,
+            focused_pane_id.as_deref(),
         );
         return;
     }
@@ -5991,18 +6118,21 @@ fn render_mode_tab(
     has_pane_control: bool,
     active_mode_name: Option<&str>,
     show_tab_bar: bool,
-    focused_side_pane_index: Option<usize>,
+    focused_pane_id: Option<&str>,
 ) {
     let palette = ui.palette;
 
-    // Determine which pane ID should appear visually focused.
-    let agent_visual_focus: Option<&str> = if focused_side_pane_index.is_none() {
+    // PRD #83: `focused_pane_id` is keyed by stable pane id. `None` (or an
+    // id that isn't one of this tab's side panes) means the agent pane is
+    // focused; otherwise the matching side pane is the visually focused one.
+    let side_visual_focus: Option<String> = focused_pane_id
+        .filter(|id| side_pane_ids.iter().any(|s| s == id))
+        .map(|id| id.to_string());
+    let agent_visual_focus: Option<&str> = if side_visual_focus.is_none() {
         Some(agent_pane_id)
     } else {
         None
     };
-    let side_visual_focus: Option<String> =
-        focused_side_pane_index.and_then(|i| side_pane_ids.get(i).cloned());
 
     // 50/50 horizontal split
     let chunks = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -7447,6 +7577,76 @@ pub fn render_card_to_buffer(
                 palette,
                 None,
             );
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// L1 harness helper — render a vertical stack of dashboard cards into a
+/// fresh `TestBackend` buffer, highlighting the card at `selected_index`
+/// exactly as the live grid does (`is_selected = flat_index ==
+/// selected_index`, see `render_frame`). Mirrors `render_card_to_buffer`
+/// but for the multi-card selection case, so an L1 snapshot can prove the
+/// highlight follows the derived selection rather than defaulting to the
+/// top card. See PRD #83 catalog entry `dashboard/pane/005`.
+///
+/// `cards` is the visible card list as `(session, display_name)` pairs in
+/// render order; one column, one card per row.
+#[doc(hidden)]
+pub fn render_dashboard_cards_to_buffer(
+    cards: &[(&SessionState, Option<&str>)],
+    selected_index: usize,
+    density: CardDensityKind,
+    palette: ColorPalette,
+    tick: u64,
+    width: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    // `render_session_card` computes `wide` from the inner width (full
+    // width minus the two border columns); mirror that so the card height
+    // we size the buffer with matches what the renderer actually draws.
+    let wide = (width as usize).saturating_sub(2) >= 60;
+    let card_height = density.rendered_height(wide);
+    let height = card_height.saturating_mul(cards.len() as u16).max(1);
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let card_density: CardDensity = density.into();
+    let owned: Vec<(&SessionState, Option<String>)> = cards
+        .iter()
+        .map(|(s, name)| (*s, name.map(str::to_string)))
+        .collect();
+    terminal
+        .draw(|frame| {
+            let constraints: Vec<Constraint> = (0..owned.len())
+                .map(|_| Constraint::Length(card_height))
+                .collect();
+            let chunks = Layout::vertical(constraints).split(Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            });
+            for (flat_index, (session, display_name)) in owned.iter().enumerate() {
+                let card_number = {
+                    let n = flat_index + 1;
+                    if n <= 9 { Some(n as u8) } else { None }
+                };
+                render_session_card(
+                    frame,
+                    chunks[flat_index],
+                    session,
+                    tick,
+                    flat_index == selected_index,
+                    display_name.as_ref(),
+                    card_number,
+                    card_density,
+                    palette,
+                    None,
+                );
+            }
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
