@@ -583,9 +583,32 @@ impl KeybindingConfig {
     /// The returned warnings let tests assert behavior without scraping
     /// stderr; [`KeybindingConfig::load`] prints them.
     pub fn from_toml_str(contents: &str) -> Result<(KeybindingConfig, Vec<String>), String> {
-        let raw: RawKeybindings =
+        // First parse into a generic table so an unknown top-level section
+        // (a typo like `[globale]`, or `[Global]` with the wrong case) is
+        // WARNED-AND-IGNORED rather than silently dropped — consistent with
+        // how unknown action names are handled. We deliberately do NOT use
+        // `#[serde(deny_unknown_fields)]`: that would turn one typo'd section
+        // into a whole-config parse error (losing the user's valid bindings)
+        // and would break forward-compat with configs using a future section.
+        let table: toml::Table =
             toml::from_str(contents).map_err(|e| format!("invalid keybindings TOML: {e}"))?;
-        Ok(Self::from_raw(raw))
+        let mut warnings = Vec::new();
+        for key in table.keys() {
+            if key != "global" && key != "dashboard" {
+                warnings.push(format!(
+                    "unknown keybinding section '[{}]' — ignored",
+                    sanitize_for_terminal(key)
+                ));
+            }
+        }
+        // Deserialize the known sections; serde ignores the unknown ones (we
+        // already warned), and `#[serde(default)]` covers any missing section.
+        let raw: RawKeybindings = table
+            .try_into()
+            .map_err(|e| format!("invalid keybindings TOML: {e}"))?;
+        let (config, entry_warnings) = Self::from_raw(raw);
+        warnings.extend(entry_warnings);
+        Ok((config, warnings))
     }
 
     fn from_raw(raw: RawKeybindings) -> (KeybindingConfig, Vec<String>) {
@@ -1364,6 +1387,44 @@ move_down = "k"
         let unknowns: Vec<_> = warnings.iter().filter(|w| w.contains("unknown")).collect();
         assert_eq!(unknowns.len(), 1, "warnings: {warnings:?}");
         assert!(unknowns[0].contains("teleport"));
+    }
+
+    #[test]
+    fn unknown_section_warns_but_valid_sections_still_apply() {
+        // Greptile R7: a typo'd top-level section ([globale]) must not silently
+        // drop — it warns and is ignored, while a valid [dashboard] section is
+        // still applied. Also covers wrong-case ([Global]).
+        let toml = r#"
+[globale]
+new_pane = "Alt+p"
+
+[Global]
+close_pane = "Alt+x"
+
+[dashboard]
+move_down = "k"
+"#;
+        let (c, warnings) = KeybindingConfig::from_toml_str(toml).unwrap();
+        // The valid [dashboard] binding still took effect.
+        assert!(c.matches(
+            Action::MoveDown,
+            &ev(KeyCode::Char('k'), KeyModifiers::NONE)
+        ));
+        // new_pane / close_pane keep their defaults (the typo'd sections were
+        // ignored, not applied).
+        assert!(c.matches(
+            Action::NewPane,
+            &ev(KeyCode::Char('n'), KeyModifiers::CONTROL)
+        ));
+        assert!(c.matches(
+            Action::ClosePane,
+            &ev(KeyCode::Char('w'), KeyModifiers::CONTROL)
+        ));
+        // One warning per unknown section, each naming it.
+        let section_warnings: Vec<_> = warnings.iter().filter(|w| w.contains("section")).collect();
+        assert_eq!(section_warnings.len(), 2, "warnings: {warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("globale")));
+        assert!(warnings.iter().any(|w| w.contains("Global")));
     }
 
     #[test]
