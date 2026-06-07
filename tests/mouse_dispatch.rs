@@ -2,7 +2,7 @@
 //!
 //! `mouse/dispatch/001` is a pure-data test that proves the foundational
 //! parity claim WITHOUT a TUI harness: the keyboard mapper
-//! (`global_ctrl_action`) and the button hit-test (`hit_test_button`) must
+//! (`global_action`) and the button hit-test (`hit_test_button`) must
 //! yield the *same* [`Action`] variant, so a keystroke and a future button
 //! click funnel into the one `dispatch_action`. `mouse/button/001` is an L1
 //! widget test that renders a Button (enabled and disabled) into a
@@ -17,12 +17,13 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 
+use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::theme::ColorPalette;
-use dot_agent_deck::ui::{Action, Button, global_ctrl_action, hit_test_button};
+use dot_agent_deck::ui::{Action, Button, global_action, hit_test_button};
 use spec::spec;
 
 /// Scenario: Build the Ctrl+N key event and run it through the keyboard
-/// mapper `global_ctrl_action`; separately build a synthetic
+/// mapper `global_action`; separately build a synthetic
 /// `[New Pane Ctrl+N]` button carrying `Action::NewPane`, record its rect
 /// in a `button_rects` vec, and hit-test a click landing inside that rect
 /// via `hit_test_button`. Both paths must produce the same `Action` variant
@@ -33,7 +34,8 @@ use spec::spec;
 fn dispatch_001_key_and_click_map_to_same_action() {
     // Keyboard path: Ctrl+N maps to the New Pane command.
     let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
-    let key_action = global_ctrl_action(&ctrl_n).expect("Ctrl+N must map to an Action");
+    let key_action =
+        global_action(&KeybindingConfig::default(), &ctrl_n).expect("Ctrl+N must map to an Action");
     assert!(
         matches!(key_action, Action::NewPane),
         "Ctrl+N should map to Action::NewPane, got {key_action:?}"

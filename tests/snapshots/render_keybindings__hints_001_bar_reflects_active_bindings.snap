@@ -1,0 +1,6 @@
+---
+source: tests/render_keybindings.rs
+assertion_line: 117
+expression: text
+---
+Ctrl+n: new  Ctrl+w: close  Alt+Shift+l: layout  Ctrl+d: dashboard (1-9 F1 /)  Ctrl+c: quit

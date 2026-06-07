@@ -10,6 +10,7 @@
 //!     card).
 //!   - mouse/dashboard/002 — clickable Filter / Rename / Generate-config
 //!     buttons enter the same modes the `/`, `r`, `g` keys do.
+//!
 //! Decision 6: gated behind the `e2e` feature so `cargo test-fast` never
 //! compiles it.
 //!

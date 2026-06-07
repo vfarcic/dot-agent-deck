@@ -79,6 +79,7 @@ pub struct TuiDeckBuilder {
     extra_env: Vec<(String, String)>,
     continue_session: Option<ContinueSession>,
     credential_imports: Vec<CredentialImport>,
+    keybindings_toml: Option<String>,
 }
 
 impl TuiDeckBuilder {
@@ -145,6 +146,19 @@ impl TuiDeckBuilder {
         self
     }
 
+    /// Stage a `keybindings.toml` in the per-test HOME's config dir
+    /// (`$HOME/.config/dot-agent-deck/keybindings.toml`, mirroring the
+    /// `config.toml` path resolved by `dot_agent_deck::config`) before
+    /// launch, so the deck reads it during startup. `content` is written
+    /// verbatim — pass malformed TOML to exercise the fallback path
+    /// (PRD #40 `keybindings/fallback/*`). The file is created with the
+    /// HOME-relative path so two clients in the same suite never share
+    /// bindings.
+    pub fn with_keybindings_toml(mut self, content: impl Into<String>) -> Self {
+        self.keybindings_toml = Some(content.into());
+        self
+    }
+
     /// Launch the deck against the named fixture under
     /// `tests/fixtures/`. The fixture is copied into the per-test
     /// tempdir at launch (Decision 12); the deck's `HOME`, hook socket,
@@ -172,10 +186,10 @@ impl TuiDeckBuilder {
 pub struct TuiDeck {
     pty_master: Box<dyn MasterPty + Send>,
     /// PTY master write side, taken ONCE at construction. `MasterPty::
-    /// take_writer()` is single-shot (a 2nd call errors), so `send_bytes`
-    /// (and `click`/`scroll`, which call it 2×/1×) must share one stored
-    /// writer rather than taking a fresh one per call. Behind a `Mutex` so
-    /// the write helpers can keep `&self`.
+    /// take_writer()` is single-shot (a 2nd call errors), so `send_keys` /
+    /// `send_bytes` (and `click`/`scroll`, which call it 2×/1×) must share one
+    /// stored writer rather than taking a fresh one per call. Behind a `Mutex`
+    /// so the write helpers can keep `&self`.
     writer: Mutex<Box<dyn Write + Send>>,
     parser: Arc<Mutex<vt100::Parser>>,
     last_byte_at: Arc<Mutex<Instant>>,
@@ -218,6 +232,7 @@ impl TuiDeck {
             extra_env: Vec::new(),
             continue_session: None,
             credential_imports: Vec::new(),
+            keybindings_toml: None,
         }
     }
 
@@ -274,6 +289,17 @@ impl TuiDeck {
 
         let home = work.join("home");
         std::fs::create_dir_all(&home).expect("create per-test HOME");
+
+        // PRD #40: stage the keybindings config the deck reads at
+        // startup. Path mirrors `config_path()` in
+        // `dot_agent_deck::config` — `$HOME/.config/dot-agent-deck/` —
+        // with the filename `keybindings.toml`. Written before the
+        // binary spawns so the deck sees it on its first config read.
+        if let Some(ref kb) = builder.keybindings_toml {
+            let cfg_dir = home.join(".config").join("dot-agent-deck");
+            std::fs::create_dir_all(&cfg_dir).expect("create keybindings config dir");
+            std::fs::write(cfg_dir.join("keybindings.toml"), kb).expect("write keybindings.toml");
+        }
 
         // Chain-smoke credential imports (PRD #77 Decision 8). Tests
         // pair these with `check_*_available()` + `skip_unless!`; if
@@ -587,6 +613,39 @@ impl TuiDeck {
         }
     }
 
+    /// Wait until `needle` appears anywhere in the deck's cumulative
+    /// byte stream since launch — including bytes emitted *before* this
+    /// call. Unlike [`wait_for_string`] (which only sees the current
+    /// vt100 grid) and [`wait_for_strings_in_order`] (which only
+    /// considers bytes after the call), this scans the entire rolling
+    /// history from offset 0. Used to assert on transient output the
+    /// deck prints before taking over the alternate screen — e.g. a
+    /// startup warning written to stderr (which, on a PTY, is merged
+    /// into the same byte stream as stdout) before the TUI clears the
+    /// screen. The warning text scrolls out of the visible grid but
+    /// stays in the byte history, so this is the only primitive that
+    /// can observe it.
+    pub fn wait_for_stream_string(&self, needle: &str) {
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            {
+                let hist = self.byte_history.lock().unwrap();
+                let text = String::from_utf8_lossy(&hist);
+                if text.contains(needle) {
+                    return;
+                }
+            }
+            if Instant::now() > deadline {
+                let grid = self.snapshot_grid();
+                panic!(
+                    "did not see {needle:?} anywhere in the byte stream within \
+                     {WAIT_TIMEOUT:?}.\nFinal grid:\n{grid}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Wait for `needles` to appear, in order, in the cumulative
     /// byte stream the deck has emitted since this call started.
     ///
@@ -643,6 +702,21 @@ impl TuiDeck {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Send raw bytes to the deck as if typed at the terminal. Writes
+    /// to the PTY master so the spawned binary reads them on stdin and
+    /// `crossterm` decodes them into key events. Callers pass the
+    /// terminal byte encoding of the keypress — e.g. `b"\x03"` for
+    /// Ctrl+C, `b"\x0e"` for Ctrl+n, `b"?"` for a literal `?`,
+    /// `b"\x1bOP"` for F1, or an ESC-prefixed sequence like `b"\x1bL"`
+    /// for Alt+Shift+L. The whole slice is written in one syscall so a
+    /// multi-byte sequence is decoded as a single chord, not as
+    /// separate keys.
+    pub fn send_keys(&self, bytes: &[u8]) {
+        let mut writer = self.writer.lock().unwrap();
+        writer.write_all(bytes).expect("write keys to PTY master");
+        writer.flush().expect("flush keys to PTY master");
     }
 
     /// Returns the deck's per-test hook socket path. Synthetic-event
