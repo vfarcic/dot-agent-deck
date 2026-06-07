@@ -48,8 +48,13 @@ fn new_pane_007_schedule_authoring_option_visually_separated() {
     // the last option). The built-in "schedule" authoring option lives there.
     deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8
 
-    // The schedule authoring option must be selectable and shown.
-    deck.wait_for_string("schedule");
+    // Wait until selection actually LANDS on the schedule option before
+    // snapshotting. The dialog title becomes "… — schedule mode" only when
+    // `selected_mode()` resolves to the authoring mode, so it is a
+    // selection-dependent signal. (The bare `[schedule]` chip renders at every
+    // cycler index, so waiting on "schedule" alone returns immediately and
+    // races the input processing.)
+    deck.wait_for_string("schedule mode");
 
     // ...and visually separated from the workload modes by an authoring-session
     // affordance (the throwaway-authoring-session marker).

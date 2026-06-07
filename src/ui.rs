@@ -4796,6 +4796,23 @@ fn dispatch_action(
                                         if let Some(ref init_cmd) = mode_config.init_command {
                                             let _ = pane.write_to_pane(&new_id, init_cmd);
                                         }
+                                        // PRD #127 M3.1: a mode carrying a
+                                        // `seed_prompt` enqueues it for GATED
+                                        // delivery to the agent pane — drained by
+                                        // `process_pending_seed_prompts` once the
+                                        // agent signals readiness (SessionStart)
+                                        // plus the spawn-time buffer, unlike
+                                        // `init_command` (written immediately
+                                        // above). A mode without `seed_prompt`
+                                        // enqueues nothing (no-op for plain modes).
+                                        if let Some(ref seed) = mode_config.seed_prompt {
+                                            ui.pending_seed_prompts.push(PendingSeedPrompt {
+                                                pane_id: new_id.clone(),
+                                                prompt: seed.clone(),
+                                                created_at: std::time::Instant::now(),
+                                                ready_since: None,
+                                            });
+                                        }
                                         if let Some(saved) = ui.pane_metadata.get(&new_id) {
                                             let agent_cmd = saved.command.clone();
                                             if !agent_cmd.is_empty() {
