@@ -617,6 +617,11 @@ struct UiState {
     /// tab index to switch to. Populated each render; a click here that missed
     /// the `[×]` switches tabs.
     tab_header_rects: Vec<(usize, Rect)>,
+    /// PRD #80 M4: screen rects of each rendered dashboard card, paired with
+    /// its flat selection index. Populated each dashboard render; consulted on
+    /// a mouse Down/Up AFTER the button/tab rects — a single click selects the
+    /// card, a double-click focuses its pane.
+    card_rects: Vec<(usize, Rect)>,
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
     /// Per-session idle ASCII art cache. Key = session_id.
@@ -721,6 +726,7 @@ impl UiState {
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             tab_header_rects: Vec::new(),
+            card_rects: Vec::new(),
         }
     }
 }
@@ -1809,6 +1815,17 @@ pub enum Action {
     /// Mode/Orchestration tab's `[×]` affordance, reusing Ctrl+W's tab-teardown
     /// semantics for the clicked tab (not necessarily the active one).
     CloseTab(usize),
+    /// PRD #80 M4: select the dashboard card at this index — the outcome of a
+    /// single click on a card. Per PRD #68 a click selects exactly card N (the
+    /// same card a j/k linear-cycle would land on), mirroring the selection
+    /// into the embedded focus the way `dispatch_normal_mode_key` does.
+    SelectCard(usize),
+    /// PRD #80 M4: enter filter mode (the `/` key and the `[Filter /]` button
+    /// share this path).
+    EnterFilter,
+    /// PRD #80 M4: enter rename mode for the selected card (the `r` key and the
+    /// `[Rename r]` button share this path; a no-op when no card is selected).
+    EnterRename,
     /// PRD #80: Normal-mode digit `1`-`9` — jump to card N and focus its pane.
     FocusCard(usize),
     /// PRD #80: on a mode tab, move the in-tab side-pane focus down (j/Down).
@@ -2388,19 +2405,16 @@ fn handle_normal_key(
             Action::Continue
         }
         // Left/Right/h/l handled in main loop for tab switching
-        KeyCode::Char('/') => {
-            ui.mode = UiMode::Filter;
-            ui.filter_text.clear();
-            Action::Continue
-        }
+        // PRD #80 M4: route `/` through the shared action so the key and the
+        // `[Filter /]` button funnel into the same `dispatch_action` path.
+        KeyCode::Char('/') => Action::EnterFilter,
         // PRD #80 M2: route `?` through the shared action so the key and the
         // `[Help ?]` button funnel into the same `dispatch_action` path.
         KeyCode::Char('?') => Action::ToggleHelp,
-        KeyCode::Char('r') if total > 0 => {
-            ui.mode = UiMode::Rename;
-            ui.rename_text.clear();
-            Action::Continue
-        }
+        // PRD #80 M4: route `r` through the shared action so the key and the
+        // `[Rename r]` button funnel into the same `dispatch_action` path. The
+        // `total > 0` guard mirrors the prior behavior (rename needs a card).
+        KeyCode::Char('r') if total > 0 => Action::EnterRename,
         KeyCode::Enter if total > 0 => Action::Focus,
         KeyCode::Char('g') if total > 0 => Action::RequestConfigGen,
         // PRD #92 F2 (PRD #18 follow-through): y / n approve / deny permission.
@@ -2990,6 +3004,16 @@ fn hit_test_tab_header(tab_header_rects: &[(usize, Rect)], col: u16, row: u16) -
         .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(Action::SelectTab(*idx)))
 }
 
+/// PRD #80 M4: hit-test a click against the dashboard card rects, returning the
+/// flat selection index of the first card whose rect contains the point.
+/// Checked AFTER the button/tab affordances; single vs double click handling
+/// (select vs focus) is decided by the caller using `UiState::last_click`.
+fn hit_test_card(card_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usize> {
+    card_rects
+        .iter()
+        .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(*idx))
+}
+
 /// PRD #80 M3: close the tab at `idx` and reconcile shared state, reusing the
 /// same teardown the Ctrl+W tab-close path performs — unregister every
 /// successfully-closed pane, drop the matching sessions (keeping any that
@@ -3319,6 +3343,30 @@ fn dispatch_action(
         // tab-teardown semantics for the clicked tab.
         Action::CloseTab(idx) => {
             close_tab_by_index(idx, ui, state, tab_manager, pane, frame_area);
+        }
+        // PRD #80 M4: single-click a card → select exactly that card (PRD #68),
+        // mirroring the move into the embedded focus so the per-frame
+        // "selected_index ← focused pane" sync doesn't roll it back — the same
+        // pattern `dispatch_normal_mode_key` uses for j/k.
+        Action::SelectCard(idx) => {
+            if idx < filtered.len() {
+                let prev = ui.selected_index;
+                ui.selected_index = idx;
+                mirror_selection_into_focus(prev, ui, filtered, pane);
+            }
+        }
+        // PRD #80 M4: `/` key or [Filter /] button → filter mode.
+        Action::EnterFilter => {
+            ui.mode = UiMode::Filter;
+            ui.filter_text.clear();
+        }
+        // PRD #80 M4: `r` key or [Rename r] button → rename mode for the
+        // selected card. No-op with no cards, matching the `r` key's guard.
+        Action::EnterRename => {
+            if !filtered.is_empty() {
+                ui.mode = UiMode::Rename;
+                ui.rename_text.clear();
+            }
         }
         // Normal-mode digit 1-9: jump to card N and focus its pane.
         Action::FocusCard(idx) => {
@@ -5277,6 +5325,76 @@ pub fn run_tui(
                     continue;
                 }
 
+                // PRD #80 M4: dashboard card click — checked AFTER the button /
+                // tab affordances and BEFORE the existing pane/selection logic.
+                // A single click selects exactly that card (PRD #68); a
+                // double-click within the multi-click window focuses its pane
+                // (the same Action::Focus the Enter key dispatches). The paired
+                // Up is consumed. Cards are their own rect region, so this
+                // coexists with the in-pane text-selection multi-click path.
+                if (is_down || is_up)
+                    && let Some(card_idx) = hit_test_card(&ui.card_rects, mouse.column, mouse.row)
+                {
+                    if is_down {
+                        // Double-click discrimination mirrors the text-selection
+                        // path: same row, within 3 columns, inside the 400ms
+                        // window.
+                        let now = std::time::Instant::now();
+                        let click_count = if let Some((t, lc, lr, cnt)) = ui.last_click {
+                            if now.duration_since(t).as_millis() < 400
+                                && lr == mouse.row
+                                && mouse.column.abs_diff(lc) <= 3
+                            {
+                                (cnt + 1).min(3)
+                            } else {
+                                1
+                            }
+                        } else {
+                            1
+                        };
+                        ui.last_click = Some((now, mouse.column, mouse.row, click_count));
+
+                        let frame_area = terminal.get_frame().area();
+                        // Single click → select exactly this card.
+                        dispatch_action(
+                            Action::SelectCard(card_idx),
+                            &mut ui,
+                            &*pane,
+                            &state,
+                            &mut tab_manager,
+                            &snapshot,
+                            &filtered,
+                            None,
+                            frame_area,
+                        );
+                        // Double click → focus the now-selected card's pane.
+                        if click_count >= 2 {
+                            let selected_id: Option<String> =
+                                filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+                            let flow = dispatch_action(
+                                Action::Focus,
+                                &mut ui,
+                                &*pane,
+                                &state,
+                                &mut tab_manager,
+                                &snapshot,
+                                &filtered,
+                                selected_id.as_deref(),
+                                frame_area,
+                            );
+                            if flow == Flow::Break {
+                                break 'outer;
+                            }
+                        }
+                    }
+                    // Consume both Down and Up — don't fall through to the
+                    // pane-focus / selection / scroll logic below.
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
                 // Side pane scroll: works in any UI mode by hit-testing rects
                 let mut side_scrolled = false;
                 if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
@@ -5995,6 +6113,10 @@ fn render_frame(
     let palette = ui.palette;
     ui.side_pane_rects.clear();
     ui.agent_pane_rect = None;
+    // PRD #80 M4: rebuilt below only for the dashboard card grid; clearing here
+    // means non-dashboard views (and the zero-card dashboard) leave no stale
+    // card rects for the mouse hit-test.
+    ui.card_rects.clear();
 
     let active_mode_name = match tab_view {
         ActiveTabView::Dashboard { .. } | ActiveTabView::Orchestration { .. } => None,
@@ -6126,7 +6248,13 @@ fn render_frame(
         .style(Style::default().fg(palette.text_secondary))
         .centered();
         frame.render_widget(msg, vertical[1]);
-        render_bottom_bar(frame, ui, hints_area, has_pane_control);
+        render_bottom_bar(
+            frame,
+            ui,
+            hints_area,
+            has_pane_control,
+            &dashboard_context_buttons(!filtered.is_empty()),
+        );
 
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -6214,7 +6342,13 @@ fn render_frame(
             active_mode_name,
             palette,
         );
-        render_bottom_bar(frame, ui, hints_area, has_pane_control);
+        render_bottom_bar(
+            frame,
+            ui,
+            hints_area,
+            has_pane_control,
+            &dashboard_context_buttons(!filtered.is_empty()),
+        );
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -6278,9 +6412,10 @@ fn render_frame(
                 if n <= 9 { Some(n as u8) } else { None }
             };
             let idle_art = ids.get(col_idx).and_then(|id| ui.idle_art_cache.get(*id));
+            let card_area = col_chunks[col_idx];
             render_session_card(
                 frame,
-                col_chunks[col_idx],
+                card_area,
                 session,
                 tick,
                 is_selected,
@@ -6290,6 +6425,11 @@ fn render_frame(
                 palette,
                 idle_art,
             );
+            // PRD #80 M4: record this card's screen rect (paired with its flat
+            // selection index) for the mouse hit-test. Safe to mutate `ui` here
+            // — `display_name` / `idle_art` were the only live `ui` borrows and
+            // their last use was the `render_session_card` call above.
+            ui.card_rects.push((flat_index, card_area));
         }
     }
 
@@ -6304,7 +6444,13 @@ fn render_frame(
     );
 
     // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control);
+    render_bottom_bar(
+        frame,
+        ui,
+        hints_area,
+        has_pane_control,
+        &dashboard_context_buttons(!filtered.is_empty()),
+    );
 
     // Render terminal panes on the right side
     if let Some(right) = panes_area {
@@ -6612,8 +6758,9 @@ fn render_mode_tab(
         }
     }
 
-    // Full-width hints bar
-    render_bottom_bar(frame, ui, hints_area, has_pane_control);
+    // Full-width hints bar — mode tabs show only the global buttons (no
+    // dashboard context buttons).
+    render_bottom_bar(frame, ui, hints_area, has_pane_control, &[]);
 
     render_overlays(frame, ui, active_mode_name, palette);
 }
@@ -6705,6 +6852,19 @@ fn global_bar_buttons(has_pane_control: bool) -> Vec<Button> {
     ]
 }
 
+/// PRD #80 M4: the dashboard-only context buttons appended to the global bar
+/// while on the dashboard in Normal mode, each carrying its inline shortcut.
+/// Filter is always actionable; Rename / Generate-config act on the selected
+/// card, so they're disabled (dimmed) when there are no cards — matching the
+/// `r` / `g` keys' `total > 0` guard.
+fn dashboard_context_buttons(has_cards: bool) -> Vec<Button> {
+    vec![
+        Button::new("Filter", "/", Action::EnterFilter, true),
+        Button::new("Rename", "r", Action::EnterRename, has_cards),
+        Button::new("Generate", "g", Action::RequestConfigGen, has_cards),
+    ]
+}
+
 /// PRD #80 M2: render the persistent global button bar into `area` (one row)
 /// and return the `(Action, Rect)` pairs to record in `UiState::button_rects`
 /// so a later click hit-tests back to the right action. Two-tier labels: the
@@ -6718,9 +6878,13 @@ fn render_button_bar(
     palette: &ColorPalette,
     area: Rect,
     has_pane_control: bool,
+    extra_buttons: &[Button],
 ) -> Vec<(Action, Rect)> {
     const SEP: u16 = 1;
-    let buttons = global_bar_buttons(has_pane_control);
+    // Global commands first, then any context-specific buttons (e.g. the
+    // dashboard's Filter / Rename / Generate). One funnel, one bar.
+    let mut buttons = global_bar_buttons(has_pane_control);
+    buttons.extend(extra_buttons.iter().cloned());
 
     // Choose full vs shortcut-only based on whether the full set fits the row.
     let full_width: u16 = buttons
@@ -6765,7 +6929,13 @@ fn render_button_bar(
     rects
 }
 
-fn render_bottom_bar(frame: &mut Frame, ui: &mut UiState, area: Rect, has_pane_control: bool) {
+fn render_bottom_bar(
+    frame: &mut Frame,
+    ui: &mut UiState,
+    area: Rect,
+    has_pane_control: bool,
+    extra_buttons: &[Button],
+) {
     match ui.mode {
         UiMode::Filter => {
             let line = Line::from(vec![
@@ -6812,7 +6982,8 @@ fn render_bottom_bar(frame: &mut Frame, ui: &mut UiState, area: Rect, has_pane_c
                 // PRD #80 M2: the persistent global button bar replaces the
                 // legacy status legend (no duplication — each button carries
                 // the same shortcut the legend used to show inline).
-                let rects = render_button_bar(frame, &ui.palette, area, has_pane_control);
+                let rects =
+                    render_button_bar(frame, &ui.palette, area, has_pane_control, extra_buttons);
                 // Preserve the "update available" badge by right-aligning it
                 // after the bar when set (it's a separate notification, not the
                 // removed legend text).
@@ -8107,7 +8278,7 @@ pub fn render_button_bar_to_buffer(width: u16, palette: ColorPalette) -> ratatui
             };
             // has_pane_control = true → the richest legacy legend today;
             // after M2 this site renders the always-visible global button bar.
-            render_bottom_bar(frame, &mut ui, area, true);
+            render_bottom_bar(frame, &mut ui, area, true, &[]);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -10688,13 +10859,17 @@ mod tests {
         let mut ui = default_ui();
         assert_eq!(ui.mode, UiMode::Normal);
 
-        // Normal -> Filter
-        handle_normal_key(
+        // Normal -> Filter: PRD #80 M4 routes `/` through `dispatch_action`
+        // (shared by the `[Filter /]` button), so the handler returns
+        // `Action::EnterFilter` rather than flipping the mode inline.
+        let filter_action = handle_normal_key(
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
             &mut ui,
             3,
             None,
         );
+        assert!(matches!(filter_action, Action::EnterFilter));
+        ui.mode = UiMode::Filter;
         assert_eq!(ui.mode, UiMode::Filter);
 
         // Filter -> Normal (Esc)
@@ -10720,13 +10895,17 @@ mod tests {
         handle_help_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ui);
         assert_eq!(ui.mode, UiMode::Normal);
 
-        // Normal -> Rename
-        handle_normal_key(
+        // Normal -> Rename: PRD #80 M4 routes `r` through `dispatch_action`
+        // (shared by the `[Rename r]` button), so the handler returns
+        // `Action::EnterRename` rather than flipping the mode inline.
+        let rename_action = handle_normal_key(
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut ui,
             3,
             None,
         );
+        assert!(matches!(rename_action, Action::EnterRename));
+        ui.mode = UiMode::Rename;
         assert_eq!(ui.mode, UiMode::Rename);
 
         // Rename -> Normal (Esc)
