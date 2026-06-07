@@ -4970,6 +4970,19 @@ pub fn run_tui(
                     {
                         if let Some(ref pane_id) = session.pane_id {
                             if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
+                                // PRD #83: snapshot the SOURCE tab's focus
+                                // before leaving it, mirroring
+                                // `switch_tab_with_focus` (capture-out →
+                                // switch_to → record/restore). This path
+                                // is reachable from a focus-bearing
+                                // Orchestration tab (Enter on its card
+                                // grid), so the source's remembered focus
+                                // must be captured. `capture_focus_on_switch_out`
+                                // only reads the controller's focused pane
+                                // id into the source tab's field — it
+                                // issues no `focus_pane`, so the
+                                // destination focus below is unaffected.
+                                tab_manager.capture_focus_on_switch_out();
                                 tab_manager.switch_to(tab_idx);
                                 // PRD #83: keep the destination tab's
                                 // remembered focus in step with the
@@ -5422,6 +5435,20 @@ pub fn run_tui(
                         Ok(()) => {
                             // Focus the pane so user can press Enter to execute.
                             if let Some(tab_idx) = tab_manager.tab_index_for_pane(&pane_id) {
+                                // PRD #83: snapshot the SOURCE tab's focus
+                                // before leaving it, mirroring
+                                // `switch_tab_with_focus` (capture-out →
+                                // switch_to → record/restore). Capture is
+                                // a no-op when the source is the Dashboard
+                                // (its selection is session-id keyed), but
+                                // adding it keeps every switch site
+                                // uniform and correct if this path ever
+                                // becomes reachable from a focus-bearing
+                                // tab. `capture_focus_on_switch_out` only
+                                // reads the controller's focused pane id —
+                                // no `focus_pane` — so the destination
+                                // focus below is unaffected.
+                                tab_manager.capture_focus_on_switch_out();
                                 tab_manager.switch_to(tab_idx);
                                 // PRD #83: keep the destination tab's
                                 // remembered focus in step with the
