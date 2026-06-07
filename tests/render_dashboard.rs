@@ -242,21 +242,23 @@ fn contrast_001_overlays_reference_frame() {
 /// unselected and SELECTED states, then assert two terminal-relative
 /// properties. (a) NO rendered cell across any surface has a `Color::Rgb(..)`
 /// background — backgrounds must be `Color::Reset` so the terminal's own
-/// background shows through. (b) The selected card draws its highlight with
-/// `Modifier::REVERSED` (a self-contained, single-frame contrast pair) rather
-/// than an absolute `selected_bg` fill. A regression that filled any surface
-/// with an absolute background, or that reverted the selection highlight to an
-/// absolute `selected_bg` tint instead of `REVERSED`, would fail one of these
-/// assertions.
+/// background shows through. (b) Selection is cued the PRD #13 Option-A way —
+/// a `▸ ` title prefix plus a `Color::Cyan` + `Modifier::BOLD` border — NOT an
+/// absolute background tint: the selected card's border style must differ from
+/// the unselected card's and be cyan-bold. A regression that filled any surface
+/// with an absolute background, or that dropped the cyan-bold selection border,
+/// would fail one of these assertions.
 #[spec("theme/guard/001")]
 #[test]
 fn guard_001_no_absolute_backgrounds() {
     // (a) No Color::Rgb(..) BACKGROUND on any cheaply-seamable surface. The
     //     color dump renders each cell as `[fg/bg]"text"`, so an Rgb background
     //     shows up as the `/Rgb(` token (Rgb in the bg position after the `/`).
+    let unselected = placeholder_card(false);
+    let selected = placeholder_card(true);
     let mut surfaces = overlay_buffers();
-    surfaces.push(("card", placeholder_card(false)));
-    surfaces.push(("card_selected", placeholder_card(true)));
+    surfaces.push(("card", unselected.clone()));
+    surfaces.push(("card_selected", selected.clone()));
     for (label, buf) in &surfaces {
         let dump = buffer_to_color_text(buf);
         assert!(
@@ -266,17 +268,42 @@ fn guard_001_no_absolute_backgrounds() {
         );
     }
 
-    // (b) The selected card's highlight is Modifier::REVERSED, not an absolute
-    //     background tint. Modifiers aren't captured in the color dump, so
-    //     inspect cells directly.
-    let selected = placeholder_card(true);
-    let area = selected.area();
-    let has_reversed = (0..area.height)
-        .any(|y| (0..area.width).any(|x| selected[(x, y)].modifier.contains(Modifier::REVERSED)));
+    // (b) PRD #13 Option A: selection is signalled by a `▸ ` title prefix and a
+    //     Cyan+BOLD border — a terminal-relative cue, NOT an absolute
+    //     background. Read the left-border cell (`│`, at a mid-height row) of
+    //     each card: the selected one must DIFFER from the unselected one and
+    //     be Color::Cyan + Modifier::BOLD. (The unselected placeholder border is
+    //     a dimmed terminal foreground.)
+    let border_style = |buf: &ratatui::buffer::Buffer| {
+        let y = buf.area().height / 2;
+        let cell = &buf[(0, y)];
+        (cell.fg, cell.modifier)
+    };
+    let (unsel_fg, unsel_mod) = border_style(&unselected);
+    let (sel_fg, sel_mod) = border_style(&selected);
+    assert_ne!(
+        (sel_fg, sel_mod),
+        (unsel_fg, unsel_mod),
+        "selected card border must differ from the unselected card border"
+    );
+    assert_eq!(
+        sel_fg,
+        Color::Cyan,
+        "selected card border must use Color::Cyan (Option-A selection cue)"
+    );
     assert!(
-        has_reversed,
-        "selected card must signal its highlight with Modifier::REVERSED \
-         instead of an absolute selected_bg fill"
+        sel_mod.contains(Modifier::BOLD),
+        "selected card border must be BOLD (Option-A selection cue)"
+    );
+
+    // The `▸ ` selection prefix appears only on the selected card's title row.
+    assert!(
+        buffer_to_text(&selected).contains('▸'),
+        "selected card must carry the `▸ ` selection prefix in its title"
+    );
+    assert!(
+        !buffer_to_text(&unselected).contains('▸'),
+        "unselected card must NOT carry the `▸ ` selection prefix"
     );
 }
 
