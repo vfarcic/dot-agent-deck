@@ -18,8 +18,10 @@
 //! succeeds against the current source + catalog.
 //!
 //! Inputs:
-//!   - The catalog under `prds/done/77-tui-testing-harness.md` (parsed
-//!     for entry headlines + body fields).
+//!   - The Test-Case Catalog at `tests/CATALOG.md` (parsed for entry
+//!     headlines + body fields). Relocated here from
+//!     `prds/77-tui-testing-harness.md` so the generator no longer depends
+//!     on a PRD's location.
 //!   - Every `#[spec("…")]`-annotated test fn under `tests/` AND `src/`
 //!     (parsed via `syn` for fn name, doc comments, and statement-level
 //!     method calls on the harness builder / handle). PRD #83 added
@@ -40,7 +42,7 @@ use syn::spanned::Spanned;
 /// generated `.md`. Reviewer Nit 2 — was duplicated literally in
 /// the renderer; pulled here so a future location change doesn't
 /// fork.
-const CATALOG_REF: &str = "PRD #77 `## Test Case Catalog`";
+const CATALOG_REF: &str = "the Test-Case Catalog (`tests/CATALOG.md`)";
 
 // ---------------------------------------------------------------------------
 // Public surface
@@ -51,7 +53,8 @@ const CATALOG_REF: &str = "PRD #77 `## Test Case Catalog`";
 #[derive(Debug, Clone)]
 pub struct DocsConfig {
     pub workspace_root: PathBuf,
-    pub prd_path: PathBuf,
+    /// Path to the Test-Case Catalog (`tests/CATALOG.md`).
+    pub catalog_path: PathBuf,
     pub tests_dir: PathBuf,
     /// PRD #83: `#[spec]` tests also live in the library crate
     /// (e.g. `src/tab.rs` unit/integration tests), so the generator
@@ -67,8 +70,7 @@ impl DocsConfig {
     pub fn from_workspace(workspace_root: impl Into<PathBuf>) -> Self {
         let workspace_root = workspace_root.into();
         Self {
-            // PRD #77 archived to prds/done/ (commit 637eb37).
-            prd_path: workspace_root.join("prds/done/77-tui-testing-harness.md"),
+            catalog_path: workspace_root.join("tests/CATALOG.md"),
             tests_dir: workspace_root.join("tests"),
             src_dir: workspace_root.join("src"),
             recordings_root: workspace_root.join(".dot-agent-deck").join("recordings"),
@@ -103,7 +105,7 @@ pub struct DiscoveredTest {
 /// `tests/`. Sorted deterministically by `spec_id` so the output
 /// order is stable.
 pub fn generate_all(config: &DocsConfig) -> Result<Vec<GeneratedDoc>, String> {
-    let catalog = parse_catalog(&config.prd_path)?;
+    let catalog = parse_catalog(&config.catalog_path)?;
     let mut tests = discover_tests(&config.tests_dir)?;
     // PRD #83: library-crate `#[spec]` tests (e.g. `src/tab.rs`) are
     // discovered too.
@@ -212,8 +214,9 @@ pub fn check_rule_7(config: &DocsConfig) -> Result<(), String> {
 // Catalog parsing
 // ---------------------------------------------------------------------------
 
-/// Single catalog entry parsed from the PRD's `## Test Case Catalog`
-/// block. The fields mirror the bullets every entry carries.
+/// Single catalog entry parsed from the Test-Case Catalog's
+/// `## Test Case Catalog` block (`tests/CATALOG.md`). The fields mirror the
+/// bullets every entry carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogEntry {
     pub id: String,
@@ -227,29 +230,29 @@ pub struct CatalogEntry {
 }
 
 /// Parse every `##### <id> — <headline>` heading + its bullet lines
-/// out of the PRD's `## Test Case Catalog` section. Returns a map
-/// keyed by catalog id.
-pub fn parse_catalog(prd_path: &Path) -> Result<BTreeMap<String, CatalogEntry>, String> {
-    // M4.1 auditor S1: refuse a symlinked PRD path with a redacted,
+/// out of the Test-Case Catalog's `## Test Case Catalog` section
+/// (`tests/CATALOG.md`). Returns a map keyed by catalog id.
+pub fn parse_catalog(catalog_path: &Path) -> Result<BTreeMap<String, CatalogEntry>, String> {
+    // M4.1 auditor S1: refuse a symlinked catalog path with a redacted,
     // specific error — matches the M3.1 auditor S3 stance on
     // symlinked credential / fixture sources.
-    let meta = std::fs::symlink_metadata(prd_path)
-        .map_err(|e| format!("stat {}: {e}", prd_path.display()))?;
+    let meta = std::fs::symlink_metadata(catalog_path)
+        .map_err(|e| format!("stat {}: {e}", catalog_path.display()))?;
     let file_type = meta.file_type();
     if file_type.is_symlink() {
         return Err(format!(
             "expected real file at {}, found symlink",
-            prd_path.display()
+            catalog_path.display()
         ));
     }
     if !file_type.is_file() {
         return Err(format!(
             "expected real file at {}, found {file_type:?}",
-            prd_path.display()
+            catalog_path.display()
         ));
     }
-    let text = std::fs::read_to_string(prd_path)
-        .map_err(|e| format!("read {}: {e}", prd_path.display()))?;
+    let text = std::fs::read_to_string(catalog_path)
+        .map_err(|e| format!("read {}: {e}", catalog_path.display()))?;
     let header_re = Regex::new(r"^#####\s+([a-z][a-z0-9-]*/[a-z][a-z0-9-]*/\d{3})\s*[—-]\s*(.+)$")
         .expect("catalog header regex compiles");
     let bullet_re =

@@ -1,0 +1,9 @@
+# Fixture for PRD #80 M3 tab-strip L2 tests. Defines a single mode so the
+# new-pane form exposes a Mode field; selecting it opens a Mode tab, giving
+# the deck ≥2 tabs (Dashboard + the mode) so the tab strip renders and its
+# click-to-switch / click-to-close affordances can be exercised. No
+# persistent or reactive panes → the mode opens a single empty agent pane,
+# no real LLM tokens spent.
+[[modes]]
+name = "demo"
+reactive_panes = 0

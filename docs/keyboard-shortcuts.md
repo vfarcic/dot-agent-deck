@@ -5,16 +5,27 @@ title: Keyboard Shortcuts
 
 # Keyboard Shortcuts
 
+## Mouse
+
+Every keyboard action below is also reachable with the mouse — the dashboard is fully clickable, not keyboard-only. Each clickable affordance carries its keyboard shortcut inline, so the on-screen controls double as a legend, and clicking one performs exactly the same action as its shortcut.
+
+- **Persistent button bar.** The bottom row exposes the global commands — `[New Pane Ctrl+N]`, `[Close Ctrl+W]`, `[Toggle Layout Ctrl+T]`, `[Help ?]`, and `[Quit Ctrl+C]`. On terminals too narrow for the full labels it falls back to shortcut-only buttons (e.g. `[Ctrl+N]`). This replaces the old status-bar legend.
+- **Tab strip.** Click a tab header to switch to it; Mode and Orchestration tabs carry a clickable `[×]` close affordance (the Dashboard tab has none).
+- **Dashboard cards.** Single-click a card to select it, double-click to focus its pane. The bar adds clickable `[Filter /]`, `[Rename r]`, and `[Generate g]` buttons.
+- **Dialogs, picker, and forms.** Each carries explicit clickable buttons alongside its keyboard controls: quit/config-gen/star/help dialog buttons; the directory picker's clickable rows, `..` parent, and `[Confirm]`/`[Cancel]`/`[Filter]`; the inline filter/rename `[Apply]`/`[Save]`/`[Cancel]`; the `[Detach Ctrl+D]` affordance while in a pane; and the new-pane form's clickable mode chips with `[Submit]`/`[Cancel]`.
+
+All the keyboard shortcuts below continue to work unchanged.
+
 ## Global Shortcuts (work from any mode)
 
 | Key | Action |
 |---|---|
-| `Ctrl+d` | Enter command / navigation mode |
-| `Ctrl+n` | New pane (directory picker, then name + command form) |
-| `Ctrl+w` | Close selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab. The dashboard tab itself cannot be closed. |
-| `Ctrl+t` | Toggle stacked / tiled layout |
+| `Ctrl+D` | Enter command / navigation mode |
+| `Ctrl+N` | New pane (directory picker, then name + command form) |
+| `Ctrl+W` | Close selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab. The dashboard tab itself cannot be closed. |
+| `Ctrl+T` | Toggle stacked / tiled layout |
 
-In PaneInput mode, `Ctrl+c` is delivered to the terminal as SIGINT (0x03). From the dashboard (command mode), pressing `Ctrl+c` opens a quit confirmation dialog; press it again to quit immediately, or use the dialog keys (see [Dialogs](#dialogs)) to choose Yes / No.
+In PaneInput mode, `Ctrl+C` is delivered to the terminal as SIGINT (0x03). From the dashboard (command mode), pressing `Ctrl+C` opens a quit confirmation dialog; press it again to quit immediately, or use the dialog keys (see [Dialogs](#dialogs)) to choose Yes / No.
 
 ## Tab Navigation
 
@@ -24,8 +35,8 @@ The tab bar appears when more than one tab is open.
 |---|---|
 | `Ctrl+PageDown` | Next tab (works from any mode, including in a focused pane) |
 | `Ctrl+PageUp` | Previous tab (works from any mode, including in a focused pane) |
-| `Tab` / `Right` / `l` | Next tab — **only in command mode** (press `Ctrl+d` first; otherwise the keystroke is sent to the agent pane) |
-| `Shift+Tab` / `Left` / `h` | Previous tab — **only in command mode** (press `Ctrl+d` first; otherwise the keystroke is sent to the agent pane) |
+| `Tab` / `Right` / `l` | Next tab — **only in command mode** (press `Ctrl+D` first; otherwise the keystroke is sent to the agent pane) |
+| `Shift+Tab` / `Left` / `h` | Previous tab — **only in command mode** (press `Ctrl+D` first; otherwise the keystroke is sent to the agent pane) |
 
 ## Mode Tab
 
@@ -39,11 +50,11 @@ These shortcuts work in Normal mode when a mode tab is active.
 | `Esc` | Deselect side pane (return focus indicator to agent) |
 | Mouse click | Click a side pane to select it; click agent pane to deselect |
 
-In PaneInput mode, use `Ctrl+d` to return to Normal mode.
+In PaneInput mode, use `Ctrl+D` to return to Normal mode.
 
 ## Dashboard
 
-These shortcuts work in **command mode**. If you're typing in an agent pane, press `Ctrl+d` first to leave the pane — otherwise the keystroke is sent to the agent.
+These shortcuts work in **command mode**. If you're typing in an agent pane, press `Ctrl+D` first to leave the pane — otherwise the keystroke is sent to the agent.
 
 | Key | Action |
 |---|---|
@@ -90,5 +101,5 @@ Several dashboard shortcuts open transient input fields or selection dialogs. Th
 | **Filter** | `/` | Type to narrow visible cards · `Backspace` to delete · `Enter` to accept and stay filtered · `Esc` to clear and close |
 | **Rename** | `r` | Type the new name · `Enter` to confirm · `Esc` to cancel |
 | **Generate config** | `g` | `Up`/`Down` (or `k`/`j`) to choose **Yes** / **No** / **Never** · `Enter` to confirm · `Esc` to cancel. **Yes** sends a prompt to the agent to write `.dot-agent-deck.toml`; **Never** suppresses the hint permanently for that directory. |
-| **Quit confirmation** | `Ctrl+c` from command mode | `Up`/`Down` (or `k`/`j`) to choose **Yes** / **No** · `Enter` to confirm · `Esc` to dismiss · `Ctrl+c` again to quit immediately |
+| **Quit confirmation** | `Ctrl+C` from command mode | `Up`/`Down` (or `k`/`j`) to choose **Yes** / **No** · `Enter` to confirm · `Esc` to dismiss · `Ctrl+C` again to quit immediately |
 | **Help overlay** | `?` | `?`, `Esc`, or `q` to dismiss |

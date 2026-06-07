@@ -39,7 +39,7 @@ Native Windows is [coming soon](https://github.com/vfarcic/dot-agent-deck/issues
 
 > **Tip:** Prebuilt binaries and source builds are also available for macOS and Linux. See [all install options](installation.md).
 
-Once the dashboard is running, press `?` inside the app to see all shortcuts.
+Once the dashboard is running, press `?` inside the app to see all shortcuts. The dashboard is also fully mouse-clickable: a button bar along the bottom exposes the main commands (each labelled with its keyboard shortcut), and cards, tab headers, dialogs, the directory picker, and forms all respond to clicks. See [Keyboard Shortcuts → Mouse](keyboard-shortcuts.md#mouse).
 
 > On launch, dot-agent-deck installs Claude Code / OpenCode hooks automatically for whichever agents it detects. See [Troubleshooting](troubleshooting.md#hooks) if you need to manage them manually.
 
