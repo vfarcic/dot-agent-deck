@@ -395,6 +395,15 @@ impl TuiDeck {
             // Disable the idle-shutdown so the daemon does not race the
             // test by exiting after a brief detach.
             ("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0"),
+            // Leaked-daemon safety net: the deck lazy-spawns its daemon
+            // DETACHED (its own session → parent is PID 1 from birth), so the
+            // orphan watchdog can't be enabled here (it would fire instantly).
+            // The max-lifetime backstop is the right net for a detached daemon:
+            // even if a test is SIGKILL'd / panics / times out before `Drop`
+            // runs, the inherited cap makes the daemon self-exit gracefully
+            // within 300s instead of leaking to PID 1 for hours/days. Idle
+            // shutdown stays disabled (above) for determinism.
+            ("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "300"),
         ];
         // PATH is required for the deck to spawn its own daemon
         // subcommand (it shells out via `current_exe`, but lookups like
@@ -808,6 +817,20 @@ impl Drop for TuiDeck {
         // its tail. Stop the reader instead so the partial buffer
         // already lives in `cast_events`.
         self.reader_stop.store(true, Ordering::Relaxed);
+        // Reap the whole process tree, not just the deck itself. portable-pty
+        // makes the spawned deck a session/process-group leader (pgid == pid),
+        // so a negative-pid `kill` signals every non-detached descendant in its
+        // group (best-effort; ignore errors). Then the normal child kill+wait
+        // as the fallback. (The deck's own lazy-spawned daemon setsid's into a
+        // separate session and escapes this group — its
+        // `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` cap is the net for that.)
+        if let Some(pid) = self.child.process_id() {
+            // SAFETY: kill(2) with a negative pid signals the process group;
+            // SIGKILL has no failure mode beyond ESRCH/EPERM, which we ignore.
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
 
@@ -1741,6 +1764,15 @@ pub struct DaemonProc {
 #[allow(dead_code)]
 impl Drop for DaemonProc {
     fn drop(&mut self) {
+        // The daemon was spawned in its own process group (pgid == its pid),
+        // so a negative-pid SIGKILL reaps the whole tree — the daemon and any
+        // agents it spawned — in one shot. Best-effort; ignore ESRCH/EPERM.
+        let pid = self.child.id();
+        // SAFETY: kill(2) with a negative pid signals the process group;
+        // SIGKILL has no failure mode beyond ESRCH/EPERM, which we ignore.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -1808,6 +1840,18 @@ pub fn spawn_daemon_serve_with_env(
         "DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS".into(),
         idle_shutdown_secs.to_string(),
     ));
+    // Leaked-daemon safety net. DaemonProc spawns `daemon serve` as a
+    // NON-detached child (its parent is this test process), so the orphan
+    // watchdog fires correctly when the test dies without running `Drop`
+    // (SIGKILL / panic-abort / nextest timeout / Ctrl-C) — the daemon
+    // gracefully self-exits instead of leaking to PID 1. The max-lifetime cap
+    // is a belt-and-suspenders backstop for anything the watchdog misses.
+    // `IDLE_SHUTDOWN_SECS` is left as the caller passed it (tests rely on `0`
+    // for determinism). These vars are inert for the short-lived `schedule`
+    // CLI subprocesses that also replay this env — only `daemon serve` reads
+    // them.
+    env.push(("DOT_AGENT_DECK_EXIT_WHEN_ORPHANED".into(), "1".into()));
+    env.push(("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS".into(), "300".into()));
     for (k, v) in extra_env {
         env.push(((*k).to_string(), (*v).to_string()));
     }
@@ -1826,6 +1870,13 @@ pub fn spawn_daemon_serve_with_env(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::from(stderr_file));
+    // Put the daemon in its own process group (pgid == its pid) so `Drop` can
+    // reap the WHOLE tree — the daemon plus any agents it spawned — with one
+    // `kill(-pgid)`, not just the daemon itself.
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let child = cmd.spawn().expect("spawn `dot-agent-deck daemon serve`");
 
     let proc = DaemonProc {
@@ -2368,6 +2419,47 @@ fn read_exact_with_deadline(
         }
     }
     Ok(())
+}
+
+/// Poll `cond` until it returns `true` or `timeout` elapses; returns the final
+/// value. Decision 21: bounded polling lives in `common`, never in an
+/// `e2e_*.rs` body (which forbids raw `sleep`).
+#[allow(dead_code)]
+pub fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    cond()
+}
+
+/// Whether `pid` is still a live (non-exited) process. A reaped pid is gone; a
+/// reparented-then-exited pid may briefly be a zombie — treat state `Z` as
+/// exited so the check isn't fooled by an unreaped zombie under a sub-reaper.
+/// Uses `/proc` on Linux and falls back to a `kill(pid, 0)` probe elsewhere.
+#[allow(dead_code)]
+pub fn process_running(pid: i32) -> bool {
+    let stat_path = format!("/proc/{pid}/stat");
+    match std::fs::read_to_string(&stat_path) {
+        Ok(stat) => match stat.rfind(')') {
+            // `/proc/<pid>/stat` is `pid (comm) STATE ...`; comm may contain
+            // spaces/parens, so the state char follows the last ')'.
+            Some(idx) => stat[idx + 1..].trim_start().chars().next() != Some('Z'),
+            None => true,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if Path::new("/proc").is_dir() {
+                false // Linux: no /proc entry → the pid is gone.
+            } else {
+                // SAFETY: kill(pid, 0) only probes existence/permission.
+                unsafe { libc::kill(pid, 0) == 0 }
+            }
+        }
+        Err(_) => true,
+    }
 }
 
 #[cfg(test)]
