@@ -622,6 +622,13 @@ struct UiState {
     /// a mouse Down/Up AFTER the button/tab rects — a single click selects the
     /// card, a double-click focuses its pane.
     card_rects: Vec<(usize, Rect)>,
+    /// PRD #80 M5: screen rects of the clickable buttons in the currently
+    /// shown modal/overlay (quit-confirm, config-gen, star-prompt, help),
+    /// paired with the [`Action`] each fires. Repopulated each render by
+    /// `render_overlays` and cleared when no modal is shown. Because the modal
+    /// is topmost, these are hit-tested FIRST (and exclusively) while a modal
+    /// is active, ahead of the bottom-bar / tab / card rects behind it.
+    modal_button_rects: Vec<(Action, Rect)>,
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
     /// Per-session idle ASCII art cache. Key = session_id.
@@ -727,6 +734,7 @@ impl UiState {
             tab_close_rects: Vec::new(),
             tab_header_rects: Vec::new(),
             card_rects: Vec::new(),
+            modal_button_rects: Vec::new(),
         }
     }
 }
@@ -1826,6 +1834,30 @@ pub enum Action {
     /// PRD #80 M4: enter rename mode for the selected card (the `r` key and the
     /// `[Rename r]` button share this path; a no-op when no card is selected).
     EnterRename,
+    /// PRD #80 M5: quit-confirm `[Stop]` button — resolve exactly as Enter-on-
+    /// Stop does: go straight to shutdown when there are no managed agents,
+    /// otherwise step through the secondary Stop-confirm dialog. The agent
+    /// count is computed in `dispatch_action` (which has the snapshot).
+    RequestStop,
+    /// PRD #80 M5: dismiss the current modal back to Normal (quit-confirm
+    /// `[Cancel]`).
+    DismissModal,
+    /// PRD #80 M5: config-gen `[Yes]` — send the config-gen prompt to the
+    /// pending target pane (same outcome as Enter-on-Yes).
+    ConfigGenConfirm,
+    /// PRD #80 M5: config-gen `[No]` — dismiss the prompt for now (clears the
+    /// target, returns to Normal).
+    ConfigGenDismiss,
+    /// PRD #80 M5: config-gen `[Never]` — suppress the prompt for this
+    /// directory and return to Normal.
+    ConfigGenSuppress,
+    /// PRD #80 M5: star-prompt `[Star]` — open the repo URL and stop asking
+    /// (== `s`).
+    StarConfirm,
+    /// PRD #80 M5: star-prompt `[Snooze]` — snooze the prompt (== `l` / Esc).
+    StarSnooze,
+    /// PRD #80 M5: star-prompt `[Dismiss]` — stop asking permanently (== `d`).
+    StarDismiss,
     /// PRD #80: Normal-mode digit `1`-`9` — jump to card N and focus its pane.
     FocusCard(usize),
     /// PRD #80: on a mode tab, move the in-tab side-pane focus down (j/Down).
@@ -3091,6 +3123,76 @@ fn close_tab_by_index(
     }
 }
 
+/// PRD #92 F1 / PRD #80 M5: finalise Stop — tell the daemon to terminate every
+/// managed agent and exit. Returns [`Flow::Break`] on success (the TUI's outer
+/// loop unwinds into the normal session-save + exit path); on a shutdown error
+/// it surfaces the failure, returns to Normal mode, and yields
+/// [`Flow::Continue`] so the user can retry or Detach. Shared by the
+/// `Action::StopAndQuit` arm (Enter/`y` on Yes) and `Action::RequestStop`
+/// (the `[Stop]` button) when there are no managed agents.
+fn perform_stop_and_quit(ui: &mut UiState, pane: &dyn PaneController) -> Flow {
+    let shutdown_result = pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .map(|embedded| embedded.shutdown_daemon());
+    match shutdown_result {
+        Some(Ok(())) | None => Flow::Break,
+        Some(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                "shutdown_daemon failed — staying in the TUI so the user can retry or Detach"
+            );
+            ui.status_message = Some((
+                format!(
+                    "Stop failed: {e} — daemon may be incompatible or unresponsive. Try Detach or restart the daemon manually."
+                ),
+                std::time::Instant::now(),
+            ));
+            ui.mode = UiMode::Normal;
+            ui.stop_confirm_selected = 0;
+            ui.quit_confirm_selected = 0;
+            Flow::Continue
+        }
+    }
+}
+
+/// PRD #80 M5: send the config-gen prompt to `pane_id`, focus it for execution,
+/// and surface the outcome. Shared by the `Action::SendConfigGenPrompt` arm
+/// (Enter-on-Yes via the key handler) and `Action::ConfigGenConfirm` (the
+/// `[Yes]` button).
+fn send_config_gen_prompt(
+    pane_id: &str,
+    cwd: &str,
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    tab_manager: &mut TabManager,
+    frame_area: Rect,
+) {
+    let prompt = crate::config_gen::config_gen_prompt(cwd);
+    match pane.write_to_pane(pane_id, &prompt) {
+        Ok(()) => {
+            // Focus the pane so the user can press Enter to execute.
+            if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
+                tab_manager.switch_to(tab_idx);
+                resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                resize_mode_tab_panes(pane, tab_manager, frame_area);
+            }
+            let _ = pane.focus_pane(pane_id);
+            ui.mode = UiMode::PaneInput;
+            ui.status_message = Some((
+                "Config prompt sent — press Enter to execute.".to_string(),
+                std::time::Instant::now(),
+            ));
+        }
+        Err(e) => {
+            ui.status_message = Some((
+                format!("Failed to send config prompt: {e}"),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+}
+
 /// PRD #80: the single funnel. Every command [`Action`] — whether it came from
 /// a keystroke (today) or a button click (M2 on) — executes here and nowhere
 /// else. The keystroke branch in `run_tui` is a thin `KeyEvent -> Option<
@@ -3518,58 +3620,11 @@ fn dispatch_action(
             ui.mode = UiMode::StopConfirm;
         }
         Action::StopAndQuit => {
-            // PRD #92 F1: user confirmed Stop (either via the
-            // primary dialog with 0 agents or via the secondary
-            // y/n with Yes). Tell the daemon to terminate every
-            // managed agent and exit, then break the TUI loop.
-            // Session save happens via the normal exit path
-            // (the `'outer` break unwinds into the existing
-            // session-save site so `--continue` is not poisoned).
-            //
-            // PRD #92 F1 followup: `shutdown_daemon` now waits
-            // for an explicit `KIND_SHUTDOWN_ACK` from the
-            // daemon. The original wire used socket-close as
-            // the implicit ack, which an old daemon (predating
-            // `PROTOCOL_VERSION = 2`) would also satisfy by
-            // closing the connection on an unknown frame —
-            // making the upgrade-mismatch case look like a
-            // successful shutdown. On `Err` we now do NOT exit
-            // the TUI; we dismiss the dialogs, surface the
-            // error via `ui.status_message`, and return to
-            // Normal mode so the user can retry, Detach, or
-            // `pkill` from a shell.
-            let shutdown_result = pane
-                .as_any()
-                .downcast_ref::<EmbeddedPaneController>()
-                .map(|embedded| embedded.shutdown_daemon());
-            match shutdown_result {
-                Some(Ok(())) | None => {
-                    // Ack received (or non-stream backend, which
-                    // can't actually shut down anything). Proceed
-                    // to TUI exit via the existing `'outer`
-                    // break.
-                    return Flow::Break;
-                }
-                Some(Err(e)) => {
-                    tracing::warn!(
-                        error = %e,
-                        "shutdown_daemon failed — staying in the TUI so the user can retry or Detach"
-                    );
-                    ui.status_message = Some((
-                        format!(
-                            "Stop failed: {e} — daemon may be incompatible or unresponsive. Try Detach or restart the daemon manually."
-                        ),
-                        std::time::Instant::now(),
-                    ));
-                    // Dismiss dialogs and return to Normal mode.
-                    // Reset the primary-dialog selection to
-                    // Detach so a hammer-Enter recovery picks
-                    // the safe option, not Stop again.
-                    ui.mode = UiMode::Normal;
-                    ui.stop_confirm_selected = 0;
-                    ui.quit_confirm_selected = 0;
-                }
-            }
+            // PRD #92 F1: user confirmed Stop (either via the primary dialog
+            // with 0 agents or via the secondary y/n with Yes). The shutdown +
+            // error-recovery sequence is shared with the `[Stop]` button (see
+            // [`perform_stop_and_quit`]).
+            return perform_stop_and_quit(ui, pane);
         }
         Action::Focus => {
             // Dismiss idle art on the focused card
@@ -4002,30 +4057,72 @@ fn dispatch_action(
             }
         }
         Action::SendConfigGenPrompt { pane_id, cwd } => {
-            let prompt = crate::config_gen::config_gen_prompt(&cwd);
-            match pane.write_to_pane(&pane_id, &prompt) {
-                Ok(()) => {
-                    // Focus the pane so user can press Enter to execute.
-                    if let Some(tab_idx) = tab_manager.tab_index_for_pane(&pane_id) {
-                        tab_manager.switch_to(tab_idx);
-                        let area = frame_area;
-                        resize_dashboard_panes(pane, ui, tab_manager, area);
-                        resize_mode_tab_panes(pane, tab_manager, area);
-                    }
-                    let _ = pane.focus_pane(&pane_id);
-                    ui.mode = UiMode::PaneInput;
-                    ui.status_message = Some((
-                        "Config prompt sent — press Enter to execute.".to_string(),
-                        std::time::Instant::now(),
-                    ));
-                }
-                Err(e) => {
-                    ui.status_message = Some((
-                        format!("Failed to send config prompt: {e}"),
-                        std::time::Instant::now(),
-                    ));
-                }
+            send_config_gen_prompt(&pane_id, &cwd, ui, pane, tab_manager, frame_area);
+        }
+        // ===== PRD #80 M5: modal button actions =====
+        // quit-confirm [Stop]: resolve like Enter-on-Stop — straight to
+        // shutdown with no managed agents, else the secondary Stop dialog.
+        Action::RequestStop => {
+            let count = snapshot
+                .sessions
+                .values()
+                .filter(|s| s.pane_id.is_some())
+                .count();
+            if count == 0 {
+                return perform_stop_and_quit(ui, pane);
             }
+            ui.stop_confirm_agent_count = count;
+            ui.stop_confirm_selected = 0;
+            ui.mode = UiMode::StopConfirm;
+        }
+        // quit-confirm [Cancel]: return to the dashboard.
+        Action::DismissModal => {
+            ui.mode = UiMode::Normal;
+        }
+        // config-gen [Yes]: send the prompt to the pending target pane.
+        Action::ConfigGenConfirm => {
+            ui.mode = UiMode::Normal;
+            if let Some((pane_id, cwd)) = ui.config_gen_target.take() {
+                send_config_gen_prompt(&pane_id, &cwd, ui, pane, tab_manager, frame_area);
+            }
+        }
+        // config-gen [No]: dismiss for now (hint stays on the card).
+        Action::ConfigGenDismiss => {
+            ui.config_gen_target = None;
+            ui.mode = UiMode::Normal;
+        }
+        // config-gen [Never]: suppress the prompt for this directory.
+        Action::ConfigGenSuppress => {
+            if let Some((_, ref cwd)) = ui.config_gen_target {
+                ui.config_gen_state.suppress_dir(cwd);
+            }
+            ui.config_gen_target = None;
+            ui.mode = UiMode::Normal;
+            ui.status_message = Some((
+                "Config prompt suppressed for this directory.".to_string(),
+                std::time::Instant::now(),
+            ));
+        }
+        // star-prompt [Star]: open the repo and stop asking (== `s`).
+        Action::StarConfirm => {
+            let msg = if open::that("https://github.com/vfarcic/dot-agent-deck").is_ok() {
+                "Thanks for starring! ⭐".to_string()
+            } else {
+                "Visit github.com/vfarcic/dot-agent-deck to star ⭐".to_string()
+            };
+            ui.star_prompt_state.dismiss_permanently();
+            ui.mode = UiMode::Normal;
+            ui.status_message = Some((msg, std::time::Instant::now()));
+        }
+        // star-prompt [Snooze]: snooze (== `l` / Esc).
+        Action::StarSnooze => {
+            ui.star_prompt_state.snooze();
+            ui.mode = UiMode::Normal;
+        }
+        // star-prompt [Dismiss]: stop asking permanently (== `d`).
+        Action::StarDismiss => {
+            ui.star_prompt_state.dismiss_permanently();
+            ui.mode = UiMode::Normal;
         }
         Action::ForwardToPane(bytes) => {
             if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
@@ -5286,7 +5383,23 @@ pub fn run_tui(
                     mouse.kind,
                     crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
                 );
-                let mouse_action = if is_down || is_up {
+                // PRD #80 M5: when a modal/overlay is active it is topmost, so
+                // its buttons are hit-tested FIRST and exclusively — the
+                // bottom-bar / tab / card rects behind it are not clickable.
+                // When no modal is up, fall back to the M2/M3 chain.
+                let modal_active = matches!(
+                    ui.mode,
+                    UiMode::QuitConfirm
+                        | UiMode::StopConfirm
+                        | UiMode::ConfigGenPrompt
+                        | UiMode::StarPrompt
+                        | UiMode::Help
+                );
+                let mouse_action = if !(is_down || is_up) {
+                    None
+                } else if modal_active {
+                    hit_test_button(&ui.modal_button_rects, mouse.column, mouse.row)
+                } else {
                     hit_test_button(&ui.button_rects, mouse.column, mouse.row)
                         .or_else(|| {
                             hit_test_tab_close(&ui.tab_close_rects, mouse.column, mouse.row)
@@ -5294,8 +5407,6 @@ pub fn run_tui(
                         .or_else(|| {
                             hit_test_tab_header(&ui.tab_header_rects, mouse.column, mouse.row)
                         })
-                } else {
-                    None
                 };
                 if let Some(action) = mouse_action {
                     if is_down {
@@ -5332,7 +5443,8 @@ pub fn run_tui(
                 // (the same Action::Focus the Enter key dispatches). The paired
                 // Up is consumed. Cards are their own rect region, so this
                 // coexists with the in-pane text-selection multi-click path.
-                if (is_down || is_up)
+                if !modal_active
+                    && (is_down || is_up)
                     && let Some(card_idx) = hit_test_card(&ui.card_rects, mouse.column, mouse.row)
                 {
                     if is_down {
@@ -6476,8 +6588,11 @@ fn render_overlays(
     active_mode_name: Option<&str>,
     palette: ColorPalette,
 ) {
+    // PRD #80 M5: rebuilt below for whichever modal is shown; cleared here so a
+    // click can't hit a modal button from a prior frame once the modal closes.
+    ui.modal_button_rects.clear();
     if ui.mode == UiMode::Help {
-        render_help_overlay(frame, active_mode_name, palette);
+        ui.modal_button_rects = render_help_overlay(frame, active_mode_name, palette);
     }
     if ui.mode == UiMode::DirPicker
         && let Some(picker) = ui.dir_picker.as_mut()
@@ -6490,15 +6605,17 @@ fn render_overlays(
         render_new_pane_form(frame, form, palette);
     }
     if ui.mode == UiMode::StarPrompt {
-        render_star_prompt(frame, palette);
+        ui.modal_button_rects = render_star_prompt(frame, palette);
     }
     if ui.mode == UiMode::ConfigGenPrompt {
-        render_config_gen_prompt(frame, ui.config_gen_selected, palette);
+        ui.modal_button_rects = render_config_gen_prompt(frame, ui.config_gen_selected, palette);
     }
     if ui.mode == UiMode::QuitConfirm {
-        render_quit_confirm(frame, ui.quit_confirm_selected, palette);
+        ui.modal_button_rects = render_quit_confirm(frame, ui.quit_confirm_selected, palette);
     }
     if ui.mode == UiMode::StopConfirm {
+        // M5 adds no buttons to the secondary Stop-confirm dialog (not in the
+        // contract); its keystrokes (y/n/Enter/Esc) remain the only path.
         render_stop_confirm(
             frame,
             ui.stop_confirm_selected,
@@ -7018,7 +7135,48 @@ fn render_bottom_bar(
     }
 }
 
-fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette) {
+/// PRD #80 M5: render a left-aligned row of modal buttons into `row` and
+/// return their `(Action, Rect)` pairs for the mouse hit-test. Modal buttons
+/// always use full `[Label]` labels (the popups are sized to fit them); a
+/// button that would overflow `row` is dropped whole. Indented by `indent`
+/// cells to align with the popup's body text.
+fn render_modal_button_row(
+    frame: &mut Frame,
+    buttons: &[Button],
+    row: Rect,
+    indent: u16,
+    palette: &ColorPalette,
+) -> Vec<(Action, Rect)> {
+    const SEP: u16 = 1;
+    let end = row.x.saturating_add(row.width);
+    let mut rects = Vec::with_capacity(buttons.len());
+    let buf = frame.buffer_mut();
+    let mut x = row.x.saturating_add(indent);
+    for (i, button) in buttons.iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(SEP);
+        }
+        let w = button.display_label().chars().count() as u16;
+        if x.saturating_add(w) > end {
+            break;
+        }
+        let rect = Rect {
+            x,
+            y: row.y,
+            width: w,
+            height: 1,
+        };
+        rects.push(button.render(rect, buf, palette));
+        x = x.saturating_add(w);
+    }
+    rects
+}
+
+fn render_quit_confirm(
+    frame: &mut Frame,
+    selected: usize,
+    palette: ColorPalette,
+) -> Vec<(Action, Rect)> {
     let area = frame.area();
     let popup_width = 64u16.min(area.width.saturating_sub(4));
     let popup_height = 10u16.min(area.height.saturating_sub(4));
@@ -7083,6 +7241,22 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
         .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
+
+    // PRD #80 M5: explicit clickable buttons ALONGSIDE the option list above.
+    // Drawn on the blank row just above the keyboard hint. [Stop] resolves
+    // like Enter-on-Stop (see Action::RequestStop).
+    let buttons = [
+        Button::new("Detach", "", Action::DetachAndQuit, true),
+        Button::new("Stop", "", Action::RequestStop, true),
+        Button::new("Cancel", "", Action::DismissModal, true),
+    ];
+    let btn_row = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + popup_area.height.saturating_sub(3),
+        width: popup_area.width.saturating_sub(2),
+        height: 1,
+    };
+    render_modal_button_row(frame, &buttons, btn_row, 1, &palette)
 }
 
 /// PRD #92 F1: secondary y/n confirmation dialog when the user picked
@@ -7155,7 +7329,7 @@ fn render_stop_confirm(
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
+fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) -> Vec<(Action, Rect)> {
     let area = frame.area();
     let popup_width = 50u16.min(area.width.saturating_sub(4));
     let popup_height = 10u16.min(area.height.saturating_sub(4));
@@ -7202,9 +7376,29 @@ fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
 
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
+
+    // PRD #80 M5: explicit clickable buttons alongside the existing hint line
+    // (the `s Star  l Later  d Don't ask again` row stays). Drawn on the last
+    // inner row so neither the URL nor the hint is clobbered.
+    let buttons = [
+        Button::new("Star", "", Action::StarConfirm, true),
+        Button::new("Snooze", "", Action::StarSnooze, true),
+        Button::new("Dismiss", "", Action::StarDismiss, true),
+    ];
+    let btn_row = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + popup_area.height.saturating_sub(2),
+        width: popup_area.width.saturating_sub(2),
+        height: 1,
+    };
+    render_modal_button_row(frame, &buttons, btn_row, 1, &palette)
 }
 
-fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPalette) {
+fn render_config_gen_prompt(
+    frame: &mut Frame,
+    selected: usize,
+    palette: ColorPalette,
+) -> Vec<(Action, Rect)> {
     let area = frame.area();
     let popup_width = 60u16.min(area.width.saturating_sub(4));
     let popup_height = 14u16.min(area.height.saturating_sub(4));
@@ -7276,9 +7470,27 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPa
 
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
+
+    // PRD #80 M5: explicit clickable buttons alongside the option list.
+    let buttons = [
+        Button::new("Yes", "", Action::ConfigGenConfirm, true),
+        Button::new("No", "", Action::ConfigGenDismiss, true),
+        Button::new("Never", "", Action::ConfigGenSuppress, true),
+    ];
+    let btn_row = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + popup_area.height.saturating_sub(3),
+        width: popup_area.width.saturating_sub(2),
+        height: 1,
+    };
+    render_modal_button_row(frame, &buttons, btn_row, 1, &palette)
 }
 
-fn render_help_overlay(frame: &mut Frame, active_mode_name: Option<&str>, palette: ColorPalette) {
+fn render_help_overlay(
+    frame: &mut Frame,
+    active_mode_name: Option<&str>,
+    palette: ColorPalette,
+) -> Vec<(Action, Rect)> {
     let cyan = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
@@ -7398,6 +7610,17 @@ fn render_help_overlay(frame: &mut Frame, active_mode_name: Option<&str>, palett
         ),
     ]);
     frame.render_widget(footer, footer_area);
+
+    // PRD #80 M5: explicit clickable [Close] button alongside the existing
+    // "Press ? or Esc to close" hint. Drawn on the footer's blank first row.
+    let close_button = [Button::new("Close", "", Action::ToggleHelp, true)];
+    let btn_row = Rect {
+        x: footer_area.x,
+        y: footer_area.y,
+        width: footer_area.width,
+        height: 1,
+    };
+    render_modal_button_row(frame, &close_button, btn_row, 2, &palette)
 }
 
 fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState, palette: ColorPalette) {
@@ -8315,6 +8538,74 @@ pub fn render_tab_bar_to_buffer(
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
+}
+
+/// PRD #80 M5: render a full-screen frame and run `draw_fn` inside it,
+/// returning the resulting `Buffer`. Backs the per-modal L1 render seams
+/// below so each one drives the *production* modal renderer through a
+/// `TestBackend` — when M5 adds clickable buttons to a modal renderer, the
+/// matching seam's buffer shows them automatically. Mirrors
+/// [`render_button_bar_to_buffer`] / [`render_tab_bar_to_buffer`].
+fn render_overlay_to_buffer(
+    width: u16,
+    height: u16,
+    draw_fn: impl FnOnce(&mut Frame),
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| draw_fn(frame))
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #80 M5 L1 seam: render the quit-confirm modal (option `selected`).
+pub fn render_quit_confirm_to_buffer(
+    selected: usize,
+    width: u16,
+    height: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    render_overlay_to_buffer(width, height, |frame| {
+        render_quit_confirm(frame, selected, palette);
+    })
+}
+
+/// PRD #80 M5 L1 seam: render the config-generation prompt (option `selected`).
+pub fn render_config_gen_prompt_to_buffer(
+    selected: usize,
+    width: u16,
+    height: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    render_overlay_to_buffer(width, height, |frame| {
+        render_config_gen_prompt(frame, selected, palette);
+    })
+}
+
+/// PRD #80 M5 L1 seam: render the star-prompt modal.
+pub fn render_star_prompt_to_buffer(
+    width: u16,
+    height: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    render_overlay_to_buffer(width, height, |frame| {
+        render_star_prompt(frame, palette);
+    })
+}
+
+/// PRD #80 M5 L1 seam: render the help overlay.
+pub fn render_help_overlay_to_buffer(
+    width: u16,
+    height: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    render_overlay_to_buffer(width, height, |frame| {
+        render_help_overlay(frame, None, palette);
+    })
 }
 
 #[cfg(test)]
