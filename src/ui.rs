@@ -2182,6 +2182,14 @@ pub struct NewPaneRequest {
     command: String,
     mode_config: Option<ModeConfig>,
     orchestration_config: Option<OrchestrationConfig>,
+    /// PRD #127: a seed prompt to deliver (gated, like a mode's `seed_prompt`)
+    /// to the spawned single-agent CARD once its pane is ready. Set for the
+    /// built-in "schedule" authoring session, which is a throwaway single-agent
+    /// card (NOT a 50/50 mode tab), so its seed cannot ride on `mode_config` —
+    /// that field routes the spawn through `render_mode_tab`. Carrying the seed
+    /// here keeps the authoring session a dashboard card while still delivering
+    /// the authoring prompt.
+    seed_prompt: Option<String>,
 }
 
 /// PRD #80: the single action layer. Every keyboard-only command and (from
@@ -2335,7 +2343,11 @@ pub enum Action {
     /// PRD #80: the new-pane form was submitted — spawn the requested pane.
     /// This is the *outcome* of the form, distinct from [`Action::NewPane`],
     /// which merely opens the picker that leads to the form.
-    SpawnPane(NewPaneRequest),
+    ///
+    /// Boxed: `NewPaneRequest` is by far the largest payload of any `Action`
+    /// variant (it owns a `ModeConfig`/`OrchestrationConfig`), so storing it
+    /// inline would bloat every `Action` value (`clippy::large_enum_variant`).
+    SpawnPane(Box<NewPaneRequest>),
     SendConfigGenPrompt {
         pane_id: String,
         cwd: String,
@@ -3165,7 +3177,7 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
         // Add: spawn the seeded authoring agent with a blank context.
         KeyCode::Char('a') => {
             ui.mode = UiMode::Normal;
-            Action::SpawnPane(schedule_authoring_request(None))
+            Action::SpawnPane(Box::new(schedule_authoring_request(None)))
         }
         // Edit the selected row: spawn the authoring agent pre-filled with the
         // row's current values (it calls `schedule update`). With no rows,
@@ -3173,7 +3185,7 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
         KeyCode::Enter | KeyCode::Char('e') => {
             let existing = ui.scheduled_tasks.get(ui.scheduled_selected).cloned();
             ui.mode = UiMode::Normal;
-            Action::SpawnPane(schedule_authoring_request(existing.as_ref()))
+            Action::SpawnPane(Box::new(schedule_authoring_request(existing.as_ref())))
         }
         // Delete (definition only) — ask to confirm first.
         KeyCode::Char('d') => {
@@ -3200,12 +3212,18 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
 /// the agent command is the conversational `claude` (it must act on the seed).
 fn schedule_authoring_request(existing: Option<&config::ScheduledTask>) -> NewPaneRequest {
     let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // PRD #127: the "schedule" authoring session is a throwaway single-agent
+    // CARD, not a workload mode tab. Carry the authoring seed on `seed_prompt`
+    // (delivered via the gated path) and leave `mode_config` None so the spawn
+    // routes to the dashboard like any single-agent card instead of opening a
+    // 50/50 mode tab.
     NewPaneRequest {
         dir,
         name: SCHEDULE_MODE_NAME.to_string(),
         command: SCHEDULE_AUTHORING_AGENT.to_string(),
-        mode_config: Some(build_schedule_authoring_mode(existing)),
+        mode_config: None,
         orchestration_config: None,
+        seed_prompt: build_schedule_authoring_mode(existing).seed_prompt,
     }
 }
 
@@ -3436,12 +3454,30 @@ fn transition_after_dir_pick(ui: &mut UiState) {
 /// Shared by the Enter-submit key arm and the `[Submit]` button
 /// ([`Action::FormSubmit`]) so click and key spawn an identical pane.
 fn build_new_pane_request(form: &NewPaneFormState) -> NewPaneRequest {
+    // PRD #127: the built-in "schedule" authoring option is NOT a workload mode
+    // tab — it is a throwaway single-agent authoring CARD that converses to
+    // build a schedule entry. Spawn it as a dashboard card (`mode_config` None)
+    // carrying the authoring seed prompt, so it routes to the dashboard like any
+    // single-agent card instead of through `render_mode_tab`'s 50/50 split. The
+    // form's `selected_mode()` still returns the synthetic mode for the Mode
+    // cycler's title/separator rendering — only the spawned request differs.
+    if form.is_schedule_selected() {
+        return NewPaneRequest {
+            dir: form.dir.clone(),
+            name: form.name.clone(),
+            command: form.command.clone(),
+            mode_config: None,
+            orchestration_config: None,
+            seed_prompt: form.schedule_authoring.seed_prompt.clone(),
+        };
+    }
     NewPaneRequest {
         dir: form.dir.clone(),
         name: form.name.clone(),
         command: form.command.clone(),
         mode_config: form.selected_mode().cloned(),
         orchestration_config: form.selected_orchestration().cloned(),
+        seed_prompt: None,
     }
 }
 
@@ -3497,7 +3533,7 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                 }
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
-                return Action::SpawnPane(req);
+                return Action::SpawnPane(Box::new(req));
             }
         },
         KeyCode::Backspace if form.focused != FormField::Mode => {
@@ -4842,6 +4878,22 @@ fn dispatch_action(
                                 // spawn-time and resize-time math
                                 // can't drift.
                                 resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                                // PRD #127: a single-agent card carrying a
+                                // `seed_prompt` (the built-in "schedule"
+                                // authoring session) enqueues it for the SAME
+                                // gated delivery modes use — drained by
+                                // `process_pending_seed_prompts` once the agent
+                                // signals readiness (SessionStart) plus the
+                                // spawn-time buffer. A card without a seed
+                                // enqueues nothing (no-op for ordinary panes).
+                                if let Some(seed) = req.seed_prompt {
+                                    ui.pending_seed_prompts.push(PendingSeedPrompt {
+                                        pane_id: new_id.clone(),
+                                        prompt: seed,
+                                        created_at: std::time::Instant::now(),
+                                        ready_since: None,
+                                    });
+                                }
                                 ui.status_message = Some((
                                     format!("Created pane {new_id} in {dir_str}"),
                                     std::time::Instant::now(),
@@ -5015,7 +5067,7 @@ fn dispatch_action(
                 ui.mode = UiMode::Normal;
                 let req = build_new_pane_request(&form);
                 return dispatch_action(
-                    Action::SpawnPane(req),
+                    Action::SpawnPane(Box::new(req)),
                     ui,
                     pane,
                     state,
