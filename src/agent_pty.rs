@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use thiserror::Error;
@@ -87,6 +87,15 @@ pub fn is_valid_pane_id_env(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Whether a `command` must be run through `$SHELL -c` rather than exec'd
+/// directly. A command with whitespace is a shell command line (pipes,
+/// `;`, redirections, multiple words); a single bare word is exec'd directly.
+/// Centralized so the spawn path's shell-override decision (PRD #127 C2) and
+/// the actual wrap in [`spawn`] can't drift apart.
+pub fn command_needs_shell_wrap(command: &str) -> bool {
+    command.contains(char::is_whitespace)
 }
 
 /// Maximum byte length the daemon will accept for a per-agent display name
@@ -695,10 +704,29 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
         })
         .map_err(|e| AgentPtyError::Open(e.to_string()))?;
 
-    let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    // Shell used for the `-c` wrap of a multi-word command and for the
+    // no-command fallback. A caller may pin it by injecting `SHELL` into
+    // `opts.env` (PRD #127 M2.1: the scheduler's spawn primitive runs an
+    // explicit multi-word `command` under a deterministic `/bin/sh -c` while
+    // reserving the daemon's own `$SHELL` for the omitted-command fallback).
+    // Falls back to the process `$SHELL`, then `/bin/sh`. The dialog never sets
+    // `SHELL` in `opts.env`, so its behavior is unchanged.
+    //
+    // PRD #127 C2: this injected `SHELL` is a *wrapper-choice override only* —
+    // it is consumed here and deliberately NOT exported into the spawned
+    // child's environment (see the env-application loop below), so the agent's
+    // own sub-shell matches an interactive session.
+    let shell_override: Option<String> = opts
+        .env
+        .iter()
+        .find(|(k, _)| k == "SHELL")
+        .map(|(_, v)| v.clone());
+    let default_shell = shell_override
+        .clone()
+        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
 
     let mut cmd = match opts.command {
-        Some(c) if c.contains(' ') => {
+        Some(c) if command_needs_shell_wrap(c) => {
             let mut cb = CommandBuilder::new(&default_shell);
             cb.arg("-c");
             cb.arg(c);
@@ -738,6 +766,13 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     cmd.env_remove(DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS);
 
     for (k, v) in &opts.env {
+        // PRD #127 C2: `SHELL` in `opts.env` is a wrapper-choice override only
+        // (consumed as `shell_override` above) — do NOT export it into the
+        // child, or the spawned agent's sub-shell would silently differ from an
+        // interactive session.
+        if k == "SHELL" {
+            continue;
+        }
         cmd.env(k, v);
     }
 
@@ -1131,6 +1166,15 @@ pub struct AgentPtyRegistry {
     /// the original shutdown for ownership of each `Child`. Read by
     /// [`shutdown_all_graceful`]; a second call returns immediately.
     shutting_down: AtomicBool,
+    /// PRD #127 M2.2 (deliver-on-idle): the last time a *user* keystroke
+    /// (STREAM_IN frame) was forwarded to a pane, keyed by `pane_id_env`. The
+    /// scheduler's reuse path consults this to decide whether to deliver a
+    /// reuse prompt immediately or queue it until the user goes idle. Only
+    /// STREAM_IN updates it — daemon-initiated writes
+    /// ([`write_to_pane_and_submit`](Self::write_to_pane_and_submit)) do not,
+    /// so a scheduled delivery never resets its own debounce clock. In-memory,
+    /// monotonically growing by `pane_id_env` seen (negligible).
+    user_input_at: Mutex<HashMap<String, Instant>>,
 }
 
 struct RegistryInner {
@@ -1167,7 +1211,52 @@ impl AgentPtyRegistry {
             detach_count: AtomicU64::new(0),
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
+            user_input_at: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// PRD #127 M2.2: record that a user keystroke just reached the pane with
+    /// `pane_id_env` (the deliver-on-idle debounce clock). Called from the
+    /// attach-stream STREAM_IN path. Sentinel / empty pane ids are ignored.
+    pub fn note_user_input(&self, pane_id_env: &str) {
+        if pane_id_env.is_empty() || pane_id_env.starts_with('<') {
+            return;
+        }
+        self.user_input_at
+            .lock()
+            .unwrap()
+            .insert(pane_id_env.to_string(), Instant::now());
+    }
+
+    /// PRD #127 M2.2: the last time a user keystroke reached `pane_id_env`, or
+    /// `None` if none has. The reuse path compares this against the debounce
+    /// window to choose deliver-now vs queue.
+    pub fn last_user_input_at(&self, pane_id_env: &str) -> Option<Instant> {
+        self.user_input_at.lock().unwrap().get(pane_id_env).copied()
+    }
+
+    /// PRD #127 M2.2: whether `agent_id` is still a live (non-exited) agent in
+    /// the registry. The scheduler's reuse registry uses this to decide whether
+    /// a recorded tab is still reusable or stale (closed/exited → spawn fresh).
+    pub fn agent_is_live(&self, agent_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .map(|a| !a.exited.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    /// PRD #127 C3: whether the pane with `pane_id_env` is backed by a live
+    /// (non-exited) agent. The reuse path gates reuse on the liveness of the
+    /// SPECIFIC delivery pane (the orchestrator role pane / single-agent pane)
+    /// rather than "any agent for the task", so it never re-delivers into a
+    /// dead pane while a sibling role pane happens to still be alive.
+    pub fn pane_is_live(&self, pane_id_env: &str) -> bool {
+        self.inner.lock().unwrap().agents.values().any(|a| {
+            a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+        })
     }
 
     /// Borrow (or lazily create) the per-pane dispatch mutex for a
@@ -2729,6 +2818,39 @@ mod tests {
         assert!(
             registry.agent_records().is_empty(),
             "agent_records must drop exited entries so hydration doesn't materialize ghost panes"
+        );
+
+        registry.shutdown_all();
+    }
+
+    // PRD #127 C3 — `pane_is_live` reports liveness for the SPECIFIC pane
+    // (by pane_id_env), so the reuse path never re-delivers into a dead pane.
+    #[tokio::test]
+    async fn pane_is_live_tracks_specific_pane() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        // A short-lived agent whose pane we'll watch flip dead.
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "watch-me".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn /usr/bin/true");
+
+        // Unknown pane is never live.
+        assert!(!registry.pane_is_live("no-such-pane"));
+
+        // Wait for it to exit, then the specific pane must read as not-live.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if !registry.pane_is_live("watch-me") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !registry.pane_is_live("watch-me"),
+            "an exited pane must report as not-live so reuse spawns fresh"
         );
 
         registry.shutdown_all();

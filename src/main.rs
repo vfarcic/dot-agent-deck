@@ -125,6 +125,82 @@ enum Commands {
         /// picker runs.
         name: Option<String>,
     },
+    /// Manage cron-scheduled prompts (PRD #127). The single validated writer
+    /// for the global `~/.config/dot-agent-deck/schedules.toml`: every
+    /// mutating subcommand validates the cron, expands `~`/`$VAR`, writes the
+    /// global file atomically regardless of cwd, and triggers a live daemon
+    /// reload.
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScheduleAction {
+    /// Add a new scheduled task.
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        cron: String,
+        #[arg(long = "working-dir")]
+        working_dir: String,
+        #[arg(long)]
+        command: Option<String>,
+        #[arg(long)]
+        prompt: String,
+        // PRD #127 B1: accept an explicit `<true|false>` value (ArgAction::Set),
+        // consistent with `update` and what the authoring seed prompt + docs
+        // tell the agent to pass. A bare `SetTrue` flag here would reject the
+        // value the primary agent-driven path supplies.
+        #[arg(long = "new-tab-per-fire", action = clap::ArgAction::Set, default_value_t = false)]
+        new_tab_per_fire: bool,
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+        enabled: bool,
+    },
+    /// Update fields of an existing task. Rename is forbidden — there is no
+    /// name-change flag; `name` selects the task to edit.
+    Update {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        cron: Option<String>,
+        #[arg(long = "working-dir")]
+        working_dir: Option<String>,
+        #[arg(long)]
+        command: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long = "new-tab-per-fire")]
+        new_tab_per_fire: Option<bool>,
+        #[arg(long)]
+        enabled: Option<bool>,
+    },
+    /// Remove a task definition (does not kill an open tab for it).
+    Remove {
+        #[arg(long)]
+        name: String,
+    },
+    /// List scheduled tasks with their enabled/disabled state and next-fire.
+    List,
+    /// Enable a task.
+    Enable {
+        #[arg(long)]
+        name: String,
+    },
+    /// Disable a task (keeps the definition; stops it firing).
+    Disable {
+        #[arg(long)]
+        name: String,
+    },
+    /// Fire a task now via the running daemon.
+    RunNow {
+        #[arg(long)]
+        name: String,
+    },
+    /// Ask the running daemon to re-read the global config.
+    Reload,
 }
 
 #[derive(Subcommand)]
@@ -505,6 +581,7 @@ fn main() -> ExitCode {
             }
         },
         Some(Commands::Connect { name }) => run_connect(cli.continue_session, name),
+        Some(Commands::Schedule { action }) => run_schedule_cli(action),
         Some(Commands::Validate { path }) => {
             use dot_agent_deck::config_validation::{has_errors, validate_config};
             use dot_agent_deck::project_config::load_project_config;
@@ -957,6 +1034,151 @@ async fn run_daemon_serve_cli() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `dot-agent-deck schedule <subcommand>` — PRD #127 M1.5. The single
+/// validated writer for the global `schedules.toml`. Mutating subcommands
+/// (add/update/remove/enable/disable) load the current file, apply the change
+/// through the `schedule_cli` helpers (cron validation + `~`/`$VAR` expansion +
+/// rename guard), write the global path atomically regardless of cwd, then
+/// trigger a live daemon reload (a daemon that isn't running is fine — the
+/// change loads on next `daemon serve`). `run-now` and `reload` send control
+/// messages to the daemon; `list` prints the current file.
+#[tokio::main]
+async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
+    use dot_agent_deck::config::{LoadedSchedules, schedules_path};
+    use dot_agent_deck::schedule_cli;
+
+    // Subcommands that purely talk to the daemon (no file write).
+    match &action {
+        ScheduleAction::RunNow { name } => {
+            use dot_agent_deck::daemon_client::RunNowOutcome;
+            let client = DaemonClient::new(attach_socket_path());
+            return match client.run_now(name).await {
+                // PRD #127 C5: report skipped distinctly (still exit 0 — the
+                // task is registered and the request succeeded).
+                Ok(RunNowOutcome::Started) => {
+                    println!("ran {name}");
+                    ExitCode::SUCCESS
+                }
+                Ok(RunNowOutcome::SkippedStillRunning) => {
+                    println!("skipped {name}: previous run still active");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("run-now failed: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        ScheduleAction::Reload => {
+            let client = DaemonClient::new(attach_socket_path());
+            return match client.reload_schedules().await {
+                Ok(names) => {
+                    println!("reloaded; registered: {}", names.join(", "));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("reload failed: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        ScheduleAction::List => {
+            let loaded = LoadedSchedules::load();
+            for err in &loaded.errors {
+                eprintln!("warning: skipped malformed entry: {}", err.message);
+            }
+            print!("{}", schedule_cli::format_list(&loaded.tasks));
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
+
+    // Mutating subcommands: load → apply → atomic write → reload trigger.
+    let loaded = LoadedSchedules::load();
+    for err in &loaded.errors {
+        eprintln!(
+            "warning: skipped malformed entry while loading: {}",
+            err.message
+        );
+    }
+    let mut tasks = loaded.tasks;
+
+    let apply_result = match action {
+        ScheduleAction::Add {
+            name,
+            cron,
+            working_dir,
+            command,
+            prompt,
+            new_tab_per_fire,
+            enabled,
+        } => schedule_cli::add(
+            &mut tasks,
+            schedule_cli::AddArgs {
+                name,
+                cron,
+                working_dir,
+                command,
+                prompt,
+                new_tab_per_fire,
+                enabled,
+            },
+        ),
+        ScheduleAction::Update {
+            name,
+            cron,
+            working_dir,
+            command,
+            prompt,
+            new_tab_per_fire,
+            enabled,
+        } => schedule_cli::update(
+            &mut tasks,
+            schedule_cli::UpdateArgs {
+                name,
+                cron,
+                working_dir,
+                command,
+                prompt,
+                new_tab_per_fire,
+                enabled,
+            },
+        ),
+        ScheduleAction::Remove { name } => schedule_cli::remove(&mut tasks, &name),
+        ScheduleAction::Enable { name } => schedule_cli::set_enabled(&mut tasks, &name, true),
+        ScheduleAction::Disable { name } => schedule_cli::set_enabled(&mut tasks, &name, false),
+        // RunNow/Reload/List handled above.
+        ScheduleAction::RunNow { .. } | ScheduleAction::Reload | ScheduleAction::List => {
+            unreachable!("daemon-only / read-only subcommands handled above")
+        }
+    };
+
+    if let Err(e) = apply_result {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+
+    let path = schedules_path();
+    if let Err(e) = schedule_cli::write_atomic(&path, &tasks) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+
+    // Trigger a live reload so a running daemon picks the change up. A daemon
+    // that isn't running is not an error — the change loads on next serve.
+    let client = DaemonClient::new(attach_socket_path());
+    match client.reload_schedules().await {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "note: wrote {} but could not reload the daemon ({e}); it will load on next `daemon serve`",
+                path.display()
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn run_ascii(
     input: &str,
@@ -972,4 +1194,74 @@ async fn run_ascii(
     }
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    // PRD #127 B1 — `schedule add --new-tab-per-fire` must accept an explicit
+    // `<true|false>` value (ArgAction::Set), matching `update`, the authoring
+    // seed prompt, and the docs. A bare SetTrue flag would reject the value.
+    fn parse_add_new_tab(value: &str) -> bool {
+        let cli = Cli::try_parse_from([
+            "dot-agent-deck",
+            "schedule",
+            "add",
+            "--name",
+            "t",
+            "--cron",
+            "0 9 * * *",
+            "--working-dir",
+            "/tmp",
+            "--prompt",
+            "p",
+            "--new-tab-per-fire",
+            value,
+        ])
+        .expect("schedule add must accept --new-tab-per-fire <true|false>");
+        match cli.command {
+            Some(Commands::Schedule {
+                action:
+                    ScheduleAction::Add {
+                        new_tab_per_fire, ..
+                    },
+            }) => new_tab_per_fire,
+            _ => panic!("expected `schedule add`"),
+        }
+    }
+
+    #[test]
+    fn schedule_add_new_tab_per_fire_takes_a_value() {
+        assert!(parse_add_new_tab("true"));
+        assert!(!parse_add_new_tab("false"));
+    }
+
+    #[test]
+    fn schedule_add_new_tab_per_fire_defaults_false() {
+        let cli = Cli::try_parse_from([
+            "dot-agent-deck",
+            "schedule",
+            "add",
+            "--name",
+            "t",
+            "--cron",
+            "0 9 * * *",
+            "--working-dir",
+            "/tmp",
+            "--prompt",
+            "p",
+        ])
+        .expect("parse without --new-tab-per-fire");
+        match cli.command {
+            Some(Commands::Schedule {
+                action:
+                    ScheduleAction::Add {
+                        new_tab_per_fire, ..
+                    },
+            }) => assert!(!new_tab_per_fire, "default must be false"),
+            _ => panic!("expected `schedule add`"),
+        }
+    }
 }

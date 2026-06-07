@@ -157,6 +157,11 @@ enum UiMode {
     /// with Stop still selected so the user can pick a different option
     /// without restarting the Ctrl+C sequence.
     StopConfirm,
+    /// PRD #127 M3.3: the "Scheduled Tasks" manager dialog — a
+    /// read-only-plus-actions list of the configured schedules (status +
+    /// next-fire) with add/edit (seeded authoring agent), delete-with-confirm
+    /// (definition only), and run-now actions.
+    ScheduledTasks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +349,192 @@ impl DirPickerState {
 // Unified new-pane form (mode selection + name/command in one modal)
 // ---------------------------------------------------------------------------
 
+/// PRD #127 M3.2: display name of the built-in "schedule" authoring option in
+/// the new-deck dialog's Mode cycler. It is NOT a per-project `[[modes]]`
+/// entry — it is appended to the end of the cycle and spawns a throwaway
+/// authoring agent pre-seeded with [`SCHEDULE_AUTHORING_SEED_PROMPT`].
+const SCHEDULE_MODE_NAME: &str = "schedule";
+
+/// PRD #127 M3.2: default conversational agent for the "schedule" authoring
+/// session when the form's command is left blank. The authoring agent must be
+/// able to act on the seed prompt (call the `schedule add` CLI), so it cannot
+/// fall back to a bare `$SHELL`.
+const SCHEDULE_AUTHORING_AGENT: &str = "claude";
+
+/// PRD #127 M3.2: the crisp seed prompt delivered (gated, like orchestrations)
+/// to the "schedule" authoring agent. It instructs the agent to converse with
+/// the user, then call the validated `dot-agent-deck schedule add` CLI — it
+/// NEVER freehand-edits the TOML. Carries the field list, the exact invocation,
+/// the validation rules, the test-in-session affordance, and the
+/// confirm-before-write requirement.
+const SCHEDULE_AUTHORING_SEED_PROMPT: &str = "\
+You are helping the user create a cron-scheduled prompt for dot-agent-deck. \
+This is a throwaway authoring session: converse to build ONE schedule entry, write it, then you are done.
+
+Collect these fields:
+- name: unique id for the schedule (also the reuse-tab key; renaming is forbidden — to rename, remove + add).
+- cron: a cron expression (5-field POSIX, e.g. \"0 9 * * MON-FRI\", evaluated in local time).
+- working_dir: directory the prompt runs in (the CLI expands ~ and $VAR — pass them literally).
+- command: the agent command for a single-agent card (e.g. \"claude\"); optional, omit to fall back to $SHELL. Ignored when working_dir has an [[orchestrations]] block.
+- prompt: the prompt text to deliver on each fire.
+- new_tab_per_fire: true to open a fresh tab every fire, false (default) to reuse one tab.
+- enabled: true (default) or false.
+
+Rules:
+- NEVER edit the TOML file directly. ALWAYS write via the validated CLI, which checks the cron, expands paths, and writes the global config atomically:
+  dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> [--command <cmd>] --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>]
+- The user can TEST the prompt in THIS session before committing — offer to run it now and show them the result (\"run it now, show me\").
+- CONFIRM the full entry (every field) with the user before you call `schedule add`.";
+
+// ---------------------------------------------------------------------------
+// "Scheduled Tasks" management dialog (PRD #127 M3.3)
+// ---------------------------------------------------------------------------
+
+/// Status of a schedule as shown in the manager dialog. "disabled" when
+/// `enabled = false`; "live" when the task currently has a live reused
+/// tab/agent; "idle" otherwise.
+fn schedule_status_label(enabled: bool, is_live: bool) -> &'static str {
+    if !enabled {
+        "disabled"
+    } else if is_live {
+        "live"
+    } else {
+        "idle"
+    }
+}
+
+/// Next-fire cell for the manager list: the `—` placeholder for a disabled
+/// task, otherwise the next occurrence of the task's cron (local time) or `—`
+/// when the cron yields no upcoming time / fails to parse (writer-validated
+/// crons always parse, so this is defensive).
+fn schedule_next_fire_display(task: &crate::config::ScheduledTask) -> String {
+    if !task.enabled {
+        return "\u{2014}".to_string(); // —
+    }
+    match crate::scheduler::parse_cron(&task.cron) {
+        Ok(schedule) => match schedule.upcoming(chrono::Local).next() {
+            Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+            None => "\u{2014}".to_string(),
+        },
+        Err(_) => "\u{2014}".to_string(),
+    }
+}
+
+/// Build the "schedule" authoring `ModeConfig` for the manager's add/edit
+/// actions (PRD #127 M3.3). Both reuse the 3B-i seeded authoring agent. For
+/// **add**, the seed is the base [`SCHEDULE_AUTHORING_SEED_PROMPT`]. For
+/// **edit**, the existing entry's current values are injected so the agent
+/// starts from them and calls `schedule update` (NOT `add`); renaming is
+/// forbidden (the `name` is the reuse-registry key — to rename, remove + add).
+fn build_schedule_authoring_mode(existing: Option<&crate::config::ScheduledTask>) -> ModeConfig {
+    let seed = match existing {
+        None => SCHEDULE_AUTHORING_SEED_PROMPT.to_string(),
+        Some(t) => {
+            let command = t.command.clone().unwrap_or_default();
+            format!(
+                "{base}\n\n\
+                 You are EDITING the existing schedule {name:?}. Its current values are:\n\
+                 - name: {name}\n\
+                 - cron: {cron}\n\
+                 - working_dir: {working_dir}\n\
+                 - command: {command}\n\
+                 - prompt: {prompt}\n\
+                 - new_tab_per_fire: {ntpf}\n\
+                 - enabled: {enabled}\n\
+                 Start from these values and write changes with \
+                 `dot-agent-deck schedule update --name {name} ...` (NOT `add`). \
+                 RENAME IS FORBIDDEN — the name {name:?} is fixed (it is the reuse-tab key); \
+                 to rename, remove this schedule and add a new one.",
+                base = SCHEDULE_AUTHORING_SEED_PROMPT,
+                name = t.name,
+                cron = t.cron,
+                working_dir = t.working_dir,
+                command = command,
+                prompt = t.prompt,
+                ntpf = t.new_tab_per_fire,
+                enabled = t.enabled,
+            )
+        }
+    };
+    ModeConfig {
+        name: SCHEDULE_MODE_NAME.to_string(),
+        init_command: None,
+        seed_prompt: Some(seed),
+        panes: Vec::new(),
+        rules: Vec::new(),
+        reactive_panes: 0,
+    }
+}
+
+/// Send a one-shot `AttachRequest` to the local daemon over the attach socket
+/// and read the single `AttachResponse`, synchronously (no tokio runtime — the
+/// TUI key path is sync). Used by the manager dialog's run-now and the
+/// reload-after-delete. Returns `Err` on any transport problem; callers treat
+/// a down daemon as best-effort.
+fn send_daemon_request_blocking(
+    req: &crate::daemon_protocol::AttachRequest,
+) -> std::io::Result<crate::daemon_protocol::AttachResponse> {
+    use crate::daemon_protocol::{KIND_REQ, KIND_RESP};
+    use std::io::{Read, Write};
+
+    let path = config::attach_socket_path();
+    let mut stream = std::os::unix::net::UnixStream::connect(&path)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+
+    let payload = serde_json::to_vec(req).map_err(std::io::Error::other)?;
+    let mut header = [0u8; 5];
+    header[0] = KIND_REQ;
+    header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    stream.write_all(&header)?;
+    stream.write_all(&payload)?;
+    stream.flush()?;
+
+    let mut resp_header = [0u8; 5];
+    stream.read_exact(&mut resp_header)?;
+    if resp_header[0] != KIND_RESP {
+        return Err(std::io::Error::other(format!(
+            "expected RESP frame, got kind 0x{:02x}",
+            resp_header[0]
+        )));
+    }
+    let len = u32::from_be_bytes([
+        resp_header[1],
+        resp_header[2],
+        resp_header[3],
+        resp_header[4],
+    ]) as usize;
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body)?;
+    serde_json::from_slice(&body).map_err(std::io::Error::other)
+}
+
+/// Names of schedules that currently have a live (non-exited) tab/agent —
+/// derived from the daemon's `ListAgents`. One-shot socket query at dialog-open
+/// time; a down daemon degrades to "no live tasks" (all idle).
+///
+/// PRD #127 N3: only agents whose `pane_id_env` carries the scheduler's
+/// `sched-` prefix are counted, so a manually-spawned agent that happens to
+/// share a schedule's display name can't be mistaken for a live fire. The task
+/// name is then read from the agent's `display_name` (the scheduler sets it to
+/// the task name at spawn).
+fn live_schedule_names() -> HashSet<String> {
+    match send_daemon_request_blocking(&crate::daemon_protocol::AttachRequest::ListAgents) {
+        Ok(resp) => resp
+            .agent_records
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| {
+                r.pane_id_env
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with(crate::spawn::SCHEDULE_PANE_ID_PREFIX))
+            })
+            .filter_map(|r| r.display_name)
+            .collect(),
+        Err(_) => HashSet::new(),
+    }
+}
+
 /// PRD #80 M8: which new-pane-form field is focused. Public because it rides
 /// in [`Action::FormFocusField`] (a click on a field's row focuses it, the
 /// same as Tab landing there).
@@ -361,7 +552,13 @@ struct NewPaneFormState {
     // Mode/orchestration selection fields
     modes: Vec<ModeConfig>,
     orchestrations: Vec<OrchestrationConfig>,
-    selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations
+    /// PRD #127 M3.2: the built-in "schedule" authoring mode, appended to the
+    /// end of the Mode cycler (after the project's workload modes and
+    /// orchestrations). Carries the authoring seed prompt; selecting it spawns
+    /// a pre-seeded conversational agent via the same gated delivery path
+    /// modes use (Phase 3A).
+    schedule_authoring: ModeConfig,
+    selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations, last = "schedule"
     has_mode_field: bool,
     focused: FormField,
 }
@@ -397,25 +594,45 @@ impl NewPaneFormState {
         modes: Vec<ModeConfig>,
         orchestrations: Vec<OrchestrationConfig>,
     ) -> Self {
-        let has_mode_field = !modes.is_empty() || !orchestrations.is_empty();
+        // PRD #127 M3.2: the built-in "schedule" authoring option is always
+        // available, so the Mode field always shows (at minimum "No mode" and
+        // "schedule") and the form opens focused on it.
+        let has_mode_field = true;
+        let schedule_authoring = ModeConfig {
+            name: SCHEDULE_MODE_NAME.to_string(),
+            init_command: None,
+            seed_prompt: Some(SCHEDULE_AUTHORING_SEED_PROMPT.to_string()),
+            panes: Vec::new(),
+            rules: Vec::new(),
+            reactive_panes: 0,
+        };
         Self {
             dir,
             name,
             command,
             modes,
             orchestrations,
+            schedule_authoring,
             selection_index: 0,
             has_mode_field,
-            focused: if has_mode_field {
-                FormField::Mode
-            } else {
-                FormField::Name
-            },
+            focused: FormField::Mode,
         }
     }
 
-    fn mode_option_count(&self) -> usize {
+    /// Cycler index of the built-in "schedule" authoring option — the last one,
+    /// after the project's workload modes and orchestrations.
+    fn schedule_index(&self) -> usize {
         1 + self.modes.len() + self.orchestrations.len()
+    }
+
+    /// Whether the built-in "schedule" authoring option is currently selected.
+    fn is_schedule_selected(&self) -> bool {
+        self.selection_index == self.schedule_index()
+    }
+
+    fn mode_option_count(&self) -> usize {
+        // +1 for the built-in "schedule" authoring option appended at the end.
+        1 + self.modes.len() + self.orchestrations.len() + 1
     }
 
     fn select_next_mode(&mut self) {
@@ -429,6 +646,11 @@ impl NewPaneFormState {
     }
 
     fn selected_mode(&self) -> Option<&ModeConfig> {
+        if self.is_schedule_selected() {
+            // The built-in authoring mode — spawns a seeded agent like any
+            // mode with a `seed_prompt`.
+            return Some(&self.schedule_authoring);
+        }
         if self.selection_index == 0 || self.selection_index > self.modes.len() {
             None
         } else {
@@ -446,14 +668,15 @@ impl NewPaneFormState {
     }
 
     /// PRD #80 M8: display name for the mode option at `idx` (0 = "No mode",
-    /// 1..=modes = mode names, then orchestrations). Used to render one
-    /// clickable chip per option.
+    /// 1..=modes = mode names, then orchestrations, then the built-in
+    /// "schedule" authoring option at the end). Used to render one clickable
+    /// chip per option.
     fn mode_option_name(&self, idx: usize) -> String {
         if idx == 0 {
             "No mode".to_string()
         } else if idx <= self.modes.len() {
             self.modes[idx - 1].name.clone()
-        } else {
+        } else if idx <= self.modes.len() + self.orchestrations.len() {
             let orch_idx = idx - 1 - self.modes.len();
             let name = &self.orchestrations[orch_idx].name;
             if name.is_empty() {
@@ -461,6 +684,9 @@ impl NewPaneFormState {
             } else {
                 format!("Orch: {name}")
             }
+        } else {
+            // PRD #127 M3.2: built-in "schedule" authoring option at the last position.
+            SCHEDULE_MODE_NAME.to_string()
         }
     }
 
@@ -601,6 +827,19 @@ struct PendingDispatch {
     created_at: std::time::Instant,
 }
 
+/// PRD #127 M3.1: a mode's `seed_prompt` queued for delivery to its agent pane,
+/// gated exactly like the orchestrator's spawn-time role prompt — agent-ready
+/// (SessionStart, fast path) or a 10s timeout (slow path), plus the
+/// `SPAWN_TIME_READINESS_BUFFER`, then an atomic `write_and_submit_to_pane`.
+/// `ready_since` records when the agent first signalled ready so the buffer is
+/// measured from that instant (mirrors `orchestration_ready_since`).
+struct PendingSeedPrompt {
+    pane_id: String,
+    prompt: String,
+    created_at: std::time::Instant,
+    ready_since: Option<std::time::Instant>,
+}
+
 struct UiState {
     mode: UiMode,
     selected_index: usize,
@@ -727,6 +966,21 @@ struct UiState {
     orchestration_ready_since: HashMap<TabId, std::time::Instant>,
     /// Prompts waiting to be injected into panes once their agent is ready (M5 dispatch).
     pending_dispatches: Vec<PendingDispatch>,
+    /// PRD #127 M3.1: mode `seed_prompt`s waiting for their agent pane to be
+    /// ready before the gated atomic submit. Parallel to `pending_dispatches`
+    /// but uses the spawn-time readiness buffer + `write_and_submit_to_pane`.
+    pending_seed_prompts: Vec<PendingSeedPrompt>,
+    /// PRD #127 M3.3: schedules listed in the "Scheduled Tasks" manager dialog,
+    /// loaded from the global config when the dialog opens.
+    scheduled_tasks: Vec<config::ScheduledTask>,
+    /// Selected row in the manager dialog.
+    scheduled_selected: usize,
+    /// True while the manager dialog is showing the delete confirmation for the
+    /// selected row (`d` pressed; `y` confirms, `n`/Esc cancels).
+    scheduled_delete_confirm: bool,
+    /// Schedule names with a live tab/agent, snapshotted when the dialog opens
+    /// (drives the live/idle status indicator).
+    scheduled_live_names: HashSet<String>,
     /// PRD #76 M2.20: timestamp of the most recent keystroke forwarded to a
     /// pane via `ForwardToPane`. Drives the submit-debounce in `PaneInput` mode
     /// so an Enter keystroke arriving fused to preceding typed bytes is
@@ -843,6 +1097,11 @@ impl UiState {
             orchestration_created_at: HashMap::new(),
             orchestration_ready_since: HashMap::new(),
             pending_dispatches: Vec::new(),
+            pending_seed_prompts: Vec::new(),
+            scheduled_tasks: Vec::new(),
+            scheduled_selected: 0,
+            scheduled_delete_confirm: false,
+            scheduled_live_names: HashSet::new(),
             last_pane_keystroke_at: None,
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
@@ -1843,6 +2102,49 @@ fn process_pending_dispatches(
     });
 }
 
+/// PRD #127 M3.1: deliver a mode's `seed_prompt` to its agent pane once the
+/// agent is ready, gated exactly like the orchestrator's spawn-time role prompt
+/// (`SessionStart` fast path / 10s timeout slow path, then the
+/// `SPAWN_TIME_READINESS_BUFFER`, then an atomic `write_and_submit_to_pane`).
+/// A mode without a `seed_prompt` never enqueues one, so this is a no-op for
+/// plain modes (no regression).
+fn process_pending_seed_prompts(
+    ui: &mut UiState,
+    pane: &Arc<dyn PaneController>,
+    snapshot: &AppState,
+) {
+    let now = std::time::Instant::now();
+    ui.pending_seed_prompts.retain_mut(|sp| {
+        // Fast path: agent fired SessionStart (agent_type resolved).
+        let agent_ready = snapshot.sessions.values().any(|s| {
+            s.pane_id.as_deref() == Some(sp.pane_id.as_str()) && s.agent_type != AgentType::None
+        });
+        // Slow path: no SessionStart after 10s (e.g. opencode) — proceed anyway.
+        let timeout_ready =
+            !agent_ready && sp.created_at.elapsed() > std::time::Duration::from_secs(10);
+        if agent_ready {
+            sp.ready_since.get_or_insert(now);
+        }
+        // Hold the write until the readiness buffer elapses (mirrors the
+        // orchestrator path). The timeout path bypasses the buffer.
+        let buffer_elapsed = if timeout_ready {
+            true
+        } else {
+            should_inject_spawn_time_prompt(sp.ready_since, now)
+        };
+        if (agent_ready || timeout_ready) && buffer_elapsed {
+            let _ = pane.write_and_submit_to_pane(&sp.pane_id, &sp.prompt);
+            return false;
+        }
+        // Hard timeout after 60s — give up.
+        if sp.created_at.elapsed() > std::time::Duration::from_secs(60) {
+            tracing::warn!(pane_id = %sp.pane_id, "seed prompt: timed out waiting for agent");
+            return false;
+        }
+        true
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Bell transition detection
 // ---------------------------------------------------------------------------
@@ -2066,6 +2368,15 @@ pub enum Action {
     /// agent and exits), and breaks the TUI's main loop.
     StopAndQuit,
     ForwardToPane(Vec<u8>),
+    /// PRD #127 M3.3: the manager dialog's `r` action — fire the named schedule
+    /// immediately via the `RunNow` daemon control message. Dispatched in the
+    /// main loop (socket I/O), which the sync key handler can't do directly.
+    ScheduleRunNow(String),
+    /// PRD #127 M3.3: the manager dialog's confirmed `d` action — remove the
+    /// named schedule's DEFINITION (rewrite `schedules.toml` via the validated
+    /// writer + daemon reload). Definition-only: it must NOT close an open tab
+    /// for that schedule (the main-loop handler does no agent teardown).
+    ScheduleDelete(String),
 }
 
 /// Convert a crossterm `KeyEvent` into the byte sequence expected by a terminal PTY.
@@ -2748,6 +3059,18 @@ fn handle_normal_key(
     {
         return Action::SendPermissionResponse(false);
     }
+    // PRD #127 M3.3: open the "Scheduled Tasks" manager dialog. `S`
+    // (Shift+s) is unbound in dashboard command mode. Load the schedules
+    // from the global config and snapshot which currently have a live
+    // tab/agent (for the status indicator).
+    if key.code == KeyCode::Char('S') {
+        ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
+        ui.scheduled_selected = 0;
+        ui.scheduled_delete_confirm = false;
+        ui.scheduled_live_names = live_schedule_names();
+        ui.mode = UiMode::ScheduledTasks;
+        return Action::Continue;
+    }
     if kb.matches(KbAction::ClearFilter, &key) {
         if !ui.filter_text.is_empty() {
             ui.filter_text.clear();
@@ -2790,6 +3113,100 @@ fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> Action {
         _ => {}
     }
     Action::Continue
+}
+
+/// PRD #127 M3.3: key handling for the "Scheduled Tasks" manager dialog.
+/// Read-only-plus-actions: `j`/`k` move the selection, `a` adds, `Enter`/`e`
+/// edits the selected row (both spawn the seeded authoring agent), `d` asks to
+/// confirm a definition-only delete (`y` confirms, `n`/Esc cancels), `r`
+/// run-now fires the selected row. NO inline enable/disable toggle and NO
+/// in-place field editing (PRD decision).
+fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
+    // Delete-confirmation sub-state takes precedence.
+    if ui.scheduled_delete_confirm {
+        match key.code {
+            KeyCode::Char('y') => {
+                ui.scheduled_delete_confirm = false;
+                if let Some(task) = ui.scheduled_tasks.get(ui.scheduled_selected) {
+                    let name = task.name.clone();
+                    // PRD #127 N2: keep the dialog OPEN after a confirmed
+                    // delete — the main-loop handler removes the definition and
+                    // refreshes the list in place so the user can act on more
+                    // rows.
+                    return Action::ScheduleDelete(name);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                ui.scheduled_delete_confirm = false;
+            }
+            _ => {}
+        }
+        return Action::Continue;
+    }
+
+    let len = ui.scheduled_tasks.len();
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => {
+            ui.mode = UiMode::Normal;
+            Action::Continue
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if len > 0 {
+                ui.scheduled_selected = (ui.scheduled_selected + 1) % len;
+            }
+            Action::Continue
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if len > 0 {
+                ui.scheduled_selected = (ui.scheduled_selected + len - 1) % len;
+            }
+            Action::Continue
+        }
+        // Add: spawn the seeded authoring agent with a blank context.
+        KeyCode::Char('a') => {
+            ui.mode = UiMode::Normal;
+            Action::SpawnPane(schedule_authoring_request(None))
+        }
+        // Edit the selected row: spawn the authoring agent pre-filled with the
+        // row's current values (it calls `schedule update`). With no rows,
+        // behave like add.
+        KeyCode::Enter | KeyCode::Char('e') => {
+            let existing = ui.scheduled_tasks.get(ui.scheduled_selected).cloned();
+            ui.mode = UiMode::Normal;
+            Action::SpawnPane(schedule_authoring_request(existing.as_ref()))
+        }
+        // Delete (definition only) — ask to confirm first.
+        KeyCode::Char('d') => {
+            if ui.scheduled_selected < len {
+                ui.scheduled_delete_confirm = true;
+            }
+            Action::Continue
+        }
+        // Run-now the selected row. PRD #127 N2: the dialog stays OPEN so the
+        // user can fire several rows; the main-loop handler refreshes status.
+        KeyCode::Char('r') => {
+            if let Some(task) = ui.scheduled_tasks.get(ui.scheduled_selected) {
+                return Action::ScheduleRunNow(task.name.clone());
+            }
+            Action::Continue
+        }
+        _ => Action::Continue,
+    }
+}
+
+/// Build the [`NewPaneRequest`] that spawns the seeded "schedule" authoring
+/// agent for the manager's add (`existing = None`) or edit (`existing =
+/// Some(..)`) action. Reuses the 3B-i authoring mode + 3A gated seed delivery;
+/// the agent command is the conversational `claude` (it must act on the seed).
+fn schedule_authoring_request(existing: Option<&config::ScheduledTask>) -> NewPaneRequest {
+    let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    NewPaneRequest {
+        dir,
+        name: SCHEDULE_MODE_NAME.to_string(),
+        command: SCHEDULE_AUTHORING_AGENT.to_string(),
+        mode_config: Some(build_schedule_authoring_mode(existing)),
+        orchestration_config: None,
+    }
 }
 
 /// Decide what value to push to the daemon on a Rename-mode keypress.
@@ -3070,7 +3487,14 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
             // selected), pressing Enter on Name submits — there's no later
             // field to advance to.
             FormField::Name | FormField::Command => {
-                let req = build_new_pane_request(form);
+                let mut req = build_new_pane_request(form);
+                // PRD #127 M3.2: the "schedule" authoring agent must be a real
+                // conversational agent (it has to act on the seed prompt and
+                // call the CLI), so default a blank command to `claude` rather
+                // than letting it fall back to a bare $SHELL.
+                if form.is_schedule_selected() && req.command.trim().is_empty() {
+                    req.command = SCHEDULE_AUTHORING_AGENT.to_string();
+                }
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
                 return Action::SpawnPane(req);
@@ -4615,6 +5039,77 @@ fn dispatch_action(
                 ui.last_pane_keystroke_at = Some(std::time::Instant::now());
             }
         }
+        Action::ScheduleRunNow(name) => {
+            // PRD #127 M3.3: fire the schedule now via the daemon's RunNow control message.
+            match send_daemon_request_blocking(&crate::daemon_protocol::AttachRequest::RunNow {
+                name: name.clone(),
+            }) {
+                Ok(resp) if resp.ok => {
+                    let msg = match crate::daemon_client::run_now_outcome_from_agents(&resp.agents)
+                    {
+                        crate::daemon_client::RunNowOutcome::Started => {
+                            format!("Ran schedule '{name}'")
+                        }
+                        crate::daemon_client::RunNowOutcome::SkippedStillRunning => {
+                            format!("'{name}' already running — skipped")
+                        }
+                    };
+                    ui.status_message = Some((msg, std::time::Instant::now()));
+                }
+                Ok(resp) => {
+                    ui.status_message = Some((
+                        format!(
+                            "Run-now failed: {}",
+                            resp.error.unwrap_or_else(|| "unknown error".to_string())
+                        ),
+                        std::time::Instant::now(),
+                    ));
+                }
+                Err(e) => {
+                    ui.status_message =
+                        Some((format!("Run-now failed: {e}"), std::time::Instant::now()));
+                }
+            }
+            // PRD #127 N2: dialog stays open after run-now; refresh live-status snapshot.
+            if ui.mode == UiMode::ScheduledTasks {
+                ui.scheduled_live_names = live_schedule_names();
+            }
+        }
+        Action::ScheduleDelete(name) => {
+            // PRD #127 M3.3: remove the DEFINITION only — rewrite the global
+            // schedules.toml via the validated writer, then reload. Does NOT
+            // touch any open tab/agent for the schedule.
+            let mut loaded = config::LoadedSchedules::load();
+            match crate::schedule_cli::remove(&mut loaded.tasks, &name) {
+                Ok(()) => {
+                    let path = config::schedules_path();
+                    if let Err(e) = crate::schedule_cli::write_atomic(&path, &loaded.tasks) {
+                        ui.status_message =
+                            Some((format!("Delete failed: {e}"), std::time::Instant::now()));
+                    } else {
+                        let _ = send_daemon_request_blocking(
+                            &crate::daemon_protocol::AttachRequest::ReloadSchedules,
+                        );
+                        ui.status_message = Some((
+                            format!("Deleted schedule '{name}' (open tab kept)"),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    ui.status_message =
+                        Some((format!("Delete failed: {e}"), std::time::Instant::now()));
+                }
+            }
+            // PRD #127 N2: dialog stays open after delete — refresh list and clamp selection.
+            if ui.mode == UiMode::ScheduledTasks {
+                ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
+                ui.scheduled_live_names = live_schedule_names();
+                if ui.scheduled_selected >= ui.scheduled_tasks.len() {
+                    ui.scheduled_selected = ui.scheduled_tasks.len().saturating_sub(1);
+                }
+            }
+        }
         Action::Continue => {}
     }
     Flow::Continue
@@ -5815,6 +6310,9 @@ pub fn run_tui(
         // pane scrollback. `process_pending_dispatches` still ferries the
         // orchestrator's *initial* prompt across the agent-ready gate.
         process_pending_dispatches(&mut ui, &pane, &snapshot);
+        // PRD #127 M3.1: deliver any mode `seed_prompt`s whose agent pane has
+        // become ready (gated, like orchestrations).
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
 
         // Drain all pending events before re-rendering. This avoids a full
         // render cycle between each keystroke, which eliminates perceived typing
@@ -6712,6 +7210,7 @@ pub fn run_tui(
                         handle_quit_confirm_key(key, &mut ui, managed_agents_count)
                     }
                     UiMode::StopConfirm => handle_stop_confirm_key(key, &mut ui),
+                    UiMode::ScheduledTasks => handle_scheduled_tasks_key(key, &mut ui),
                 });
             }
 
@@ -7296,6 +7795,9 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
             ui.form_chip_rects = chips;
             ui.form_button_rects = buttons;
         }
+    }
+    if ui.mode == UiMode::ScheduledTasks {
+        render_scheduled_tasks(frame, ui);
     }
     if ui.mode == UiMode::StarPrompt {
         ui.modal_button_rects = render_star_prompt(frame);
@@ -8456,6 +8958,7 @@ fn render_help_overlay(
             ),
             "Approve / deny permission",
         ),
+        help_key_line("S", "Scheduled Tasks manager"),
         help_key_line(&n(KbAction::Help), "Toggle this help"),
     ];
 
@@ -8724,6 +9227,147 @@ fn new_pane_form_footer_hint(has_mode_field: bool, name_submits: bool) -> &'stat
     }
 }
 
+/// PRD #127 M3.3: render the "Scheduled Tasks" manager dialog — a
+/// read-only-plus-actions list of the configured schedules, each row showing
+/// name, status (live/idle/disabled), and next-fire. Shows a delete
+/// confirmation when armed.
+fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) {
+    let area = frame.area();
+    let popup_width = 72.min(area.width.saturating_sub(4));
+    let row_count = ui.scheduled_tasks.len().max(1) as u16;
+    // header + column-head + rows + blank + footer (+confirm) within borders.
+    let popup_height = (row_count + 7).min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    // PRD #127 N2: bound the rendered rows to what fits and scroll the selected
+    // row into view, so a list taller than the viewport is fully reachable.
+    // Chrome inside the border: leading blank + column header + trailing blank
+    // + footer = 4 lines.
+    let inner_height = popup_height.saturating_sub(2) as usize;
+    let max_visible_rows = inner_height.saturating_sub(4).max(1);
+    let (win_start, win_end) = visible_window(
+        ui.scheduled_tasks.len(),
+        ui.scheduled_selected,
+        max_visible_rows,
+    );
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+
+    if ui.scheduled_tasks.is_empty() {
+        lines.push(Line::styled(
+            "  No schedules configured. Press `a` to add one.",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    } else {
+        // Column header, with a scroll indicator when rows are hidden.
+        let hidden_above = win_start;
+        let hidden_below = ui.scheduled_tasks.len().saturating_sub(win_end);
+        let scroll_hint = match (hidden_above, hidden_below) {
+            (0, 0) => String::new(),
+            (a, 0) => format!("  (\u{2191}{a})"),
+            (0, b) => format!("  (\u{2193}{b})"),
+            (a, b) => format!("  (\u{2191}{a} \u{2193}{b})"),
+        };
+        lines.push(Line::styled(
+            format!(
+                "  {:<22}{:<11}{}{}",
+                "NAME", "STATUS", "NEXT FIRE", scroll_hint
+            ),
+            text_primary().add_modifier(Modifier::BOLD),
+        ));
+        for (i, task) in ui
+            .scheduled_tasks
+            .iter()
+            .enumerate()
+            .skip(win_start)
+            .take(win_end - win_start)
+        {
+            let is_live = ui.scheduled_live_names.contains(&task.name);
+            let status = schedule_status_label(task.enabled, is_live);
+            let next = schedule_next_fire_display(task);
+            let selected = i == ui.scheduled_selected;
+            let marker = if selected { "\u{25b6} " } else { "  " };
+            let row = format!(
+                "{marker}{:<22}{:<11}{}",
+                truncate_cell(&task.name, 21),
+                status,
+                next,
+            );
+            let style = if selected {
+                text_primary().add_modifier(Modifier::BOLD)
+            } else {
+                text_primary()
+            };
+            lines.push(Line::styled(row, style));
+        }
+    }
+
+    lines.push(Line::from(""));
+    if ui.scheduled_delete_confirm {
+        let name = ui
+            .scheduled_tasks
+            .get(ui.scheduled_selected)
+            .map(|t| t.name.as_str())
+            .unwrap_or("");
+        lines.push(Line::styled(
+            format!("  Delete schedule '{name}'? definition only — open tab kept. (y/n)"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        lines.push(Line::styled(
+            "  a add   e/Enter edit   d delete   r run-now   Esc close",
+            text_primary(),
+        ));
+    }
+
+    // PRD #13: terminal-relative — no absolute background fill; the terminal's
+    // own background shows through.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Scheduled Tasks ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+/// PRD #127 N2: the `[start, end)` slice of `len` rows to render so `selected`
+/// is always visible within a window of `max_rows`. When `selected` would fall
+/// below the window it scrolls so the selected row is the last visible one.
+/// Pure so the scroll math is unit-testable.
+fn visible_window(len: usize, selected: usize, max_rows: usize) -> (usize, usize) {
+    if len == 0 || max_rows == 0 {
+        return (0, 0);
+    }
+    let window = max_rows.min(len);
+    let start = if selected < window {
+        0
+    } else {
+        (selected + 1 - window).min(len - window)
+    };
+    (start, start + window)
+}
+
+/// Truncate a cell to `max` display chars, appending `…` when cut. Keeps the
+/// manager list columns aligned without wrapping a long schedule name.
+fn truncate_cell(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('\u{2026}'); // …
+        out
+    }
+}
+
 /// PRD #80 M8: clickable geometry returned by [`render_new_pane_form`] — the
 /// field rows (each paired with the [`FormField`] it focuses), the mode chips
 /// (each paired with its option index), and the `[Submit]`/`[Cancel]` button
@@ -8744,7 +9388,11 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // form is two rows shorter — Command's label row plus its spacing row.
     let cmd_visible = form.command_visible();
     let cmd_rows: u16 = if cmd_visible { 2 } else { 0 };
-    let popup_height = (10 + mode_extra + cmd_rows).min(area.height.saturating_sub(4));
+    // PRD #127 M3.2: the "schedule" authoring option adds one separator/label
+    // row marking it as a throwaway authoring session.
+    let schedule_rows: u16 = if form.is_schedule_selected() { 1 } else { 0 };
+    let popup_height =
+        (10 + mode_extra + cmd_rows + schedule_rows).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -8795,6 +9443,17 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
                 .add_modifier(Modifier::ITALIC),
         ));
         lines.push(Line::from(""));
+    }
+    // PRD #127 M3.2: subtle visual separation — when the "schedule" authoring
+    // option is selected, the second reserved line shows a throwaway-session
+    // hint (the first holds the chips, the second is spare).
+    if form.has_mode_field && form.is_schedule_selected() {
+        lines.push(Line::styled(
+            "           \u{21b3} authoring session \u{2014} writes a schedule, then done",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::ITALIC),
+        ));
     }
 
     let name_line_idx = lines.len();
@@ -9905,6 +10564,7 @@ pub fn render_new_pane_form_to_buffer(
         .map(|n| ModeConfig {
             name: (*n).to_string(),
             init_command: None,
+            seed_prompt: None,
             panes: Vec::new(),
             rules: Vec::new(),
             reactive_panes: 0,
@@ -12278,8 +12938,10 @@ mod tests {
         assert!(ui.new_pane_form.is_some());
         let form = ui.new_pane_form.as_ref().unwrap();
         assert!(form.modes.is_empty());
-        assert!(!form.has_mode_field);
-        assert_eq!(form.focused, FormField::Name);
+        // PRD #127 M3.2: the built-in "schedule" authoring option is always
+        // available, so the Mode field always shows and the form opens on it.
+        assert!(form.has_mode_field);
+        assert_eq!(form.focused, FormField::Mode);
     }
 
     #[test]
@@ -13523,6 +14185,7 @@ mod tests {
         ModeConfig {
             name: name.to_string(),
             init_command: None,
+            seed_prompt: None,
             panes: vec![],
             rules: vec![],
             reactive_panes: 2,
@@ -13599,7 +14262,8 @@ mod tests {
             vec![make_mode("a")],
             vec![],
         );
-        assert_eq!(f.mode_option_count(), 2); // "No mode" + 1 mode
+        // PRD #127 M3.2: + the built-in "schedule" authoring option.
+        assert_eq!(f.mode_option_count(), 3); // "No mode" + 1 mode + "schedule"
 
         let f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
@@ -13608,7 +14272,7 @@ mod tests {
             vec![],
             vec![],
         );
-        assert_eq!(f.mode_option_count(), 1); // "No mode" only
+        assert_eq!(f.mode_option_count(), 2); // "No mode" + "schedule"
     }
 
     #[test]
@@ -13630,10 +14294,14 @@ mod tests {
         assert_eq!(f.selection_index, 1);
         f.select_next_mode();
         assert_eq!(f.selection_index, 2);
-
-        // Can't go past last
+        // PRD #127 M3.2: index 3 is the built-in "schedule" authoring option.
         f.select_next_mode();
-        assert_eq!(f.selection_index, 2);
+        assert_eq!(f.selection_index, 3);
+        assert!(f.is_schedule_selected());
+
+        // Can't go past last (schedule)
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 3);
     }
 
     #[test]
@@ -13695,17 +14363,23 @@ mod tests {
             vec![make_mode("dev")],
             vec![make_orchestration("tdd")],
         );
-        // 0=No mode, 1=dev, 2=tdd
-        assert_eq!(f.mode_option_count(), 3);
+        // 0=No mode, 1=dev, 2=tdd, 3=schedule (PRD #127 M3.2 built-in).
+        assert_eq!(f.mode_option_count(), 4);
 
         f.select_next_mode();
         f.select_next_mode();
         assert_eq!(f.selection_index, 2);
         assert_eq!(f.selected_orchestration().unwrap().name, "tdd");
 
-        // Can't go past last
+        // Index 3 is the built-in "schedule" authoring option.
         f.select_next_mode();
-        assert_eq!(f.selection_index, 2);
+        assert_eq!(f.selection_index, 3);
+        assert!(f.is_schedule_selected());
+        assert!(f.selected_orchestration().is_none());
+
+        // Can't go past last (schedule)
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 3);
     }
 
     #[test]
@@ -13733,8 +14407,11 @@ mod tests {
         assert_eq!(f.focused, FormField::Command);
     }
 
+    // PRD #127 M3.2: with the built-in "schedule" authoring option, the Mode
+    // field is always present even when the project declares no modes — so the
+    // field cycle always includes Mode.
     #[test]
-    fn unified_form_tab_cycles_without_mode() {
+    fn unified_form_tab_cycles_with_builtin_schedule_when_no_project_modes() {
         let mut f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
             String::new(),
@@ -13742,17 +14419,188 @@ mod tests {
             vec![],
             vec![],
         );
-        assert!(!f.has_mode_field);
+        assert!(f.has_mode_field);
+        assert_eq!(f.focused, FormField::Mode);
+
+        f.focused = f.next_field();
         assert_eq!(f.focused, FormField::Name);
 
         f.focused = f.next_field();
         assert_eq!(f.focused, FormField::Command);
 
         f.focused = f.next_field();
-        assert_eq!(f.focused, FormField::Name); // wraps, skips Mode
+        assert_eq!(f.focused, FormField::Mode); // wraps
 
         f.focused = f.prev_field();
         assert_eq!(f.focused, FormField::Command);
+    }
+
+    // --- PRD #127 M3.3: "Scheduled Tasks" manager dialog pure-data helpers ---
+
+    fn make_scheduled_task(name: &str, enabled: bool) -> config::ScheduledTask {
+        config::ScheduledTask {
+            name: name.to_string(),
+            cron: "0 9 * * *".to_string(),
+            working_dir: "/tmp".to_string(),
+            command: Some("cat".to_string()),
+            prompt: format!("{name}-prompt-marker"),
+            new_tab_per_fire: false,
+            enabled,
+        }
+    }
+
+    #[test]
+    fn manager_status_label_derivation() {
+        assert_eq!(schedule_status_label(false, false), "disabled");
+        assert_eq!(schedule_status_label(false, true), "disabled"); // disabled wins
+        assert_eq!(schedule_status_label(true, true), "live");
+        assert_eq!(schedule_status_label(true, false), "idle");
+    }
+
+    #[test]
+    fn manager_next_fire_display_disabled_is_placeholder() {
+        let disabled = make_scheduled_task("paused", false);
+        assert_eq!(schedule_next_fire_display(&disabled), "\u{2014}"); // —
+
+        // An enabled task with a valid cron renders a concrete next-fire.
+        let enabled = make_scheduled_task("digest", true);
+        let next = schedule_next_fire_display(&enabled);
+        assert_ne!(next, "\u{2014}");
+        assert!(
+            next.contains("09:") || next.contains(" 9:"),
+            "next-fire should reflect the 09:00 cron, got {next}"
+        );
+    }
+
+    #[test]
+    fn manager_add_authoring_mode_is_blank_base_seed() {
+        let mode = build_schedule_authoring_mode(None);
+        assert_eq!(mode.name, SCHEDULE_MODE_NAME);
+        let seed = mode.seed_prompt.as_deref().unwrap();
+        // Add uses the base seed verbatim (invokes `schedule add`, no edit block).
+        assert_eq!(seed, SCHEDULE_AUTHORING_SEED_PROMPT);
+        assert!(seed.contains("schedule add"));
+    }
+
+    #[test]
+    fn manager_edit_authoring_mode_prefills_and_forbids_rename() {
+        let existing = make_scheduled_task("digest", true);
+        let mode = build_schedule_authoring_mode(Some(&existing));
+        assert_eq!(mode.name, SCHEDULE_MODE_NAME);
+        let seed = mode.seed_prompt.as_deref().unwrap();
+        // Pre-fill: the existing entry's distinctive prompt + name reach the seed.
+        assert!(
+            seed.contains("digest-prompt-marker"),
+            "edit seed must carry the row's current prompt"
+        );
+        assert!(
+            seed.contains("digest"),
+            "edit seed must carry the row's name"
+        );
+        // Edit drives `schedule update`, never `add`-as-rename, and forbids rename.
+        assert!(
+            seed.contains("schedule update"),
+            "edit seed must instruct `schedule update`"
+        );
+        assert!(
+            seed.to_lowercase().contains("rename is forbidden"),
+            "edit seed must forbid renaming (name is the reuse key)"
+        );
+    }
+
+    // PRD #127 N2 — the scroll window keeps the selected row visible.
+    #[test]
+    fn manager_visible_window_scrolls_selection_into_view() {
+        // Fewer rows than the window → show all.
+        assert_eq!(visible_window(3, 0, 5), (0, 3));
+        assert_eq!(visible_window(3, 2, 5), (0, 3));
+
+        // More rows than the window: selection at the top stays at offset 0.
+        assert_eq!(visible_window(10, 0, 4), (0, 4));
+        // Selection beyond the first window scrolls so it's the last visible row.
+        assert_eq!(visible_window(10, 5, 4), (2, 6));
+        // Selection at the very end pins the window to the bottom.
+        assert_eq!(visible_window(10, 9, 4), (6, 10));
+
+        // Degenerate inputs.
+        assert_eq!(visible_window(0, 0, 4), (0, 0));
+        assert_eq!(visible_window(5, 0, 0), (0, 0));
+    }
+
+    // PRD #127 N2 — the manager dialog stays OPEN after run-now and after a
+    // confirmed delete, so the user can act on multiple rows (the action is
+    // dispatched by the main loop, which refreshes the list in place).
+    #[test]
+    fn manager_run_now_and_delete_keep_dialog_open() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::ScheduledTasks;
+        ui.scheduled_tasks = vec![make_scheduled_task("a", true)];
+        ui.scheduled_selected = 0;
+
+        // run-now → emits ScheduleRunNow and leaves the dialog open.
+        let r = handle_scheduled_tasks_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert!(matches!(r, Action::ScheduleRunNow(ref n) if n == "a"));
+        assert_eq!(ui.mode, UiMode::ScheduledTasks);
+
+        // d → confirmation (dialog stays open), then y → ScheduleDelete, still open.
+        let r = handle_scheduled_tasks_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert!(matches!(r, Action::Continue));
+        assert!(ui.scheduled_delete_confirm);
+        assert_eq!(ui.mode, UiMode::ScheduledTasks);
+
+        let r = handle_scheduled_tasks_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut ui,
+        );
+        assert!(matches!(r, Action::ScheduleDelete(ref n) if n == "a"));
+        assert_eq!(ui.mode, UiMode::ScheduledTasks);
+        assert!(!ui.scheduled_delete_confirm);
+    }
+
+    // PRD #127 M3.2: the new-deck dialog's Mode cycler always ends with a
+    // built-in "schedule" authoring option (after the project modes and
+    // orchestrations). Selecting it yields a synthetic ModeConfig carrying the
+    // authoring seed prompt, so the gated seed-delivery path (Phase 3A) spawns
+    // a pre-seeded agent.
+    #[test]
+    fn unified_form_builtin_schedule_option_is_last_and_seeded() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("build")],
+            vec![make_orchestration("review")],
+        );
+        // 0=No mode, 1=build, 2=review, 3=schedule.
+        assert_eq!(f.schedule_index(), 3);
+        assert_eq!(f.mode_option_count(), 4);
+
+        // Cycling Right to the cap lands on the schedule option.
+        for _ in 0..10 {
+            f.select_next_mode();
+        }
+        assert!(f.is_schedule_selected());
+
+        // It is a real (synthetic) mode carrying the authoring seed prompt, and
+        // it is NOT misread as an orchestration.
+        let seeded = f.selected_mode().expect("schedule yields a mode");
+        assert_eq!(seeded.name, "schedule");
+        let seed = seeded
+            .seed_prompt
+            .as_deref()
+            .expect("carries a seed prompt");
+        assert!(seed.contains("schedule add"), "seed must invoke the CLI");
+        assert!(
+            seed.to_lowercase().contains("confirm"),
+            "seed must require confirm-before-write"
+        );
+        assert!(f.selected_orchestration().is_none());
     }
 
     #[test]
@@ -13767,8 +14615,11 @@ mod tests {
         assert_eq!(f.focused, FormField::Mode);
     }
 
+    // PRD #127 M3.2: the built-in "schedule" authoring option makes the Mode
+    // field always present, so the form opens focused on Mode even with no
+    // project modes.
     #[test]
-    fn unified_form_initial_focus_without_modes() {
+    fn unified_form_initial_focus_without_project_modes() {
         let f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
             String::new(),
@@ -13776,7 +14627,7 @@ mod tests {
             vec![],
             vec![],
         );
-        assert_eq!(f.focused, FormField::Name);
+        assert_eq!(f.focused, FormField::Mode);
     }
 
     #[test]

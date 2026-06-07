@@ -400,6 +400,250 @@ impl SavedSession {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scheduled tasks — global, daemon-owned config (PRD #127, M1.2)
+// ---------------------------------------------------------------------------
+
+/// One `[[scheduled_tasks]]` entry from the global
+/// `~/.config/dot-agent-deck/schedules.toml`. The daemon's job list. See PRD
+/// #127 "Configuration: global, daemon-owned".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledTask {
+    /// Reuse-registry key; unique per daemon. Renaming is forbidden via the
+    /// edit path (it orphans the reused tab) — treat as remove + add.
+    pub name: String,
+    /// Cron expression (5-field POSIX or 6/7-field). Validated by the
+    /// scheduler / CLI before write. Evaluated in local time.
+    pub cron: String,
+    /// Spawn target directory. `~` and `$VAR` are expanded at load time
+    /// (see [`expand_path`]); relative paths resolve against `$HOME`.
+    pub working_dir: String,
+    /// Single-agent command (mirrors the new-deck dialog); ignored when the
+    /// target dir defines `[[orchestrations]]`. Falls back to `$SHELL` when
+    /// omitted (resolved later, at spawn time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The prompt delivered to the spawned agent / orchestrator role.
+    pub prompt: String,
+    /// Open a fresh tab on every fire instead of reusing one. Default false
+    /// (reuse — the dominant access pattern; see PRD "Tab lifecycle").
+    #[serde(default)]
+    pub new_tab_per_fire: bool,
+    /// Whether the daemon registers and fires this task. Default true.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// Internal mirror of the file shape so a well-formed file deserializes in one
+/// shot; the robust loader below falls back to per-entry parsing when the
+/// strict parse fails, so one bad entry can't block the rest.
+#[derive(Debug, Default, Deserialize)]
+struct SchedulesFile {
+    #[serde(default)]
+    scheduled_tasks: Vec<ScheduledTask>,
+}
+
+/// A per-entry (or file-level) load failure. `entry` is the array index when
+/// the failure is attributable to a single `[[scheduled_tasks]]` block, `None`
+/// for a file-level error. The caller surfaces these via the scheduler's
+/// notification seam (PRD #126) — a malformed entry never crashes the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleLoadError {
+    pub entry: Option<usize>,
+    pub message: String,
+}
+
+/// Result of loading the global schedules config: the entries that parsed
+/// (with paths expanded), plus any per-entry / file-level errors.
+#[derive(Debug, Default, Clone)]
+pub struct LoadedSchedules {
+    pub tasks: Vec<ScheduledTask>,
+    pub errors: Vec<ScheduleLoadError>,
+}
+
+/// Global schedules path: `$XDG_CONFIG_HOME/dot-agent-deck/schedules.toml`,
+/// falling back to `~/.config/...`. `DOT_AGENT_DECK_SCHEDULES` overrides it so
+/// tests never touch the real home dir.
+pub fn schedules_path() -> PathBuf {
+    if let Ok(p) = std::env::var("DOT_AGENT_DECK_SCHEDULES") {
+        return PathBuf::from(p);
+    }
+    match std::env::var("XDG_CONFIG_HOME") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("dot-agent-deck/schedules.toml"),
+        _ => dirs_home().join(".config/dot-agent-deck/schedules.toml"),
+    }
+}
+
+impl LoadedSchedules {
+    /// Load from the global [`schedules_path`].
+    pub fn load() -> Self {
+        Self::load_from(&schedules_path())
+    }
+
+    /// Load from an explicit path (tests, and any future supervised-mode
+    /// override). A missing file is not an error — it yields an empty set.
+    pub fn load_from(path: &std::path::Path) -> Self {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Self::default();
+            }
+            Err(err) => {
+                return Self {
+                    tasks: Vec::new(),
+                    errors: vec![ScheduleLoadError {
+                        entry: None,
+                        message: format!("failed to read {}: {err}", path.display()),
+                    }],
+                };
+            }
+        };
+        Self::parse(&contents)
+    }
+
+    /// Parse schedules from a TOML string with robust per-entry handling: a
+    /// single malformed `[[scheduled_tasks]]` entry is reported as an error and
+    /// skipped without blocking the valid entries.
+    pub fn parse(contents: &str) -> Self {
+        // Fast path: the whole file is well-formed.
+        if let Ok(file) = toml::from_str::<SchedulesFile>(contents) {
+            let tasks = file.scheduled_tasks.into_iter().map(expand_task).collect();
+            return Self {
+                tasks,
+                errors: Vec::new(),
+            };
+        }
+
+        // Slow path: parse to a generic table, then deserialize each
+        // `[[scheduled_tasks]]` entry individually so one bad entry doesn't
+        // take the others down with it.
+        let table: toml::Table = match contents.parse() {
+            Ok(t) => t,
+            Err(err) => {
+                return Self {
+                    tasks: Vec::new(),
+                    errors: vec![ScheduleLoadError {
+                        entry: None,
+                        message: format!("malformed TOML: {err}"),
+                    }],
+                };
+            }
+        };
+
+        let mut out = Self::default();
+        let Some(value) = table.get("scheduled_tasks") else {
+            return out;
+        };
+        let Some(entries) = value.as_array() else {
+            out.errors.push(ScheduleLoadError {
+                entry: None,
+                message: "`scheduled_tasks` must be an array of tables".to_string(),
+            });
+            return out;
+        };
+
+        for (i, entry) in entries.iter().enumerate() {
+            match entry.clone().try_into::<ScheduledTask>() {
+                Ok(task) => out.tasks.push(expand_task(task)),
+                Err(err) => out.errors.push(ScheduleLoadError {
+                    entry: Some(i),
+                    message: err.to_string(),
+                }),
+            }
+        }
+        out
+    }
+}
+
+/// Apply load-time path expansion to a task's `working_dir`.
+fn expand_task(mut task: ScheduledTask) -> ScheduledTask {
+    task.working_dir = expand_path(&task.working_dir);
+    task
+}
+
+/// Expand `~` and `$VAR` / `${VAR}` in a path, then resolve a relative result
+/// against `$HOME` (NOT any agent cwd — the authoring agent's cwd is
+/// irrelevant for a global daemon). PRD #127 Open Q7.
+pub fn expand_path(input: &str) -> String {
+    let home = dirs_home();
+
+    // `~` / `~/...` → home.
+    let after_tilde = if input == "~" {
+        return home.to_string_lossy().into_owned();
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        format!("{}/{}", home.to_string_lossy(), rest)
+    } else {
+        input.to_string()
+    };
+
+    let expanded = expand_env_vars(&after_tilde);
+
+    // Resolve a still-relative path against $HOME.
+    if expanded.starts_with('/') {
+        expanded
+    } else {
+        home.join(&expanded).to_string_lossy().into_owned()
+    }
+}
+
+/// Substitute `$VAR` and `${VAR}` with their environment values. An undefined
+/// variable expands to the empty string (matching common shell-ish behavior
+/// without failing the whole load). A `$` that does not begin a valid variable
+/// reference is left untouched.
+fn expand_env_vars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // ${VAR}
+            Some('{') => {
+                chars.next(); // consume '{'
+                let mut name = String::new();
+                let mut closed = false;
+                for nc in chars.by_ref() {
+                    if nc == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(nc);
+                }
+                if closed && !name.is_empty() {
+                    out.push_str(&std::env::var(&name).unwrap_or_default());
+                } else {
+                    // Not a well-formed reference — emit verbatim.
+                    out.push('$');
+                    out.push('{');
+                    out.push_str(&name);
+                }
+            }
+            // $VAR — name is [A-Za-z_][A-Za-z0-9_]*
+            Some(&first) if first == '_' || first.is_ascii_alphabetic() => {
+                let mut name = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if nc == '_' || nc.is_ascii_alphanumeric() {
+                        name.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                out.push_str(&std::env::var(&name).unwrap_or_default());
+            }
+            // Lone `$` — leave it.
+            _ => out.push('$'),
+        }
+    }
+    out
+}
+
 const STAR_PROMPT_INTERVAL: u64 = 10;
 
 fn star_prompt_path() -> PathBuf {
@@ -1144,6 +1388,144 @@ timeout_secs = 600
         assert_eq!(loaded.suppressed_dirs.len(), 2);
         assert!(loaded.is_suppressed("/a"));
         assert!(loaded.is_suppressed("/b"));
+    }
+
+    // scheduler/config/001 — one valid + one malformed `[[scheduled_tasks]]`:
+    // the valid entry loads, the malformed one is reported as an error, and
+    // there is no panic.
+    #[test]
+    fn schedules_load_one_valid_one_malformed() {
+        let toml_str = r#"
+[[scheduled_tasks]]
+name = "good"
+cron = "0 9 * * *"
+working_dir = "/tmp/good"
+prompt = "do the thing"
+
+[[scheduled_tasks]]
+name = "bad"
+# `cron` is required but missing, and prompt is missing too → entry fails
+working_dir = "/tmp/bad"
+"#;
+        let loaded = LoadedSchedules::parse(toml_str);
+        assert_eq!(loaded.tasks.len(), 1, "valid entry still loads");
+        assert_eq!(loaded.tasks[0].name, "good");
+        assert_eq!(loaded.errors.len(), 1, "malformed entry reported");
+        assert_eq!(loaded.errors[0].entry, Some(1));
+    }
+
+    #[test]
+    fn schedules_missing_file_is_empty_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.toml");
+        let loaded = LoadedSchedules::load_from(&path);
+        assert!(loaded.tasks.is_empty());
+        assert!(loaded.errors.is_empty());
+    }
+
+    // scheduler/config/002 — a minimal entry applies the documented defaults
+    // (`new_tab_per_fire=false`, `enabled=true`, `command=None`) and `~`/`$VAR`
+    // in `working_dir` are expanded at load time.
+    #[test]
+    fn schedules_defaults_and_path_expansion() {
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var("HOME").ok();
+        let prev_var = std::env::var("DAD_TEST_DIR").ok();
+        // SAFETY: env-var lock held; restored on the way out.
+        unsafe {
+            std::env::set_var("HOME", "/home/tester");
+            std::env::set_var("DAD_TEST_DIR", "projects/digest");
+        }
+
+        let toml_str = r#"
+[[scheduled_tasks]]
+name = "minimal"
+cron = "0 9 * * *"
+working_dir = "~/scheduled/morning"
+prompt = "hi"
+
+[[scheduled_tasks]]
+name = "with-var"
+cron = "0 9 * * *"
+working_dir = "$DAD_TEST_DIR"
+prompt = "hi"
+"#;
+        let loaded = LoadedSchedules::parse(toml_str);
+        assert!(loaded.errors.is_empty());
+        assert_eq!(loaded.tasks.len(), 2);
+
+        let minimal = &loaded.tasks[0];
+        assert!(!minimal.new_tab_per_fire, "new_tab_per_fire defaults false");
+        assert!(minimal.enabled, "enabled defaults true");
+        assert!(minimal.command.is_none(), "command defaults None");
+        assert_eq!(minimal.working_dir, "/home/tester/scheduled/morning");
+
+        // Relative result (from $VAR) resolves against $HOME.
+        let with_var = &loaded.tasks[1];
+        assert_eq!(with_var.working_dir, "/home/tester/projects/digest");
+
+        // SAFETY: same lock held; restore previous values.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_var {
+                Some(v) => std::env::set_var("DAD_TEST_DIR", v),
+                None => std::env::remove_var("DAD_TEST_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn schedules_round_trip_explicit_fields() {
+        let toml_str = r#"
+[[scheduled_tasks]]
+name = "full"
+cron = "0 9 * * MON-FRI"
+working_dir = "/abs/path"
+command = "claude"
+prompt = "multi\nline"
+new_tab_per_fire = true
+enabled = false
+"#;
+        let loaded = LoadedSchedules::parse(toml_str);
+        assert!(loaded.errors.is_empty());
+        let t = &loaded.tasks[0];
+        assert_eq!(t.command.as_deref(), Some("claude"));
+        assert!(t.new_tab_per_fire);
+        assert!(!t.enabled);
+        assert_eq!(t.working_dir, "/abs/path");
+    }
+
+    #[test]
+    fn expand_path_handles_braced_and_lone_dollar() {
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var("HOME").ok();
+        let prev_var = std::env::var("DAD_BRACE").ok();
+        // SAFETY: env-var lock held; restored below.
+        unsafe {
+            std::env::set_var("HOME", "/home/tester");
+            std::env::set_var("DAD_BRACE", "braced");
+        }
+
+        assert_eq!(expand_path("/a/${DAD_BRACE}/b"), "/a/braced/b");
+        assert_eq!(expand_path("~"), "/home/tester");
+        // A lone `$` and an undefined var don't panic.
+        assert_eq!(expand_path("/lit/$"), "/lit/$");
+        assert_eq!(expand_path("/x/$DAD_UNDEFINED/y"), "/x//y");
+
+        // SAFETY: same lock held; restore previous values.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_var {
+                Some(v) => std::env::set_var("DAD_BRACE", v),
+                None => std::env::remove_var("DAD_BRACE"),
+            }
+        }
     }
 
     #[test]

@@ -358,6 +358,19 @@ pub enum AttachRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_build_version: Option<String>,
     },
+    /// PRD #127 M1.3: re-read the global `schedules.toml` and diff/replace the
+    /// daemon's registered scheduled-task set without a restart. The handler
+    /// replies `ok = true` with the names of the now-registered ENABLED tasks
+    /// in [`AttachResponse::agents`]. The CLI's mutating subcommands send this
+    /// after an atomic write so a running daemon picks the change up live.
+    ReloadSchedules,
+    /// PRD #127 M1.5: fire a registered scheduled task's callback immediately
+    /// (the `schedule run-now` CLI door). Replies `ok = true` if the run
+    /// started or was skipped (prior run still active), `ok = false` if no
+    /// such task is registered.
+    RunNow {
+        name: String,
+    },
 }
 
 fn default_rows() -> u16 {
@@ -518,7 +531,22 @@ pub async fn serve_attach(
     use tokio::sync::RwLock;
     let dummy_count = Arc::new(AtomicUsize::new(0));
     let dummy_state: SharedState = Arc::new(RwLock::new(crate::state::AppState::default()));
-    serve_attach_with_counter(listener, registry, event_tx, dummy_count, dummy_state, None).await
+    // No-counter callers (tests, the local daemon_client fallback) don't drive
+    // the scheduler; hand them an empty stand-in so `ReloadSchedules`/`RunNow`
+    // resolve against an empty registry rather than needing a real one.
+    let dummy_scheduler = Arc::new(crate::scheduler::Scheduler::with_stderr_notifier());
+    let dummy_reuse = crate::spawn::new_reuse_registry();
+    serve_attach_with_counter(
+        listener,
+        registry,
+        event_tx,
+        dummy_count,
+        dummy_state,
+        None,
+        dummy_scheduler,
+        dummy_reuse,
+    )
+    .await
 }
 
 /// PRD #93 M1.2 variant of [`serve_attach`] that maintains `client_count`
@@ -529,6 +557,7 @@ pub async fn serve_attach(
 /// The counter is incremented immediately after `accept` returns and
 /// decremented in the per-connection task's exit branch (panic or not — the
 /// `tokio::spawn` future is wrapped so the decrement always runs).
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_attach_with_counter(
     listener: UnixListener,
     registry: Arc<AgentPtyRegistry>,
@@ -536,6 +565,8 @@ pub async fn serve_attach_with_counter(
     client_count: Arc<std::sync::atomic::AtomicUsize>,
     state: SharedState,
     shutdown: Option<Arc<tokio::sync::Notify>>,
+    scheduler: Arc<crate::scheduler::Scheduler>,
+    reuse_registry: crate::spawn::ReuseRegistry,
 ) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
@@ -556,6 +587,8 @@ pub async fn serve_attach_with_counter(
                 let state = state.clone();
                 let notify = change_notify.clone();
                 let shutdown = shutdown.clone();
+                let scheduler = scheduler.clone();
+                let reuse_registry = reuse_registry.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
                     // so a `handle_connection` task that panics or is dropped
@@ -585,8 +618,16 @@ pub async fn serve_attach_with_counter(
                         counter: counter.clone(),
                         notify: notify.clone(),
                     };
-                    if let Err(e) =
-                        handle_connection(stream, registry, event_tx, state, shutdown).await
+                    if let Err(e) = handle_connection(
+                        stream,
+                        registry,
+                        event_tx,
+                        state,
+                        shutdown,
+                        scheduler,
+                        reuse_registry,
+                    )
+                    .await
                     {
                         warn!("attach protocol connection error: {e}");
                     }
@@ -625,7 +666,19 @@ pub async fn run_attach_server_with_counter(
 ) -> io::Result<()> {
     let listener = bind_attach_listener(path)?;
     info!("Attach protocol listening on {}", path.display());
-    serve_attach_with_counter(listener, registry, event_tx, client_count, state, None).await
+    let dummy_scheduler = Arc::new(crate::scheduler::Scheduler::with_stderr_notifier());
+    let dummy_reuse = crate::spawn::new_reuse_registry();
+    serve_attach_with_counter(
+        listener,
+        registry,
+        event_tx,
+        client_count,
+        state,
+        None,
+        dummy_scheduler,
+        dummy_reuse,
+    )
+    .await
 }
 
 async fn handle_connection(
@@ -634,6 +687,8 @@ async fn handle_connection(
     event_tx: broadcast::Sender<BroadcastMsg>,
     state: SharedState,
     shutdown: Option<Arc<tokio::sync::Notify>>,
+    scheduler: Arc<crate::scheduler::Scheduler>,
+    reuse_registry: crate::spawn::ReuseRegistry,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -990,6 +1045,42 @@ async fn handle_connection(
             }
             write_resp(&mut stream, &AttachResponse::hello(PROTOCOL_VERSION)).await?;
         }
+        AttachRequest::ReloadSchedules => {
+            // PRD #127 M1.3: re-read the global config and diff/replace the
+            // registered task set. A bad entry is surfaced via the notifier
+            // and skipped; it never fails the reload. Then wake the idle
+            // monitor (via the registry's change_notify) so a reload that
+            // dropped the last enabled schedule lets the idle gate fire, and
+            // one that added a schedule re-arms the carve-out.
+            let loaded = crate::config::LoadedSchedules::load();
+            scheduler.report_config_errors(&loaded.errors);
+            scheduler.reload_apply(
+                &loaded.tasks,
+                crate::daemon::schedule_callback_factory(registry.clone(), reuse_registry.clone()),
+            );
+            registry.change_notify().notify_one();
+            let names = scheduler.registered_names();
+            let mut resp = AttachResponse::ok();
+            resp.agents = Some(names);
+            write_resp(&mut stream, &resp).await?;
+        }
+        AttachRequest::RunNow { name } => {
+            // PRD #127 M1.5: fire the task now (the `schedule run-now` door).
+            // Both started and skipped-still-running mean the task IS
+            // registered → ok=true (so `wait_for_schedule_registered` and the
+            // CLI treat it as success). PRD #127 C5: surface the started-vs-
+            // skipped outcome in `agents` so the caller can report it
+            // distinctly; an unknown task → ok=false.
+            match scheduler.run_now(&name) {
+                Ok(started) => {
+                    let token = if started { "started" } else { "skipped" };
+                    let mut resp = AttachResponse::ok();
+                    resp.agents = Some(vec![token.to_string()]);
+                    write_resp(&mut stream, &resp).await?
+                }
+                Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+            }
+        }
     }
     Ok(())
 }
@@ -1213,6 +1304,13 @@ async fn handle_attach_stream(
                     break;
                 }
                 let _ = w.flush();
+                drop(w);
+                // PRD #127 M2.2: a STREAM_IN frame is a *user* keystroke —
+                // stamp the pane's deliver-on-idle debounce clock so a
+                // concurrent scheduled reuse fire queues its prompt instead of
+                // interrupting active typing. Keyed by `pane_id_env` (the same
+                // key the reuse path delivers to).
+                registry.note_user_input(&pane_id);
             }
             Ok(Some((KIND_DETACH, _))) => {
                 // Explicit M2.5 detach: client signalled intent to leave the

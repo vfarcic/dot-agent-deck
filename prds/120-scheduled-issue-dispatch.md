@@ -107,11 +107,22 @@ The dispatch flow runs **in-process inside the deck**, not as a remote `/schedul
 
 ## Milestones
 
-### Phase 1: Scheduler primitive and config
+### Phase 1: Consume #127's scheduler primitives (do NOT rebuild)
 
-- [ ] **M1.1** — Decide config schema. Specify the `[[scheduled_tasks]]` (or equivalent) TOML shape, including task type, cron, and task-specific fields. Document in the PRD and add a sample to a fixture under `tests/`.
-- [ ] **M1.2** — Implement the scheduler engine. Loads scheduled tasks from `.dot-agent-deck.toml` on startup, evaluates cron expressions, dispatches a (placeholder) handler when a task fires. Includes the "run now" manual trigger and the skip-if-already-running concurrency rule.
-- [ ] **M1.3** — Surface scheduler state in the deck UI: at minimum, log entries / notifications when a task fires and when it completes or fails. A dedicated "scheduler log" view is nice-to-have, not required.
+> **Revised 2026-06-07 — #127 has landed.** The general scheduler is done and
+> this PRD now **composes** it rather than building its own. Do not add a second
+> cron engine, config schema, or spawn path. What #127 already provides and #120
+> consumes:
+> - **Cron primitive** (`src/scheduler.rs`): `Scheduler::register(name, cron, callback)`, `run_now`, `tick_at`, the daemon-side firing loop, skip-if-prior-run-still-active, and `reload_apply`. #120's issue-dispatch is simply *"a registered callback whose body calls `spawn` N times"* — register a callback on this scheduler; do not reimplement cron evaluation.
+> - **Spawn primitive** (`src/spawn.rs`): `spawn(SpawnRequest{ task_name, working_dir, command, prompt }) -> SpawnHandle`. It already does `mkdir -p` + fail-loud via the notifier, branches on the target dir's `.dot-agent-deck.toml` (orchestration tab vs single-agent card), delivers the prompt, and reuse-by-default lifecycle. #120 calls this per issue (different `working_dir`/`prompt` per worktree) instead of duplicating the spawn/branch logic.
+> - **Tab-closed cleanup seam**: `SpawnHandle.on_tab_closed` (`TabClosedCallback`) is the hook #120 registers for **per-issue worktree cleanup** (M2.4) — its close-detection wiring is the addition #120 makes; the seam exists so #120 needs *additions*, not breaking changes.
+> - **Config + CLI**: the global `~/.config/dot-agent-deck/schedules.toml` schema, the `dot-agent-deck schedule …` validated writer, and the "schedule" authoring mode / "Scheduled Tasks" manager UX all exist. #120 does **not** add a competing config or UI for the cron part; it layers its GitHub-specific fields (repo list, label filter, `max_per_run`, query) on top, ideally as a distinct task type that reuses the same machinery.
+>
+> The remaining #120 scope is purely the **GitHub layer** (Phases 2–4 below): repo provisioning, per-issue worktrees, `gh` enumeration, idempotency/dedup, and the worktree-cleanup hook. The original M1.1–M1.3 below are **subsumed by #127** and kept only for historical reference.
+
+- [x] ~~**M1.1** — Decide config schema.~~ *Subsumed by #127 (`config::ScheduledTask` + the global `schedules.toml`).*
+- [x] ~~**M1.2** — Implement the scheduler engine.~~ *Subsumed by #127 (`src/scheduler.rs`: cron loop, `run_now`, skip-if-running, `reload_apply`).*
+- [ ] **M1.3** — Surface scheduler state / failure notifications for issue-dispatch runs. Reuse #127's notification seam (PRD #126) rather than adding a parallel one; only the issue-dispatch-specific events (per-repo/per-issue success/skip/failure) are new here.
 
 ### Phase 2: Issue-dispatch task type
 

@@ -1,0 +1,8 @@
+# Fixture for PRD #127 M3.2 — the "schedule" creation option in the new-deck
+# dialog. Defines one regular workload mode so the dialog's Mode field appears
+# and there is a workload mode for the built-in "schedule" option to be
+# visually separated FROM. The "schedule" option is a built-in authoring mode,
+# NOT declared here.
+
+[[modes]]
+name = "build"
