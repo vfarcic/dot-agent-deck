@@ -1968,6 +1968,13 @@ without depending on the config struct API.
 - **Does not assert:** the full set of actions shown in the bar or their order beyond what the committed snapshot pins; truncation behaviour at narrow widths.
 - **Platform coverage:** mac+linux+windows.
 
+##### keybindings/hints/002 — An unbound action is rendered as `(unbound)` in the hints bar, never as a bare `: <label>`.
+- **Layer:** L1 (ratatui `TestBackend`; asserts on buffer text, no `insta` snapshot).
+- **Agent:** none.
+- **Asserts:** rendered against a default `KeybindingConfig` with `new_pane` unbound (empty notation), the hints-bar text substitutes `(unbound)` for the empty key (matching the help overlay) and renders `(unbound): new`; it never emits a bare `: new` with an empty key column (no leading `: <label>` and no mid-string `  : <label>`). Greptile P2 regression guard.
+- **Does not assert:** the exact placeholder wording beyond `(unbound)`, behaviour of other simultaneously-unbound actions, snapshot of the full bar.
+- **Platform coverage:** mac+linux+windows.
+
 ### Error paths
 
 #### error/socket

@@ -110,3 +110,46 @@ fn hints_001_bar_reflects_active_bindings() {
     );
     insta::assert_snapshot!(text);
 }
+
+/// Scenario: Build a default `KeybindingConfig` and unbind `new_pane`
+/// (`set(NewPane, parse_binding("").unwrap())`), then render the hints
+/// bar against it. An unbound action has an empty notation, so the hints
+/// bar must substitute `(unbound)` for its key (matching the help
+/// overlay's behaviour) and render `(unbound): new` — never a bare
+/// `: new` with an empty key column. Asserts on the buffer text directly
+/// (no `insta` snapshot) so this guard needs no `.snap` accept step.
+/// Greptile P2 regression guard.
+#[spec("keybindings/hints/002")]
+#[test]
+fn hints_002_unbound_action_not_bare() {
+    // PRD #40 catalog: keybindings/hints/002 — an unbound action renders
+    // as `(unbound)` in the hints bar, never as a bare `: <label>`.
+    let mut config = KeybindingConfig::default();
+    config.set(
+        Action::NewPane,
+        parse_binding("").expect("empty == unbound"),
+    );
+    let palette: ColorPalette = resolve_palette(Theme::Dark);
+
+    let buffer = render_hints_bar_to_buffer(&config, palette, 120, 1);
+    let text = buffer_to_text(&buffer);
+    let line = text.lines().next().unwrap_or("");
+
+    assert!(
+        text.contains("(unbound)"),
+        "unbound new_pane must render as '(unbound): new', not a bare key. \
+         Hints bar text was:\n{line:?}"
+    );
+    // The bare artifact for the first (new_pane) slot is a line that
+    // begins with ': new'; a mid-string empty slot would show '  : '.
+    assert!(
+        !line.trim_start().starts_with(": "),
+        "hints bar starts with a bare ': <label>' (empty key column) — \
+         unbound new_pane was not substituted with '(unbound)'. Line:\n{line:?}"
+    );
+    assert!(
+        !text.contains("  : "),
+        "hints bar contains a bare '  : <label>' (empty key column) for some \
+         unbound action. Text:\n{line:?}"
+    );
+}

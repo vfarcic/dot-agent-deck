@@ -4525,7 +4525,8 @@ pub fn run_tui(
                                     );
                                     ui.status_message = Some((
                                         format!(
-                                            "Failed to close pane {closed_pane_id}: {e} — press Ctrl+W to retry"
+                                            "Failed to close pane {closed_pane_id}: {e} — press {} to retry",
+                                            kb.notation(Action::ClosePane)
                                         ),
                                         std::time::Instant::now(),
                                     ));
@@ -6244,7 +6245,9 @@ fn render_bottom_bar(
                 };
                 let hints = if is_mode_tab {
                     format!(
-                        "j/k: navigate panes  Enter: interact  Esc: agent pane  {MOD_KEY}+w: close tab  ?: help  {MOD_KEY}+c: quit{tab_hint}"
+                        "j/k: navigate panes  Enter: interact  Esc: agent pane  {}: close tab  {}: help  {MOD_KEY}+c: quit{tab_hint}",
+                        display_notation(&ui.keybindings, Action::ClosePane),
+                        display_notation(&ui.keybindings, Action::Help),
                     )
                 } else if has_pane_control {
                     format!("{}{tab_hint}", dashboard_hints_string(&ui.keybindings))
@@ -6543,22 +6546,68 @@ fn help_key_line(keys: &str, desc: &str) -> Line<'static> {
     Line::from(format!("  {keys:<18} {desc}"))
 }
 
+/// PRD #40: an action's active key notation for *display* in the help overlay
+/// and hints bar, with `(unbound)` substituted for the empty string so an
+/// unbound action never renders as a bare key column (`: new`). Shared by both
+/// renderers so they can't drift (Greptile P2).
+fn display_notation(keybindings: &KeybindingConfig, action: Action) -> String {
+    let s = keybindings.notation(action);
+    if s.is_empty() {
+        "(unbound)".to_string()
+    } else {
+        s
+    }
+}
+
+/// PRD #40: the displayed jump-key hint for `Jump1..Jump9`. When every jump is
+/// at its bare-digit default (`1`..`9`) this returns the compact `"1-9"` so the
+/// default help/hints stay byte-for-byte unchanged; once any jump is remapped
+/// it lists the actual notations (slash-joined) so the remap is visible.
+fn jump_range_notation(keybindings: &KeybindingConfig) -> String {
+    const JUMPS: [Action; 9] = [
+        Action::Jump1,
+        Action::Jump2,
+        Action::Jump3,
+        Action::Jump4,
+        Action::Jump5,
+        Action::Jump6,
+        Action::Jump7,
+        Action::Jump8,
+        Action::Jump9,
+    ];
+    let all_default = JUMPS
+        .iter()
+        .enumerate()
+        .all(|(i, &a)| keybindings.notation(a) == (i + 1).to_string());
+    if all_default {
+        "1-9".to_string()
+    } else {
+        JUMPS
+            .iter()
+            .map(|&a| display_notation(keybindings, a))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+}
+
 /// PRD #40: build the dashboard hints-bar text from the active keybinding
 /// config. With the default config this reproduces the previous hardcoded
 /// string byte-for-byte (`Ctrl+n: new  …  Ctrl+c: quit`); a remapped action
-/// shows the user's key (e.g. `Alt+Shift+l: layout`). Single source of truth
-/// for both the live hints bar (`render_bottom_bar`) and the standalone
+/// shows the user's key (e.g. `Alt+Shift+l: layout`), and an unbound action
+/// shows `(unbound)` rather than a bare `: new`. Single source of truth for
+/// both the live hints bar (`render_bottom_bar`) and the standalone
 /// [`render_hints_bar_to_buffer`] snapshot entrypoint.
 fn dashboard_hints_string(keybindings: &KeybindingConfig) -> String {
     format!(
-        "{}: new  {}: close  {}: layout  {}: dashboard (1-9 {} {})  {}: quit",
-        keybindings.notation(Action::NewPane),
-        keybindings.notation(Action::ClosePane),
-        keybindings.notation(Action::ToggleLayout),
-        keybindings.notation(Action::Dashboard),
-        keybindings.notation(Action::Help),
-        keybindings.notation(Action::Filter),
-        keybindings.notation(Action::Quit),
+        "{}: new  {}: close  {}: layout  {}: dashboard ({} {} {})  {}: quit",
+        display_notation(keybindings, Action::NewPane),
+        display_notation(keybindings, Action::ClosePane),
+        display_notation(keybindings, Action::ToggleLayout),
+        display_notation(keybindings, Action::Dashboard),
+        jump_range_notation(keybindings),
+        display_notation(keybindings, Action::Help),
+        display_notation(keybindings, Action::Filter),
+        display_notation(keybindings, Action::Quit),
     )
 }
 
@@ -6633,15 +6682,9 @@ fn render_help_overlay(
 
     // PRD #40: notation for a remappable action, or "(unbound)" when the user
     // has cleared the binding (`action = ""`), so the overlay is honest about
-    // a key that no longer fires.
-    let n = |action: Action| -> String {
-        let s = keybindings.notation(action);
-        if s.is_empty() {
-            "(unbound)".to_string()
-        } else {
-            s
-        }
-    };
+    // a key that no longer fires. Shared with the hints bar via
+    // `display_notation` so the two renderers can't drift.
+    let n = |action: Action| -> String { display_notation(keybindings, action) };
 
     let left: Vec<Line> = vec![
         Line::styled("  Global (works from any pane)", cyan),
@@ -6675,7 +6718,7 @@ fn render_help_overlay(
             &format!("{} / Up", n(Action::MoveUp)),
             "Select previous card",
         ),
-        help_key_line("1-9", "Jump to pane N"),
+        help_key_line(&jump_range_notation(keybindings), "Jump to pane N"),
         help_key_line(&n(Action::FocusPane), "Focus selected pane"),
         help_key_line(&n(Action::Filter), "Filter sessions"),
         help_key_line(&n(Action::ClearFilter), "Clear filter"),
