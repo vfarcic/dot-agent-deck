@@ -6755,10 +6755,12 @@ fn render_tab_strip(
     // click-to-switch (same width-fitting the `Tabs` widget previously used).
     let fitted_labels = fit_tab_labels(labels, area.width);
 
-    // Inactive tabs dim the terminal foreground; the active tab inverts the
-    // terminal's own fg/bg in place (Modifier::REVERSED) for a self-contained,
-    // single-frame highlight that needs no absolute color.
-    let base_style = text_dim();
+    // Inactive tab labels render at full contrast (readable text); the active
+    // tab inverts the terminal's own fg/bg in place (Modifier::REVERSED) for a
+    // self-contained, single-frame highlight that needs no absolute color. The
+    // `│` divider between tabs is decoration, so it stays dim.
+    let base_style = text_primary();
+    let divider_style = text_dim();
     let active_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
 
     let mut headers = Vec::with_capacity(fitted_labels.len());
@@ -6779,7 +6781,7 @@ fn render_tab_strip(
 
         // Divider between tabs (not before the first).
         if i > 0 {
-            let (after, _) = buf.set_span(x, area.y, &Span::styled("│", base_style), end - x);
+            let (after, _) = buf.set_span(x, area.y, &Span::styled("│", divider_style), end - x);
             x = after;
             if x >= end {
                 break;
@@ -6975,7 +6977,7 @@ fn render_frame(
         let msg = Paragraph::new(format!(
             "No active sessions. Press {MOD_KEY}+n to create a pane."
         ))
-        .style(text_dim())
+        .style(text_primary())
         .centered();
         frame.render_widget(msg, vertical[1]);
         render_bottom_bar(
@@ -7040,7 +7042,7 @@ fn render_frame(
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(title_text, text_dim()),
+        Span::styled(title_text, text_primary()),
     ]));
 
     if sessions.is_empty() {
@@ -7054,7 +7056,7 @@ fn render_frame(
         frame.render_widget(title, vertical[0]);
 
         let msg = Paragraph::new("No sessions match filter.")
-            .style(text_dim())
+            .style(text_primary())
             .centered();
         let inner = Layout::vertical([
             Constraint::Fill(1),
@@ -7530,7 +7532,7 @@ fn render_stats_bar(
         ),
         (stats.waiting, "waiting", Style::default().fg(Color::Yellow)),
         (stats.errors, "error", Style::default().fg(Color::Red)),
-        (stats.idle, "idle", text_dim()),
+        (stats.idle, "idle", text_primary()),
     ];
 
     for &(count, label, style) in segments {
@@ -7544,7 +7546,7 @@ fn render_stats_bar(
     spans.push(Span::styled("  \u{2502}  ", text_dim()));
     spans.push(Span::styled(
         format!("{} tools", stats.total_tools),
-        text_dim(),
+        text_primary(),
     ));
 
     if let Some(name) = active_mode_name {
@@ -7885,7 +7887,7 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect)
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
-            text_dim()
+            text_primary()
         };
         text.push(Line::styled(
             format!("  {cursor} {label:<7} \u{2014} {desc}"),
@@ -7896,7 +7898,7 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect)
     text.push(Line::from(""));
     text.push(Line::styled(
         "  Up/Down: navigate  Enter: confirm  Esc: cancel",
-        text_dim(),
+        text_primary(),
     ));
 
     let block = Block::default()
@@ -7969,7 +7971,7 @@ fn render_stop_confirm(frame: &mut Frame, selected: usize, agent_count: usize) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
-            text_dim()
+            text_primary()
         };
         text.push(Line::styled(
             format!("  {cursor} {label:<5} \u{2014} {desc}"),
@@ -7980,7 +7982,7 @@ fn render_stop_confirm(frame: &mut Frame, selected: usize, agent_count: usize) {
     text.push(Line::from(""));
     text.push(Line::styled(
         "  y / Enter on Yes confirms  ·  n / Esc / Enter on No returns to Quit dialog",
-        text_dim(),
+        text_primary(),
     ));
 
     let block = Block::default()
@@ -8014,7 +8016,7 @@ fn render_star_prompt(frame: &mut Frame) -> Vec<(Action, Rect)> {
                 .add_modifier(Modifier::UNDERLINED),
         ),
         Line::from(""),
-        Line::styled("  s Star  l Later  d Don't ask again", text_dim()),
+        Line::styled("  s Star  l Later  d Don't ask again", text_primary()),
     ];
 
     let block = Block::default()
@@ -8078,7 +8080,7 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize) -> Vec<(Action, 
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD)
         } else {
-            text_dim()
+            text_primary()
         };
         text.push(Line::styled(
             format!("  {cursor} {label:<6} \u{2014} {desc}"),
@@ -8089,12 +8091,12 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize) -> Vec<(Action, 
     text.push(Line::from(""));
     text.push(Line::styled(
         "  Disable: dot-agent-deck config set auto_config_prompt false",
-        text_dim(),
+        text_primary(),
     ));
     text.push(Line::from(""));
     text.push(Line::styled(
         "  Up/Down: navigate  Enter: confirm  Esc: cancel",
-        text_dim(),
+        text_primary(),
     ));
 
     let block = Block::default()
@@ -8238,7 +8240,7 @@ fn render_help_overlay(frame: &mut Frame, active_mode_name: Option<&str>) -> Vec
 
     let footer = Paragraph::new(vec![
         Line::from(""),
-        Line::styled("  Press ? or Esc to close", text_dim()),
+        Line::styled("  Press ? or Esc to close", text_primary()),
     ]);
     frame.render_widget(footer, footer_area);
 
@@ -8295,7 +8297,7 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) -> PickerCl
     )];
 
     if show_filter_row {
-        let mut spans = vec![Span::styled("  / ", text_dim())];
+        let mut spans = vec![Span::styled("  / ", text_primary())];
         spans.push(Span::styled(picker.filter_text.clone(), text_primary()));
         if picker.filtering {
             spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
@@ -8317,7 +8319,7 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) -> PickerCl
         } else {
             "  (no matching directories)"
         };
-        lines.push(Line::styled(message, text_dim()));
+        lines.push(Line::styled(message, text_primary()));
     } else {
         for (i, entry_idx) in picker
             .filtered_indices
@@ -8370,7 +8372,7 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) -> PickerCl
     } else {
         "  j/k or ↑↓: navigate  l/Enter: open  Space: select  h/Backspace: up"
     };
-    lines.push(Line::styled(nav_footer, text_dim()));
+    lines.push(Line::styled(nav_footer, text_primary()));
     let mode_footer = if picker.filtering {
         "  Typing: add characters  Enter: accept filter  Esc: clear"
     } else if !picker.filter_text.is_empty() {
@@ -8378,7 +8380,7 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) -> PickerCl
     } else {
         "  /: filter directories  Esc or q: cancel"
     };
-    lines.push(Line::styled(mode_footer, text_dim()));
+    lines.push(Line::styled(mode_footer, text_primary()));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -8540,7 +8542,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // the generic "Enter: next" wording, which is misleading in that state.
     let name_submits = form.focused == FormField::Name && !cmd_visible;
     let footer = new_pane_form_footer_hint(form.has_mode_field, name_submits);
-    lines.push(Line::styled(footer, text_dim()));
+    lines.push(Line::styled(footer, text_primary()));
 
     let title = match form.selected_mode() {
         Some(cfg) => format!(" New Agent \u{2014} {} mode ", cfg.name),
@@ -8605,7 +8607,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         // place (REVERSED) rather than painting an absolute pair; unselected
         // chips dim the terminal foreground.
         let selected_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
-        let chip_style = text_dim();
+        let chip_style = text_primary();
         let buf = frame.buffer_mut();
         let mut cx = row_x;
         let (after, _) = buf.set_span(
@@ -8707,7 +8709,7 @@ fn render_session_card(
 ) {
     let is_placeholder = session.agent_type == crate::event::AgentType::None;
     let (status_label, status_style) = if is_placeholder {
-        ("No agent", text_dim())
+        ("No agent", text_primary())
     } else {
         status_style(&session.status)
     };
@@ -8789,9 +8791,9 @@ fn render_session_card(
 
     if wide {
         let right_spans = vec![
-            Span::styled("Last: ", text_dim()),
+            Span::styled("Last: ", text_primary()),
             Span::raw(format!("{}  ", elapsed)),
-            Span::styled("Tools: ", text_dim()),
+            Span::styled("Tools: ", text_primary()),
             Span::raw(session.tool_count.to_string()),
         ];
         let right_len: usize = right_spans.iter().map(|s| s.width()).sum();
@@ -8801,13 +8803,16 @@ fn render_session_card(
         let dir_display = truncate_with_ellipsis(cwd_display.as_ref(), max_dir);
 
         lines.push(padded_line(
-            vec![Span::styled("Dir:  ", text_dim()), Span::raw(dir_display)],
+            vec![
+                Span::styled("Dir:  ", text_primary()),
+                Span::raw(dir_display),
+            ],
             right_spans,
             w,
         ));
     } else {
         lines.push(Line::from(vec![
-            Span::styled("Dir:  ", text_dim()),
+            Span::styled("Dir:  ", text_primary()),
             Span::raw(cwd_display),
         ]));
     }
@@ -8815,7 +8820,7 @@ fn render_session_card(
     if is_placeholder {
         lines.push(Line::from(Span::styled(
             "Launch an agent to get started",
-            text_dim(),
+            text_primary(),
         )));
     } else {
         let prompts = collect_recent_prompts(session, density.max_prompts());
@@ -8824,7 +8829,7 @@ fn render_session_card(
             let max_prompt = w.saturating_sub(6);
             let display = truncate_with_ellipsis(prompt, max_prompt);
             lines.push(Line::from(vec![
-                Span::styled(prefix, text_dim()),
+                Span::styled(prefix, text_primary()),
                 Span::raw(display),
             ]));
         }
@@ -8832,9 +8837,9 @@ fn render_session_card(
 
     if !wide {
         lines.push(Line::from(vec![
-            Span::styled("Last: ", text_dim()),
+            Span::styled("Last: ", text_primary()),
             Span::raw(format!("{}  ", elapsed)),
-            Span::styled("Tools: ", text_dim()),
+            Span::styled("Tools: ", text_primary()),
             Span::raw(session.tool_count.to_string()),
         ]));
     }
@@ -8933,7 +8938,7 @@ fn recent_tool_lines(session: &SessionState, max_tools: usize) -> Vec<Line<'stat
             } else {
                 format!("  {} — {}", name, detail)
             };
-            Line::styled(text, text_dim())
+            Line::styled(text, text_primary())
         })
         .collect()
 }
