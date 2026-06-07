@@ -10,10 +10,11 @@ use std::collections::VecDeque;
 
 use dot_agent_deck::event::AgentType;
 use dot_agent_deck::state::{ActiveTool, DashboardStats, SessionState, SessionStatus};
+use dot_agent_deck::tab::Tab;
 use dot_agent_deck::ui::{
     CardDensityKind, render_card_to_buffer, render_config_gen_prompt_to_buffer,
-    render_quit_confirm_to_buffer, render_star_prompt_to_buffer, render_stats_bar_to_buffer,
-    render_stop_confirm_to_buffer,
+    render_dashboard_cards_to_buffer, render_quit_confirm_to_buffer, render_star_prompt_to_buffer,
+    render_stats_bar_to_buffer, render_stop_confirm_to_buffer, sync_and_derive_selection,
 };
 use ratatui::style::{Color, Modifier};
 use spec::spec;
@@ -303,4 +304,84 @@ fn guard_002_no_absolute_bg_in_source() {
              terminal-relative surfaces must use Color::Reset / Modifier::REVERSED"
         );
     }
+}
+
+/// Scenario: Build three dashboard session cards and a
+/// `Tab::Dashboard` whose `selected_session_id` points at the
+/// **second** card (`sess-beta`), then derive the highlighted index
+/// via `ui::sync_and_derive_selection` and render the three cards
+/// stacked into a `TestBackend` buffer with `insta`. The derived
+/// index is 1 (not 0), so the snapshot shows the `▸` selection
+/// marker and highlighted border on the second card while the first
+/// and third stay unselected — proving the dashboard highlight
+/// follows the stable selected session id (PRD #83 M3) rather than
+/// defaulting to card 0.
+#[spec("dashboard/pane/005")]
+#[test]
+fn pane_005_highlight_follows_selected_session_id() {
+    // PRD #83 catalog: dashboard/pane/005 — the dashboard card
+    // highlight must follow the per-tab `selected_session_id` (the M3
+    // fix), not snap back to the top card. We render three cards and
+    // point the selection at the 2nd, so a regression that ignored the
+    // stable id (highlighting card 0) would visibly diff the snapshot.
+    //
+    // `last_activity = now` keeps every `Last: Xs ago` line at `0s ago`
+    // so calendar drift can't churn the snapshot (mirrors pane_004).
+    let now = chrono::Utc::now();
+    let make = |sid: &str, pane: &str, name: &str, cwd: &str| SessionState {
+        session_id: sid.to_string(),
+        agent_type: AgentType::ClaudeCode,
+        cwd: Some(cwd.to_string()),
+        status: SessionStatus::Working,
+        active_tool: Some(ActiveTool {
+            name: "Read".to_string(),
+            detail: Some("src/main.rs".to_string()),
+        }),
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 3,
+        last_user_prompt: Some("do the thing".to_string()),
+        first_prompts: vec!["do the thing".to_string()],
+        pane_id: Some(pane.to_string()),
+        agent_id: Some(name.to_string()),
+    };
+    let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
+    let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");
+    let s3 = make("sess-gamma", "pane-3", "3", "/home/dev/gamma");
+
+    // Render-order filtered list of (session_id, pane_id) pairs — the
+    // shape `sync_and_derive_selection` resolves the selection against.
+    let filtered: [(&str, Option<&str>); 3] = [
+        ("sess-alpha", Some("pane-1")),
+        ("sess-beta", Some("pane-2")),
+        ("sess-gamma", Some("pane-3")),
+    ];
+
+    // Per-tab selection pinned to the 2nd card's session id. With no
+    // focused pane, the derived index resolves purely from the stable
+    // session id — and must be 1, not 0.
+    let mut tab = Tab::Dashboard {
+        selected_session_id: Some("sess-beta".to_string()),
+    };
+    let selected_index =
+        sync_and_derive_selection(&mut tab, None, &filtered).expect("dashboard derives an index");
+    assert_eq!(
+        selected_index, 1,
+        "selection must follow the stable session id to the 2nd card"
+    );
+
+    let cards: [(&SessionState, Option<&str>); 3] = [
+        (&s1, Some("example-alpha")),
+        (&s2, Some("example-beta")),
+        (&s3, Some("example-gamma")),
+    ];
+    let buffer = render_dashboard_cards_to_buffer(
+        &cards,
+        selected_index,
+        CardDensityKind::Normal,
+        0, // animation tick
+        80,
+    );
+    insta::assert_snapshot!(buffer_to_text(&buffer));
 }

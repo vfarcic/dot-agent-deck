@@ -40,6 +40,9 @@ use std::process::ExitCode;
 
 use regex::Regex;
 
+// PRD #77 was archived to `prds/done/` (commit 637eb37); the catalog
+// is the source of truth for the linkage check, so this points at the
+// archived location, not the original `prds/77-tui-testing-harness.md`.
 const PRD_PATH: &str = "prds/done/77-tui-testing-harness.md";
 const ALLOWLIST_PATH: &str = "xtask/linkage-check/m2.allowlist";
 const TESTS_DIR: &str = "tests";
@@ -94,8 +97,13 @@ fn main() -> ExitCode {
         }
     }
 
-    // Scan tests/ for `#[spec(...)]` annotations + function defs.
-    let test_files = collect_test_rs_files(&tests_dir);
+    // Scan tests/ AND src/ for `#[spec(...)]` annotations + function
+    // defs. PRD #83 added per-tab-selection `#[spec]` unit tests in
+    // `src/tab.rs`; the e2e-only checks below key off the `e2e_`
+    // filename prefix, so library sources never trip the sleep/polling
+    // rules.
+    let mut test_files = collect_test_rs_files(&tests_dir);
+    test_files.extend(collect_test_rs_files(&root.join("src")));
     let mut annotations: Vec<SpecAnnotation> = Vec::new();
     let mut e2e_violations: Vec<String> = Vec::new();
     let mut ignore_violations: Vec<String> = Vec::new();
