@@ -390,8 +390,25 @@ pub fn parse_binding(notation: &str) -> Result<Binding, String> {
         }
     }
 
-    let code = parse_key_code(key_part)
+    let mut code = parse_key_code(key_part)
         .ok_or_else(|| format!("unknown key '{key_part}' in '{notation}'"))?;
+
+    // Greptile P1: an uppercase letter combined with a Ctrl/Alt modifier is a
+    // silently-dead binding. A terminal delivers e.g. `Ctrl+T` as
+    // `Char('t')+CONTROL` (lowercase — no Shift is involved), but the notation
+    // `"Ctrl+T"` would parse to `Char('T')+CONTROL` and never match. Fold the
+    // base letter to lowercase whenever a Ctrl/Alt modifier is present so the
+    // chord matches what the terminal sends; an intentional uppercase chord is
+    // expressed with an explicit `Shift+`. (A *bare* uppercase letter with no
+    // Ctrl/Alt — e.g. `"D"` — is left as-is: it correctly represents the
+    // Shift+d key the terminal delivers as `Char('D')`, and stays equivalent
+    // to `"Shift+d"` via `normalize_chord`.)
+    if let KeyCode::Char(c) = code
+        && c.is_ascii_uppercase()
+        && mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        code = KeyCode::Char(c.to_ascii_lowercase());
+    }
 
     Ok(Binding::bound(code, mods))
 }
@@ -591,8 +608,36 @@ impl KeybindingConfig {
             }
         }
 
+        Self::reserve_ctrl_c(&mut config, &mut warnings);
         Self::resolve_conflicts(&mut config, &mut warnings);
         (config, warnings)
+    }
+
+    /// Greptile P2: `Ctrl+C` is a hardcoded, non-overridable quit-modal
+    /// trigger in the event loop (the `is_ctrl_c` guard excludes it from *all*
+    /// config dispatch), so any action a user binds to it is guaranteed dead.
+    /// Rather than silently accept such a binding, warn and leave the action
+    /// unbound — so it can never masquerade as live and never claims `Ctrl+C`
+    /// in conflict resolution. Keyed on the normalized chord, matching the
+    /// event loop's guard. Not fatal: load still succeeds and the deck still
+    /// launches (the warning is the only effect).
+    fn reserve_ctrl_c(config: &mut KeybindingConfig, warnings: &mut Vec<String>) {
+        let ctrl_c = normalize_chord(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        for spec in ACTIONS {
+            let action = spec.action;
+            let Some((code, mods)) = config.binding(action).chord() else {
+                continue;
+            };
+            if normalize_chord(code, mods) == ctrl_c {
+                warnings.push(format!(
+                    "'{}' is bound to Ctrl+C, which is reserved as the non-overridable \
+                     quit trigger and can never be dispatched from config — ignoring \
+                     (the action is left unbound)",
+                    action.config_name(),
+                ));
+                config.set(action, Binding::unbound());
+            }
+        }
     }
 
     /// First-defined (canonical [`ACTIONS`] order) wins: if two actions share
@@ -783,6 +828,67 @@ mod tests {
             parse_binding("Control+d").unwrap().chord(),
             Some((KeyCode::Char('d'), KeyModifiers::CONTROL))
         );
+    }
+
+    #[test]
+    fn uppercase_letter_with_modifier_folds_to_lowercase_base() {
+        // Greptile P1: `Ctrl+T` must parse to the lowercase base letter, since
+        // a terminal delivers Ctrl+T as Char('t')+CONTROL (no Shift). Without
+        // the fold this would be a silently-dead binding.
+        let b = parse_binding("Ctrl+T").unwrap();
+        assert_eq!(b.chord(), Some((KeyCode::Char('t'), KeyModifiers::CONTROL)));
+        // It matches the runtime event and is identical to the lowercase form.
+        assert!(matches_binding(
+            &ev(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &b
+        ));
+        assert_eq!(b, parse_binding("Ctrl+t").unwrap());
+        // Same for Alt.
+        assert_eq!(
+            parse_binding("Alt+W").unwrap().chord(),
+            Some((KeyCode::Char('w'), KeyModifiers::ALT))
+        );
+    }
+
+    #[test]
+    fn base_letter_parsing_is_case_insensitive_under_modifiers() {
+        // Ctrl+G / Ctrl+g / CTRL+g all denote the same chord.
+        let canonical = parse_binding("Ctrl+g").unwrap();
+        assert_eq!(parse_binding("Ctrl+G").unwrap(), canonical);
+        assert_eq!(parse_binding("ctrl+G").unwrap(), canonical);
+    }
+
+    #[test]
+    fn coherence_cases_after_uppercase_fold() {
+        // (1) Ctrl+T and Ctrl+t both match the runtime Ctrl+t event.
+        let ctrl_t_event = ev(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(matches_binding(
+            &ctrl_t_event,
+            &parse_binding("Ctrl+T").unwrap()
+        ));
+        assert!(matches_binding(
+            &ctrl_t_event,
+            &parse_binding("Ctrl+t").unwrap()
+        ));
+
+        // (2) Alt+Shift+l still matches the runtime Char('L')+ALT event
+        // (what e2e remap_001 sends as \x1bL) — the fold must not regress it.
+        assert!(matches_binding(
+            &ev(KeyCode::Char('L'), KeyModifiers::ALT),
+            &parse_binding("Alt+Shift+l").unwrap()
+        ));
+
+        // (3) Shift+d and a bare "D" still resolve equivalently: both fold to
+        // the Char('D')+NONE the terminal delivers for the D key.
+        let d_event = ev(KeyCode::Char('D'), KeyModifiers::NONE);
+        assert!(matches_binding(
+            &d_event,
+            &parse_binding("Shift+d").unwrap()
+        ));
+        assert!(matches_binding(&d_event, &parse_binding("D").unwrap()));
+        let (dc, dm) = parse_binding("D").unwrap().chord().unwrap();
+        let (sc, sm) = parse_binding("Shift+d").unwrap().chord().unwrap();
+        assert_eq!(normalize_chord(dc, dm), normalize_chord(sc, sm));
     }
 
     #[test]
@@ -1086,6 +1192,56 @@ close_pane = ""
         assert!(c.binding(Action::NewPane).is_unbound());
         assert!(c.binding(Action::ClosePane).is_unbound());
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn binding_to_ctrl_c_is_warned_and_left_unbound() {
+        // Greptile P2: Ctrl+C is the hardcoded non-overridable quit trigger,
+        // so any action bound to it is dead. Such a config must still PARSE
+        // (the deck must launch — e2e safety/001,002 rely on this) but the
+        // action is left unbound with a warning, and Ctrl+C is never claimable
+        // by config.
+        let toml = r#"
+[global]
+new_pane = "Ctrl+C"
+"#;
+        let (c, warnings) = KeybindingConfig::from_toml_str(toml).unwrap();
+        assert!(
+            c.binding(Action::NewPane).is_unbound(),
+            "an action bound to Ctrl+C must be left unbound"
+        );
+        assert!(
+            !c.matches(
+                Action::NewPane,
+                &ev(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            "Ctrl+C must never be claimable by config"
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.contains("Ctrl+C") && w.contains("new_pane"))
+                .count(),
+            1,
+            "expected exactly one Ctrl+C reservation warning: {warnings:?}"
+        );
+        // No action matches a Ctrl+C event under the merged config.
+        assert_eq!(
+            c.action_for(&ev(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            None
+        );
+    }
+
+    #[test]
+    fn lowercase_ctrl_c_binding_also_reserved() {
+        // The lowercase spelling resolves to the same reserved chord.
+        let toml = r#"
+[dashboard]
+move_left = "Ctrl+c"
+"#;
+        let (c, warnings) = KeybindingConfig::from_toml_str(toml).unwrap();
+        assert!(c.binding(Action::MoveLeft).is_unbound());
+        assert!(warnings.iter().any(|w| w.contains("Ctrl+C")));
     }
 
     #[test]
