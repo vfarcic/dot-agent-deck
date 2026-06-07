@@ -1,6 +1,6 @@
 # PRD #13: Light Terminal Background Compatibility
 
-**Status**: In Progress — Phase 2 (terminal-relative refactor)
+**Status**: Complete (Phase 1 + Phase 2)
 **Priority**: Medium
 **Created**: 2026-03-29
 **GitHub Issue**: [#13](https://github.com/vfarcic/dot-agent-deck/issues/13)
@@ -79,14 +79,18 @@ This supersedes the three options the PRD originally floated (detect-and-switch 
 
 ### Phase 2 — terminal-relative refactor (open)
 
-- [ ] Remove the absolute `palette.terminal_bg` fill from the dashboard frame (`src/ui.rs:5449`) and from every overlay/prompt block (`bg(palette.terminal_bg)` at ~6281/6351/6399/6473/6571/6713/6867) — render the canvas with `Color::Reset` so the terminal's own background shows through.
-- [ ] Convert "default text" neutral foregrounds to `Color::Reset` where they exist only to mean "terminal default," keeping `text_muted`/dimming via `Modifier::DIM` relative to the terminal foreground (not absolute gray).
-- [ ] Re-express the selected-card highlight (currently `selected_bg = Rgb(...)`) and `tab_bar_bg` using `Modifier::REVERSED` or named ANSI brights — a self-contained, single-frame contrast pair — instead of absolute RGB tints.
-- [ ] Audit other render surfaces beyond `ui.rs` (`src/terminal_widget.rs:177` `Color::Black`, embedded panes, tab layout) for mixed-frame contrast pairs and fix any found.
-- [ ] Confirm semantic status/accent ANSI colors still read correctly with a `Reset` canvas on both light and dark terminals.
-- [ ] Add a structural regression guard: a test/lint asserting (a) no absolute background fill on the canvas, and (b) no contrast-critical pair mixes an absolute color with a terminal-relative one. Update/replace the Phase 1 `theme/contrast/001–002` snapshots accordingly.
-- [ ] Decide the fate of OSC-11 detection + `light`/`dark` `ColorPalette` (`src/theme.rs`): remove, or retain solely for optional cosmetic tuning. Record the decision.
-- [ ] Manually verify on a real light terminal (the failure the user actually observed) that the canvas is no longer a black slab.
+- [x] Remove the absolute `palette.terminal_bg` fill from the dashboard frame and every overlay/prompt block — canvas now renders with `Color::Reset`; terminal background shows through.
+- [x] Convert neutral foregrounds to terminal-relative styling via `text_primary()` (`Reset`) / `text_dim()` (`Reset`+`DIM`) helpers. *(Refined post-manual-check — see Decision Log "Secondary-text contrast".)*
+- [x] Re-express the selected-card highlight without absolute RGB. *(Landed as Option A — see Decision Log "Selection cue"; active-tab uses `Modifier::REVERSED`.)*
+- [x] Audit other render surfaces beyond `ui.rs` (`terminal_widget.rs`, embedded panes, tab layout) — only self-contained ANSI pairs + vt100 passthrough remain; no mixed-frame pairs.
+- [x] Confirm semantic status/accent ANSI colors still read correctly on a `Reset` canvas on both themes *(reviewer + manual check)*.
+- [x] Add a structural regression guard: `theme/guard/001` (render-time: no cell has an absolute `Color::Rgb` background; selection cue present) + `theme/guard/002` (source lint forbidding `bg(Color::Rgb…)`/`bg(palette.*_bg)`); `theme/contrast/001` repurposed; `theme/contrast/002` removed.
+- [x] Decide the fate of OSC-11 detection + `light`/`dark` `ColorPalette` — **removed** (`src/theme.rs` deleted, `terminal-colorsaurus` dep dropped, `--theme` flag + `theme` config key removed). No longer load-bearing under the terminal-relative model.
+- [x] Manually verify on a real light terminal that the canvas is no longer a black slab — **confirmed by the user** (canvas inherits terminal background; Option-A selection legible; secondary text readable in both modes after the contrast refinement).
+
+### Integration note
+- Merged `origin/main`'s **PRD-80 (mouse parity, M1–M10)** into this branch; all PRD-80 button/tab/modal surfaces were reconciled to the terminal-relative model (no absolute `Rgb` backgrounds) with no loss of mouse functionality. The test catalog relocation (`prds/done/77-…` → `tests/CATALOG.md`) introduced by PRD-80 was adopted; our `theme/*` specs live there.
+- Enabled Greptile `triggerOnUpdates` (`greptile.json`) so PRs re-review on every push.
 
 ## Decision Log
 
@@ -100,6 +104,10 @@ This supersedes the three options the PRD originally floated (detect-and-switch 
   A *disciplined* mix (every contrast pair self-contained in one frame) is technically safe but rejected as the default because the discipline lived only in reviewers' heads — nothing structural prevented the regression, and indeed no test caught it. Phase 2 therefore also adds a structural guard. **Consequence:** the OSC-11 detection and the `light`/`dark` palette split stop being load-bearing for legibility (their removal/retention is a follow-up).
 
 - **Why Phase 1's tests did not catch the bug.** The two L1 contrast tests (`theme/contrast/001–002`) (a) rendered only the six overlay/prompt surfaces, never the top-level dashboard frame where `terminal_bg` is filled, and (b) *injected* an explicit palette (`resolve_palette(Theme::Dark/Light)`), bypassing the `Theme::Auto → detect_palette()` path that actually selects the palette at runtime. So neither the offending surface nor the offending code path was under test. Phase 2's structural guard targets exactly this gap.
+
+- **Selection cue = Option A (post-manual-check refinement).** The first terminal-relative attempt highlighted the selected card by applying `Modifier::REVERSED` to the *whole card*, which fully inverted it to a solid opposite-of-theme block — too heavy, and redundant since selection is already signalled by the `▸ ` title prefix and a `Cyan`+`BOLD` border. Resolved by **dropping the whole-card `REVERSED`** and keeping the prefix + cyan-bold border (still fully terminal-relative). The active-*tab* `REVERSED` highlight is retained (a single line, where a strong invert reads well). `guard_001` was re-expressed to assert the cyan-bold border cue instead of `REVERSED`.
+
+- **Secondary-text contrast (post-manual-check refinement).** In pure terminal-relative 16-color space the only "dimmer" knob is `Modifier::DIM`, but on the user's terminal `DIM` secondary text (`text_dim()`) was hard to read in dark mode and worse in light (a long-standing legibility issue, not new to this PRD). Resolved by reserving `DIM` for purely-decorative, non-read elements only (the `│` separators, unfocused-input / disabled-button / placeholder borders) and rendering all actual *text* (labels, hints, footers, values, "No agent", messages) at full contrast via `text_primary()`. Visual hierarchy now comes from wording/layout + the few remaining decorative dims, not from faint text. (Trade-off accepted: there is no readable terminal-relative "mid-gray"; full contrast wins over a faint hierarchy.)
 
 - **Validation approach: L1 structural assertions instead of screenshots + manual emulator matrix.** The PRD predates the PRD-77 TUI testing harness. Rather than ad-hoc screenshots and manual Terminal.app/iTerm2/Alacritty runs, the contract is pinned by deterministic, CI-runnable (`cargo test-fast`) L1 tests. *(Phase 1 originally used a dark/light snapshot **pair** `theme/contrast/001`+`002`; Phase 2 replaced that with the terminal-relative model below, since light/dark no longer produce different buffers.)* The current guards are: `theme/guard/001` (render-time: no rendered cell carries an absolute `Color::Rgb(..)` background; selection uses `Modifier::REVERSED`), `theme/guard/002` (source lint: no `bg(Color::Rgb…)` / `bg(palette.*_bg)` in `ui.rs`), and `theme/contrast/001` (overlays emit a `Reset` background + `Reset`/ANSI foregrounds). Residual gap vs. a true terminal: L1 inspects the ratatui buffer, not a real emulator's ANSI rendering — closed by the milestone-8 manual check on a real light terminal.
 - **Cyan/accent colors left hardcoded by design.** ANSI accent colors (Cyan title/borders, status colors) are remapped by the terminal's own theme, so they adapt without intervention; only neutral text (White/Gray/DarkGray) needed palette routing.
