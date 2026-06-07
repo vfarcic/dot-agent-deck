@@ -92,3 +92,78 @@ Several dashboard shortcuts open transient input fields or selection dialogs. Th
 | **Generate config** | `g` | `Up`/`Down` (or `k`/`j`) to choose **Yes** / **No** / **Never** · `Enter` to confirm · `Esc` to cancel. **Yes** sends a prompt to the agent to write `.dot-agent-deck.toml`; **Never** suppresses the hint permanently for that directory. |
 | **Quit confirmation** | `Ctrl+c` from command mode | `Up`/`Down` (or `k`/`j`) to choose **Yes** / **No** · `Enter` to confirm · `Esc` to dismiss · `Ctrl+c` again to quit immediately |
 | **Help overlay** | `?` | `?`, `Esc`, or `q` to dismiss |
+
+## Customizing Keybindings
+
+Every shortcut above can be remapped. dot-agent-deck reads an optional config file at:
+
+```
+~/.config/dot-agent-deck/keybindings.toml
+```
+
+(Override the path with the `DOT_AGENT_DECK_KEYBINDINGS` environment variable.) Keybindings are resolved **client-side**, on the machine running the TUI — so when two clients attach to one remote daemon, each can have its own bindings.
+
+The file has two sections, `[global]` and `[dashboard]`. You only need to list the actions you want to change; everything else keeps its default. The help overlay (`?`) and the hints bar are generated from the active config, so they always show your real keys.
+
+### Key notation
+
+- **Modifiers:** `Ctrl+`, `Alt+`, `Shift+` — combine in any order, e.g. `Alt+Shift+t`.
+- **Named keys:** `Enter`, `Esc`, `Tab`, `Space`, `Up`, `Down`, `Left`, `Right`, `Backspace`, `Delete`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, and `F1`–`F12`.
+- **Printable characters:** `a`–`z`, `0`–`9`, `/`, `?`, etc.
+- **Unbound:** an empty string (`new_pane = ""`) disables the action entirely.
+
+Notation is case-insensitive for modifier and named keys (`ctrl+enter` == `Ctrl+Enter`).
+
+### Example
+
+```toml
+# ~/.config/dot-agent-deck/keybindings.toml
+# Only override what you need — defaults apply for everything else.
+
+[global]
+toggle_layout = "Alt+Shift+l"   # move it off Ctrl+t
+new_pane = ""                    # disable the new-pane shortcut
+
+[dashboard]
+help = "F1"                      # open help with F1 instead of ?
+```
+
+### Actions and defaults
+
+`[global]` (work from any mode):
+
+| Action | Default | Description |
+|---|---|---|
+| `quit` | `Ctrl+c` | Open the quit-confirmation dialog |
+| `dashboard` | `Ctrl+d` | Enter command / navigation mode |
+| `new_pane` | `Ctrl+n` | New pane (directory picker → name + command) |
+| `close_pane` | `Ctrl+w` | Close selected pane / tear down mode tab |
+| `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout |
+| `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane |
+
+`[dashboard]` (command mode):
+
+| Action | Default | Description |
+|---|---|---|
+| `move_down` | `j` | Select next card |
+| `move_up` | `k` | Select previous card |
+| `move_left` | `h` | Previous tab |
+| `move_right` | `l` | Next tab |
+| `filter` | `/` | Filter sessions |
+| `rename` | `r` | Rename selected session |
+| `help` | `?` | Toggle help overlay |
+| `focus_pane` | `Enter` | Focus selected pane |
+| `clear_filter` | `Esc` | Clear active filter |
+| `approve_permission` | `y` | Approve a pending permission request |
+| `deny_permission` | `n` | Deny a pending permission request |
+
+The `Down`/`Up`/`Tab`/`Shift+Tab`/`Left`/`Right` aliases and `Ctrl+PageUp` / `Ctrl+PageDown` tab navigation are not remappable and always work alongside your bindings.
+
+### Edge cases
+
+- **No config file** → all defaults (current behavior, nothing changes).
+- **Malformed file** → dot-agent-deck warns on stderr and falls back to all defaults; it never crashes.
+- **Conflicting bindings** (two actions on the same key) → a warning is printed and the first-defined action wins; the later one is left unbound.
+- **Unknown action name** → ignored with a warning.
+- **Empty binding** (`action = ""`) → that action is unbound and its default key does nothing.
+- **`Ctrl+c` always quits.** It is a non-overridable safety net: even if you unbind `quit` or bind another action to `Ctrl+c`, pressing `Ctrl+c` from command mode always opens the quit flow — it is never routed through your config (so it can't be turned into "new pane", "switch tab", etc.).

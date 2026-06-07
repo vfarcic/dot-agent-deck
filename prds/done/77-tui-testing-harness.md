@@ -1888,6 +1888,86 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** which layout is the "default" (already a settled product call).
 - **Platform coverage:** mac+linux.
 
+### Keybindings (PRD #40)
+
+Keybindings resolve **client-side**: the config file lives on the machine
+running the TUI (`$HOME/.config/dot-agent-deck/keybindings.toml`, mirroring
+the `config.toml` path), the TUI event loop reads it and matches each
+keypress to a semantic action, and the daemon never sees raw command-mode
+keystrokes — it stays binding-agnostic. The L2 tests below are
+interface-agnostic: each stages a `keybindings.toml` under the per-test
+HOME (harness `TuiDeckBuilder::with_keybindings_toml`) and asserts on the
+rendered grid, so they exercise the full client-side resolution path
+without depending on the config struct API.
+
+#### keybindings/remap
+
+##### keybindings/remap/001 — A config remap of a **global** action (`toggle_layout` → `Alt+Shift+l`) takes effect on the new combo and the old default stops toggling.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** with a `keybindings.toml` rebinding `[global] toggle_layout = "Alt+Shift+l"`, pressing `Alt+Shift+l` toggles the dashboard layout (the `Layout: …` status message appears in the bottom bar); the old default toggle key (`Ctrl+t`) no longer toggles. The remap is resolved **client-side** — the file is read on the TUI side, the TUI matches the keypress to the action, and the daemon stays binding-agnostic.
+- **Does not assert:** which layout (stacked vs tiled) is the default, exact status-message wording beyond the `Layout:` prefix, daemon-side behaviour (there is none — binding resolution is entirely client-side).
+- **Platform coverage:** mac+linux.
+
+##### keybindings/remap/002 — A config remap of a **dashboard** action (`help` `?` → `F1`) opens the help overlay on the new key.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** with a `keybindings.toml` rebinding `[dashboard] help = "F1"`, pressing `F1` opens the help overlay (the "Create new pane" line is rendered).
+- **Does not assert:** that the old `?` still opens help (the action was remapped, not added), help-overlay content beyond one anchor line.
+- **Platform coverage:** mac+linux.
+
+#### keybindings/safety
+
+##### keybindings/safety/001 — `Ctrl+C` always opens the quit flow, even when the config unbinds/rebinds `quit`.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** with a `keybindings.toml` that both unbinds `[global] quit = ""` and tries to hijack `Ctrl+C` for another action (`new_pane = "Ctrl+C"`), pressing `Ctrl+C` still opens the quit-confirmation dialog ("Quit dot-agent-deck?"). `Ctrl+C` is a non-overridable safety net that outranks both the unbind and the reassignment. Guard test — must stay green through the implementation so config can never disable emergency quit.
+- **Does not assert:** which quit option is selected by default, the dialog layout, the rebound `quit` key's behaviour.
+- **Platform coverage:** mac+linux.
+
+##### keybindings/safety/002 — `Ctrl+C` always opens the quit flow, even when a tab-navigation action is bound to `Ctrl+C`.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** with a `keybindings.toml` that unbinds `[global] quit = ""` and binds both `[dashboard] move_left = "Ctrl+C"` and `move_right = "Ctrl+C"`, pressing `Ctrl+C` still opens the quit-confirmation dialog ("Quit dot-agent-deck?"). Complements safety/001 by covering the Normal-mode tab-cycle dispatch path: `Ctrl+C` is never routed through the configurable `move_left`/`move_right` matching, so it can't be turned into a tab switch. Regression guard for the `!is_ctrl_c` gate on that dispatch path.
+- **Does not assert:** tab-switch behaviour for non-`Ctrl+C` `move_left`/`move_right` bindings, conflict-resolution warning wording.
+- **Platform coverage:** mac+linux.
+
+#### keybindings/unbind
+
+##### keybindings/unbind/001 — An empty-string binding (`new_pane = ""`) makes the default key a no-op.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** with a `keybindings.toml` setting `[global] new_pane = ""`, pressing the default `Ctrl+n` does nothing — the directory picker / new-pane flow ("Select Directory") never opens. The deck stays in Normal mode (a following `?` still opens help).
+- **Does not assert:** behaviour of other unbound actions, that the new-pane flow can be re-bound to a different key (separate concern).
+- **Platform coverage:** mac+linux.
+
+#### keybindings/fallback
+
+##### keybindings/fallback/001 — A malformed `keybindings.toml` falls back to defaults and warns on stderr.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** with an unparseable `keybindings.toml`, the deck still launches to its empty dashboard, default bindings still work (`?` opens help), and a warning mentioning "keybindings" is emitted on stderr (observed in the merged PTY byte stream, which retains it after the TUI clears the screen).
+- **Does not assert:** the exact warning wording beyond the "keybindings" substring, per-entry vs whole-file fallback granularity.
+- **Platform coverage:** mac+linux.
+
+#### keybindings/help
+
+##### keybindings/help/001 — The help overlay is generated from the active keybinding config and shows remapped keys.
+- **Layer:** L1 (ratatui `TestBackend` + `insta` file snapshot).
+- **Agent:** none.
+- **Asserts:** rendered against a `KeybindingConfig` that remaps `toggle_layout` → `Alt+Shift+l` and `help` → `F1`, the help-overlay buffer shows those custom notations (the snapshot — and a substring guard on `Alt+Shift+l` / `F1`) rather than the defaults, proving the overlay is generated from the active config, not hardcoded strings. The defaults-content guard lives separately at `dashboard/help/002` and stays untouched.
+- **Does not assert:** the overlay's exact column layout or footer wording beyond what the committed snapshot pins; behaviour with the *default* config (that is `dashboard/help/002`'s job).
+- **Platform coverage:** mac+linux+windows.
+
+#### keybindings/hints
+
+##### keybindings/hints/001 — The hints bar is generated from the active keybinding config and shows remapped keys.
+- **Layer:** L1 (ratatui `TestBackend` + `insta` file snapshot).
+- **Agent:** none.
+- **Asserts:** rendered against a `KeybindingConfig` that remaps `toggle_layout` → `Alt+Shift+l`, the hints-bar buffer shows the custom layout-toggle notation (the snapshot — and a substring guard on `Alt+Shift+l`) rather than the default `Ctrl+t`, proving the hints bar is generated from the active config.
+- **Does not assert:** the full set of actions shown in the bar or their order beyond what the committed snapshot pins; truncation behaviour at narrow widths.
+- **Platform coverage:** mac+linux+windows.
+
 ### Error paths
 
 #### error/socket

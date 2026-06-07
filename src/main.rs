@@ -674,6 +674,14 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
 
     let config = dot_agent_deck::config::DashboardConfig::load();
 
+    // PRD #40: resolve keybindings client-side, *before* entering the
+    // alternate screen, so any malformed-config / conflict / unknown-action
+    // warnings land on stderr in the normal terminal (and, under a PTY, in
+    // the byte stream that precedes the alt-screen switch) where they are
+    // actually visible. `run_tui` (via `ratatui::init`) is what flips into
+    // the alt-screen, so loading here keeps the warnings ahead of it.
+    let keybindings = dot_agent_deck::keybindings::KeybindingConfig::load();
+
     // Auto-install hooks for detected agents (silent, best-effort)
     hooks_manage::auto_install();
     dot_agent_deck::opencode_manage::auto_install();
@@ -692,6 +700,7 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
             pane_controller,
             config,
             palette,
+            keybindings,
             continue_session,
         )
     })

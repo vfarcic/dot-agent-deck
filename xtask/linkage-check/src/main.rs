@@ -40,7 +40,7 @@ use std::process::ExitCode;
 
 use regex::Regex;
 
-const PRD_PATH: &str = "prds/77-tui-testing-harness.md";
+const PRD_PATH: &str = "prds/done/77-tui-testing-harness.md";
 const ALLOWLIST_PATH: &str = "xtask/linkage-check/m2.allowlist";
 const TESTS_DIR: &str = "tests";
 

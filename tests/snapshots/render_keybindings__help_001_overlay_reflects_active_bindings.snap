@@ -1,0 +1,45 @@
+---
+source: tests/render_keybindings.rs
+assertion_line: 90
+expression: text
+---
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+        ┌ Help ───────────────────────────────────────────────────────────────────────────────────────────────┐         
+        │  Global (works from any pane)                       Mode Tab (in-tab navigation)                    │         
+        │                                                                                                     │         
+        │  Ctrl+d             Command mode (dashboard)        j / Down           Focus next pane              │         
+        │  Ctrl+n             Create new pane                 k / Up             Focus previous pane          │         
+        │  Ctrl+w             Close selected pane             Enter           Enter PaneInput on selected     │         
+        │  Alt+Shift+l        Toggle layout (stacked/tiled)   Esc             Deselect side pane              │         
+        │  Ctrl+c             Quit                            Mouse click     Focus pane                      │         
+        │                                                     Ctrl+click      Open hyperlink                  │         
+        │  Tab Navigation                                     Ctrl+d             Return to Normal mode        │         
+        │                                                                                                     │         
+        │  Tab / Right / l    Next tab                        New Agent Form                                  │         
+        │  Shift+Tab / Left / h Prev tab                                                                      │         
+        │  Ctrl+PgDn          Next tab                        Tab             Switch field                    │         
+        │  Ctrl+PgUp          Prev tab                        ◀/▶             Cycle mode                      │         
+        │                                                     Enter           Next field / confirm            │         
+        │  Dashboard (command mode)                           Esc             Cancel                          │         
+        │                                                                                                     │         
+        │  j / Down           Select next card                Directory Picker                                │         
+        │  k / Up             Select previous card                                                            │         
+        │  1-9                Jump to pane N                  j / Down        Select next                     │         
+        │  Enter              Focus selected pane             k / Up          Select previous                 │         
+        │  /                  Filter sessions                 l / Right / Enter   Enter directory             │         
+        │  Esc                Clear filter                    h / Left / Bksp     Go up one level             │         
+        │  r                  Rename session                  Space           Confirm current directory       │         
+        │  g                  Generate .dot-agent-deck.toml   /               Filter (case-insensitive)       │         
+        │  y / n              Approve / deny permission       Esc             Clear filter (twice = close)    │         
+        │  F1                 Toggle this help                q               Cancel                          │         
+        │                                                                                                     │         
+        │                                                     Session                                         │         
+        │                                                                                                     │         
+        │                                                     Panes auto-saved on exit.                       │         
+        │                                                     Restore: dot-agent-deck --continue              │         
+        │                                                                                                     │         
+        │  Press ? or Esc to close                                                                            │         
+        └─────────────────────────────────────────────────────────────────────────────────────────────────────┘

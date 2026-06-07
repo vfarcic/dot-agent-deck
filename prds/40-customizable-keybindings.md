@@ -1,8 +1,14 @@
 # PRD #40: Customizable Keybindings
 
-**Status**: Draft
+**Status**: Implemented — PR pending
 **Priority**: Medium
 **Created**: 2026-04-04
+**Implemented**: 2026-06-07
+
+### Implementation notes / divergences from this draft
+
+- **Keybindings resolve client-side.** Bindings are interpreted in the TUI event loop (`run_tui` / `src/ui.rs`), never in the daemon. The config file lives on the machine running the TUI client; the daemon stays binding-agnostic, so multiple clients attached to one remote daemon can each have their own bindings.
+- **Authoritative defaults are Ctrl-based, not Alt-based.** The `Alt+…` notation in the draft example below predates inspection of the real code. Actual defaults: `dashboard = Ctrl+d`, `new_pane = Ctrl+n`, `close_pane = Ctrl+w`, `toggle_layout = Ctrl+t`; jump keys are **bare** `1`–`9`; dashboard keys `j/k/h/l`, `/`, `r`, `?`, `Enter`, `Esc`, `y`, `n`. **`Ctrl+C` always opens the quit flow and is non-overridable** — it can never be remapped, unbound, or hijacked by binding another action to it. See `docs/keyboard-shortcuts.md` for the full defaults table.
 
 ## Problem
 
@@ -108,14 +114,14 @@ Support a simple key notation:
 
 ## Milestones
 
-- [ ] Design and implement `KeybindingConfig` struct with defaults matching current shortcuts
-- [ ] Add config file parsing (extend existing config system or new file)
-- [ ] Replace hardcoded key checks in `ui.rs` event loop with config-driven matching
-- [ ] Generate help overlay dynamically from active keybinding config
-- [ ] Generate hints bar dynamically from active bindings
-- [ ] Validation: detect and warn about conflicting bindings
-- [ ] Documentation: add keybinding customization section to README
-- [ ] Tests: unit tests for config parsing, key matching, conflict detection
+- [x] Design and implement `KeybindingConfig` struct with defaults matching current shortcuts — `src/keybindings.rs` (`Action`/`Section` enums, `ACTIONS` table, `Binding`, `KeybindingConfig`).
+- [x] Add config file parsing (extend existing config system or new file) — `KeybindingConfig::load()` reads `$DOT_AGENT_DECK_KEYBINDINGS` or `~/.config/dot-agent-deck/keybindings.toml`; `from_toml_str` for in-memory parsing.
+- [x] Replace hardcoded key checks in `ui.rs` event loop with config-driven matching — dispatch via `cfg.matches(Action, &KeyEvent)` / `action_for`; single-match invariant enforced.
+- [x] Generate help overlay dynamically from active keybinding config — `render_help_overlay_to_buffer`; live overlay refactored through the same config-driven path.
+- [x] Generate hints bar dynamically from active bindings — `render_hints_bar_to_buffer`; live hints bar refactored through the same path.
+- [x] Validation: detect and warn about conflicting bindings — `resolve_conflicts` (normalized-chord keyed, first-defined wins, later unbound + stderr warning).
+- [x] Documentation: add keybinding customization section to README — added to `docs/keyboard-shortcuts.md` (README delegates all shortcut docs there).
+- [x] Tests: unit tests for config parsing, key matching, conflict detection — ~26 pure-data unit tests in `src/keybindings.rs`, plus 2 L1 snapshot tests (`keybindings/help/001`, `keybindings/hints/001`) and 6 L2 synthetic tests (`keybindings/remap/00{1,2}`, `unbind/001`, `fallback/001`, `safety/00{1,2}`).
 
 ## Out of Scope (v1)
 

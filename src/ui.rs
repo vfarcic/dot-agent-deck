@@ -19,6 +19,7 @@ use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
 use crate::event::{AgentType, EventType};
+use crate::keybindings::{Action, KeybindingConfig};
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
@@ -580,6 +581,10 @@ struct UiState {
     pane_metadata: HashMap<String, config::SavedPane>,
     config: DashboardConfig,
     palette: ColorPalette,
+    /// PRD #40: active keybinding config (resolved client-side at startup).
+    /// Drives command-mode key dispatch and the dynamically-generated help
+    /// overlay / hints bar. Defaults reproduce today's hardcoded bindings.
+    keybindings: KeybindingConfig,
     /// Tracks last-seen status per session for bell transition detection.
     last_bell_status: HashMap<String, SessionStatus>,
     /// Populated by the background version-check task when a newer release is available.
@@ -660,7 +665,7 @@ struct TextSelection {
 }
 
 impl UiState {
-    fn new(config: DashboardConfig, palette: ColorPalette) -> Self {
+    fn new(config: DashboardConfig, palette: ColorPalette, keybindings: KeybindingConfig) -> Self {
         Self {
             mode: UiMode::Normal,
             selected_index: 0,
@@ -677,6 +682,7 @@ impl UiState {
             pane_metadata: HashMap::new(),
             config,
             palette,
+            keybindings,
             last_bell_status: HashMap::new(),
             update_available: None,
             pane_layout: PaneLayout::Stacked,
@@ -705,7 +711,11 @@ impl UiState {
 
 impl Default for UiState {
     fn default() -> Self {
-        Self::new(DashboardConfig::default(), ColorPalette::dark())
+        Self::new(
+            DashboardConfig::default(),
+            ColorPalette::dark(),
+            KeybindingConfig::default(),
+        )
     }
 }
 
@@ -2284,71 +2294,83 @@ fn handle_normal_key(
     total: usize,
     selected_status: Option<SessionStatus>,
 ) -> KeyResult {
-    // Ctrl+C from dashboard: show quit confirmation
+    // Ctrl+C from dashboard: show quit confirmation. PRD #40 safety net —
+    // hardcoded and checked first so it can never be remapped or unbound.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
         return KeyResult::Continue;
     }
-    match key.code {
-        // Dashboard card navigation (linear cycling)
-        KeyCode::Char('j') | KeyCode::Down => {
-            if total > 0 {
-                ui.selected_index = (ui.selected_index + 1) % total;
-            }
-            KeyResult::Continue
+
+    // PRD #40: resolve dashboard actions from the active keybinding config.
+    // Cloned up front so the `&mut ui` mutations below don't conflict with an
+    // immutable borrow of `ui.keybindings`.
+    let kb = ui.keybindings.clone();
+
+    // PRD #40: dashboard (command-mode) actions resolve from the keybinding
+    // config. The non-configurable arrow-key aliases (Down/Up) are kept
+    // alongside the move_down/move_up bindings so default navigation is
+    // byte-for-byte unchanged.
+    if kb.matches(Action::MoveDown, &key) || key.code == KeyCode::Down {
+        if total > 0 {
+            ui.selected_index = (ui.selected_index + 1) % total;
         }
-        KeyCode::Char('k') | KeyCode::Up => {
-            if total > 0 {
-                ui.selected_index = (ui.selected_index + total - 1) % total;
-            }
-            KeyResult::Continue
-        }
-        // Left/Right/h/l handled in main loop for tab switching
-        KeyCode::Char('/') => {
-            ui.mode = UiMode::Filter;
-            ui.filter_text.clear();
-            KeyResult::Continue
-        }
-        KeyCode::Char('?') => {
-            ui.mode = UiMode::Help;
-            KeyResult::Continue
-        }
-        KeyCode::Char('r') if total > 0 => {
-            ui.mode = UiMode::Rename;
-            ui.rename_text.clear();
-            KeyResult::Continue
-        }
-        KeyCode::Enter if total > 0 => KeyResult::Focus,
-        KeyCode::Char('g') if total > 0 => KeyResult::RequestConfigGen,
-        // PRD #92 F2 (PRD #18 follow-through): y / n approve / deny permission.
-        // Only fires when the selected card is in `WaitingForInput` — any
-        // other status, or no card selected, no-ops silently so y / n don't
-        // accidentally clobber some future keybinding. `KeyModifiers::NONE`
-        // is required so Ctrl+n (new pane, handled in the outer dispatch
-        // loop) still wins.
-        KeyCode::Char('y')
-            if total > 0
-                && key.modifiers == KeyModifiers::NONE
-                && selected_status == Some(SessionStatus::WaitingForInput) =>
-        {
-            KeyResult::SendPermissionResponse(true)
-        }
-        KeyCode::Char('n')
-            if total > 0
-                && key.modifiers == KeyModifiers::NONE
-                && selected_status == Some(SessionStatus::WaitingForInput) =>
-        {
-            KeyResult::SendPermissionResponse(false)
-        }
-        KeyCode::Esc => {
-            if !ui.filter_text.is_empty() {
-                ui.filter_text.clear();
-            }
-            KeyResult::Continue
-        }
-        _ => KeyResult::Continue,
+        return KeyResult::Continue;
     }
+    if kb.matches(Action::MoveUp, &key) || key.code == KeyCode::Up {
+        if total > 0 {
+            ui.selected_index = (ui.selected_index + total - 1) % total;
+        }
+        return KeyResult::Continue;
+    }
+    // move_left / move_right (defaults h / l) are handled in the main loop for
+    // tab switching.
+    if kb.matches(Action::Filter, &key) {
+        ui.mode = UiMode::Filter;
+        ui.filter_text.clear();
+        return KeyResult::Continue;
+    }
+    if kb.matches(Action::Help, &key) {
+        ui.mode = UiMode::Help;
+        return KeyResult::Continue;
+    }
+    if kb.matches(Action::Rename, &key) && total > 0 {
+        ui.mode = UiMode::Rename;
+        ui.rename_text.clear();
+        return KeyResult::Continue;
+    }
+    if kb.matches(Action::FocusPane, &key) && total > 0 {
+        return KeyResult::Focus;
+    }
+    // `g` generates a project config — not part of the PRD #40 action set, so
+    // it stays hardcoded.
+    if key.code == KeyCode::Char('g') && total > 0 {
+        return KeyResult::RequestConfigGen;
+    }
+    // PRD #92 F2 (PRD #18 follow-through): approve / deny permission. Only
+    // fires when the selected card is in `WaitingForInput` — any other status,
+    // or no card selected, no-ops silently. The bindings (defaults y / n)
+    // carry their own modifier requirement via `matches`, so Ctrl+n (new
+    // pane, handled in the outer dispatch loop) still wins.
+    if kb.matches(Action::ApprovePermission, &key)
+        && total > 0
+        && selected_status == Some(SessionStatus::WaitingForInput)
+    {
+        return KeyResult::SendPermissionResponse(true);
+    }
+    if kb.matches(Action::DenyPermission, &key)
+        && total > 0
+        && selected_status == Some(SessionStatus::WaitingForInput)
+    {
+        return KeyResult::SendPermissionResponse(false);
+    }
+    if kb.matches(Action::ClearFilter, &key) {
+        if !ui.filter_text.is_empty() {
+            ui.filter_text.clear();
+        }
+        return KeyResult::Continue;
+    }
+    KeyResult::Continue
 }
 
 fn handle_filter_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
@@ -2700,6 +2722,7 @@ pub fn run_tui(
     pane: Arc<dyn PaneController>,
     config: DashboardConfig,
     palette: ColorPalette,
+    keybindings: KeybindingConfig,
     continue_session: bool,
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
@@ -2722,7 +2745,7 @@ pub fn run_tui(
 
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
-    let mut ui = UiState::new(config, palette);
+    let mut ui = UiState::new(config, palette, keybindings);
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -4274,13 +4297,39 @@ pub fn run_tui(
                 continue;
             }
 
-            // 1..9 in Normal mode: jump to card N and focus its pane
+            // PRD #40: snapshot the active keybindings for this keypress so
+            // the (mutable) `ui` borrows below don't fight an immutable borrow
+            // of `ui.keybindings`. Cheap (a small HashMap) and the config is
+            // immutable for the session.
+            let kb = ui.keybindings.clone();
+
+            // PRD #40 safety net: Ctrl+C is non-overridable and is NEVER
+            // routed through the config dispatch — it falls through to the
+            // mode-specific handlers (which open the quit flow). This guards
+            // every config-driven block below so a user binding like
+            // `new_pane = "Ctrl+C"` can't hijack the emergency quit.
+            let is_ctrl_c =
+                key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+
+            // Jump-to-card actions in Normal mode (defaults: 1..9): focus the
+            // Nth card's pane. Resolved from config so the digits can be
+            // remapped.
             let mut shortcut_handled = false;
-            if ui.mode == UiMode::Normal
-                && let KeyCode::Char(c @ '1'..='9') = key.code
-                && key.modifiers == KeyModifiers::NONE
+            const JUMP_ACTIONS: [Action; 9] = [
+                Action::Jump1,
+                Action::Jump2,
+                Action::Jump3,
+                Action::Jump4,
+                Action::Jump5,
+                Action::Jump6,
+                Action::Jump7,
+                Action::Jump8,
+                Action::Jump9,
+            ];
+            if !is_ctrl_c
+                && ui.mode == UiMode::Normal
+                && let Some(idx) = JUMP_ACTIONS.iter().position(|a| kb.matches(*a, &key))
             {
-                let idx = (c as usize) - ('1' as usize);
                 // Dismiss idle art on the target card
                 if let Some((sid, _)) = filtered.get(idx)
                     && let Some(entry) = ui.idle_art_cache.get_mut(*sid)
@@ -4294,14 +4343,18 @@ pub fn run_tui(
             }
 
             // ---------------------------------------------------------------
-            // Global Ctrl+key shortcuts (work from any mode / future pane focus)
+            // Global configurable shortcuts (PRD #40): resolved client-side
+            // from the keybinding config so they work from any mode and can be
+            // remapped to any chord (not just Ctrl+key). Ctrl+C is excluded
+            // (`is_ctrl_c`) so it can never be hijacked away from the quit flow.
             // ---------------------------------------------------------------
-            if !shortcut_handled && key.modifiers.contains(KeyModifiers::CONTROL) {
-                match key.code {
-                    // Ctrl+d: enter Normal (command) mode, stay on current tab
-                    KeyCode::Char('d') => {
+            if !shortcut_handled && !is_ctrl_c {
+                // dashboard (command mode) — default Ctrl+d
+                if kb.matches(Action::Dashboard, &key) {
+                    {
                         // Re-suppress the prompt in reactive panes when
                         // leaving PaneInput so automated output stays clean.
+                        // (inner block kept to preserve original arm body)
                         if ui.mode == UiMode::PaneInput
                             && let Some(embedded) =
                                 pane.as_any().downcast_ref::<EmbeddedPaneController>()
@@ -4318,44 +4371,44 @@ pub fn run_tui(
                         ui.status_message = None;
                         shortcut_handled = true;
                     }
-                    // Ctrl+t: toggle layout
-                    KeyCode::Char('t') => {
-                        ui.pane_layout = match ui.pane_layout {
-                            PaneLayout::Stacked => PaneLayout::Tiled,
-                            PaneLayout::Tiled => PaneLayout::Stacked,
-                        };
-                        let mode_name = match ui.pane_layout {
-                            PaneLayout::Stacked => "stacked",
-                            PaneLayout::Tiled => "tiled",
-                        };
-                        // PRD #76 M2.15 fixup F2: route through the same
-                        // SSOT sweep helpers that handle spawn / tab-switch
-                        // resize, so a layout toggle can't end up with a
-                        // different geometry than the rest of the
-                        // codebase. The previous inline math used 67%
-                        // (dashboard) for the non-mode-tab branch, which
-                        // silently produced a 1-col-wider PTY for
-                        // orchestration tabs (66%); it also skipped the
-                        // `show_tab_bar` chrome accounting.
-                        let frame_area = terminal.get_frame().area();
-                        if tab_manager.active_mode_name().is_some() {
-                            resize_mode_tab_panes(&*pane, &tab_manager, frame_area);
-                        } else {
-                            resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
-                        }
-                        ui.status_message =
-                            Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
-                        shortcut_handled = true;
+                } else if kb.matches(Action::ToggleLayout, &key) {
+                    // toggle layout (stacked/tiled) — default Ctrl+t
+                    ui.pane_layout = match ui.pane_layout {
+                        PaneLayout::Stacked => PaneLayout::Tiled,
+                        PaneLayout::Tiled => PaneLayout::Stacked,
+                    };
+                    let mode_name = match ui.pane_layout {
+                        PaneLayout::Stacked => "stacked",
+                        PaneLayout::Tiled => "tiled",
+                    };
+                    // PRD #76 M2.15 fixup F2: route through the same
+                    // SSOT sweep helpers that handle spawn / tab-switch
+                    // resize, so a layout toggle can't end up with a
+                    // different geometry than the rest of the
+                    // codebase. The previous inline math used 67%
+                    // (dashboard) for the non-mode-tab branch, which
+                    // silently produced a 1-col-wider PTY for
+                    // orchestration tabs (66%); it also skipped the
+                    // `show_tab_bar` chrome accounting.
+                    let frame_area = terminal.get_frame().area();
+                    if tab_manager.active_mode_name().is_some() {
+                        resize_mode_tab_panes(&*pane, &tab_manager, frame_area);
+                    } else {
+                        resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
                     }
-                    // Ctrl+n: new pane (open directory picker)
-                    KeyCode::Char('n') => {
-                        ui.mode = UiMode::DirPicker;
-                        ui.dir_picker = Some(DirPickerState::new(
-                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-                        ));
-                        shortcut_handled = true;
-                    }
-                    // Ctrl+w: close selected pane (or entire mode tab if it's the agent pane)
+                    ui.status_message =
+                        Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
+                    shortcut_handled = true;
+                } else if kb.matches(Action::NewPane, &key) {
+                    // new pane (open directory picker) — default Ctrl+n
+                    ui.mode = UiMode::DirPicker;
+                    ui.dir_picker = Some(DirPickerState::new(
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+                    ));
+                    shortcut_handled = true;
+                } else if kb.matches(Action::ClosePane, &key) {
+                    // close selected pane (or entire mode tab if it's the agent
+                    // pane) — default Ctrl+w
                     //
                     // PRD #92 F4: previously the result of `close_pane` was
                     // discarded with `let _ =` and the card / session was
@@ -4370,134 +4423,139 @@ pub fn run_tui(
                     // consume `CloseTabOutcome::closed` to remove
                     // successfully-closed cards and `CloseTabOutcome::failed`
                     // to keep failed cards with a status-bar summary.
-                    KeyCode::Char('w') => {
-                        if let Some(sid) =
-                            filtered.get(ui.selected_index).map(|(id, _)| (*id).clone())
-                            && let Some(session) = snapshot.sessions.get(&sid)
-                            && let Some(ref pane_id) = session.pane_id
-                        {
-                            let closed_pane_id = pane_id.clone();
-                            // Check if this pane belongs to a mode or orchestration tab.
-                            let mode_tab_idx = tab_manager
-                                .tab_index_for_agent_pane(pane_id)
-                                .or_else(|| tab_manager.tab_index_for_pane(pane_id));
-                            if let Some(tab_idx) = mode_tab_idx {
-                                // Close the entire tab (agent + side panes, or all role panes).
-                                // close_tab returns a per-pane outcome — successful closes
-                                // get their cards removed, failed closes keep theirs.
-                                match tab_manager.close_tab(tab_idx) {
-                                    Ok(outcome) => {
-                                        let mut st = state.blocking_write();
-                                        for id in &outcome.closed {
-                                            st.unregister_pane(id);
-                                        }
-                                        // Remove sessions whose pane_id is in the closed set ONLY.
-                                        // Failed panes retain their sessions so the user can retry.
-                                        let closed_set: std::collections::HashSet<&str> =
-                                            outcome.closed.iter().map(String::as_str).collect();
-                                        st.sessions.retain(|_, s| {
-                                            s.pane_id.as_ref().is_none_or(|pid| {
-                                                !closed_set.contains(pid.as_str())
-                                            })
-                                        });
-                                        drop(st);
-                                        // Clean pane_metadata only for the successfully-closed panes.
-                                        for id in &outcome.closed {
-                                            ui.pane_metadata.remove(id);
-                                        }
-                                        if outcome.is_clean() {
-                                            ui.status_message = Some((
-                                                format!(
-                                                    "Closed tab containing pane {closed_pane_id}"
-                                                ),
-                                                std::time::Instant::now(),
-                                            ));
-                                        } else {
-                                            // List which panes failed plus the first error so the
-                                            // status bar stays readable (single-line). Full per-pane
-                                            // errors are tracing-logged for the daemon log.
-                                            let failed_ids: Vec<&str> = outcome
-                                                .failed
-                                                .iter()
-                                                .map(|(id, _)| id.as_str())
-                                                .collect();
-                                            let first_err = outcome
-                                                .failed
-                                                .first()
-                                                .map(|(_, e)| e.as_str())
-                                                .unwrap_or("");
-                                            for (id, e) in &outcome.failed {
-                                                tracing::warn!(
-                                                    pane_id = %id,
-                                                    error = %e,
-                                                    "F4: close_pane failed during tab teardown — card preserved"
-                                                );
-                                            }
-                                            ui.status_message = Some((
-                                                format!(
-                                                    "Close partially failed for {} pane(s) — first error: {first_err}",
-                                                    failed_ids.len()
-                                                ),
-                                                std::time::Instant::now(),
-                                            ));
-                                        }
-                                        let area = terminal.get_frame().area();
-                                        resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                    if let Some(sid) = filtered.get(ui.selected_index).map(|(id, _)| (*id).clone())
+                        && let Some(session) = snapshot.sessions.get(&sid)
+                        && let Some(ref pane_id) = session.pane_id
+                    {
+                        let closed_pane_id = pane_id.clone();
+                        // Check if this pane belongs to a mode or orchestration tab.
+                        let mode_tab_idx = tab_manager
+                            .tab_index_for_agent_pane(pane_id)
+                            .or_else(|| tab_manager.tab_index_for_pane(pane_id));
+                        if let Some(tab_idx) = mode_tab_idx {
+                            // Close the entire tab (agent + side panes, or all role panes).
+                            // close_tab returns a per-pane outcome — successful closes
+                            // get their cards removed, failed closes keep theirs.
+                            match tab_manager.close_tab(tab_idx) {
+                                Ok(outcome) => {
+                                    let mut st = state.blocking_write();
+                                    for id in &outcome.closed {
+                                        st.unregister_pane(id);
                                     }
-                                    Err(e) => {
+                                    // Remove sessions whose pane_id is in the closed set ONLY.
+                                    // Failed panes retain their sessions so the user can retry.
+                                    let closed_set: std::collections::HashSet<&str> =
+                                        outcome.closed.iter().map(String::as_str).collect();
+                                    st.sessions.retain(|_, s| {
+                                        s.pane_id
+                                            .as_ref()
+                                            .is_none_or(|pid| !closed_set.contains(pid.as_str()))
+                                    });
+                                    drop(st);
+                                    // Clean pane_metadata only for the successfully-closed panes.
+                                    for id in &outcome.closed {
+                                        ui.pane_metadata.remove(id);
+                                    }
+                                    if outcome.is_clean() {
                                         ui.status_message = Some((
-                                            format!("Failed to close tab: {e}"),
+                                            format!("Closed tab containing pane {closed_pane_id}"),
                                             std::time::Instant::now(),
                                         ));
-                                    }
-                                }
-                            } else {
-                                // Plain dashboard pane — close just this one and inspect
-                                // the result. On Err the controller has already restored
-                                // the local pane state (see EmbeddedPaneController::close_pane),
-                                // so we leave the card / session in place for retry.
-                                match pane.close_pane(pane_id) {
-                                    Ok(()) => {
-                                        let mut st = state.blocking_write();
-                                        st.sessions.remove(&sid);
-                                        st.unregister_pane(&closed_pane_id);
-                                        drop(st);
-                                        ui.pane_metadata.remove(&closed_pane_id);
-                                        ui.status_message = Some((
-                                            format!("Closed pane {closed_pane_id}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            pane_id = %closed_pane_id,
-                                            error = %e,
-                                            "F4: close_pane failed — card preserved for retry"
-                                        );
+                                    } else {
+                                        // List which panes failed plus the first error so the
+                                        // status bar stays readable (single-line). Full per-pane
+                                        // errors are tracing-logged for the daemon log.
+                                        let failed_ids: Vec<&str> = outcome
+                                            .failed
+                                            .iter()
+                                            .map(|(id, _)| id.as_str())
+                                            .collect();
+                                        let first_err = outcome
+                                            .failed
+                                            .first()
+                                            .map(|(_, e)| e.as_str())
+                                            .unwrap_or("");
+                                        for (id, e) in &outcome.failed {
+                                            tracing::warn!(
+                                                pane_id = %id,
+                                                error = %e,
+                                                "F4: close_pane failed during tab teardown — card preserved"
+                                            );
+                                        }
                                         ui.status_message = Some((
                                             format!(
-                                                "Failed to close pane {closed_pane_id}: {e} — press Ctrl+W to retry"
+                                                "Close partially failed for {} pane(s) — first error: {first_err}",
+                                                failed_ids.len()
                                             ),
                                             std::time::Instant::now(),
                                         ));
                                     }
+                                    let area = terminal.get_frame().area();
+                                    resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                                }
+                                Err(e) => {
+                                    ui.status_message = Some((
+                                        format!("Failed to close tab: {e}"),
+                                        std::time::Instant::now(),
+                                    ));
                                 }
                             }
-                            if ui.mode == UiMode::PaneInput {
-                                ui.mode = UiMode::Normal;
-                            }
-                            // Clamp selected_index so it doesn't point past
-                            // the now-shorter card list. (Only meaningful if
-                            // at least one pane was actually removed; on a
-                            // pure-failure close the card count is unchanged
-                            // and this is a no-op since selected_index
-                            // already points at the (preserved) card.)
-                            if ui.selected_index > 0 {
-                                ui.selected_index = ui.selected_index.saturating_sub(1);
+                        } else {
+                            // Plain dashboard pane — close just this one and inspect
+                            // the result. On Err the controller has already restored
+                            // the local pane state (see EmbeddedPaneController::close_pane),
+                            // so we leave the card / session in place for retry.
+                            match pane.close_pane(pane_id) {
+                                Ok(()) => {
+                                    let mut st = state.blocking_write();
+                                    st.sessions.remove(&sid);
+                                    st.unregister_pane(&closed_pane_id);
+                                    drop(st);
+                                    ui.pane_metadata.remove(&closed_pane_id);
+                                    ui.status_message = Some((
+                                        format!("Closed pane {closed_pane_id}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        pane_id = %closed_pane_id,
+                                        error = %e,
+                                        "F4: close_pane failed — card preserved for retry"
+                                    );
+                                    ui.status_message = Some((
+                                        format!(
+                                            "Failed to close pane {closed_pane_id}: {e} — press Ctrl+W to retry"
+                                        ),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
                             }
                         }
-                        shortcut_handled = true;
+                        if ui.mode == UiMode::PaneInput {
+                            ui.mode = UiMode::Normal;
+                        }
+                        // Clamp selected_index so it doesn't point past
+                        // the now-shorter card list. (Only meaningful if
+                        // at least one pane was actually removed; on a
+                        // pure-failure close the card count is unchanged
+                        // and this is a no-op since selected_index
+                        // already points at the (preserved) card.)
+                        if ui.selected_index > 0 {
+                            ui.selected_index = ui.selected_index.saturating_sub(1);
+                        }
                     }
+                    shortcut_handled = true;
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // Non-configurable global tab navigation: Ctrl+PageUp / PageDown
+            // (not part of the PRD #40 action set — kept hardcoded under the
+            // CONTROL gate).
+            // ---------------------------------------------------------------
+            if !shortcut_handled && key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
                     // Ctrl+PageDown: next tab
                     KeyCode::PageDown => {
                         if tab_manager.show_tab_bar() {
@@ -4530,46 +4588,56 @@ pub fn run_tui(
                 }
             }
 
-            // Tab / Shift+Tab / Left / Right / h / l: cycle tabs in Normal mode
-            if !shortcut_handled && ui.mode == UiMode::Normal {
-                match key.code {
-                    KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                        let count = tab_manager.tab_count();
-                        if count > 0 {
-                            let prev_idx = tab_manager.active_index();
-                            let next = (prev_idx + 1) % count;
-                            tab_manager.switch_to(next);
-                            if prev_idx != tab_manager.active_index() {
-                                let area = terminal.get_frame().area();
-                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
-                                resize_mode_tab_panes(&*pane, &tab_manager, area);
-                            }
+            // Cycle tabs in Normal mode. The configurable move_right /
+            // move_left actions (defaults `l` / `h`) drive this, alongside the
+            // non-configurable Tab / Shift+Tab / Right / Left aliases that are
+            // kept hardcoded so default navigation is byte-for-byte unchanged.
+            // `!is_ctrl_c` keeps Ctrl+C out of this config-dispatch path too
+            // (e.g. move_left = "Ctrl+C" must never switch tabs) so the
+            // non-overridable quit safety net always wins.
+            if !shortcut_handled && !is_ctrl_c && ui.mode == UiMode::Normal {
+                let go_next = kb.matches(Action::MoveRight, &key)
+                    || matches!(key.code, KeyCode::Tab | KeyCode::Right);
+                let go_prev = kb.matches(Action::MoveLeft, &key)
+                    || matches!(key.code, KeyCode::BackTab | KeyCode::Left);
+                if go_next {
+                    let count = tab_manager.tab_count();
+                    if count > 0 {
+                        let prev_idx = tab_manager.active_index();
+                        let next = (prev_idx + 1) % count;
+                        tab_manager.switch_to(next);
+                        if prev_idx != tab_manager.active_index() {
+                            let area = terminal.get_frame().area();
+                            resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                            resize_mode_tab_panes(&*pane, &tab_manager, area);
                         }
-                        shortcut_handled = true;
                     }
-                    KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                        let count = tab_manager.tab_count();
-                        if count > 0 {
-                            let prev_idx = tab_manager.active_index();
-                            let prev = (prev_idx + count - 1) % count;
-                            tab_manager.switch_to(prev);
-                            if prev_idx != tab_manager.active_index() {
-                                let area = terminal.get_frame().area();
-                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
-                                resize_mode_tab_panes(&*pane, &tab_manager, area);
-                            }
+                    shortcut_handled = true;
+                } else if go_prev {
+                    let count = tab_manager.tab_count();
+                    if count > 0 {
+                        let prev_idx = tab_manager.active_index();
+                        let prev = (prev_idx + count - 1) % count;
+                        tab_manager.switch_to(prev);
+                        if prev_idx != tab_manager.active_index() {
+                            let area = terminal.get_frame().area();
+                            resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                            resize_mode_tab_panes(&*pane, &tab_manager, area);
                         }
-                        shortcut_handled = true;
                     }
-                    _ => {}
+                    shortcut_handled = true;
                 }
             }
 
             let selected_id: Option<String> =
                 filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
 
-            // On a mode tab in Normal mode, j/k navigate side panes, Enter focuses, Esc resets.
+            // On a mode tab in Normal mode, move_down/move_up (defaults j/k,
+            // plus the Down/Up arrows) navigate side panes, Enter focuses, Esc
+            // resets. `!is_ctrl_c` keeps the quit safety net non-overridable
+            // here too.
             if !shortcut_handled
+                && !is_ctrl_c
                 && ui.mode == UiMode::Normal
                 && let Tab::Mode {
                     focused_side_pane_index,
@@ -4580,86 +4648,79 @@ pub fn run_tui(
             {
                 let side_ids = mode_manager.managed_pane_ids();
                 let side_count = side_ids.len();
-                match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        *focused_side_pane_index = match *focused_side_pane_index {
-                            None => {
-                                if side_count > 0 {
-                                    Some(0)
-                                } else {
-                                    None
-                                }
+                if kb.matches(Action::MoveDown, &key) || key.code == KeyCode::Down {
+                    *focused_side_pane_index = match *focused_side_pane_index {
+                        None => {
+                            if side_count > 0 {
+                                Some(0)
+                            } else {
+                                None
                             }
-                            Some(i) if i + 1 < side_count => Some(i + 1),
-                            Some(_) => None, // wrap back to agent pane
-                        };
-                        // Sync embedded controller focus so the visual highlight
-                        // matches (prevents stale cyan border on a previous pane).
-                        let focus_id = match *focused_side_pane_index {
-                            None => agent_pane_id.clone(),
-                            Some(i) => side_ids
-                                .get(i)
-                                .cloned()
-                                .unwrap_or_else(|| agent_pane_id.clone()),
-                        };
-                        let _ = pane.focus_pane(&focus_id);
-                        shortcut_handled = true;
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        *focused_side_pane_index = match *focused_side_pane_index {
-                            None => {
-                                if side_count > 0 {
-                                    Some(side_count - 1)
-                                } else {
-                                    None
-                                }
-                            }
-                            Some(0) => None,
-                            Some(i) => Some(i - 1),
-                        };
-                        let focus_id = match *focused_side_pane_index {
-                            None => agent_pane_id.clone(),
-                            Some(i) => side_ids
-                                .get(i)
-                                .cloned()
-                                .unwrap_or_else(|| agent_pane_id.clone()),
-                        };
-                        let _ = pane.focus_pane(&focus_id);
-                        shortcut_handled = true;
-                    }
-                    KeyCode::Enter => {
-                        let target_pane_id = match *focused_side_pane_index {
-                            None => agent_pane_id.clone(),
-                            Some(i) => side_ids
-                                .get(i)
-                                .cloned()
-                                .unwrap_or_else(|| agent_pane_id.clone()),
-                        };
-                        let is_reactive = mode_manager.is_reactive_pane(&target_pane_id);
-                        if pane.focus_pane(&target_pane_id).is_ok() {
-                            ui.mode = UiMode::PaneInput;
-                            // Restore a minimal prompt so the user can
-                            // interact with the shell in this reactive pane.
-                            if is_reactive {
-                                let _ = pane.write_to_pane(
-                                    &target_pane_id,
-                                    "export PS1='$ ' PS2='> ' PROMPT='$ '",
-                                );
-                            }
-                            ui.status_message = Some((
-                                "PaneInput mode — type to interact, Ctrl+d for dashboard"
-                                    .to_string(),
-                                std::time::Instant::now(),
-                            ));
                         }
-                        shortcut_handled = true;
+                        Some(i) if i + 1 < side_count => Some(i + 1),
+                        Some(_) => None, // wrap back to agent pane
+                    };
+                    // Sync embedded controller focus so the visual highlight
+                    // matches (prevents stale cyan border on a previous pane).
+                    let focus_id = match *focused_side_pane_index {
+                        None => agent_pane_id.clone(),
+                        Some(i) => side_ids
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| agent_pane_id.clone()),
+                    };
+                    let _ = pane.focus_pane(&focus_id);
+                    shortcut_handled = true;
+                } else if kb.matches(Action::MoveUp, &key) || key.code == KeyCode::Up {
+                    *focused_side_pane_index = match *focused_side_pane_index {
+                        None => {
+                            if side_count > 0 {
+                                Some(side_count - 1)
+                            } else {
+                                None
+                            }
+                        }
+                        Some(0) => None,
+                        Some(i) => Some(i - 1),
+                    };
+                    let focus_id = match *focused_side_pane_index {
+                        None => agent_pane_id.clone(),
+                        Some(i) => side_ids
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| agent_pane_id.clone()),
+                    };
+                    let _ = pane.focus_pane(&focus_id);
+                    shortcut_handled = true;
+                } else if key.code == KeyCode::Enter {
+                    let target_pane_id = match *focused_side_pane_index {
+                        None => agent_pane_id.clone(),
+                        Some(i) => side_ids
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| agent_pane_id.clone()),
+                    };
+                    let is_reactive = mode_manager.is_reactive_pane(&target_pane_id);
+                    if pane.focus_pane(&target_pane_id).is_ok() {
+                        ui.mode = UiMode::PaneInput;
+                        // Restore a minimal prompt so the user can
+                        // interact with the shell in this reactive pane.
+                        if is_reactive {
+                            let _ = pane.write_to_pane(
+                                &target_pane_id,
+                                "export PS1='$ ' PS2='> ' PROMPT='$ '",
+                            );
+                        }
+                        ui.status_message = Some((
+                            "PaneInput mode — type to interact, Ctrl+d for dashboard".to_string(),
+                            std::time::Instant::now(),
+                        ));
                     }
-                    KeyCode::Esc => {
-                        *focused_side_pane_index = None;
-                        let _ = pane.focus_pane(agent_pane_id);
-                        shortcut_handled = true;
-                    }
-                    _ => {}
+                    shortcut_handled = true;
+                } else if key.code == KeyCode::Esc {
+                    *focused_side_pane_index = None;
+                    let _ = pane.focus_pane(agent_pane_id);
+                    shortcut_handled = true;
                 }
             }
 
@@ -5780,7 +5841,7 @@ fn render_overlays(
     palette: ColorPalette,
 ) {
     if ui.mode == UiMode::Help {
-        render_help_overlay(frame, active_mode_name, palette);
+        render_help_overlay(frame, &ui.keybindings, active_mode_name, palette);
     }
     if ui.mode == UiMode::DirPicker
         && let Some(picker) = ui.dir_picker.as_mut()
@@ -6186,9 +6247,7 @@ fn render_bottom_bar(
                         "j/k: navigate panes  Enter: interact  Esc: agent pane  {MOD_KEY}+w: close tab  ?: help  {MOD_KEY}+c: quit{tab_hint}"
                     )
                 } else if has_pane_control {
-                    format!(
-                        "{MOD_KEY}+n: new  {MOD_KEY}+w: close  {MOD_KEY}+t: layout  {MOD_KEY}+d: dashboard (1-9 ? /)  {MOD_KEY}+c: quit{tab_hint}"
-                    )
+                    format!("{}{tab_hint}", dashboard_hints_string(&ui.keybindings))
                 } else {
                     format!("?: help  1-9: jump  {MOD_KEY}+c: quit{tab_hint}")
                 };
@@ -6476,53 +6535,179 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize, palette: ColorPa
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_help_overlay(frame: &mut Frame, active_mode_name: Option<&str>, palette: ColorPalette) {
+/// Format one help row: a key column (left-padded to a fixed width so the
+/// description column lines up) followed by the description. PRD #40 — the
+/// key column is sourced from the active [`KeybindingConfig`] so the overlay
+/// always reflects the user's real bindings.
+fn help_key_line(keys: &str, desc: &str) -> Line<'static> {
+    Line::from(format!("  {keys:<18} {desc}"))
+}
+
+/// PRD #40: build the dashboard hints-bar text from the active keybinding
+/// config. With the default config this reproduces the previous hardcoded
+/// string byte-for-byte (`Ctrl+n: new  …  Ctrl+c: quit`); a remapped action
+/// shows the user's key (e.g. `Alt+Shift+l: layout`). Single source of truth
+/// for both the live hints bar (`render_bottom_bar`) and the standalone
+/// [`render_hints_bar_to_buffer`] snapshot entrypoint.
+fn dashboard_hints_string(keybindings: &KeybindingConfig) -> String {
+    format!(
+        "{}: new  {}: close  {}: layout  {}: dashboard (1-9 {} {})  {}: quit",
+        keybindings.notation(Action::NewPane),
+        keybindings.notation(Action::ClosePane),
+        keybindings.notation(Action::ToggleLayout),
+        keybindings.notation(Action::Dashboard),
+        keybindings.notation(Action::Help),
+        keybindings.notation(Action::Filter),
+        keybindings.notation(Action::Quit),
+    )
+}
+
+/// PRD #40 (L1 `keybindings/help/001`): render the help overlay against an
+/// arbitrary [`KeybindingConfig`] into a standalone `Buffer` for snapshot
+/// testing. Mirrors [`render_card_to_buffer`] — a `TestBackend` of the given
+/// size, drawn through the *same* `render_help_overlay` code path the live UI
+/// uses, so the snapshot and the running overlay can never drift.
+pub fn render_help_overlay_to_buffer(
+    keybindings: &KeybindingConfig,
+    active_mode_name: Option<&str>,
+    palette: ColorPalette,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            render_help_overlay(frame, keybindings, active_mode_name, palette);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #40 (L1 `keybindings/hints/001`): render the dashboard hints bar
+/// against an arbitrary [`KeybindingConfig`] into a standalone `Buffer` for
+/// snapshot testing. Uses the shared [`dashboard_hints_string`] builder so the
+/// snapshot matches the live bar's content.
+pub fn render_hints_bar_to_buffer(
+    keybindings: &KeybindingConfig,
+    palette: ColorPalette,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let hints = dashboard_hints_string(keybindings);
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            let line = Line::from(Span::styled(
+                hints,
+                Style::default().fg(palette.text_secondary),
+            ));
+            frame.render_widget(Paragraph::new(line), area);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+fn render_help_overlay(
+    frame: &mut Frame,
+    keybindings: &KeybindingConfig,
+    active_mode_name: Option<&str>,
+    palette: ColorPalette,
+) {
     let cyan = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
 
+    // PRD #40: notation for a remappable action, or "(unbound)" when the user
+    // has cleared the binding (`action = ""`), so the overlay is honest about
+    // a key that no longer fires.
+    let n = |action: Action| -> String {
+        let s = keybindings.notation(action);
+        if s.is_empty() {
+            "(unbound)".to_string()
+        } else {
+            s
+        }
+    };
+
     let left: Vec<Line> = vec![
         Line::styled("  Global (works from any pane)", cyan),
         Line::from(""),
-        Line::from(format!("  {MOD_KEY}+d           Command mode (dashboard)")),
-        Line::from(format!("  {MOD_KEY}+n           Create new pane")),
-        Line::from(format!("  {MOD_KEY}+w           Close selected pane")),
-        Line::from(format!(
-            "  {MOD_KEY}+t           Toggle layout (stacked/tiled)"
-        )),
-        Line::from(format!("  {MOD_KEY}+c           Quit")),
+        help_key_line(&n(Action::Dashboard), "Command mode (dashboard)"),
+        help_key_line(&n(Action::NewPane), "Create new pane"),
+        help_key_line(&n(Action::ClosePane), "Close selected pane"),
+        help_key_line(&n(Action::ToggleLayout), "Toggle layout (stacked/tiled)"),
+        help_key_line(&n(Action::Quit), "Quit"),
         Line::from(""),
         Line::styled("  Tab Navigation", cyan),
         Line::from(""),
-        Line::from("  Tab / Right / l       Next tab"),
-        Line::from("  Shift+Tab / Left / h  Prev tab"),
-        Line::from(format!("  {MOD_KEY}+PgDn            Next tab")),
-        Line::from(format!("  {MOD_KEY}+PgUp            Prev tab")),
+        help_key_line(
+            &format!("Tab / Right / {}", n(Action::MoveRight)),
+            "Next tab",
+        ),
+        help_key_line(
+            &format!("Shift+Tab / Left / {}", n(Action::MoveLeft)),
+            "Prev tab",
+        ),
+        help_key_line(&format!("{MOD_KEY}+PgDn"), "Next tab"),
+        help_key_line(&format!("{MOD_KEY}+PgUp"), "Prev tab"),
         Line::from(""),
         Line::styled("  Dashboard (command mode)", cyan),
         Line::from(""),
-        Line::from("  j / Down        Select next card"),
-        Line::from("  k / Up          Select previous card"),
-        Line::from("  1-9             Jump to pane N"),
-        Line::from("  Enter           Focus selected pane"),
-        Line::from("  /               Filter sessions"),
-        Line::from("  Esc             Clear filter"),
-        Line::from("  r               Rename session"),
-        Line::from("  g               Generate .dot-agent-deck.toml"),
-        Line::from("  y / n           Approve / deny permission"),
-        Line::from("  ?               Toggle this help"),
+        help_key_line(
+            &format!("{} / Down", n(Action::MoveDown)),
+            "Select next card",
+        ),
+        help_key_line(
+            &format!("{} / Up", n(Action::MoveUp)),
+            "Select previous card",
+        ),
+        help_key_line("1-9", "Jump to pane N"),
+        help_key_line(&n(Action::FocusPane), "Focus selected pane"),
+        help_key_line(&n(Action::Filter), "Filter sessions"),
+        help_key_line(&n(Action::ClearFilter), "Clear filter"),
+        help_key_line(&n(Action::Rename), "Rename session"),
+        help_key_line("g", "Generate .dot-agent-deck.toml"),
+        help_key_line(
+            &format!(
+                "{} / {}",
+                n(Action::ApprovePermission),
+                n(Action::DenyPermission)
+            ),
+            "Approve / deny permission",
+        ),
+        help_key_line(&n(Action::Help), "Toggle this help"),
     ];
 
     let mut right: Vec<Line> = vec![
         Line::styled("  Mode Tab (in-tab navigation)", cyan),
         Line::from(""),
-        Line::from("  j / Down        Focus next pane"),
-        Line::from("  k / Up          Focus previous pane"),
+        help_key_line(
+            &format!("{} / Down", n(Action::MoveDown)),
+            "Focus next pane",
+        ),
+        help_key_line(
+            &format!("{} / Up", n(Action::MoveUp)),
+            "Focus previous pane",
+        ),
         Line::from("  Enter           Enter PaneInput on selected"),
         Line::from("  Esc             Deselect side pane"),
         Line::from("  Mouse click     Focus pane"),
         Line::from("  Ctrl+click      Open hyperlink"),
-        Line::from(format!("  {MOD_KEY}+d            Return to Normal mode")),
+        help_key_line(&n(Action::Dashboard), "Return to Normal mode"),
         Line::from(""),
         Line::styled("  New Agent Form", cyan),
         Line::from(""),
