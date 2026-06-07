@@ -17,7 +17,10 @@
 
 use dot_agent_deck::keybindings::{Action, KeybindingConfig, parse_binding};
 use dot_agent_deck::theme::{ColorPalette, Theme, resolve_palette};
-use dot_agent_deck::ui::{render_help_overlay_with_bindings_to_buffer, render_hints_bar_to_buffer};
+use dot_agent_deck::ui::{
+    render_button_bar_with_bindings_to_buffer, render_help_overlay_with_bindings_to_buffer,
+    render_hints_bar_to_buffer,
+};
 use spec::spec;
 
 /// Stringify the rendered buffer — one line per row, cells joined into
@@ -151,5 +154,47 @@ fn hints_002_unbound_action_not_bare() {
         !text.contains("  : "),
         "hints bar contains a bare '  : <label>' (empty key column) for some \
          unbound action. Text:\n{line:?}"
+    );
+}
+
+/// Scenario: Build a default `KeybindingConfig`, remap `new_pane` to
+/// `Alt+P` and `help` to `F1`, then render the prd-80 button bar against
+/// it. The bar's labels are derived from the active config, so the
+/// New-pane button must show the remapped `Alt+P` (never the default
+/// `Ctrl+N`) and the Help button must show `F1`. Asserts on the buffer
+/// text directly (no `insta` snapshot) so this guard needs no `.snap`
+/// accept step. Guards against a future refactor silently re-hardcoding
+/// the button labels.
+#[spec("keybindings/buttons/001")]
+#[test]
+fn buttons_001_bar_reflects_active_bindings() {
+    // PRD #40 catalog: keybindings/buttons/001 — the button bar labels
+    // track the active KeybindingConfig (remapped key shown, default not).
+    let mut config = KeybindingConfig::default();
+    config.set(
+        Action::NewPane,
+        parse_binding("Alt+P").expect("valid notation"),
+    );
+    config.set(Action::Help, parse_binding("F1").expect("valid notation"));
+    let palette: ColorPalette = resolve_palette(Theme::Dark);
+
+    // Width wide enough that the New-pane and Help buttons render in full.
+    let buffer = render_button_bar_with_bindings_to_buffer(&config, palette, 200, 1);
+    let text = buffer_to_text(&buffer);
+
+    assert!(
+        text.contains("Alt+P"),
+        "button bar must show the remapped New-pane key (Alt+P); labels were \
+         hardcoded?\n{text}"
+    );
+    assert!(
+        !text.contains("Ctrl+N"),
+        "button bar still shows the default New-pane key (Ctrl+N) after the \
+         action was remapped to Alt+P — labels are not config-derived.\n{text}"
+    );
+    assert!(
+        text.contains("F1"),
+        "button bar must show the remapped Help key (F1); labels were \
+         hardcoded?\n{text}"
     );
 }

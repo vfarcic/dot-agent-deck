@@ -909,6 +909,15 @@ without depending on the config struct API.
 - **Does not assert:** the exact placeholder wording beyond `(unbound)`, behaviour of other simultaneously-unbound actions, snapshot of the full bar.
 - **Platform coverage:** mac+linux+windows.
 
+#### keybindings/buttons
+
+##### keybindings/buttons/001 — The prd-80 button bar labels are derived from the active keybinding config.
+- **Layer:** L1 (ratatui `TestBackend`; asserts on buffer text, no `insta` snapshot).
+- **Agent:** none.
+- **Asserts:** rendered against a `KeybindingConfig` that remaps `new_pane` → `Alt+P` and `help` → `F1`, the button bar shows the remapped New-pane key `Alt+P` and Help key `F1`, and does NOT show the default New-pane key `Ctrl+N` — proving the button labels are generated from the active config, not hardcoded. Guards against a future refactor silently re-hardcoding the labels.
+- **Does not assert:** button positions/ordering, the non-remappable `Quit` button label (fixed `Ctrl+C`), truncation behaviour at narrow widths.
+- **Platform coverage:** mac+linux+windows.
+
 ### Error paths
 
 #### error/socket
