@@ -295,27 +295,52 @@ pub fn collect_tests_from_sources(
             Ok(p) => p,
             Err(e) => return Err(format!("parse {path}: {e}")),
         };
-        for item in &parsed.items {
-            if let syn::Item::Fn(item_fn) = item
-                && let Some(spec_id) = read_spec_attr(&item_fn.attrs)
-            {
-                let fn_name = item_fn.sig.ident.to_string();
-                let scenario = read_scenario_doc(&item_fn.attrs).unwrap_or_default();
-                let body_fingerprint = fingerprint_block(&item_fn.block);
-                out.insert(
-                    spec_id.clone(),
-                    TestEntry {
-                        spec_id,
-                        fn_name,
-                        file: path.clone(),
-                        scenario,
-                        body_fingerprint,
-                    },
-                );
-            }
-        }
+        // PRD #83: recurse into inline `mod` blocks so `#[spec]` tests
+        // that live inside `#[cfg(test)] mod tests { … }` (e.g. the
+        // `tabs/selection/*` unit tests in `src/tab.rs`) are found, not
+        // just top-level test fns in `tests/`. Mirrors the docs
+        // generator's `collect_spec_tests_from_items` walk.
+        collect_entries_from_items(&parsed.items, path, &mut out);
     }
     Ok(out)
+}
+
+/// Recurse through `items`, recording every `#[spec]`-annotated fn into
+/// `out`. Items inside inline `Item::Mod { content: Some(_) }` are
+/// walked the same way; external `mod foo;` declarations (no inline
+/// body) are skipped — resolving them would need a separate file read.
+fn collect_entries_from_items(
+    items: &[syn::Item],
+    path: &str,
+    out: &mut BTreeMap<String, TestEntry>,
+) {
+    for item in items {
+        match item {
+            syn::Item::Fn(item_fn) => {
+                if let Some(spec_id) = read_spec_attr(&item_fn.attrs) {
+                    let fn_name = item_fn.sig.ident.to_string();
+                    let scenario = read_scenario_doc(&item_fn.attrs).unwrap_or_default();
+                    let body_fingerprint = fingerprint_block(&item_fn.block);
+                    out.insert(
+                        spec_id.clone(),
+                        TestEntry {
+                            spec_id,
+                            fn_name,
+                            file: path.to_string(),
+                            scenario,
+                            body_fingerprint,
+                        },
+                    );
+                }
+            }
+            syn::Item::Mod(item_mod) => {
+                if let Some((_, nested_items)) = &item_mod.content {
+                    collect_entries_from_items(nested_items, path, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn read_spec_attr(attrs: &[syn::Attribute]) -> Option<String> {
@@ -580,9 +605,8 @@ fn git_ls_tree(reference: &str, path: &str) -> Result<Vec<String>, String> {
 }
 
 fn collect_tests_at_ref(reference: &str) -> Result<BTreeMap<String, TestEntry>, String> {
-    let files = git_ls_tree(reference, "tests")?;
     let mut sources: Vec<(String, String)> = Vec::new();
-    for f in files {
+    for f in git_ls_tree(reference, "tests")? {
         if !f.ends_with(".rs") {
             continue;
         }
@@ -594,27 +618,63 @@ fn collect_tests_at_ref(reference: &str) -> Result<BTreeMap<String, TestEntry>, 
         let body = git_show(reference, &f)?;
         sources.push((f, body));
     }
+    // src/ — PRD #83: the library crate can hold `#[spec]` tests too
+    // (e.g. `src/tab.rs`). Only keep files that carry a `#[spec(` so a
+    // ref's whole `src/` tree isn't syn-parsed, matching the on-disk and
+    // docs-generator approach. (Scanning `src/` at BOTH refs keeps a
+    // src-resident test that existed at merge-base out of the Created
+    // section and into Modified, as expected.)
+    for f in git_ls_tree(reference, "src")? {
+        if !f.ends_with(".rs") {
+            continue;
+        }
+        let body = git_show(reference, &f)?;
+        if !body.contains("#[spec(") {
+            continue;
+        }
+        sources.push((f, body));
+    }
     collect_tests_from_sources(&sources)
 }
 
 fn collect_tests_on_disk(root: &Path) -> Result<BTreeMap<String, TestEntry>, String> {
-    let tests_dir = root.join("tests");
     let mut sources: Vec<(String, String)> = Vec::new();
+    // tests/ — parse every .rs (minus the huge spec-less harness module).
+    let tests_dir = root.join("tests");
     walk_rs_files(&tests_dir, &mut |abs_path| {
         if abs_path.ends_with("common/mod.rs") {
             return Ok(());
         }
-        let rel = abs_path
-            .strip_prefix(root)
-            .map_err(|e| format!("strip prefix {}: {e}", abs_path.display()))?
-            .to_string_lossy()
-            .into_owned();
+        let rel = rel_to_root(root, abs_path)?;
         let body = std::fs::read_to_string(abs_path)
             .map_err(|e| format!("read {}: {e}", abs_path.display()))?;
         sources.push((rel, body));
         Ok(())
     })?;
+    // src/ — PRD #83: `#[spec]` tests also live in the library crate
+    // (e.g. `src/tab.rs`). Pre-filter to files that actually carry a
+    // `#[spec(` so we don't syn-parse the whole crate every run, matching
+    // the docs generator's approach.
+    let src_dir = root.join("src");
+    walk_rs_files(&src_dir, &mut |abs_path| {
+        let body = std::fs::read_to_string(abs_path)
+            .map_err(|e| format!("read {}: {e}", abs_path.display()))?;
+        if !body.contains("#[spec(") {
+            return Ok(());
+        }
+        let rel = rel_to_root(root, abs_path)?;
+        sources.push((rel, body));
+        Ok(())
+    })?;
     collect_tests_from_sources(&sources)
+}
+
+fn rel_to_root(root: &Path, abs_path: &Path) -> Result<String, String> {
+    Ok(abs_path
+        .strip_prefix(root)
+        .map_err(|e| format!("strip prefix {}: {e}", abs_path.display()))?
+        .to_string_lossy()
+        .into_owned())
 }
 
 fn walk_rs_files(
@@ -648,6 +708,7 @@ fn parse_catalog_at_ref(
     workspace_root: &Path,
     reference: &str,
 ) -> Result<BTreeMap<String, CatalogEntry>, String> {
+    // PRD #77 archived to prds/done/ (commit 637eb37).
     let prd_rel = "prds/done/77-tui-testing-harness.md";
     let body = git_show(reference, prd_rel)?;
     // parse_catalog wants a file path; stage the body in a tempfile.
@@ -928,6 +989,42 @@ mod tests {
         assert_eq!(t.fn_name, "delivery_001_x");
         assert_eq!(t.scenario, "A short, in-process check.");
         assert!(!t.body_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn collect_tests_from_sources_recurses_into_inline_modules() {
+        // PRD #83: src-resident `#[spec]` tests live inside
+        // `#[cfg(test)] mod tests { … }`. The inventory walker must
+        // recurse into inline modules, not just scan top-level items —
+        // otherwise `cargo xtask list-tests` silently omits them.
+        let src = r#"
+            #[spec("dashboard/pane/004")]
+            #[test]
+            /// Scenario: top-level test.
+            fn pane_004_top() { let _ = 1; }
+
+            #[cfg(test)]
+            mod tests {
+                #[spec("tabs/selection/001")]
+                #[test]
+                /// Scenario: nested in a test module.
+                fn selection_001_nested() { let _ = 2; }
+
+                mod deeper {
+                    #[spec("tabs/selection/002")]
+                    #[test]
+                    /// Scenario: doubly nested.
+                    fn selection_002_deep() { let _ = 3; }
+                }
+            }
+        "#;
+        let sources = vec![("src/tab.rs".to_string(), src.to_string())];
+        let map = collect_tests_from_sources(&sources).expect("parses");
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["dashboard/pane/004"].fn_name, "pane_004_top");
+        assert_eq!(map["tabs/selection/001"].fn_name, "selection_001_nested");
+        assert_eq!(map["tabs/selection/001"].file, "src/tab.rs");
+        assert_eq!(map["tabs/selection/002"].fn_name, "selection_002_deep");
     }
 
     #[test]

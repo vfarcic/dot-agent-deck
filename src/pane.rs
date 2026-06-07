@@ -218,6 +218,18 @@ impl Default for AgentSpawnOptions<'_> {
 
 pub trait PaneController: Send + Sync {
     fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError>;
+    /// PRD #83: the id of the pane that currently holds process-wide
+    /// focus, if any. Tab-switch focus capture (`TabManager`'s
+    /// switch-out path) reads this to remember which pane was focused in
+    /// the tab being left. The default returns `None` for controllers
+    /// without a real focus registry (local-PTY mocks /
+    /// render-only fixtures); the stream-backed `EmbeddedPaneController`
+    /// overrides it to report its registry's focused pane, and test
+    /// mocks that exercise the capture path override it to echo the last
+    /// `focus_pane` call.
+    fn focused_pane_id(&self) -> Option<String> {
+        None
+    }
     /// PRD #76 M2.15 fixup pass 2 G1 — legacy single-call entry point.
     /// The default impl routes through `create_pane_with_options` with
     /// `AgentSpawnOptions::default()`, which opens the PTY at the

@@ -20,9 +20,11 @@
 //! Inputs:
 //!   - The catalog under `prds/done/77-tui-testing-harness.md` (parsed
 //!     for entry headlines + body fields).
-//!   - Every `#[spec("…")]`-annotated test fn under `tests/` (parsed
-//!     via `syn` for fn name, doc comments, and statement-level
-//!     method calls on the harness builder / handle).
+//!   - Every `#[spec("…")]`-annotated test fn under `tests/` AND `src/`
+//!     (parsed via `syn` for fn name, doc comments, and statement-level
+//!     method calls on the harness builder / handle). PRD #83 added
+//!     per-tab-selection unit tests in `src/tab.rs`, so the library
+//!     crate is walked too.
 //!
 //! Output:
 //!   - One `.md` per `#[spec]` test, written to
@@ -51,6 +53,10 @@ pub struct DocsConfig {
     pub workspace_root: PathBuf,
     pub prd_path: PathBuf,
     pub tests_dir: PathBuf,
+    /// PRD #83: `#[spec]` tests also live in the library crate
+    /// (e.g. `src/tab.rs` unit/integration tests), so the generator
+    /// walks `src/` in addition to `tests/`.
+    pub src_dir: PathBuf,
     /// `.dot-agent-deck/recordings` — parent of every per-test
     /// subdirectory written by the generator (M4.3 flattened layout).
     pub recordings_root: PathBuf,
@@ -61,8 +67,10 @@ impl DocsConfig {
     pub fn from_workspace(workspace_root: impl Into<PathBuf>) -> Self {
         let workspace_root = workspace_root.into();
         Self {
+            // PRD #77 archived to prds/done/ (commit 637eb37).
             prd_path: workspace_root.join("prds/done/77-tui-testing-harness.md"),
             tests_dir: workspace_root.join("tests"),
+            src_dir: workspace_root.join("src"),
             recordings_root: workspace_root.join(".dot-agent-deck").join("recordings"),
             workspace_root,
         }
@@ -97,6 +105,9 @@ pub struct DiscoveredTest {
 pub fn generate_all(config: &DocsConfig) -> Result<Vec<GeneratedDoc>, String> {
     let catalog = parse_catalog(&config.prd_path)?;
     let mut tests = discover_tests(&config.tests_dir)?;
+    // PRD #83: library-crate `#[spec]` tests (e.g. `src/tab.rs`) are
+    // discovered too.
+    tests.extend(discover_tests(&config.src_dir)?);
     tests.sort_by(|a, b| a.spec_id.cmp(&b.spec_id));
     let mut out: Vec<GeneratedDoc> = Vec::with_capacity(tests.len());
     for t in &tests {
@@ -302,11 +313,12 @@ pub fn parse_catalog(prd_path: &Path) -> Result<BTreeMap<String, CatalogEntry>, 
 // Test source discovery
 // ---------------------------------------------------------------------------
 
-/// Walk `tests/` recursively and return every `#[spec("…")]`-annotated
-/// test fn we find, sorted by spec id for determinism.
-pub fn discover_tests(tests_dir: &Path) -> Result<Vec<DiscoveredTest>, String> {
+/// Walk `dir` recursively and return every `#[spec("…")]`-annotated
+/// test fn we find, sorted by spec id for determinism. Used for both
+/// `tests/` and (PRD #83) the library crate's `src/`.
+pub fn discover_tests(dir: &Path) -> Result<Vec<DiscoveredTest>, String> {
     let mut files: Vec<PathBuf> = Vec::new();
-    collect_rs_files(tests_dir, &mut files)?;
+    collect_rs_files(dir, &mut files)?;
     files.sort();
     let mut out: Vec<DiscoveredTest> = Vec::new();
     for path in files {
@@ -316,6 +328,14 @@ pub fn discover_tests(tests_dir: &Path) -> Result<Vec<DiscoveredTest>, String> {
                 return Err(format!("read test source {}: {e}", path.display()));
             }
         };
+        // PRD #83: only syn-parse files that actually carry a `#[spec(`
+        // annotation. Walking `src/` would otherwise parse the entire
+        // library crate every run and turn any single file syn can't
+        // handle into a generator failure — neither is wanted when the
+        // only spec-bearing source files are a handful.
+        if !source.contains("#[spec(") {
+            continue;
+        }
         let parsed = match syn::parse_file(&source) {
             Ok(p) => p,
             Err(e) => {
@@ -884,14 +904,23 @@ fn resolve_output_path(recordings_root: &Path, fn_name: &str) -> PathBuf {
 fn render_markdown(test: &DiscoveredTest, entry: &CatalogEntry, scenario: &str) -> String {
     let mut s = String::new();
     s.push_str(&format!("# {} — {}\n\n", entry.id, entry.headline));
-    let rel_src = test
+    // PRD #83: derive the `<dir>/<file>` prefix from the source path
+    // instead of hardcoding `tests/`, since `#[spec]` tests now also
+    // live under `src/`.
+    let src_file = test
         .source_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("?");
+    let src_dir = test
+        .source_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("tests");
     s.push_str(&format!(
-        "**Source:** `tests/{}::{}`\n",
-        rel_src, test.fn_name
+        "**Source:** `{src_dir}/{src_file}::{}`\n",
+        test.fn_name
     ));
     s.push_str(&format!("**Catalog:** {CATALOG_REF}\n"));
     let layer_is_l2 = entry
