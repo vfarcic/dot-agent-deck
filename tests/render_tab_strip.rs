@@ -13,7 +13,6 @@
 //! `closeable` mask passed to the renderer encodes that — `false` for the
 //! Dashboard tab, `true` for Mode/Orchestration tabs.
 
-use dot_agent_deck::theme::ColorPalette;
 use dot_agent_deck::ui::render_tab_bar_to_buffer;
 use spec::spec;
 
@@ -35,10 +34,8 @@ fn close_glyph_count(buffer: &ratatui::buffer::Buffer) -> usize {
 #[spec("mouse/tabstrip/002")]
 #[test]
 fn tabstrip_002_close_glyph_on_mode_orchestration_not_dashboard() {
-    let palette = ColorPalette::dark();
-
     // Dashboard alone: never closeable → no close glyph anywhere.
-    let dashboard_only = render_tab_bar_to_buffer(&["Dashboard"], &[false], 0, 80, palette);
+    let dashboard_only = render_tab_bar_to_buffer(&["Dashboard"], &[false], 0, 80);
     assert_eq!(
         close_glyph_count(&dashboard_only),
         0,
@@ -49,13 +46,8 @@ fn tabstrip_002_close_glyph_on_mode_orchestration_not_dashboard() {
     // Dashboard + Mode + Orchestration: only the two non-Dashboard tabs get
     // a close glyph, so exactly two `×` render. A third would mean the
     // Dashboard wrongly gained one; zero means the affordance is missing.
-    let three_tabs = render_tab_bar_to_buffer(
-        &["Dashboard", "demo", "squad"],
-        &[false, true, true],
-        0,
-        80,
-        palette,
-    );
+    let three_tabs =
+        render_tab_bar_to_buffer(&["Dashboard", "demo", "squad"], &[false, true, true], 0, 80);
     assert_eq!(
         close_glyph_count(&three_tabs),
         2,

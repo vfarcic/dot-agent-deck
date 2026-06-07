@@ -15,7 +15,6 @@
 //! bracketed labels are distinct from the prompt text, so a `[Label]`
 //! substring proves the button.
 
-use dot_agent_deck::theme::ColorPalette;
 use dot_agent_deck::ui::{render_filter_bar_to_buffer, render_rename_bar_to_buffer};
 use spec::spec;
 
@@ -37,10 +36,8 @@ fn row_text(buffer: &ratatui::buffer::Buffer) -> String {
 #[spec("mouse/inline/001")]
 #[test]
 fn inline_001_filter_and_rename_rows_render_buttons() {
-    let palette = ColorPalette::dark();
-
     // Filter row: prompt + text still present, plus [Apply] / [Cancel].
-    let filter = row_text(&render_filter_bar_to_buffer("proj", 80, palette));
+    let filter = row_text(&render_filter_bar_to_buffer("proj", 80));
     assert!(
         filter.contains("/ proj"),
         "filter row must still render the '/ <text>' input, got {filter:?}"
@@ -53,7 +50,7 @@ fn inline_001_filter_and_rename_rows_render_buttons() {
     }
 
     // Rename row: prompt + text still present, plus [Save] / [Cancel].
-    let rename = row_text(&render_rename_bar_to_buffer("newname", 80, palette));
+    let rename = row_text(&render_rename_bar_to_buffer("newname", 80));
     assert!(
         rename.contains("Rename: newname"),
         "rename row must still render the 'Rename: <text>' input, got {rename:?}"

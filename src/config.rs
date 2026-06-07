@@ -4,11 +4,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::state::SessionStatus;
-use crate::theme::Theme;
 
 pub const CONFIG_KEYS: &[(&str, &str)] = &[
     ("default_command", "Default shell command for new panes"),
-    ("theme", "Color theme: auto, light, dark (default: auto)"),
     (
         "auto_config_prompt",
         "Enable/disable the config generation prompt (default: true)",
@@ -179,7 +177,6 @@ impl Default for IdleArtConfig {
 pub struct DashboardConfig {
     pub default_command: String,
     pub bell: BellConfig,
-    pub theme: Theme,
     pub idle_art: IdleArtConfig,
     pub auto_config_prompt: bool,
 }
@@ -189,7 +186,6 @@ impl Default for DashboardConfig {
         Self {
             default_command: String::new(),
             bell: BellConfig::default(),
-            theme: Theme::default(),
             idle_art: IdleArtConfig::default(),
             auto_config_prompt: true,
         }
@@ -230,7 +226,6 @@ impl DashboardConfig {
     pub fn get_field(&self, key: &str) -> Result<String, String> {
         match key {
             "default_command" => Ok(self.default_command.clone()),
-            "theme" => Ok(self.theme.to_string()),
             "bell.enabled" => Ok(self.bell.enabled.to_string()),
             "bell.on_waiting_for_input" => Ok(self.bell.on_waiting_for_input.to_string()),
             "bell.on_idle" => Ok(self.bell.on_idle.to_string()),
@@ -251,10 +246,6 @@ impl DashboardConfig {
         match key {
             "default_command" => {
                 self.default_command = value.to_string();
-                Ok(())
-            }
-            "theme" => {
-                self.theme = value.parse().map_err(|e: String| e)?;
                 Ok(())
             }
             "bell.enabled" => {
@@ -908,27 +899,6 @@ on_idle = true
         };
         assert!(!bc.should_bell(&SessionStatus::WaitingForInput));
         assert!(!bc.should_bell(&SessionStatus::Error));
-    }
-
-    #[test]
-    fn theme_defaults_to_auto() {
-        let dc: DashboardConfig = toml::from_str("").unwrap();
-        assert_eq!(dc.theme, Theme::Auto);
-    }
-
-    #[test]
-    fn theme_deserialize_light() {
-        let dc: DashboardConfig = toml::from_str(r#"theme = "light""#).unwrap();
-        assert_eq!(dc.theme, Theme::Light);
-    }
-
-    #[test]
-    fn theme_get_set_field() {
-        let mut dc = DashboardConfig::default();
-        assert_eq!(dc.get_field("theme").unwrap(), "auto");
-        dc.set_field("theme", "dark").unwrap();
-        assert_eq!(dc.theme, Theme::Dark);
-        assert!(dc.set_field("theme", "invalid").is_err());
     }
 
     #[test]

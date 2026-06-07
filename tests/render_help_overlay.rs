@@ -12,7 +12,6 @@
 //! so they pin "these shortcuts are documented" without being brittle to
 //! layout or label wording.
 
-use dot_agent_deck::theme::ColorPalette;
 use dot_agent_deck::ui::render_help_overlay_to_buffer;
 use spec::spec;
 
@@ -42,8 +41,7 @@ fn buffer_text_lower(buffer: &ratatui::buffer::Buffer) -> String {
 #[spec("mouse/help/001")]
 #[test]
 fn help_001_overlay_documents_canonical_shortcut_set() {
-    let palette = ColorPalette::dark();
-    let buf = buffer_text_lower(&render_help_overlay_to_buffer(110, 60, palette));
+    let buf = buffer_text_lower(&render_help_overlay_to_buffer(110, 60));
 
     // Each entry: (token, human description for the failure message).
     let required: &[(&str, &str)] = &[

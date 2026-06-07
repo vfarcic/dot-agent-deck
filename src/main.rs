@@ -16,7 +16,6 @@ use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::hooks_manage;
 use dot_agent_deck::pane::PaneController;
 use dot_agent_deck::state::AppState;
-use dot_agent_deck::theme::Theme;
 use dot_agent_deck::ui::run_tui;
 
 #[derive(Parser)]
@@ -28,10 +27,6 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Commands>,
-
-    /// Color theme: auto-detect, force light, or force dark
-    #[arg(long, value_enum)]
-    theme: Option<Theme>,
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -350,7 +345,7 @@ fn main() -> ExitCode {
         .expect("clap arg matches should be valid for Cli struct");
 
     match cli.command {
-        None => run_dashboard(cli.theme, cli.continue_session),
+        None => run_dashboard(cli.continue_session),
         Some(Commands::Hook { agent }) => {
             let agent_str = match agent {
                 CliAgent::ClaudeCode => "claude-code",
@@ -585,7 +580,7 @@ fn main() -> ExitCode {
                 }
             }
         },
-        Some(Commands::Connect { name }) => run_connect(cli.theme, cli.continue_session, name),
+        Some(Commands::Connect { name }) => run_connect(cli.continue_session, name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
         Some(Commands::Validate { path }) => {
             use dot_agent_deck::config_validation::{has_errors, validate_config};
@@ -622,9 +617,9 @@ fn main() -> ExitCode {
 }
 
 #[tokio::main]
-async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) -> ExitCode {
+async fn run_dashboard(continue_session: bool) -> ExitCode {
     init_logging_from_env();
-    run_tui_session(cli_theme, continue_session).await
+    run_tui_session(continue_session).await
 }
 
 /// Optional file-based logging from `DOT_AGENT_DECK_LOG`. Pulled out of the
@@ -670,7 +665,7 @@ fn init_logging_from_env() {
 /// (spawn error, start timeout, or trust-check rejection). Successful TUI
 /// runs return `ExitCode::SUCCESS` — including TUI-task errors, which are
 /// already surfaced to stderr.
-async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> ExitCode {
+async fn run_tui_session(continue_session: bool) -> ExitCode {
     let state = Arc::new(RwLock::new(AppState::default()));
     let attach_path = attach_socket_path();
 
@@ -763,9 +758,6 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
     hooks_manage::auto_install();
     dot_agent_deck::opencode_manage::auto_install();
 
-    let effective_theme = cli_theme.unwrap_or(config.theme);
-    // Detect terminal theme *before* raw mode / alternate screen takes over.
-    let palette = dot_agent_deck::theme::resolve_palette(effective_theme);
     let pane_controller: Arc<dyn PaneController> = Arc::new(EmbeddedPaneController::new(
         attach_path.clone(),
         tokio::runtime::Handle::current(),
@@ -776,7 +768,6 @@ async fn run_tui_session(cli_theme: Option<Theme>, continue_session: bool) -> Ex
             tui_state,
             pane_controller,
             config,
-            palette,
             keybindings,
             continue_session,
         )
@@ -867,15 +858,11 @@ fn spawn_event_subscriber(
 /// mode. The laptop process blocks until ssh exits and propagates the
 /// exit code.
 ///
-/// `_cli_theme` and `_continue_session` are accepted to keep the
-/// `Commands::Connect` call shape stable but are intentionally ignored —
-/// they apply to a laptop-side TUI that no longer exists in this flow.
-/// See `connect::run_connect`'s doc comment for the rationale.
-fn run_connect(
-    _cli_theme: Option<Theme>,
-    _continue_session: bool,
-    name: Option<String>,
-) -> ExitCode {
+/// `_continue_session` is accepted to keep the `Commands::Connect` call shape
+/// stable but is intentionally ignored — it applies to a laptop-side TUI that
+/// no longer exists in this flow. See `connect::run_connect`'s doc comment for
+/// the rationale.
+fn run_connect(_continue_session: bool, name: Option<String>) -> ExitCode {
     let registry_path = dot_agent_deck::remote::default_remotes_path();
 
     let entry = match name {

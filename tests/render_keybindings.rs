@@ -16,7 +16,6 @@
 //! once the renderers landed.
 
 use dot_agent_deck::keybindings::{Action, KeybindingConfig, parse_binding};
-use dot_agent_deck::theme::{ColorPalette, Theme, resolve_palette};
 use dot_agent_deck::ui::{
     render_button_bar_with_bindings_to_buffer, render_help_overlay_with_bindings_to_buffer,
     render_hints_bar_to_buffer,
@@ -65,13 +64,12 @@ fn help_001_overlay_reflects_active_bindings() {
     // against a remapped config shows the custom keys (dynamic
     // generation). dashboard/help/002 remains the defaults-content guard.
     let config = remapped_config();
-    let palette: ColorPalette = resolve_palette(Theme::Dark);
 
     // Full default-ish viewport so the centered overlay popup is not
     // clipped (120×44 comfortably fits the help columns + footer).
     let width: u16 = 120;
     let height: u16 = 44;
-    let buffer = render_help_overlay_with_bindings_to_buffer(&config, None, palette, width, height);
+    let buffer = render_help_overlay_with_bindings_to_buffer(&config, None, width, height);
 
     let text = buffer_to_text(&buffer);
     assert!(
@@ -98,12 +96,11 @@ fn hints_001_bar_reflects_active_bindings() {
     // PRD #40 catalog: keybindings/hints/001 — hints bar rendered against
     // a remapped config shows the custom keys (dynamic generation).
     let config = remapped_config();
-    let palette: ColorPalette = resolve_palette(Theme::Dark);
 
     // Single-row hints bar at the default 120-column width.
     let width: u16 = 120;
     let height: u16 = 1;
-    let buffer = render_hints_bar_to_buffer(&config, palette, width, height);
+    let buffer = render_hints_bar_to_buffer(&config, width, height);
 
     let text = buffer_to_text(&buffer);
     assert!(
@@ -132,9 +129,8 @@ fn hints_002_unbound_action_not_bare() {
         Action::NewPane,
         parse_binding("").expect("empty == unbound"),
     );
-    let palette: ColorPalette = resolve_palette(Theme::Dark);
 
-    let buffer = render_hints_bar_to_buffer(&config, palette, 120, 1);
+    let buffer = render_hints_bar_to_buffer(&config, 120, 1);
     let text = buffer_to_text(&buffer);
     let line = text.lines().next().unwrap_or("");
 
@@ -176,10 +172,9 @@ fn buttons_001_bar_reflects_active_bindings() {
         parse_binding("Alt+P").expect("valid notation"),
     );
     config.set(Action::Help, parse_binding("F1").expect("valid notation"));
-    let palette: ColorPalette = resolve_palette(Theme::Dark);
 
     // Width wide enough that the New-pane and Help buttons render in full.
-    let buffer = render_button_bar_with_bindings_to_buffer(&config, palette, 200, 1);
+    let buffer = render_button_bar_with_bindings_to_buffer(&config, 200, 1);
     let text = buffer_to_text(&buffer);
 
     assert!(

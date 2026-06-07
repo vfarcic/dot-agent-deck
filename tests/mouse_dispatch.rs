@@ -18,7 +18,6 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 
 use dot_agent_deck::keybindings::KeybindingConfig;
-use dot_agent_deck::theme::ColorPalette;
 use dot_agent_deck::ui::{Action, Button, global_action, hit_test_button};
 use spec::spec;
 
@@ -80,13 +79,12 @@ fn dispatch_001_key_and_click_map_to_same_action() {
 #[spec("mouse/button/001")]
 #[test]
 fn button_001_render_label_and_disabled_dim() {
-    let palette = ColorPalette::dark();
     let area = Rect::new(0, 0, 20, 1);
 
     // Enabled button: full label, not dimmed, returns its action+rect pair.
     let enabled = Button::new("New Pane", "Ctrl+N", Action::NewPane, true);
     let mut buf = Buffer::empty(area);
-    let (action, rect) = enabled.render(area, &mut buf, &palette);
+    let (action, rect) = enabled.render(area, &mut buf);
     assert!(matches!(action, Action::NewPane));
     assert_eq!(rect, area);
     let rendered: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
@@ -102,7 +100,7 @@ fn button_001_render_label_and_disabled_dim() {
     // Disabled button: same label shape, rendered dimmed.
     let disabled = Button::new("Close", "Ctrl+W", Action::CloseSelected, false);
     let mut buf2 = Buffer::empty(area);
-    disabled.render(area, &mut buf2, &palette);
+    disabled.render(area, &mut buf2);
     let rendered2: String = (0..area.width).map(|x| buf2[(x, 0)].symbol()).collect();
     assert!(
         rendered2.contains("[Close Ctrl+W]"),

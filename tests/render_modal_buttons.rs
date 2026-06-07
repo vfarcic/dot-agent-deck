@@ -17,7 +17,6 @@
 //! running`, button `[Detach]`), so a `[Label]` substring proves the button
 //! and a list-only phrase proves the list still renders.
 
-use dot_agent_deck::theme::ColorPalette;
 use dot_agent_deck::ui::{
     render_config_gen_prompt_to_buffer, render_help_overlay_to_buffer,
     render_quit_confirm_to_buffer, render_star_prompt_to_buffer,
@@ -49,10 +48,8 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
 #[spec("mouse/modal/002")]
 #[test]
 fn modal_002_buttons_render_alongside_selection_list() {
-    let palette = ColorPalette::dark();
-
     // ── Quit-confirm: [Detach] [Stop] [Cancel] alongside the option list ──
-    let quit = buffer_text(&render_quit_confirm_to_buffer(0, 80, 24, palette));
+    let quit = buffer_text(&render_quit_confirm_to_buffer(0, 80, 24));
     assert!(
         quit.contains("leave agents running"),
         "quit-confirm must still render its option list, got:\n{quit}"
@@ -65,7 +62,7 @@ fn modal_002_buttons_render_alongside_selection_list() {
     }
 
     // ── Config-gen: [Yes] [No] [Never] alongside the option list ──────────
-    let cfg = buffer_text(&render_config_gen_prompt_to_buffer(0, 80, 24, palette));
+    let cfg = buffer_text(&render_config_gen_prompt_to_buffer(0, 80, 24));
     assert!(
         cfg.contains("skip for now"),
         "config-gen must still render its option list, got:\n{cfg}"
@@ -78,7 +75,7 @@ fn modal_002_buttons_render_alongside_selection_list() {
     }
 
     // ── Star-prompt: [Star] [Snooze] [Dismiss] alongside the hint line ────
-    let star = buffer_text(&render_star_prompt_to_buffer(80, 24, palette));
+    let star = buffer_text(&render_star_prompt_to_buffer(80, 24));
     assert!(
         star.contains("github.com/vfarcic/dot-agent-deck"),
         "star-prompt must still render its existing content, got:\n{star}"
@@ -91,7 +88,7 @@ fn modal_002_buttons_render_alongside_selection_list() {
     }
 
     // ── Help: [Close] alongside the help content ──────────────────────────
-    let help = buffer_text(&render_help_overlay_to_buffer(80, 24, palette));
+    let help = buffer_text(&render_help_overlay_to_buffer(80, 24));
     assert!(
         help.contains("Press ? or Esc to close"),
         "help overlay must still render its existing content, got:\n{help}"

@@ -14,7 +14,6 @@
 //! substring proves the button while the footer text proves the list chrome
 //! still renders.
 
-use dot_agent_deck::theme::ColorPalette;
 use dot_agent_deck::ui::render_dir_picker_to_buffer;
 use spec::spec;
 
@@ -40,13 +39,7 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
 #[spec("mouse/picker/001")]
 #[test]
 fn picker_001_renders_confirm_cancel_filter_affordances() {
-    let palette = ColorPalette::dark();
-    let buf = buffer_text(&render_dir_picker_to_buffer(
-        std::env::temp_dir(),
-        80,
-        24,
-        palette,
-    ));
+    let buf = buffer_text(&render_dir_picker_to_buffer(std::env::temp_dir(), 80, 24));
 
     // Existing chrome still present (affordances are additive).
     assert!(

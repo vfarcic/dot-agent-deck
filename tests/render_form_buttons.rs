@@ -13,7 +13,6 @@
 //! distinct from the field labels, so their substrings prove the new
 //! affordances while the field labels prove the form chrome still renders.
 
-use dot_agent_deck::theme::ColorPalette;
 use dot_agent_deck::ui::render_new_pane_form_to_buffer;
 use spec::spec;
 
@@ -41,13 +40,7 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
 #[spec("mouse/form/001")]
 #[test]
 fn form_001_renders_mode_chips_and_submit_cancel() {
-    let palette = ColorPalette::dark();
-    let buf = buffer_text(&render_new_pane_form_to_buffer(
-        &["demo", "demo2"],
-        80,
-        24,
-        palette,
-    ));
+    let buf = buffer_text(&render_new_pane_form_to_buffer(&["demo", "demo2"], 80, 24));
 
     // Existing form chrome still present (affordances are additive).
     assert!(

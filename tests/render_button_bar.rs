@@ -18,7 +18,6 @@
 //! `src/ui.rs` (`global_ctrl_action` for Ctrl+N/W/T, `Char('?')` → Help,
 //! Ctrl+C → Quit). M2 must wire the buttons to those same bindings.
 
-use dot_agent_deck::theme::ColorPalette;
 use dot_agent_deck::ui::render_button_bar_to_buffer;
 use spec::spec;
 
@@ -41,8 +40,7 @@ fn row_text(buffer: &ratatui::buffer::Buffer) -> String {
 #[spec("mouse/buttonbar/001")]
 #[test]
 fn buttonbar_001_full_bar_has_button_per_command_with_shortcut() {
-    let palette = ColorPalette::dark();
-    let buffer = render_button_bar_to_buffer(120, palette);
+    let buffer = render_button_bar_to_buffer(120);
     let bar = row_text(&buffer);
 
     for expected in [
@@ -71,8 +69,7 @@ fn buttonbar_001_full_bar_has_button_per_command_with_shortcut() {
 #[spec("mouse/buttonbar/002")]
 #[test]
 fn buttonbar_002_narrow_terminal_degrades_to_shortcut_only() {
-    let palette = ColorPalette::dark();
-    let buffer = render_button_bar_to_buffer(40, palette);
+    let buffer = render_button_bar_to_buffer(40);
     let bar = row_text(&buffer);
 
     // All five commands remain represented by their shortcut-only label.
