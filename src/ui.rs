@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Tabs},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use crate::agent_pty::TabMembership;
@@ -607,6 +607,16 @@ struct UiState {
     /// M1 so the render side has a stable home to populate.
     #[allow(dead_code)]
     button_rects: Vec<(Action, Rect)>,
+    /// PRD #80 M3: screen rects of each tab's `[×]` close affordance, paired
+    /// with the tab index to close (only closeable Mode/Orchestration tabs;
+    /// the Dashboard at index 0 is excluded). Populated each render, consulted
+    /// on a mouse Down/Up AFTER `button_rects` but BEFORE `tab_header_rects`,
+    /// so the `[×]` beats the surrounding header.
+    tab_close_rects: Vec<(usize, Rect)>,
+    /// PRD #80 M3: screen rects of each tab's clickable header, paired with the
+    /// tab index to switch to. Populated each render; a click here that missed
+    /// the `[×]` switches tabs.
+    tab_header_rects: Vec<(usize, Rect)>,
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
     /// Per-session idle ASCII art cache. Key = session_id.
@@ -709,6 +719,8 @@ impl UiState {
             pending_dispatches: Vec::new(),
             last_pane_keystroke_at: None,
             button_rects: Vec::new(),
+            tab_close_rects: Vec::new(),
+            tab_header_rects: Vec::new(),
         }
     }
 }
@@ -1788,6 +1800,15 @@ pub enum Action {
     /// PRD #80: Normal-mode BackTab / Left / `h` — cycle to the previous tab
     /// (wraps).
     CycleTabPrev,
+    /// PRD #80 M3: switch to the tab at this index — the outcome of clicking a
+    /// tab header in the strip (the keyboard equivalent of Tab / Ctrl+PageDown
+    /// landing on that tab). The index is from the most recent render, stable
+    /// for the click that produced it.
+    SelectTab(usize),
+    /// PRD #80 M3: close the tab at this index — the outcome of clicking a
+    /// Mode/Orchestration tab's `[×]` affordance, reusing Ctrl+W's tab-teardown
+    /// semantics for the clicked tab (not necessarily the active one).
+    CloseTab(usize),
     /// PRD #80: Normal-mode digit `1`-`9` — jump to card N and focus its pane.
     FocusCard(usize),
     /// PRD #80: on a mode tab, move the in-tab side-pane focus down (j/Down).
@@ -2939,13 +2960,111 @@ impl Button {
 /// hyperlink logic. Per the PRD's hit-test order, this runs BEFORE pane-region
 /// logic so a button click short-circuits.
 pub fn hit_test_button(button_rects: &[(Action, Rect)], col: u16, row: u16) -> Option<Action> {
-    button_rects.iter().find_map(|(action, rect)| {
-        let inside = col >= rect.x
-            && col < rect.x.saturating_add(rect.width)
-            && row >= rect.y
-            && row < rect.y.saturating_add(rect.height);
-        inside.then(|| action.clone())
-    })
+    button_rects
+        .iter()
+        .find_map(|(action, rect)| point_in_rect(rect, col, row).then(|| action.clone()))
+}
+
+/// Whether the cell `(col, row)` falls inside `rect` (upper bounds exclusive).
+fn point_in_rect(rect: &Rect, col: u16, row: u16) -> bool {
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+/// PRD #80 M3: hit-test a click against the tab `[×]` close rects, returning a
+/// [`Action::CloseTab`] for the first match. Checked AFTER `button_rects` but
+/// BEFORE the header rects so the `[×]` beats the surrounding tab header.
+fn hit_test_tab_close(tab_close_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<Action> {
+    tab_close_rects
+        .iter()
+        .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(Action::CloseTab(*idx)))
+}
+
+/// PRD #80 M3: hit-test a click against the tab header rects, returning a
+/// [`Action::SelectTab`] for the first match (a click that missed the `[×]`).
+fn hit_test_tab_header(tab_header_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<Action> {
+    tab_header_rects
+        .iter()
+        .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(Action::SelectTab(*idx)))
+}
+
+/// PRD #80 M3: close the tab at `idx` and reconcile shared state, reusing the
+/// same teardown the Ctrl+W tab-close path performs — unregister every
+/// successfully-closed pane, drop the matching sessions (keeping any that
+/// failed to close so the user can retry), clean their metadata, and resweep
+/// the dashboard layout. Used by [`Action::CloseTab`] (a `[×]` click); the
+/// Ctrl+W card path keeps its own inline message that names the specific pane.
+fn close_tab_by_index(
+    idx: usize,
+    ui: &mut UiState,
+    state: &SharedState,
+    tab_manager: &mut TabManager,
+    pane: &dyn PaneController,
+    frame_area: Rect,
+) {
+    match tab_manager.close_tab(idx) {
+        Ok(outcome) => {
+            let mut st = state.blocking_write();
+            for id in &outcome.closed {
+                st.unregister_pane(id);
+            }
+            // Drop only the sessions whose pane was actually closed; failed
+            // panes keep their card/session so the user can retry.
+            let closed_set: std::collections::HashSet<&str> =
+                outcome.closed.iter().map(String::as_str).collect();
+            st.sessions.retain(|_, s| {
+                s.pane_id
+                    .as_ref()
+                    .is_none_or(|pid| !closed_set.contains(pid.as_str()))
+            });
+            drop(st);
+            for id in &outcome.closed {
+                ui.pane_metadata.remove(id);
+            }
+            if outcome.is_clean() {
+                ui.status_message = Some(("Closed tab".to_string(), std::time::Instant::now()));
+            } else {
+                let failed_ids: Vec<&str> =
+                    outcome.failed.iter().map(|(id, _)| id.as_str()).collect();
+                let first_err = outcome
+                    .failed
+                    .first()
+                    .map(|(_, e)| e.as_str())
+                    .unwrap_or("");
+                for (id, e) in &outcome.failed {
+                    tracing::warn!(
+                        pane_id = %id,
+                        error = %e,
+                        "M3: close_pane failed during [×] tab teardown — card preserved"
+                    );
+                }
+                ui.status_message = Some((
+                    format!(
+                        "Close partially failed for {} pane(s) — first error: {first_err}",
+                        failed_ids.len()
+                    ),
+                    std::time::Instant::now(),
+                ));
+            }
+            resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+        }
+        Err(e) => {
+            ui.status_message = Some((
+                format!("Failed to close tab: {e}"),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+    // Closing the active mode/orchestration tab returns focus to the
+    // dashboard, so leave PaneInput just like the Ctrl+W path does.
+    if ui.mode == UiMode::PaneInput {
+        ui.mode = UiMode::Normal;
+    }
+    if ui.selected_index > 0 {
+        ui.selected_index = ui.selected_index.saturating_sub(1);
+    }
 }
 
 /// PRD #80: the single funnel. Every command [`Action`] — whether it came from
@@ -3185,6 +3304,21 @@ fn dispatch_action(
                     resize_mode_tab_panes(pane, tab_manager, frame_area);
                 }
             }
+        }
+        // PRD #80 M3: click a tab header → switch to that tab (same resize
+        // sweep as the keyboard tab-switch paths).
+        Action::SelectTab(idx) => {
+            let prev_idx = tab_manager.active_index();
+            tab_manager.switch_to(idx);
+            if prev_idx != tab_manager.active_index() {
+                resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                resize_mode_tab_panes(pane, tab_manager, frame_area);
+            }
+        }
+        // PRD #80 M3: click a tab's [×] → close that tab, reusing Ctrl+W's
+        // tab-teardown semantics for the clicked tab.
+        Action::CloseTab(idx) => {
+            close_tab_by_index(idx, ui, state, tab_manager, pane, frame_area);
         }
         // Normal-mode digit 1-9: jump to card N and focus its pane.
         Action::FocusCard(idx) => {
@@ -5083,14 +5217,19 @@ pub fn run_tui(
 
             // Handle mouse events: scroll, text selection, and copy.
             if let Event::Mouse(mouse) = ev {
-                // PRD #80 M2: button bar takes precedence. A left-button Down
-                // on a recorded button rect fires its Action through the SAME
-                // `dispatch_action` funnel as the keystroke, then short-circuits
-                // the rest of mouse handling. The paired Up on a button is also
-                // consumed (without re-dispatching) so it can't fall through to
-                // the selection/copy path. Scroll events are not Down/Up, so
-                // they bypass this layer entirely and reach the forwarding
-                // branch unchanged.
+                // PRD #80 M2/M3: clickable affordances take precedence. A
+                // left-button Down on a recorded rect fires its Action through
+                // the SAME `dispatch_action` funnel as the keystroke, then
+                // short-circuits the rest of mouse handling. The paired Up on a
+                // rect is consumed (without re-dispatching) so it can't fall
+                // through to the selection/copy path. Scroll events are not
+                // Down/Up, so they bypass this layer entirely and reach the
+                // forwarding branch unchanged.
+                //
+                // Hit-test order: button bar FIRST, then each tab's `[×]`
+                // close rect (so `[×]` beats the surrounding header), then the
+                // tab header rects (switch). A miss falls through to the
+                // existing pane/selection/scroll logic below.
                 let is_down = matches!(
                     mouse.kind,
                     crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
@@ -5099,9 +5238,18 @@ pub fn run_tui(
                     mouse.kind,
                     crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
                 );
-                if (is_down || is_up)
-                    && let Some(action) = hit_test_button(&ui.button_rects, mouse.column, mouse.row)
-                {
+                let mouse_action = if is_down || is_up {
+                    hit_test_button(&ui.button_rects, mouse.column, mouse.row)
+                        .or_else(|| {
+                            hit_test_tab_close(&ui.tab_close_rects, mouse.column, mouse.row)
+                        })
+                        .or_else(|| {
+                            hit_test_tab_header(&ui.tab_header_rects, mouse.column, mouse.row)
+                        })
+                } else {
+                    None
+                };
+                if let Some(action) = mouse_action {
                     if is_down {
                         let frame_area = terminal.get_frame().area();
                         let selected_id: Option<String> =
@@ -5720,6 +5868,116 @@ pub fn run_tui(
 // Rendering
 // ---------------------------------------------------------------------------
 
+/// PRD #80: render the top tab strip into `area`. `labels` are the per-tab
+/// titles (already in tab order, Dashboard at index 0); `closeable` marks,
+/// per tab, whether it carries a `[×]` close affordance (Dashboard never
+/// does — see the M3 acceptance criteria). Extracted from `render_frame` so
+/// both the live render and the L1 `render_tab_bar_to_buffer` seam exercise
+/// the same code path, keeping render and (M3) hit-test in lockstep the way
+/// the button bar does.
+/// The clickable rects produced by [`render_tab_strip`], keyed by tab index
+/// (Dashboard = 0). `headers` covers every visible tab (click → switch);
+/// `closes` covers only the closeable tabs' `[×]` glyphs (click → close).
+struct TabStripRects {
+    headers: Vec<(usize, Rect)>,
+    closes: Vec<(usize, Rect)>,
+}
+
+fn render_tab_strip(
+    frame: &mut Frame,
+    area: Rect,
+    labels: &[String],
+    closeable: &[bool],
+    active_index: usize,
+    palette: &ColorPalette,
+) -> TabStripRects {
+    // Fill the tab-bar row with the distinct background first.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.tab_bar_bg)),
+        area,
+    );
+
+    // Cap long labels so trailing tabs stay at least partially visible for
+    // click-to-switch (same width-fitting the `Tabs` widget previously used).
+    let fitted_labels = fit_tab_labels(labels, area.width);
+
+    let base_style = Style::default()
+        .fg(palette.text_muted)
+        .bg(palette.tab_bar_bg);
+    // Active tab: inverted colors for high contrast (matches the prior look).
+    let active_style = Style::default()
+        .fg(palette.terminal_bg)
+        .bg(palette.text_secondary)
+        .add_modifier(Modifier::BOLD);
+
+    let mut headers = Vec::with_capacity(fitted_labels.len());
+    let mut closes = Vec::new();
+    let end = area.x.saturating_add(area.width);
+    let buf = frame.buffer_mut();
+    let mut x = area.x;
+
+    for (i, label) in fitted_labels.iter().enumerate() {
+        if x >= end {
+            break;
+        }
+        let style = if i == active_index {
+            active_style
+        } else {
+            base_style
+        };
+
+        // Divider between tabs (not before the first).
+        if i > 0 {
+            let (after, _) = buf.set_span(x, area.y, &Span::styled("│", base_style), end - x);
+            x = after;
+            if x >= end {
+                break;
+            }
+        }
+
+        let header_start = x;
+
+        // Label segment, padded with a space on each side.
+        let (after, _) = buf.set_span(
+            x,
+            area.y,
+            &Span::styled(format!(" {label} "), style),
+            end - x,
+        );
+        x = after;
+
+        // Close affordance for Mode/Orchestration tabs (never the Dashboard).
+        if *closeable.get(i).unwrap_or(&false) && x < end {
+            let glyph_start = x;
+            let (after, _) = buf.set_span(x, area.y, &Span::styled("[×]", style), end - x);
+            x = after;
+            closes.push((
+                i,
+                Rect {
+                    x: glyph_start,
+                    y: area.y,
+                    width: x.saturating_sub(glyph_start),
+                    height: 1,
+                },
+            ));
+        }
+
+        // The whole tab segment (label + any close glyph) is the click target
+        // for switching; the `[×]` rect is hit-tested first so it wins there.
+        headers.push((
+            i,
+            Rect {
+                x: header_start,
+                y: area.y,
+                width: x.saturating_sub(header_start),
+                height: 1,
+            },
+        ));
+    }
+
+    TabStripRects { headers, closes }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     frame: &mut Frame,
@@ -5759,34 +6017,28 @@ fn render_frame(
         ])
         .split(area);
 
-        // Render the tab bar. Cap long labels so trailing tabs don't clip
-        // off the right edge of `Tabs`'s clipped output — every tab stays
-        // at least partially visible for click-to-switch.
-        let fitted_labels = fit_tab_labels(&tab_bar.labels, chunks[0].width);
-        let titles: Vec<Line> = fitted_labels
-            .iter()
-            .map(|l| Line::from(format!(" {l} ")))
-            .collect();
-        // Fill tab bar row with distinct background.
-        frame.render_widget(
-            Block::default().style(Style::default().bg(palette.tab_bar_bg)),
+        // PRD #80 M3: the Dashboard tab (always index 0) carries no close
+        // affordance; Mode and Orchestration tabs do. Pass the per-tab
+        // closeable mask to the tab-strip renderer, and record the clickable
+        // header / [×] rects for the mouse hit-test.
+        let closeable: Vec<bool> = (0..tab_bar.labels.len()).map(|i| i != 0).collect();
+        let strip = render_tab_strip(
+            frame,
             chunks[0],
+            &tab_bar.labels,
+            &closeable,
+            tab_bar.active_index,
+            &palette,
         );
-        // Active tab: inverted colors for high contrast.
-        let tabs_widget = Tabs::new(titles)
-            .select(tab_bar.active_index)
-            .style(Style::default().fg(palette.text_muted))
-            .highlight_style(
-                Style::default()
-                    .fg(palette.terminal_bg)
-                    .bg(palette.text_secondary)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .divider("│");
-        frame.render_widget(tabs_widget, chunks[0]);
+        ui.tab_header_rects = strip.headers;
+        ui.tab_close_rects = strip.closes;
 
         (chunks[1], chunks[2])
     } else {
+        // No tab strip this frame — drop any stale rects so a click can't hit a
+        // tab affordance that isn't on screen.
+        ui.tab_header_rects.clear();
+        ui.tab_close_rects.clear();
         let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
         (chunks[0], chunks[1])
     };
@@ -7856,6 +8108,39 @@ pub fn render_button_bar_to_buffer(width: u16, palette: ColorPalette) -> ratatui
             // has_pane_control = true → the richest legacy legend today;
             // after M2 this site renders the always-visible global button bar.
             render_bottom_bar(frame, &mut ui, area, true);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #80 M3: render the top tab strip into a one-row `Buffer` for L1
+/// tests, mirroring [`render_button_bar_to_buffer`]. Drives the production
+/// [`render_tab_strip`] through a `TestBackend` so a test can assert on the
+/// rendered cells (e.g. the presence of a `[×]` close glyph on Mode /
+/// Orchestration tabs and its absence on the Dashboard tab) without a PTY.
+/// `closeable[i]` marks whether tab `i` carries a close affordance.
+pub fn render_tab_bar_to_buffer(
+    labels: &[&str],
+    closeable: &[bool],
+    active_index: usize,
+    width: u16,
+    palette: ColorPalette,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let owned: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
+    let backend = TestBackend::new(width, 1);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 1,
+            };
+            render_tab_strip(frame, area, &owned, closeable, active_index, &palette);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
