@@ -604,7 +604,7 @@ struct UiState {
     /// Screen rect of the agent pane in mode tabs (set during render, used for click-to-focus).
     agent_pane_rect: Option<Rect>,
     /// Tracks last click time and position for double/triple-click detection.
-    last_click: Option<(std::time::Instant, u16, u16, u8)>, // (time, col, row, click_count)
+    last_click: Option<LastClick>, // PRD #80 review FIX 4: region-aware multi-click state
     /// PRD #80: screen rects of the clickable buttons rendered this frame,
     /// paired with the [`Action`] each one triggers. Populated during render
     /// and consulted FIRST on a mouse Down/Up so a button click short-circuits
@@ -699,6 +699,59 @@ struct UiState {
     /// (matches `write_to_pane`'s SUBMIT_DELAY rationale at
     /// src/embedded_pane.rs:199).
     last_pane_keystroke_at: Option<std::time::Instant>,
+}
+
+/// PRD #80 review FIX 4: which click region produced a [`LastClick`]. Multi-
+/// click (double/triple) detection only fires when the current click is in the
+/// SAME region as the previous one, so a cross-region click within the 400ms
+/// window can't mis-classify — e.g. a dashboard card click (screen coords)
+/// followed by an in-pane click (pane-relative coords) resets to a single
+/// click instead of being read as a double.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClickRegion {
+    /// In-pane text selection (pane-relative coordinates).
+    Pane,
+    /// A dashboard card (screen coordinates).
+    Card,
+    /// A directory-picker row (screen coordinates).
+    PickerRow,
+}
+
+/// PRD #80 review FIX 4: the previous left-button-down, used for region-aware
+/// double/triple-click detection.
+#[derive(Debug, Clone, Copy)]
+struct LastClick {
+    at: std::time::Instant,
+    col: u16,
+    row: u16,
+    count: u8,
+    region: ClickRegion,
+}
+
+impl LastClick {
+    /// The multi-click count for a click at `(col, row)` in `region` given the
+    /// previous click `prev`. Returns `(prev.count + 1).min(3)` only when the
+    /// previous click was in the SAME region, within 400ms, on the same row,
+    /// and within 3 columns; otherwise `1` (a fresh single click).
+    fn next_count(
+        prev: Option<LastClick>,
+        now: std::time::Instant,
+        col: u16,
+        row: u16,
+        region: ClickRegion,
+    ) -> u8 {
+        match prev {
+            Some(p)
+                if p.region == region
+                    && now.duration_since(p.at).as_millis() < 400
+                    && p.row == row
+                    && col.abs_diff(p.col) <= 3 =>
+            {
+                (p.count + 1).min(3)
+            }
+            _ => 1,
+        }
+    }
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -2978,7 +3031,9 @@ pub struct Button {
     /// the inline shortcut maps to.
     pub action: Action,
     /// Whether the button is currently actionable. A disabled button renders
-    /// dimmed; M2+ decides whether to record/ignore its rect.
+    /// dimmed and is INERT: the bar renderers do not record its rect, so a
+    /// click on it is a no-op — matching the keyboard, where the bound key is
+    /// a silent no-op (PRD #80 review FIX 3).
     pub enabled: bool,
 }
 
@@ -5607,6 +5662,33 @@ pub fn run_tui(
                     crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
                 );
 
+                // PRD #80 review FIX 5: when a blocking overlay (any modal, the
+                // directory picker, or the new-pane form) is the topmost layer,
+                // swallow scroll-wheel events so they don't scroll the pane
+                // behind the overlay. Scroll in Normal / PaneInput is left
+                // untouched below (pane scroll + child-app forwarding).
+                let blocking_overlay = matches!(
+                    ui.mode,
+                    UiMode::QuitConfirm
+                        | UiMode::StopConfirm
+                        | UiMode::ConfigGenPrompt
+                        | UiMode::StarPrompt
+                        | UiMode::Help
+                        | UiMode::DirPicker
+                        | UiMode::NewPaneForm
+                );
+                let is_scroll = matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::ScrollUp
+                        | crossterm::event::MouseEventKind::ScrollDown
+                );
+                if is_scroll && blocking_overlay {
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
                 // PRD #80 M7: the directory picker is a topmost overlay — when
                 // it's open, its [Confirm]/[Cancel]/[Filter] buttons and row
                 // rects are the only click targets, hit-tested here and
@@ -5636,24 +5718,25 @@ pub fn run_tui(
                         if is_parent {
                             picker_action = Some(Action::PickerParent);
                         } else {
-                            // Single vs double click via the shared last_click
-                            // multi-click discrimination (400ms / same row /
-                            // within 3 cols).
+                            // Single vs double click via the shared, region-aware
+                            // last_click discrimination (400ms / same row / within
+                            // 3 cols / same region — PRD #80 review FIX 4).
                             let now = std::time::Instant::now();
-                            let click_count = if let Some((t, lc, lr, cnt)) = ui.last_click {
-                                if now.duration_since(t).as_millis() < 400
-                                    && lr == row
-                                    && col.abs_diff(lc) <= 3
-                                {
-                                    (cnt + 1).min(3)
-                                } else {
-                                    1
-                                }
-                            } else {
-                                1
-                            };
+                            let click_count = LastClick::next_count(
+                                ui.last_click,
+                                now,
+                                col,
+                                row,
+                                ClickRegion::PickerRow,
+                            );
                             if is_down {
-                                ui.last_click = Some((now, col, row, click_count));
+                                ui.last_click = Some(LastClick {
+                                    at: now,
+                                    col,
+                                    row,
+                                    count: click_count,
+                                    region: ClickRegion::PickerRow,
+                                });
                             }
                             picker_action = Some(if click_count >= 2 {
                                 Action::PickerEnterRow(i)
@@ -5740,10 +5823,6 @@ pub fn run_tui(
                     continue;
                 }
 
-                // PRD #80 M5: when a modal/overlay is active it is topmost, so
-                // its buttons are hit-tested FIRST and exclusively — the
-                // bottom-bar / tab / card rects behind it are not clickable.
-                // When no modal is up, fall back to the M2/M3 chain.
                 let modal_active = matches!(
                     ui.mode,
                     UiMode::QuitConfirm
@@ -5757,18 +5836,60 @@ pub fn run_tui(
                 // `button_rects`, and any other click is consumed below so it
                 // keeps the field focused instead of exiting the mode.
                 let text_input_mode = matches!(ui.mode, UiMode::Filter | UiMode::Rename);
+
+                // PRD #80 M5 + review FIX 1: a modal/overlay is the topmost
+                // layer, so its buttons are the ONLY click targets and every
+                // Down/Up is consumed here — a miss must NOT fall through to the
+                // pane selection/scroll logic behind the popup (which could
+                // start a text selection / copy). Matches the picker/form
+                // branches above.
+                if modal_active && (is_down || is_up) {
+                    if let Some(action) =
+                        hit_test_button(&ui.modal_button_rects, mouse.column, mouse.row)
+                        && is_down
+                    {
+                        let frame_area = terminal.get_frame().area();
+                        let selected_id: Option<String> =
+                            filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+                        let flow = dispatch_action(
+                            action,
+                            &mut ui,
+                            &*pane,
+                            &state,
+                            &mut tab_manager,
+                            &snapshot,
+                            &filtered,
+                            selected_id.as_deref(),
+                            frame_area,
+                        );
+                        if flow == Flow::Break {
+                            break 'outer;
+                        }
+                    }
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
+                // No modal up: the M2/M3 chain — global button bar first, then
+                // the tab affordances. PRD #80 review FIX 2: the tab rects are
+                // hit-tested ONLY when NOT in a text-input row mode, so a tab
+                // click is inert while Filter/Rename is active (matching the
+                // keyboard, where tab-cycling is Normal-mode-only). The global
+                // button_rects (which carry the inline-edit Apply/Save/Cancel
+                // buttons in those modes) stay active.
                 let mouse_action = if !(is_down || is_up) {
                     None
-                } else if modal_active {
-                    hit_test_button(&ui.modal_button_rects, mouse.column, mouse.row)
                 } else {
-                    hit_test_button(&ui.button_rects, mouse.column, mouse.row)
-                        .or_else(|| {
-                            hit_test_tab_close(&ui.tab_close_rects, mouse.column, mouse.row)
-                        })
-                        .or_else(|| {
-                            hit_test_tab_header(&ui.tab_header_rects, mouse.column, mouse.row)
-                        })
+                    let mut action = hit_test_button(&ui.button_rects, mouse.column, mouse.row);
+                    if action.is_none() && !text_input_mode {
+                        action = hit_test_tab_close(&ui.tab_close_rects, mouse.column, mouse.row)
+                            .or_else(|| {
+                                hit_test_tab_header(&ui.tab_header_rects, mouse.column, mouse.row)
+                            });
+                    }
+                    action
                 };
                 if let Some(action) = mouse_action {
                     if is_down {
@@ -5811,23 +5932,25 @@ pub fn run_tui(
                     && let Some(card_idx) = hit_test_card(&ui.card_rects, mouse.column, mouse.row)
                 {
                     if is_down {
-                        // Double-click discrimination mirrors the text-selection
-                        // path: same row, within 3 columns, inside the 400ms
-                        // window.
+                        // Region-aware double-click discrimination: same row,
+                        // within 3 columns, inside the 400ms window, AND the
+                        // previous click was also on a card (PRD #80 review
+                        // FIX 4).
                         let now = std::time::Instant::now();
-                        let click_count = if let Some((t, lc, lr, cnt)) = ui.last_click {
-                            if now.duration_since(t).as_millis() < 400
-                                && lr == mouse.row
-                                && mouse.column.abs_diff(lc) <= 3
-                            {
-                                (cnt + 1).min(3)
-                            } else {
-                                1
-                            }
-                        } else {
-                            1
-                        };
-                        ui.last_click = Some((now, mouse.column, mouse.row, click_count));
+                        let click_count = LastClick::next_count(
+                            ui.last_click,
+                            now,
+                            mouse.column,
+                            mouse.row,
+                            ClickRegion::Card,
+                        );
+                        ui.last_click = Some(LastClick {
+                            at: now,
+                            col: mouse.column,
+                            row: mouse.row,
+                            count: click_count,
+                            region: ClickRegion::Card,
+                        });
 
                         let frame_area = terminal.get_frame().area();
                         // Single click → select exactly this card.
@@ -6045,22 +6168,26 @@ pub fn run_tui(
 
                                     // Detect multi-click (double/triple).
                                     // Require same row and nearby column (within 3 cells)
-                                    // to handle slight mouse movement between clicks.
+                                    // to handle slight mouse movement between clicks, AND
+                                    // the same click region (PRD #80 review FIX 4) so a
+                                    // card/picker click can't seed a pane double-click.
+                                    // These coords are pane-relative — a distinct region
+                                    // from the screen-coord card/picker clicks.
                                     let now = std::time::Instant::now();
-                                    let click_count = if let Some((t, lc, lr, cnt)) = ui.last_click
-                                    {
-                                        if now.duration_since(t).as_millis() < 400
-                                            && lr == row
-                                            && col.abs_diff(lc) <= 3
-                                        {
-                                            (cnt + 1).min(3)
-                                        } else {
-                                            1
-                                        }
-                                    } else {
-                                        1
-                                    };
-                                    ui.last_click = Some((now, col, row, click_count));
+                                    let click_count = LastClick::next_count(
+                                        ui.last_click,
+                                        now,
+                                        col,
+                                        row,
+                                        ClickRegion::Pane,
+                                    );
+                                    ui.last_click = Some(LastClick {
+                                        at: now,
+                                        col,
+                                        row,
+                                        count: click_count,
+                                        region: ClickRegion::Pane,
+                                    });
 
                                     match click_count {
                                         2 => {
@@ -6167,10 +6294,8 @@ pub fn run_tui(
                         crossterm::event::MouseEventKind::Up(
                             crossterm::event::MouseButton::Left,
                         ) => {
-                            let was_multiclick = ui
-                                .last_click
-                                .map(|(_, _, _, cnt)| cnt >= 2)
-                                .unwrap_or(false);
+                            let was_multiclick =
+                                ui.last_click.map(|l| l.count >= 2).unwrap_or(false);
                             // Only copy when the selection is a real drag or multi-click,
                             // not a plain single click.
                             if let Some(ref sel) = ui.selection
@@ -7335,7 +7460,9 @@ fn render_stats_bar(
 /// Ctrl+C → Quit.
 fn global_bar_buttons(has_pane_control: bool) -> Vec<Button> {
     vec![
-        Button::new("New Pane", "Ctrl+N", Action::NewPane, has_pane_control),
+        // PRD #80 review FIX 3: New Pane is ALWAYS enabled — you can always
+        // create the first pane, even with no panes / controller yet.
+        Button::new("New Pane", "Ctrl+N", Action::NewPane, true),
         Button::new("Close", "Ctrl+W", Action::CloseSelected, has_pane_control),
         Button::new(
             "Toggle Layout",
@@ -7419,7 +7546,12 @@ fn render_button_bar(
         } else {
             button.render_compact(rect, buf, palette)
         };
-        rects.push(pair);
+        // PRD #80 review FIX 3: a disabled button renders dimmed but is inert —
+        // its rect is NOT recorded, so a click on it is a no-op (matching the
+        // keyboard, where the bound key is a silent no-op).
+        if button.enabled {
+            rects.push(pair);
+        }
         x = x.saturating_add(w);
     }
     rects
@@ -7572,7 +7704,12 @@ fn render_modal_button_row(
             width: w,
             height: 1,
         };
-        rects.push(button.render(rect, buf, palette));
+        let pair = button.render(rect, buf, palette);
+        // PRD #80 review FIX 3: disabled buttons render dimmed but are inert —
+        // don't record their rect.
+        if button.enabled {
+            rects.push(pair);
+        }
         x = x.saturating_add(w);
     }
     rects

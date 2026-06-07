@@ -153,3 +153,85 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
         "the button click must short-circuit — bravo should still be selected, got: {bravo_line_after:?}"
     );
 }
+
+/// Scenario: PRD #80 review FIX 1 — a click that misses every modal button
+/// must be CONSUMED by the modal layer, never falling through to the pane
+/// behind the popup (where it could start a text selection / OSC-52 copy).
+/// Focus a real `--continue` pane so a focused pane renders behind, return to
+/// the dashboard, open the quit-confirm modal (Ctrl+C), then double-click a
+/// blank interior cell of the modal offset to the right so it overlaps the
+/// pane region behind the centered popup. The modal must stay open (its prompt
+/// still visible) and no `Copied to clipboard` status may appear — proving the
+/// stray click was consumed rather than leaking into the pane behind. (Build-
+/// checked here; not run in the fast tier.)
+#[test]
+fn preserve_modal_click_miss_is_consumed() {
+    let deck = TuiDeck::builder()
+        .with_continue_session("realpane", "sleep 600")
+        .launch_with_fixture("minimal");
+    deck.wait_until_quiescent();
+    deck.send_bytes(b"\x04"); // Ctrl+D → dashboard
+    deck.wait_for_string("realpane");
+
+    // Focus the pane (Enter) so a focused pane renders behind, then return to
+    // the dashboard — the pane stays focused behind the modal.
+    deck.send_bytes(b"\r");
+    deck.wait_for_string("PaneInput mode");
+    deck.send_bytes(b"\x04"); // Ctrl+D → back to dashboard
+    deck.wait_until_quiescent();
+
+    // Open the quit-confirm modal over the dashboard.
+    deck.send_bytes(b"\x03"); // Ctrl+C → quit-confirm
+    deck.wait_for_string("Quit dot-agent-deck?");
+
+    // Double-click a blank interior cell of the modal, offset right so it sits
+    // over the pane region behind the centered popup.
+    let (qcol, qrow) = deck
+        .find_in_grid("Quit dot-agent-deck?")
+        .expect("quit-confirm modal should be open");
+    let cx = qcol + 20;
+    let cy = qrow + 1; // the blank line just below the title
+    deck.click(cx, cy);
+    deck.click(cx, cy); // second click within the double-click window
+    deck.wait_until_quiescent();
+
+    let grid = deck.snapshot_grid();
+    assert!(
+        grid.contains("Quit dot-agent-deck?"),
+        "the modal must stay open after a click on its empty interior:\n{grid}"
+    );
+    assert!(
+        !grid.contains("Copied to clipboard"),
+        "a modal-interior click must not leak into a text selection/copy behind the popup:\n{grid}"
+    );
+}
+
+/// Scenario: PRD #80 review FIX 3 — a disabled (dimmed) button is inert. On an
+/// empty dashboard (no cards) the `[Generate g]` context button is disabled,
+/// so clicking it must be a no-op, exactly like pressing `g` with no cards.
+/// The config-gen prompt must NOT open, and the "no active agent session"
+/// status that the RequestConfigGen action would otherwise set must NOT appear
+/// — i.e. the disabled button records no clickable rect. (Build-checked here;
+/// not run in the fast tier.)
+#[test]
+fn preserve_disabled_button_is_inert() {
+    let deck = TuiDeck::launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    // The dashboard bar renders [Generate g] dimmed (no cards → disabled).
+    let (col, row) = deck
+        .find_in_grid("Generate")
+        .expect("dashboard bar should render a (dimmed) Generate button");
+    deck.click(col, row);
+    deck.wait_until_quiescent();
+
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("Generate .dot-agent-deck.toml"),
+        "clicking the disabled Generate button must not open the config-gen prompt:\n{grid}"
+    );
+    assert!(
+        !grid.contains("No active agent session"),
+        "clicking the disabled Generate button must be a true no-op (no RequestConfigGen side effect):\n{grid}"
+    );
+}
