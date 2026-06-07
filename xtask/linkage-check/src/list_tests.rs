@@ -648,8 +648,15 @@ fn parse_catalog_at_ref(
     workspace_root: &Path,
     reference: &str,
 ) -> Result<BTreeMap<String, CatalogEntry>, String> {
-    let prd_rel = "prds/77-tui-testing-harness.md";
-    let body = git_show(reference, prd_rel)?;
+    // The catalog lives at `tests/CATALOG.md` (relocated out of the archived
+    // PRD #77 file). On a base ref that predates the move the file is absent;
+    // treat that like an empty catalog (mirrors `read_allowlist_at_ref`) so
+    // the diff just shows the entries as added rather than failing.
+    let catalog_rel = "tests/CATALOG.md";
+    let body = match git_show(reference, catalog_rel) {
+        Ok(s) => s,
+        Err(_) => return Ok(BTreeMap::new()),
+    };
     // parse_catalog wants a file path; stage the body in a tempfile.
     let tmp = tempfile_for_catalog(workspace_root, &body)?;
     let result = parse_catalog(&tmp);
@@ -659,7 +666,7 @@ fn parse_catalog_at_ref(
 
 fn parse_catalog_on_disk(workspace_root: &Path) -> Result<BTreeMap<String, CatalogEntry>, String> {
     let config = DocsConfig::from_workspace(workspace_root);
-    parse_catalog(&config.prd_path)
+    parse_catalog(&config.catalog_path)
 }
 
 fn tempfile_for_catalog(workspace_root: &Path, body: &str) -> Result<PathBuf, String> {

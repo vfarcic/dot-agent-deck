@@ -4,7 +4,7 @@
 # catalog with:
 #
 #   awk '/^## Test Case Catalog/{p=1;next} /^## /{p=0} p && /^##### /' \
-#       prds/77-tui-testing-harness.md \
+#       tests/CATALOG.md \
 #     | grep -oE '[a-z-]+/[a-z-]+/[0-9]{3}' | sort -u
 
 # chain-smoke/claude/001 — covered by tests/e2e_chain_smoke_claude.rs (M3).
