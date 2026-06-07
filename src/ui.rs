@@ -7930,13 +7930,13 @@ fn render_help_overlay(
     let left: Vec<Line> = vec![
         Line::styled("  Global (works from any pane)", cyan),
         Line::from(""),
-        Line::from(format!("  {MOD_KEY}+d           Command mode (dashboard)")),
-        Line::from(format!("  {MOD_KEY}+n           Create new pane")),
-        Line::from(format!("  {MOD_KEY}+w           Close selected pane")),
+        Line::from(format!("  {MOD_KEY}+D           Command mode (dashboard)")),
+        Line::from(format!("  {MOD_KEY}+N           Create new pane")),
+        Line::from(format!("  {MOD_KEY}+W           Close selected pane")),
         Line::from(format!(
-            "  {MOD_KEY}+t           Toggle layout (stacked/tiled)"
+            "  {MOD_KEY}+T           Toggle layout (stacked/tiled)"
         )),
-        Line::from(format!("  {MOD_KEY}+c           Quit")),
+        Line::from(format!("  {MOD_KEY}+C           Quit")),
         Line::from(""),
         Line::styled("  Tab Navigation", cyan),
         Line::from(""),
@@ -7968,7 +7968,7 @@ fn render_help_overlay(
         Line::from("  Esc             Deselect side pane"),
         Line::from("  Mouse click     Focus pane"),
         Line::from("  Ctrl+click      Open hyperlink"),
-        Line::from(format!("  {MOD_KEY}+d            Return to Normal mode")),
+        Line::from(format!("  {MOD_KEY}+D            Return to Normal mode")),
         Line::from(""),
         Line::styled("  New Agent Form", cyan),
         Line::from(""),
