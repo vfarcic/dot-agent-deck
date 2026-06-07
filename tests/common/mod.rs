@@ -171,6 +171,12 @@ impl TuiDeckBuilder {
 /// Handle to a running deck.
 pub struct TuiDeck {
     pty_master: Box<dyn MasterPty + Send>,
+    /// PTY master write side, taken ONCE at construction. `MasterPty::
+    /// take_writer()` is single-shot (a 2nd call errors), so `send_bytes`
+    /// (and `click`/`scroll`, which call it 2×/1×) must share one stored
+    /// writer rather than taking a fresh one per call. Behind a `Mutex` so
+    /// the write helpers can keep `&self`.
+    writer: Mutex<Box<dyn Write + Send>>,
     parser: Arc<Mutex<vt100::Parser>>,
     last_byte_at: Arc<Mutex<Instant>>,
     cast_events: Arc<Mutex<Vec<CastEvent>>>,
@@ -457,8 +463,15 @@ impl TuiDeck {
 
         let record_on_success = std::env::var_os("DOT_AGENT_DECK_RECORD").is_some();
 
+        // Take the PTY write side exactly once — `take_writer()` is
+        // single-shot, so the per-call `take_writer()` the write helpers used
+        // before panicked on their 2nd invocation (and dropped/closed the
+        // write side after the 1st). Store it for all writes.
+        let writer = pair.master.take_writer().expect("take PTY master writer");
+
         Ok(TuiDeck {
             pty_master: pair.master,
+            writer: Mutex::new(writer),
             parser,
             last_byte_at,
             cast_events,
@@ -520,6 +533,36 @@ impl TuiDeck {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Deterministic wait until `pred` holds for the current rendered grid
+    /// (one string, rows joined by '\n'), or panic after the timeout. Unlike
+    /// [`wait_until_quiescent`], this does not depend on the PTY going idle —
+    /// with a live daemon event stream the deck redraws often enough that a
+    /// 50 ms idle window may never occur, so quiescence is unreliable for
+    /// mouse specs. Use this to wait for a specific observable outcome (e.g.
+    /// a row gaining the selection marker, or a modal/form closing) after a
+    /// click or keystroke.
+    pub fn wait_until_grid(&self, what: &str, pred: impl Fn(&str) -> bool) {
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            let grid = self.snapshot_grid();
+            if pred(&grid) {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "did not reach grid state {what:?} within {WAIT_TIMEOUT:?}.\nFinal grid:\n{grid}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Wait until `needle` is ABSENT from the rendered grid, or panic after
+    /// the timeout. For asserting a modal/overlay/form closed.
+    pub fn wait_for_absence(&self, needle: &str) {
+        self.wait_until_grid(&format!("absence of {needle:?}"), |g| !g.contains(needle));
     }
 
     /// Opt-in fast wait when the test knows the screen contents it is
@@ -625,10 +668,7 @@ impl TuiDeck {
     /// mouse would (key bytes, SGR mouse reports). Flushes so the deck sees
     /// the input promptly.
     pub fn send_bytes(&self, bytes: &[u8]) {
-        let mut writer = self
-            .pty_master
-            .take_writer()
-            .expect("take PTY master writer");
+        let mut writer = self.writer.lock().unwrap();
         writer.write_all(bytes).expect("write to PTY master");
         writer.flush().expect("flush PTY master");
     }

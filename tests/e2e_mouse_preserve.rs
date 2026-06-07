@@ -30,33 +30,28 @@ fn send_session_start(deck: &TuiDeck, session_id: &str, pane_id: &str, cwd: &str
         .expect("write SessionStart hook to per-test socket");
 }
 
-/// Return the first rendered grid line containing `needle`, if any.
-fn grid_line_containing(deck: &TuiDeck, needle: &str) -> Option<String> {
-    deck.snapshot_grid()
-        .lines()
-        .find(|l| l.contains(needle))
-        .map(|l| l.to_string())
-}
-
-/// Scenario: Verify existing mouse behavior survives the PRD #80 button
-/// layer, using a real `--continue`-spawned pane (`realpane`, running a
-/// long-lived command). (1) Double-clicking its dashboard card still focuses
-/// the pane and enters PaneInput (the focus_pane / focused_pane_rect path).
-/// (2) A non-button click inside the focused-pane region is NOT swallowed by
-/// the button layer — it does not fire a global button action (no picker
-/// opens). (3) A scroll wheel event in the pane region likewise reaches the
-/// scroll path, not the button hit-test (which only runs on Down/Up). Should
-/// be GREEN (asserts existing behavior). DEFERRED, with reasons, in the body:
-/// mode-tab side/agent click-to-focus, text-selection drag/multi-click,
-/// Ctrl+click hyperlink, and child-app mouse forwarding.
+/// Scenario: Verify existing pane mouse behavior survives the PRD #80 button
+/// layer. A real `--continue`-spawned pane (`realpane`, running a long-lived
+/// command) is auto-focused on launch (PaneInput → [Detach Ctrl+D]), which
+/// already exercises the focus_pane / focused_pane_rect path. (1) A non-button
+/// click inside the focused-pane region and (2) a scroll wheel event in that
+/// region must NOT be swallowed by the button hit-test layer (which only runs
+/// on Down/Up) — they reach the existing pane path, so no global button action
+/// (no picker) fires. We then detach via the [Detach Ctrl+D] affordance and
+/// return cleanly to Normal mode; if a mid-pane event had wrongly navigated
+/// away, the detach would not return us to the global bar. Should be GREEN
+/// (asserts existing behavior). DEFERRED, with reasons, in the body:
+/// explicit double-click-to-focus from the dashboard (covered by
+/// mouse/dashboard/001), mode-tab side/agent click-to-focus, text-selection
+/// drag/multi-click, Ctrl+click hyperlink, and child-app mouse forwarding.
 #[spec("mouse/preserve/001")]
 #[test]
 fn preserve_001_existing_pane_mouse_behavior_intact() {
     // DEFERRED sub-behaviors (not asserted here) and why:
+    //  - Explicit double-click-to-focus a card: covered by mouse/dashboard/001.
     //  - Mode-tab side/agent pane click-to-focus: focus there is visual-only
     //    (border highlight, no PaneInput status), not robustly readable via
-    //    vt100, and needs heavy mode-tab setup. It shares the same
-    //    `pane.focus_pane` mechanism exercised below via the dashboard.
+    //    vt100, and needs heavy mode-tab setup; same `pane.focus_pane` path.
     //  - Text selection (drag / double-click word / triple-click): the
     //    harness sends discrete clicks; driving a Drag sequence and reading
     //    the selection highlight from the grid is not robust. The
@@ -68,38 +63,26 @@ fn preserve_001_existing_pane_mouse_behavior_intact() {
     let deck = TuiDeck::builder()
         .with_continue_session("realpane", "sleep 600")
         .launch_with_fixture("minimal");
-    deck.wait_until_quiescent();
-    deck.send_bytes(b"\x04"); // Ctrl+D → ensure dashboard
-    deck.wait_for_string("realpane");
+    // --continue auto-focuses the restored pane → PaneInput, shown by the
+    // [Detach Ctrl+D] affordance (the focus path works).
+    deck.wait_for_string("[Detach Ctrl+D]");
 
-    // (1) Double-click the card → pane focused, PaneInput entered.
-    let (col, row) = deck
-        .find_in_grid("realpane")
-        .expect("realpane card should be on the dashboard");
-    deck.click(col, row);
-    deck.click(col, row);
-    deck.wait_for_string("PaneInput mode");
-
-    // (2) A non-button click inside the focused-pane region is not swallowed
-    // into a button action — clicking mid-pane must NOT open the New-Pane
-    // picker (the button layer's action). Coordinates are well inside the
-    // pane and away from the bottom button bar (last row).
-    deck.click(20, 5);
-    deck.wait_until_quiescent();
+    // (1)+(2) A non-button click AND a scroll inside the focused-pane region
+    // (right-hand preview) must NOT be swallowed by the button layer. Capture
+    // the [Detach Ctrl+D] affordance, then send mid-pane click, mid-pane
+    // scroll, and the detach click — buffered and processed in order. If a
+    // mid-pane event had wrongly fired the New-Pane button, the picker would
+    // cover the bar and the detach click would not return us to Normal.
+    let (dcol, drow) = deck
+        .find_in_grid("[Detach Ctrl+D]")
+        .expect("PaneInput bottom bar should render [Detach Ctrl+D]");
+    deck.click(60, 5); // non-button click inside the focused-pane preview
+    deck.scroll(60, 5, true); // scroll inside the pane region (not Down/Up → never hits buttons)
+    deck.click(dcol, drow); // detach
+    deck.wait_for_string("[New Pane Ctrl+N]"); // cleanly back to Normal — events didn't navigate away
     assert!(
         !deck.snapshot_grid().contains("Select Directory"),
-        "a non-button click in the pane region must not fire a global button action:\n{}",
-        deck.snapshot_grid()
-    );
-
-    // (3) A scroll event in the pane region reaches the scroll path, not the
-    // button layer (which only hit-tests Down/Up) — it must not fire a button
-    // action either.
-    deck.scroll(20, 5, true);
-    deck.wait_until_quiescent();
-    assert!(
-        !deck.snapshot_grid().contains("Select Directory"),
-        "a scroll event must not be intercepted by the button layer:\n{}",
+        "a non-button click/scroll in the pane region must not open the New-Pane picker:\n{}",
         deck.snapshot_grid()
     );
 }
@@ -123,17 +106,17 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
     send_session_start(&deck, "bravo", "pane-bravo", "/tmp");
     deck.wait_for_string("bravo");
 
-    // (1) Miss-falls-through: clicking the bravo card selects it (▸ marker).
+    // (1) Miss-falls-through: clicking the bravo card selects it (▸ marker
+    // on bravo's row). The deterministic wait IS the assertion.
     let (col, row) = deck
         .find_in_grid("bravo")
         .expect("bravo card should be on the dashboard");
     deck.click(col, row);
-    deck.wait_until_quiescent();
-    let bravo_line = grid_line_containing(&deck, "bravo").expect("bravo card row");
-    assert!(
-        bravo_line.contains("> ") || bravo_line.contains('▸'),
-        "clicking the bravo card should select it (selection marker), got: {bravo_line:?}"
-    );
+    let bravo_selected = |g: &str| {
+        g.lines()
+            .any(|l| l.contains("bravo") && (l.contains('▸') || l.contains("> ")))
+    };
+    deck.wait_until_grid("bravo card selected", bravo_selected);
 
     // (2) Short-circuit: clicking the [New Pane Ctrl+N] bar button fires its
     // action (picker opens) and does NOT also act on the cards underneath.
@@ -146,39 +129,30 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
     // Dismiss the picker and confirm the card selection was untouched by the
     // button click (it short-circuited rather than falling through).
     deck.send_bytes(b"\x1b"); // Esc → close picker → back to dashboard
-    deck.wait_for_string("bravo");
-    let bravo_line_after = grid_line_containing(&deck, "bravo").expect("bravo card row");
-    assert!(
-        bravo_line_after.contains("> ") || bravo_line_after.contains('▸'),
-        "the button click must short-circuit — bravo should still be selected, got: {bravo_line_after:?}"
-    );
+    deck.wait_for_absence("Select Directory");
+    deck.wait_until_grid("bravo still selected", bravo_selected);
 }
 
 /// Scenario: PRD #80 review FIX 1 — a click that misses every modal button
-/// must be CONSUMED by the modal layer, never falling through to the pane
+/// must be CONSUMED by the modal layer, never falling through to the content
 /// behind the popup (where it could start a text selection / OSC-52 copy).
-/// Focus a real `--continue` pane so a focused pane renders behind, return to
-/// the dashboard, open the quit-confirm modal (Ctrl+C), then double-click a
-/// blank interior cell of the modal offset to the right so it overlaps the
-/// pane region behind the centered popup. The modal must stay open (its prompt
-/// still visible) and no `Copied to clipboard` status may appear — proving the
-/// stray click was consumed rather than leaking into the pane behind. (Build-
-/// checked here; not run in the fast tier.)
+/// With a real `--continue` pane on the dashboard behind it, open the
+/// quit-confirm modal (Ctrl+C), then double-click a blank interior cell of the
+/// modal offset to the right so it overlaps the region behind the centered
+/// popup. The modal must stay open (its [Cancel] button still present) and no
+/// `Copied to clipboard` status may appear — proving the stray click was
+/// consumed rather than leaking behind.
 #[test]
 fn preserve_modal_click_miss_is_consumed() {
     let deck = TuiDeck::builder()
         .with_continue_session("realpane", "sleep 600")
         .launch_with_fixture("minimal");
-    deck.wait_until_quiescent();
-    deck.send_bytes(b"\x04"); // Ctrl+D → dashboard
-    deck.wait_for_string("realpane");
-
-    // Focus the pane (Enter) so a focused pane renders behind, then return to
-    // the dashboard — the pane stays focused behind the modal.
-    deck.send_bytes(b"\r");
-    deck.wait_for_string("PaneInput mode");
-    deck.send_bytes(b"\x04"); // Ctrl+D → back to dashboard
-    deck.wait_until_quiescent();
+    // --continue auto-focuses the restored pane (PaneInput). Detach to the
+    // dashboard so the modal opens over the dashboard, with the (now
+    // unfocused) pane region behind the centered popup.
+    deck.wait_for_string("[Detach Ctrl+D]");
+    deck.send_bytes(b"\x04"); // Ctrl+D → dashboard / Normal
+    deck.wait_for_string("[New Pane Ctrl+N]");
 
     // Open the quit-confirm modal over the dashboard.
     deck.send_bytes(b"\x03"); // Ctrl+C → quit-confirm
@@ -193,17 +167,22 @@ fn preserve_modal_click_miss_is_consumed() {
     let cy = qrow + 1; // the blank line just below the title
     deck.click(cx, cy);
     deck.click(cx, cy); // second click within the double-click window
-    deck.wait_until_quiescent();
 
-    let grid = deck.snapshot_grid();
+    // The modal stayed open and consumed the stray click: clicking its
+    // [Cancel] button (buffered after the stray clicks, processed in order)
+    // closes it. If the stray click had leaked/closed the modal, [Cancel]
+    // would be gone and this would fail. No copy may have leaked to the pane
+    // behind.
+    let (ccol, crow) = deck
+        .find_in_grid("[Cancel]")
+        .expect("quit-confirm modal should still render its [Cancel] button");
     assert!(
-        grid.contains("Quit dot-agent-deck?"),
-        "the modal must stay open after a click on its empty interior:\n{grid}"
+        !deck.snapshot_grid().contains("Copied to clipboard"),
+        "a modal-interior click must not leak into a text selection/copy behind the popup:\n{}",
+        deck.snapshot_grid()
     );
-    assert!(
-        !grid.contains("Copied to clipboard"),
-        "a modal-interior click must not leak into a text selection/copy behind the popup:\n{grid}"
-    );
+    deck.click(ccol, crow);
+    deck.wait_for_absence("Quit dot-agent-deck?");
 }
 
 /// Scenario: PRD #80 review FIX 3 — a disabled (dimmed) button is inert. On an
@@ -223,11 +202,17 @@ fn preserve_disabled_button_is_inert() {
         .find_in_grid("Generate")
         .expect("dashboard bar should render a (dimmed) Generate button");
     deck.click(col, row);
-    deck.wait_until_quiescent();
+
+    // Anchor: open the help overlay (?). It renders only from Normal mode, so
+    // reaching it proves (a) the deck processed the prior disabled-click in
+    // order and (b) the disabled click did NOT open the config-gen prompt
+    // (from which `?` would do nothing and this wait would time out).
+    deck.send_bytes(b"?");
+    deck.wait_for_string("works from any pane");
 
     let grid = deck.snapshot_grid();
     assert!(
-        !grid.contains("Generate .dot-agent-deck.toml"),
+        !grid.contains("No workspace modes config found"),
         "clicking the disabled Generate button must not open the config-gen prompt:\n{grid}"
     );
     assert!(

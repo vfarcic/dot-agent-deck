@@ -35,14 +35,6 @@ fn click_target(deck: &TuiDeck, needle: &str) {
     deck.click(col, row);
 }
 
-/// Return the first rendered grid line containing `needle`, if any.
-fn grid_line_containing(deck: &TuiDeck, needle: &str) -> Option<String> {
-    deck.snapshot_grid()
-        .lines()
-        .find(|l| l.contains(needle))
-        .map(|l| l.to_string())
-}
-
 /// Scenario: Open the picker and single-click the `childdir` row. That row
 /// must become the highlighted/selected row — the `> ` selection marker
 /// moves onto it (`> childdir/`), the same row a j/k highlight would land on.
@@ -58,13 +50,11 @@ fn picker_001_single_click_selects_row() {
         .find_in_grid("childdir")
         .expect("childdir row should be listed");
     deck.click(col, row);
-    deck.wait_until_quiescent();
-
-    let line = grid_line_containing(&deck, "childdir").expect("childdir row");
-    assert!(
-        line.contains("> childdir"),
-        "single-click should select the childdir row (> marker), got: {line:?}"
-    );
+    // Deterministic wait IS the assertion: the childdir row gains the "> "
+    // selection marker.
+    deck.wait_until_grid("childdir row selected (> marker)", |g| {
+        g.lines().any(|l| l.contains("> childdir"))
+    });
 }
 
 /// Scenario: Open the picker and double-click the `childdir` row. It must

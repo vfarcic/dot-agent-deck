@@ -142,44 +142,36 @@ fn inline_001_rename_cancel_abandons() {
 
     click_button(&deck, "[Cancel]");
 
-    // Abandoned like Esc: original name stays, typed name not applied.
+    // Abandoned like Esc: the rename input is discarded — the typed name
+    // disappears (the alpha card was always visible, so its absence, not
+    // alpha's presence, is the deterministic signal the cancel took effect).
+    deck.wait_for_absence("discarded9");
     deck.wait_for_string("alpha");
-    assert!(
-        !deck.snapshot_grid().contains("discarded9"),
-        "cancelled rename must not apply the typed name:\n{}",
-        deck.snapshot_grid()
-    );
 }
 
-/// Scenario: Focus a real, `--continue`-spawned pane (`realpane`, running a
-/// long-lived command) so the TUI enters PaneInput mode, then click the
-/// `[Detach Ctrl+D]` affordance shown in that mode. It must return to the
-/// dashboard exactly as Ctrl+D (`Action::DetachToNormal`) does — the
-/// `PaneInput mode` status is gone. RED until M6 renders the `[Detach
-/// Ctrl+D]` affordance.
+/// Scenario: A real `--continue`-spawned pane (`realpane`, running a long-
+/// lived command) is auto-focused on launch, so the TUI is in PaneInput mode
+/// showing the `[Detach Ctrl+D]` affordance. Click that affordance — it must
+/// return to the dashboard exactly as pressing Ctrl+D (`Action::
+/// DetachToNormal`) does, so the PaneInput `[Detach Ctrl+D]` bar is replaced
+/// by the Normal-mode global bar. RED until M6 renders the `[Detach Ctrl+D]`
+/// affordance.
 #[spec("mouse/inline/001")]
 #[test]
 fn inline_001_pane_input_detach_returns_to_dashboard() {
     let deck = TuiDeck::builder()
         .with_continue_session("realpane", "sleep 600")
         .launch_with_fixture("minimal");
-    deck.wait_until_quiescent();
-    // Ensure we're on the dashboard (in case --continue auto-focused the pane).
-    deck.send_bytes(b"\x04"); // Ctrl+D → dashboard / Normal
-    deck.wait_for_string("realpane");
+    // --continue auto-focuses the single restored pane → PaneInput, so the
+    // [Detach Ctrl+D] affordance is already shown. That is exactly the
+    // affordance under test.
+    deck.wait_for_string("[Detach Ctrl+D]");
 
-    // Enter PaneInput by focusing the selected card (== Enter).
-    deck.send_bytes(b"\r");
-    deck.wait_for_string("PaneInput mode");
-
-    // Click the detach affordance shown while in PaneInput.
+    // Click the detach affordance — same outcome as pressing Ctrl+D.
     click_button(&deck, "[Detach Ctrl+D]");
 
-    // Returned to dashboard like Ctrl+D: the PaneInput status is gone.
-    deck.wait_until_quiescent();
-    assert!(
-        !deck.snapshot_grid().contains("PaneInput mode"),
-        "clicking [Detach Ctrl+D] should leave PaneInput and return to the dashboard:\n{}",
-        deck.snapshot_grid()
-    );
+    // Detached to the dashboard: PaneInput's affordance is replaced by the
+    // Normal-mode global bar.
+    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_absence("[Detach Ctrl+D]");
 }

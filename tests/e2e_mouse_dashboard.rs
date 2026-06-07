@@ -39,59 +39,41 @@ fn send_session_start(deck: &TuiDeck, session_id: &str, pane_id: &str, cwd: &str
         .expect("write SessionStart hook to per-test socket");
 }
 
-/// Return the first rendered grid line containing `needle`, if any.
-fn grid_line_containing(deck: &TuiDeck, needle: &str) -> Option<String> {
-    deck.snapshot_grid()
-        .lines()
-        .find(|l| l.contains(needle))
-        .map(|l| l.to_string())
-}
-
-/// Scenario: With two dashboard cards present — a real `--continue`-spawned
-/// pane (`realpane`, running `sleep`, so its pane is focusable) and a
-/// synthetic hook card (`bravo`) — single-click the `bravo` card. Selection
-/// (the `▸` marker) must move to `bravo`, the same card a j/k cycle would
-/// select. Then double-click the `realpane` card: its pane must be focused
-/// and the TUI must enter PaneInput mode — the same outcome as pressing
-/// Enter on the selected card. RED until M4 adds card click hit-testing
-/// (today a card click does not move selection or focus a pane).
+/// Scenario: Double-click a dashboard card to focus its pane. With a real
+/// `--continue`-spawned pane (`realpane`, running `sleep`, so its pane is
+/// focusable), detach to the dashboard, then double-click the `realpane`
+/// card: its pane must be focused and the TUI must enter PaneInput mode — the
+/// same outcome as pressing Enter on the selected card. (Single-click card
+/// SELECTION is covered by `mouse/preserve/002` using two synthetic cards;
+/// here the single restored real pane is the focused pane, so the PRD #68
+/// selection↔focus sync keeps it selected — a mixed real+synthetic selection
+/// move can't be demonstrated.) RED until M4 adds card click hit-testing.
 #[spec("mouse/dashboard/001")]
 #[test]
 fn dashboard_001_click_selects_double_click_focuses() {
     // `realpane` runs a plain long-lived command → a real, focusable PTY
-    // pane (no agent credentials needed) so the double-click→focus half can
-    // actually enter PaneInput.
+    // pane (no agent credentials needed) so the double-click→focus enters
+    // PaneInput.
     let deck = TuiDeck::builder()
         .with_continue_session("realpane", "sleep 600")
         .launch_with_fixture("minimal");
-    deck.wait_until_quiescent();
-    // If --continue restored straight into the pane, Ctrl+D returns to the
-    // dashboard so the cards are visible and clickable.
+    // --continue auto-focuses the single restored pane (PaneInput → the bottom
+    // bar shows [Detach Ctrl+D]). Detach to the dashboard Normal mode (bar
+    // shows [New Pane Ctrl+N]) so the card is clickable.
+    deck.wait_for_string("[Detach Ctrl+D]");
     deck.send_bytes(b"\x04"); // Ctrl+D → dashboard / Normal mode
-    deck.wait_for_string("realpane");
-
-    // Second card via a synthetic SessionStart hook.
-    send_session_start(&deck, "bravo", "pane-bravo", "/tmp");
-    deck.wait_for_string("bravo");
-
-    // Single-click the bravo card title → selection marker moves to it.
-    let (col, row) = deck
-        .find_in_grid("bravo")
-        .expect("bravo card should be on the dashboard");
-    deck.click(col, row);
-    deck.wait_until_quiescent();
-    let bravo_line = grid_line_containing(&deck, "bravo").expect("bravo card row");
-    assert!(
-        bravo_line.contains('▸'),
-        "single-click should select the bravo card (▸ marker), got: {bravo_line:?}"
-    );
+    deck.wait_for_string("[New Pane Ctrl+N]");
+    // The realpane card's body shows "Launch an agent..." (a No-agent pane).
+    // Locate the card by that text — find_in_grid("realpane") would hit the
+    // focused-pane preview's title bar on the right, not the card.
+    deck.wait_for_string("Launch an agent");
 
     // Double-click the realpane card → focus its pane (PaneInput mode).
-    let (rcol, rrow) = deck
-        .find_in_grid("realpane")
-        .expect("realpane card should be on the dashboard");
-    deck.click(rcol, rrow);
-    deck.click(rcol, rrow); // second click within the double-click window
+    let (col, row) = deck
+        .find_in_grid("Launch an agent")
+        .expect("realpane card body should be on the dashboard");
+    deck.click(col, row);
+    deck.click(col, row); // second click within the double-click window
     deck.wait_for_string("PaneInput mode");
 }
 
@@ -123,6 +105,9 @@ fn dashboard_002_filter_rename_generate_buttons() {
     deck.send_bytes(b"zqx");
     deck.wait_for_string("zqx");
     deck.send_bytes(b"\x1b"); // Esc → back to Normal mode
+    // Wait for the Normal-mode button bar to return before locating the next
+    // button (Esc is async — finding it immediately races the redraw).
+    deck.wait_for_string("[New Pane Ctrl+N]");
 
     // Rename button (acts on the selected card) → rename mode.
     let (c, r) = deck
@@ -131,6 +116,7 @@ fn dashboard_002_filter_rename_generate_buttons() {
     deck.click(c, r);
     deck.wait_for_string("Rename:");
     deck.send_bytes(b"\x1b"); // Esc → back to Normal mode
+    deck.wait_for_string("[New Pane Ctrl+N]");
 
     // Generate-config button → config-generation prompt.
     let (c, r) = deck

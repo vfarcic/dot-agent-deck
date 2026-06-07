@@ -29,19 +29,25 @@ fn open_second_tab(deck: &TuiDeck) {
     deck.send_bytes(b"\x0e"); // Ctrl+N → directory picker
     deck.wait_for_string("Select Directory");
     deck.send_bytes(b" "); // Space: choose current dir → new-pane form
-    deck.wait_until_quiescent();
+    deck.wait_for_string("Mode:"); // form ready (Mode field present with modes)
     deck.send_bytes(b"\x1b[C"); // Right: move Mode selection off "No mode" to `demo`
-    deck.send_bytes(b"\r"); // Enter: Mode → Name field
-    deck.send_bytes(b"\r"); // Enter: submit (Command field hidden for a mode pane)
+    deck.wait_for_string("demo mode"); // selection reflected in the title
+    // Submit via the [Submit] button (deterministic — a mode pane still shows
+    // the Command field, so an Enter-count would be fragile).
+    let (scol, srow) = deck
+        .find_in_grid("[Submit]")
+        .expect("new-pane form should render a [Submit] button");
+    deck.click(scol, srow);
     deck.wait_for_string("Dashboard"); // tab strip appears only with ≥2 tabs
 }
 
 /// Scenario: With a Dashboard tab and a Mode tab open (the Mode tab is
 /// active after creation), click the inactive `Dashboard` tab header in the
 /// top strip. The deck must switch to the Dashboard view — the same outcome
-/// as pressing Tab / Ctrl+PageUp — so the empty-dashboard `No active
-/// sessions` state is shown again, proving click-to-switch funnels through
-/// the shared tab-switch action.
+/// as pressing Tab / Ctrl+PageUp — so the dashboard's session-count title
+/// (`dot-agent-deck — N session(s)`, shown only on the Dashboard tab, not on
+/// a Mode tab) appears, proving click-to-switch funnels through the shared
+/// tab-switch action.
 #[spec("mouse/tabstrip/001")]
 #[test]
 fn tabstrip_001_click_header_switches_tab() {
@@ -55,8 +61,9 @@ fn tabstrip_001_click_header_switches_tab() {
         .expect("tab strip should render a Dashboard header");
     deck.click(col + 1, row);
 
-    // Switching to the Dashboard tab shows the empty-dashboard state.
-    deck.wait_for_string("No active sessions");
+    // Switching to the Dashboard tab shows the dashboard's session-count title
+    // (the Mode tab view does not render it).
+    deck.wait_for_string("dot-agent-deck \u{2014}");
 }
 
 /// Scenario: With a Dashboard tab and a Mode tab open, click the `[×]`
@@ -77,10 +84,5 @@ fn tabstrip_002_click_close_glyph_closes_tab() {
     deck.click(col, row);
 
     // Tab closed → back to a lone Dashboard → strip hidden, no × remains.
-    deck.wait_until_quiescent();
-    let grid = deck.snapshot_grid();
-    assert!(
-        !grid.contains('×'),
-        "closing the Mode tab should remove its [×]; grid still shows one:\n{grid}"
-    );
+    deck.wait_for_absence("×");
 }

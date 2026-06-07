@@ -92,17 +92,12 @@ fn form_001_click_submit_creates_pane() {
 
     click_target(&deck, "[Submit]");
 
-    // Submitted like Enter: form closed, the named pane was created.
-    deck.wait_until_quiescent();
-    let grid = deck.snapshot_grid();
-    assert!(
-        grid.contains("subm5"),
-        "submit should create the pane named subm5:\n{grid}"
-    );
-    assert!(
-        !grid.contains("New Agent"),
-        "submit should close the new-pane form:\n{grid}"
-    );
+    // Submitted like Enter: the form closes ("New Agent" gone) and the named
+    // pane was created (the "subm5" card remains). The combined wait is the
+    // assertion.
+    deck.wait_until_grid("form closed and subm5 pane created", |g| {
+        !g.contains("New Agent") && g.contains("subm5")
+    });
 }
 
 /// Scenario: Open the form, type a Name, then click `[Cancel]`. The form must
