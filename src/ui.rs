@@ -3809,10 +3809,7 @@ pub fn run_tui(
         // list is cleared and the selection falls back to the first card.
         // Mode tabs render via the early-return path below, so
         // `selected_index` is irrelevant there and left as clamped.
-        let focused_pane_now = pane
-            .as_any()
-            .downcast_ref::<EmbeddedPaneController>()
-            .and_then(|e| e.focused_pane_id());
+        let focused_pane_now = pane.focused_pane_id();
         let filtered_ids: Vec<(&str, Option<&str>)> = filtered
             .iter()
             .map(|(id, s)| (id.as_str(), s.pane_id.as_deref()))
