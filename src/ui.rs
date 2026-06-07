@@ -7060,13 +7060,8 @@ fn render_frame(
         .style(Style::default().fg(palette.text_secondary))
         .centered();
         frame.render_widget(msg, vertical[1]);
-        render_bottom_bar(
-            frame,
-            ui,
-            hints_area,
-            has_pane_control,
-            &dashboard_context_buttons(!filtered.is_empty()),
-        );
+        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -7154,13 +7149,8 @@ fn render_frame(
             active_mode_name,
             palette,
         );
-        render_bottom_bar(
-            frame,
-            ui,
-            hints_area,
-            has_pane_control,
-            &dashboard_context_buttons(!filtered.is_empty()),
-        );
+        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -7256,13 +7246,8 @@ fn render_frame(
     );
 
     // Full-width hints bar
-    render_bottom_bar(
-        frame,
-        ui,
-        hints_area,
-        has_pane_control,
-        &dashboard_context_buttons(!filtered.is_empty()),
-    );
+    let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+    render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
     // Render terminal panes on the right side
     if let Some(right) = panes_area {
@@ -7679,33 +7664,88 @@ fn render_stats_bar(
 /// available; Help and Quit are always actionable. Shortcuts mirror the
 /// keyboard handlers: `global_ctrl_action` (Ctrl+N/W/T), `?` → Help,
 /// Ctrl+C → Quit.
-fn global_bar_buttons(has_pane_control: bool) -> Vec<Button> {
+/// PRD #40: format a keybinding's notation for a BUTTON label. Buttons use the
+/// prd-80 convention of `Ctrl+<UPPERCASE letter>` (e.g. `Ctrl+N`), while
+/// `notation()` emits lowercase (`Ctrl+n`). Uppercase ONLY the trailing single
+/// ASCII letter of a modifier combo (one containing `+`); bare keys (`r`, `g`,
+/// `?`, `/`) and non-letter tails are left untouched. So under the default
+/// config every button label is byte-for-byte identical to the old hardcoded
+/// strings, while a remap (e.g. `new_pane = "Alt+p"`) renders `Alt+P`. An
+/// unbound action renders `(unbound)` (via `display_notation`).
+fn button_shortcut_label(keybindings: &KeybindingConfig, action: KbAction) -> String {
+    let s = display_notation(keybindings, action);
+    if let Some(plus) = s.rfind('+') {
+        let (head, tail) = s.split_at(plus + 1);
+        let mut tail_chars = tail.chars();
+        if let Some(c) = tail_chars.next()
+            && tail_chars.next().is_none()
+            && c.is_ascii_alphabetic()
+        {
+            return format!("{head}{}", c.to_ascii_uppercase());
+        }
+    }
+    s
+}
+
+fn global_bar_buttons(keybindings: &KeybindingConfig, has_pane_control: bool) -> Vec<Button> {
     vec![
         // PRD #80 review FIX 3: New Pane is ALWAYS enabled — you can always
         // create the first pane, even with no panes / controller yet.
-        Button::new("New Pane", "Ctrl+N", Action::NewPane, true),
-        Button::new("Close", "Ctrl+W", Action::CloseSelected, has_pane_control),
+        Button::new(
+            "New Pane",
+            button_shortcut_label(keybindings, KbAction::NewPane),
+            Action::NewPane,
+            true,
+        ),
+        Button::new(
+            "Close",
+            button_shortcut_label(keybindings, KbAction::ClosePane),
+            Action::CloseSelected,
+            has_pane_control,
+        ),
         Button::new(
             "Toggle Layout",
-            "Ctrl+T",
+            button_shortcut_label(keybindings, KbAction::ToggleLayout),
             Action::ToggleLayout,
             has_pane_control,
         ),
-        Button::new("Help", "?", Action::ToggleHelp, true),
+        Button::new(
+            "Help",
+            button_shortcut_label(keybindings, KbAction::Help),
+            Action::ToggleHelp,
+            true,
+        ),
+        // Quit is the non-overridable Ctrl+C modal trigger — not a remappable
+        // KbAction, so its label stays fixed.
         Button::new("Quit", "Ctrl+C", Action::Quit, true),
     ]
 }
 
 /// PRD #80 M4: the dashboard-only context buttons appended to the global bar
-/// while on the dashboard in Normal mode, each carrying its inline shortcut.
-/// Filter is always actionable; Rename / Generate-config act on the selected
-/// card, so they're disabled (dimmed) when there are no cards — matching the
-/// `r` / `g` keys' `total > 0` guard.
-fn dashboard_context_buttons(has_cards: bool) -> Vec<Button> {
+/// while on the dashboard in Normal mode, each carrying its (live) inline
+/// shortcut. Filter is always actionable; Rename / Generate-config act on the
+/// selected card, so they're disabled (dimmed) when there are no cards —
+/// matching the keys' `total > 0` guard.
+fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) -> Vec<Button> {
     vec![
-        Button::new("Filter", "/", Action::EnterFilter, true),
-        Button::new("Rename", "r", Action::EnterRename, has_cards),
-        Button::new("Generate", "g", Action::RequestConfigGen, has_cards),
+        Button::new(
+            "Filter",
+            button_shortcut_label(keybindings, KbAction::Filter),
+            Action::EnterFilter,
+            true,
+        ),
+        Button::new(
+            "Rename",
+            button_shortcut_label(keybindings, KbAction::Rename),
+            Action::EnterRename,
+            has_cards,
+        ),
+        Button::new(
+            "Generate",
+            button_shortcut_label(keybindings, KbAction::GenerateConfig),
+            Action::RequestConfigGen,
+            has_cards,
+        ),
     ]
 }
 
@@ -7720,6 +7760,7 @@ fn dashboard_context_buttons(has_cards: bool) -> Vec<Button> {
 fn render_button_bar(
     frame: &mut Frame,
     palette: &ColorPalette,
+    keybindings: &KeybindingConfig,
     area: Rect,
     has_pane_control: bool,
     extra_buttons: &[Button],
@@ -7727,7 +7768,7 @@ fn render_button_bar(
     const SEP: u16 = 1;
     // Global commands first, then any context-specific buttons (e.g. the
     // dashboard's Filter / Rename / Generate). One funnel, one bar.
-    let mut buttons = global_bar_buttons(has_pane_control);
+    let mut buttons = global_bar_buttons(keybindings, has_pane_control);
     buttons.extend(extra_buttons.iter().cloned());
 
     // Choose full vs shortcut-only based on whether the full set fits the row.
@@ -7839,9 +7880,10 @@ fn render_bottom_bar(
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
             }
+            let detach_label = button_shortcut_label(&ui.keybindings, KbAction::Dashboard);
             let buttons = [Button::new(
                 "Detach",
-                "Ctrl+D",
+                detach_label,
                 Action::DetachToNormal,
                 true,
             )];
@@ -7858,8 +7900,14 @@ fn render_bottom_bar(
                 // PRD #80 M2: the persistent global button bar replaces the
                 // legacy status legend (no duplication — each button carries
                 // the same shortcut the legend used to show inline).
-                let rects =
-                    render_button_bar(frame, &ui.palette, area, has_pane_control, extra_buttons);
+                let rects = render_button_bar(
+                    frame,
+                    &ui.palette,
+                    &ui.keybindings,
+                    area,
+                    has_pane_control,
+                    extra_buttons,
+                );
                 // Preserve the "update available" badge by right-aligning it
                 // after the bar when set (it's a separate notification, not the
                 // removed legend text).
@@ -9691,6 +9739,39 @@ pub fn render_button_bar_to_buffer(width: u16, palette: ColorPalette) -> ratatui
             // has_pane_control = true → the richest legacy legend today;
             // after M2 this site renders the always-visible global button bar.
             render_bottom_bar(frame, &mut ui, area, true, &[]);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #40 L1 seam: render the dashboard button bar (global + dashboard
+/// context buttons) against an arbitrary [`KeybindingConfig`] into a `Buffer`,
+/// so a test can assert the button labels track a remapped config. Mirrors
+/// [`render_hints_bar_to_buffer`]'s shape. `has_pane_control` is `true` and the
+/// dashboard context buttons are included so every remappable label is
+/// exercised; the bar is one row but `height` is honored for layout headroom.
+pub fn render_button_bar_with_bindings_to_buffer(
+    keybindings: &KeybindingConfig,
+    palette: ColorPalette,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let ctx_buttons = dashboard_context_buttons(keybindings, true);
+    let mut ui = UiState::new(DashboardConfig::default(), palette, keybindings.clone());
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            render_bottom_bar(frame, &mut ui, area, true, &ctx_buttons);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
