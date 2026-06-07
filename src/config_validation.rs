@@ -232,6 +232,7 @@ mod tests {
         ModeConfig {
             name: name.to_string(),
             init_command: None,
+            seed_prompt: None,
             panes: vec![],
             rules,
             reactive_panes: 2,
@@ -329,6 +330,7 @@ mod tests {
         let config = make_config(vec![ModeConfig {
             name: "dev".to_string(),
             init_command: None,
+            seed_prompt: None,
             panes: vec![],
             rules: vec![make_rule("cargo\\s+test", false, None)],
             reactive_panes: 0,
@@ -352,6 +354,7 @@ mod tests {
         let config = make_config(vec![ModeConfig {
             name: "empty".to_string(),
             init_command: None,
+            seed_prompt: None,
             panes: vec![],
             rules: vec![],
             reactive_panes: 2,

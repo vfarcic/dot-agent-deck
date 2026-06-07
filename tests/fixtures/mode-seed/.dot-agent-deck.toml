@@ -1,0 +1,13 @@
+# Fixture for PRD #127 M3.1 — seed_prompt on [[modes]].
+#
+# `seeded` carries a `seed_prompt` that M3.1 must auto-deliver to the mode's
+# agent pane (gated on agent-ready). `plain` carries none and must deliver
+# nothing (no regression). The agent command is supplied by the new-pane form
+# at spawn time (the test types a recorder script), so the modes need no panes.
+
+[[modes]]
+name = "seeded"
+seed_prompt = "SEEDPROMPTMARKER127"
+
+[[modes]]
+name = "plain"

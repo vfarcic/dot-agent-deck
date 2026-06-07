@@ -435,10 +435,16 @@ pub fn first_sentence(scenario: &str) -> String {
 }
 
 /// Derive a one-word layer label from the spec id + catalog entry.
+///
+/// The catalog `Layer:` field is free prose after the token, e.g.
+/// `L2 (re-sequenced from L1: ...)`. We must read the layer TOKEN that
+/// immediately follows the marker (the first whitespace-delimited word),
+/// NOT match `L1`/`L2` anywhere in the line — otherwise the `L1` inside a
+/// parenthetical explanation would wrongly win over the real `L2` token.
 pub fn layer_label(spec_id: &str, catalog_entry: Option<&CatalogEntry>) -> String {
     if let Some(entry) = catalog_entry
         && let Some(layer) = entry.layer.as_deref()
-        && layer.to_lowercase().contains("l1")
+        && layer_token_is_l1(layer)
     {
         return "L1".to_string();
     }
@@ -446,6 +452,17 @@ pub fn layer_label(spec_id: &str, catalog_entry: Option<&CatalogEntry>) -> Strin
         return "chain-smoke".to_string();
     }
     "L2 synthetic".to_string()
+}
+
+/// Whether the FIRST token of a catalog `Layer:` value is `L1` (case- and
+/// surrounding-punctuation-insensitive), e.g. `L1`, `L1 (ratatui).`, `L1.`.
+/// `L2 (re-sequenced from L1: ...)` → `false` (the leading token is `L2`).
+fn layer_token_is_l1(layer: &str) -> bool {
+    layer
+        .split_whitespace()
+        .next()
+        .map(|tok| tok.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+        .is_some_and(|tok| tok.eq_ignore_ascii_case("l1"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,5 +1072,37 @@ mod tests {
         );
         assert_eq!(layer_label("chain-smoke/claude/001", None), "chain-smoke");
         assert_eq!(layer_label("hooks/delivery/001", None), "L2 synthetic");
+    }
+
+    #[test]
+    fn layer_label_reads_first_token_not_parenthetical_l1() {
+        // The leading token is `L2`; the `L1` inside the parenthetical prose
+        // must NOT flip the label (regression for the substring-match bug).
+        let entry = CatalogEntry {
+            id: "prompt/new-pane/007".into(),
+            headline: "x".into(),
+            layer: Some(
+                "L2 (re-sequenced from L1: no public L1 render seam, driven via PTY).".into(),
+            ),
+            agent: None,
+            asserts: None,
+            does_not_assert: None,
+            platform_coverage: None,
+            cost_note: None,
+        };
+        let mut catalog: BTreeMap<String, CatalogEntry> = BTreeMap::new();
+        catalog.insert("prompt/new-pane/007".into(), entry);
+        assert_eq!(
+            layer_label("prompt/new-pane/007", catalog.get("prompt/new-pane/007")),
+            "L2 synthetic"
+        );
+
+        // First-token detection is robust to trailing punctuation / parens.
+        assert!(layer_token_is_l1("L1"));
+        assert!(layer_token_is_l1("L1 (ratatui TestBackend + insta)."));
+        assert!(layer_token_is_l1("L1."));
+        assert!(!layer_token_is_l1("L2 (re-sequenced from L1: ...)"));
+        assert!(!layer_token_is_l1("L2 synthetic"));
+        assert!(!layer_token_is_l1(""));
     }
 }

@@ -31,6 +31,14 @@ pub struct ModeConfig {
     pub name: String,
     #[serde(default)]
     pub init_command: Option<String>,
+    /// PRD #127 M3.1: a prompt auto-delivered to the mode's **agent** pane
+    /// once the agent signals readiness (gated like orchestrations), as
+    /// opposed to `init_command` which targets the side panes. Optional;
+    /// `None` (the default, and existing configs without it) delivers nothing.
+    /// This is the generic primitive the Phase-3 "schedule" creation mode
+    /// builds on — a `[[modes]]` entry that carries a `seed_prompt`.
+    #[serde(default)]
+    pub seed_prompt: Option<String>,
     #[serde(default)]
     pub panes: Vec<ModePersistentPane>,
     #[serde(default)]
@@ -288,6 +296,29 @@ command = "echo hello"
         assert_eq!(mode.name, "minimal");
         assert_eq!(mode.panes.len(), 1);
         assert!(mode.rules.is_empty());
+    }
+
+    // PRD #127 M3.1 — `seed_prompt` is an optional mode field: present →
+    // parsed, absent → None (existing configs without it keep parsing).
+    #[test]
+    fn seed_prompt_parses_when_present() {
+        let toml = r#"
+[[modes]]
+name = "seeded"
+seed_prompt = "do the thing"
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.modes[0].seed_prompt.as_deref(), Some("do the thing"));
+    }
+
+    #[test]
+    fn seed_prompt_defaults_to_none_when_absent() {
+        let toml = r#"
+[[modes]]
+name = "plain"
+"#;
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        assert!(config.modes[0].seed_prompt.is_none());
     }
 
     #[test]
