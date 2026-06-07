@@ -7583,8 +7583,11 @@ fn render_stats_bar(
             .add_modifier(Modifier::BOLD),
     ));
 
-    // Semantic statuses keep their named-ANSI accent; idle is neutral, so it
-    // dims the terminal foreground (text_dim) rather than carrying a color.
+    // Semantic statuses keep their named-ANSI accent. Idle has no accent color,
+    // but its count is neutral text the user reads (like the tools count), so
+    // per the PRD #13 readability decision it renders at full contrast via
+    // text_primary() rather than dimmed. Only decoration — the `│` separators
+    // below — stays text_dim().
     let segments: &[(usize, &str, Style)] = &[
         (stats.working, "working", Style::default().fg(Color::Green)),
         (stats.thinking, "thinking", Style::default().fg(Color::Blue)),
