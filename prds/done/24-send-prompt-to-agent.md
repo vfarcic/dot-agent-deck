@@ -1,8 +1,10 @@
 # PRD #24: Send Prompt to Agent from Dashboard
 
-**Status**: Draft
+**Status**: No Longer Needed
 **Priority**: Medium
 **Created**: 2026-04-01
+**Last Updated**: 2026-06-07
+**Closed**: 2026-06-07
 **GitHub Issue**: [#24](https://github.com/vfarcic/dot-agent-deck/issues/24)
 
 ## Problem Statement
