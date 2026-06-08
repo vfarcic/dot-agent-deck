@@ -20,6 +20,7 @@ const INITIAL: &str = r#"
 name = "alpha"
 cron = "0 9 * * *"
 working_dir = "/tmp"
+command = "cat"
 prompt = "alpha prompt"
 enabled = true
 "#;
@@ -30,6 +31,7 @@ const EDITED: &str = r#"
 name = "beta"
 cron = "0 10 * * *"
 working_dir = "/tmp"
+command = "cat"
 prompt = "beta prompt"
 enabled = true
 "#;
