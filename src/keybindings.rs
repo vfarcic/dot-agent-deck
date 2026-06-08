@@ -78,6 +78,7 @@ pub enum Action {
     ApprovePermission,
     DenyPermission,
     GenerateConfig,
+    OpenScheduledTasks,
 }
 
 /// Static description of one action: which section it lives in, its config
@@ -280,6 +281,17 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "generate_config",
         default: "g",
         description: "Generate config",
+    },
+    // PRD #127 finding #4: open the "Scheduled Tasks" manager dialog. Default
+    // `s`; the dashboard handler also keeps the legacy uppercase `S` as a
+    // non-configurable alias (mirroring the Down/Up aliases for j/k), so both
+    // cases open it by default while the action itself stays remappable.
+    ActionSpec {
+        action: Action::OpenScheduledTasks,
+        section: Section::Dashboard,
+        name: "open_scheduled_tasks",
+        default: "s",
+        description: "Scheduled Tasks manager",
     },
 ];
 

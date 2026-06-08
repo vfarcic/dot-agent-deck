@@ -981,6 +981,12 @@ struct UiState {
     /// Schedule names with a live tab/agent, snapshotted when the dialog opens
     /// (drives the live/idle status indicator).
     scheduled_live_names: HashSet<String>,
+    /// PRD #127 finding #4: cached "are any schedules configured?" flag, so the
+    /// dashboard can show the `[Scheduled Tasks s]` button-bar button only when
+    /// there is something to manage — without re-reading the schedules file on
+    /// every render frame. Seeded at startup and refreshed whenever the dialog
+    /// loads or a delete rewrites the definitions.
+    scheduled_tasks_present: bool,
     /// PRD #76 M2.20: timestamp of the most recent keystroke forwarded to a
     /// pane via `ForwardToPane`. Drives the submit-debounce in `PaneInput` mode
     /// so an Enter keystroke arriving fused to preceding typed bytes is
@@ -1102,6 +1108,7 @@ impl UiState {
             scheduled_selected: 0,
             scheduled_delete_confirm: false,
             scheduled_live_names: HashSet::new(),
+            scheduled_tasks_present: false,
             last_pane_keystroke_at: None,
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
@@ -2380,6 +2387,24 @@ pub enum Action {
     /// agent and exits), and breaks the TUI's main loop.
     StopAndQuit,
     ForwardToPane(Vec<u8>),
+    /// PRD #127 finding #4: open the "Scheduled Tasks" manager dialog. Shared by
+    /// the dashboard `s`/`S` key and the `[Scheduled Tasks s]` button-bar button
+    /// (PRD #80 parity), so both funnel through one dispatch path that loads the
+    /// schedules and switches into [`UiMode::ScheduledTasks`].
+    OpenScheduledTasks,
+    /// PRD #127 finding #4: the manager dialog's `[Add]` button — mouse parity
+    /// for the `a` key. Closes the dialog and spawns the seeded authoring agent
+    /// with a blank context (same outcome as pressing `a`).
+    ScheduleAdd,
+    /// PRD #127 finding #4: the manager dialog's `[Edit]` button — mouse parity
+    /// for the `e`/Enter key. Closes the dialog and spawns the authoring agent
+    /// pre-filled with the selected row's values.
+    ScheduleEdit,
+    /// PRD #127 finding #4: the manager dialog's `[Delete]` button — mouse
+    /// parity for the `d` key. Arms the definition-only delete confirmation for
+    /// the selected row (the dialog stays open); confirming is then `y` / the
+    /// confirmed [`Action::ScheduleDelete`].
+    ScheduleArmDelete,
     /// PRD #127 M3.3: the manager dialog's `r` action — fire the named schedule
     /// immediately via the `RunNow` daemon control message. Dispatched in the
     /// main loop (socket I/O), which the sync key handler can't do directly.
@@ -3071,17 +3096,14 @@ fn handle_normal_key(
     {
         return Action::SendPermissionResponse(false);
     }
-    // PRD #127 M3.3: open the "Scheduled Tasks" manager dialog. `S`
-    // (Shift+s) is unbound in dashboard command mode. Load the schedules
-    // from the global config and snapshot which currently have a live
-    // tab/agent (for the status indicator).
-    if key.code == KeyCode::Char('S') {
-        ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
-        ui.scheduled_selected = 0;
-        ui.scheduled_delete_confirm = false;
-        ui.scheduled_live_names = live_schedule_names();
-        ui.mode = UiMode::ScheduledTasks;
-        return Action::Continue;
+    // PRD #127 finding #4: open the "Scheduled Tasks" manager dialog. Routed
+    // through the keybinding registry (default `s`) so it is remappable and
+    // shares one dispatch path with the `[Scheduled Tasks s]` button-bar button
+    // (PRD #80 parity). The legacy uppercase `S` (Shift+s) stays a hardcoded
+    // non-configurable alias — mirroring the Down/Up aliases kept beside j/k —
+    // so existing muscle memory keeps working while lowercase `s` is added.
+    if kb.matches(KbAction::OpenScheduledTasks, &key) || key.code == KeyCode::Char('S') {
+        return Action::OpenScheduledTasks;
     }
     if kb.matches(KbAction::ClearFilter, &key) {
         if !ui.filter_text.is_empty() {
@@ -3158,7 +3180,9 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
 
     let len = ui.scheduled_tasks.len();
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => {
+        // PRD #127 finding #4: `s`/`S` toggle the dialog closed, mirroring the
+        // case-insensitive open shortcut, alongside the usual Esc / `q`.
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') | KeyCode::Char('s') => {
             ui.mode = UiMode::Normal;
             Action::Continue
         }
@@ -5115,6 +5139,63 @@ fn dispatch_action(
                 ui.last_pane_keystroke_at = Some(std::time::Instant::now());
             }
         }
+        // PRD #127 finding #4: open the manager dialog. Shared by the dashboard
+        // `s`/`S` key and the `[Scheduled Tasks s]` button-bar button. Loads the
+        // schedules from the global config and snapshots which currently have a
+        // live tab/agent (for the status indicator), then switches mode.
+        Action::OpenScheduledTasks => {
+            let tasks = config::LoadedSchedules::load().tasks;
+            ui.scheduled_tasks_present = !tasks.is_empty();
+            ui.scheduled_tasks = tasks;
+            ui.scheduled_selected = 0;
+            ui.scheduled_delete_confirm = false;
+            ui.scheduled_live_names = live_schedule_names();
+            ui.mode = UiMode::ScheduledTasks;
+        }
+        // PRD #127 finding #4: `[Add]` button parity for the `a` key — close the
+        // dialog and spawn the seeded authoring agent with a blank context.
+        Action::ScheduleAdd => {
+            ui.mode = UiMode::Normal;
+            let req = schedule_authoring_request(None);
+            return dispatch_action(
+                Action::SpawnPane(Box::new(req)),
+                ui,
+                pane,
+                state,
+                tab_manager,
+                snapshot,
+                filtered,
+                selected_id,
+                frame_area,
+            );
+        }
+        // PRD #127 finding #4: `[Edit]` button parity for the `e`/Enter key —
+        // close the dialog and spawn the authoring agent pre-filled with the
+        // selected row's values (blank context when the list is empty).
+        Action::ScheduleEdit => {
+            let existing = ui.scheduled_tasks.get(ui.scheduled_selected).cloned();
+            ui.mode = UiMode::Normal;
+            let req = schedule_authoring_request(existing.as_ref());
+            return dispatch_action(
+                Action::SpawnPane(Box::new(req)),
+                ui,
+                pane,
+                state,
+                tab_manager,
+                snapshot,
+                filtered,
+                selected_id,
+                frame_area,
+            );
+        }
+        // PRD #127 finding #4: `[Delete]` button parity for the `d` key — arm
+        // the definition-only delete confirmation for the selected row (the
+        // dialog stays open; `y` / the confirmed delete then removes it).
+        Action::ScheduleArmDelete => {
+            if ui.scheduled_selected < ui.scheduled_tasks.len() {
+                ui.scheduled_delete_confirm = true;
+            }
+        }
         Action::ScheduleRunNow(name) => {
             // PRD #127 M3.3: fire the schedule now via the daemon's RunNow control message.
             match send_daemon_request_blocking(&crate::daemon_protocol::AttachRequest::RunNow {
@@ -5180,6 +5261,7 @@ fn dispatch_action(
             // PRD #127 N2: dialog stays open after delete — refresh list and clamp selection.
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
+                ui.scheduled_tasks_present = !ui.scheduled_tasks.is_empty();
                 ui.scheduled_live_names = live_schedule_names();
                 if ui.scheduled_selected >= ui.scheduled_tasks.len() {
                     ui.scheduled_selected = ui.scheduled_tasks.len().saturating_sub(1);
@@ -5219,6 +5301,12 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, keybindings);
+    // PRD #127 finding #4: seed the cached "schedules exist?" flag once at
+    // startup so the dashboard can decide whether to show the `[Scheduled Tasks
+    // s]` button-bar button without re-reading the schedules file every frame.
+    // Refreshed thereafter whenever the manager dialog loads or a delete
+    // rewrites the definitions.
+    ui.scheduled_tasks_present = !config::LoadedSchedules::load().tasks.is_empty();
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -6601,6 +6689,11 @@ pub fn run_tui(
                         | UiMode::ConfigGenPrompt
                         | UiMode::StarPrompt
                         | UiMode::Help
+                        // PRD #127 finding #4: the Scheduled Tasks dialog is a
+                        // topmost modal too — its [Add]/[Edit]/[Delete]/[Run now]
+                        // buttons live in `modal_button_rects` and any miss is
+                        // consumed here rather than reaching the pane behind it.
+                        | UiMode::ScheduledTasks
                 );
                 // PRD #80 M6: in the inline-edit modes the bottom row IS the
                 // input; its [Apply]/[Cancel] / [Save]/[Cancel] buttons live in
@@ -7633,7 +7726,11 @@ fn render_frame(
         .style(text_primary())
         .centered();
         frame.render_widget(msg, vertical[1]);
-        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        let ctx_buttons = dashboard_context_buttons(
+            &ui.keybindings,
+            !filtered.is_empty(),
+            ui.scheduled_tasks_present,
+        );
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
         if let Some(right) = panes_area {
@@ -7720,7 +7817,11 @@ fn render_frame(
             vertical[2],
             active_mode_name,
         );
-        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        let ctx_buttons = dashboard_context_buttons(
+            &ui.keybindings,
+            !filtered.is_empty(),
+            ui.scheduled_tasks_present,
+        );
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
@@ -7814,7 +7915,11 @@ fn render_frame(
     );
 
     // Full-width hints bar
-    let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+    let ctx_buttons = dashboard_context_buttons(
+        &ui.keybindings,
+        !filtered.is_empty(),
+        ui.scheduled_tasks_present,
+    );
     render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
     // Render terminal panes on the right side
@@ -7873,7 +7978,8 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
         }
     }
     if ui.mode == UiMode::ScheduledTasks {
-        render_scheduled_tasks(frame, ui);
+        let rects = render_scheduled_tasks(frame, ui);
+        ui.modal_button_rects = rects;
     }
     if ui.mode == UiMode::StarPrompt {
         ui.modal_button_rects = render_star_prompt(frame);
@@ -8275,8 +8381,12 @@ fn global_bar_buttons(keybindings: &KeybindingConfig, has_pane_control: bool) ->
 /// shortcut. Filter is always actionable; Rename / Generate-config act on the
 /// selected card, so they're disabled (dimmed) when there are no cards —
 /// matching the keys' `total > 0` guard.
-fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) -> Vec<Button> {
-    vec![
+fn dashboard_context_buttons(
+    keybindings: &KeybindingConfig,
+    has_cards: bool,
+    has_schedules: bool,
+) -> Vec<Button> {
+    let mut buttons = vec![
         Button::new(
             "Filter",
             button_shortcut_label(keybindings, KbAction::Filter),
@@ -8295,7 +8405,28 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
             Action::RequestConfigGen,
             has_cards,
         ),
-    ]
+    ];
+    // PRD #127 finding #4 / PRD #80: the `[Scheduled Tasks s]` open button is
+    // shown only when there are schedules to manage (you create the first via
+    // the new-pane "schedule" authoring option or the `s` key). The label/
+    // shortcut are baked into `label` with an EMPTY shortcut on purpose: this
+    // button only ever appears once the bar has overflowed into shortcut-only
+    // mode (it cannot fit at full width), and an empty shortcut makes the
+    // shortcut-only fallback render `[Scheduled Tasks s]` rather than `[s]`, so
+    // the command stays identifiable and clickable. The notation is still
+    // config-derived so a remap of `open_scheduled_tasks` is reflected.
+    if has_schedules {
+        buttons.push(Button::new(
+            format!(
+                "Scheduled Tasks {}",
+                display_notation(keybindings, KbAction::OpenScheduledTasks)
+            ),
+            "",
+            Action::OpenScheduledTasks,
+            true,
+        ));
+    }
+    buttons
 }
 
 /// PRD #80 M2: render the persistent global button bar into `area` (one row)
@@ -9034,7 +9165,7 @@ fn render_help_overlay(
             ),
             "Approve / deny permission",
         ),
-        help_key_line("S", "Scheduled Tasks manager"),
+        help_key_line(&n(KbAction::OpenScheduledTasks), "Scheduled Tasks manager"),
         help_key_line(&n(KbAction::Help), "Toggle this help"),
     ];
 
@@ -9307,7 +9438,13 @@ fn new_pane_form_footer_hint(has_mode_field: bool, name_submits: bool) -> &'stat
 /// read-only-plus-actions list of the configured schedules, each row showing
 /// name, status (live/idle/disabled), and next-fire. Shows a delete
 /// confirmation when armed.
-fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) {
+///
+/// PRD #127 finding #4 / PRD #80: the action line is now a row of clickable
+/// `[Add] [Edit] [Delete] [Run now]` buttons; returns their `(Action, Rect)`
+/// pairs to record in `UiState::modal_button_rects` for the mouse hit-test
+/// (empty while the delete confirmation is armed). The keyboard a/e/d/r/Enter
+/// still drive the same actions.
+fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> Vec<(Action, Rect)> {
     let area = frame.area();
     let popup_width = 72.min(area.width.saturating_sub(4));
     let row_count = ui.scheduled_tasks.len().max(1) as u16;
@@ -9386,7 +9523,11 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) {
     }
 
     lines.push(Line::from(""));
-    if ui.scheduled_delete_confirm {
+    // The footer is either the delete confirmation (no buttons) or a blank
+    // placeholder row that the clickable action buttons are overlaid onto after
+    // the Paragraph render (mirroring `render_quit_confirm`). `Esc close` rides
+    // alongside as a keyboard-only hint, since Esc has no button.
+    let button_row_index = if ui.scheduled_delete_confirm {
         let name = ui
             .scheduled_tasks
             .get(ui.scheduled_selected)
@@ -9398,12 +9539,17 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ));
+        None
     } else {
+        let idx = lines.len();
+        // Placeholder row overlaid with the buttons below; trailing keyboard
+        // hint for Esc (no button) is right of the buttons' span.
         lines.push(Line::styled(
-            "  a add   e/Enter edit   d delete   r run-now   Esc close",
-            text_primary(),
+            "                                       Esc close",
+            text_dim(),
         ));
-    }
+        Some(idx)
+    };
 
     // PRD #13: terminal-relative — no absolute background fill; the terminal's
     // own background shows through.
@@ -9413,6 +9559,33 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) {
         .border_style(Style::default().fg(Color::Cyan));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
+
+    // PRD #127 finding #4 + PRD #80: overlay the clickable action buttons on the
+    // footer row. [Edit]/[Delete]/[Run now] act on the selected row, so they're
+    // disabled (dimmed + inert) when the list is empty; [Add] is always
+    // actionable — mirroring the a / e-Enter / d / r keys.
+    let Some(row_idx) = button_row_index else {
+        return Vec::new();
+    };
+    let has_rows = !ui.scheduled_tasks.is_empty();
+    let run_now_action = ui
+        .scheduled_tasks
+        .get(ui.scheduled_selected)
+        .map(|t| Action::ScheduleRunNow(t.name.clone()))
+        .unwrap_or(Action::Continue);
+    let buttons = [
+        Button::new("Add", "", Action::ScheduleAdd, true),
+        Button::new("Edit", "", Action::ScheduleEdit, has_rows),
+        Button::new("Delete", "", Action::ScheduleArmDelete, has_rows),
+        Button::new("Run now", "", run_now_action, has_rows),
+    ];
+    let btn_row = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + 1 + row_idx as u16,
+        width: popup_area.width.saturating_sub(2),
+        height: 1,
+    };
+    render_modal_button_row(frame, &buttons, btn_row, 1)
 }
 
 /// PRD #127 N2: the `[start, end)` slice of `len` rows to render so `selected`
@@ -10472,7 +10645,10 @@ pub fn render_button_bar_with_bindings_to_buffer(
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
-    let ctx_buttons = dashboard_context_buttons(keybindings, true);
+    // Seam keeps the existing global+context bar (no schedules) so the
+    // remap-reflection assertions stay stable; the Scheduled Tasks button is
+    // exercised by the L2 button-bar test.
+    let ctx_buttons = dashboard_context_buttons(keybindings, true, false);
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     terminal
         .draw(|frame| {

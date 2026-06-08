@@ -33,7 +33,7 @@ expression: text
         │  r                  Rename session                  Space           Confirm current directory       │         
         │  g                  Generate .dot-agent-deck.toml   /               Filter (case-insensitive)       │         
         │  y / n              Approve / deny permission       Esc             Clear filter (twice = close)    │         
-        │  S                  Scheduled Tasks manager         q               Cancel                          │         
+        │  s                  Scheduled Tasks manager         q               Cancel                          │         
         │  F1                 Toggle this help                                                                │         
         │                                                     Session                                         │         
         │                                                                                                     │         
