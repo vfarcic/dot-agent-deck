@@ -886,6 +886,110 @@ impl EmbeddedPaneController {
         hydrated
     }
 
+    /// PRD #127 finding #2: wire a SINGLE daemon-side agent's pane on demand,
+    /// keyed by its `DOT_AGENT_DECK_PANE_ID`. A scheduler-spawned agent surfaces
+    /// its card to an already-attached TUI via a `SessionStart` broadcast (see
+    /// [`crate::spawn`]), but that path creates only a placeholder session — the
+    /// pane has no local [`StreamBackend`]. `focus_deck` calls this when
+    /// `focus_pane` reports the pane missing, so focusing the card attaches the
+    /// live daemon PTY (the same `AttachStream` + scrollback-replay wiring as
+    /// [`Self::hydrate_from_daemon`]) instead of deleting the "stale" session.
+    ///
+    /// Returns `true` when the pane is present locally afterward — already wired
+    /// (idempotent), or freshly attached — and `false` when no live daemon agent
+    /// backs `pane_id` (a genuinely stale card the caller may then drop). Errors
+    /// from `list_agents` / `attach` are absorbed into `false`, mirroring
+    /// `hydrate_from_daemon`'s best-effort posture.
+    pub fn hydrate_pane(&self, pane_id: &str) -> bool {
+        if self.panes.lock().unwrap().contains_key(pane_id) {
+            return true;
+        }
+
+        let client = self.client.clone();
+        let runtime = self.runtime.clone();
+
+        let list_client = client.clone();
+        let records = match runtime.block_on(async move {
+            tokio::time::timeout(HYDRATE_LIST_TIMEOUT, list_client.list_agents()).await
+        }) {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    pane_id,
+                    error = %e,
+                    "hydrate_pane: list_agents failed, treating as no-backing-agent"
+                );
+                return false;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    pane_id,
+                    timeout_ms = HYDRATE_LIST_TIMEOUT.as_millis() as u64,
+                    "hydrate_pane: list_agents timed out, treating as no-backing-agent"
+                );
+                return false;
+            }
+        };
+
+        // Match the daemon agent whose child carries this exact
+        // `DOT_AGENT_DECK_PANE_ID` — the same value the placeholder session and
+        // the agent's hook events route by.
+        let Some(record) = records
+            .into_iter()
+            .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
+        else {
+            return false;
+        };
+
+        let agent_id = record.id.clone();
+        let id_for_attach = agent_id.clone();
+        let client_for_attach = client.clone();
+        let conn = match runtime.block_on(async move {
+            tokio::time::timeout(
+                HYDRATE_ATTACH_TIMEOUT,
+                client_for_attach.attach(&id_for_attach),
+            )
+            .await
+        }) {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    pane_id,
+                    agent_id = %agent_id,
+                    error = %e,
+                    "hydrate_pane: attach failed"
+                );
+                return false;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    pane_id,
+                    agent_id = %agent_id,
+                    timeout_ms = HYDRATE_ATTACH_TIMEOUT.as_millis() as u64,
+                    "hydrate_pane: attach timed out"
+                );
+                return false;
+            }
+        };
+
+        let pane_name = record
+            .display_name
+            .clone()
+            .unwrap_or_else(|| agent_id.clone());
+        let (parser_rows, parser_cols) = parser_init_dims(record.rows, record.cols);
+        self.wire_stream_pane(
+            pane_id.to_string(),
+            agent_id,
+            conn,
+            pane_name,
+            None,
+            record.cwd.clone(),
+            parser_rows,
+            parser_cols,
+        );
+        self.panes.lock().unwrap().contains_key(pane_id)
+    }
+
     /// Explicit M2.5 detach: tell the daemon "I'm leaving voluntarily,
     /// keep the agent running." The pane is removed from the registry and
     /// its writer is given a brief window to flush a `KIND_DETACH` frame

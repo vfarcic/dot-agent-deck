@@ -37,9 +37,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::sync::broadcast;
+
 use crate::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership, command_needs_shell_wrap,
 };
+use crate::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
 use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestration_name};
 use crate::scheduler::{Notifier, NotifyEvent};
 
@@ -207,6 +210,7 @@ pub async fn spawn(
     req: SpawnRequest,
     registry: &AgentPtyRegistry,
     notifier: &dyn Notifier,
+    event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
 ) -> Result<SpawnHandle, SpawnError> {
     // 1. mkdir -p the working_dir; fail loud via the notifier.
     let dir = Path::new(&req.working_dir);
@@ -247,6 +251,17 @@ pub async fn spawn(
                 pin_sh,
                 notifier,
             )?;
+            // PRD #127 finding #2: surface this single-agent card LIVE to any
+            // already-attached TUI (the daemon otherwise only hydrates its
+            // agents at TUI startup). Reuses the existing hook-event broadcast
+            // — no new broadcast variant. Orchestration fires are intentionally
+            // NOT surfaced this way: a proper orchestration tab is rebuilt by
+            // the TUI's hydration/partition path, which a flat SessionStart
+            // can't reconstruct, and live multi-orchestration surfacing is the
+            // #140 session-partitioning concern.
+            if let Some(tx) = event_tx {
+                surface_spawned_pane(tx, &pane_id, &req.working_dir, command.as_deref());
+            }
             deliver(registry, &pane_id, &req.prompt).await;
             Ok(SpawnHandle {
                 task_name: req.task_name,
@@ -356,6 +371,45 @@ async fn deliver(registry: &AgentPtyRegistry, pane_id: &str, prompt: &str) {
     if let Err(e) = registry.write_to_pane_and_submit(pane_id, prompt).await {
         tracing::warn!(pane_id, error = %e, "scheduled prompt delivery failed");
     }
+}
+
+/// PRD #127 finding #2: surface a freshly-spawned single-agent scheduled pane
+/// to any ALREADY-ATTACHED TUI by publishing a synthetic `SessionStart`
+/// through the daemon's EXISTING hook-event broadcast — the same channel a
+/// real agent's `SessionStart` hook rides. Reusing that fan-out (rather than
+/// adding a new broadcast variant) brings bare commands (a shell, `cat`) that
+/// emit no hook of their own to card-surfacing parity with hook-emitting
+/// agents: before this, a scheduler fire registered an agent in the daemon
+/// that an attached dashboard never painted, because the TUI only hydrates
+/// daemon agents at startup.
+///
+/// `agent_id` is deliberately `None`: a later real `SessionStart` hook from
+/// the spawned agent (carrying the daemon registry id) then SUPERSEDES this
+/// placeholder via `AppState::apply_event`'s retire-on-agent-id-mismatch path,
+/// instead of leaving a duplicate card beside it. `cwd` is the spawn target so
+/// the dashboard renders the card with the working-dir basename. Delivery is
+/// best-effort: `send` errs only when there are no subscribers (no TUI
+/// attached), which is the expected standalone-daemon case.
+fn surface_spawned_pane(
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    pane_id: &str,
+    cwd: &str,
+    command: Option<&str>,
+) {
+    let event = AgentEvent {
+        session_id: pane_id.to_string(),
+        agent_type: AgentType::from_command(command).unwrap_or(AgentType::None),
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: Some(cwd.to_string()),
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some(pane_id.to_string()),
+        agent_id: None,
+    };
+    let _ = event_tx.send(BroadcastMsg::Event(event));
 }
 
 /// A fresh, valid `DOT_AGENT_DECK_PANE_ID` for a spawned pane. Sanitizes the
@@ -519,6 +573,7 @@ pub async fn spawn_or_reuse(
     reuse: &ReuseRegistry,
     notifier: &dyn Notifier,
     debounce: Duration,
+    event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
 ) -> Result<(), SpawnError> {
     // Snapshot the reuse decision under the lock (don't hold it across awaits).
     let decision = {
@@ -542,7 +597,7 @@ pub async fn spawn_or_reuse(
         }
         ReuseDecision::SpawnFresh => {
             let task_name = req.task_name.clone();
-            let handle = spawn(req, registry, notifier).await?;
+            let handle = spawn(req, registry, notifier, event_tx).await?;
             // Record the tab for reuse only when the task opts into reuse.
             if !new_tab_per_fire {
                 let entry = ReuseEntry {
@@ -866,6 +921,36 @@ mod tests {
         // multi-word (pin_sh=true) → pane-id + the SHELL wrapper override.
         let env = pane_env("sched-x-1", true);
         assert!(env.iter().any(|(k, v)| k == "SHELL" && v == "/bin/sh"));
+    }
+
+    // finding #2 — the synthetic SessionStart surfaced to attached TUIs is a
+    // SessionStart for the spawned pane, rooted at the spawn cwd, with
+    // `agent_id == None` so a later real hook supersedes (not duplicates) it.
+    #[test]
+    fn surface_spawned_pane_emits_session_start_for_attached_tuis() {
+        let (tx, mut rx) = broadcast::channel(8);
+        surface_spawned_pane(
+            &tx,
+            "sched-livecard-0",
+            "/tmp/scratch/livecard",
+            Some("cat"),
+        );
+        let BroadcastMsg::Event(e) = rx.try_recv().expect("a broadcast must be queued");
+        assert_eq!(e.event_type, EventType::SessionStart);
+        assert_eq!(e.pane_id.as_deref(), Some("sched-livecard-0"));
+        assert_eq!(e.cwd.as_deref(), Some("/tmp/scratch/livecard"));
+        assert!(
+            e.agent_id.is_none(),
+            "agent_id must be None so a real SessionStart hook supersedes the placeholder"
+        );
+    }
+
+    #[test]
+    fn surface_spawned_pane_send_is_noop_without_subscribers() {
+        // The standalone-daemon case (no attached TUI): `send` errs, swallowed.
+        let (tx, rx) = broadcast::channel::<BroadcastMsg>(8);
+        drop(rx);
+        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None);
     }
 
     #[test]

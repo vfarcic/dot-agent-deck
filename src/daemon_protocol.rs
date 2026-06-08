@@ -1056,7 +1056,11 @@ async fn handle_connection(
             scheduler.report_config_errors(&loaded.errors);
             scheduler.reload_apply(
                 &loaded.tasks,
-                crate::daemon::schedule_callback_factory(registry.clone(), reuse_registry.clone()),
+                crate::daemon::schedule_callback_factory(
+                    registry.clone(),
+                    reuse_registry.clone(),
+                    event_tx.clone(),
+                ),
             );
             registry.change_notify().notify_one();
             let names = scheduler.registered_names();

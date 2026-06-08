@@ -458,7 +458,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         scheduler.report_config_errors(&loaded.errors);
         scheduler.reload_apply(
             &loaded.tasks,
-            schedule_callback_factory(pty_registry.clone(), reuse_registry.clone()),
+            schedule_callback_factory(
+                pty_registry.clone(),
+                reuse_registry.clone(),
+                event_tx.clone(),
+            ),
         );
     }
     // Start the per-second cron firing loop. Held as a JoinHandle and aborted
@@ -634,8 +638,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
 pub(crate) fn schedule_callback_factory(
     registry: Arc<AgentPtyRegistry>,
     reuse: crate::spawn::ReuseRegistry,
+    event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> impl FnMut(&crate::config::ScheduledTask) -> crate::scheduler::Callback {
-    move |task| make_schedule_callback(task, registry.clone(), reuse.clone())
+    move |task| make_schedule_callback(task, registry.clone(), reuse.clone(), event_tx.clone())
 }
 
 /// One task's firing callback: rebuild the [`crate::spawn::SpawnRequest`] from
@@ -650,6 +655,7 @@ fn make_schedule_callback(
     task: &crate::config::ScheduledTask,
     registry: Arc<AgentPtyRegistry>,
     reuse: crate::spawn::ReuseRegistry,
+    event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> crate::scheduler::Callback {
     let req = crate::spawn::SpawnRequest {
         task_name: task.name.clone(),
@@ -662,6 +668,10 @@ fn make_schedule_callback(
         let registry = registry.clone();
         let reuse = reuse.clone();
         let req = req.clone();
+        // PRD #127 finding #2: hand the daemon-wide hook-event broadcast to the
+        // fire so a fresh single-agent card surfaces LIVE to an already-attached
+        // TUI (see `crate::spawn::surface_spawned_pane`).
+        let event_tx = event_tx.clone();
         Box::pin(async move {
             let notifier = crate::scheduler::StderrNotifier;
             let debounce = crate::spawn::reuse_debounce();
@@ -672,6 +682,7 @@ fn make_schedule_callback(
                 &reuse,
                 &notifier,
                 debounce,
+                Some(&event_tx),
             )
             .await
             {

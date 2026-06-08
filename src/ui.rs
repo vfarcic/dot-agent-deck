@@ -2831,7 +2831,22 @@ fn focus_deck(
         && let Some(session) = snapshot.sessions.get(*sid)
     {
         if let Some(ref pane_id) = session.pane_id {
-            match pane.focus_pane(pane_id) {
+            // PRD #127 finding #2: a card backed by a LIVE daemon agent but not
+            // yet wired to a local pane (e.g. a scheduler-spawned agent that
+            // surfaced via a `SessionStart` broadcast without going through
+            // startup hydration) makes `focus_pane` report "pane not found".
+            // That is NOT a stale card — attach the daemon's pane on demand and
+            // retry before the delete arm below treats it as stale. No-op for
+            // the in-process (`LocalDeck`) controller, whose registry IS the
+            // daemon's, so a miss there is genuinely stale.
+            let mut focus_result = pane.focus_pane(pane_id);
+            if let Err(PaneError::CommandFailed(_)) = focus_result
+                && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                && embedded.hydrate_pane(pane_id)
+            {
+                focus_result = pane.focus_pane(pane_id);
+            }
+            match focus_result {
                 Ok(()) => {
                     ui.mode = UiMode::PaneInput;
                     ui.status_message = Some((
