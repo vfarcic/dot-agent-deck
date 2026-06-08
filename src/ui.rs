@@ -375,7 +375,7 @@ Collect these fields:
 - name: unique id for the schedule (also the reuse-tab key; renaming is forbidden — to rename, remove + add).
 - cron: a cron expression (5-field POSIX, e.g. \"0 9 * * MON-FRI\", evaluated in local time).
 - working_dir: directory the prompt runs in (the CLI expands ~ and $VAR — pass them literally).
-- command: REQUIRED — the agent command for a single-agent card (e.g. \"claude\"). ALWAYS ask the user which agent command to run and ALWAYS pass --command; a scheduled task needs an agent to act on its prompt (there is no $SHELL fallback). Ignored only when working_dir has an [[orchestrations]] block (the orchestration's role commands win).
+- command: REQUIRED — the agent command for a single-agent card. dot-agent-deck supports ONLY \"claude\" and \"opencode\"; offer and pass ONLY one of those — never suggest other CLIs (e.g. gemini), which have no deck integration. ALWAYS ask the user which of the two to run and ALWAYS pass --command; a scheduled task needs an agent to act on its prompt (there is no $SHELL fallback). Ignored only when working_dir has an [[orchestrations]] block (the orchestration's role commands win).
 - prompt: the prompt text to deliver on each fire.
 - new_tab_per_fire: true to open a fresh tab every fire, false (default) to reuse one tab.
 - enabled: true (default) or false.
