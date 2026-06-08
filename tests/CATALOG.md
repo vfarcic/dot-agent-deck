@@ -1301,13 +1301,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (run-now; observes `ListAgents` tab_membership + PTY prompt echo).
 - **Asserts:** the orchestration fire registers an agent tagged as the orchestration's `orchestrator` role and the prompt is echoed by its PTY; the plain fire registers a non-orchestration single-agent card and the prompt is echoed by its PTY.
 - **Does not assert:** orchestration role layout beyond the orchestrator slot; any LLM behavior (commands are plain `cat`).
+- **Note:** every task carries a `command` (required to LOAD even for orchestration targets, whose fire is driven by the target dir's role command — so the task `command` is ignored at fire time).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/spawn/003 — A fire with `command` set spawns that command; with `command` omitted it falls back to `$SHELL` (PRD #127 M2.1).
+##### scheduler/spawn/003 — A fire spawns the task's configured `command` (its on-disk marker appears) (PRD #127 M2.1; command-required follow-up).
 - **Layer:** L2.
-- **Agent:** none (run-now; observes on-disk marker side effects of each spawned command).
-- **Asserts:** a task with an explicit `command` runs that command (its marker file appears); a task with no `command` spawns the pinned `$SHELL` (its marker file appears).
-- **Does not assert:** prompt delivery for this case (covered by spawn/002 + spawn/004).
+- **Agent:** none (run-now; observes the on-disk marker side effect of the spawned command).
+- **Asserts:** a task with an explicit `command` runs that command (its marker file appears), proving the scheduler spawns the configured command itself.
+- **Does not assert:** any `$SHELL` fallback — `command` is now a required field, so there is no implicit-shell case (the former omitted-command fallback was removed); prompt delivery for this case (covered by spawn/002 + spawn/004).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/spawn/004 — A single fire calls spawn exactly once and delivers the configured prompt (no double-spawn, no missed delivery) (PRD #127 M2.3).

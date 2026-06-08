@@ -96,8 +96,9 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
 
     // Submit via the [Submit] button (deterministic — the schedule mode still
     // shows a Command field, so an Enter-count would be fragile). That field is
-    // empty for the built-in option, so the spawn falls back to $SHELL — no real
-    // LLM, and the card-vs-mode-tab layout renders independent of the agent.
+    // empty for the built-in option, which the schedule authoring mode defaults
+    // to `claude`; the card-vs-mode-tab layout renders independent of which
+    // command is spawned, so this assertion holds regardless of the agent.
     let (scol, srow) = deck
         .find_in_grid("[Submit]")
         .expect("the new-pane form should render a [Submit] button");

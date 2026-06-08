@@ -4,7 +4,7 @@
 //! M2.1 + M2.3). A scheduled fire (cron tick or run-now) must call the spawn
 //! primitive once: auto-create the working_dir, branch on the target dir's
 //! `.dot-agent-deck.toml` (orchestration tab vs single-agent card), spawn the
-//! command (or `$SHELL`), and deliver the prompt into the PTY.
+//! task's required `command`, and deliver the prompt into the PTY.
 //!
 //! Per the task's LATITUDE CLAUSE, these tests observe ONLY externally-visible
 //! behavior — the daemon's agent registry (`ListAgents` / `AttachResponse`),
@@ -24,8 +24,8 @@ use spec::spec;
 
 const PROMPT_MARKER: &str = "SCHEDPROMPTMARKER";
 
-/// Build one `[[scheduled_tasks]]` block. `command` is omitted from the TOML
-/// when `None` so the `$SHELL` fallback path is exercised.
+/// Build one `[[scheduled_tasks]]` block. `command` is written into the TOML
+/// when `Some` and omitted when `None`.
 fn task_block(name: &str, working_dir: &str, command: Option<&str>) -> String {
     let mut s = String::new();
     s.push_str("[[scheduled_tasks]]\n");
@@ -148,7 +148,15 @@ fn spawn_002_orchestration_vs_single_agent() {
     std::fs::create_dir_all(&single_dir).expect("create single dir");
 
     let mut toml = String::new();
-    toml.push_str(&task_block("orch", &orch_dir.to_string_lossy(), None));
+    // `command` is required for every task to LOAD, even an orchestration
+    // target whose fire is driven by the target dir's role command (so this
+    // value is ignored at fire time). Without it the loader skips the entry and
+    // `run-now orch` would error on an unknown task.
+    toml.push_str(&task_block(
+        "orch",
+        &orch_dir.to_string_lossy(),
+        Some("cat"),
+    ));
     toml.push_str(&task_block(
         "single",
         &single_dir.to_string_lossy(),
@@ -188,71 +196,39 @@ fn spawn_002_orchestration_vs_single_agent() {
     );
 }
 
-/// Scenario: Register one task with an explicit `command` and one with no
-/// `command` (so it must fall back to `$SHELL`, which the harness pins to a
-/// marker script). Both commands touch a unique marker file on startup. Fire
-/// both via run-now and assert each marker appears — proving the explicit
-/// command is honored and the omitted-command case spawns `$SHELL`.
+/// Scenario: Register one task whose explicit `command` touches a unique marker
+/// file on startup. Fire it via run-now and assert the marker appears — proving
+/// the scheduler spawns the configured `command` itself. (The former
+/// omitted-command -> `$SHELL` fallback no longer exists: `command` is now a
+/// required field, so there is no implicit-shell case left to exercise.)
 #[spec("scheduler/spawn/003")]
 #[test]
-fn spawn_003_command_vs_shell_fallback() {
+fn spawn_003_command_is_honored() {
     let scratch = tempfile::tempdir().expect("scratch tempdir");
     let base = scratch.path();
 
     let cmd_dir = base.join("cmd");
-    let shell_dir = base.join("shell");
     std::fs::create_dir_all(&cmd_dir).expect("create cmd dir");
-    std::fs::create_dir_all(&shell_dir).expect("create shell dir");
 
     let cmd_marker = base.join("CMD_RAN");
-    let shell_marker = base.join("SHELL_RAN");
-
-    // A fake $SHELL: touches its marker then blocks so the PTY stays alive.
-    let fake_shell = base.join("fake-shell.sh");
-    std::fs::write(
-        &fake_shell,
-        format!(
-            "#!/bin/sh\ntouch \"{}\"\nexec sleep 30\n",
-            shell_marker.to_string_lossy()
-        ),
-    )
-    .expect("write fake shell");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake_shell, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod fake shell");
-    }
 
     let explicit_command = format!(
         "touch \\\"{}\\\"; exec sleep 30",
         cmd_marker.to_string_lossy()
     );
 
-    let mut toml = String::new();
-    toml.push_str(&task_block(
+    let toml = task_block(
         "with-cmd",
         &cmd_dir.to_string_lossy(),
         Some(&explicit_command),
-    ));
-    toml.push_str(&task_block("no-cmd", &shell_dir.to_string_lossy(), None));
-
-    let daemon = common::spawn_daemon_serve_with_env(
-        Some(&toml),
-        "0",
-        &[("SHELL", &fake_shell.to_string_lossy())],
     );
+    let daemon = common::spawn_daemon_serve(Some(&toml), "0");
 
     daemon.run_now("with-cmd").expect("run-now with-cmd");
-    daemon.run_now("no-cmd").expect("run-now no-cmd");
 
     assert!(
         common::wait_for_path(&cmd_marker, Duration::from_secs(10)),
-        "explicit command must be spawned (CMD_RAN marker)"
-    );
-    assert!(
-        common::wait_for_path(&shell_marker, Duration::from_secs(10)),
-        "omitted command must fall back to $SHELL (SHELL_RAN marker)"
+        "the configured command must be the process spawned (CMD_RAN marker)"
     );
 }
 

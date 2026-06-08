@@ -33,6 +33,8 @@ fn cli_002_add_writes_global_and_daemon_reloads() {
             "add",
             "--name",
             "cli-task",
+            "--command",
+            "claude",
             "--cron",
             "*/5 * * * * *",
             "--working-dir",
