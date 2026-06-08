@@ -384,7 +384,8 @@ Rules:
 - NEVER edit the TOML file directly. ALWAYS write via the validated CLI, which checks the cron, expands paths, and writes the global config atomically:
   dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> --command <cmd> --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>]
 - The user can TEST the prompt in THIS session before committing — offer to run it now and show them the result (\"run it now, show me\").
-- CONFIRM the full entry (every field) with the user before you call `schedule add`.";
+- CONFIRM the full entry (every field) with the user before you call `schedule add`.
+- AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — each time the schedule fires, its run surfaces live in its own pane on the deck.";
 
 // ---------------------------------------------------------------------------
 // "Scheduled Tasks" management dialog (PRD #127 M3.3)
