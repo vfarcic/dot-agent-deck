@@ -375,14 +375,14 @@ Collect these fields:
 - name: unique id for the schedule (also the reuse-tab key; renaming is forbidden — to rename, remove + add).
 - cron: a cron expression (5-field POSIX, e.g. \"0 9 * * MON-FRI\", evaluated in local time).
 - working_dir: directory the prompt runs in (the CLI expands ~ and $VAR — pass them literally).
-- command: the agent command for a single-agent card (e.g. \"claude\"); optional, omit to fall back to $SHELL. Ignored when working_dir has an [[orchestrations]] block.
+- command: REQUIRED — the agent command for a single-agent card (e.g. \"claude\"). ALWAYS ask the user which agent command to run and ALWAYS pass --command; a scheduled task needs an agent to act on its prompt (there is no $SHELL fallback). Ignored only when working_dir has an [[orchestrations]] block (the orchestration's role commands win).
 - prompt: the prompt text to deliver on each fire.
 - new_tab_per_fire: true to open a fresh tab every fire, false (default) to reuse one tab.
 - enabled: true (default) or false.
 
 Rules:
 - NEVER edit the TOML file directly. ALWAYS write via the validated CLI, which checks the cron, expands paths, and writes the global config atomically:
-  dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> [--command <cmd>] --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>]
+  dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> --command <cmd> --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>]
 - The user can TEST the prompt in THIS session before committing — offer to run it now and show them the result (\"run it now, show me\").
 - CONFIRM the full entry (every field) with the user before you call `schedule add`.";
 
@@ -3462,10 +3462,21 @@ fn build_new_pane_request(form: &NewPaneFormState) -> NewPaneRequest {
     // form's `selected_mode()` still returns the synthetic mode for the Mode
     // cycler's title/separator rendering — only the spawned request differs.
     if form.is_schedule_selected() {
+        // PRD #127 M3.2: the authoring agent must be a real conversational agent
+        // (it has to act on the seed prompt and call the `schedule add` CLI), so
+        // default a blank command to `claude` rather than spawning a bare $SHELL
+        // that can't author anything. Applied HERE — not only in the Enter arm —
+        // so BOTH submit doors (Enter on the final field AND the [Submit] button,
+        // which calls this directly) apply the default.
+        let command = if form.command.trim().is_empty() {
+            SCHEDULE_AUTHORING_AGENT.to_string()
+        } else {
+            form.command.clone()
+        };
         return NewPaneRequest {
             dir: form.dir.clone(),
             name: form.name.clone(),
-            command: form.command.clone(),
+            command,
             mode_config: None,
             orchestration_config: None,
             seed_prompt: form.schedule_authoring.seed_prompt.clone(),
@@ -3523,14 +3534,10 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
             // selected), pressing Enter on Name submits — there's no later
             // field to advance to.
             FormField::Name | FormField::Command => {
-                let mut req = build_new_pane_request(form);
-                // PRD #127 M3.2: the "schedule" authoring agent must be a real
-                // conversational agent (it has to act on the seed prompt and
-                // call the CLI), so default a blank command to `claude` rather
-                // than letting it fall back to a bare $SHELL.
-                if form.is_schedule_selected() && req.command.trim().is_empty() {
-                    req.command = SCHEDULE_AUTHORING_AGENT.to_string();
-                }
+                // The blank-command -> SCHEDULE_AUTHORING_AGENT default now lives
+                // in `build_new_pane_request`, so both this Enter door and the
+                // [Submit] button door apply it identically.
+                let req = build_new_pane_request(form);
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
                 return Action::SpawnPane(Box::new(req));
@@ -14670,6 +14677,58 @@ mod tests {
             "seed must require confirm-before-write"
         );
         assert!(f.selected_orchestration().is_none());
+    }
+
+    // PRD #127 Part 4 — a blank Command on the "schedule" authoring option must
+    // default to the conversational agent (SCHEDULE_AUTHORING_AGENT), never a
+    // bare $SHELL, for BOTH submit doors: the [Submit] button path (which calls
+    // `build_new_pane_request` directly) and the Enter-on-final-field key path.
+    #[test]
+    fn schedule_blank_command_defaults_to_agent_both_doors() {
+        // Door 1: the [Submit] button path calls build_new_pane_request directly.
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(), // blank command
+            vec![],
+            vec![],
+        );
+        f.select_next_mode(); // index 0 -> 1 = the built-in "schedule" option
+        assert!(f.is_schedule_selected());
+        let req = build_new_pane_request(&f);
+        assert_eq!(
+            req.command, SCHEDULE_AUTHORING_AGENT,
+            "[Submit] door must default a blank schedule command to the agent, not $SHELL"
+        );
+        assert!(
+            req.seed_prompt.is_some(),
+            "authoring seed prompt is carried"
+        );
+
+        // Door 2: the Enter-on-final-field key path.
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(), // blank command
+            vec![],
+            vec![],
+        ));
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // select the schedule option
+        assert!(ui.new_pane_form.as_ref().unwrap().is_schedule_selected());
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        handle_new_pane_form_key(enter, &mut ui); // Name -> Command
+        let result = handle_new_pane_form_key(enter, &mut ui); // submit
+        match result {
+            Action::SpawnPane(req) => assert_eq!(
+                req.command, SCHEDULE_AUTHORING_AGENT,
+                "Enter door must default a blank schedule command to the agent, not $SHELL"
+            ),
+            other => panic!("expected SpawnPane, got {other:?}"),
+        }
     }
 
     #[test]
