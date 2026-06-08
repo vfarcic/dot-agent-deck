@@ -339,7 +339,15 @@ fn spawn_one(
         cols: 80,
         env: pane_env(pane_id, pin_sh),
         tab_membership: membership,
-        agent_type: None,
+        // PRD #127 finding #4: tag the daemon-side registry entry with the
+        // agent type inferred from the command (e.g. `claude` → `ClaudeCode`),
+        // matching what `surface_spawned_pane` puts on the live card and what
+        // TUI-spawned panes register (see `tab.rs`). Without this the daemon
+        // stored `None`, so a scheduled card showed e.g. `claude` while live
+        // but reverted to "No agent" after a reconnect rebuilt it from
+        // `list_agents`. `from_command` returns `None` for bare commands, the
+        // same legacy placeholder behavior.
+        agent_type: AgentType::from_command(command),
     };
     registry.spawn_agent(opts).map_err(|e| {
         notifier.notify(NotifyEvent::SpawnFailed {

@@ -385,7 +385,7 @@ Rules:
   dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> --command <cmd> --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>]
 - The user can TEST the prompt in THIS session before committing — offer to run it now and show them the result (\"run it now, show me\").
 - CONFIRM the full entry (every field) with the user before you call `schedule add`.
-- AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — each time the schedule fires, its run surfaces live in its own pane on the deck.";
+- AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, a single-agent run surfaces live in its own pane on the deck, while an orchestration-targeted run appears in its tab when the deck is (re)opened.";
 
 // ---------------------------------------------------------------------------
 // "Scheduled Tasks" management dialog (PRD #127 M3.3)
@@ -2837,9 +2837,10 @@ fn focus_deck(
             // surfaced via a `SessionStart` broadcast without going through
             // startup hydration) makes `focus_pane` report "pane not found".
             // That is NOT a stale card — attach the daemon's pane on demand and
-            // retry before the delete arm below treats it as stale. No-op for
-            // the in-process (`LocalDeck`) controller, whose registry IS the
-            // daemon's, so a miss there is genuinely stale.
+            // retry before the delete arm below treats it as stale. Post-PRD #93
+            // the daemon-backed `EmbeddedPaneController` is the only production
+            // `PaneController` (the old in-process `LocalDeck` is gone), so the
+            // downcast below always succeeds and the guard always operates on it.
             let mut focus_result = pane.focus_pane(pane_id);
             if let Err(PaneError::CommandFailed(_)) = focus_result
                 && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
