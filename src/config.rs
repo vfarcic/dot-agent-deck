@@ -419,8 +419,11 @@ pub struct ScheduledTask {
     /// (see [`expand_path`]); relative paths resolve against `$HOME`.
     pub working_dir: String,
     /// Single-agent command (mirrors the new-deck dialog); ignored when the
-    /// target dir defines `[[orchestrations]]`. Falls back to `$SHELL` when
-    /// omitted (resolved later, at spawn time).
+    /// target dir defines `[[orchestrations]]`. Required: a missing or blank
+    /// value is rejected at load time (see [`validate_task`]) — there is no
+    /// `$SHELL` fallback for scheduled tasks. Kept `Option` only so the file
+    /// shape round-trips and the absence can be reported as a load error rather
+    /// than a parse failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     /// The prompt delivered to the spawned agent / orchestrator role.

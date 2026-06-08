@@ -12,9 +12,12 @@
 //!    [`load_config_for_dir`] helper (no reaching into config internals):
 //!    `[[orchestrations]]` present → open an orchestration tab and deliver the
 //!    prompt to the `orchestrator` role; absent → a single-agent card spawned
-//!    with the schedule's `command` (falling back to `$SHELL` exactly as the
-//!    new-deck dialog does — handled by [`AgentPtyRegistry::spawn_agent`] when
-//!    `command` is `None`).
+//!    with the schedule's `command`. For scheduled fires `command` is always
+//!    present — it is required and validated at config load time, so the
+//!    `$SHELL` fallback inside [`AgentPtyRegistry::spawn_agent`] (taken when
+//!    `command` is `None`) is unreachable from this path. That fallback is
+//!    retained in the spawn primitive purely for the new-deck dialog, which
+//!    still permits an omitted command.
 //! 3. **Reuses the existing spawn path** ([`AgentPtyRegistry::spawn_agent`]) and
 //!    delivers the prompt through the UNGATED
 //!    [`AgentPtyRegistry::write_to_pane_and_submit`] (payload + CR, routed by
