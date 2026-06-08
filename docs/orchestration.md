@@ -7,6 +7,10 @@ title: Orchestration
 
 Orchestrations are multi-agent pipelines where a designated **orchestrator** agent coordinates work across one or more **worker** agents. Each worker runs in its own pane, gets tasks injected into it, and signals completion back to the orchestrator — all automatically, through the daemon.
 
+:::warning Run one orchestration at a time
+Run only **one orchestration at a time per user/machine**. Separate directories do **not** isolate concurrent orchestrations: they all share a single per-user daemon, so a worker's `work-done` report or notification can be delivered to the wrong orchestrator's stream. This is tracked for a fix in [issue #140](https://github.com/vfarcic/dot-agent-deck/issues/140).
+:::
+
 ## Why orchestrations work
 
 An agent reviewing its own code is like a developer reviewing their own PR: the same assumptions, the same blind spots, the same conviction that what they wrote is correct. Running the reviewer as a separate agent — in a fresh session, pointed at a different model if you like — removes that bias.
@@ -363,7 +367,7 @@ The daemon re-reads `.dot-agent-deck.toml` on every delegation, so edits take ef
 
 ### Two orchestrations with the same project name conflict
 
-If you run two orchestration tabs from different directories that happen to have the same basename (e.g. `~/a/myproject` and `~/b/myproject`), the daemon disambiguates them by their full path. Delegation is scoped to panes in the same tab, so there is no cross-routing.
+If you run two orchestration tabs from different directories that happen to have the same basename (e.g. `~/a/myproject` and `~/b/myproject`), the daemon disambiguates delegation routing by their full path. Note that this scoping is best-effort and does not cover notification delivery — concurrent orchestrations are not yet safe to run side by side. Run one at a time (see the warning at the top of this page and [issue #140](https://github.com/vfarcic/dot-agent-deck/issues/140)).
 
 ## See also
 
