@@ -110,3 +110,53 @@ fn modal_001_help_close_closes_overlay() {
     // Overlay closed → dashboard empty state visible again.
     deck.wait_for_string("No active sessions");
 }
+
+/// Scenario: Seed a global `schedules.toml` (one enabled task, `delrow`) via
+/// `DOT_AGENT_DECK_SCHEDULES`, open the "Scheduled Tasks" manager dialog with
+/// `S` (the existing, already-working open key — so this test isolates the
+/// in-dialog modal-click behaviour from the separate open-shortcut parity
+/// work), then click the dialog's `[Delete]` action button. The
+/// definition-only delete-confirmation must appear — the same outcome as
+/// pressing `d` — surfacing `Delete schedule 'delrow'?`. RED today: the dialog
+/// renders its actions as a non-clickable hint line
+/// (`a add  e/Enter edit  d delete  r run-now  Esc close`), so there is no
+/// `[Delete]` button and the lookup fails.
+#[spec("mouse/modal/001")]
+#[test]
+fn modal_001_scheduler_delete_button_confirms() {
+    // PRD #127 finding #4 (RED). Pinned for the coder: the manager dialog's
+    // actions must become clickable bracketed buttons — `[Add]`, `[Edit]`,
+    // `[Delete]`, `[Run now]` — wired through the PRD #80 modal-button hit-test
+    // (`button_rects` / `hit_test_button`), mirroring `[Cancel]`/`[Never]`/
+    // `[Close]`. This test covers `[Delete]`; wiring (and click tests for) the
+    // other three — add / edit / run-now — remain for the coder.
+    let dir = tempfile::tempdir().expect("scratch tempdir");
+    let sched_path = dir.path().join("schedules.toml");
+    std::fs::write(
+        &sched_path,
+        "[[scheduled_tasks]]\n\
+         name = \"delrow\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"delrow prompt\"\n\
+         enabled = true\n",
+    )
+    .expect("write fixture schedules.toml");
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    // Open the manager via the existing `S` (Shift+S) key, then click Delete.
+    deck.send_bytes(b"S");
+    deck.wait_for_string("Scheduled Tasks");
+    deck.wait_for_string("delrow"); // row present + auto-selected
+
+    click_button(&deck, "[Delete]");
+
+    // Same outcome as pressing `d`: the definition-only delete confirmation.
+    deck.wait_for_string("Delete schedule 'delrow'?");
+    drop(dir);
+}
