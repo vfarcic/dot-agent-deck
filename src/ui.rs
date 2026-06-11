@@ -9541,12 +9541,12 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
     };
 
     // Chrome inside the border: leading blank + column header + trailing blank +
-    // footer. The footer is the wrapped confirmation (≥1 line) when armed, else a
-    // single button-placeholder row.
+    // footer. The footer is the wrapped confirmation (≥1 line) when armed, else
+    // the button-placeholder row plus a dedicated `Esc close` hint row below it.
     let footer_lines = if ui.scheduled_delete_confirm {
         confirm_lines.len().max(1)
     } else {
-        1
+        2
     };
     let chrome_lines = 3 + footer_lines;
     let popup_height = (row_count + chrome_lines as u16 + 3).min(area.height.saturating_sub(4));
@@ -9640,8 +9640,11 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
     lines.push(Line::from(""));
     // The footer is either the delete confirmation (no buttons) or a blank
     // placeholder row that the clickable action buttons are overlaid onto after
-    // the Paragraph render (mirroring `render_quit_confirm`). `Esc close` rides
-    // alongside as a keyboard-only hint, since Esc has no button.
+    // the Paragraph render (mirroring `render_quit_confirm`). The `Esc close`
+    // keyboard hint (Esc has no button) sits on its OWN row below the buttons so
+    // it never clips on narrow terminals — a Paragraph doesn't wrap, so padding
+    // it to the right of the buttons would push it past the border once the
+    // modal shrinks with the terminal width.
     let button_row_index = if ui.scheduled_delete_confirm {
         // Pre-wrapped above so a long name grows the modal in HEIGHT (name on its
         // own line) instead of spilling the trailing `(y/n)` past the border.
@@ -9649,14 +9652,11 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
         None
     } else {
         let idx = lines.len();
-        // Placeholder row overlaid with the buttons below; trailing keyboard
-        // hint for Esc (no button) sits right of the buttons' span. The leading
-        // pad clears `[Add a] [Edit e] [Delete d] [Run now r]` (which end at
-        // inner column 39) so the overlay never collides with `Esc close`.
-        lines.push(Line::styled(
-            "                                              Esc close",
-            text_dim(),
-        ));
+        // Blank placeholder row overlaid with the action buttons below.
+        lines.push(Line::from(""));
+        // Dedicated keyboard-hint row, left-aligned like the list rows so it
+        // stays fully inside the border at any reasonable width.
+        lines.push(Line::styled("  Esc close", text_dim()));
         Some(idx)
     };
 
@@ -9868,7 +9868,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // hint (the first holds the chips, the second is spare).
     if form.has_mode_field && form.is_schedule_selected() {
         lines.push(Line::styled(
-            "           \u{21b3} authoring session \u{2014} writes a schedule, then done",
+            "           \u{21b3} authoring (one-off)",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::ITALIC),
