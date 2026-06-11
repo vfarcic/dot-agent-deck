@@ -68,7 +68,12 @@ fn manager_001_lists_schedules_with_status_and_next_fire() {
     deck.wait_for_string("No active sessions");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Scheduled Tasks");
+    // PRD #127 finding #4: the dashboard now carries a `[Scheduled Tasks s]`
+    // button-bar button, so the bare "Scheduled Tasks" substring is on-screen
+    // BEFORE the dialog opens — waiting for it would snapshot the dashboard. The
+    // `NEXT FIRE` column header only renders once the dialog is open with its
+    // rows loaded, so it's an unambiguous "dialog is up" signal.
+    deck.wait_for_string("NEXT FIRE");
 
     let grid = deck.snapshot_grid();
     assert!(
