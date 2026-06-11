@@ -41,7 +41,10 @@ fn scratch_with_schedules(body: &str) -> (tempfile::TempDir, std::path::PathBuf)
 /// (`digest`) and a disabled task (`paused`), press `S` to open the "Scheduled
 /// Tasks" dialog. Assert the dialog lists each task with a status indicator and
 /// a next-fire cell — `digest` shows an `idle` status, `paused` shows the
-/// `disabled` indicator with a `—` next-fire placeholder.
+/// `disabled` indicator with a `—` next-fire placeholder. Also assert each
+/// action button advertises its keyboard shortcut next to the label
+/// (`[Add a]` / `[Edit e]` / `[Delete d]` / `[Run now r]`), mirroring the
+/// `[Scheduled Tasks s]` button-bar button.
 #[spec("scheduler/manager/001")]
 #[test]
 fn manager_001_lists_schedules_with_status_and_next_fire() {
@@ -92,6 +95,26 @@ fn manager_001_lists_schedules_with_status_and_next_fire() {
         grid.contains('—'),
         "a disabled schedule's next-fire cell must render the `—` placeholder.\nGrid:\n{grid}"
     );
+
+    // PRD #127: each action button must advertise its keyboard shortcut next to
+    // the label — `[Add a]`, `[Edit e]`, `[Delete d]`, `[Run now r]` — mirroring
+    // the `[Scheduled Tasks s]` button-bar button, so a keyboard user can tell
+    // which key drives each action. RED today: the buttons render `[Add]` /
+    // `[Edit]` / `[Delete]` / `[Run now]` with the shortcut field empty
+    // (src/ui.rs Button::new(.., "", ..)), so no `<label> <key>` pair appears.
+    for (label, key) in [
+        ("Add", "a"),
+        ("Edit", "e"),
+        ("Delete", "d"),
+        ("Run now", "r"),
+    ] {
+        assert!(
+            grid.contains(&format!("{label} {key}")),
+            "the `{label}` action button must show its `{key}` shortcut key \
+             alongside its label (e.g. `[{label} {key}]`), like the \
+             `[Scheduled Tasks s]` button-bar button.\nGrid:\n{grid}"
+        );
+    }
     drop(scratch);
 }
 
@@ -332,6 +355,76 @@ fn manager_004_run_now_fires_selected_task() {
             Duration::from_secs(10),
         ),
         "pressing `r` in the manager must run-now the selected task (it never fired)"
+    );
+    drop(scratch);
+}
+
+/// Scenario: With a fixture global `schedules.toml` holding TWO enabled tasks
+/// (`alpha` then `bravo`), press `S` to open the manager. `alpha` (the first
+/// row) is auto-selected, so the `▶` selection marker sits on it. Left-click
+/// the `bravo` row — which is NOT currently selected — and assert the selection
+/// marker moves to `bravo` (the rendered `▶ bravo` indicator appears and
+/// `▶ alpha` is gone), proving a row click hit-tests and re-selects. RED today:
+/// clicking a row is a no-op (selection only moves via the keyboard j/k), so the
+/// marker stays on `alpha`.
+#[spec("scheduler/manager/006")]
+#[test]
+fn manager_006_click_row_moves_selection() {
+    let (scratch, sched_path) = scratch_with_schedules(
+        "[[scheduled_tasks]]\n\
+         name = \"alpha\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"alpha prompt\"\n\
+         enabled = true\n\n\
+         [[scheduled_tasks]]\n\
+         name = \"bravo\"\n\
+         cron = \"0 10 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"bravo prompt\"\n\
+         enabled = true\n",
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    deck.send_keys(MANAGER_KEY);
+    // `NEXT FIRE` only renders once the dialog is open with its rows loaded.
+    deck.wait_for_string("NEXT FIRE");
+
+    // Precondition: the first row (`alpha`) is auto-selected — the `▶` marker
+    // (U+25B6 + space) sits on it, and NOT on `bravo`.
+    let grid = deck.snapshot_grid();
+    assert!(
+        grid.contains("\u{25b6} alpha"),
+        "precondition: the first row (`alpha`) must be auto-selected, marked \
+         with `▶`.\nGrid:\n{grid}"
+    );
+    assert!(
+        !grid.contains("\u{25b6} bravo"),
+        "precondition: the second row (`bravo`) must NOT start selected.\nGrid:\n{grid}"
+    );
+
+    // Click the (currently unselected) `bravo` row at its on-screen position.
+    let (col, row) = deck
+        .find_in_grid("bravo")
+        .expect("the manager list must render the `bravo` row");
+    deck.click(col, row);
+
+    // The selection marker must move to the clicked row: `▶ bravo` now renders.
+    // RED today — clicking a row is a no-op, so this never appears and the wait
+    // times out with the marker still on `alpha`.
+    deck.wait_for_string("\u{25b6} bravo");
+
+    // And the selection has left `alpha` (exactly one row is selected at a time).
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("\u{25b6} alpha"),
+        "after clicking `bravo`, the selection marker must leave `alpha`.\nGrid:\n{grid}"
     );
     drop(scratch);
 }
