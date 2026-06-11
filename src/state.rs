@@ -30,7 +30,8 @@ const MAX_FIRST_PROMPTS: usize = 3;
 /// Agents that never emit `SessionStart` (e.g. `cat -u` in tests, or
 /// agent runtimes without dot-agent-deck's hooks installed) still get
 /// their prompt — just delayed by `SESSION_START_WAIT_TIMEOUT`.
-const SESSION_START_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const SESSION_START_WAIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -217,7 +218,11 @@ fn lookup_orchestration_role(
 /// the baseline `process_pending_dispatches` semantics — but it's
 /// returned so future telemetry / tracing can distinguish "fast path"
 /// from "fallback".
-async fn wait_for_session_start(
+///
+/// PRD #127: also reused by the scheduler spawn primitive
+/// ([`crate::spawn::spawn`]) to gate a freshly-spawned scheduled card's
+/// prompt delivery on the same readiness signal — hence `pub(crate)`.
+pub(crate) async fn wait_for_session_start(
     rx: &mut broadcast::Receiver<BroadcastMsg>,
     pane_id: &str,
     agent_id: &str,
