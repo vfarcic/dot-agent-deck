@@ -11,7 +11,7 @@ Each task pairs a **schedule** (when it runs) with a **working directory and a p
 
 > **The scheduler lives in the daemon**
 >
-> Scheduling runs inside the long-lived **daemon**, not the TUI, so fires keep happening after you close the deck window. It does **not** survive the daemon itself stopping — see [Daemon must be running](#daemon-must-be-running).
+> Scheduling runs inside the long-lived **daemon**, not the TUI, so fires keep happening after you close the deck window. While the daemon is stopped nothing fires — and a fire that comes due during the downtime is **not** run later (there is no catch-up) — but your schedules **resume on the next daemon start**, because their definitions live on disk. See [Daemon must be running](#daemon-must-be-running).
 
 ## Creating a scheduled task
 
