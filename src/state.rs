@@ -870,6 +870,16 @@ impl AppState {
         // not recoverable. The pinned shape lives in the regression
         // test `pre_f9_hook_with_no_agent_id_does_not_wipe_tagged_session`
         // below.
+        //
+        // PRD #127 finding #2: the `display_name` lives on the session, not
+        // the pane, so retiring the superseded session would drop the
+        // friendly title — e.g. a scheduler's synthetic live-surface
+        // placeholder (`agent_id=None`, `display_name=<task name>`) replaced
+        // by the agent's real `SessionStart` (a distinct `Some(agent_id)`, no
+        // display_name metadata). Capture the retired session's friendly name,
+        // keyed by the stable pane, so the replacement created below can
+        // inherit it when the superseding event carries none.
+        let mut inherited_display_name: Option<String> = None;
         if event.event_type == EventType::SessionStart
             && event.agent_id.is_some()
             && let Some(ref pane_id) = event.pane_id
@@ -885,7 +895,12 @@ impl AppState {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in to_remove {
-                self.sessions.remove(&id);
+                if let Some(removed) = self.sessions.remove(&id) {
+                    // First non-empty friendly name on this pane wins.
+                    if inherited_display_name.is_none() {
+                        inherited_display_name = removed.display_name;
+                    }
+                }
             }
         }
 
@@ -945,18 +960,21 @@ impl AppState {
                 first_prompts: Vec::new(),
                 pane_id: event.pane_id.clone(),
                 agent_id: event.agent_id.clone(),
-                display_name: event
-                    .metadata
-                    .get(DISPLAY_NAME_METADATA_KEY)
-                    .filter(|n| !n.is_empty())
-                    .cloned(),
+                // PRD #127 finding #2: seed with the friendly name inherited
+                // from a session this event just superseded on the same pane
+                // (above). The event-metadata case is handled unconditionally
+                // by the refresh block below — which takes precedence — so we
+                // do NOT recompute it from metadata here (reviewer LOW-2: it
+                // was a redundant duplicate of that block).
+                display_name: inherited_display_name,
             });
 
         session.last_activity = event.timestamp;
 
         // PRD #127 finding #2: a later event carrying the friendly-name
         // metadata refreshes it (the synthetic live-surface `SessionStart`
-        // sets it; ordinary hooks omit the key and leave it untouched).
+        // sets it; ordinary hooks omit the key and leave it untouched). This
+        // takes precedence over any name inherited from a superseded session.
         if let Some(name) = event
             .metadata
             .get(DISPLAY_NAME_METADATA_KEY)
