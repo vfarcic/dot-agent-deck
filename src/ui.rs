@@ -9473,10 +9473,52 @@ fn new_pane_form_footer_hint(has_mode_field: bool, name_submits: bool) -> &'stat
 /// still drive the same actions.
 fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> Vec<(Action, Rect)> {
     let area = frame.area();
+    // PRD #127: the modal width is capped (never grows with the schedule name) —
+    // a long name is handled by WRAPPING the delete confirmation onto more lines
+    // so the modal grows in HEIGHT and the message stays inside the border.
     let popup_width = 72.min(area.width.saturating_sub(4));
+    let inner_width = popup_width.saturating_sub(2) as usize;
+    // Confirmation text wraps within a 2-space left margin inside the inner width.
+    let confirm_text_width = inner_width.saturating_sub(2).max(1);
     let row_count = ui.scheduled_tasks.len().max(1) as u16;
-    // header + column-head + rows + blank + footer (+confirm) within borders.
-    let popup_height = (row_count + 7).min(area.height.saturating_sub(4));
+
+    // PRD #127: when the delete confirmation is armed, pre-wrap it so the
+    // variable-length schedule name lands on its own line(s) and the fixed
+    // trailer (`… (y/n)`) is never pushed past the border. Built up-front so the
+    // modal height can grow to fit the wrapped lines.
+    let confirm_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let confirm_lines: Vec<Line> = if ui.scheduled_delete_confirm {
+        let name = ui
+            .scheduled_tasks
+            .get(ui.scheduled_selected)
+            .map(|t| t.name.as_str())
+            .unwrap_or("");
+        let mut out: Vec<Line> = Vec::new();
+        for seg in [
+            format!("Delete schedule '{name}'?"),
+            "definition only — open tab kept. (y/n)".to_string(),
+        ] {
+            for wrapped in wrap_to_width(&seg, confirm_text_width) {
+                out.push(Line::styled(format!("  {wrapped}"), confirm_style));
+            }
+        }
+        out
+    } else {
+        Vec::new()
+    };
+
+    // Chrome inside the border: leading blank + column header + trailing blank +
+    // footer. The footer is the wrapped confirmation (≥1 line) when armed, else a
+    // single button-placeholder row.
+    let footer_lines = if ui.scheduled_delete_confirm {
+        confirm_lines.len().max(1)
+    } else {
+        1
+    };
+    let chrome_lines = 3 + footer_lines;
+    let popup_height = (row_count + chrome_lines as u16 + 3).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -9485,10 +9527,8 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> Vec<(Action, Rect)
 
     // PRD #127 N2: bound the rendered rows to what fits and scroll the selected
     // row into view, so a list taller than the viewport is fully reachable.
-    // Chrome inside the border: leading blank + column header + trailing blank
-    // + footer = 4 lines.
     let inner_height = popup_height.saturating_sub(2) as usize;
-    let max_visible_rows = inner_height.saturating_sub(4).max(1);
+    let max_visible_rows = inner_height.saturating_sub(chrome_lines).max(1);
     let (win_start, win_end) = visible_window(
         ui.scheduled_tasks.len(),
         ui.scheduled_selected,
@@ -9555,17 +9595,9 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> Vec<(Action, Rect)
     // the Paragraph render (mirroring `render_quit_confirm`). `Esc close` rides
     // alongside as a keyboard-only hint, since Esc has no button.
     let button_row_index = if ui.scheduled_delete_confirm {
-        let name = ui
-            .scheduled_tasks
-            .get(ui.scheduled_selected)
-            .map(|t| t.name.as_str())
-            .unwrap_or("");
-        lines.push(Line::styled(
-            format!("  Delete schedule '{name}'? definition only — open tab kept. (y/n)"),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
+        // Pre-wrapped above so a long name grows the modal in HEIGHT (name on its
+        // own line) instead of spilling the trailing `(y/n)` past the border.
+        lines.extend(confirm_lines);
         None
     } else {
         let idx = lines.len();
@@ -9630,6 +9662,55 @@ fn visible_window(len: usize, selected: usize, max_rows: usize) -> (usize, usize
         (selected + 1 - window).min(len - window)
     };
     (start, start + window)
+}
+
+/// Wrap `text` to at most `max_width` display columns, breaking on ASCII
+/// whitespace and hard-splitting any single word longer than the width. Counts
+/// columns by `char` (matching [`truncate_cell`]). Returns at least one
+/// (possibly empty) line. PRD #127: keeps the Scheduled-Tasks delete
+/// confirmation inside the modal border regardless of schedule-name length.
+fn wrap_to_width(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_w = 0usize;
+    for word in text.split_whitespace() {
+        let word_w = word.chars().count();
+        // A word longer than the line is hard-split across as many lines as needed.
+        if word_w > max_width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_w = 0;
+            }
+            for ch in word.chars() {
+                if current_w == max_width {
+                    lines.push(std::mem::take(&mut current));
+                    current_w = 0;
+                }
+                current.push(ch);
+                current_w += 1;
+            }
+            continue;
+        }
+        let sep = usize::from(!current.is_empty());
+        if current_w + sep + word_w > max_width {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+            current_w = word_w;
+        } else {
+            if sep == 1 {
+                current.push(' ');
+            }
+            current.push_str(word);
+            current_w += sep + word_w;
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 /// Truncate a cell to `max` display chars, appending `…` when cut. Keeps the
