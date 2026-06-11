@@ -989,12 +989,6 @@ struct UiState {
     /// Schedule names with a live tab/agent, snapshotted when the dialog opens
     /// (drives the live/idle status indicator).
     scheduled_live_names: HashSet<String>,
-    /// PRD #127 finding #4: cached "are any schedules configured?" flag, so the
-    /// dashboard can show the `[Scheduled Tasks s]` button-bar button only when
-    /// there is something to manage — without re-reading the schedules file on
-    /// every render frame. Seeded at startup and refreshed whenever the dialog
-    /// loads or a delete rewrites the definitions.
-    scheduled_tasks_present: bool,
     /// PRD #76 M2.20: timestamp of the most recent keystroke forwarded to a
     /// pane via `ForwardToPane`. Drives the submit-debounce in `PaneInput` mode
     /// so an Enter keystroke arriving fused to preceding typed bytes is
@@ -1116,7 +1110,6 @@ impl UiState {
             scheduled_selected: 0,
             scheduled_delete_confirm: false,
             scheduled_live_names: HashSet::new(),
-            scheduled_tasks_present: false,
             last_pane_keystroke_at: None,
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
@@ -5170,7 +5163,6 @@ fn dispatch_action(
         // live tab/agent (for the status indicator), then switches mode.
         Action::OpenScheduledTasks => {
             let tasks = config::LoadedSchedules::load().tasks;
-            ui.scheduled_tasks_present = !tasks.is_empty();
             ui.scheduled_tasks = tasks;
             ui.scheduled_selected = 0;
             ui.scheduled_delete_confirm = false;
@@ -5286,7 +5278,6 @@ fn dispatch_action(
             // PRD #127 N2: dialog stays open after delete — refresh list and clamp selection.
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
-                ui.scheduled_tasks_present = !ui.scheduled_tasks.is_empty();
                 ui.scheduled_live_names = live_schedule_names();
                 if ui.scheduled_selected >= ui.scheduled_tasks.len() {
                     ui.scheduled_selected = ui.scheduled_tasks.len().saturating_sub(1);
@@ -5326,12 +5317,6 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, keybindings);
-    // PRD #127 finding #4: seed the cached "schedules exist?" flag once at
-    // startup so the dashboard can decide whether to show the `[Scheduled Tasks
-    // s]` button-bar button without re-reading the schedules file every frame.
-    // Refreshed thereafter whenever the manager dialog loads or a delete
-    // rewrites the definitions.
-    ui.scheduled_tasks_present = !config::LoadedSchedules::load().tasks.is_empty();
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -7762,11 +7747,7 @@ fn render_frame(
         .style(text_primary())
         .centered();
         frame.render_widget(msg, vertical[1]);
-        let ctx_buttons = dashboard_context_buttons(
-            &ui.keybindings,
-            !filtered.is_empty(),
-            ui.scheduled_tasks_present,
-        );
+        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
         if let Some(right) = panes_area {
@@ -7853,11 +7834,7 @@ fn render_frame(
             vertical[2],
             active_mode_name,
         );
-        let ctx_buttons = dashboard_context_buttons(
-            &ui.keybindings,
-            !filtered.is_empty(),
-            ui.scheduled_tasks_present,
-        );
+        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
@@ -7961,11 +7938,7 @@ fn render_frame(
     );
 
     // Full-width hints bar
-    let ctx_buttons = dashboard_context_buttons(
-        &ui.keybindings,
-        !filtered.is_empty(),
-        ui.scheduled_tasks_present,
-    );
+    let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
     render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
     // Render terminal panes on the right side
@@ -8429,11 +8402,7 @@ fn global_bar_buttons(keybindings: &KeybindingConfig, has_pane_control: bool) ->
 /// shortcut. Filter is always actionable; Rename / Generate-config act on the
 /// selected card, so they're disabled (dimmed) when there are no cards —
 /// matching the keys' `total > 0` guard.
-fn dashboard_context_buttons(
-    keybindings: &KeybindingConfig,
-    has_cards: bool,
-    has_schedules: bool,
-) -> Vec<Button> {
+fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) -> Vec<Button> {
     let mut buttons = vec![
         Button::new(
             "Filter",
@@ -8454,26 +8423,25 @@ fn dashboard_context_buttons(
             has_cards,
         ),
     ];
-    // PRD #127 finding #4 / PRD #80: the `[Scheduled Tasks s]` open button is
-    // shown only when there are schedules to manage (you create the first via
-    // the new-pane "schedule" authoring option or the `s` key). The label/
+    // PRD #80 / PRD #127 finding #4: the `[Scheduled Tasks s]` open button is
+    // always shown — it opens the manager, which is itself how you CREATE the
+    // first schedule (its `[Add a]` action works on an empty list), so gating it
+    // on a non-empty schedule list would hide the only entry point. The label/
     // shortcut are baked into `label` with an EMPTY shortcut on purpose: this
     // button only ever appears once the bar has overflowed into shortcut-only
     // mode (it cannot fit at full width), and an empty shortcut makes the
     // shortcut-only fallback render `[Scheduled Tasks s]` rather than `[s]`, so
     // the command stays identifiable and clickable. The notation is still
     // config-derived so a remap of `open_scheduled_tasks` is reflected.
-    if has_schedules {
-        buttons.push(Button::new(
-            format!(
-                "Scheduled Tasks {}",
-                display_notation(keybindings, KbAction::OpenScheduledTasks)
-            ),
-            "",
-            Action::OpenScheduledTasks,
-            true,
-        ));
-    }
+    buttons.push(Button::new(
+        format!(
+            "Scheduled Tasks {}",
+            display_notation(keybindings, KbAction::OpenScheduledTasks)
+        ),
+        "",
+        Action::OpenScheduledTasks,
+        true,
+    ));
     buttons
 }
 
@@ -10866,10 +10834,9 @@ pub fn render_button_bar_with_bindings_to_buffer(
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
-    // Seam keeps the existing global+context bar (no schedules) so the
-    // remap-reflection assertions stay stable; the Scheduled Tasks button is
-    // exercised by the L2 button-bar test.
-    let ctx_buttons = dashboard_context_buttons(keybindings, true, false);
+    // Seam renders the full global+context bar (including the always-on
+    // Scheduled Tasks button) so every remappable label is exercised.
+    let ctx_buttons = dashboard_context_buttons(keybindings, true);
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     terminal
         .draw(|frame| {
