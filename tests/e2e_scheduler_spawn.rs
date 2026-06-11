@@ -262,3 +262,73 @@ fn spawn_004_fires_spawn_exactly_once_and_delivers() {
         "the configured prompt must be delivered to the spawned agent"
     );
 }
+
+/// Scenario: Register one single-agent task whose `command` is `cat` (a process
+/// that emits NO `SessionStart` hook of its own) and fire it via run-now. While
+/// no `SessionStart` for the spawned pane has been observed, the prompt must NOT
+/// be delivered — assert it is absent from the pane's PTY output for a window
+/// well past the old flat 300ms buffer. Then inject the agent's real
+/// `SessionStart` hook (carrying the spawned pane's `pane_id` + registry
+/// `agent_id`, exactly as a live agent's hook would) and assert the prompt IS
+/// THEN delivered (echoed by `cat`) — pinning that delivery is gated on agent
+/// readiness, not a flat timer.
+#[spec("scheduler/spawn/005")]
+#[test]
+fn spawn_005_delivery_gated_on_session_start() {
+    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let work = scratch.path().join("gated");
+    std::fs::create_dir_all(&work).expect("create work dir");
+
+    let toml = task_block("gated", &work.to_string_lossy(), Some("cat"));
+    let daemon = common::spawn_daemon_serve(Some(&toml), "0");
+
+    daemon.run_now("gated").expect("run-now gated");
+
+    // The agent is registered at spawn time (before any prompt delivery). Read
+    // back its pane_id + agent_id — the SessionStart-gate match keys, mirroring
+    // `state.rs::wait_for_session_start` (pane_id AND agent_id must both match).
+    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
+    let agent = records
+        .first()
+        .unwrap_or_else(|| panic!("fire must spawn the single-agent card, got {records:?}"));
+    let agent_id = agent.id.clone();
+    let pane_id = agent
+        .pane_id_env
+        .clone()
+        .expect("scheduler-spawned pane must carry a DOT_AGENT_DECK_PANE_ID for hook routing");
+
+    // GATE (RED today): no SessionStart for this pane has been observed, so the
+    // prompt must NOT be delivered yet. The 2s window is comfortably past the old
+    // flat 300ms buffer that delivered ungated — under the bug the marker is
+    // already echoed by `cat`, so this returns `true` and the assertion trips.
+    assert!(
+        !daemon.attach_and_wait_for_output(&agent_id, PROMPT_MARKER, Duration::from_secs(2)),
+        "the scheduled prompt must NOT be delivered before the agent's SessionStart \
+         is observed (delivery must be gated on readiness, not a flat 300ms timer)"
+    );
+
+    // The agent becomes ready: inject its real SessionStart hook carrying the
+    // spawned pane's pane_id + registry agent_id (what a live claude/opencode
+    // agent's hook emits). This rides the daemon's hook-event broadcast — the
+    // same channel the readiness gate subscribes to — and satisfies the gate.
+    let event = serde_json::json!({
+        "session_id": "gated",
+        "agent_type": "claude_code",
+        "event_type": "session_start",
+        "timestamp": "2026-06-08T12:00:00Z",
+        "pane_id": pane_id,
+        "agent_id": agent_id,
+        "cwd": work.to_string_lossy(),
+    });
+    common::write_hook_line(&daemon.hook_socket, &event.to_string())
+        .expect("write SessionStart hook to the daemon's hook socket");
+
+    // GREEN signal: once the SessionStart lands, the gate releases and the prompt
+    // is delivered (echoed by `cat`). The injection happens ~2s in — well within
+    // the 10s gate fallback — so the delivery is attributable to the SessionStart,
+    // not the timeout safety net.
+    assert!(
+        daemon.attach_and_wait_for_output(&agent_id, PROMPT_MARKER, Duration::from_secs(10)),
+        "after the agent's SessionStart is observed, the gated prompt must be delivered"
+    );
+}
