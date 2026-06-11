@@ -42,7 +42,7 @@ use tokio::sync::broadcast;
 use crate::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership, command_needs_shell_wrap,
 };
-use crate::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
+use crate::event::{AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, EventType};
 use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestration_name};
 use crate::scheduler::{Notifier, NotifyEvent};
 
@@ -260,7 +260,13 @@ pub async fn spawn(
             // can't reconstruct, and live multi-orchestration surfacing is the
             // #140 session-partitioning concern.
             if let Some(tx) = event_tx {
-                surface_spawned_pane(tx, &pane_id, &req.working_dir, command.as_deref());
+                surface_spawned_pane(
+                    tx,
+                    &pane_id,
+                    &req.working_dir,
+                    command.as_deref(),
+                    &req.task_name,
+                );
             }
             deliver(registry, &pane_id, &req.prompt).await;
             Ok(SpawnHandle {
@@ -398,12 +404,22 @@ async fn deliver(registry: &AgentPtyRegistry, pane_id: &str, prompt: &str) {
 /// the dashboard renders the card with the working-dir basename. Delivery is
 /// best-effort: `send` errs only when there are no subscribers (no TUI
 /// attached), which is the expected standalone-daemon case.
+///
+/// PRD #127 finding #2 followup: `task_name` rides on the event's
+/// [`DISPLAY_NAME_METADATA_KEY`] so the attached TUI titles the live card with
+/// the schedule's friendly name. Without it the card fell back to the
+/// truncated pane id (`sched-<name>-<n>`'s 11-char prefix). The daemon already
+/// stores this name as the registry `display_name`, so a reconnect titled the
+/// card correctly; this brings the live path to parity.
 fn surface_spawned_pane(
     event_tx: &broadcast::Sender<BroadcastMsg>,
     pane_id: &str,
     cwd: &str,
     command: Option<&str>,
+    task_name: &str,
 ) {
+    let mut metadata = HashMap::new();
+    metadata.insert(DISPLAY_NAME_METADATA_KEY.to_string(), task_name.to_string());
     let event = AgentEvent {
         session_id: pane_id.to_string(),
         agent_type: AgentType::from_command(command).unwrap_or(AgentType::None),
@@ -413,7 +429,7 @@ fn surface_spawned_pane(
         cwd: Some(cwd.to_string()),
         timestamp: chrono::Utc::now(),
         user_prompt: None,
-        metadata: HashMap::new(),
+        metadata,
         pane_id: Some(pane_id.to_string()),
         agent_id: None,
     };
@@ -933,23 +949,33 @@ mod tests {
 
     // finding #2 — the synthetic SessionStart surfaced to attached TUIs is a
     // SessionStart for the spawned pane, rooted at the spawn cwd, with
-    // `agent_id == None` so a later real hook supersedes (not duplicates) it.
+    // `agent_id == None` so a later real hook supersedes (not duplicates) it,
+    // and carrying the schedule's friendly name so the live card titles itself
+    // with the name rather than the truncated pane id.
     #[test]
     fn surface_spawned_pane_emits_session_start_for_attached_tuis() {
         let (tx, mut rx) = broadcast::channel(8);
         surface_spawned_pane(
             &tx,
-            "sched-livecard-0",
-            "/tmp/scratch/livecard",
+            "sched-morning-digest-0",
+            "/tmp/scratch/runbox",
             Some("cat"),
+            "morning-digest",
         );
         let BroadcastMsg::Event(e) = rx.try_recv().expect("a broadcast must be queued");
         assert_eq!(e.event_type, EventType::SessionStart);
-        assert_eq!(e.pane_id.as_deref(), Some("sched-livecard-0"));
-        assert_eq!(e.cwd.as_deref(), Some("/tmp/scratch/livecard"));
+        assert_eq!(e.pane_id.as_deref(), Some("sched-morning-digest-0"));
+        assert_eq!(e.cwd.as_deref(), Some("/tmp/scratch/runbox"));
         assert!(
             e.agent_id.is_none(),
             "agent_id must be None so a real SessionStart hook supersedes the placeholder"
+        );
+        assert_eq!(
+            e.metadata
+                .get(DISPLAY_NAME_METADATA_KEY)
+                .map(String::as_str),
+            Some("morning-digest"),
+            "the friendly name must ride on the event so the live card titles itself with it"
         );
     }
 
@@ -958,7 +984,7 @@ mod tests {
         // The standalone-daemon case (no attached TUI): `send` errs, swallowed.
         let (tx, rx) = broadcast::channel::<BroadcastMsg>(8);
         drop(rx);
-        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None);
+        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, "x");
     }
 
     #[test]

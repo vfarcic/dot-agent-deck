@@ -51,6 +51,14 @@ impl AgentType {
     }
 }
 
+/// `AgentEvent.metadata` key carrying a human-friendly card title (PRD #127
+/// finding #2). The daemon's live-surface path (`surface_spawned_pane`) sets
+/// this to the schedule's task name so an ALREADY-ATTACHED TUI titles the
+/// live card with the friendly name — matching what a disconnect/reconnect
+/// already renders from the daemon registry's `display_name`. Real agent hooks
+/// don't emit it; consumers treat its absence as "no friendly name known".
+pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub session_id: String,

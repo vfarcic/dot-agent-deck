@@ -8,7 +8,8 @@ use tracing::warn;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
-    AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType, WorkDoneSignal,
+    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
+    WorkDoneSignal,
 };
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
@@ -79,6 +80,14 @@ pub struct SessionState {
     /// (opencode crash/reload — reuse) from "different agent entirely"
     /// (PRD #92 F9 clear=true respawn — new session card).
     pub agent_id: Option<String>,
+    /// PRD #127 finding #2: a human-friendly card title carried on the
+    /// live-surface `SessionStart` (the schedule's task name, via
+    /// [`crate::event::DISPLAY_NAME_METADATA_KEY`]). The dashboard prefers
+    /// `ui.display_names` (populated by hydration/rename) and falls back to
+    /// this when the attached TUI has no display-name entry for the pane —
+    /// the live scheduler-spawn case, where the name would otherwise degrade
+    /// to the truncated pane id. `None` for ordinary hook-driven sessions.
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -559,6 +568,7 @@ impl AppState {
                 first_prompts: Vec::new(),
                 pane_id: Some(pane_id),
                 agent_id,
+                display_name: None,
             },
         );
     }
@@ -935,9 +945,25 @@ impl AppState {
                 first_prompts: Vec::new(),
                 pane_id: event.pane_id.clone(),
                 agent_id: event.agent_id.clone(),
+                display_name: event
+                    .metadata
+                    .get(DISPLAY_NAME_METADATA_KEY)
+                    .filter(|n| !n.is_empty())
+                    .cloned(),
             });
 
         session.last_activity = event.timestamp;
+
+        // PRD #127 finding #2: a later event carrying the friendly-name
+        // metadata refreshes it (the synthetic live-surface `SessionStart`
+        // sets it; ordinary hooks omit the key and leave it untouched).
+        if let Some(name) = event
+            .metadata
+            .get(DISPLAY_NAME_METADATA_KEY)
+            .filter(|n| !n.is_empty())
+        {
+            session.display_name = Some(name.clone());
+        }
 
         if session.agent_type == AgentType::None && event.agent_type != AgentType::None {
             session.agent_type = event.agent_type.clone();

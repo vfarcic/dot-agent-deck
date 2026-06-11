@@ -7896,7 +7896,17 @@ fn render_frame(
         for (col_idx, session) in row.iter().enumerate() {
             let flat_index = (ui.scroll_offset + vi) * cols + col_idx;
             let is_selected = flat_index == ui.selected_index;
-            let display_name = ids.get(col_idx).and_then(|id| ui.display_names.get(*id));
+            // PRD #127 finding #2: `ui.display_names` is populated by hydration
+            // and explicit renames; a live scheduler-spawned card has no entry
+            // there, so fall back to the friendly name the synthetic
+            // `SessionStart` carried onto `SessionState.display_name`. Without
+            // this the live card degraded to the truncated pane id while a
+            // reconnect (which reads the daemon registry's display_name into
+            // `ui.display_names`) titled it correctly.
+            let display_name = ids
+                .get(col_idx)
+                .and_then(|id| ui.display_names.get(*id))
+                .or(session.display_name.as_ref());
             let card_number = {
                 let n = flat_index + 1;
                 if n <= 9 { Some(n as u8) } else { None }
@@ -12544,6 +12554,7 @@ mod tests {
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
+            display_name: None,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -13983,6 +13994,7 @@ mod tests {
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
+            display_name: None,
         }
     }
 
@@ -14175,6 +14187,7 @@ mod tests {
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
+            display_name: None,
         };
 
         // Spacious: get all 3
@@ -14208,6 +14221,7 @@ mod tests {
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
+            display_name: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -14232,6 +14246,7 @@ mod tests {
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
+            display_name: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
