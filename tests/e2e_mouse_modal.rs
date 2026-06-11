@@ -115,21 +115,20 @@ fn modal_001_help_close_closes_overlay() {
 /// `DOT_AGENT_DECK_SCHEDULES`, open the "Scheduled Tasks" manager dialog with
 /// `S` (the existing, already-working open key — so this test isolates the
 /// in-dialog modal-click behaviour from the separate open-shortcut parity
-/// work), then click the dialog's `[Delete]` action button. The
-/// definition-only delete-confirmation must appear — the same outcome as
-/// pressing `d` — surfacing `Delete schedule 'delrow'?`. RED today: the dialog
-/// renders its actions as a non-clickable hint line
-/// (`a add  e/Enter edit  d delete  r run-now  Esc close`), so there is no
-/// `[Delete]` button and the lookup fails.
+/// work), then click the dialog's Delete action button. The definition-only
+/// delete-confirmation must appear — the same outcome as pressing `d` —
+/// surfacing `Delete schedule 'delrow'?`. The manager's action buttons now
+/// advertise their shortcut key, so the Delete button renders as `[Delete d]`
+/// (not the bare `[Delete]`); the click is targeted at that label.
 #[spec("mouse/modal/001")]
 #[test]
 fn modal_001_scheduler_delete_button_confirms() {
-    // PRD #127 finding #4 (RED). Pinned for the coder: the manager dialog's
-    // actions must become clickable bracketed buttons — `[Add]`, `[Edit]`,
-    // `[Delete]`, `[Run now]` — wired through the PRD #80 modal-button hit-test
+    // PRD #127 finding #4 (GREEN): the manager dialog's actions are clickable
+    // bracketed buttons wired through the PRD #80 modal-button hit-test
     // (`button_rects` / `hit_test_button`), mirroring `[Cancel]`/`[Never]`/
-    // `[Close]`. This test covers `[Delete]`; wiring (and click tests for) the
-    // other three — add / edit / run-now — remain for the coder.
+    // `[Close]`. Each button advertises its shortcut key, so Delete renders as
+    // `[Delete d]` (commit 06d0388). This test covers Delete; click coverage
+    // for add / edit / run-now lives in the scheduler manager suite.
     let dir = tempfile::tempdir().expect("scratch tempdir");
     let sched_path = dir.path().join("schedules.toml");
     std::fs::write(
@@ -154,7 +153,7 @@ fn modal_001_scheduler_delete_button_confirms() {
     deck.wait_for_string("Scheduled Tasks");
     deck.wait_for_string("delrow"); // row present + auto-selected
 
-    click_button(&deck, "[Delete]");
+    click_button(&deck, "[Delete d]");
 
     // Same outcome as pressing `d`: the definition-only delete confirmation.
     deck.wait_for_string("Delete schedule 'delrow'?");
