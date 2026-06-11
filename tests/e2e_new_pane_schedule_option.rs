@@ -180,3 +180,70 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
          landing as a dashboard card.\nGrid:\n{grid}"
     );
 }
+
+/// Scenario: Launch the deck in a fixture whose `.dot-agent-deck.toml` defines a
+/// workload mode (`build`) PLUS an orchestration (`ci-deployment`), so the
+/// new-deck dialog's Mode field renders a long chip row
+/// (`  Mode: [No mode] [build] [Orch: ci-deployment] [schedule]`) that is wider
+/// than the capped modal. Open the new-pane form (Ctrl+n → Space confirms the
+/// dir), then cycle the Mode field to the end so the built-in `[schedule]` chip
+/// is the selected option, and assert that the `[schedule]` chip renders FULLY
+/// within the modal's vertical borders — it is not clipped off the right edge.
+/// RED today: the chip row overflows the modal's inner width, so the renderer
+/// breaks the chip loop before drawing the trailing `[schedule]` chip, leaving
+/// it absent from every between-the-borders span. The assertion is
+/// approach-agnostic: it passes whether the coder later WRAPS the chip row to a
+/// second line or WINDOWS/scrolls the cycler, as long as the selected
+/// `[schedule]` chip ends up visible inside the modal.
+#[spec("prompt/new-pane/009")]
+#[test]
+fn new_pane_009_schedule_chip_contained_when_row_overflows() {
+    let deck = TuiDeck::launch_with_fixture("mode-chip-overflow");
+    deck.wait_for_string("No active sessions");
+
+    // Open the new-pane form: Ctrl+n → directory picker, Space confirms the
+    // current dir → the new-pane form.
+    deck.send_keys(b"\x0e"); // Ctrl+n
+    deck.send_keys(b" "); // Space → confirm dir → new-pane form
+    deck.wait_for_string("No mode"); // Mode field is up (cycler at "No mode")
+
+    // Cycle the Mode field to the end of its options so the built-in `schedule`
+    // authoring option is selected (`select_next_mode` caps at the last option,
+    // so an over-count of Rights is safe).
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8
+
+    // Wait until selection actually LANDS on the schedule option before
+    // snapshotting. The dialog title becomes "… — schedule mode" only when
+    // `selected_mode()` resolves to the authoring mode, so it is a
+    // selection-dependent signal that renders in the same frame as the chips.
+    // (Waiting on the bare `[schedule]` chip would be circular — the chip is
+    // exactly what is clipped/absent in the RED state.)
+    deck.wait_for_string("schedule mode");
+
+    let grid = deck.snapshot_grid();
+
+    // The selected `[schedule]` chip must render FULLY between the modal's
+    // vertical borders (`│`, U+2502). Scan every row bounded by a left AND a
+    // right `│` and check whether the bracketed chip lands inside that inner
+    // span — a wrap fix puts the chip on a second content line, a window/scroll
+    // fix keeps it on the Mode line, and both still live between the borders.
+    // The top-border title row carries corner glyphs (`┌ … ┐`), not `│ … │`, so
+    // the title's "schedule mode" (no brackets) is excluded; only the bracketed
+    // chip counts.
+    let bar = '\u{2502}';
+    let contained = grid
+        .lines()
+        .any(|line| match (line.find(bar), line.rfind(bar)) {
+            (Some(l), Some(r)) if r > l => line[l + bar.len_utf8()..r].contains("[schedule]"),
+            _ => false,
+        });
+
+    assert!(
+        contained,
+        "the selected `[schedule]` chip must render FULLY within the new-pane modal border, \
+         but it is clipped off the right edge. The Mode chip row \
+         (`  Mode: [No mode] [build] [Orch: ci-deployment] [schedule]`) overflows the modal's \
+         inner width, so the renderer drops the trailing `[schedule]` chip and it never appears \
+         between any row's `│ … │` borders.\nGrid:\n{grid}"
+    );
+}
