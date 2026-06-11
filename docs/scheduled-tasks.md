@@ -15,7 +15,7 @@ Each task pairs a **schedule** (when it runs) with a **working directory and a p
 
 ## Creating a scheduled task
 
-There are three doors to creating (and editing) a schedule, listed in the order most people reach for them. Whichever one you use, your entry is validated — the cron is checked and `~`/`$VAR` paths are expanded — and saved to the same global file regardless of which directory you're in, and a running daemon picks up the change right away.
+You can create and edit schedules three ways, listed below easiest-first.
 
 ### 1. Agent-driven authoring (primary)
 
