@@ -31,7 +31,7 @@ Either way a throwaway **`claude`** session opens and walks you through it. It:
 - lets you **test the prompt in the same session** ("run it now, show me") before committing;
 - **confirms the full entry** with you, then calls `schedule add` (or `schedule update` on the edit path).
 
-The agent never hand-edits TOML, so it can't silently produce a malformed cron or an unescaped multi-line prompt. When it's done it tells you that **this authoring pane existed only to create the schedule and can be closed** — when the schedule later fires, a single-agent run **appears live in its own pane** on the deck, while an orchestration-targeted run opens in its tab when the deck is (re)opened.
+The agent writes the entry for you, so you don't have to get the cron syntax or prompt formatting right by hand. When it's done it tells you that **this authoring pane existed only to create the schedule and can be closed** — when the schedule later fires, a single-agent run **appears live in its own pane** on the deck, while an orchestration-targeted run opens in its tab when the deck is (re)opened.
 
 This is also where the [management dialog](#management-the-scheduled-tasks-dialog) sends you for **add** and **edit**.
 
@@ -162,7 +162,7 @@ When a task fires, the scheduler reads the **target `working_dir`'s** `.dot-agen
 - If it defines an **`[[orchestrations]]`** block → an **orchestration tab** is opened rooted at that directory and the prompt is delivered to the `orchestrator` role (the task's `command` is ignored here).
 - Otherwise → a **single agent card** is opened, running `command`, and the prompt is delivered to it.
 
-**First-fire delivery waits for the agent to be ready.** On a cold first fire the scheduler waits for the spawned agent to signal readiness (a `SessionStart` hook, with a **~10s fallback**) before sending the prompt, so a cold-start prompt isn't dropped on the floor before the agent is listening. Commands that emit no such signal (a bare shell, `cat`, OpenCode) fall through on the timeout and are delivered anyway.
+**The first prompt waits for the agent to be ready.** When a fire spawns a new agent, the deck waits for it to finish starting up before delivering the prompt, so nothing is lost while the agent is still coming up.
 
 A single malformed `[[scheduled_tasks]]` entry never crashes the daemon or blocks the other (valid) entries — the bad entry is reported and skipped. A **command-less entry is one such rejected entry** (see the `command` field above).
 
