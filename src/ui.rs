@@ -920,6 +920,13 @@ struct UiState {
     /// `..` row goes up. Populated while the picker is shown, cleared
     /// otherwise.
     picker_row_rects: Vec<(usize, Rect)>,
+    /// PRD #127 M3.3: Scheduled-Tasks manager row rects, paired with the row's
+    /// index into `scheduled_tasks` (matching `scheduled_selected`). A click
+    /// selects the row — the keyboard parity for `j`/`k`. Populated by
+    /// `render_overlays` while the manager dialog is shown (and empty while its
+    /// delete confirmation is armed), cleared otherwise. Mirrors
+    /// [`UiState::picker_row_rects`].
+    scheduled_row_rects: Vec<(usize, Rect)>,
     /// PRD #80 M8: new-pane-form clickable field rows, paired with the
     /// [`FormField`] each focuses. Populated while the form is shown, cleared
     /// otherwise.
@@ -1118,6 +1125,7 @@ impl UiState {
             modal_button_rects: Vec::new(),
             picker_button_rects: Vec::new(),
             picker_row_rects: Vec::new(),
+            scheduled_row_rects: Vec::new(),
             form_field_rects: Vec::new(),
             form_chip_rects: Vec::new(),
             form_button_rects: Vec::new(),
@@ -6746,6 +6754,17 @@ pub fn run_tui(
                         if flow == Flow::Break {
                             break 'outer;
                         }
+                    } else if ui.mode == UiMode::ScheduledTasks
+                        && is_down
+                        && let Some(&(i, _)) = ui
+                            .scheduled_row_rects
+                            .iter()
+                            .find(|(_, r)| point_in_rect(r, mouse.column, mouse.row))
+                    {
+                        // PRD #127 M3.3: a click on a manager row re-selects it —
+                        // keyboard parity for `j`/`k` — mirroring the directory
+                        // picker's row hit-test.
+                        ui.scheduled_selected = i;
                     }
                     if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                         break;
@@ -7973,6 +7992,7 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
     ui.modal_button_rects.clear();
     ui.picker_button_rects.clear();
     ui.picker_row_rects.clear();
+    ui.scheduled_row_rects.clear();
     ui.form_field_rects.clear();
     ui.form_chip_rects.clear();
     ui.form_button_rects.clear();
@@ -8005,8 +8025,9 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
         }
     }
     if ui.mode == UiMode::ScheduledTasks {
-        let rects = render_scheduled_tasks(frame, ui);
-        ui.modal_button_rects = rects;
+        let (button_rects, row_rects) = render_scheduled_tasks(frame, ui);
+        ui.modal_button_rects = button_rects;
+        ui.scheduled_row_rects = row_rects;
     }
     if ui.mode == UiMode::StarPrompt {
         ui.modal_button_rects = render_star_prompt(frame);
@@ -9461,17 +9482,27 @@ fn new_pane_form_footer_hint(has_mode_field: bool, name_submits: bool) -> &'stat
     }
 }
 
+/// PRD #127 M3.3: clickable geometry returned by [`render_scheduled_tasks`] —
+/// the `[Add]`/`[Edit]`/`[Delete]`/`[Run now]` button rects (recorded in
+/// `UiState::modal_button_rects`) and the schedule row rects each paired with
+/// its index into `scheduled_tasks` (recorded in `UiState::scheduled_row_rects`).
+type ScheduledTasksClickTargets = (Vec<(Action, Rect)>, Vec<(usize, Rect)>);
+
 /// PRD #127 M3.3: render the "Scheduled Tasks" manager dialog — a
 /// read-only-plus-actions list of the configured schedules, each row showing
 /// name, status (live/idle/disabled), and next-fire. Shows a delete
 /// confirmation when armed.
 ///
 /// PRD #127 finding #4 / PRD #80: the action line is now a row of clickable
-/// `[Add] [Edit] [Delete] [Run now]` buttons; returns their `(Action, Rect)`
-/// pairs to record in `UiState::modal_button_rects` for the mouse hit-test
-/// (empty while the delete confirmation is armed). The keyboard a/e/d/r/Enter
-/// still drive the same actions.
-fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> Vec<(Action, Rect)> {
+/// `[Add a] [Edit e] [Delete d] [Run now r]` buttons; returns their
+/// `(Action, Rect)` pairs to record in `UiState::modal_button_rects` for the
+/// mouse hit-test (empty while the delete confirmation is armed). The keyboard
+/// a/e/d/r/Enter still drive the same actions.
+///
+/// PRD #127 M3.3: also returns each schedule row's `(index, Rect)` to record in
+/// `UiState::scheduled_row_rects` so a click on a row re-selects it (keyboard
+/// parity for `j`/`k`); empty while the delete confirmation is armed.
+fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClickTargets {
     let area = frame.area();
     // PRD #127: the modal width is capped (never grows with the schedule name) —
     // a long name is handled by WRAPPING the delete confirmation onto more lines
@@ -9536,6 +9567,10 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> Vec<(Action, Rect)
     );
 
     let mut lines: Vec<Line> = Vec::new();
+    // PRD #127 M3.3: collect each schedule row's clickable rect so the mouse
+    // can re-select a row (keyboard parity for `j`/`k`). Built alongside the
+    // rendered lines so the screen-row math stays in lock-step with the layout.
+    let mut row_rects: Vec<(usize, Rect)> = Vec::new();
     lines.push(Line::from(""));
 
     if ui.scheduled_tasks.is_empty() {
@@ -9585,6 +9620,19 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> Vec<(Action, Rect)
             } else {
                 text_primary()
             };
+            // Screen row of this line: the Paragraph renders inside the border,
+            // so content line `n` sits at `popup_area.y + 1 + n`. Capture the
+            // rect (full inner width) before pushing.
+            let line_idx = lines.len();
+            row_rects.push((
+                i,
+                Rect {
+                    x: popup_area.x + 1,
+                    y: popup_area.y + 1 + line_idx as u16,
+                    width: popup_area.width.saturating_sub(2),
+                    height: 1,
+                },
+            ));
             lines.push(Line::styled(row, style));
         }
     }
@@ -9602,9 +9650,11 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> Vec<(Action, Rect)
     } else {
         let idx = lines.len();
         // Placeholder row overlaid with the buttons below; trailing keyboard
-        // hint for Esc (no button) is right of the buttons' span.
+        // hint for Esc (no button) sits right of the buttons' span. The leading
+        // pad clears `[Add a] [Edit e] [Delete d] [Run now r]` (which end at
+        // inner column 39) so the overlay never collides with `Esc close`.
         lines.push(Line::styled(
-            "                                       Esc close",
+            "                                              Esc close",
             text_dim(),
         ));
         Some(idx)
@@ -9624,7 +9674,9 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> Vec<(Action, Rect)
     // disabled (dimmed + inert) when the list is empty; [Add] is always
     // actionable — mirroring the a / e-Enter / d / r keys.
     let Some(row_idx) = button_row_index else {
-        return Vec::new();
+        // Delete confirmation is armed: no action buttons and no row-click
+        // re-selection — `y`/`n`/Esc are the only inputs.
+        return (Vec::new(), Vec::new());
     };
     let has_rows = !ui.scheduled_tasks.is_empty();
     let run_now_action = ui
@@ -9632,11 +9684,17 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> Vec<(Action, Rect)
         .get(ui.scheduled_selected)
         .map(|t| Action::ScheduleRunNow(t.name.clone()))
         .unwrap_or(Action::Continue);
+    // PRD #127: each button advertises its shortcut key alongside the label —
+    // `[Add a]` / `[Edit e]` / `[Delete d]` / `[Run now r]` — mirroring the
+    // `[Scheduled Tasks s]` button-bar button so a keyboard user can tell which
+    // key drives each action. These in-dialog keys are matched as literals in
+    // `handle_scheduled_tasks_key` (not remappable `KbAction`s), so the literal
+    // key is the shortcut.
     let buttons = [
-        Button::new("Add", "", Action::ScheduleAdd, true),
-        Button::new("Edit", "", Action::ScheduleEdit, has_rows),
-        Button::new("Delete", "", Action::ScheduleArmDelete, has_rows),
-        Button::new("Run now", "", run_now_action, has_rows),
+        Button::new("Add", "a", Action::ScheduleAdd, true),
+        Button::new("Edit", "e", Action::ScheduleEdit, has_rows),
+        Button::new("Delete", "d", Action::ScheduleArmDelete, has_rows),
+        Button::new("Run now", "r", run_now_action, has_rows),
     ];
     let btn_row = Rect {
         x: popup_area.x + 1,
@@ -9644,7 +9702,10 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> Vec<(Action, Rect)
         width: popup_area.width.saturating_sub(2),
         height: 1,
     };
-    render_modal_button_row(frame, &buttons, btn_row, 1)
+    (
+        render_modal_button_row(frame, &buttons, btn_row, 1),
+        row_rects,
+    )
 }
 
 /// PRD #127 N2: the `[start, end)` slice of `len` rows to render so `selected`
@@ -9664,11 +9725,12 @@ fn visible_window(len: usize, selected: usize, max_rows: usize) -> (usize, usize
     (start, start + window)
 }
 
-/// Wrap `text` to at most `max_width` display columns, breaking on ASCII
-/// whitespace and hard-splitting any single word longer than the width. Counts
-/// columns by `char` (matching [`truncate_cell`]). Returns at least one
-/// (possibly empty) line. PRD #127: keeps the Scheduled-Tasks delete
-/// confirmation inside the modal border regardless of schedule-name length.
+/// Wrap `text` to at most `max_width` display columns, breaking on Unicode
+/// whitespace (via [`str::split_whitespace`]) and hard-splitting any single
+/// word longer than the width. Counts columns by `char` (matching
+/// [`truncate_cell`]). Returns at least one (possibly empty) line. PRD #127:
+/// keeps the Scheduled-Tasks delete confirmation inside the modal border
+/// regardless of schedule-name length.
 fn wrap_to_width(text: &str, max_width: usize) -> Vec<String> {
     if max_width == 0 {
         return vec![String::new()];
@@ -14890,6 +14952,33 @@ mod tests {
         // Degenerate inputs.
         assert_eq!(visible_window(0, 0, 4), (0, 0));
         assert_eq!(visible_window(5, 0, 0), (0, 0));
+    }
+
+    // PRD #127 — `wrap_to_width` keeps the delete confirmation inside the modal:
+    // whitespace wrapping, hard-splitting an over-long word, and the degenerate
+    // empty-text / zero-width inputs.
+    #[test]
+    fn wrap_to_width_whitespace_split_and_edges() {
+        // Whitespace wrap: words are packed up to the width, then broken.
+        assert_eq!(
+            wrap_to_width("aa bb cc dd", 5),
+            vec!["aa bb".to_string(), "cc dd".to_string()],
+        );
+        // A single word longer than the width is hard-split across lines.
+        assert_eq!(
+            wrap_to_width("abcdefg", 3),
+            vec!["abc".to_string(), "def".to_string(), "g".to_string()],
+        );
+        // A long word after a short one: the short word flushes first, then the
+        // long word hard-splits.
+        assert_eq!(
+            wrap_to_width("hi abcdef", 3),
+            vec!["hi".to_string(), "abc".to_string(), "def".to_string()],
+        );
+        // Empty text still yields exactly one (empty) line.
+        assert_eq!(wrap_to_width("", 5), vec![String::new()]);
+        // Zero width is degenerate: one empty line regardless of input.
+        assert_eq!(wrap_to_width("anything here", 0), vec![String::new()]);
     }
 
     // PRD #127 N2 — the manager dialog stays OPEN after run-now and after a
