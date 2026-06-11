@@ -15,9 +15,12 @@
 //! (`◀ name ▶`). The "schedule" option is a built-in authoring mode placed at
 //! the END of the cycle (after the project's workload modes), so cycling Right
 //! to the cap lands on it. It is VISUALLY SEPARATED from the workload modes by
-//! an authoring-session affordance — a label/section containing the word
-//! `authoring` (the PRD's "throwaway authoring session" marker). RED today:
-//! neither the `schedule` option nor the `authoring` separator exists.
+//! an authoring-session affordance — a hint line marked with `↳` reading
+//! exactly `↳ authoring (one-off)` (the PRD's "throwaway authoring session"
+//! marker), short enough to stay fully CONTAINED within the new-pane modal
+//! border. RED today: the hint renders the long
+//! `↳ authoring session — writes a schedule, then done`, whose tail overflows
+//! the modal's inner width and is clipped at the right border.
 
 mod common;
 
@@ -27,11 +30,14 @@ use spec::spec;
 /// Scenario: Launch the deck in a fixture whose `.dot-agent-deck.toml` defines
 /// one workload mode (`build`). Open the new-deck dialog (Ctrl+n → Space
 /// confirms the dir → the new-pane form), then cycle the Mode field to the end
-/// of its options. Assert the dialog surfaces a selectable `schedule` option
-/// and that it is visually separated from the workload modes by an
-/// authoring-session affordance (an `authoring` label/section) — the
-/// throwaway-authoring-session marker. RED today: the dialog only cycles
-/// through `No mode` / `build`, with no `schedule` option and no separator.
+/// of its options so the built-in `schedule` authoring option is selected.
+/// Assert the authoring-session affordance — the `↳`-marked hint that visually
+/// separates `schedule` from the workload modes — renders its FULL text as
+/// exactly `↳ authoring (one-off)` AND is fully contained within the new-pane
+/// modal border (its tail is followed by padding before the right `│`, not
+/// clipped by it). RED today: the hint is the long
+/// `↳ authoring session — writes a schedule, then done`, which is both the
+/// wrong text and clipped at the modal's right border.
 #[spec("prompt/new-pane/007")]
 #[test]
 fn new_pane_007_schedule_authoring_option_visually_separated() {
@@ -55,18 +61,64 @@ fn new_pane_007_schedule_authoring_option_visually_separated() {
     // cycler index, so waiting on "schedule" alone returns immediately and
     // races the input processing.)
     deck.wait_for_string("schedule mode");
+    // The authoring hint renders on its own line only while the schedule mode
+    // is selected; the `↳` marker is unique to that line. Wait for it so the
+    // assertions never race the repaint.
+    deck.wait_for_string("\u{21b3}");
 
-    // ...and visually separated from the workload modes by an authoring-session
-    // affordance (the throwaway-authoring-session marker).
     let grid = deck.snapshot_grid();
+
+    // Isolate the authoring hint's row — the only line carrying the `↳` marker.
+    let hint_row = grid
+        .lines()
+        .find(|line| line.contains('\u{21b3}'))
+        .unwrap_or_else(|| {
+            panic!(
+                "the new-pane form must render an authoring hint line (marked `↳`) when \
+                 the `schedule` mode is selected.\nGrid:\n{grid}"
+            )
+        });
+
+    // The hint must live BETWEEN the modal's vertical borders (`│`, U+2502).
+    // Slice the inner span between the left and right border so the assertions
+    // see exactly what rendered INSIDE the box — anything pushed past the inner
+    // width is clipped at the border and absent from this slice.
+    let bar = '\u{2502}';
+    let left = hint_row.find(bar).unwrap_or_else(|| {
+        panic!(
+            "the authoring hint row should carry the modal's left border `│`.\nRow: {hint_row:?}"
+        )
+    });
+    let right = hint_row.rfind(bar).unwrap_or_else(|| {
+        panic!(
+            "the authoring hint row should carry the modal's right border `│`.\nRow: {hint_row:?}"
+        )
+    });
     assert!(
-        grid.contains("schedule"),
-        "the new-deck dialog must surface a selectable `schedule` option.\nGrid:\n{grid}"
+        right > left,
+        "the authoring hint row should have distinct left/right modal borders.\nRow: {hint_row:?}"
     );
+    let inner = &hint_row[left + bar.len_utf8()..right];
+
+    // (1) FULL TEXT: the complete hint (normalized for the grid's left/right
+    // padding) must be exactly the SHORTENED authoring marker — not the long,
+    // overflowing wording.
+    assert_eq!(
+        inner.trim(),
+        "\u{21b3} authoring (one-off)",
+        "the authoring affordance must render the SHORTENED hint `↳ authoring (one-off)`, \
+         not the long `↳ authoring session — writes a schedule, then done`.\nGrid:\n{grid}"
+    );
+
+    // (2) CONTAINED WITHIN THE MODAL: the hint must not be pressed against (and
+    // clipped by) the right border — there must be padding between its tail and
+    // the `│`. An overflowing hint runs straight into the border, so `inner`
+    // would not end in a space.
     assert!(
-        grid.to_lowercase().contains("authoring"),
-        "the `schedule` option must be visually separated from workload modes by an \
-         authoring-session affordance (an `authoring` label/section).\nGrid:\n{grid}"
+        inner.ends_with(' '),
+        "the authoring hint must be fully CONTAINED within the new-pane modal border: its \
+         tail should be followed by padding before the right `│`, but it runs straight into \
+         (is clipped by) the border.\nGrid:\n{grid}"
     );
 }
 

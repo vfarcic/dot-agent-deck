@@ -422,8 +422,8 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 ##### prompt/new-pane/007 — The new-deck dialog surfaces a built-in `schedule` authoring option, visually separated from the workload modes (PRD #127 M3.2).
 - **Layer:** L2 (re-sequenced from L1: the dialog renderer + `NewPaneFormState` are private and there is no public L1 render seam, so the real dialog is driven via PTY keystrokes and asserted on the rendered vt100 grid).
 - **Agent:** none (drives Ctrl+n → dir-picker → new-pane form, then cycles the Mode field).
-- **Asserts:** after cycling the Mode field to the end, the dialog shows a selectable `schedule` option AND an authoring-session affordance (an `authoring` label/section) marking it as a throwaway authoring session distinct from the workload modes.
-- **Does not assert:** the authoring seed-prompt delivery (covered by `tabs/mode/005`); the manager dialog's add/edit path (Phase 3B-ii); the exact separator glyphs.
+- **Asserts:** after cycling the Mode field to the end, the dialog's authoring-session affordance — the `↳`-marked hint that separates `schedule` from the workload modes — renders its FULL text (normalized for grid padding) as exactly `↳ authoring (one-off)` AND stays fully contained within the new-pane modal border (its tail is followed by padding before the right `│`, not clipped by it).
+- **Does not assert:** the authoring seed-prompt delivery (covered by `tabs/mode/005`); the manager dialog's add/edit path (Phase 3B-ii); the leading-pad width that aligns the hint under the mode chips.
 - **Platform coverage:** mac+linux.
 
 ##### prompt/new-pane/008 — Submitting the built-in `schedule` authoring option opens a single-agent dashboard card, not a 50/50 mode tab (PRD #127 bug fix).
