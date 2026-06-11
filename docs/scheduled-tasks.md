@@ -7,7 +7,7 @@ title: Scheduled Tasks
 
 Scheduled tasks let you say *"every weekday at 09:00, run this prompt in this directory"* and have the result land in the deck where you can read it after a notification — no opening a terminal at the right time, `cd`-ing to the right place, and pasting the prompt by hand.
 
-A scheduled task is two small primitives wired together: **a cron fires**, and **a tab opens from a working directory plus a prompt**. The prompt is delivered into a live agent (or an orchestration), exactly as if you had spawned it from the new-deck dialog.
+Each task pairs a **schedule** (when it runs) with a **working directory and a prompt** (what runs). When the schedule comes due, the deck opens a tab in that directory and hands the prompt to a fresh agent — or to an orchestration, if that directory defines one — exactly as if you had started it yourself from the new-deck dialog.
 
 :::info The scheduler lives in the daemon
 Scheduling runs inside the long-lived **daemon**, not the TUI, so fires keep happening after you close the deck window. It does **not** survive the daemon itself stopping — see [Daemon must be running](#daemon-must-be-running).
@@ -15,23 +15,23 @@ Scheduling runs inside the long-lived **daemon**, not the TUI, so fires keep hap
 
 ## Creating a scheduled task
 
-There are three doors to creating (and editing) a schedule. All funnel through **one validated writer**: it checks the cron, expands `~`/`$VAR`, writes atomically to the fixed global path regardless of your current directory, and triggers a daemon reload. They are listed in the order most people reach for them.
+There are three doors to creating (and editing) a schedule, listed in the order most people reach for them. Whichever one you use, your entry is validated — the cron is checked and `~`/`$VAR` paths are expanded — and saved to the same global file regardless of which directory you're in, and a running daemon picks up the change right away.
 
 ### 1. Agent-driven authoring (primary)
 
-The easiest door: converse with an agent that builds the entry and calls the CLI for you. There are two ways in, and both spawn the **same seeded authoring agent**:
+The easiest door: converse with an agent that builds the entry and runs the commands for you. There are two ways in, and both open the same guided authoring session:
 
 - **From the new-deck / new-pane dialog** — open it (`Ctrl+n`), confirm a directory, and cycle the **Mode** field to the end — past your project's workload modes — to the built-in **`schedule`** option (marked as an *authoring session*).
 - **From the Scheduled Tasks dialog** — press **`s`** on the dashboard, then **`a`** / **`[Add]`** to author a new one (or **`e`** / **`[Edit]`** to start from an existing row's values).
 
-Either way a throwaway **`claude`** session opens, pre-seeded with instructions. It:
+Either way a throwaway **`claude`** session opens and walks you through it. It:
 
 - asks you for the fields (name, cron, working dir, command, prompt, …);
 - offers **only `claude` or `opencode`** for the command — the two CLIs the deck integrates with — and never suggests others (e.g. `gemini`), which have no deck integration. It **always asks which of the two to run** because the command is **required**;
 - lets you **test the prompt in the same session** ("run it now, show me") before committing;
 - **confirms the full entry** with you, then calls `schedule add` (or `schedule update` on the edit path).
 
-The agent never hand-edits TOML, so it can't silently produce a malformed cron or an unescaped multi-line prompt. When it's done it tells you that **this authoring pane existed only to create the schedule and can be closed** — when the schedule later fires, a single-agent run **surfaces live in its own pane** on the deck, while an orchestration-targeted run appears in its tab when the deck is (re)opened.
+The agent never hand-edits TOML, so it can't silently produce a malformed cron or an unescaped multi-line prompt. When it's done it tells you that **this authoring pane existed only to create the schedule and can be closed** — when the schedule later fires, a single-agent run **appears live in its own pane** on the deck, while an orchestration-targeted run opens in its tab when the deck is (re)opened.
 
 This is also where the [management dialog](#management-the-scheduled-tasks-dialog) sends you for **add** and **edit**.
 
@@ -40,7 +40,7 @@ This is also where the [management dialog](#management-the-scheduled-tasks-dialo
 Scriptable, and the fast path for trivial edits:
 
 ```bash
-# Add a task (the single validated writer). --command is REQUIRED:
+# Add a task (validated, then saved to the global file). --command is REQUIRED:
 dot-agent-deck schedule add \
   --name morning-digest \
   --cron "0 9 * * MON-FRI" \
@@ -77,7 +77,7 @@ dot-agent-deck schedule remove --name morning-digest
 | `run-now` | Fire the task immediately via the running daemon. |
 | `reload` | Tell the running daemon to re-read `schedules.toml`. |
 
-After any mutating command the CLI triggers a live daemon reload, so a running daemon picks the change up immediately. If no daemon is running that's fine — the change loads on the next `daemon serve`.
+After any command that changes a task, the CLI tells a running daemon to reload, so it picks the change up immediately. If no daemon is running that's fine — the change loads on the next `daemon serve`.
 
 ### 3. Hand-edit the file
 
@@ -85,7 +85,7 @@ The TOML is human-readable; edit `~/.config/dot-agent-deck/schedules.toml` direc
 
 ## Management: the "Scheduled Tasks" dialog
 
-Press **`s`** on the dashboard (lowercase; the legacy uppercase **`S`** also works) to open the **Scheduled Tasks** manager — the canonical home for the concept. Its **`[Scheduled Tasks s]`** button is **always present on the dashboard**: it doesn't wait for a schedule to exist, because the manager's **`[Add]`** action is itself how you create the first one. The dialog is *read-only-plus-actions*: it lists schedules but does not edit fields in place (mutation goes through the agent / CLI / file).
+Press **`s`** on the dashboard (lowercase; the legacy uppercase **`S`** also works) to open the **Scheduled Tasks** manager — your one place to see and manage every schedule. Its **`[Scheduled Tasks s]`** button is **always present on the dashboard**: it doesn't wait for a schedule to exist, because the manager's **`[Add]`** action is itself how you create the first one. The dialog lists your schedules and lets you act on them, but you don't edit fields inside it — changes flow through the authoring agent, the CLI, or the file.
 
 Rows are **click-selectable**. Each row shows the task **name**, a **status** indicator, and its **next-fire** time:
 
@@ -106,7 +106,7 @@ Actions — the footer buttons mirror the keys, shown as `[Add a]` `[Edit e]` `[
 | `j` / `k` | Move the selection. |
 | `Esc` / `q` / `s` | Close the dialog. |
 
-**Edits take effect on the next fire.** When you change a schedule's prompt (or any fire-affecting field — cron, working dir, command, `new_tab_per_fire`) the daemon **re-registers** the task on reload, so the next fire uses the new values rather than the ones captured at first registration.
+**Edits take effect on the next fire.** Change a schedule's prompt — or any field that affects a fire (cron, working dir, command, `new_tab_per_fire`) — and the next fire uses the new values, not the ones from when you first created the task.
 
 There is deliberately **no inline enable/disable toggle** and **no in-place field editing** — that keeps the terminal dialog simple. Pause a task via the agent, `schedule disable <name>`, or a file edit. **Rename is forbidden** via the edit path because `name` is the reuse-tab key; to rename, remove + add.
 
@@ -143,7 +143,7 @@ enabled = true
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `name` | string | yes | Unique id. Also the **reuse-tab registry key** — see [Tab reuse](#tab-reuse). Renaming is forbidden (it would orphan an open reused tab); treat a rename as remove + add. |
+| `name` | string | yes | Unique id. Also the key that ties a task to its reused tab — see [Tab reuse](#tab-reuse). Renaming is forbidden (it would orphan an open reused tab); treat a rename as remove + add. |
 | `cron` | string | yes | A **5-field POSIX** cron expression (`min hour day-of-month month day-of-week`), e.g. `0 9 * * MON-FRI`. Evaluated in **local time**. 6/7-field forms (with a seconds field) are also accepted. |
 | `working_dir` | string | yes | Directory the fire spawns into. `~` and `$VAR` / `${VAR}` are expanded at load time; a relative path resolves against `$HOME` (never the authoring agent's cwd). Created with `mkdir -p` if missing. |
 | `command` | string | **yes** | The agent command for the **single-agent** card (e.g. `claude` or `opencode`), mirroring the new-deck dialog's command field. **Required**: `schedule add` errors without it and the loader **rejects (skips) a command-less entry** — there is **no `$SHELL` fallback**. Required **universally**, including orchestration-target schedules: it is still validated at load, but **ignored at fire** when the target dir defines an `[[orchestrations]]` block (the orchestration's role commands win). |
@@ -155,7 +155,7 @@ enabled = true
 Cron is evaluated in the host's **local time** — there is no timezone field. At a daylight-saving transition this means a fire may be **skipped** (the spring-forward hour never occurs) or **run twice** (the fall-back hour repeats). This is an accepted tradeoff of local-time scheduling; if you need exactness across a DST boundary, avoid scheduling inside the transition hour.
 :::
 
-### What a fire spawns into
+### What happens when a task fires
 
 When a task fires, the scheduler reads the **target `working_dir`'s** `.dot-agent-deck.toml`:
 
@@ -173,11 +173,11 @@ Most scheduled tasks should **reuse** one tab, because you primarily learn about
 - **Default (`new_tab_per_fire = false`)** — a task reuses the same tab/card each fire. Yesterday's weather output is replaced by today's. One weather tab, ever.
 - **Opt-in (`new_tab_per_fire = true`)** — each fire opens a fresh tab, for audit-style tasks where you want per-fire history.
 
-The reuse registry is keyed by task **name** and lives **in memory in the daemon**, so it is **wiped on daemon restart** — the first fire after a restart creates a fresh tab even under reuse.
+Tab reuse is tracked only while the daemon keeps running, so a daemon restart clears it — the first fire after a restart starts a fresh tab even when reuse is on.
 
-### Mid-interaction deliver-on-idle
+### If a fire lands while you're typing
 
-If a reuse fire lands while you are actively typing in that tab, the new prompt is **queued** and delivered once the pane goes idle (a short debounce, ~5s by default). If you are not typing, it is delivered immediately. The debounce window is tunable via the `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` environment variable (milliseconds).
+If a reuse fire lands while you are actively typing in that tab, the new prompt **waits** and is delivered once you pause (a short debounce, ~5s by default). If you are not typing, it is delivered immediately. The debounce window is tunable via the `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` environment variable (milliseconds).
 
 ## Daemon must be running
 
