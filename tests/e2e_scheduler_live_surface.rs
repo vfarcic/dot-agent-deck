@@ -193,3 +193,94 @@ fn live_002_focusing_scheduled_card_does_not_delete_it() {
 
     drop(scratch);
 }
+
+/// Scenario: Launch the deck attached to a daemon with one enabled schedule
+/// named `morning-digest` whose `working_dir` basename (`runbox`) is
+/// deliberately UNRELATED to the schedule name, then fire it via `RunNow`
+/// WITHOUT detaching. After confirming the daemon registered the spawned agent
+/// under its friendly name (precondition) and the card surfaced live (its Dir
+/// line shows `runbox`), assert the card's TITLE shows the friendly schedule
+/// name `morning-digest` — matching what a disconnect/reconnect already renders
+/// — and is NOT the truncated pane-id form (`… · sched-morni…`). RED today: the
+/// live-surfacing path titles the card from the spawned pane id, so the header
+/// reads `No agent · sched-morni` instead of the schedule's name.
+#[spec("scheduler/live/003")]
+#[test]
+fn live_003_scheduled_card_title_shows_friendly_name() {
+    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    // The working-dir basename (`runbox`) is deliberately UNRELATED to the
+    // schedule name. That is the whole point: the friendly name `morning-digest`
+    // can then reach the rendered grid ONLY through the card TITLE — never via
+    // the Dir line's cwd basename (the trap `scheduler/live/001`'s
+    // name==basename fixture sidesteps, letting a stray substring match pass).
+    let work = scratch.path().join("runbox");
+    std::fs::create_dir_all(&work).expect("create work dir");
+
+    let sched_path = scratch.path().join("schedules.toml");
+    std::fs::write(
+        &sched_path,
+        single_task_toml(
+            "morning-digest",
+            &work.to_string_lossy(),
+            "cat",
+            "RUNBOXPROMPT",
+        ),
+    )
+    .expect("write fixture schedules.toml");
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    // Fire the schedule into the SAME daemon this TUI is attached to.
+    run_now(&deck, "morning-digest");
+
+    // Precondition: the daemon registers the spawned agent under the schedule's
+    // FRIENDLY name. So the friendly name IS available daemon-side — the bug is
+    // isolated to how the already-attached TUI titles the live-surfaced card
+    // (a reconnect reads this same name back via startup hydration and titles
+    // the card correctly).
+    assert!(
+        common::wait_for_agent_display_name(
+            deck.attach_socket_path(),
+            "morning-digest",
+            true,
+            Duration::from_secs(10),
+        ),
+        "the daemon must spawn the scheduled agent under its friendly name (precondition)"
+    );
+
+    // Title-independent surfacing signal: the card's Dir line renders the cwd
+    // basename (`runbox`) in BOTH the broken and fixed states, so this waits for
+    // the card to paint live without depending on the (buggy) title. The whole
+    // card — title block + body — is drawn in one render pass, so once `runbox`
+    // is on the grid the title is too.
+    deck.wait_for_string("runbox");
+
+    let grid = deck.snapshot_grid();
+
+    // DESIRED (matches a reconnect): the live-surfaced card's TITLE shows the
+    // friendly schedule name. Because the cwd basename is `runbox` and the
+    // placeholder card renders no prompt, `morning-digest` can ONLY appear on
+    // the grid via the card header — so this is a title assertion, not a stray
+    // substring match.
+    assert!(
+        grid.contains("morning-digest"),
+        "live-surfaced scheduled card TITLE must show the friendly name \
+         'morning-digest' (a disconnect/reconnect already titles it so).\nGrid:\n{grid}"
+    );
+
+    // ...and must NOT fall back to the truncated pane id (`sched-morning-digest-0`
+    // → its 11-char `id_display` prefix `sched-morni`). This is the load-bearing
+    // pin: `sched-morni` reaches the grid ONLY through the broken title's
+    // pane-id `id_display`, so its presence means the header is showing the
+    // pane id instead of the schedule name.
+    assert!(
+        !grid.contains("sched-morni"),
+        "live-surfaced scheduled card TITLE must NOT show the truncated pane-id \
+         form ('… · sched-morni…') — it should show the schedule name.\nGrid:\n{grid}"
+    );
+
+    drop(scratch);
+}
