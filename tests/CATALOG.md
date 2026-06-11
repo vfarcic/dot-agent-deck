@@ -1386,6 +1386,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** prompt delivery content (covered by `scheduler/spawn/004`); reuse vs new-tab on the fire.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/manager/005 — The delete confirmation stays contained within the modal even for a long schedule name (PRD #127 finding).
+- **Layer:** L2 (same no-L1-seam reason). Drives the real dialog via `S` + `d` and asserts on the rendered vt100 grid.
+- **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`, one enabled task with a deliberately long name).
+- **Asserts:** after arming delete (`d`) on a long-named row, the confirmation's trailing `(y/n)` prompt — the only `(y/n)` in the app — still renders, proving the message is contained within the modal (wrapped, name on its own line) instead of overflowing the inner width and clipping the tail off the right border.
+- **Does not assert:** the exact wrap points / line count; the modal's precise capped width; the confirmation wording beyond the `(y/n)` tail and `Delete schedule` prefix.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/live
 
 ##### scheduler/live/001 — A scheduled fire surfaces its card LIVE to an already-attached TUI, without a disconnect/reconnect (PRD #127 finding #2).
