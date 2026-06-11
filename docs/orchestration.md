@@ -7,9 +7,9 @@ title: Orchestration
 
 Orchestrations are multi-agent pipelines where a designated **orchestrator** agent coordinates work across one or more **worker** agents. Each worker runs in its own pane, gets tasks injected into it, and signals completion back to the orchestrator — all automatically, through the daemon.
 
-:::warning Run one orchestration at a time
-Run only **one orchestration at a time per user/machine**. Separate directories do **not** isolate concurrent orchestrations: they all share a single per-user daemon, so a worker's `work-done` report or notification can be delivered to the wrong orchestrator's stream. This is tracked for a fix in [issue #140](https://github.com/vfarcic/dot-agent-deck/issues/140).
-:::
+> **Run one orchestration at a time**
+>
+> Run only **one orchestration at a time per user/machine**. Separate directories do **not** isolate concurrent orchestrations: they all share a single per-user daemon, so a worker's `work-done` report or notification can be delivered to the wrong orchestrator's stream. This is tracked for a fix in [issue #140](https://github.com/vfarcic/dot-agent-deck/issues/140).
 
 ## Why orchestrations work
 

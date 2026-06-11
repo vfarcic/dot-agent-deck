@@ -9,9 +9,9 @@ Scheduled tasks let you say *"every weekday at 09:00, run this prompt in this di
 
 Each task pairs a **schedule** (when it runs) with a **working directory and a prompt** (what runs). When the schedule comes due, the deck opens a tab in that directory and hands the prompt to a fresh agent — or to an orchestration, if that directory defines one — exactly as if you had started it yourself from the new-deck dialog.
 
-:::info The scheduler lives in the daemon
-Scheduling runs inside the long-lived **daemon**, not the TUI, so fires keep happening after you close the deck window. It does **not** survive the daemon itself stopping — see [Daemon must be running](#daemon-must-be-running).
-:::
+> **The scheduler lives in the daemon**
+>
+> Scheduling runs inside the long-lived **daemon**, not the TUI, so fires keep happening after you close the deck window. It does **not** survive the daemon itself stopping — see [Daemon must be running](#daemon-must-be-running).
 
 ## Creating a scheduled task
 
@@ -151,9 +151,9 @@ enabled = true
 | `new_tab_per_fire` | bool | no (default `false`) | `false` reuses one tab per task; `true` opens a fresh tab every fire. See [Tab reuse](#tab-reuse). |
 | `enabled` | bool | no (default `true`) | `false` keeps the definition but stops it firing. |
 
-:::note Local time & daylight saving
-Cron is evaluated in the host's **local time** — there is no timezone field. At a daylight-saving transition this means a fire may be **skipped** (the spring-forward hour never occurs) or **run twice** (the fall-back hour repeats). This is an accepted tradeoff of local-time scheduling; if you need exactness across a DST boundary, avoid scheduling inside the transition hour.
-:::
+> **Local time & daylight saving**
+>
+> Cron is evaluated in the host's **local time** — there is no timezone field. At a daylight-saving transition this means a fire may be **skipped** (the spring-forward hour never occurs) or **run twice** (the fall-back hour repeats). This is an accepted tradeoff of local-time scheduling; if you need exactness across a DST boundary, avoid scheduling inside the transition hour.
 
 ### What happens when a task fires
 
