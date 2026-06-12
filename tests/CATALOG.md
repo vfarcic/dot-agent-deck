@@ -87,7 +87,7 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Layer:** L1 (ratatui `TestBackend`, buffer inspection).
 - **Agent:** none.
 - **Asserts:** a fully-populated session card (3 prompts + 3 tools) rendered at each tier's own `rendered_height` in an 80-column wide viewport has zero blank inner rows between its last content line and the bottom border on Compact, Normal, and Spacious — reserved card height equals rendered content height.
-- **Does not assert:** the exact `card_height` value per tier (covered by the `choose_density` unit tests); the mid-card blank separator line on Normal/Spacious (intentional content, not a trailing row).
+- **Does not assert:** the exact `card_height` value per tier (covered by `card_height_001_content_derived_values`); the mid-card blank separator line on Normal/Spacious (intentional content, not a trailing row).
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/selection

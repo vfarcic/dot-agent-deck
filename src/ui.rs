@@ -152,10 +152,13 @@ fn choose_density(
 /// offset; while content genuinely overflows (`total_rows > visible_rows`) a
 /// legitimate offset is returned unchanged, so normal scrolling is untouched.
 ///
-/// Hidden-public so the in-source unit tests can exercise the pure window math
-/// directly; it is not a library API surface for downstream consumers.
-#[doc(hidden)]
-pub fn clamp_scroll_offset(scroll_offset: usize, total_rows: usize, visible_rows: usize) -> usize {
+/// Crate-private: the only consumers are the render call site and the in-crate
+/// unit test, so it needs no crate-external visibility.
+pub(crate) fn clamp_scroll_offset(
+    scroll_offset: usize,
+    total_rows: usize,
+    visible_rows: usize,
+) -> usize {
     scroll_offset.min(total_rows.saturating_sub(visible_rows))
 }
 
