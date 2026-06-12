@@ -49,7 +49,12 @@ fn click_button(deck: &TuiDeck, needle: &str) {
 #[spec("mouse/inline/001")]
 #[test]
 fn inline_001_filter_apply_commits() {
-    let deck = TuiDeck::launch_with_fixture("minimal");
+    // PRD #127: 200 cols so the Normal-mode bar (reached after Apply) renders
+    // the FULL `[New Pane Ctrl+N]` label; at 120 it collapses to chips once the
+    // always-shown Scheduled Tasks button is included.
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
     send_session_start(&deck, "alpha", "pane-alpha", "/tmp");
     deck.wait_for_string("alpha");
@@ -82,7 +87,12 @@ fn inline_001_filter_apply_commits() {
 #[spec("mouse/inline/001")]
 #[test]
 fn inline_001_filter_cancel_abandons() {
-    let deck = TuiDeck::launch_with_fixture("minimal");
+    // PRD #127: 200 cols so the Normal-mode bar (reached after Cancel) renders
+    // the FULL `[New Pane Ctrl+N]` label; at 120 it collapses to chips once the
+    // always-shown Scheduled Tasks button is included.
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
     send_session_start(&deck, "alpha", "pane-alpha", "/tmp");
     deck.wait_for_string("alpha");
@@ -105,7 +115,12 @@ fn inline_001_filter_cancel_abandons() {
 #[spec("mouse/inline/001")]
 #[test]
 fn inline_001_rename_save_commits() {
-    let deck = TuiDeck::launch_with_fixture("minimal");
+    // PRD #127: 200 cols so the Normal-mode bar (reached after Save) renders
+    // the FULL `[New Pane Ctrl+N]` label; at 120 it collapses to chips once the
+    // always-shown Scheduled Tasks button is included.
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
     send_session_start(&deck, "alpha", "pane-alpha", "/tmp");
     deck.wait_for_string("alpha");
@@ -159,7 +174,11 @@ fn inline_001_rename_cancel_abandons() {
 #[spec("mouse/inline/001")]
 #[test]
 fn inline_001_pane_input_detach_returns_to_dashboard() {
+    // PRD #127: 200 cols so the Normal-mode bar (reached after detach) renders
+    // the FULL `[New Pane Ctrl+N]` label; at 120 it collapses to chips once the
+    // always-shown Scheduled Tasks button is included.
     let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
         .with_continue_session("realpane", "sleep 600")
         .launch_with_fixture("minimal");
     // --continue auto-focuses the single restored pane → PaneInput, so the

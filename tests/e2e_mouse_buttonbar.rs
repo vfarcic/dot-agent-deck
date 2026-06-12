@@ -23,7 +23,14 @@ use spec::spec;
 #[spec("mouse/buttonbar/003")]
 #[test]
 fn buttonbar_003_click_new_pane_opens_picker() {
-    let deck = TuiDeck::launch_with_fixture("minimal");
+    // PRD #127: render at a roomy full-screen width so the bottom bar shows the
+    // FULL `[New Pane Ctrl+N]` label. At the default 120 cols the bar correctly
+    // collapses to shortcut-only chips once the always-shown Scheduled Tasks
+    // button is included (~133 cells > 120), so the labeled-button lookup would
+    // miss. 200 cols fits the full labeled set (mirrors L1 buttonbar_005).
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .launch_with_fixture("minimal");
 
     // Empty dashboard rendered → the bottom button bar is on screen.
     deck.wait_for_string("No active sessions");

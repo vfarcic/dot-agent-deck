@@ -1159,6 +1159,13 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** the exact label/shortcut beyond the `[Scheduled` prefix; click behavior (covered by `mouse/buttonbar/004`); the bar's narrow-width degradation.
 - **Platform coverage:** mac+linux+windows.
 
+##### mouse/buttonbar/006 — At the default 120-col PTY width the FULL dashboard button set degrades to shortcut-only chips (PRD #127 — locks in the responsive collapse the L2 mouse specs widen past).
+- **Layer:** L1.
+- **Agent:** none (renders the full global + dashboard context bar, including the always-shown Scheduled Tasks button).
+- **Asserts:** at 120 cols (`DEFAULT_COLS`) the full set (~133 cells) overflows, so the bar shows the shortcut-only `[Ctrl+N]` chip and NOT the full `[New Pane Ctrl+N]` label, while the Scheduled Tasks button stays present and identifiable as `[Scheduled Tasks s]`.
+- **Does not assert:** the exact column widths; click behavior; the full-label rendering at roomy widths (covered by `mouse/buttonbar/001` / `005`).
+- **Platform coverage:** mac+linux+windows.
+
 #### mouse/tabstrip
 
 ##### mouse/tabstrip/001 — Clicking a tab header switches to that tab.
