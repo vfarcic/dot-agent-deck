@@ -125,7 +125,14 @@ pub fn init_and_watch() {
 /// caught mid-write before applying.
 fn spawn_watcher(path: std::path::PathBuf) {
     let handle = shared();
-    let _ = std::thread::Builder::new()
+    // Greptile P2: surface a spawn failure instead of silently discarding it.
+    // If the OS refuses the thread (e.g. thread-limit), live config reload is
+    // disabled for the process lifetime; without this log the operator would
+    // have no signal that the documented ~2s reload simply isn't running. The
+    // loop below is infinite and poison-safe (lock errors are recovered via
+    // `into_inner`), so a started thread never exits or panics on its own —
+    // the spawn call is the only failure point worth reporting.
+    let spawn_result = std::thread::Builder::new()
         .name("dad-features-watch".to_string())
         .spawn(move || {
             let poll = std::time::Duration::from_secs(2);
@@ -160,4 +167,10 @@ fn spawn_watcher(path: std::path::PathBuf) {
                 }
             }
         });
+    if let Err(err) = spawn_result {
+        tracing::warn!(
+            "failed to spawn experimental-flag watcher thread: {err}; \
+             live config reload is disabled for this process"
+        );
+    }
 }

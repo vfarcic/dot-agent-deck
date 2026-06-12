@@ -55,6 +55,42 @@ impl Drop for ExperimentalEnvGuard {
     }
 }
 
+/// RAII guard for an arbitrary env var: set/clear it and restore the prior
+/// value on drop, even on panic. Sibling of [`ExperimentalEnvGuard`] for env
+/// vars other than `DOT_AGENT_DECK_EXPERIMENTAL`. The caller must hold
+/// `ENV_LOCK`.
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: Option<&str>) -> Self {
+        let prev = std::env::var(key).ok();
+        // SAFETY: the caller holds ENV_LOCK for the guard's lifetime, which
+        // serializes all access to this env var across the test binary.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: see EnvVarGuard::set — ENV_LOCK is held.
+        unsafe {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 // (a) `[features]` TOML parse, including absent-table → default false.
 #[test]
 fn parse_features_table_and_absent_default() {
@@ -200,23 +236,15 @@ fn reload_apply_path_updates_shared_features() {
 #[test]
 fn features_config_path_honors_override() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG").ok();
-    // SAFETY: ENV_LOCK held for the duration of this test.
-    unsafe {
-        std::env::set_var(
-            "DOT_AGENT_DECK_FEATURES_CONFIG",
-            "/tmp/explicit/.dot-agent-deck.toml",
-        );
-    }
+    // RAII guard: restores the prior value on drop even if the assertion
+    // panics, so the override never leaks to other tests that read
+    // `DOT_AGENT_DECK_FEATURES_CONFIG` without holding ENV_LOCK.
+    let _config_env = EnvVarGuard::set(
+        "DOT_AGENT_DECK_FEATURES_CONFIG",
+        Some("/tmp/explicit/.dot-agent-deck.toml"),
+    );
     assert_eq!(
         features_config_path(),
         std::path::PathBuf::from("/tmp/explicit/.dot-agent-deck.toml")
     );
-    // SAFETY: ENV_LOCK held; restore the prior value.
-    unsafe {
-        match prev {
-            Some(v) => std::env::set_var("DOT_AGENT_DECK_FEATURES_CONFIG", v),
-            None => std::env::remove_var("DOT_AGENT_DECK_FEATURES_CONFIG"),
-        }
-    }
 }

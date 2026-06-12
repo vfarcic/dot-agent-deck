@@ -7613,15 +7613,24 @@ fn render_frame(
     tab_bar: &TabBarInfo,
 ) {
     // PRD #139 M4.1: throwaway experimental footer, gated at the single
-    // user-visible seam via `features::show_experimental_footer()` (the one
-    // wrapper for this feature — CLAUDE.md #9). When ON, reserve the bottom
-    // row for the `experimental: on` label and lay the rest of the frame out
-    // above it; when OFF the layout is byte-for-byte the pre-feature baseline.
+    // user-visible seam for this feature (the `show_experimental_footer()`
+    // wrapper — CLAUDE.md #9; grep that name to find this site at graduation).
+    // When ON, reserve the bottom row for the `experimental: on` label and lay
+    // the rest of the frame out above it; when OFF the layout is byte-for-byte
+    // the pre-feature baseline.
     let area = {
         let full = frame.area();
-        if crate::features::show_experimental_footer() {
+        // Greptile P2: snapshot the flag ONCE per frame so the gate decision and
+        // the render observe the same value. Reading it twice (gate, then render)
+        // opened a TOCTOU window where the ~2s watcher could flip it between the
+        // reads — reserving a footer row but drawing nothing (cropping the main
+        // content by a row), or vice versa. `features_snap.experimental` is
+        // exactly what `show_experimental_footer()` returns, without a second
+        // lock acquisition.
+        let features_snap = crate::features::current();
+        if features_snap.experimental {
             let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(full);
-            render_experimental_footer(frame, &crate::features::current(), chunks[1]);
+            render_experimental_footer(frame, &features_snap, chunks[1]);
             chunks[0]
         } else {
             full
