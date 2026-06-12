@@ -375,16 +375,17 @@ Collect these fields:
 - name: unique id for the schedule (also the reuse-tab key; renaming is forbidden — to rename, remove + add).
 - cron: a cron expression (5-field POSIX, e.g. \"0 9 * * MON-FRI\", evaluated in local time).
 - working_dir: directory the prompt runs in (the CLI expands ~ and $VAR — pass them literally).
-- command: the agent command for a single-agent card (e.g. \"claude\"); optional, omit to fall back to $SHELL. Ignored when working_dir has an [[orchestrations]] block.
+- command: REQUIRED — the agent command for a single-agent card. dot-agent-deck supports ONLY \"claude\" and \"opencode\"; offer and pass ONLY one of those — never suggest other CLIs (e.g. gemini), which have no deck integration. ALWAYS ask the user which of the two to run and ALWAYS pass --command; a scheduled task needs an agent to act on its prompt (there is no $SHELL fallback). Ignored only when working_dir has an [[orchestrations]] block (the orchestration's role commands win).
 - prompt: the prompt text to deliver on each fire.
 - new_tab_per_fire: true to open a fresh tab every fire, false (default) to reuse one tab.
 - enabled: true (default) or false.
 
 Rules:
 - NEVER edit the TOML file directly. ALWAYS write via the validated CLI, which checks the cron, expands paths, and writes the global config atomically:
-  dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> [--command <cmd>] --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>]
+  dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> --command <cmd> --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>]
 - The user can TEST the prompt in THIS session before committing — offer to run it now and show them the result (\"run it now, show me\").
-- CONFIRM the full entry (every field) with the user before you call `schedule add`.";
+- CONFIRM the full entry (every field) with the user before you call `schedule add`.
+- AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, a single-agent run surfaces live in its own pane on the deck, while an orchestration-targeted run appears in its tab when the deck is (re)opened.";
 
 // ---------------------------------------------------------------------------
 // "Scheduled Tasks" management dialog (PRD #127 M3.3)
@@ -919,6 +920,13 @@ struct UiState {
     /// `..` row goes up. Populated while the picker is shown, cleared
     /// otherwise.
     picker_row_rects: Vec<(usize, Rect)>,
+    /// PRD #127 M3.3: Scheduled-Tasks manager row rects, paired with the row's
+    /// index into `scheduled_tasks` (matching `scheduled_selected`). A click
+    /// selects the row — the keyboard parity for `j`/`k`. Populated by
+    /// `render_overlays` while the manager dialog is shown (and empty while its
+    /// delete confirmation is armed), cleared otherwise. Mirrors
+    /// [`UiState::picker_row_rects`].
+    scheduled_row_rects: Vec<(usize, Rect)>,
     /// PRD #80 M8: new-pane-form clickable field rows, paired with the
     /// [`FormField`] each focuses. Populated while the form is shown, cleared
     /// otherwise.
@@ -1110,6 +1118,7 @@ impl UiState {
             modal_button_rects: Vec::new(),
             picker_button_rects: Vec::new(),
             picker_row_rects: Vec::new(),
+            scheduled_row_rects: Vec::new(),
             form_field_rects: Vec::new(),
             form_chip_rects: Vec::new(),
             form_button_rects: Vec::new(),
@@ -2182,6 +2191,14 @@ pub struct NewPaneRequest {
     command: String,
     mode_config: Option<ModeConfig>,
     orchestration_config: Option<OrchestrationConfig>,
+    /// PRD #127: a seed prompt to deliver (gated, like a mode's `seed_prompt`)
+    /// to the spawned single-agent CARD once its pane is ready. Set for the
+    /// built-in "schedule" authoring session, which is a throwaway single-agent
+    /// card (NOT a 50/50 mode tab), so its seed cannot ride on `mode_config` —
+    /// that field routes the spawn through `render_mode_tab`. Carrying the seed
+    /// here keeps the authoring session a dashboard card while still delivering
+    /// the authoring prompt.
+    seed_prompt: Option<String>,
 }
 
 /// PRD #80: the single action layer. Every keyboard-only command and (from
@@ -2335,7 +2352,11 @@ pub enum Action {
     /// PRD #80: the new-pane form was submitted — spawn the requested pane.
     /// This is the *outcome* of the form, distinct from [`Action::NewPane`],
     /// which merely opens the picker that leads to the form.
-    SpawnPane(NewPaneRequest),
+    ///
+    /// Boxed: `NewPaneRequest` is by far the largest payload of any `Action`
+    /// variant (it owns a `ModeConfig`/`OrchestrationConfig`), so storing it
+    /// inline would bloat every `Action` value (`clippy::large_enum_variant`).
+    SpawnPane(Box<NewPaneRequest>),
     SendConfigGenPrompt {
         pane_id: String,
         cwd: String,
@@ -2368,6 +2389,24 @@ pub enum Action {
     /// agent and exits), and breaks the TUI's main loop.
     StopAndQuit,
     ForwardToPane(Vec<u8>),
+    /// PRD #127 finding #4: open the "Scheduled Tasks" manager dialog. Shared by
+    /// the dashboard `s`/`S` key and the `[Scheduled Tasks s]` button-bar button
+    /// (PRD #80 parity), so both funnel through one dispatch path that loads the
+    /// schedules and switches into [`UiMode::ScheduledTasks`].
+    OpenScheduledTasks,
+    /// PRD #127 finding #4: the manager dialog's `[Add]` button — mouse parity
+    /// for the `a` key. Closes the dialog and spawns the seeded authoring agent
+    /// with a blank context (same outcome as pressing `a`).
+    ScheduleAdd,
+    /// PRD #127 finding #4: the manager dialog's `[Edit]` button — mouse parity
+    /// for the `e`/Enter key. Closes the dialog and spawns the authoring agent
+    /// pre-filled with the selected row's values.
+    ScheduleEdit,
+    /// PRD #127 finding #4: the manager dialog's `[Delete]` button — mouse
+    /// parity for the `d` key. Arms the definition-only delete confirmation for
+    /// the selected row (the dialog stays open); confirming is then `y` / the
+    /// confirmed [`Action::ScheduleDelete`].
+    ScheduleArmDelete,
     /// PRD #127 M3.3: the manager dialog's `r` action — fire the named schedule
     /// immediately via the `RunNow` daemon control message. Dispatched in the
     /// main loop (socket I/O), which the sync key handler can't do directly.
@@ -2794,7 +2833,23 @@ fn focus_deck(
         && let Some(session) = snapshot.sessions.get(*sid)
     {
         if let Some(ref pane_id) = session.pane_id {
-            match pane.focus_pane(pane_id) {
+            // PRD #127 finding #2: a card backed by a LIVE daemon agent but not
+            // yet wired to a local pane (e.g. a scheduler-spawned agent that
+            // surfaced via a `SessionStart` broadcast without going through
+            // startup hydration) makes `focus_pane` report "pane not found".
+            // That is NOT a stale card — attach the daemon's pane on demand and
+            // retry before the delete arm below treats it as stale. Post-PRD #93
+            // the daemon-backed `EmbeddedPaneController` is the only production
+            // `PaneController` (the old in-process `LocalDeck` is gone), so the
+            // downcast below always succeeds and the guard always operates on it.
+            let mut focus_result = pane.focus_pane(pane_id);
+            if let Err(PaneError::CommandFailed(_)) = focus_result
+                && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                && embedded.hydrate_pane(pane_id)
+            {
+                focus_result = pane.focus_pane(pane_id);
+            }
+            match focus_result {
                 Ok(()) => {
                     ui.mode = UiMode::PaneInput;
                     ui.status_message = Some((
@@ -3059,17 +3114,14 @@ fn handle_normal_key(
     {
         return Action::SendPermissionResponse(false);
     }
-    // PRD #127 M3.3: open the "Scheduled Tasks" manager dialog. `S`
-    // (Shift+s) is unbound in dashboard command mode. Load the schedules
-    // from the global config and snapshot which currently have a live
-    // tab/agent (for the status indicator).
-    if key.code == KeyCode::Char('S') {
-        ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
-        ui.scheduled_selected = 0;
-        ui.scheduled_delete_confirm = false;
-        ui.scheduled_live_names = live_schedule_names();
-        ui.mode = UiMode::ScheduledTasks;
-        return Action::Continue;
+    // PRD #127 finding #4: open the "Scheduled Tasks" manager dialog. Routed
+    // through the keybinding registry (default `s`) so it is remappable and
+    // shares one dispatch path with the `[Scheduled Tasks s]` button-bar button
+    // (PRD #80 parity). The legacy uppercase `S` (Shift+s) stays a hardcoded
+    // non-configurable alias — mirroring the Down/Up aliases kept beside j/k —
+    // so existing muscle memory keeps working while lowercase `s` is added.
+    if kb.matches(KbAction::OpenScheduledTasks, &key) || key.code == KeyCode::Char('S') {
+        return Action::OpenScheduledTasks;
     }
     if kb.matches(KbAction::ClearFilter, &key) {
         if !ui.filter_text.is_empty() {
@@ -3146,7 +3198,9 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
 
     let len = ui.scheduled_tasks.len();
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => {
+        // PRD #127 finding #4: `s`/`S` toggle the dialog closed, mirroring the
+        // case-insensitive open shortcut, alongside the usual Esc / `q`.
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') | KeyCode::Char('s') => {
             ui.mode = UiMode::Normal;
             Action::Continue
         }
@@ -3165,7 +3219,7 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
         // Add: spawn the seeded authoring agent with a blank context.
         KeyCode::Char('a') => {
             ui.mode = UiMode::Normal;
-            Action::SpawnPane(schedule_authoring_request(None))
+            Action::SpawnPane(Box::new(schedule_authoring_request(None)))
         }
         // Edit the selected row: spawn the authoring agent pre-filled with the
         // row's current values (it calls `schedule update`). With no rows,
@@ -3173,7 +3227,7 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
         KeyCode::Enter | KeyCode::Char('e') => {
             let existing = ui.scheduled_tasks.get(ui.scheduled_selected).cloned();
             ui.mode = UiMode::Normal;
-            Action::SpawnPane(schedule_authoring_request(existing.as_ref()))
+            Action::SpawnPane(Box::new(schedule_authoring_request(existing.as_ref())))
         }
         // Delete (definition only) — ask to confirm first.
         KeyCode::Char('d') => {
@@ -3200,12 +3254,18 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
 /// the agent command is the conversational `claude` (it must act on the seed).
 fn schedule_authoring_request(existing: Option<&config::ScheduledTask>) -> NewPaneRequest {
     let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // PRD #127: the "schedule" authoring session is a throwaway single-agent
+    // CARD, not a workload mode tab. Carry the authoring seed on `seed_prompt`
+    // (delivered via the gated path) and leave `mode_config` None so the spawn
+    // routes to the dashboard like any single-agent card instead of opening a
+    // 50/50 mode tab.
     NewPaneRequest {
         dir,
         name: SCHEDULE_MODE_NAME.to_string(),
         command: SCHEDULE_AUTHORING_AGENT.to_string(),
-        mode_config: Some(build_schedule_authoring_mode(existing)),
+        mode_config: None,
         orchestration_config: None,
+        seed_prompt: build_schedule_authoring_mode(existing).seed_prompt,
     }
 }
 
@@ -3436,12 +3496,41 @@ fn transition_after_dir_pick(ui: &mut UiState) {
 /// Shared by the Enter-submit key arm and the `[Submit]` button
 /// ([`Action::FormSubmit`]) so click and key spawn an identical pane.
 fn build_new_pane_request(form: &NewPaneFormState) -> NewPaneRequest {
+    // PRD #127: the built-in "schedule" authoring option is NOT a workload mode
+    // tab — it is a throwaway single-agent authoring CARD that converses to
+    // build a schedule entry. Spawn it as a dashboard card (`mode_config` None)
+    // carrying the authoring seed prompt, so it routes to the dashboard like any
+    // single-agent card instead of through `render_mode_tab`'s 50/50 split. The
+    // form's `selected_mode()` still returns the synthetic mode for the Mode
+    // cycler's title/separator rendering — only the spawned request differs.
+    if form.is_schedule_selected() {
+        // PRD #127 M3.2: the authoring agent must be a real conversational agent
+        // (it has to act on the seed prompt and call the `schedule add` CLI), so
+        // default a blank command to `claude` rather than spawning a bare $SHELL
+        // that can't author anything. Applied HERE — not only in the Enter arm —
+        // so BOTH submit doors (Enter on the final field AND the [Submit] button,
+        // which calls this directly) apply the default.
+        let command = if form.command.trim().is_empty() {
+            SCHEDULE_AUTHORING_AGENT.to_string()
+        } else {
+            form.command.clone()
+        };
+        return NewPaneRequest {
+            dir: form.dir.clone(),
+            name: form.name.clone(),
+            command,
+            mode_config: None,
+            orchestration_config: None,
+            seed_prompt: form.schedule_authoring.seed_prompt.clone(),
+        };
+    }
     NewPaneRequest {
         dir: form.dir.clone(),
         name: form.name.clone(),
         command: form.command.clone(),
         mode_config: form.selected_mode().cloned(),
         orchestration_config: form.selected_orchestration().cloned(),
+        seed_prompt: None,
     }
 }
 
@@ -3487,17 +3576,13 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
             // selected), pressing Enter on Name submits — there's no later
             // field to advance to.
             FormField::Name | FormField::Command => {
-                let mut req = build_new_pane_request(form);
-                // PRD #127 M3.2: the "schedule" authoring agent must be a real
-                // conversational agent (it has to act on the seed prompt and
-                // call the CLI), so default a blank command to `claude` rather
-                // than letting it fall back to a bare $SHELL.
-                if form.is_schedule_selected() && req.command.trim().is_empty() {
-                    req.command = SCHEDULE_AUTHORING_AGENT.to_string();
-                }
+                // The blank-command -> SCHEDULE_AUTHORING_AGENT default now lives
+                // in `build_new_pane_request`, so both this Enter door and the
+                // [Submit] button door apply it identically.
+                let req = build_new_pane_request(form);
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
-                return Action::SpawnPane(req);
+                return Action::SpawnPane(Box::new(req));
             }
         },
         KeyCode::Backspace if form.focused != FormField::Mode => {
@@ -4842,6 +4927,22 @@ fn dispatch_action(
                                 // spawn-time and resize-time math
                                 // can't drift.
                                 resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                                // PRD #127: a single-agent card carrying a
+                                // `seed_prompt` (the built-in "schedule"
+                                // authoring session) enqueues it for the SAME
+                                // gated delivery modes use — drained by
+                                // `process_pending_seed_prompts` once the agent
+                                // signals readiness (SessionStart) plus the
+                                // spawn-time buffer. A card without a seed
+                                // enqueues nothing (no-op for ordinary panes).
+                                if let Some(seed) = req.seed_prompt {
+                                    ui.pending_seed_prompts.push(PendingSeedPrompt {
+                                        pane_id: new_id.clone(),
+                                        prompt: seed,
+                                        created_at: std::time::Instant::now(),
+                                        ready_since: None,
+                                    });
+                                }
                                 ui.status_message = Some((
                                     format!("Created pane {new_id} in {dir_str}"),
                                     std::time::Instant::now(),
@@ -5015,7 +5116,7 @@ fn dispatch_action(
                 ui.mode = UiMode::Normal;
                 let req = build_new_pane_request(&form);
                 return dispatch_action(
-                    Action::SpawnPane(req),
+                    Action::SpawnPane(Box::new(req)),
                     ui,
                     pane,
                     state,
@@ -5054,6 +5155,62 @@ fn dispatch_action(
                         Some((format!("PTY write failed: {e}"), std::time::Instant::now()));
                 }
                 ui.last_pane_keystroke_at = Some(std::time::Instant::now());
+            }
+        }
+        // PRD #127 finding #4: open the manager dialog. Shared by the dashboard
+        // `s`/`S` key and the `[Scheduled Tasks s]` button-bar button. Loads the
+        // schedules from the global config and snapshots which currently have a
+        // live tab/agent (for the status indicator), then switches mode.
+        Action::OpenScheduledTasks => {
+            let tasks = config::LoadedSchedules::load().tasks;
+            ui.scheduled_tasks = tasks;
+            ui.scheduled_selected = 0;
+            ui.scheduled_delete_confirm = false;
+            ui.scheduled_live_names = live_schedule_names();
+            ui.mode = UiMode::ScheduledTasks;
+        }
+        // PRD #127 finding #4: `[Add]` button parity for the `a` key — close the
+        // dialog and spawn the seeded authoring agent with a blank context.
+        Action::ScheduleAdd => {
+            ui.mode = UiMode::Normal;
+            let req = schedule_authoring_request(None);
+            return dispatch_action(
+                Action::SpawnPane(Box::new(req)),
+                ui,
+                pane,
+                state,
+                tab_manager,
+                snapshot,
+                filtered,
+                selected_id,
+                frame_area,
+            );
+        }
+        // PRD #127 finding #4: `[Edit]` button parity for the `e`/Enter key —
+        // close the dialog and spawn the authoring agent pre-filled with the
+        // selected row's values (blank context when the list is empty).
+        Action::ScheduleEdit => {
+            let existing = ui.scheduled_tasks.get(ui.scheduled_selected).cloned();
+            ui.mode = UiMode::Normal;
+            let req = schedule_authoring_request(existing.as_ref());
+            return dispatch_action(
+                Action::SpawnPane(Box::new(req)),
+                ui,
+                pane,
+                state,
+                tab_manager,
+                snapshot,
+                filtered,
+                selected_id,
+                frame_area,
+            );
+        }
+        // PRD #127 finding #4: `[Delete]` button parity for the `d` key — arm
+        // the definition-only delete confirmation for the selected row (the
+        // dialog stays open; `y` / the confirmed delete then removes it).
+        Action::ScheduleArmDelete => {
+            if ui.scheduled_selected < ui.scheduled_tasks.len() {
+                ui.scheduled_delete_confirm = true;
             }
         }
         Action::ScheduleRunNow(name) => {
@@ -6542,6 +6699,11 @@ pub fn run_tui(
                         | UiMode::ConfigGenPrompt
                         | UiMode::StarPrompt
                         | UiMode::Help
+                        // PRD #127 finding #4: the Scheduled Tasks dialog is a
+                        // topmost modal too — its [Add]/[Edit]/[Delete]/[Run now]
+                        // buttons live in `modal_button_rects` and any miss is
+                        // consumed here rather than reaching the pane behind it.
+                        | UiMode::ScheduledTasks
                 );
                 // PRD #80 M6: in the inline-edit modes the bottom row IS the
                 // input; its [Apply]/[Cancel] / [Save]/[Cancel] buttons live in
@@ -6577,6 +6739,17 @@ pub fn run_tui(
                         if flow == Flow::Break {
                             break 'outer;
                         }
+                    } else if ui.mode == UiMode::ScheduledTasks
+                        && is_down
+                        && let Some(&(i, _)) = ui
+                            .scheduled_row_rects
+                            .iter()
+                            .find(|(_, r)| point_in_rect(r, mouse.column, mouse.row))
+                    {
+                        // PRD #127 M3.3: a click on a manager row re-selects it —
+                        // keyboard parity for `j`/`k` — mirroring the directory
+                        // picker's row hit-test.
+                        ui.scheduled_selected = i;
                     }
                     if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                         break;
@@ -7719,7 +7892,17 @@ fn render_frame(
         for (col_idx, session) in row.iter().enumerate() {
             let flat_index = (ui.scroll_offset + vi) * cols + col_idx;
             let is_selected = flat_index == ui.selected_index;
-            let display_name = ids.get(col_idx).and_then(|id| ui.display_names.get(*id));
+            // PRD #127 finding #2: `ui.display_names` is populated by hydration
+            // and explicit renames; a live scheduler-spawned card has no entry
+            // there, so fall back to the friendly name the synthetic
+            // `SessionStart` carried onto `SessionState.display_name`. Without
+            // this the live card degraded to the truncated pane id while a
+            // reconnect (which reads the daemon registry's display_name into
+            // `ui.display_names`) titled it correctly.
+            let display_name = ids
+                .get(col_idx)
+                .and_then(|id| ui.display_names.get(*id))
+                .or(session.display_name.as_ref());
             let card_number = {
                 let n = flat_index + 1;
                 if n <= 9 { Some(n as u8) } else { None }
@@ -7782,6 +7965,7 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
     ui.modal_button_rects.clear();
     ui.picker_button_rects.clear();
     ui.picker_row_rects.clear();
+    ui.scheduled_row_rects.clear();
     ui.form_field_rects.clear();
     ui.form_chip_rects.clear();
     ui.form_button_rects.clear();
@@ -7814,7 +7998,9 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
         }
     }
     if ui.mode == UiMode::ScheduledTasks {
-        render_scheduled_tasks(frame, ui);
+        let (button_rects, row_rects) = render_scheduled_tasks(frame, ui);
+        ui.modal_button_rects = button_rects;
+        ui.scheduled_row_rects = row_rects;
     }
     if ui.mode == UiMode::StarPrompt {
         ui.modal_button_rects = render_star_prompt(frame);
@@ -8217,7 +8403,7 @@ fn global_bar_buttons(keybindings: &KeybindingConfig, has_pane_control: bool) ->
 /// selected card, so they're disabled (dimmed) when there are no cards —
 /// matching the keys' `total > 0` guard.
 fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) -> Vec<Button> {
-    vec![
+    let mut buttons = vec![
         Button::new(
             "Filter",
             button_shortcut_label(keybindings, KbAction::Filter),
@@ -8236,7 +8422,27 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
             Action::RequestConfigGen,
             has_cards,
         ),
-    ]
+    ];
+    // PRD #80 / PRD #127 finding #4: the `[Scheduled Tasks s]` open button is
+    // always shown — it opens the manager, which is itself how you CREATE the
+    // first schedule (its `[Add a]` action works on an empty list), so gating it
+    // on a non-empty schedule list would hide the only entry point. The label/
+    // shortcut are baked into `label` with an EMPTY shortcut on purpose: this
+    // button only ever appears once the bar has overflowed into shortcut-only
+    // mode (it cannot fit at full width), and an empty shortcut makes the
+    // shortcut-only fallback render `[Scheduled Tasks s]` rather than `[s]`, so
+    // the command stays identifiable and clickable. The notation is still
+    // config-derived so a remap of `open_scheduled_tasks` is reflected.
+    buttons.push(Button::new(
+        format!(
+            "Scheduled Tasks {}",
+            display_notation(keybindings, KbAction::OpenScheduledTasks)
+        ),
+        "",
+        Action::OpenScheduledTasks,
+        true,
+    ));
+    buttons
 }
 
 /// PRD #80 M2: render the persistent global button bar into `area` (one row)
@@ -8975,7 +9181,7 @@ fn render_help_overlay(
             ),
             "Approve / deny permission",
         ),
-        help_key_line("S", "Scheduled Tasks manager"),
+        help_key_line(&n(KbAction::OpenScheduledTasks), "Scheduled Tasks manager"),
         help_key_line(&n(KbAction::Help), "Toggle this help"),
     ];
 
@@ -9244,16 +9450,74 @@ fn new_pane_form_footer_hint(has_mode_field: bool, name_submits: bool) -> &'stat
     }
 }
 
+/// PRD #127 M3.3: clickable geometry returned by [`render_scheduled_tasks`] —
+/// the `[Add]`/`[Edit]`/`[Delete]`/`[Run now]` button rects (recorded in
+/// `UiState::modal_button_rects`) and the schedule row rects each paired with
+/// its index into `scheduled_tasks` (recorded in `UiState::scheduled_row_rects`).
+type ScheduledTasksClickTargets = (Vec<(Action, Rect)>, Vec<(usize, Rect)>);
+
 /// PRD #127 M3.3: render the "Scheduled Tasks" manager dialog — a
 /// read-only-plus-actions list of the configured schedules, each row showing
 /// name, status (live/idle/disabled), and next-fire. Shows a delete
 /// confirmation when armed.
-fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) {
+///
+/// PRD #127 finding #4 / PRD #80: the action line is now a row of clickable
+/// `[Add a] [Edit e] [Delete d] [Run now r]` buttons; returns their
+/// `(Action, Rect)` pairs to record in `UiState::modal_button_rects` for the
+/// mouse hit-test (empty while the delete confirmation is armed). The keyboard
+/// a/e/d/r/Enter still drive the same actions.
+///
+/// PRD #127 M3.3: also returns each schedule row's `(index, Rect)` to record in
+/// `UiState::scheduled_row_rects` so a click on a row re-selects it (keyboard
+/// parity for `j`/`k`); empty while the delete confirmation is armed.
+fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClickTargets {
     let area = frame.area();
+    // PRD #127: the modal width is capped (never grows with the schedule name) —
+    // a long name is handled by WRAPPING the delete confirmation onto more lines
+    // so the modal grows in HEIGHT and the message stays inside the border.
     let popup_width = 72.min(area.width.saturating_sub(4));
+    let inner_width = popup_width.saturating_sub(2) as usize;
+    // Confirmation text wraps within a 2-space left margin inside the inner width.
+    let confirm_text_width = inner_width.saturating_sub(2).max(1);
     let row_count = ui.scheduled_tasks.len().max(1) as u16;
-    // header + column-head + rows + blank + footer (+confirm) within borders.
-    let popup_height = (row_count + 7).min(area.height.saturating_sub(4));
+
+    // PRD #127: when the delete confirmation is armed, pre-wrap it so the
+    // variable-length schedule name lands on its own line(s) and the fixed
+    // trailer (`… (y/n)`) is never pushed past the border. Built up-front so the
+    // modal height can grow to fit the wrapped lines.
+    let confirm_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let confirm_lines: Vec<Line> = if ui.scheduled_delete_confirm {
+        let name = ui
+            .scheduled_tasks
+            .get(ui.scheduled_selected)
+            .map(|t| t.name.as_str())
+            .unwrap_or("");
+        let mut out: Vec<Line> = Vec::new();
+        for seg in [
+            format!("Delete schedule '{name}'?"),
+            "definition only — open tab kept. (y/n)".to_string(),
+        ] {
+            for wrapped in wrap_to_width(&seg, confirm_text_width) {
+                out.push(Line::styled(format!("  {wrapped}"), confirm_style));
+            }
+        }
+        out
+    } else {
+        Vec::new()
+    };
+
+    // Chrome inside the border: leading blank + column header + trailing blank +
+    // footer. The footer is the wrapped confirmation (≥1 line) when armed, else
+    // the button-placeholder row plus a dedicated `Esc close` hint row below it.
+    let footer_lines = if ui.scheduled_delete_confirm {
+        confirm_lines.len().max(1)
+    } else {
+        2
+    };
+    let chrome_lines = 3 + footer_lines;
+    let popup_height = (row_count + chrome_lines as u16 + 3).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -9262,10 +9526,8 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) {
 
     // PRD #127 N2: bound the rendered rows to what fits and scroll the selected
     // row into view, so a list taller than the viewport is fully reachable.
-    // Chrome inside the border: leading blank + column header + trailing blank
-    // + footer = 4 lines.
     let inner_height = popup_height.saturating_sub(2) as usize;
-    let max_visible_rows = inner_height.saturating_sub(4).max(1);
+    let max_visible_rows = inner_height.saturating_sub(chrome_lines).max(1);
     let (win_start, win_end) = visible_window(
         ui.scheduled_tasks.len(),
         ui.scheduled_selected,
@@ -9273,6 +9535,10 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) {
     );
 
     let mut lines: Vec<Line> = Vec::new();
+    // PRD #127 M3.3: collect each schedule row's clickable rect so the mouse
+    // can re-select a row (keyboard parity for `j`/`k`). Built alongside the
+    // rendered lines so the screen-row math stays in lock-step with the layout.
+    let mut row_rects: Vec<(usize, Rect)> = Vec::new();
     lines.push(Line::from(""));
 
     if ui.scheduled_tasks.is_empty() {
@@ -9322,29 +9588,45 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) {
             } else {
                 text_primary()
             };
+            // Screen row of this line: the Paragraph renders inside the border,
+            // so content line `n` sits at `popup_area.y + 1 + n`. Capture the
+            // rect (full inner width) before pushing.
+            let line_idx = lines.len();
+            row_rects.push((
+                i,
+                Rect {
+                    x: popup_area.x + 1,
+                    y: popup_area.y + 1 + line_idx as u16,
+                    width: popup_area.width.saturating_sub(2),
+                    height: 1,
+                },
+            ));
             lines.push(Line::styled(row, style));
         }
     }
 
     lines.push(Line::from(""));
-    if ui.scheduled_delete_confirm {
-        let name = ui
-            .scheduled_tasks
-            .get(ui.scheduled_selected)
-            .map(|t| t.name.as_str())
-            .unwrap_or("");
-        lines.push(Line::styled(
-            format!("  Delete schedule '{name}'? definition only — open tab kept. (y/n)"),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
+    // The footer is either the delete confirmation (no buttons) or a blank
+    // placeholder row that the clickable action buttons are overlaid onto after
+    // the Paragraph render (mirroring `render_quit_confirm`). The `Esc close`
+    // keyboard hint (Esc has no button) sits on its OWN row below the buttons so
+    // it never clips on narrow terminals — a Paragraph doesn't wrap, so padding
+    // it to the right of the buttons would push it past the border once the
+    // modal shrinks with the terminal width.
+    let button_row_index = if ui.scheduled_delete_confirm {
+        // Pre-wrapped above so a long name grows the modal in HEIGHT (name on its
+        // own line) instead of spilling the trailing `(y/n)` past the border.
+        lines.extend(confirm_lines);
+        None
     } else {
-        lines.push(Line::styled(
-            "  a add   e/Enter edit   d delete   r run-now   Esc close",
-            text_primary(),
-        ));
-    }
+        let idx = lines.len();
+        // Blank placeholder row overlaid with the action buttons below.
+        lines.push(Line::from(""));
+        // Dedicated keyboard-hint row, left-aligned like the list rows so it
+        // stays fully inside the border at any reasonable width.
+        lines.push(Line::styled("  Esc close", text_dim()));
+        Some(idx)
+    };
 
     // PRD #13: terminal-relative — no absolute background fill; the terminal's
     // own background shows through.
@@ -9354,6 +9636,44 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) {
         .border_style(Style::default().fg(Color::Cyan));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
+
+    // PRD #127 finding #4 + PRD #80: overlay the clickable action buttons on the
+    // footer row. [Edit]/[Delete]/[Run now] act on the selected row, so they're
+    // disabled (dimmed + inert) when the list is empty; [Add] is always
+    // actionable — mirroring the a / e-Enter / d / r keys.
+    let Some(row_idx) = button_row_index else {
+        // Delete confirmation is armed: no action buttons and no row-click
+        // re-selection — `y`/`n`/Esc are the only inputs.
+        return (Vec::new(), Vec::new());
+    };
+    let has_rows = !ui.scheduled_tasks.is_empty();
+    let run_now_action = ui
+        .scheduled_tasks
+        .get(ui.scheduled_selected)
+        .map(|t| Action::ScheduleRunNow(t.name.clone()))
+        .unwrap_or(Action::Continue);
+    // PRD #127: each button advertises its shortcut key alongside the label —
+    // `[Add a]` / `[Edit e]` / `[Delete d]` / `[Run now r]` — mirroring the
+    // `[Scheduled Tasks s]` button-bar button so a keyboard user can tell which
+    // key drives each action. These in-dialog keys are matched as literals in
+    // `handle_scheduled_tasks_key` (not remappable `KbAction`s), so the literal
+    // key is the shortcut.
+    let buttons = [
+        Button::new("Add", "a", Action::ScheduleAdd, true),
+        Button::new("Edit", "e", Action::ScheduleEdit, has_rows),
+        Button::new("Delete", "d", Action::ScheduleArmDelete, has_rows),
+        Button::new("Run now", "r", run_now_action, has_rows),
+    ];
+    let btn_row = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + 1 + row_idx as u16,
+        width: popup_area.width.saturating_sub(2),
+        height: 1,
+    };
+    (
+        render_modal_button_row(frame, &buttons, btn_row, 1),
+        row_rects,
+    )
 }
 
 /// PRD #127 N2: the `[start, end)` slice of `len` rows to render so `selected`
@@ -9371,6 +9691,56 @@ fn visible_window(len: usize, selected: usize, max_rows: usize) -> (usize, usize
         (selected + 1 - window).min(len - window)
     };
     (start, start + window)
+}
+
+/// Wrap `text` to at most `max_width` display columns, breaking on Unicode
+/// whitespace (via [`str::split_whitespace`]) and hard-splitting any single
+/// word longer than the width. Counts columns by `char` (matching
+/// [`truncate_cell`]). Returns at least one (possibly empty) line. PRD #127:
+/// keeps the Scheduled-Tasks delete confirmation inside the modal border
+/// regardless of schedule-name length.
+fn wrap_to_width(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_w = 0usize;
+    for word in text.split_whitespace() {
+        let word_w = word.chars().count();
+        // A word longer than the line is hard-split across as many lines as needed.
+        if word_w > max_width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_w = 0;
+            }
+            for ch in word.chars() {
+                if current_w == max_width {
+                    lines.push(std::mem::take(&mut current));
+                    current_w = 0;
+                }
+                current.push(ch);
+                current_w += 1;
+            }
+            continue;
+        }
+        let sep = usize::from(!current.is_empty());
+        if current_w + sep + word_w > max_width {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+            current_w = word_w;
+        } else {
+            if sep == 1 {
+                current.push(' ');
+            }
+            current.push_str(word);
+            current_w += sep + word_w;
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 /// Truncate a cell to `max` display chars, appending `…` when cut. Keeps the
@@ -9395,12 +9765,58 @@ type FormClickTargets = (
     Vec<(Action, Rect)>,
 );
 
+/// PRD #127 follow-up: lay out the new-pane Mode chip row, WRAPPING chips onto
+/// additional lines when the row would overflow the modal's inner width (rather
+/// than dropping the trailing chip). Given each chip's display width, the inner
+/// content width, and the x-offset of the first chip (one space after the
+/// `  Mode: ` label), returns one `(line, x_offset)` per chip — both relative to
+/// the chip area's top-left. The render loop adds the modal origin to place each
+/// chip (and its click rect) at its wrapped position, and the height calc uses
+/// `max line + 1` to reserve enough rows, so the two never disagree. A chip too
+/// wide for an empty line is placed (and later clipped) in place rather than
+/// looping forever.
+fn layout_mode_chips(chip_widths: &[u16], inner_width: u16, first_chip_x: u16) -> Vec<(u16, u16)> {
+    let mut out = Vec::with_capacity(chip_widths.len());
+    let mut cx = first_chip_x;
+    let mut line = 0u16;
+    let mut placed_on_line = 0u16;
+    for &w in chip_widths {
+        if cx.saturating_add(w) > inner_width && placed_on_line > 0 {
+            line += 1;
+            cx = first_chip_x;
+            placed_on_line = 0;
+        }
+        out.push((line, cx));
+        cx = cx.saturating_add(w).saturating_add(1); // chip + trailing space
+        placed_on_line += 1;
+    }
+    out
+}
+
 fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClickTargets {
     let area = frame.area();
     let popup_width = 56.min(area.width.saturating_sub(4));
-    // The mode field (when modes exist) or the tip line (when they don't)
-    // each need 2 extra rows.  Always reserve them.
-    let mode_extra: u16 = 2;
+    // PRD #127 follow-up: the Mode chip row WRAPS when its chips would overflow
+    // the modal's inner width, so its height is no longer fixed at one line.
+    // Lay the chips out up front (the wrap count depends only on the chip widths
+    // and the modal width, both known here) so the same layout drives both the
+    // reserved height below and the overlaid render later. `  Mode: ` is 8 cols;
+    // chips start one space after it.
+    let chip_label_w: u16 = 8; // "  Mode: "
+    let first_chip_x: u16 = chip_label_w + 1;
+    let chip_layout: Vec<(u16, u16)> = if form.has_mode_field {
+        let widths: Vec<u16> = (0..form.mode_option_count())
+            .map(|i| form.mode_option_name(i).chars().count() as u16 + 2) // [name]
+            .collect();
+        layout_mode_chips(&widths, popup_width.saturating_sub(2), first_chip_x)
+    } else {
+        Vec::new()
+    };
+    let mode_lines: u16 = chip_layout.iter().map(|(l, _)| l + 1).max().unwrap_or(1);
+    // The mode field (when modes exist) or the tip line (when they don't) needs
+    // its content line(s) plus one spacing row before the next field. The chip
+    // row grows by however many extra lines the wrap added.
+    let mode_extra: u16 = mode_lines + 1;
     // PRD #106: when the Command field is hidden (orchestration selected) the
     // form is two rows shorter — Command's label row plus its spacing row.
     let cmd_visible = form.command_visible();
@@ -9449,7 +9865,11 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     let mut mode_line_idx: Option<usize> = None;
     if form.has_mode_field {
         mode_line_idx = Some(lines.len());
-        lines.push(Line::from(""));
+        // Reserve one blank line per (possibly wrapped) chip row, plus a spacing
+        // line before the next field — matching the height reserved above.
+        for _ in 0..mode_lines {
+            lines.push(Line::from(""));
+        }
         lines.push(Line::from(""));
     } else {
         // No .dot-agent-deck.toml or no modes — show a contextual hint.
@@ -9466,7 +9886,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // hint (the first holds the chips, the second is spare).
     if form.has_mode_field && form.is_schedule_selected() {
         lines.push(Line::styled(
-            "           \u{21b3} authoring session \u{2014} writes a schedule, then done",
+            "           \u{21b3} authoring (one-off)",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::ITALIC),
@@ -9561,18 +9981,24 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     }
 
     // Mode chip row: render `  Mode: ` then one `[name]` chip per option, the
-    // selected one highlighted. Each chip records its own clickable rect.
+    // selected one highlighted. The chips WRAP onto additional lines when the
+    // row is wider than the modal (PRD #127 follow-up) — `chip_layout`, computed
+    // up front, gives each chip's `(line, x_offset)` so the trailing chip (e.g.
+    // `[schedule]`) is never dropped. Each chip records its own clickable rect at
+    // its wrapped screen position, so the mode-chip click hit-test still selects
+    // the right option on any line.
     let mut chip_rects: Vec<(usize, Rect)> = Vec::new();
     if let Some(mi) = mode_line_idx {
         let mode_y = line_y(mi);
-        // Whole row (off-chip clicks focus the Mode field).
+        // Whole chip area (off-chip clicks focus the Mode field) — spans every
+        // wrapped chip line.
         field_rects.push((
             FormField::Mode,
             Rect {
                 x: row_x,
                 y: mode_y,
                 width: row_width,
-                height: 1,
+                height: mode_lines,
             },
         ));
         let mode_label_style = if form.focused == FormField::Mode {
@@ -9586,40 +10012,35 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         let selected_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
         let chip_style = text_primary();
         let buf = frame.buffer_mut();
-        let mut cx = row_x;
-        let (after, _) = buf.set_span(
-            cx,
+        // The `  Mode: ` label sits on the first line; wrapped chips align under
+        // the first chip (`first_chip_x`), not under the label.
+        let _ = buf.set_span(
+            row_x,
             mode_y,
             &Span::styled("  Mode: ", mode_label_style),
-            inner_end.saturating_sub(cx),
+            inner_end.saturating_sub(row_x),
         );
-        cx = after;
-        for i in 0..form.mode_option_count() {
-            if cx >= inner_end {
-                break;
-            }
-            cx += 1; // space between chips
+        for (i, &(line_off, x_off)) in chip_layout.iter().enumerate() {
+            let cx = row_x + x_off;
+            let cy = mode_y + line_off;
             let chip = format!("[{}]", form.mode_option_name(i));
             let w = chip.chars().count() as u16;
-            if cx.saturating_add(w) > inner_end {
-                break;
-            }
             let style = if i == form.selection_index {
                 selected_style
             } else {
                 chip_style
             };
-            let (after, _) = buf.set_span(cx, mode_y, &Span::styled(chip, style), inner_end - cx);
+            let avail = inner_end.saturating_sub(cx);
+            let (_after, _) = buf.set_span(cx, cy, &Span::styled(chip, style), avail);
             chip_rects.push((
                 i,
                 Rect {
                     x: cx,
-                    y: mode_y,
-                    width: w,
+                    y: cy,
+                    width: w.min(avail),
                     height: 1,
                 },
             ));
-            cx = after;
         }
     }
 
@@ -10413,6 +10834,8 @@ pub fn render_button_bar_with_bindings_to_buffer(
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    // Seam renders the full global+context bar (including the always-on
+    // Scheduled Tasks button) so every remappable label is exercised.
     let ctx_buttons = dashboard_context_buttons(keybindings, true);
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     terminal
@@ -12292,6 +12715,7 @@ mod tests {
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
+            display_name: None,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -13731,6 +14155,7 @@ mod tests {
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
+            display_name: None,
         }
     }
 
@@ -13923,6 +14348,7 @@ mod tests {
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
+            display_name: None,
         };
 
         // Spacious: get all 3
@@ -13956,6 +14382,7 @@ mod tests {
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
+            display_name: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -13980,6 +14407,7 @@ mod tests {
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
+            display_name: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -14544,6 +14972,33 @@ mod tests {
         assert_eq!(visible_window(5, 0, 0), (0, 0));
     }
 
+    // PRD #127 — `wrap_to_width` keeps the delete confirmation inside the modal:
+    // whitespace wrapping, hard-splitting an over-long word, and the degenerate
+    // empty-text / zero-width inputs.
+    #[test]
+    fn wrap_to_width_whitespace_split_and_edges() {
+        // Whitespace wrap: words are packed up to the width, then broken.
+        assert_eq!(
+            wrap_to_width("aa bb cc dd", 5),
+            vec!["aa bb".to_string(), "cc dd".to_string()],
+        );
+        // A single word longer than the width is hard-split across lines.
+        assert_eq!(
+            wrap_to_width("abcdefg", 3),
+            vec!["abc".to_string(), "def".to_string(), "g".to_string()],
+        );
+        // A long word after a short one: the short word flushes first, then the
+        // long word hard-splits.
+        assert_eq!(
+            wrap_to_width("hi abcdef", 3),
+            vec!["hi".to_string(), "abc".to_string(), "def".to_string()],
+        );
+        // Empty text still yields exactly one (empty) line.
+        assert_eq!(wrap_to_width("", 5), vec![String::new()]);
+        // Zero width is degenerate: one empty line regardless of input.
+        assert_eq!(wrap_to_width("anything here", 0), vec![String::new()]);
+    }
+
     // PRD #127 N2 — the manager dialog stays OPEN after run-now and after a
     // confirmed delete, so the user can act on multiple rows (the action is
     // dispatched by the main loop, which refreshes the list in place).
@@ -14618,6 +15073,58 @@ mod tests {
             "seed must require confirm-before-write"
         );
         assert!(f.selected_orchestration().is_none());
+    }
+
+    // PRD #127 Part 4 — a blank Command on the "schedule" authoring option must
+    // default to the conversational agent (SCHEDULE_AUTHORING_AGENT), never a
+    // bare $SHELL, for BOTH submit doors: the [Submit] button path (which calls
+    // `build_new_pane_request` directly) and the Enter-on-final-field key path.
+    #[test]
+    fn schedule_blank_command_defaults_to_agent_both_doors() {
+        // Door 1: the [Submit] button path calls build_new_pane_request directly.
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(), // blank command
+            vec![],
+            vec![],
+        );
+        f.select_next_mode(); // index 0 -> 1 = the built-in "schedule" option
+        assert!(f.is_schedule_selected());
+        let req = build_new_pane_request(&f);
+        assert_eq!(
+            req.command, SCHEDULE_AUTHORING_AGENT,
+            "[Submit] door must default a blank schedule command to the agent, not $SHELL"
+        );
+        assert!(
+            req.seed_prompt.is_some(),
+            "authoring seed prompt is carried"
+        );
+
+        // Door 2: the Enter-on-final-field key path.
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(), // blank command
+            vec![],
+            vec![],
+        ));
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // select the schedule option
+        assert!(ui.new_pane_form.as_ref().unwrap().is_schedule_selected());
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        handle_new_pane_form_key(enter, &mut ui); // Name -> Command
+        let result = handle_new_pane_form_key(enter, &mut ui); // submit
+        match result {
+            Action::SpawnPane(req) => assert_eq!(
+                req.command, SCHEDULE_AUTHORING_AGENT,
+                "Enter door must default a blank schedule command to the agent, not $SHELL"
+            ),
+            other => panic!("expected SpawnPane, got {other:?}"),
+        }
     }
 
     #[test]

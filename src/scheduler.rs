@@ -180,11 +180,55 @@ pub struct TaskHandle {
     pub name: String,
 }
 
+/// The fire-affecting fields of a scheduled task, retained on the registered
+/// task so a reload can detect when ANY of them changed — not just the cron.
+/// The live callback ([`crate::daemon`]'s `make_schedule_callback`) CLONES
+/// these values into the `SpawnRequest` it captures, so a prompt-only edit that
+/// the diff misses would keep firing the prompt captured at first registration
+/// (PRD #127 stale-prompt bug). Comparing the whole struct forces a callback
+/// rebuild on any change. `cron` is kept un-normalized so the comparison
+/// matches the value written in `schedules.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FireFields {
+    cron: String,
+    working_dir: String,
+    command: Option<String>,
+    prompt: String,
+    new_tab_per_fire: bool,
+}
+
+impl FireFields {
+    /// All fire-affecting fields of a freshly-loaded config entry.
+    fn from_task(task: &ScheduledTask) -> Self {
+        Self {
+            cron: task.cron.clone(),
+            working_dir: task.working_dir.clone(),
+            command: task.command.clone(),
+            prompt: task.prompt.clone(),
+            new_tab_per_fire: task.new_tab_per_fire,
+        }
+    }
+
+    /// Cron-only fields, for [`Scheduler::register`] (test/non-config callers
+    /// that carry a cron but no full [`ScheduledTask`]). The remaining fields
+    /// default to empty, so a later config-driven reload of the same name
+    /// always reads as changed and re-registers — the safe direction.
+    fn from_cron(cron_expr: &str) -> Self {
+        Self {
+            cron: cron_expr.to_string(),
+            working_dir: String::new(),
+            command: None,
+            prompt: String::new(),
+            new_tab_per_fire: false,
+        }
+    }
+}
+
 struct RegisteredTask {
     name: String,
-    /// Original (un-normalized) cron expression, retained so reload-apply can
-    /// detect a changed schedule without re-deriving it.
-    cron_expr: String,
+    /// All fire-affecting fields (incl. the un-normalized cron), retained so
+    /// reload-apply can detect ANY change without re-deriving it.
+    fire_fields: FireFields,
     schedule: CronSchedule,
     callback: Callback,
     /// Skip-if-prior-run-still-active flag. Set when a fire starts, cleared
@@ -205,7 +249,8 @@ pub struct ReloadDiff {
     pub added: Vec<String>,
     /// Task names removed (no longer in the config, or now disabled).
     pub removed: Vec<String>,
-    /// Task names whose cron expression changed (re-registered in place).
+    /// Task names whose fire-affecting config changed — cron, prompt,
+    /// working_dir, command, or new_tab_per_fire (re-registered in place).
     pub updated: Vec<String>,
 }
 
@@ -248,7 +293,7 @@ impl Scheduler {
         callback: Callback,
     ) -> Result<TaskHandle, SchedulerError> {
         let name = name.into();
-        let task = Arc::new(self.build_task(&name, cron_expr, callback)?);
+        let task = Arc::new(self.build_task(&name, FireFields::from_cron(cron_expr), callback)?);
         self.tasks
             .lock()
             .expect("scheduler task map poisoned")
@@ -259,13 +304,13 @@ impl Scheduler {
     fn build_task(
         &self,
         name: &str,
-        cron_expr: &str,
+        fire_fields: FireFields,
         callback: Callback,
     ) -> Result<RegisteredTask, SchedulerError> {
-        let schedule = parse_cron(cron_expr)?;
+        let schedule = parse_cron(&fire_fields.cron)?;
         Ok(RegisteredTask {
             name: name.to_string(),
-            cron_expr: cron_expr.to_string(),
+            fire_fields,
             schedule,
             callback,
             running: Arc::new(AtomicBool::new(false)),
@@ -421,10 +466,16 @@ impl Scheduler {
             diff.removed.push(name);
         }
 
-        // Add new tasks and re-register ones whose cron changed.
+        // Add new tasks and re-register ones whose fire-affecting config
+        // changed. The guard compares ALL fire-affecting fields (cron, prompt,
+        // working_dir, command, new_tab_per_fire), not just the cron — a
+        // prompt-only edit must rebuild the callback so the next fire delivers
+        // the new prompt rather than the value captured at first registration
+        // (PRD #127 stale-prompt bug).
         for task in desired_enabled {
+            let fire_fields = FireFields::from_task(task);
             match tasks.get(&task.name) {
-                Some(existing) if existing.cron_expr == task.cron => {
+                Some(existing) if existing.fire_fields == fire_fields => {
                     // Unchanged: keep the live task (preserves its running flag).
                 }
                 existing => {
@@ -434,7 +485,7 @@ impl Scheduler {
                     // the next tick fires it again → a brief double-fire.
                     let preserved_running = existing.map(|e| e.running.clone());
                     let is_update = preserved_running.is_some();
-                    match self.build_task(&task.name, &task.cron, make_callback(task)) {
+                    match self.build_task(&task.name, fire_fields, make_callback(task)) {
                         Ok(mut built) => {
                             if let Some(running) = preserved_running {
                                 built.running = running;

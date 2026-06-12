@@ -50,6 +50,20 @@ pub struct UpdateArgs {
 /// Append a new task. Errors if the cron is malformed or a task with the same
 /// name already exists (use `update` to change one).
 pub fn add(tasks: &mut Vec<ScheduledTask>, args: AddArgs) -> Result<(), String> {
+    // PRD #127 follow-up (USER DECISION): a scheduled task's `command` is now
+    // REQUIRED — there is no silent `$SHELL` fallback, because a bare shell
+    // can't act on the scheduled prompt. `schedule update` deliberately does
+    // NOT re-require it (a stored task already has one).
+    match &args.command {
+        Some(cmd) if !cmd.trim().is_empty() => {}
+        _ => {
+            return Err(
+                "--command is required: a scheduled task needs an agent command \
+                 (e.g. claude) to act on its prompt"
+                    .to_string(),
+            );
+        }
+    }
     validate_cron(&args.cron).map_err(|e| format!("invalid cron expression: {e}"))?;
     if tasks.iter().any(|t| t.name == args.name) {
         return Err(format!(
@@ -244,10 +258,34 @@ mod tests {
             name: name.to_string(),
             cron: cron.to_string(),
             working_dir: "/tmp".to_string(),
-            command: None,
+            // `command` is now required (PRD #127 follow-up); the helper supplies
+            // one so the other cases exercise the field they care about.
+            command: Some("claude".to_string()),
             prompt: "hi".to_string(),
             new_tab_per_fire: false,
             enabled: true,
+        }
+    }
+
+    // PRD #127 follow-up — `add` REQUIRES a non-empty `command`. A missing or
+    // blank command is rejected with an error that names `--command` and says it
+    // is required (so the CLI surfaces the contract), and no task is appended.
+    #[test]
+    fn add_requires_non_empty_command() {
+        for bad in [None, Some(String::new()), Some("   ".to_string())] {
+            let mut tasks = Vec::new();
+            let mut args = sample_add("needs-command", "0 9 * * *");
+            args.command = bad.clone();
+            let err = add(&mut tasks, args).unwrap_err();
+            let lowered = err.to_lowercase();
+            assert!(
+                lowered.contains("command") && lowered.contains("required"),
+                "error must name --command as required, got: {err} (for {bad:?})"
+            );
+            assert!(
+                tasks.is_empty(),
+                "no task should be added when command is missing/blank"
+            );
         }
     }
 

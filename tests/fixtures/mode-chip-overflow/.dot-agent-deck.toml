@@ -1,0 +1,24 @@
+# Fixture for the new-pane Mode-chip-row overflow test (PRD #127 follow-up).
+#
+# Defines one workload mode (`build`) PLUS one orchestration (`ci-deployment`)
+# so the new-deck dialog's Mode field renders a long chip row:
+#
+#   Mode: [No mode] [build] [Orch: ci-deployment] [schedule]
+#
+# At the harness's pinned 120-col PTY the modal is capped at width 56 (≈54
+# inner columns), so the chip row is wider than the modal: everything up to the
+# `[Orch: ci-deployment]` chip fits, but the trailing built-in `[schedule]`
+# chip overflows the inner width and is clipped at the right border. The
+# orchestration name length is chosen to land the overflow squarely on the
+# trailing `[schedule]` chip.
+
+[[modes]]
+name = "build"
+
+[[orchestrations]]
+name = "ci-deployment"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude"
+start = true

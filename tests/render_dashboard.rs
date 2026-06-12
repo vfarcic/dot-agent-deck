@@ -87,6 +87,7 @@ fn pane_004_card_title_row() {
         first_prompts: vec!["fix the login bug".to_string()],
         pane_id: Some("pane-1".to_string()),
         agent_id: Some("1".to_string()),
+        display_name: None,
     };
     // 80-cell-wide buffer triggers the layout's "wide" branch
     // (inline stats row). The height comes from the density tier
@@ -199,6 +200,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         first_prompts: Vec::new(),
         pane_id: None,
         agent_id: None,
+        display_name: None,
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
@@ -372,6 +374,7 @@ fn pane_005_highlight_follows_selected_session_id() {
         first_prompts: vec!["do the thing".to_string()],
         pane_id: Some(pane.to_string()),
         agent_id: Some(name.to_string()),
+        display_name: None,
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
     let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");

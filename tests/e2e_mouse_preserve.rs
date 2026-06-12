@@ -60,7 +60,11 @@ fn preserve_001_existing_pane_mouse_behavior_intact() {
     //    observe link-open in the harness.
     //  - Child-app mouse forwarding (mouse_mode_enabled): needs a child TUI
     //    that enables mouse mode; `sleep` does not.
+    // PRD #127: 200 cols so the Normal-mode bar (reached after detach) renders
+    // the FULL `[New Pane Ctrl+N]` label; at 120 it collapses to chips once the
+    // always-shown Scheduled Tasks button is included.
     let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
         .with_continue_session("realpane", "sleep 600")
         .launch_with_fixture("minimal");
     // --continue auto-focuses the restored pane → PaneInput, shown by the
@@ -99,7 +103,12 @@ fn preserve_001_existing_pane_mouse_behavior_intact() {
 #[spec("mouse/preserve/002")]
 #[test]
 fn preserve_002_button_short_circuits_miss_falls_through() {
-    let deck = TuiDeck::launch_with_fixture("minimal");
+    // PRD #127: 200 cols so the bar renders the FULL `[New Pane Ctrl+N]` label;
+    // at 120 it collapses to chips once the always-shown Scheduled Tasks button
+    // is included.
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
     send_session_start(&deck, "alpha", "pane-alpha", "/tmp");
     deck.wait_for_string("alpha");
@@ -144,7 +153,11 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
 /// consumed rather than leaking behind.
 #[test]
 fn preserve_modal_click_miss_is_consumed() {
+    // PRD #127: 200 cols so the Normal-mode bar (reached after detach) renders
+    // the FULL `[New Pane Ctrl+N]` label; at 120 it collapses to chips once the
+    // always-shown Scheduled Tasks button is included.
     let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
         .with_continue_session("realpane", "sleep 600")
         .launch_with_fixture("minimal");
     // --continue auto-focuses the restored pane (PaneInput). Detach to the
@@ -194,7 +207,13 @@ fn preserve_modal_click_miss_is_consumed() {
 /// not run in the fast tier.)
 #[test]
 fn preserve_disabled_button_is_inert() {
-    let deck = TuiDeck::launch_with_fixture("minimal");
+    // PRD #127: 200 cols so the dashboard bar renders the FULL (dimmed)
+    // `[Generate g]` label; at 120 the bar collapses to a `[g]` chip once the
+    // always-shown Scheduled Tasks button is included, and the labeled lookup
+    // would miss.
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
 
     // The dashboard bar renders [Generate g] dimmed (no cards → disabled).

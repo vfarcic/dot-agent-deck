@@ -1852,6 +1852,14 @@ pub fn spawn_daemon_serve_with_env(
     // them.
     env.push(("DOT_AGENT_DECK_EXIT_WHEN_ORPHANED".into(), "1".into()));
     env.push(("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS".into(), "300".into()));
+    // PRD #127: the scheduler spawn primitive gates a fresh fire's prompt
+    // delivery on the spawned agent's `SessionStart` (readiness), falling back
+    // after a timeout for commands that emit no hook (bare `cat`, the recorder
+    // scripts these tests use). Shrink that fallback from the production 10s so
+    // the no-hook delivery tests don't race their ~10s observation windows;
+    // 5000ms stays comfortably above spawn/005's 2s "not yet delivered" window
+    // and below every 10s delivery window. A test may override via `extra_env`.
+    env.push(("DOT_AGENT_DECK_SESSION_START_WAIT_MS".into(), "5000".into()));
     for (k, v) in extra_env {
         env.push(((*k).to_string(), (*v).to_string()));
     }

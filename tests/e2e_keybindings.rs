@@ -253,3 +253,52 @@ fn fallback_001_malformed_config() {
     // this times out.
     deck.wait_for_stream_string("keybindings");
 }
+
+/// Scenario: Seed a global `schedules.toml` (one enabled task, `kbsopen`) via
+/// `DOT_AGENT_DECK_SCHEDULES`, launch against the `minimal` fixture, and from
+/// the empty dashboard press the DEFAULT lowercase `s`. The "Scheduled Tasks"
+/// manager dialog must open — proving the dialog open-shortcut is routed
+/// through the keybinding registry with a case-insensitive default (lowercase
+/// `s` as well as `S`, like the registry's `t`/`T` and `l`/`L` pairs), rather
+/// than the hardcoded uppercase-only `Shift+S`. We confirm the dialog (not
+/// merely a button-bar label) opened by waiting for the seeded task name
+/// `kbsopen`, which renders only inside the dialog's list. RED today: the
+/// open-shortcut bypasses the registry and is uppercase-only, so lowercase `s`
+/// is a no-op and the dialog never opens.
+#[spec("keybindings/scheduler/001")]
+#[test]
+fn scheduler_001_lowercase_s_opens_manager() {
+    // PRD #127 finding #4 (RED): the manager dialog open-shortcut is a
+    // hardcoded `KeyCode::Char('S')` that bypasses the KbAction registry, so it
+    // is uppercase-only and not remappable. The fix routes it through the
+    // registry with a default that accepts lowercase `s` (case-insensitive,
+    // keeping `S`). This test drops NO keybindings.toml — it asserts the
+    // *default* binding accepts lowercase `s`.
+    let dir = tempfile::tempdir().expect("scratch tempdir");
+    let sched_path = dir.path().join("schedules.toml");
+    std::fs::write(
+        &sched_path,
+        "[[scheduled_tasks]]\n\
+         name = \"kbsopen\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"kbsopen prompt\"\n\
+         enabled = true\n",
+    )
+    .expect("write fixture schedules.toml");
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    // Default lowercase `s` in dashboard command mode.
+    deck.send_keys(b"s");
+
+    // The dialog lists the seeded task by name; `kbsopen` is unique to the
+    // dialog's list (never the button bar), so its appearance proves the
+    // manager dialog opened from the lowercase `s` press.
+    deck.wait_for_string("kbsopen");
+    drop(dir);
+}

@@ -55,7 +55,11 @@ fn dashboard_001_click_selects_double_click_focuses() {
     // `realpane` runs a plain long-lived command → a real, focusable PTY
     // pane (no agent credentials needed) so the double-click→focus enters
     // PaneInput.
+    // PRD #127: 200 cols so the Normal-mode bar renders the FULL labeled set
+    // (`[New Pane Ctrl+N]`); at the default 120 it collapses to chips once the
+    // always-shown Scheduled Tasks button is included.
     let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
         .with_continue_session("realpane", "sleep 600")
         .launch_with_fixture("minimal");
     // --continue auto-focuses the single restored pane (PaneInput → the bottom
@@ -92,7 +96,13 @@ fn dashboard_001_click_selects_double_click_focuses() {
 #[spec("mouse/dashboard/002")]
 #[test]
 fn dashboard_002_filter_rename_generate_buttons() {
-    let deck = TuiDeck::launch_with_fixture("minimal");
+    // PRD #127: 200 cols so the dashboard bar renders the FULL labeled context
+    // buttons (`[Filter /]`, `[Rename r]`, `[Generate g]`) and the labeled
+    // global `[New Pane Ctrl+N]`; at the default 120 the bar collapses to
+    // shortcut-only chips once the always-shown Scheduled Tasks button is added.
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
     send_session_start(&deck, "alpha", "pane-alpha", "/tmp");
     deck.wait_for_string("alpha");

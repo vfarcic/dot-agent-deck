@@ -8,7 +8,8 @@ use tracing::warn;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
-    AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType, WorkDoneSignal,
+    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
+    WorkDoneSignal,
 };
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
@@ -29,7 +30,8 @@ const MAX_FIRST_PROMPTS: usize = 3;
 /// Agents that never emit `SessionStart` (e.g. `cat -u` in tests, or
 /// agent runtimes without dot-agent-deck's hooks installed) still get
 /// their prompt — just delayed by `SESSION_START_WAIT_TIMEOUT`.
-const SESSION_START_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const SESSION_START_WAIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -79,6 +81,14 @@ pub struct SessionState {
     /// (opencode crash/reload — reuse) from "different agent entirely"
     /// (PRD #92 F9 clear=true respawn — new session card).
     pub agent_id: Option<String>,
+    /// PRD #127 finding #2: a human-friendly card title carried on the
+    /// live-surface `SessionStart` (the schedule's task name, via
+    /// [`crate::event::DISPLAY_NAME_METADATA_KEY`]). The dashboard prefers
+    /// `ui.display_names` (populated by hydration/rename) and falls back to
+    /// this when the attached TUI has no display-name entry for the pane —
+    /// the live scheduler-spawn case, where the name would otherwise degrade
+    /// to the truncated pane id. `None` for ordinary hook-driven sessions.
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -208,7 +218,11 @@ fn lookup_orchestration_role(
 /// the baseline `process_pending_dispatches` semantics — but it's
 /// returned so future telemetry / tracing can distinguish "fast path"
 /// from "fallback".
-async fn wait_for_session_start(
+///
+/// PRD #127: also reused by the scheduler spawn primitive
+/// ([`crate::spawn::spawn`]) to gate a freshly-spawned scheduled card's
+/// prompt delivery on the same readiness signal — hence `pub(crate)`.
+pub(crate) async fn wait_for_session_start(
     rx: &mut broadcast::Receiver<BroadcastMsg>,
     pane_id: &str,
     agent_id: &str,
@@ -559,6 +573,7 @@ impl AppState {
                 first_prompts: Vec::new(),
                 pane_id: Some(pane_id),
                 agent_id,
+                display_name: None,
             },
         );
     }
@@ -860,6 +875,16 @@ impl AppState {
         // not recoverable. The pinned shape lives in the regression
         // test `pre_f9_hook_with_no_agent_id_does_not_wipe_tagged_session`
         // below.
+        //
+        // PRD #127 finding #2: the `display_name` lives on the session, not
+        // the pane, so retiring the superseded session would drop the
+        // friendly title — e.g. a scheduler's synthetic live-surface
+        // placeholder (`agent_id=None`, `display_name=<task name>`) replaced
+        // by the agent's real `SessionStart` (a distinct `Some(agent_id)`, no
+        // display_name metadata). Capture the retired session's friendly name,
+        // keyed by the stable pane, so the replacement created below can
+        // inherit it when the superseding event carries none.
+        let mut inherited_display_name: Option<String> = None;
         if event.event_type == EventType::SessionStart
             && event.agent_id.is_some()
             && let Some(ref pane_id) = event.pane_id
@@ -875,7 +900,12 @@ impl AppState {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in to_remove {
-                self.sessions.remove(&id);
+                if let Some(removed) = self.sessions.remove(&id) {
+                    // First non-empty friendly name on this pane wins.
+                    if inherited_display_name.is_none() {
+                        inherited_display_name = removed.display_name;
+                    }
+                }
             }
         }
 
@@ -935,9 +965,28 @@ impl AppState {
                 first_prompts: Vec::new(),
                 pane_id: event.pane_id.clone(),
                 agent_id: event.agent_id.clone(),
+                // PRD #127 finding #2: seed with the friendly name inherited
+                // from a session this event just superseded on the same pane
+                // (above). The event-metadata case is handled unconditionally
+                // by the refresh block below — which takes precedence — so we
+                // do NOT recompute it from metadata here (reviewer LOW-2: it
+                // was a redundant duplicate of that block).
+                display_name: inherited_display_name,
             });
 
         session.last_activity = event.timestamp;
+
+        // PRD #127 finding #2: a later event carrying the friendly-name
+        // metadata refreshes it (the synthetic live-surface `SessionStart`
+        // sets it; ordinary hooks omit the key and leave it untouched). This
+        // takes precedence over any name inherited from a superseded session.
+        if let Some(name) = event
+            .metadata
+            .get(DISPLAY_NAME_METADATA_KEY)
+            .filter(|n| !n.is_empty())
+        {
+            session.display_name = Some(name.clone());
+        }
 
         if session.agent_type == AgentType::None && event.agent_type != AgentType::None {
             session.agent_type = event.agent_type.clone();

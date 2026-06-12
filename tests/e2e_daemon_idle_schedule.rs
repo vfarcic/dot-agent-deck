@@ -19,6 +19,7 @@ const KEEPALIVE_SCHEDULE: &str = r#"
 name = "keepalive"
 cron = "0 9 * * *"
 working_dir = "/tmp"
+command = "cat"
 prompt = "keep the daemon alive between fires"
 enabled = true
 "#;

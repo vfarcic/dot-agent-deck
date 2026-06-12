@@ -12,15 +12,22 @@
 //!    [`load_config_for_dir`] helper (no reaching into config internals):
 //!    `[[orchestrations]]` present → open an orchestration tab and deliver the
 //!    prompt to the `orchestrator` role; absent → a single-agent card spawned
-//!    with the schedule's `command` (falling back to `$SHELL` exactly as the
-//!    new-deck dialog does — handled by [`AgentPtyRegistry::spawn_agent`] when
-//!    `command` is `None`).
+//!    with the schedule's `command`. For scheduled fires `command` is always
+//!    present — it is required and validated at config load time, so the
+//!    `$SHELL` fallback inside [`AgentPtyRegistry::spawn_agent`] (taken when
+//!    `command` is `None`) is unreachable from this path. That fallback is
+//!    retained in the spawn primitive purely for the new-deck dialog, which
+//!    still permits an omitted command.
 //! 3. **Reuses the existing spawn path** ([`AgentPtyRegistry::spawn_agent`]) and
-//!    delivers the prompt through the UNGATED
-//!    [`AgentPtyRegistry::write_to_pane_and_submit`] (payload + CR, routed by
-//!    `DOT_AGENT_DECK_PANE_ID`) after a short buffer delay — NOT gated on a
-//!    SessionStart "agent-ready" hook, so bare commands (a shell, `cat`) still
-//!    receive the prompt.
+//!    delivers the prompt through [`AgentPtyRegistry::write_to_pane_and_submit`]
+//!    (payload + CR, routed by `DOT_AGENT_DECK_PANE_ID`), GATED on the spawned
+//!    agent's readiness: the fire subscribes to the hook-event broadcast before
+//!    spawning and waits for a `SessionStart` matching the pane's `pane_id` +
+//!    registry `agent_id` before writing, mirroring the daemon delegate path
+//!    ([`crate::state::dispatch_one_owned`]). On a cold first fire this stops
+//!    the write from landing before the agent is listening. Commands that emit
+//!    no pre-input `SessionStart` (a shell, `cat`, OpenCode) fall through on a
+//!    bounded timeout and still receive the prompt.
 //!
 //! Tab reuse / `new_tab_per_fire` / mid-interaction deliver-on-idle are Phase
 //! 2B; [`SpawnRequest`] carries the task `name` so 2B can key a reuse registry
@@ -34,15 +41,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::sync::broadcast;
+
 use crate::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership, command_needs_shell_wrap,
 };
+use crate::event::{AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, EventType};
 use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestration_name};
 use crate::scheduler::{Notifier, NotifyEvent};
 
-/// Buffer delay between spawning the PTY and writing the prompt, so the child
-/// and the registry's pump reader are wired before bytes flow. Deliberately a
-/// fixed delay, NOT a SessionStart gate (bare commands have no hook).
+/// Fallback buffer delay between spawning the PTY and writing the prompt, used
+/// ONLY when [`deliver`] has no hook-event broadcast to gate on (a direct
+/// caller without an event bus). The normal scheduler path instead waits for a
+/// `SessionStart` readiness signal (see [`deliver`]); this fixed delay just
+/// gives the child + the registry's pump reader time to wire up before bytes
+/// flow.
 const DELIVER_BUFFER_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Prefix every scheduler-spawned pane's `DOT_AGENT_DECK_PANE_ID` carries
@@ -204,6 +217,7 @@ pub async fn spawn(
     req: SpawnRequest,
     registry: &AgentPtyRegistry,
     notifier: &dyn Notifier,
+    event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
 ) -> Result<SpawnHandle, SpawnError> {
     // 1. mkdir -p the working_dir; fail loud via the notifier.
     let dir = Path::new(&req.working_dir);
@@ -234,6 +248,11 @@ pub async fn spawn(
             // daemon's `$SHELL` (mirrors the new-deck dialog) — in neither case
             // do we pin (or leak) a SHELL override.
             let pin_sh = command.as_deref().is_some_and(command_needs_shell_wrap);
+            // PRD #127 readiness gate: SUBSCRIBE before spawning so a
+            // fast-booting agent's `SessionStart` can't land on the broadcast
+            // before our receiver attaches (mirrors
+            // `state.rs::dispatch_one_owned`'s subscribe-before-respawn).
+            let event_rx = event_tx.map(|tx| tx.subscribe());
             let id = spawn_one(
                 registry,
                 command.as_deref(),
@@ -244,7 +263,24 @@ pub async fn spawn(
                 pin_sh,
                 notifier,
             )?;
-            deliver(registry, &pane_id, &req.prompt).await;
+            // PRD #127 finding #2: surface this single-agent card LIVE to any
+            // already-attached TUI (the daemon otherwise only hydrates its
+            // agents at TUI startup). Reuses the existing hook-event broadcast
+            // — no new broadcast variant. Orchestration fires are intentionally
+            // NOT surfaced this way: a proper orchestration tab is rebuilt by
+            // the TUI's hydration/partition path, which a flat SessionStart
+            // can't reconstruct, and live multi-orchestration surfacing is the
+            // #140 session-partitioning concern.
+            if let Some(tx) = event_tx {
+                surface_spawned_pane(
+                    tx,
+                    &pane_id,
+                    &req.working_dir,
+                    command.as_deref(),
+                    &req.task_name,
+                );
+            }
+            deliver(registry, &pane_id, &id, event_rx, &req.prompt).await;
             Ok(SpawnHandle {
                 task_name: req.task_name,
                 kind: SpawnKind::SingleAgent,
@@ -260,6 +296,10 @@ pub async fn spawn(
         SpawnTarget::Orchestration { name, roles } => {
             let orch_idx = orchestrator_role_index(&roles);
             let mut agents = Vec::with_capacity(roles.len());
+            // PRD #127 readiness gate: SUBSCRIBE before any pane is spawned so
+            // the orchestrator pane's `SessionStart` can't be missed regardless
+            // of spawn order (the orchestrator role is not necessarily first).
+            let event_rx = event_tx.map(|tx| tx.subscribe());
             for role in &roles {
                 let pane_id = next_pane_id(&req.task_name, Some(role.role_index));
                 let membership = TabMembership::Orchestration {
@@ -285,9 +325,18 @@ pub async fn spawn(
                     role_name: Some(role.role_name.clone()),
                 });
             }
-            // Deliver the prompt to the orchestrator role pane.
+            // Deliver the prompt to the orchestrator role pane, gated on that
+            // pane's readiness (its registry agent_id is the gate's match key).
             let delivery_pane_id = agents[orch_idx].pane_id.clone();
-            deliver(registry, &delivery_pane_id, &req.prompt).await;
+            let delivery_agent_id = agents[orch_idx].id.clone();
+            deliver(
+                registry,
+                &delivery_pane_id,
+                &delivery_agent_id,
+                event_rx,
+                &req.prompt,
+            )
+            .await;
             Ok(SpawnHandle {
                 task_name: req.task_name,
                 kind: SpawnKind::Orchestration { name },
@@ -321,7 +370,15 @@ fn spawn_one(
         cols: 80,
         env: pane_env(pane_id, pin_sh),
         tab_membership: membership,
-        agent_type: None,
+        // PRD #127 finding #4: tag the daemon-side registry entry with the
+        // agent type inferred from the command (e.g. `claude` → `ClaudeCode`),
+        // matching what `surface_spawned_pane` puts on the live card and what
+        // TUI-spawned panes register (see `tab.rs`). Without this the daemon
+        // stored `None`, so a scheduled card showed e.g. `claude` while live
+        // but reverted to "No agent" after a reconnect rebuilt it from
+        // `list_agents`. `from_command` returns `None` for bare commands, the
+        // same legacy placeholder behavior.
+        agent_type: AgentType::from_command(command),
     };
     registry.spawn_agent(opts).map_err(|e| {
         notifier.notify(NotifyEvent::SpawnFailed {
@@ -345,14 +402,112 @@ fn pane_env(pane_id: &str, pin_sh: bool) -> Vec<(String, String)> {
     env
 }
 
-/// Deliver the prompt into the pane via the ungated write-and-submit path after
-/// a short buffer delay. Delivery failure is logged, not fatal — the tab is
-/// already open.
-async fn deliver(registry: &AgentPtyRegistry, pane_id: &str, prompt: &str) {
-    tokio::time::sleep(DELIVER_BUFFER_DELAY).await;
+/// How long [`deliver`] waits for the spawned agent's `SessionStart` before
+/// falling through and writing the prompt anyway. Defaults to the daemon-wide
+/// [`crate::state::SESSION_START_WAIT_TIMEOUT`] (10s, matching the delegate
+/// path); overridable via `DOT_AGENT_DECK_SESSION_START_WAIT_MS` (milliseconds)
+/// so the e2e scheduler harness can shrink the no-hook fallback without a real
+/// 10s wait. Mirrors the [`reuse_debounce`] override idiom.
+fn session_start_wait_timeout() -> Duration {
+    std::env::var("DOT_AGENT_DECK_SESSION_START_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(crate::state::SESSION_START_WAIT_TIMEOUT)
+}
+
+/// Deliver the prompt into a freshly-spawned pane, gated on the agent's
+/// readiness. Delivery failure is logged, not fatal — the tab is already open.
+///
+/// PRD #127 readiness-gate fix: on a cold first fire the old flat
+/// [`DELIVER_BUFFER_DELAY`] write could land before the agent was listening, so
+/// the prompt was dropped on the floor. This mirrors the daemon delegate path
+/// ([`crate::state::dispatch_one_owned`]): the caller has already SUBSCRIBED to
+/// the hook-event broadcast *before* spawning (so a fast-booting agent's
+/// `SessionStart` can't be missed), and here we WAIT for a `SessionStart`
+/// matching this pane's `pane_id` AND the registry `agent_id` before writing,
+/// up to [`SESSION_START_WAIT_TIMEOUT`]. Commands that emit no pre-input
+/// `SessionStart` (bare `cat`, OpenCode) fall through on the timeout and are
+/// delivered anyway — exactly the fallback the delegate/respawn path uses.
+///
+/// `event_rx == None` (a direct caller with no event bus) preserves the legacy
+/// short fixed buffer delay so the child + pump reader are wired before bytes
+/// flow.
+async fn deliver(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    agent_id: &str,
+    event_rx: Option<broadcast::Receiver<BroadcastMsg>>,
+    prompt: &str,
+) {
+    match event_rx {
+        Some(mut rx) => {
+            let timeout = session_start_wait_timeout();
+            let observed =
+                crate::state::wait_for_session_start(&mut rx, pane_id, agent_id, timeout).await;
+            if !observed {
+                tracing::debug!(
+                    pane_id,
+                    timeout_ms = timeout.as_millis(),
+                    "scheduled spawn: SessionStart wait timed out; \
+                     delivering prompt via fallback path"
+                );
+            }
+        }
+        None => tokio::time::sleep(DELIVER_BUFFER_DELAY).await,
+    }
     if let Err(e) = registry.write_to_pane_and_submit(pane_id, prompt).await {
         tracing::warn!(pane_id, error = %e, "scheduled prompt delivery failed");
     }
+}
+
+/// PRD #127 finding #2: surface a freshly-spawned single-agent scheduled pane
+/// to any ALREADY-ATTACHED TUI by publishing a synthetic `SessionStart`
+/// through the daemon's EXISTING hook-event broadcast — the same channel a
+/// real agent's `SessionStart` hook rides. Reusing that fan-out (rather than
+/// adding a new broadcast variant) brings bare commands (a shell, `cat`) that
+/// emit no hook of their own to card-surfacing parity with hook-emitting
+/// agents: before this, a scheduler fire registered an agent in the daemon
+/// that an attached dashboard never painted, because the TUI only hydrates
+/// daemon agents at startup.
+///
+/// `agent_id` is deliberately `None`: a later real `SessionStart` hook from
+/// the spawned agent (carrying the daemon registry id) then SUPERSEDES this
+/// placeholder via `AppState::apply_event`'s retire-on-agent-id-mismatch path,
+/// instead of leaving a duplicate card beside it. `cwd` is the spawn target so
+/// the dashboard renders the card with the working-dir basename. Delivery is
+/// best-effort: `send` errs only when there are no subscribers (no TUI
+/// attached), which is the expected standalone-daemon case.
+///
+/// PRD #127 finding #2 followup: `task_name` rides on the event's
+/// [`DISPLAY_NAME_METADATA_KEY`] so the attached TUI titles the live card with
+/// the schedule's friendly name. Without it the card fell back to the
+/// truncated pane id (`sched-<name>-<n>`'s 11-char prefix). The daemon already
+/// stores this name as the registry `display_name`, so a reconnect titled the
+/// card correctly; this brings the live path to parity.
+fn surface_spawned_pane(
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    pane_id: &str,
+    cwd: &str,
+    command: Option<&str>,
+    task_name: &str,
+) {
+    let mut metadata = HashMap::new();
+    metadata.insert(DISPLAY_NAME_METADATA_KEY.to_string(), task_name.to_string());
+    let event = AgentEvent {
+        session_id: pane_id.to_string(),
+        agent_type: AgentType::from_command(command).unwrap_or(AgentType::None),
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: Some(cwd.to_string()),
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata,
+        pane_id: Some(pane_id.to_string()),
+        agent_id: None,
+    };
+    let _ = event_tx.send(BroadcastMsg::Event(event));
 }
 
 /// A fresh, valid `DOT_AGENT_DECK_PANE_ID` for a spawned pane. Sanitizes the
@@ -516,6 +671,7 @@ pub async fn spawn_or_reuse(
     reuse: &ReuseRegistry,
     notifier: &dyn Notifier,
     debounce: Duration,
+    event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
 ) -> Result<(), SpawnError> {
     // Snapshot the reuse decision under the lock (don't hold it across awaits).
     let decision = {
@@ -539,7 +695,7 @@ pub async fn spawn_or_reuse(
         }
         ReuseDecision::SpawnFresh => {
             let task_name = req.task_name.clone();
-            let handle = spawn(req, registry, notifier).await?;
+            let handle = spawn(req, registry, notifier, event_tx).await?;
             // Record the tab for reuse only when the task opts into reuse.
             if !new_tab_per_fire {
                 let entry = ReuseEntry {
@@ -863,6 +1019,46 @@ mod tests {
         // multi-word (pin_sh=true) → pane-id + the SHELL wrapper override.
         let env = pane_env("sched-x-1", true);
         assert!(env.iter().any(|(k, v)| k == "SHELL" && v == "/bin/sh"));
+    }
+
+    // finding #2 — the synthetic SessionStart surfaced to attached TUIs is a
+    // SessionStart for the spawned pane, rooted at the spawn cwd, with
+    // `agent_id == None` so a later real hook supersedes (not duplicates) it,
+    // and carrying the schedule's friendly name so the live card titles itself
+    // with the name rather than the truncated pane id.
+    #[test]
+    fn surface_spawned_pane_emits_session_start_for_attached_tuis() {
+        let (tx, mut rx) = broadcast::channel(8);
+        surface_spawned_pane(
+            &tx,
+            "sched-morning-digest-0",
+            "/tmp/scratch/runbox",
+            Some("cat"),
+            "morning-digest",
+        );
+        let BroadcastMsg::Event(e) = rx.try_recv().expect("a broadcast must be queued");
+        assert_eq!(e.event_type, EventType::SessionStart);
+        assert_eq!(e.pane_id.as_deref(), Some("sched-morning-digest-0"));
+        assert_eq!(e.cwd.as_deref(), Some("/tmp/scratch/runbox"));
+        assert!(
+            e.agent_id.is_none(),
+            "agent_id must be None so a real SessionStart hook supersedes the placeholder"
+        );
+        assert_eq!(
+            e.metadata
+                .get(DISPLAY_NAME_METADATA_KEY)
+                .map(String::as_str),
+            Some("morning-digest"),
+            "the friendly name must ride on the event so the live card titles itself with it"
+        );
+    }
+
+    #[test]
+    fn surface_spawned_pane_send_is_noop_without_subscribers() {
+        // The standalone-daemon case (no attached TUI): `send` errs, swallowed.
+        let (tx, rx) = broadcast::channel::<BroadcastMsg>(8);
+        drop(rx);
+        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, "x");
     }
 
     #[test]

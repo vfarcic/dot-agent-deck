@@ -64,7 +64,7 @@ These shortcuts work in **command mode**. If you're typing in an agent pane, pre
 | `/` | Filter sessions (opens filter input — see [Dialogs](#dialogs)) |
 | `r` | Rename selected session (opens rename input — see [Dialogs](#dialogs)) |
 | `g` | Generate `.dot-agent-deck.toml` (opens config-generation prompt — see [Dialogs](#dialogs)) |
-| `S` | Open the **Scheduled Tasks** manager (see [Scheduled Tasks](./scheduled-tasks.md)) |
+| `s` | Open the **Scheduled Tasks** manager (`S` also works) (see [Scheduled Tasks](./scheduled-tasks.md)) |
 | `?` | Toggle help overlay |
 | `y` / `n` | Approve / deny a pending permission request (only when an agent is waiting) |
 | `Esc` | Clear active filter |

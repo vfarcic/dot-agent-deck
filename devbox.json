@@ -12,7 +12,8 @@
     "rustc@1.94.1",
     "cargo@1.94.1",
     "clippy@1.94.1",
-    "rustfmt@1.94.1"
+    "rustfmt@1.94.1",
+    "path:gcloud#google-cloud-sdk"
   ],
   "shell": {
     "init_hook": [

@@ -419,8 +419,11 @@ pub struct ScheduledTask {
     /// (see [`expand_path`]); relative paths resolve against `$HOME`.
     pub working_dir: String,
     /// Single-agent command (mirrors the new-deck dialog); ignored when the
-    /// target dir defines `[[orchestrations]]`. Falls back to `$SHELL` when
-    /// omitted (resolved later, at spawn time).
+    /// target dir defines `[[orchestrations]]`. Required: a missing or blank
+    /// value is rejected at load time (see [`validate_task`]) — there is no
+    /// `$SHELL` fallback for scheduled tasks. Kept `Option` only so the file
+    /// shape round-trips and the absence can be reported as a load error rather
+    /// than a parse failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     /// The prompt delivered to the spawned agent / orchestrator role.
@@ -509,13 +512,18 @@ impl LoadedSchedules {
     /// single malformed `[[scheduled_tasks]]` entry is reported as an error and
     /// skipped without blocking the valid entries.
     pub fn parse(contents: &str) -> Self {
-        // Fast path: the whole file is well-formed.
+        // Fast path: the whole file is well-formed TOML. Each entry still has to
+        // clear the semantic check below (a command-less entry is rejected), so
+        // we validate per-entry even on this path rather than blindly collecting.
         if let Ok(file) = toml::from_str::<SchedulesFile>(contents) {
-            let tasks = file.scheduled_tasks.into_iter().map(expand_task).collect();
-            return Self {
-                tasks,
-                errors: Vec::new(),
-            };
+            let mut out = Self::default();
+            for (i, task) in file.scheduled_tasks.into_iter().enumerate() {
+                match validate_task(task, i) {
+                    Ok(task) => out.tasks.push(task),
+                    Err(err) => out.errors.push(err),
+                }
+            }
+            return out;
         }
 
         // Slow path: parse to a generic table, then deserialize each
@@ -548,7 +556,10 @@ impl LoadedSchedules {
 
         for (i, entry) in entries.iter().enumerate() {
             match entry.clone().try_into::<ScheduledTask>() {
-                Ok(task) => out.tasks.push(expand_task(task)),
+                Ok(task) => match validate_task(task, i) {
+                    Ok(task) => out.tasks.push(task),
+                    Err(err) => out.errors.push(err),
+                },
                 Err(err) => out.errors.push(ScheduleLoadError {
                     entry: Some(i),
                     message: err.to_string(),
@@ -556,6 +567,28 @@ impl LoadedSchedules {
             }
         }
         out
+    }
+}
+
+/// Validate a freshly-parsed task and apply load-time path expansion. A
+/// hand-edited entry with no (or blank) `command` is REJECTED here (PRD #127
+/// follow-up, USER DECISION): a scheduled task needs an agent command to act on
+/// its prompt, and there is no silent `$SHELL` fallback. Rejection mirrors the
+/// malformed-entry path — the error is surfaced via the daemon's notification
+/// seam (PRD #126) and the entry is skipped, without blocking valid siblings or
+/// crashing the daemon.
+fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, ScheduleLoadError> {
+    match &task.command {
+        Some(cmd) if !cmd.trim().is_empty() => Ok(expand_task(task)),
+        _ => Err(ScheduleLoadError {
+            entry: Some(index),
+            message: format!(
+                "scheduled task {:?} has no `command`; a command is required \
+                 (a scheduled task needs an agent command to act on its prompt — \
+                 there is no $SHELL fallback)",
+                task.name
+            ),
+        }),
     }
 }
 
@@ -1400,6 +1433,7 @@ timeout_secs = 600
 name = "good"
 cron = "0 9 * * *"
 working_dir = "/tmp/good"
+command = "claude"
 prompt = "do the thing"
 
 [[scheduled_tasks]]
@@ -1414,6 +1448,55 @@ working_dir = "/tmp/bad"
         assert_eq!(loaded.errors[0].entry, Some(1));
     }
 
+    // PRD #127 follow-up — a hand-edited entry with no `command` is REJECTED on
+    // load (no silent $SHELL fallback): it is reported as an error and skipped,
+    // while a sibling entry that DOES carry a command still loads. Mirrors the
+    // malformed-entry handling so the daemon never crashes on a bad entry.
+    #[test]
+    fn schedules_reject_command_less_entry_keep_valid() {
+        let toml_str = r#"
+[[scheduled_tasks]]
+name = "no-cmd"
+cron = "0 9 * * *"
+working_dir = "/tmp/no-cmd"
+prompt = "do the thing"
+
+[[scheduled_tasks]]
+name = "has-cmd"
+cron = "0 9 * * *"
+working_dir = "/tmp/has-cmd"
+command = "claude"
+prompt = "do the thing"
+"#;
+        let loaded = LoadedSchedules::parse(toml_str);
+        assert_eq!(
+            loaded.tasks.len(),
+            1,
+            "only the command-bearing entry loads"
+        );
+        assert_eq!(loaded.tasks[0].name, "has-cmd");
+        assert_eq!(loaded.errors.len(), 1, "the command-less entry is reported");
+        assert_eq!(loaded.errors[0].entry, Some(0));
+        assert!(
+            loaded.errors[0].message.to_lowercase().contains("command"),
+            "error must name the missing command, got: {}",
+            loaded.errors[0].message
+        );
+
+        // A blank (whitespace-only) command is rejected the same way.
+        let blank = r#"
+[[scheduled_tasks]]
+name = "blank-cmd"
+cron = "0 9 * * *"
+working_dir = "/tmp/blank-cmd"
+command = "   "
+prompt = "do the thing"
+"#;
+        let loaded = LoadedSchedules::parse(blank);
+        assert!(loaded.tasks.is_empty(), "a blank command is not a command");
+        assert_eq!(loaded.errors.len(), 1);
+    }
+
     #[test]
     fn schedules_missing_file_is_empty_not_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -1424,8 +1507,9 @@ working_dir = "/tmp/bad"
     }
 
     // scheduler/config/002 — a minimal entry applies the documented defaults
-    // (`new_tab_per_fire=false`, `enabled=true`, `command=None`) and `~`/`$VAR`
-    // in `working_dir` are expanded at load time.
+    // (`new_tab_per_fire=false`, `enabled=true`) and `~`/`$VAR` in `working_dir`
+    // are expanded at load time. `command` is required (PRD #127 follow-up) so
+    // each entry carries one.
     #[test]
     fn schedules_defaults_and_path_expansion() {
         let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1442,12 +1526,14 @@ working_dir = "/tmp/bad"
 name = "minimal"
 cron = "0 9 * * *"
 working_dir = "~/scheduled/morning"
+command = "claude"
 prompt = "hi"
 
 [[scheduled_tasks]]
 name = "with-var"
 cron = "0 9 * * *"
 working_dir = "$DAD_TEST_DIR"
+command = "claude"
 prompt = "hi"
 "#;
         let loaded = LoadedSchedules::parse(toml_str);
@@ -1457,7 +1543,7 @@ prompt = "hi"
         let minimal = &loaded.tasks[0];
         assert!(!minimal.new_tab_per_fire, "new_tab_per_fire defaults false");
         assert!(minimal.enabled, "enabled defaults true");
-        assert!(minimal.command.is_none(), "command defaults None");
+        assert_eq!(minimal.command.as_deref(), Some("claude"));
         assert_eq!(minimal.working_dir, "/home/tester/scheduled/morning");
 
         // Relative result (from $VAR) resolves against $HOME.

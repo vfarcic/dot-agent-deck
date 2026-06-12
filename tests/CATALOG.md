@@ -422,8 +422,22 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 ##### prompt/new-pane/007 — The new-deck dialog surfaces a built-in `schedule` authoring option, visually separated from the workload modes (PRD #127 M3.2).
 - **Layer:** L2 (re-sequenced from L1: the dialog renderer + `NewPaneFormState` are private and there is no public L1 render seam, so the real dialog is driven via PTY keystrokes and asserted on the rendered vt100 grid).
 - **Agent:** none (drives Ctrl+n → dir-picker → new-pane form, then cycles the Mode field).
-- **Asserts:** after cycling the Mode field to the end, the dialog shows a selectable `schedule` option AND an authoring-session affordance (an `authoring` label/section) marking it as a throwaway authoring session distinct from the workload modes.
-- **Does not assert:** the authoring seed-prompt delivery (covered by `tabs/mode/005`); the manager dialog's add/edit path (Phase 3B-ii); the exact separator glyphs.
+- **Asserts:** after cycling the Mode field to the end, the dialog's authoring-session affordance — the `↳`-marked hint that separates `schedule` from the workload modes — renders its FULL text (normalized for grid padding) as exactly `↳ authoring (one-off)` AND stays fully contained within the new-pane modal border (its tail is followed by padding before the right `│`, not clipped by it).
+- **Does not assert:** the authoring seed-prompt delivery (covered by `tabs/mode/005`); the manager dialog's add/edit path (Phase 3B-ii); the leading-pad width that aligns the hint under the mode chips.
+- **Platform coverage:** mac+linux.
+
+##### prompt/new-pane/008 — Submitting the built-in `schedule` authoring option opens a single-agent dashboard card, not a 50/50 mode tab (PRD #127 bug fix).
+- **Layer:** L2 (no public L1 render seam for the dialog or the post-submit layout — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid).
+- **Agent:** none (the schedule option's Command field is empty, so the spawn falls back to `$SHELL`; the card-vs-mode-tab layout renders independent of the agent).
+- **Asserts:** after cycling the Mode field to the `schedule` option and submitting, the rendered grid shows the dashboard-with-card layout — the dashboard's `dot-agent-deck — N session(s)` title is present (it renders only on the Dashboard tab) AND no `×` tab-close glyph appears — proving the authoring session stayed a single-agent card rather than opening as a separate 50/50 mode tab.
+- **Does not assert:** the authoring seed-prompt delivery (covered by `tabs/mode/005`); the exact mode-tab split geometry; the spawned agent's command behavior.
+- **Platform coverage:** mac+linux.
+
+##### prompt/new-pane/009 — The built-in `[schedule]` Mode chip stays fully visible inside the modal even when the chip row is wider than the modal (overflow regression guard).
+- **Layer:** L2 (no public L1 render seam for the dialog — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid).
+- **Agent:** none (drives Ctrl+n → dir-picker → new-pane form, then cycles the Mode field to the `schedule` option).
+- **Asserts:** with a fixture defining a workload mode (`build`) plus an orchestration (`ci-deployment`) — so the Mode chip row `  Mode: [No mode] [build] [Orch: ci-deployment] [schedule]` is wider than the capped modal — cycling to and selecting the trailing built-in `[schedule]` option leaves that `[schedule]` chip rendered FULLY between some row's modal borders (`│ … │`), not clipped at the right edge. Approach-agnostic: passes whether the renderer wraps the chip row or windows/scrolls the cycler, as long as the selected chip ends up visible inside the modal.
+- **Does not assert:** the exact layout used to keep the chip visible (wrap vs. window/scroll); the visibility of the non-selected chips when the row overflows; the authoring hint text (covered by `prompt/new-pane/007`).
 - **Platform coverage:** mac+linux.
 
 ### Focus / navigation
@@ -948,6 +962,15 @@ without depending on the config struct API.
 - **Does not assert:** button positions/ordering, the non-remappable `Quit` button label (fixed `Ctrl+C`), truncation behaviour at narrow widths.
 - **Platform coverage:** mac+linux+windows.
 
+#### keybindings/scheduler
+
+##### keybindings/scheduler/001 — The "Scheduled Tasks" dialog open-shortcut is registry-routed: the default lowercase `s` opens it, not uppercase-only `Shift+S` (PRD #127 finding #4).
+- **Layer:** L2.
+- **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`).
+- **Asserts:** with no `keybindings.toml`, pressing the DEFAULT lowercase `s` from the empty dashboard opens the "Scheduled Tasks" manager dialog (confirmed by the seeded task name appearing in the dialog list) — proving the open-shortcut is routed through the KbAction registry with a case-insensitive default (lowercase `s` as well as `S`, like the registry's `t`/`T` and `l`/`L` pairs) rather than the hardcoded uppercase-only `KeyCode::Char('S')`.
+- **Does not assert:** that `S` still works (covered by `scheduler/manager/*`); remappability of the open-shortcut to an arbitrary key; the dialog's list/action contents beyond the seeded task name.
+- **Platform coverage:** mac+linux.
+
 ### Error paths
 
 #### error/socket
@@ -1122,6 +1145,27 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** the rest of the new-pane flow (covered by `mouse/form/001`).
 - **Platform coverage:** mac+linux.
 
+##### mouse/buttonbar/004 — A Scheduled Tasks bar button is present and clicking it opens the manager dialog (PRD #127 finding #4 — mouse parity).
+- **Layer:** L2 (PTY end-to-end).
+- **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`).
+- **Asserts:** the bottom button bar renders a Scheduled Tasks button (label starting `[Scheduled …`); clicking it opens the "Scheduled Tasks" manager dialog (confirmed by the seeded task name appearing in the dialog list), the same outcome as the keyboard open-shortcut — proving click→action parity for the open-shortcut, like `[New Pane Ctrl+N]`.
+- **Does not assert:** the in-dialog action clicks (covered by `mouse/modal/001`); the exact button label/shortcut beyond the `[Scheduled` prefix; the bar's narrow-width degradation for the new button.
+- **Platform coverage:** mac+linux.
+
+##### mouse/buttonbar/005 — The Scheduled Tasks open button is shown on the dashboard even with ZERO schedules configured (fix/scheduler-single-agent-card — the manager is how you create the first one).
+- **Layer:** L1.
+- **Agent:** none (renders `dashboard_context_buttons` with `has_schedules = false`).
+- **Asserts:** at a comfortable 200-column width (so the full global+context bar fits and overflow is not in play), the bottom button bar renders a Scheduled Tasks open button (label starting `[Scheduled`) even though no schedules exist — because that button opens the manager, which is itself the way to CREATE the first schedule.
+- **Does not assert:** the exact label/shortcut beyond the `[Scheduled` prefix; click behavior (covered by `mouse/buttonbar/004`); the bar's narrow-width degradation.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/buttonbar/006 — At the default 120-col PTY width the FULL dashboard button set degrades to shortcut-only chips (PRD #127 — locks in the responsive collapse the L2 mouse specs widen past).
+- **Layer:** L1.
+- **Agent:** none (renders the full global + dashboard context bar, including the always-shown Scheduled Tasks button).
+- **Asserts:** at 120 cols (`DEFAULT_COLS`) the full set (~133 cells) overflows, so the bar shows the shortcut-only `[Ctrl+N]` chip and NOT the full `[New Pane Ctrl+N]` label, while the Scheduled Tasks button stays present and identifiable as `[Scheduled Tasks s]`.
+- **Does not assert:** the exact column widths; click behavior; the full-label rendering at roomy widths (covered by `mouse/buttonbar/001` / `005`).
+- **Platform coverage:** mac+linux+windows.
+
 #### mouse/tabstrip
 
 ##### mouse/tabstrip/001 — Clicking a tab header switches to that tab.
@@ -1158,9 +1202,9 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 
 ##### mouse/modal/001 — Modal dialog buttons fire their action like the keyboard.
 - **Layer:** L2.
-- **Agent:** none (synthetic card for config-gen).
-- **Asserts:** quit-confirm `[Cancel]` dismisses (app stays), config-gen `[Never]` sets the "Config prompt suppressed" status, help `[Close]` closes the overlay.
-- **Does not assert:** the destructive quit-confirm `[Detach]`/`[Stop]` (process-exit, keyboard-tested) or the star-prompt (not deterministically triggerable).
+- **Agent:** none (synthetic card for config-gen; fixture `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES` for the Scheduled Tasks manager).
+- **Asserts:** quit-confirm `[Cancel]` dismisses (app stays), config-gen `[Never]` sets the "Config prompt suppressed" status, help `[Close]` closes the overlay, and the "Scheduled Tasks" manager dialog's `[Delete]` button surfaces the definition-only delete-confirmation (`Delete schedule '<name>'?`) like pressing `d` (PRD #127 finding #4 — modal mouse parity).
+- **Does not assert:** the destructive quit-confirm `[Detach]`/`[Stop]` (process-exit, keyboard-tested) or the star-prompt (not deterministically triggerable); the manager dialog's other clickable actions — `[Add]`/`[Edit]`/`[Run now]` — which the coder must also wire (and whose click outcomes are deferred).
 - **Platform coverage:** mac+linux.
 
 ##### mouse/modal/002 — Each modal renders explicit buttons alongside its existing selection list / hint.
@@ -1264,6 +1308,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** persistence across an actual daemon restart (out of scope per PRD #127); the cron-firing behavior of the reloaded tasks.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/reload/002 — A prompt-ONLY edit (same name + cron, new `prompt`) followed by `ReloadSchedules` is honored on the next fire: the spawned agent receives the NEW prompt, not the value captured at first registration (PRD #127 finding).
+- **Layer:** L2.
+- **Agent:** none (rewrites the global `schedules.toml`, sends `ReloadSchedules`, then drives a run-now fire; observes `ListAgents` + the spawned single-agent card's PTY prompt echo).
+- **Asserts:** after registering a single-agent task with prompt `PROMPT_ALPHA`, rewriting the file to change ONLY the prompt to `PROMPT_BRAVO`, and reloading, a run-now fire spawns exactly one agent whose PTY echoes `PROMPT_BRAVO` and never the stale `PROMPT_ALPHA`.
+- **Does not assert:** cron-change reload behavior (covered by `scheduler/reload/001`); reuse vs new-tab semantics; the exact reload diff mechanism (black-box on delivered prompt only).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/cli
 
 ##### scheduler/cli/002 — `dot-agent-deck schedule add` from an arbitrary cwd writes the global `schedules.toml` and triggers a live daemon reload (PRD #127 M1.5).
@@ -1271,6 +1322,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (runs the `schedule` CLI subprocess against a live `daemon serve`).
 - **Asserts:** running `schedule add` from a directory that is not the global config dir writes the entry to the fixed global path (and not under the cwd), and the running daemon registers the new task via the add-triggered reload (probed via `schedule run-now`).
 - **Does not assert:** cron validation / rename rejection / atomic-write internals (covered by the pure-data `scheduler/cli/001` unit tests alongside the CLI).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/cli/003 — `dot-agent-deck schedule add` rejects a missing `--command` with a non-zero exit and a clear "command required" error (PRD #127 follow-up).
+- **Layer:** L2.
+- **Agent:** none (runs the `schedule` CLI subprocess against a live `daemon serve`).
+- **Asserts:** running `schedule add` with a complete, valid flag set (name/cron/working-dir/prompt/enabled) but no `--command` exits non-zero and prints a stderr error indicating that `--command` is required — so the writer no longer silently accepts a task that would fall back to a bare `$SHELL`.
+- **Does not assert:** the exact error wording (loose substring on "command" + "required"); validation of any other field; on-disk write effects.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/spawn
@@ -1287,13 +1345,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (run-now; observes `ListAgents` tab_membership + PTY prompt echo).
 - **Asserts:** the orchestration fire registers an agent tagged as the orchestration's `orchestrator` role and the prompt is echoed by its PTY; the plain fire registers a non-orchestration single-agent card and the prompt is echoed by its PTY.
 - **Does not assert:** orchestration role layout beyond the orchestrator slot; any LLM behavior (commands are plain `cat`).
+- **Note:** every task carries a `command` (required to LOAD even for orchestration targets, whose fire is driven by the target dir's role command — so the task `command` is ignored at fire time).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/spawn/003 — A fire with `command` set spawns that command; with `command` omitted it falls back to `$SHELL` (PRD #127 M2.1).
+##### scheduler/spawn/003 — A fire spawns the task's configured `command` (its on-disk marker appears) (PRD #127 M2.1; command-required follow-up).
 - **Layer:** L2.
-- **Agent:** none (run-now; observes on-disk marker side effects of each spawned command).
-- **Asserts:** a task with an explicit `command` runs that command (its marker file appears); a task with no `command` spawns the pinned `$SHELL` (its marker file appears).
-- **Does not assert:** prompt delivery for this case (covered by spawn/002 + spawn/004).
+- **Agent:** none (run-now; observes the on-disk marker side effect of the spawned command).
+- **Asserts:** a task with an explicit `command` runs that command (its marker file appears), proving the scheduler spawns the configured command itself.
+- **Does not assert:** any `$SHELL` fallback — `command` is now a required field, so there is no implicit-shell case (the former omitted-command fallback was removed); prompt delivery for this case (covered by spawn/002 + spawn/004).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/spawn/004 — A single fire calls spawn exactly once and delivers the configured prompt (no double-spawn, no missed delivery) (PRD #127 M2.3).
@@ -1301,6 +1360,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (run-now; observes registry agent count + PTY prompt echo).
 - **Asserts:** one run-now spawns exactly one agent (count stays at 1 across a short window) and the configured prompt is echoed by that agent's PTY.
 - **Does not assert:** tab-reuse vs `new_tab_per_fire` semantics (Phase 2B).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/spawn/005 — A scheduled single-agent fire does NOT deliver its prompt until the agent's `SessionStart` is observed; delivery is gated on readiness, not a flat 300ms timer (PRD #127 scheduled-prompt readiness bug).
+- **Layer:** L2.
+- **Agent:** none (run-now; observes PTY prompt echo + injects the agent's real `SessionStart` hook carrying the spawned pane's `pane_id` + registry `agent_id`).
+- **Asserts:** firing a `cat` task (no hook of its own) leaves the prompt UNDELIVERED for a window well past the old flat 300ms buffer while no matching `SessionStart` has been observed; once the real `SessionStart` hook (pane_id + agent_id) is injected, the prompt IS delivered (echoed by `cat`), well inside the 10s gate fallback so delivery is attributable to readiness, not the timeout.
+- **Does not assert:** the 10s fallback-on-timeout delivery path (a separate readiness facet); orchestration-tab delivery gating (covered structurally by spawn/002).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/reuse
@@ -1328,11 +1394,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 #### scheduler/manager
 
-##### scheduler/manager/001 — The "Scheduled Tasks" manager dialog lists schedules with a live/idle/disabled status indicator and a next-fire time (PRD #127 M3.3).
+##### scheduler/manager/001 — The "Scheduled Tasks" manager dialog lists schedules with a live/idle/disabled status indicator and a next-fire time, and its action buttons show their shortcut keys (PRD #127 M3.3).
 - **Layer:** L2 (no public L1 dialog render seam — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid). Opened with the `S` keybinding.
 - **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`).
-- **Asserts:** pressing `S` opens a "Scheduled Tasks" dialog listing the configured tasks; an enabled-but-not-live task shows an `idle` status; a disabled task shows the `disabled` indicator with a `—` next-fire placeholder.
-- **Does not assert:** the exact next-fire timestamp formatting for enabled tasks; live-status rendering when a reused tab exists.
+- **Asserts:** pressing `S` opens a "Scheduled Tasks" dialog listing the configured tasks; an enabled-but-not-live task shows an `idle` status; a disabled task shows the `disabled` indicator with a `—` next-fire placeholder; each action button advertises its keyboard shortcut alongside the label (`[Add a]` / `[Edit e]` / `[Delete d]` / `[Run now r]`), mirroring the `[Scheduled Tasks s]` button-bar button.
+- **Does not assert:** the exact next-fire timestamp formatting for enabled tasks; live-status rendering when a reused tab exists; the action buttons' click behavior (covered by `mouse/modal/001`).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/manager/002 — `a` (add) / `Enter`/`e` (edit) spawn the seeded authoring agent; edit pre-fills the row's current values (PRD #127 M3.3).
@@ -1353,6 +1419,50 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Layer:** L2 (same no-L1-seam reason). Drives the real dialog + observes the daemon registry.
 - **Asserts:** pressing `r` in the manager fires the selected task, which spawns its tab/agent (registered under the task's display name).
 - **Does not assert:** prompt delivery content (covered by `scheduler/spawn/004`); reuse vs new-tab on the fire.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/005 — The delete confirmation stays contained within the modal even for a long schedule name (PRD #127 finding).
+- **Layer:** L2 (same no-L1-seam reason). Drives the real dialog via `S` + `d` and asserts on the rendered vt100 grid.
+- **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`, one enabled task with a deliberately long name).
+- **Asserts:** after arming delete (`d`) on a long-named row, the confirmation's trailing `(y/n)` prompt — the only `(y/n)` in the app — still renders, proving the message is contained within the modal (wrapped, name on its own line) instead of overflowing the inner width and clipping the tail off the right border.
+- **Does not assert:** the exact wrap points / line count; the modal's precise capped width; the confirmation wording beyond the `(y/n)` tail and `Delete schedule` prefix.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/006 — Clicking a schedule row moves the selection to that row (PRD #127 finding — mouse parity).
+- **Layer:** L2 (same no-L1-seam reason). Drives the real dialog via `S`, then a left-click SGR mouse report on a row, asserting on the rendered vt100 grid.
+- **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`, two enabled tasks).
+- **Asserts:** with two rows (`alpha` auto-selected, `bravo` not), clicking the `bravo` row moves the `▶` selection marker to it (`▶ bravo` renders and `▶ alpha` is gone), proving a row click hit-tests and re-selects.
+- **Does not assert:** that the click also fires an action (it only selects); keyboard j/k navigation (the pre-existing selection path); scroll-into-view when the clicked row is off-window.
+- **Platform coverage:** mac+linux.
+
+#### scheduler/live
+
+##### scheduler/live/001 — A scheduled fire surfaces its card LIVE to an already-attached TUI, without a disconnect/reconnect (PRD #127 finding #2).
+- **Layer:** L2 (real TUI driven via PTY; observed on the rendered vt100 grid — the only surface where the bug shows, since the daemon registry holds the agent in both states). Fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`; fired with the `RunNow` control message over the deck's attach socket.
+- **Agent:** none (a plain `cat` command — no hooks — so the only path that could surface a card is a new-agent broadcast, not a hook event).
+- **Asserts:** after firing a `cat`-command schedule into the daemon the attached TUI is connected to, the agent is registered in the daemon (precondition), AND a card for it appears on the already-attached dashboard live (the task name renders) — no detach/reattach.
+- **Does not assert:** prompt delivery content; the card's status badge / body layout; behavior after a reconnect (which already masks the bug via startup hydration).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/live/002 — A scheduled (daemon-spawned) card survives being focused — focus re-hydrates it instead of deleting it (PRD #127 finding #2).
+- **Layer:** L2 (real TUI driven via PTY; observed on the rendered vt100 grid). Fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`; fired with `RunNow`. A `SessionStart` hook carrying the daemon-spawned agent's own `DOT_AGENT_DECK_PANE_ID` (read back from the registry) is injected to paint the card — faithfully mirroring what a real agent's hook does.
+- **Agent:** none (long-lived `cat`; the hook is injected by the harness with the agent's real pane id so the card is backed by a live daemon agent but not a local TUI pane — the orphan-card condition).
+- **Asserts:** the hook paints a card on the attached dashboard (precondition, holds in the broken state too), and pressing the `1` jump key to focus that card keeps it usable — the TUI enters PaneInput mode on the re-hydrated pane (the card is not deleted).
+- **Does not assert:** the exact pane contents after focus; the live-surfacing path for the non-hook case (covered by `scheduler/live/001`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/live/003 — A live-surfaced scheduled card's TITLE shows the schedule's friendly name, not the truncated spawn pane-id (PRD #127 finding #2 regression).
+- **Layer:** L2 (real TUI driven via PTY; observed on the rendered vt100 grid). Fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`; fired with the `RunNow` control message over the deck's attach socket. The schedule's `working_dir` basename (`runbox`) is deliberately unrelated to its name (`morning-digest`) so the friendly name can only reach the grid through the card title — not the Dir line.
+- **Agent:** none (a plain `cat` command — no hooks; the card surfaces via the new-agent broadcast as in `scheduler/live/001`).
+- **Asserts:** after a fire into the attached daemon, the agent is registered under its friendly name (precondition) and the card surfaces live (its Dir line shows the cwd basename), AND the card TITLE shows the friendly name `morning-digest` — matching a reconnect — and NOT the truncated spawn pane-id form (`… · sched-morni…`).
+- **Does not assert:** the surfacing path itself (covered by `scheduler/live/001`); focus survival (covered by `scheduler/live/002`); the title after a reconnect (which already masks the bug via startup hydration); the card's status badge / body layout.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/live/004 — A live-surfaced scheduled card's friendly TITLE SURVIVES being superseded by the agent's real `SessionStart` hook — it does not revert to the session-id hash (PRD #127 finding #2, hook-supersession gap).
+- **Layer:** L2 (real TUI driven via PTY; observed on the rendered vt100 grid). Fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`; fired with `RunNow`. The schedule's `working_dir` basename (`runbox`) is deliberately unrelated to its name (`morning-digest`) so the friendly name can only reach the grid through the card title. After the synthetic placeholder surfaces, a real `SessionStart` hook is injected carrying the spawned pane's pane id AND its spawn-injected registry agent id (both read back from the registry) and NO display_name metadata — faithfully reproducing what a hook-emitting claude/opencode agent emits.
+- **Agent:** none (a plain `cat` command; the synthetic placeholder surfaces via the new-agent broadcast as in `scheduler/live/001`, then the harness injects the agent's real `SessionStart` hook — a `Some(agent_id)` distinct from the placeholder's `None` — to drive the supersession the primary hook-emitting scheduler case hits).
+- **Asserts:** after the placeholder surfaces with the friendly title `morning-digest` and the real hook supersedes it (the "No agent" placeholder becomes a live ClaudeCode card), the card TITLE STILL shows `morning-digest` (matching a reconnect) and has NOT reverted to the session-id hash form (`… · 9f8e7d6c-5b…`).
+- **Does not assert:** the surfacing path itself (covered by `scheduler/live/001`); focus survival (covered by `scheduler/live/002`); the no-hook title case (covered by `scheduler/live/003`); the title after a reconnect (which already masks the bug via startup hydration); the card's status badge / body layout.
 - **Platform coverage:** mac+linux.
 
 

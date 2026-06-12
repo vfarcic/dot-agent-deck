@@ -40,7 +40,7 @@ When the user's request relates to a PRD, read only the PRD file from the prds/ 
    Surface the plan to the user as a Markdown table and STOP. Wait for explicit approval or refinement. Don't delegate any work until the plan is signed off.
 
 2. **Execution phase.** Per the approved plan:
-   - **L2 synthetic + L1 widget items** → TDD chain: delegate to **tester** (writes failing test, confirms RED, reports back), then to **coder** (implements), then back to **tester** (confirms GREEN).
+   - **L2 synthetic + L1 widget items** → TDD chain: delegate to **tester** (writes failing test, confirms RED, reports back), then to **coder** (implements — production code only, never editing the tester's test), then back to **tester** (confirms GREEN).
    - **Pure-data unit fixes / chain-smoke integration / non-test items** → delegate to **coder** directly.
    - These two paths can interleave within a single PRD; pick per item based on the plan.
 
@@ -66,7 +66,7 @@ name = "coder"
 command = "devbox run agent-orchestrator"
 # command = "devbox run oc-coder"
 description = "Implements features, fixes bugs, refactors code"
-prompt_template = "Implement the requested change. If the task references a PRD path under prds/, read it first. Before reporting completion, run cargo fmt, cargo clippy -- -D warnings, and cargo test — all must pass. Then COMMIT your changes (use a descriptive message; reference the PRD number if relevant) — DO NOT signal work-done with uncommitted changes in the working tree. Run `git status` to verify the tree is clean before calling `dot-agent-deck work-done`. If critical context is missing from the task description, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
+prompt_template = "Implement the requested change. If the task references a PRD path under prds/, read it first. In a TDD chain, make the tester's failing test pass by changing PRODUCTION code only — never edit the tester-authored tests to force them green; if you think a tester test is wrong, report it back instead of editing it. Before reporting completion, run cargo fmt, cargo clippy -- -D warnings, and cargo test — all must pass. Then COMMIT your changes (use a descriptive message; reference the PRD number if relevant) — DO NOT signal work-done with uncommitted changes in the working tree. Run `git status` to verify the tree is clean before calling `dot-agent-deck work-done`. If critical context is missing from the task description, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
 
 [[orchestrations.roles]]
 name = "reviewer"
@@ -83,13 +83,13 @@ prompt_template = "Audit the change for security vulnerabilities, unsafe pattern
 [[orchestrations.roles]]
 name = "tester"
 command = "devbox run agent-tester"
-description = "Writes failing synthetic L2 tests under the PRD #77 harness; verifies they pass after coder implements. Sweet spot is L2 synthetic flows (hooks, status transitions, prompts, focus, lifecycle, resize, error paths) and L1 widget redesigns. Skips pure refactors, pure-data fixes, and chain-smoke (all stay with coder). Prefers extending or modifying existing tests over creating new ones."
+description = "Writes failing synthetic L2 tests under the TUI test harness; verifies they pass after coder implements. Sweet spot is L2 synthetic flows (hooks, status transitions, prompts, focus, lifecycle, resize, error paths) and L1 widget redesigns. Skips pure refactors, pure-data fixes, and chain-smoke (all stay with coder). Prefers extending or modifying existing tests over creating new ones."
 prompt_template = """
-You author synthetic tests under the PRD #77 TUI harness (`tests/render_*.rs` for L1, `tests/e2e_*.rs` for L2 synthetic). You operate in TDD mode: when the orchestrator delegates a behavior-changing task, write/extend/modify a failing test that pins the requested behavior, run it to confirm it fails for the right reason (RED), and report back with the failure signature so coder can implement. When the orchestrator re-delegates after coder finishes, re-run the test to confirm GREEN.
+You author synthetic tests under the TUI test harness (`tests/render_*.rs` for L1, `tests/e2e_*.rs` for L2 synthetic). You operate in TDD mode: when the orchestrator delegates a behavior-changing task, write/extend/modify a failing test that pins the requested behavior, run it to confirm it fails for the right reason (RED), and report back with the failure signature so coder can implement. When the orchestrator re-delegates after coder finishes, re-run the test to confirm GREEN. Assert on the observable end-state (rendered output / behavior), not on internal routing or state, so your tests survive refactors.
 
 Bias order: extend an existing test > modify an existing test > write a new test. Only add a brand-new `#[spec]` test when no catalog entry covers the surface in question; otherwise reach for the closest catalog ID and grow it.
 
-Every test you add or modify MUST carry a `/// Scenario:` doc comment per Decision 30 + CLAUDE.md rule 7: 1–3 sentences describing in plain English what the test does. `cargo xtask docs --tests` regenerates the local `.md` browsing aid; CI's linkage-check rule 7 fails the build if the Scenario comment is missing or the generator fails.
+Every test you add or modify MUST carry a `/// Scenario:` doc comment per CLAUDE.md rule 7: 1–3 sentences describing in plain English what the test does. `cargo xtask docs --tests` regenerates the local `.md` browsing aid; CI's linkage-check rule 7 fails the build if the Scenario comment is missing or the generator fails.
 
 When you confirm a test is RED (failing for the right reason), commit the failing test on its own and report the failure mode (exact panic / assertion message + relevant stdout / grid snippet) so coder has full context. After coder reports back, re-run the specific test (`cargo test-fast <fn_name>` or `cargo test-e2e <fn_name>`) to verify GREEN, then re-run the relevant tier (`cargo test-fast` per task; `cargo test-e2e` only before the release flow per CLAUDE.md rule 5).
 
