@@ -1,6 +1,6 @@
 # PRD #113: Clear deck selection highlight when switching tabs
 
-**Status**: Planning
+**Status**: Implemented
 **Priority**: Medium
 **Created**: 2026-05-24
 **GitHub Issue**: [#113](https://github.com/vfarcic/dot-agent-deck/issues/113)
@@ -55,11 +55,11 @@ Mode tab side-pane behavior is unchanged.
 
 ## Milestones
 
-- [ ] **M1 — Selection becomes optional**: `UiState` carries an "inactive" state for the dashboard selection; renderer paints blue bg only when active. Default state on startup remains "active at index 0" (no behavior change on first launch).
-- [ ] **M2 — Tab switch clears highlight**: Tab / BackTab / Left / Right / `h` / `l` deactivate the selection. Switching back to the Dashboard shows no blue card until the user acts.
-- [ ] **M3 — Key handlers updated**: `j` → first + activate; `k` → last + activate; Enter → first when inactive, otherwise focuses highlighted card; `1`-`9` unchanged but explicitly activates the highlight.
-- [ ] **M4 — Focused-pane sync still works**: When the embedded controller's focused pane corresponds to a dashboard session, the highlight reactivates on that card.
-- [ ] **M5 — Tests pass**: Unit tests cover the inactive-on-tab-switch, jump-to-first/last, Enter-fallback, and 1-9 paths. Existing dashboard tests still pass.
+- [x] **M1 — Selection becomes optional**: `UiState` carries an "inactive" state for the dashboard selection; renderer paints blue bg only when active. Default state on startup remains "active at index 0" (no behavior change on first launch).
+- [x] **M2 — Tab switch clears highlight**: Tab / BackTab / Left / Right / `h` / `l` deactivate the selection. Switching back to the Dashboard shows no blue card until the user acts.
+- [x] **M3 — Key handlers updated**: `j` → first + activate; `k` → last + activate; Enter → first when inactive, otherwise focuses highlighted card; `1`-`9` unchanged but explicitly activates the highlight.
+- [x] **M4 — Focused-pane sync still works**: When the embedded controller's focused pane corresponds to a dashboard session, the highlight reactivates on that card.
+- [x] **M5 — Tests pass**: Unit tests cover the inactive-on-tab-switch, jump-to-first/last, Enter-fallback, and 1-9 paths. Existing dashboard tests still pass.
 
 ## Success Criteria
 

@@ -408,7 +408,9 @@ fn pane_005_highlight_follows_selected_session_id() {
     ];
     let buffer = render_dashboard_cards_to_buffer(
         &cards,
-        selected_index,
+        // PRD #113: the renderer now takes an active/inactive `Option<usize>`;
+        // `Some(idx)` paints the highlight on that card.
+        Some(selected_index),
         CardDensityKind::Normal,
         0, // animation tick
         80,

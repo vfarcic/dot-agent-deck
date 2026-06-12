@@ -85,26 +85,26 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 
 #### dashboard/selection
 
-##### dashboard/selection/001 — `j` / `Down` selects next card; wraps at end.
-- **Layer:** L2.
-- **Agent:** none (3 synthetic panes).
-- **Asserts:** selection indicator moves through cards in order and wraps to the first card after the last.
-- **Does not assert:** how the selection indicator is drawn beyond "present at card N".
-- **Platform coverage:** mac+linux.
+##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.
+- **Layer:** L1 (in-process `handle_normal_key` dispatch).
+- **Agent:** none (synthetic card count).
+- **Asserts:** starting active on card 0, `j` advances 0→1, `Down` advances 1→2, and `j` wraps 2→0; the selection stays active (`Some(idx)`) throughout.
+- **Does not assert:** how the highlight is drawn (covered by `dashboard/selection/010`); the inactive-start jump-to-first (`dashboard/selection/006`).
+- **Platform coverage:** mac+linux+windows.
 
-##### dashboard/selection/002 — `k` / `Up` selects previous card; wraps at start.
-- **Layer:** L2.
+##### dashboard/selection/002 — While the selection is active, `k` / `Up` selects the previous card and wraps at the start.
+- **Layer:** L1 (in-process `handle_normal_key` dispatch).
 - **Agent:** none.
-- **Asserts:** selection moves backwards and wraps from card 0 to the last card.
-- **Does not assert:** rendering of inactive cards.
-- **Platform coverage:** mac+linux.
+- **Asserts:** starting active on card 0, `k` wraps 0→2 and `Up` retreats 2→1; the selection stays active throughout.
+- **Does not assert:** the inactive-start jump-to-last (`dashboard/selection/007`).
+- **Platform coverage:** mac+linux+windows.
 
-##### dashboard/selection/003 — `1`–`9` jumps to card N and focuses its pane.
-- **Layer:** L2.
-- **Agent:** none.
-- **Asserts:** keystroke `3` (with 3+ cards) selects card index 2 and the corresponding agent pane gains the focus border.
+##### dashboard/selection/003 — `1`–`9` jumps to card N, focuses its pane, and activates the highlight — even when the selection was inactive.
+- **Layer:** L1 (in-process `focus_deck` dispatch).
+- **Agent:** none (3 synthetic sessions with pane ids).
+- **Asserts:** starting from an inactive selection, `focus_deck(1, …)` activates the highlight on index 1 (`Some(1)`), focuses that card's pane, and enters PaneInput mode.
 - **Does not assert:** what `0` or digits past the card count do (kept open until catalogued).
-- **Platform coverage:** mac+linux.
+- **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/selection/004 — `Esc` clears an active filter.
 - **Layer:** L2.
@@ -112,6 +112,62 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Asserts:** with the filter dialog populated, pressing `Esc` returns the visible cards to the unfiltered set.
 - **Does not assert:** filter dialog dismissal animation.
 - **Platform coverage:** mac+linux.
+
+##### dashboard/selection/005 — A tab switch away from the Dashboard and back clears the card highlight.
+- **Layer:** L1 (in-process `dispatch_action` tab-switch path + renderer).
+- **Agent:** none (a real second Mode tab; 3 synthetic dashboard cards).
+- **Asserts:** with the highlight active on card 2, driving `Action::CycleTabNext` then `Action::CycleTabPrev` leaves the dashboard selection inactive (`None`), and `render_dashboard_cards_to_buffer` paints no `▸` selection marker on any card.
+- **Does not assert:** the cyan focus border on embedded panes (unaffected); Mode/Orchestration tab side-pane focus (out of scope).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/006 — With the selection inactive, `j` jumps to the first card and activates the highlight.
+- **Layer:** L1 (in-process `handle_normal_key` dispatch).
+- **Agent:** none.
+- **Asserts:** from an inactive selection (`None`), `j` lands the highlight on the first card (`Some(0)`) and the selection becomes active.
+- **Does not assert:** the active-state next/wrap behaviour (`dashboard/selection/001`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/007 — With the selection inactive, `k` jumps to the last card and activates the highlight.
+- **Layer:** L1 (in-process `handle_normal_key` dispatch).
+- **Agent:** none.
+- **Asserts:** from an inactive selection (`None`) with 3 cards, `k` lands the highlight on the last card (`Some(2)`) and the selection becomes active.
+- **Does not assert:** the active-state prev/wrap behaviour (`dashboard/selection/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/008 — With the selection inactive, Enter focuses the first card.
+- **Layer:** L1 (in-process `handle_normal_key` + `dashboard_focus_target`).
+- **Agent:** none.
+- **Asserts:** Enter maps to `Action::Focus`; the focus target is the first card (index 0) when the selection is inactive, the highlighted card when active, and `None` when there are no cards.
+- **Does not assert:** the pane-focus side effect of `Action::Focus` itself (exercised by `dashboard/selection/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/009 — A focused dashboard pane reactivates the highlight on its card.
+- **Layer:** L1 (in-process `reconcile_dashboard_selection`).
+- **Agent:** none (3 synthetic `(session_id, pane_id)` pairs).
+- **Asserts:** from an inactive selection, reconciling with a focused pane that maps to card 1 activates the highlight on `Some(1)`; reconciling with no matching focused pane leaves the selection inactive.
+- **Does not assert:** how the focused pane id is obtained from the embedded controller (the per-frame `pane.focused_pane_id()` read).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/010 — Startup default: the dashboard is active on card 0 and paints its highlight.
+- **Layer:** L1 (in-process state + renderer).
+- **Agent:** none.
+- **Asserts:** a freshly-built `UiState` is active on card 0 (`Some(0)`); rendering with that selection paints the `▸` marker on the first card's title row, while rendering with an inactive selection (`None`) paints no marker.
+- **Does not assert:** the `Last: … Tools: …` card body (covered by `dashboard/pane/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/011 — Switching Dashboard → Orchestration → Dashboard leaves the selection inactive (SC1, any-other-tab path).
+- **Layer:** L1 (in-process `switch_tab_with_focus` + per-frame `reconcile_dashboard_selection`).
+- **Agent:** none (a real Orchestration tab; 3 synthetic dashboard cards).
+- **Asserts:** with the highlight armed on card 2, driving the real switch path to an Orchestration tab and back — running the real per-frame reconcile on each frame — leaves `selected_index == None`. Covers the path `selection/005` cannot (the Orchestration tab shares `selected_index` and its always-active reconcile re-arms `Some(0)` in transit, while deactivation fires only on Dashboard-leave).
+- **Does not assert:** Orchestration role-pane selection behaviour itself (covered by `tabs/selection/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/012 — An inactive selection makes the close-pane action a no-op (no fall back to card 0).
+- **Layer:** L1 (in-process `dispatch_action(Action::CloseSelected)`).
+- **Agent:** none (3 synthetic dashboard cards with pane ids).
+- **Asserts:** with `selected_index = None` (inactive, nothing armed), dispatching `Action::CloseSelected` issues no `close_pane` call and removes no session — it does NOT close card 0. Encodes the PRD invariant (inactive = nothing armed) alongside `dashboard/pane/003`.
+- **Does not assert:** the active-selection close behaviour, or mode/orchestration whole-tab teardown.
+- **Platform coverage:** mac+linux+windows.
 
 #### dashboard/filter
 
