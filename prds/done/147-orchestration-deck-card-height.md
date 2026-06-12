@@ -1,6 +1,7 @@
 # PRD #147: Right-size orchestration deck card height
 
-**Status**: Planning
+**Status**: Complete
+**Completed**: 2026-06-12
 **Priority**: Medium
 **Created**: 2026-06-12
 **GitHub Issue**: [#147](https://github.com/vfarcic/dot-agent-deck/issues/147)
@@ -60,23 +61,23 @@ Effects:
 ## Acceptance Criteria
 
 ### Height matches content
-- [ ] `CardDensity::card_height` returns Compact=5, Normal=8, Spacious=10 (wide) and 6 / 9 / 11 (narrow).
-- [ ] A rendered card has no trailing blank rows below its content at any tier (verified by L1 buffer inspection).
+- [x] `CardDensity::card_height` returns Compact=5, Normal=8, Spacious=10 (wide) and 6 / 9 / 11 (narrow).
+- [x] A rendered card has no trailing blank rows below its content at any tier (verified by L1 buffer inspection).
 
 ### Orchestration fit
-- [ ] With 7 decks in the single-column orchestration card area at a typical terminal height, all 7 cards render without scrolling.
-- [ ] Selecting/navigating past the last visible card still scrolls correctly when the deck count genuinely exceeds the now-tighter capacity.
+- [x] With 7 decks in the single-column orchestration card area at a typical terminal height, all 7 cards render without scrolling.
+- [x] Selecting/navigating past the last visible card still scrolls correctly when the deck count genuinely exceeds the now-tighter capacity.
 
 ### No regressions
-- [ ] Dashboard tab card grid (multi-column) renders correctly at the new heights.
-- [ ] `choose_density` still selects the largest tier that fits; its tier-boundary unit tests are updated for the new heights and pass.
-- [ ] L1 `insta` snapshots in `tests/render_dashboard.rs` are re-accepted at the new card heights.
+- [x] Dashboard tab card grid (multi-column) renders correctly at the new heights.
+- [x] `choose_density` still selects the largest tier that fits; its tier-boundary unit tests are updated for the new heights and pass.
+- [x] L1 `insta` snapshots in `tests/render_dashboard.rs` are re-accepted at the new card heights.
 
 ## Milestones
 
-- [ ] **M1 — Content-derived height.** Replace `CardDensity::card_height` magic numbers with the content-derived computation; confirm the six (tier × wide/narrow) values.
-- [ ] **M2 — Tests updated.** Update `test_choose_density_wide` / `test_choose_density_narrow` boundary assertions; add/adjust an L1 test asserting no trailing blank rows and that 7 decks fit; re-accept affected `insta` snapshots.
-- [ ] **M3 — Verified in the running TUI.** Launch the deck with 7 orchestration decks and confirm all fit with no empty rows (per `run-dot-agent-deck`).
+- [x] **M1 — Content-derived height.** Replace `CardDensity::card_height` magic numbers with the content-derived computation; confirm the six (tier × wide/narrow) values.
+- [x] **M2 — Tests updated.** Update `test_choose_density_wide` / `test_choose_density_narrow` boundary assertions; add/adjust an L1 test asserting no trailing blank rows and that 7 decks fit; re-accept affected `insta` snapshots.
+- [x] **M3 — Verified in the running TUI.** Launch the deck with 7 orchestration decks and confirm all fit with no empty rows (per `run-dot-agent-deck`).
 
 ## Out of Scope
 

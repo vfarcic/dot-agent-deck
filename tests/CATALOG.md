@@ -83,6 +83,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** card visual style beyond the rendered character buffer.
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/density/004 — A rendered card has no trailing blank rows below its content at any density tier (PRD #147).
+- **Layer:** L1 (ratatui `TestBackend`, buffer inspection).
+- **Agent:** none.
+- **Asserts:** a fully-populated session card (3 prompts + 3 tools) rendered at each tier's own `rendered_height` in an 80-column wide viewport has zero blank inner rows between its last content line and the bottom border on Compact, Normal, and Spacious — reserved card height equals rendered content height.
+- **Does not assert:** the exact `card_height` value per tier (covered by the `choose_density` unit tests); the mid-card blank separator line on Normal/Spacious (intentional content, not a trailing row).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — `j` / `Down` selects next card; wraps at end.
@@ -1045,6 +1052,15 @@ without depending on the config struct API.
 - **Asserts:** worker's pane gains an error line; no task is delivered to any role.
 - **Does not assert:** the daemon-side log entry.
 - **Platform coverage:** mac+linux.
+
+#### orchestration/layout
+
+##### orchestration/layout/001 — Seven decks fit the single-column orchestration card area without scrolling (PRD #147).
+- **Layer:** L1 (ratatui `TestBackend`, buffer inspection + capacity math via the public `rendered_height` seam).
+- **Agent:** none.
+- **Asserts:** in the ~34%-width single-column orchestration card area at a typical ~48-row card height, the renderer's `visible_rows = available / card_height` fits all 7 decks with no scrolling and the 7th deck actually renders in the visible slice; a much larger deck count (20) still engages scrolling, so right-sizing the card height does not remove the scroll fallback.
+- **Does not assert:** the full orchestration-tab frame (tab bar, side panes, stats bar); the `ORCHESTRATION_LEFT_PERCENT` width split or `grid_columns` thresholds (out of scope per PRD #147).
+- **Platform coverage:** mac+linux+windows.
 
 ### Session restore
 
