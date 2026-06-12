@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.28.0] - 2026-06-12
+
+### Added
+
+- **Scheduled Prompt Dispatch**
+  Schedule prompts to run on a cron and land in the deck automatically. Previously, every recurring agent task was a manual ritual: open a terminal at the right time, navigate to the right directory, paste the prompt, and wait. Now the deck's daemon fires the prompt on your behalf — whether you're watching or not.
+  Schedule any prompt with a standard five-field cron expression (`0 9 * * MON-FRI`) in a global config file at `~/.config/dot-agent-deck/schedules.toml`. Each entry specifies a working directory, the agent command, and the prompt to deliver. At fire time, the daemon reads the target directory's `.dot-agent-deck.toml`: if it defines an orchestration, the prompt goes to the orchestrator role; otherwise a single-agent card is opened. New working directories are created automatically. A reuse-by-default policy means repeated fires update the same tab rather than accumulating new ones; `new_tab_per_fire = true` opts into per-fire history when you need it.
+  Three ways to manage schedules: converse with a seeded agent via the new **"schedule" mode** in the new-deck dialog (best for crafting multi-line prompts and testing them live), use the `dot-agent-deck schedule add|update|remove|list|enable|disable|run-now|reload` CLI directly, or hand-edit the TOML and run `schedule reload`. A **Scheduled Tasks manager dialog** (press `S`) lists all schedules with their status and next-fire time, and lets you add, edit, delete, or run a task immediately without leaving the deck. The daemon stays alive between fires even with no active agents, so a daily task never silently misses its window because the daemon GC'd itself overnight.
+  See the [Scheduled Tasks guide](https://devopstoolkit.ai/docs/ui/scheduled-tasks) for the full config reference, authoring walkthrough, and daemon-supervision recipe for unattended (always-on) use.
+- **Customizable Keybindings**
+  All TUI keyboard shortcuts are now remappable via a TOML config file, resolving conflicts with terminal emulators that intercept keys like `Alt+n` or `Alt+w` and accommodating personal preferences, accessibility needs, and international keyboard layouts.
+  Create `~/.config/dot-agent-deck/keybindings.toml` (or point `$DOT_AGENT_DECK_KEYBINDINGS` at any path) and override only what you need—defaults apply for everything else. Global actions (`dashboard`, `new_pane`, `close_pane`, `toggle_layout`, `jump_1`–`jump_9`) and dashboard navigation keys (`move_down`, `move_up`, `filter`, `rename`, `help`, `approve_permission`, etc.) are all remappable. Empty a binding (`new_pane = ""`) to unbind it entirely. Conflicting assignments produce a warning on stderr and the first-defined binding wins. `Ctrl+C` always opens the quit flow and cannot be remapped. The help overlay (`?`) and hints bar update dynamically to reflect your active bindings.
+  See [docs/keyboard-shortcuts.md](docs/keyboard-shortcuts.md) for the full defaults table and configuration format.
+- **Mouse Parity for Keyboard Actions**
+  Every keyboard action in dot-agent-deck is now reachable by mouse click. Previously, users had to know the right keystroke for creating panes, switching tabs, dismissing modals, navigating the dashboard, picking directories, and filling out forms — the mouse worked only for click-to-focus and scrolling. Now every action has a visible, clickable affordance with its keyboard shortcut shown inline (e.g., `[New Pane Ctrl+N]`), making the UI self-documenting for mouse-first users while teaching keyboard shortcuts to those learning the key set.
+  A persistent global button bar at the bottom of every screen exposes New Pane, Close, Toggle Layout, Help, and Quit. The tab strip gains click-to-switch on all tabs (Dashboard, Mode, Orchestration) and a `[×]` close affordance on Mode and Orchestration tabs. Dashboard cards are now clickable (single-click to select, double-click to enter PaneInput), with explicit Filter, Rename, and Generate-config buttons alongside the existing keystrokes. Modal dialogs (quit-confirm, config-gen, star-prompt, help overlay) each gain clickable Yes/No/Cancel buttons that work alongside the existing keyboard selection flow. Inline-edit rows (filter, rename) expose Apply/Cancel buttons; PaneInput mode shows a `[Detach Ctrl+D]` affordance. The directory picker and new-pane form are fully clickable — rows, breadcrumbs, mode chips, and Submit/Cancel buttons.
+  All existing keyboard shortcuts and prior mouse behaviors (click-to-focus pane, scroll forwarding, text selection, Ctrl+click hyperlinks, child-app mouse pass-through) are preserved unchanged. Clicks are hit-tested against button regions first and fall through to existing pane logic on a miss. The `?` help overlay and docs have been updated to reflect the new button bar.
+  See the [dot-agent-deck documentation](https://devopstoolkit.ai/docs/ui) for the full keyboard/mouse reference.
+
+### Fixed
+
+- **Light Terminal Background Compatibility**
+  The dashboard is now readable on light terminal backgrounds (e.g., Solarized Light, macOS Terminal white). Previously the canvas, overlays, and prompt dialogs were painted with a hardcoded dark background — a black slab over a light theme — and neutral text used hardcoded `White`/`Gray` colors that were invisible or extremely low-contrast.
+  Every color the dashboard emits is now expressed in the terminal's own frame of reference, so it inherits whatever foreground and background the terminal is already using:
+  - Backgrounds are left unpainted (`Color::Reset`) so the terminal's own background shows through — no more black slab. This applies to the canvas, the tab bar, every overlay/prompt dialog, and the embedded terminal panes.
+  - Primary text uses the terminal's default foreground; secondary and muted text dim that same foreground rather than hardcoding a gray.
+  - Selection and active-tab highlights invert in place (`REVERSED`) instead of painting an absolute tint.
+  - Status and accent colors (Working, Error, Thinking, borders, badges) stay as named ANSI colors, which the terminal's theme already remaps.
+  Because styling is now terminal-relative, the previous OSC-11 background detection, the light/dark `ColorPalette`, and the `--theme` flag / `theme` config key are no longer needed and have been removed. Readability is pinned by structural L1 tests that assert no overlay or card paints an absolute `Color::Rgb` background and that selection highlights use `REVERSED`.
+- **Per-Tab Selection Memory**
+  Each tab now remembers its own deck card and pane focus independently, fixing a bug where switching tabs would overwrite or lose your selection in other tabs.
+  Previously, switching between Dashboard, Mode, and Orchestration tabs caused selections to bleed across tabs: whichever deck card or side pane was last focused anywhere in the app would appear selected when landing on any other tab. After a tab switch, keystrokes could silently reach a pane in a tab you were no longer viewing. The more tabs open, the more disorienting the behaviour.
+  Tab selection state is now keyed on stable IDs (session id for dashboard cards, pane id for Mode and Orchestration side panes) rather than positional indices, so selections survive filter changes, sort changes, session restarts, and reactive pane recreation. On every tab switch, the destination tab's remembered selection is restored—both the visual highlight and the actual keyboard focus. When a remembered session or pane no longer exists (session ended, pane closed), the tab falls back cleanly to the first available item rather than pointing at stale state.
+
+### Miscellaneous
+
+- **Test daemons no longer leak to PID 1 on abrupt exit**
+  The integration/E2E harness disables daemon idle-shutdown for determinism and only cleaned daemons up in `Drop`, which never runs on `SIGKILL` / panic-abort / nextest-timeout / `Ctrl-C`. Such daemons orphaned to `init` (PID 1) and kept running for hours after a test run died abruptly.
+  Two env-gated, test-only daemon self-defense nets now prevent this (both OFF by default, so detached/lazy-spawned production daemons are unaffected):
+  - `DOT_AGENT_DECK_EXIT_WHEN_ORPHANED` — the daemon captures its parent pid at startup and gracefully shuts down once it is orphaned (parent becomes PID 1 or otherwise changes).
+  - `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` — a hard backstop that self-exits after N seconds regardless, covering detached daemons the orphan watchdog can't help.
+  Harness `Drop` paths additionally reap the whole process group so a daemon's spawned agents go down with it. New L2 test `lifecycle/orphan-exit/001` proves an orphaned, idle-disabled daemon self-exits within seconds.
+
+
+
 ## [0.27.1] - 2026-06-06
 
 ### Fixed
