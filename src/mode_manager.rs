@@ -288,8 +288,10 @@ impl ModeManager {
         Ok(())
     }
 
-    /// Phase 2: Send commands to panes. Must be called after panes are resized
-    /// to correct display dimensions to avoid stale content artifacts.
+    /// Phase 2: Send commands to panes. PRD #84 M4/M5: panes are spawned at
+    /// their layout dims and reconciled to the exact inner area by the
+    /// per-frame `resize_panes_to_layout` pass, so commands started here run at
+    /// the correct PTY size without a manual post-spawn resize step.
     pub fn start_mode_commands(&mut self) -> Result<(), ModeManagerError> {
         let mode = self
             .active_mode

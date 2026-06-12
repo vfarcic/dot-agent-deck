@@ -438,7 +438,10 @@ impl TabManager {
     }
 
     /// Send pending commands to the active mode tab's panes.
-    /// Must be called after panes are resized to correct display dimensions.
+    /// PRD #84 M4/M5: panes are spawned at their layout dims and then reconciled
+    /// to the exact inner area by the per-frame `resize_panes_to_layout` pass —
+    /// there is no longer a manual post-spawn resize sweep to wait on, so
+    /// commands started here run at the correct PTY size.
     pub fn start_mode_commands(&mut self) -> Result<(), TabError> {
         if let Some(Tab::Mode { mode_manager, .. }) = self.tabs.get_mut(self.active_index) {
             mode_manager
@@ -461,8 +464,9 @@ impl TabManager {
         // `terminal.get_frame().area()` + the dashboard-layout helper, so
         // the daemon-side PTY opens at the viewport size instead of the
         // legacy 24×80. Callers without a real viewport (tests) pass
-        // `(24, 80)`. The post-spawn `resize_dashboard_panes` sweep
-        // reconciles per-role focus state on the first frame.
+        // `(24, 80)`. PRD #84 M4: the per-frame `resize_panes_to_layout`
+        // pass reconciles each role pane to its exact inner area (and the
+        // active tab's focus state) on the first frame.
         spawn_dims: (u16, u16),
     ) -> Result<(usize, Vec<String>), TabError> {
         let mut role_pane_ids: Vec<String> = Vec::with_capacity(config.roles.len());
@@ -797,8 +801,7 @@ impl TabManager {
                 // get a spurious orchestration tab match.
                 // Follow-up to 0d5e651 (reviewer finding #6): also skip
                 // synthetic dead-slot pane ids for consistency with
-                // `close_tab`, `all_managed_pane_ids`, and
-                // `resize_orchestration_role_panes_for`. No production
+                // `close_tab` and `all_managed_pane_ids`. No production
                 // caller hits the synthetic-id branch today, but the
                 // inconsistency is a footgun for any future code that
                 // assumes "if `tab_index_for_pane` returns Some, the
