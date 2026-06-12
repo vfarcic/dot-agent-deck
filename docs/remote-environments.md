@@ -69,7 +69,7 @@ laptop                       remote host
 
 Three properties follow from this shape:
 
-1. **Agents survive your laptop.** Close the lid, lose Wi-Fi, kill the ssh session — the remote TUI process dies with its terminal, but the daemon and agents are separate processes and keep running. Reconnect later from the same laptop or a different one.
+1. **Agents survive your laptop.** Close the lid, lose Wi-Fi, kill the ssh session — the remote TUI process dies with its terminal, but the daemon and agents are separate processes and keep running. Reconnect later from the same laptop or a different one. A sleep or network drop reconnects on its own without closing the tab (see [Surviving sleep/wake](#surviving-sleepwake)); an explicit `connect` is only needed after you deliberately quit or move to another machine.
 2. **Hooks never cross the network.** Agents run on the remote and so does the daemon; hook events travel over a Unix socket on the remote. Network drops do not lose hook events.
 3. **One environment per project.** A remote is registered to a single project's working tree on the host. Running multiple projects on one host is supported (one directory per project under `~/projects/`), but each project should still be one registered remote.
 
@@ -82,7 +82,7 @@ Two distinct user actions; very different consequences.
 | **Stop** (`Ctrl+W` on a remote pane) | Sends `StopAgent` to the daemon over the local-on-remote socket; the daemon kills the PTY and removes the agent from the registry. | You're done with the agent; want it gone. |
 | **Detach** (Ctrl+C in dashboard, then "Detach" in the dialog) | The TUI sends an explicit `KIND_DETACH` frame to the daemon on its Unix socket, then exits. The daemon records a clean detach and keeps the agents running. The ssh session ends when the TUI exits. | You want to step away and come back later, and want the daemon's logs to show a voluntary detach. |
 | **Quit** (Ctrl+C in dashboard, then "Quit") | The TUI exits without sending a detach frame. The daemon observes EOF on its socket and treats it the same as detach — agents stay alive. The ssh session ends when the TUI exits. | You're done for the day; don't need the explicit signal. |
-| **Sleep / network drop** (no action) | The ssh session dies abruptly; the remote TUI process is killed by its lost controlling terminal, but the daemon is a separate process and keeps running. Agents stay alive. | Implicit; happens automatically when the laptop disconnects. |
+| **Sleep / network drop** (no action) | SSH keepalive detects the dead connection within ~45s and ssh exits; `connect` then re-probes and **reconnects automatically** to the still-running agents, so the session resumes in place. The daemon and agents never stopped. See [Surviving sleep/wake](#surviving-sleepwake). | Implicit; happens automatically when the laptop sleeps or the network drops. |
 
 The TUI reflects this split in its quit dialog. Pressing `Ctrl+C` in the dashboard opens a three-option prompt:
 
@@ -99,6 +99,19 @@ Quit and Detach both leave agents running. The only difference is that Detach se
 Run `connect` again. That re-runs `ssh -t` to the remote, which launches a fresh TUI; the TUI calls `list_agents` on the still-running daemon and hydrates one pane per agent (each `AgentRecord` carries the agent's `display_name` and `cwd`, so the dashboard looks the way you left it). Each pane then attaches to the daemon's per-agent stream, and the daemon replays its scrollback snapshot as the first bytes of the new attach so you can see what was happening while you were gone.
 
 Per-agent scrollback is a 1 MiB ring buffer (`SCROLLBACK_CAP_BYTES` in `src/agent_pty.rs`): if an agent produced more than 1 MiB since you last attached, the oldest bytes are evicted. This is not a feature ceiling — long-running agent transcripts are best read from the agent's own log file, not the deck's scrollback buffer.
+
+## Surviving sleep/wake
+
+A long-lived `connect` session survives the laptop sleeping or the network dropping out from under it — you don't have to close the tab and start over. Reopen the laptop and the session reconnects to the same running agents on its own. Two mechanisms cooperate:
+
+1. **SSH keepalive detects the dead connection.** When the laptop sleeps, the TCP connection dies silently — the sleeping endpoint never sends a FIN/RST, so on wake ssh is parked on a dead socket it can't tell is dead, and the TUI freezes. To prevent that, the live session probes the remote over the encrypted channel every 15 seconds (`ServerAliveInterval=15`) and aborts after 3 consecutive unanswered probes (`ServerAliveCountMax=3`). So a connection killed by sleep is noticed and torn down within roughly **45 seconds** of wake instead of hanging forever. Probing over the encrypted channel works through NAT and firewalls, unlike TCP-level keepalive.
+2. **`connect` reconnects automatically.** When ssh exits because the transport dropped (its exit code 255), `connect` prints `connection to <name> lost — reconnecting…` to stderr, re-runs its version/protocol probe to confirm the host is reachable again, and re-launches the TUI. Because the daemon and agents on the remote never stopped (see [Reattaching](#reattaching)), the fresh session re-attaches to the **same running agents** — you see your session resume, not a blank dashboard.
+
+Reconnection is **bounded**, so a genuinely-gone remote surfaces an error instead of looping forever: `connect` retries up to four times after the initial drop, with a short backoff between attempts. If the host is still unreachable when the budget is exhausted, `connect` prints a clear "giving up" message, restores your local terminal to a sane state (a session interrupted mid-stream may otherwise leave the terminal in raw mode), and exits.
+
+Only a **dropped transport** triggers a reconnect. A clean quit or detach (exit 0), a `Ctrl-C` (exit 130), or a remote-side crash all end the session immediately — `connect` never reconnects into an intentional exit or a crashing TUI, and `last_connected` is recorded only on a clean exit, not on intermediate reconnects.
+
+The keepalive interval/count and retry budget are sensible fixed defaults today; exposing them as configuration is a future improvement.
 
 ## Failure modes
 

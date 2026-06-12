@@ -22,6 +22,7 @@
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -71,6 +72,44 @@ const PROBE_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS";
 /// that module here because connect.rs is built into the laptop CLI surface
 /// and shouldn't pull agent-side internals into its dependency graph.
 const VIA_DAEMON_ENV: &str = "DOT_AGENT_DECK_VIA_DAEMON";
+
+/// PRD #148: SSH keepalive cadence for the *live* connect session. Once an
+/// `ssh -t` session is up ssh otherwise keeps it alive indefinitely with no
+/// liveness probing, so a connection killed by laptop sleep is never noticed
+/// and the TUI freezes on a dead socket. `ServerAlive*` makes ssh probe the
+/// peer over the encrypted channel every `LIVE_KEEPALIVE_INTERVAL_SECS` and
+/// drop the session after `LIVE_KEEPALIVE_COUNT_MAX` consecutive unanswered
+/// probes, so a dead connection is torn down within roughly
+/// `interval × count` (~45s) instead of hanging forever.
+///
+/// Distinct from the probe path in `remote.rs` (`ServerAliveCountMax=1`, which
+/// wants fail-fast): the live interactive session uses a higher count so a
+/// brief real network blip (15–30s) doesn't tear down a working session.
+const LIVE_KEEPALIVE_INTERVAL_SECS: u64 = 15;
+const LIVE_KEEPALIVE_COUNT_MAX: u64 = 3;
+
+/// PRD #148: total number of `ssh -t` spawns `run_connect` will attempt before
+/// giving up — the initial connect plus up to `MAX_CONNECT_ATTEMPTS - 1`
+/// automatic reconnects after a transport drop (ssh exit 255). Bounded so a
+/// genuinely-gone remote surfaces an error and a sane exit code instead of
+/// looping forever; with [`RECONNECT_BACKOFF`] this caps the reconnect window
+/// at roughly `(MAX_CONNECT_ATTEMPTS - 1) × backoff` plus probe round-trips.
+const MAX_CONNECT_ATTEMPTS: usize = 5;
+
+/// PRD #148: fixed delay between reconnect attempts. Gives a just-woken
+/// laptop's network a moment to come back (wifi association, DHCP, VPN) before
+/// the next re-probe; the probe itself is the reachability gate, this just
+/// avoids hammering it the instant ssh reports the drop.
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
+
+/// PRD #148: ssh's own exit code for a transport/auth failure (dropped
+/// connection, keepalive timeout, refused, auth). ssh passes a clean remote
+/// exit through verbatim, so 255 uniquely marks "the transport died, not the
+/// user quit" — the signal auto-reconnect keys on. Also returned by
+/// `run_connect` when the reconnect budget is exhausted, since a transport
+/// failure is ultimately what happened. Mirrors the contract documented at
+/// `src/remote.rs` (the exit-255 handling in `SystemSshExecutor::run`).
+const SSH_TRANSPORT_FAILURE_EXIT_CODE: i32 = 255;
 
 #[derive(Debug, Error)]
 pub enum RemoteConnectError {
@@ -631,11 +670,22 @@ fn map_probe_ssh_error(name: &str, err: SshError) -> RemoteConnectError {
 pub fn build_connect_command(target: &SshTarget, install_path: &str) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.arg("-t");
-    // ConnectTimeout (separate from session-runtime — once the session is up,
-    // ssh keeps it alive indefinitely). Aligned with the version probe so the
-    // two stages have the same fail-fast budget.
+    // ConnectTimeout caps only the pre-handshake phase. Once the session is up
+    // ssh would otherwise keep it alive indefinitely with no liveness probing,
+    // so a connection killed by laptop sleep is never noticed and the TUI
+    // freezes on a dead socket. ServerAlive* (PRD #148) makes ssh probe the
+    // peer over the encrypted channel (works through NAT/firewalls, unlike
+    // TCPKeepAlive) and abort after ServerAliveCountMax consecutive unanswered
+    // probes — so a dead connection is dropped within ~interval×count instead
+    // of hanging forever. CountMax here is higher than the remote.rs probe
+    // path's (=1) so a brief real network blip doesn't tear down a live
+    // interactive session.
     cmd.arg("-o")
         .arg(format!("ConnectTimeout={}", probe_timeout_secs()));
+    let keepalive_interval = format!("ServerAliveInterval={LIVE_KEEPALIVE_INTERVAL_SECS}");
+    let keepalive_count = format!("ServerAliveCountMax={LIVE_KEEPALIVE_COUNT_MAX}");
+    cmd.arg("-o").arg(&keepalive_interval);
+    cmd.arg("-o").arg(&keepalive_count);
     cmd.arg("-p").arg(target.port.to_string());
     if let Some(key) = &target.key {
         cmd.arg("-i").arg(key);
@@ -688,6 +738,67 @@ impl ConnectSpawner for SystemConnectSpawner {
     }
 }
 
+/// PRD #148: abstraction over the inter-attempt backoff sleep in the
+/// reconnect loop. Production sleeps for real ([`SleepBackoff`]); unit tests
+/// inject a recorder that returns immediately and counts invocations, so the
+/// reconnect state machine can be exercised without real wall-clock delays.
+/// Modeled on the [`ConnectSpawner`] / [`SshExecutor`] seams already used to
+/// keep the connect path testable.
+pub trait ReconnectBackoff {
+    /// Sleep before the next reconnect attempt. `attempt` is the 1-based index
+    /// of the reconnect about to be made (the production impl uses a fixed
+    /// delay and ignores it; the parameter leaves room for an exponential
+    /// policy later without another signature change).
+    fn backoff(&self, attempt: usize);
+}
+
+/// Production backoff: sleeps [`RECONNECT_BACKOFF`] on the calling thread.
+pub struct SleepBackoff;
+
+impl SleepBackoff {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SleepBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReconnectBackoff for SleepBackoff {
+    fn backoff(&self, _attempt: usize) {
+        std::thread::sleep(RECONNECT_BACKOFF);
+    }
+}
+
+/// PRD #148: best-effort restore of a sane local terminal after auto-reconnect
+/// gives up.
+///
+/// When ssh dies on a transport failure, the *remote* TUI never ran its own
+/// teardown (leave alternate screen, show cursor, disable mouse reporting), so
+/// the laptop terminal is left in the remote app's screen state. A successful
+/// reconnect re-inits the terminal via the next `ssh -t`; but when we exhaust
+/// the retry budget there is no new session to fix it, so we reset it here.
+///
+/// ssh normally restores the local line discipline itself (it owns the raw
+/// mode it set for `-t`), but we still attempt a cooked-mode restore in case
+/// it didn't. Everything is best-effort: errors are ignored (no controlling
+/// tty under tests; an unwritable terminal can't be helped on the give-up
+/// path anyway).
+fn restore_local_terminal() {
+    // Cooked-mode restore in case ssh's own cleanup didn't run.
+    let _ = crossterm::terminal::disable_raw_mode();
+    // Leave the alternate screen, show the cursor, disable the common
+    // mouse-tracking modes, and reset SGR attributes — the state a
+    // ratatui/crossterm TUI typically leaves set.
+    let mut out = std::io::stdout();
+    let _ =
+        out.write_all(b"\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[0m");
+    let _ = out.flush();
+}
+
 /// Map a child `ExitStatus` to the conventional shell exit code.
 ///
 /// - Normal exit: pass through `status.code()` verbatim, so a remote shell
@@ -730,78 +841,190 @@ fn touch_last_connected(name: &str, path: &Path) -> Result<Option<String>, Remot
     Ok(Some(now))
 }
 
-/// Orchestrate one connect: probe → spawn `ssh -t` → record `last_connected`.
+/// PRD #148: classify a probe error as the "host not reachable *yet*" class
+/// (transient) vs a genuine incompatibility (fatal). Every ssh-transport-level
+/// probe failure folds into [`RemoteConnectError::HostUnreachable`] (see
+/// `map_probe_ssh_error`), so that single variant captures the reachability
+/// class. Everything else — binary missing, protocol/build mismatch, handshake
+/// rejection, spawn/IO/registry failures — is a problem retrying can't fix, so
+/// it stays fatal even on a reconnect and we never blindly retry into an
+/// incompatible or absent remote.
+fn is_reachability_error(err: &RemoteConnectError) -> bool {
+    matches!(err, RemoteConnectError::HostUnreachable { .. })
+}
+
+/// PRD #148: shared bounded-retry decision for a transport failure on attempt
+/// `attempt` (1-based) — either a spawn that returned 255 or a reconnect-time
+/// reachability probe failure. Returns `Some(exit_code)` when the retry budget
+/// is exhausted (caller should `return Ok(code)`); returns `None` after backing
+/// off (caller should `continue` to the next attempt).
 ///
-/// Returns ssh's exit code so the caller can propagate it as the laptop
-/// process's exit code (mirroring `ssh`'s own behavior — a remote shell
-/// that exits 17 makes `ssh` exit 17, and we keep that contract one level
-/// up). `last_connected` is only updated on a clean exit (status 0):
+/// On give-up it restores a sane local terminal — the remote TUI never got to
+/// leave alt screen / raw mode when the transport died — and prints the
+/// "giving up" line to stderr, so BOTH the spawn-255 path and the
+/// reconnect-probe-failure path restore the terminal and surface the same
+/// message. Keeping this in one place is what guarantees a still-unreachable
+/// host on a reconnect can't escape the loop without counting against the
+/// budget, backing off, and (on exhaustion) restoring the terminal.
+fn on_transport_failure(attempt: usize, name: &str, backoff: &dyn ReconnectBackoff) -> Option<i32> {
+    if attempt >= MAX_CONNECT_ATTEMPTS {
+        // Budget exhausted: the remote stayed unreachable across every attempt.
+        restore_local_terminal();
+        eprintln!(
+            "connection to '{}' lost and could not be re-established after {} attempts — giving up.",
+            name, MAX_CONNECT_ATTEMPTS
+        );
+        return Some(SSH_TRANSPORT_FAILURE_EXIT_CODE);
+    }
+    // Message goes to stderr, between the handed-over terminal sessions.
+    // `attempt + 1` is the attempt we're about to make.
+    eprintln!(
+        "connection to '{}' lost — reconnecting… (attempt {}/{})",
+        name,
+        attempt + 1,
+        MAX_CONNECT_ATTEMPTS
+    );
+    backoff.backoff(attempt);
+    None
+}
+
+/// Orchestrate one connect: probe → spawn `ssh -t` → record `last_connected`,
+/// with PRD #148 auto-reconnect wrapped around the probe/spawn step.
+///
+/// The whole probe + spawn + bookkeeping flow runs inside a loop keyed on
+/// ssh's transport-failure exit code (255). ssh passes a clean remote exit
+/// through verbatim (TUI quit → 0, Ctrl-C → 130, SIGTERM → 143, remote panic
+/// → its own non-255 code) and reserves 255 for its own connection/auth
+/// failures, so we reconnect *only* on a dropped transport — never on a user
+/// quitting or a crashing remote TUI (which would just crash again):
+///
+/// - **exit 255** → print a "reconnecting…" line to stderr, back off
+///   ([`ReconnectBackoff`], injectable so tests don't really sleep), and loop
+///   to re-probe + re-spawn. The remote daemon is external and persistent
+///   (#93) and the remote TUI restores its view from daemon state on startup
+///   (#89), so a fresh `ssh -t` re-attaches to the *same* running agents.
+/// - **any other code** → terminal; returned verbatim. ssh's exit code
+///   propagates as the laptop process's exit code (a remote shell that exits
+///   17 makes the laptop exit 17 — same contract one level up).
+///
+/// The re-probe each attempt doubles as the reachability gate: right after
+/// sleep/wake the laptop's wifi/DHCP may not be back, so the *initial*
+/// connect's probe is fatal (returns the existing "Could not reach…" error),
+/// but a probe **reachability** failure on a *reconnect* attempt
+/// ([`is_reachability_error`]) folds into the SAME bounded-retry/backoff/
+/// give-up path a dropped session uses — otherwise a still-down network would
+/// let the reconnect escape the loop without counting against the budget,
+/// backing off, or restoring the terminal. Genuine incompatibilities
+/// (protocol/build mismatch, missing binary) stay fatal even on a reconnect.
+///
+/// Reconnection is bounded by [`MAX_CONNECT_ATTEMPTS`]. When exhausted we
+/// restore a sane local terminal (the remote TUI never got to leave alt
+/// screen / raw mode when ssh died mid-session), print a "giving up" line, and
+/// return [`SSH_TRANSPORT_FAILURE_EXIT_CODE`] — surfacing the transport
+/// failure as the process exit code rather than looping forever.
+///
+/// `last_connected` is only updated on a genuine clean exit (status 0), never
+/// on an intermediate 255 reconnect:
 ///
 /// - User exits the TUI cleanly → laptop registry records the session.
-/// - User Ctrl-C's the ssh, daemon dies, network drops mid-session → no
-///   bookkeeping update; the registry only ever shows sessions that
-///   actually ran to completion.
-///
-/// `_cli_theme` and `_continue_session` are accepted to preserve the
-/// existing call site (M2.7-era stub) but are *intentionally ignored* in
-/// M2.9. The remote TUI runs on the remote, so a laptop-side `--theme` /
-/// `--continue` would have no effect on what the user sees. Piping them
-/// through as remote flags is a future ergonomic improvement (deferred to
-/// M5.5 when the connect UX is documented end-to-end).
+/// - User Ctrl-C's the ssh, daemon dies, network drops mid-session, or we
+///   exhaust reconnects → no bookkeeping update; the registry only ever shows
+///   sessions that actually ran to completion.
 pub fn run_connect(
     entry: &RemoteEntry,
     executor: &dyn SshExecutor,
     spawner: &dyn ConnectSpawner,
+    backoff: &dyn ReconnectBackoff,
     remotes_path: &Path,
     local_version: &str,
     install_path: &str,
 ) -> Result<i32, RemoteConnectError> {
     let target = entry.ssh_target();
 
-    // Stage 1: binary-version probe. Errors short-circuit; warnings (mismatch)
-    // get surfaced on stderr and we proceed.
-    match probe_remote_version(executor, &target, &entry.name, install_path, local_version)? {
-        ProbeOutcome::Match => {}
-        ProbeOutcome::Mismatch { remote, local } => {
-            eprintln!(
-                "warning: remote '{}' runs dot-agent-deck {}; laptop runs {}. Run `dot-agent-deck remote upgrade {}` to align.",
-                entry.name, remote, local, entry.name
-            );
+    // 1-based count of connect attempts made (initial connect + reconnects).
+    // This is the retry budget: a transport failure on attempt N — a spawn
+    // that returned 255, OR (on a reconnect) a reachability probe failure —
+    // gives up once N reaches MAX_CONNECT_ATTEMPTS.
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+
+        // Stage 1: binary-version probe. A version *mismatch* warns and
+        // proceeds. A probe *error* is fatal on the initial connect (returns
+        // the existing "Could not reach…" UX), but on a RECONNECT a
+        // reachability failure (the normal "wifi/DHCP not back yet" state after
+        // sleep/wake) folds into the same bounded-retry/backoff/give-up path a
+        // dropped session uses — see `on_transport_failure`. Genuine
+        // incompatibilities stay fatal even on a reconnect.
+        match probe_remote_version(executor, &target, &entry.name, install_path, local_version) {
+            Ok(ProbeOutcome::Match) => {}
+            Ok(ProbeOutcome::Mismatch { remote, local }) => {
+                eprintln!(
+                    "warning: remote '{}' runs dot-agent-deck {}; laptop runs {}. Run `dot-agent-deck remote upgrade {}` to align.",
+                    entry.name, remote, local, entry.name
+                );
+            }
+            Err(e) if attempt > 1 && is_reachability_error(&e) => {
+                match on_transport_failure(attempt, &entry.name, backoff) {
+                    Some(code) => return Ok(code),
+                    None => continue,
+                }
+            }
+            Err(e) => return Err(e),
         }
-    }
 
-    // Stage 1b: protocol-version handshake. A binary-version match doesn't
-    // guarantee wire-format compatibility (the protocol is bumped
-    // independently of the binary semver, see PRD #76 M2.21), and a
-    // binary-version mismatch can still be safe if the protocol versions
-    // agree. Fail the connect with a clear error on any protocol disagreement
-    // — the wire format isn't backward-compatible and the silent failure
-    // mode (frozen dashboard, no error) is worse than a hard-stop here.
-    probe_remote_protocol(executor, &target, &entry.name, install_path)?;
+        // Stage 1b: protocol-version handshake. A binary-version match doesn't
+        // guarantee wire-format compatibility (the protocol is bumped
+        // independently of the binary semver, see PRD #76 M2.21), and a
+        // binary-version mismatch can still be safe if the protocol versions
+        // agree. Same reachability-vs-fatal split as the version probe: a
+        // transient transport failure on a reconnect retries, but a
+        // protocol/build incompatibility (the downgrade/safety case) stays
+        // fatal so we never re-spawn into an incompatible remote.
+        match probe_remote_protocol(executor, &target, &entry.name, install_path) {
+            Ok(()) => {}
+            Err(e) if attempt > 1 && is_reachability_error(&e) => {
+                match on_transport_failure(attempt, &entry.name, backoff) {
+                    Some(code) => return Ok(code),
+                    None => continue,
+                }
+            }
+            Err(e) => return Err(e),
+        }
 
-    // Stage 2: hand the terminal over. This blocks until the user exits.
-    let exit_code =
-        spawner
-            .spawn(&target, install_path)
-            .map_err(|source| RemoteConnectError::SpawnFailed {
+        // Stage 2: hand the terminal over. This blocks until the user exits.
+        let exit_code = spawner.spawn(&target, install_path).map_err(|source| {
+            RemoteConnectError::SpawnFailed {
                 name: entry.name.clone(),
                 source,
-            })?;
+            }
+        })?;
 
-    // Stage 3: bookkeeping. Only on a clean exit — see doc comment.
-    if exit_code == 0 {
-        // Registry I/O failures here are reported but don't fail the
-        // command — the user already finished their session, and a busted
-        // registry shouldn't surface as a connect error after the fact.
-        if let Err(e) = touch_last_connected(&entry.name, remotes_path) {
-            eprintln!(
-                "warning: connect to '{}' succeeded but the registry update failed: {}",
-                entry.name, e
-            );
+        // Stage 3: route on the exit code. Reconnect ONLY on ssh's
+        // transport-failure code (255); any other code is terminal.
+        if exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE {
+            match on_transport_failure(attempt, &entry.name, backoff) {
+                Some(code) => return Ok(code),
+                None => continue,
+            }
         }
-    }
 
-    Ok(exit_code)
+        // Terminal exit (clean 0, Ctrl-C 130, SIGTERM 143, non-255 crash).
+        // Bookkeeping only on a genuine clean exit — see doc comment.
+        if exit_code == 0 {
+            // Registry I/O failures here are reported but don't fail the
+            // command — the user already finished their session, and a busted
+            // registry shouldn't surface as a connect error after the fact.
+            if let Err(e) = touch_last_connected(&entry.name, remotes_path) {
+                eprintln!(
+                    "warning: connect to '{}' succeeded but the registry update failed: {}",
+                    entry.name, e
+                );
+            }
+        }
+
+        return Ok(exit_code);
+    }
 }
 
 /// Public entry point used by `main.rs`'s `run_connect` handler. Wires up
@@ -818,10 +1041,12 @@ pub fn run_connect_default(
     // `connect` indefinitely (cmd.output() has no timeout of its own).
     let executor = SystemSshExecutor::with_wallclock_timeout(probe_timeout_secs());
     let spawner = SystemConnectSpawner::new();
+    let backoff = SleepBackoff::new();
     run_connect(
         entry,
         &executor,
         &spawner,
+        &backoff,
         remotes_path,
         local_version,
         REMOTE_INSTALL_PATH,
@@ -855,6 +1080,24 @@ mod tests {
         // -t must be present (remote TUI requires a pty); install_path is
         // passed verbatim and the env var is set on the remote shell.
         assert_eq!(args[0], "-t", "must request remote pty: {args:?}");
+        // PRD #148: the live session carries ConnectTimeout *and* the
+        // ServerAlive* keepalive pair so a sleep-killed connection is detected
+        // and dropped instead of hanging forever. The keepalive count is the
+        // tolerant value (3), distinct from the probe path's fail-fast 1.
+        assert!(
+            args.iter().any(|a| a.starts_with("ConnectTimeout=")),
+            "must set ConnectTimeout: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == &format!("ServerAliveInterval={LIVE_KEEPALIVE_INTERVAL_SECS}")),
+            "must set ServerAliveInterval={LIVE_KEEPALIVE_INTERVAL_SECS}: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == &format!("ServerAliveCountMax={LIVE_KEEPALIVE_COUNT_MAX}")),
+            "must set ServerAliveCountMax={LIVE_KEEPALIVE_COUNT_MAX}: {args:?}"
+        );
         assert!(
             args.iter()
                 .any(|a| a == "DOT_AGENT_DECK_VIA_DAEMON=1"
@@ -982,5 +1225,411 @@ mod tests {
         assert_eq!(exit_code_from_status(&sigterm), 143);
         let sigkill = std::process::ExitStatus::from_raw(9);
         assert_eq!(exit_code_from_status(&sigkill), 137);
+    }
+
+    // ----- PRD #148: auto-reconnect state machine -----
+
+    use crate::remote::SshOutput;
+    use std::cell::Cell;
+
+    const TEST_LOCAL_VERSION: &str = "9.9.9";
+
+    /// Fake executor whose probes always succeed: `--version` echoes the
+    /// laptop version and `daemon hello` returns a matching protocol/build
+    /// handshake. Counts invocations so a test can confirm the *full* probe
+    /// (version + protocol) re-runs on every reconnect attempt.
+    struct ProbeOkExecutor {
+        local_version: String,
+        runs: Cell<usize>,
+    }
+
+    impl ProbeOkExecutor {
+        fn new(local_version: &str) -> Self {
+            Self {
+                local_version: local_version.to_string(),
+                runs: Cell::new(0),
+            }
+        }
+        fn run_count(&self) -> usize {
+            self.runs.get()
+        }
+    }
+
+    impl SshExecutor for ProbeOkExecutor {
+        fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+            self.runs.set(self.runs.get() + 1);
+            if command.contains("daemon hello") {
+                // `hello()` carries server_version == PROTOCOL_VERSION and
+                // build_version == local_build_id(), which is exactly what
+                // probe_remote_protocol compares against in-process — so the
+                // handshake matches without any env juggling.
+                let body = serde_json::to_string(&AttachResponse::hello(PROTOCOL_VERSION))
+                    .expect("serialize hello");
+                Ok(SshOutput {
+                    status: 0,
+                    stdout: body,
+                    stderr: String::new(),
+                })
+            } else if command.contains("--version") {
+                Ok(SshOutput {
+                    status: 0,
+                    stdout: format!("dot-agent-deck {}\n", self.local_version),
+                    stderr: String::new(),
+                })
+            } else {
+                panic!("unexpected probe command: {command}");
+            }
+        }
+    }
+
+    /// Fake executor that lets the FIRST connect's probe succeed, then fails
+    /// every later `--version` probe with an ssh transport error. The connect
+    /// path folds that into [`RemoteConnectError::HostUnreachable`] — the
+    /// canonical "host not reachable yet" state on a reconnect right after
+    /// sleep/wake, before wifi/DHCP recover. Used to prove a reconnect-time
+    /// reachability failure is bounded (counts against the budget, backs off)
+    /// instead of escaping the loop on the first re-probe.
+    ///
+    /// `daemon hello` always succeeds, but it's only ever reached on the first
+    /// attempt: on reconnects the `--version` probe fails first and short-
+    /// circuits before the protocol handshake runs.
+    struct UnreachableAfterFirstConnectExecutor {
+        local_version: String,
+        version_calls: Cell<usize>,
+    }
+
+    impl UnreachableAfterFirstConnectExecutor {
+        fn new(local_version: &str) -> Self {
+            Self {
+                local_version: local_version.to_string(),
+                version_calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl SshExecutor for UnreachableAfterFirstConnectExecutor {
+        fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+            if command.contains("daemon hello") {
+                let body = serde_json::to_string(&AttachResponse::hello(PROTOCOL_VERSION))
+                    .expect("serialize hello");
+                return Ok(SshOutput {
+                    status: 0,
+                    stdout: body,
+                    stderr: String::new(),
+                });
+            }
+            if command.contains("--version") {
+                let n = self.version_calls.get();
+                self.version_calls.set(n + 1);
+                if n == 0 {
+                    // First connect: reachable.
+                    return Ok(SshOutput {
+                        status: 0,
+                        stdout: format!("dot-agent-deck {}\n", self.local_version),
+                        stderr: String::new(),
+                    });
+                }
+                // Every reconnect attempt: host not reachable yet. An ssh
+                // transport error maps to HostUnreachable in probe_remote_version.
+                return Err(SshError::ConnectionRefused {
+                    host: target.host.clone(),
+                    port: target.port,
+                    detail: "connection refused".to_string(),
+                });
+            }
+            panic!("unexpected probe command: {command}");
+        }
+    }
+
+    /// Fake spawner returning a scripted sequence of exit codes, counting
+    /// spawns. Past the end of the script it repeats the last code, so "always
+    /// 255" is a one-element script and an unexpected extra spawn surfaces as a
+    /// failed count assertion rather than a panic.
+    struct ScriptedSpawner {
+        codes: Vec<i32>,
+        calls: Cell<usize>,
+    }
+
+    impl ScriptedSpawner {
+        fn new(codes: Vec<i32>) -> Self {
+            assert!(!codes.is_empty(), "script needs at least one exit code");
+            Self {
+                codes,
+                calls: Cell::new(0),
+            }
+        }
+        fn spawn_count(&self) -> usize {
+            self.calls.get()
+        }
+    }
+
+    impl ConnectSpawner for ScriptedSpawner {
+        fn spawn(&self, _target: &SshTarget, _install_path: &str) -> Result<i32, std::io::Error> {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            let code = self
+                .codes
+                .get(n)
+                .copied()
+                .unwrap_or_else(|| *self.codes.last().expect("non-empty"));
+            Ok(code)
+        }
+    }
+
+    /// Fake backoff that records how many times it was asked to sleep and never
+    /// actually sleeps, so reconnect tests run instantly.
+    struct RecordingBackoff {
+        calls: Cell<usize>,
+    }
+
+    impl RecordingBackoff {
+        fn new() -> Self {
+            Self {
+                calls: Cell::new(0),
+            }
+        }
+        fn count(&self) -> usize {
+            self.calls.get()
+        }
+    }
+
+    impl ReconnectBackoff for RecordingBackoff {
+        fn backoff(&self, _attempt: usize) {
+            self.calls.set(self.calls.get() + 1);
+        }
+    }
+
+    fn test_entry(name: &str) -> RemoteEntry {
+        RemoteEntry {
+            name: name.to_string(),
+            kind: "ssh".to_string(),
+            host: "viktor@host.example.com".to_string(),
+            port: 22,
+            key: None,
+            version: TEST_LOCAL_VERSION.to_string(),
+            added_at: "2026-06-12T00:00:00Z".to_string(),
+            upgraded_at: None,
+            last_connected: None,
+        }
+    }
+
+    /// Write a registry containing `entry` to a fresh temp file. Returns the
+    /// tempdir (kept alive by the caller so the file isn't removed) and the
+    /// registry path.
+    fn registry_with(entry: &RemoteEntry) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("remotes.toml");
+        RemotesFile {
+            remotes: vec![entry.clone()],
+        }
+        .save(&path)
+        .expect("save registry");
+        (dir, path)
+    }
+
+    #[test]
+    fn reconnect_then_clean_exit_returns_zero() {
+        // [255, 0] ⇒ exactly two spawns + one reconnect, returns 0. Backoff
+        // fires once; the full probe re-runs on the reconnect; last_connected
+        // is recorded once (on the final clean exit, not the 255 drop).
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor = ProbeOkExecutor::new(TEST_LOCAL_VERSION);
+        let spawner = ScriptedSpawner::new(vec![255, 0]);
+        let backoff = RecordingBackoff::new();
+
+        let code = run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &backoff,
+            &path,
+            TEST_LOCAL_VERSION,
+            REMOTE_INSTALL_PATH,
+        )
+        .expect("run_connect should succeed after one reconnect");
+
+        assert_eq!(code, 0, "clean exit on the second attempt");
+        assert_eq!(
+            spawner.spawn_count(),
+            2,
+            "exactly two spawns: initial + one reconnect"
+        );
+        assert_eq!(
+            backoff.count(),
+            1,
+            "backoff invoked once, for the single reconnect"
+        );
+        assert_eq!(
+            executor.run_count(),
+            4,
+            "full probe (version + protocol) re-ran on each of the two attempts"
+        );
+        let reloaded = RemotesFile::load(&path).expect("reload registry");
+        assert!(
+            reloaded.remotes[0].last_connected.is_some(),
+            "last_connected recorded on the clean exit"
+        );
+    }
+
+    #[test]
+    fn clean_exit_does_not_reconnect() {
+        // [0] ⇒ one spawn, no reconnect, returns 0.
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor = ProbeOkExecutor::new(TEST_LOCAL_VERSION);
+        let spawner = ScriptedSpawner::new(vec![0]);
+        let backoff = RecordingBackoff::new();
+
+        let code = run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &backoff,
+            &path,
+            TEST_LOCAL_VERSION,
+            REMOTE_INSTALL_PATH,
+        )
+        .expect("run_connect");
+
+        assert_eq!(code, 0);
+        assert_eq!(spawner.spawn_count(), 1, "single spawn, no reconnect");
+        assert_eq!(backoff.count(), 0, "no backoff on a clean exit");
+    }
+
+    #[test]
+    fn ctrl_c_exit_is_terminal_no_reconnect() {
+        // [130] (Ctrl-C / SIGINT) is a user-intent exit, not a transport
+        // failure ⇒ one spawn, no reconnect, returned verbatim. Non-zero exit
+        // ⇒ no last_connected bookkeeping.
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor = ProbeOkExecutor::new(TEST_LOCAL_VERSION);
+        let spawner = ScriptedSpawner::new(vec![130]);
+        let backoff = RecordingBackoff::new();
+
+        let code = run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &backoff,
+            &path,
+            TEST_LOCAL_VERSION,
+            REMOTE_INSTALL_PATH,
+        )
+        .expect("run_connect");
+
+        assert_eq!(code, 130, "Ctrl-C exit returned verbatim");
+        assert_eq!(spawner.spawn_count(), 1, "single spawn, no reconnect");
+        assert_eq!(backoff.count(), 0, "no backoff on a terminal exit");
+        let reloaded = RemotesFile::load(&path).expect("reload registry");
+        assert!(
+            reloaded.remotes[0].last_connected.is_none(),
+            "no bookkeeping on a non-zero exit"
+        );
+    }
+
+    #[test]
+    fn repeated_transport_failure_is_bounded() {
+        // Always 255 ⇒ exactly MAX_CONNECT_ATTEMPTS spawns, then give up with
+        // the transport-failure exit code. Backoff fires only *between*
+        // attempts (MAX_CONNECT_ATTEMPTS - 1 times). The 255 path never records
+        // last_connected, so it stays None.
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor = ProbeOkExecutor::new(TEST_LOCAL_VERSION);
+        let spawner = ScriptedSpawner::new(vec![255]);
+        let backoff = RecordingBackoff::new();
+
+        let code = run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &backoff,
+            &path,
+            TEST_LOCAL_VERSION,
+            REMOTE_INSTALL_PATH,
+        )
+        .expect("run_connect returns Ok with the terminal-error code");
+
+        assert_eq!(
+            code, SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            "give-up returns the transport-failure exit code"
+        );
+        assert_eq!(
+            spawner.spawn_count(),
+            MAX_CONNECT_ATTEMPTS,
+            "spawns are capped at the retry budget"
+        );
+        assert_eq!(
+            backoff.count(),
+            MAX_CONNECT_ATTEMPTS - 1,
+            "backoff invoked between attempts only"
+        );
+        let reloaded = RemotesFile::load(&path).expect("reload registry");
+        assert!(
+            reloaded.remotes[0].last_connected.is_none(),
+            "no bookkeeping on a transport-failure give-up"
+        );
+    }
+
+    #[test]
+    fn reconnect_time_unreachable_is_bounded_not_immediate() {
+        // Regression for Blocker 1: a re-probe that keeps failing with the
+        // reachability error after a first successful connect + a 255 drop must
+        // be BOUNDED — counted against the budget, backed off, and given up on
+        // with the terminal error code — NOT returned immediately on the first
+        // re-probe failure.
+        //
+        // Trace with MAX_CONNECT_ATTEMPTS = 5:
+        //   attempt 1: probe ok → spawn 255 (drop)            → backoff(1)
+        //   attempts 2..=4: --version probe → HostUnreachable → backoff(2..4)
+        //   attempt 5: --version probe → HostUnreachable      → give up → 255
+        // So: exactly ONE spawn (the initial connect), MAX-1 backoffs, return
+        // 255. The buggy code would back off once then return Err on attempt 2.
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor = UnreachableAfterFirstConnectExecutor::new(TEST_LOCAL_VERSION);
+        let spawner = ScriptedSpawner::new(vec![255]);
+        let backoff = RecordingBackoff::new();
+
+        let code = run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &backoff,
+            &path,
+            TEST_LOCAL_VERSION,
+            REMOTE_INSTALL_PATH,
+        )
+        .expect("run_connect folds reconnect-time unreachable into bounded retry, returns Ok(255)");
+
+        assert_eq!(
+            code, SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            "give-up after exhausting reconnects returns the transport-failure code, \
+             not an early HostUnreachable error"
+        );
+        assert_eq!(
+            backoff.count(),
+            MAX_CONNECT_ATTEMPTS - 1,
+            "every reconnect attempt backed off — proves it did NOT return early \
+             after the first re-probe failure (the bug would back off once)"
+        );
+        assert_eq!(
+            spawner.spawn_count(),
+            1,
+            "only the initial connect spawned; reconnects fail at the probe before spawning"
+        );
+        // restore_local_terminal() runs on this give-up path: it is the first
+        // line of `on_transport_failure`'s budget-exhausted branch, and the
+        // only way to reach a returned 255 here is through that branch — so the
+        // 255 return above proves restore ran (asserted by code inspection, not
+        // a separate observable seam, to avoid threading a restore-injection
+        // param through run_connect and every call site).
+        let reloaded = RemotesFile::load(&path).expect("reload registry");
+        assert!(
+            reloaded.remotes[0].last_connected.is_none(),
+            "no bookkeeping when reconnects exhaust on an unreachable host"
+        );
     }
 }
