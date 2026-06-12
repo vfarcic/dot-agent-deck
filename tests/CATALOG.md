@@ -1466,6 +1466,40 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux.
 
 
+### Experimental feature flag (PRD #139)
+
+#### features/gating
+
+##### features/gating/001 — Dashboard rendered with the experimental flag forced ON shows the `experimental: on` footer.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`).
+- **Agent:** none.
+- **Asserts:** `render_experimental_footer_to_buffer(&Features::test_with(true), 80, 1)` renders a buffer containing the exact label `experimental: on`; the stringified buffer matches the committed snapshot.
+- **Does not assert:** the footer's absolute placement within the full dashboard layout (the seam renders the standalone footer region); colour/style of the label.
+- **Platform coverage:** mac+linux+windows.
+
+##### features/gating/002 — Dashboard rendered with the experimental flag forced OFF shows NO footer (blank pre-feature baseline).
+- **Layer:** L1 (ratatui `TestBackend` + `insta`).
+- **Agent:** none.
+- **Asserts:** `render_experimental_footer_to_buffer(&Features::test_with(false), 80, 1)` renders a buffer containing no `experimental` text; the stringified buffer matches the committed blank-baseline snapshot — identical to how the region looked before the surface existed.
+- **Does not assert:** the ON path (covered by `features/gating/001`); any behavioural difference beyond the rendered footer region.
+- **Platform coverage:** mac+linux+windows.
+
+##### features/gating/003 — `DOT_AGENT_DECK_EXPERIMENTAL=1` surfaces the `experimental: on` footer end-to-end; the default (OFF) hides it.
+- **Layer:** L2 (real TUI driven via PTY; observed on the rendered vt100 grid). The flag is injected through the spawned binary's env (`with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")`); a control launch sets no env var. The harness `env_clear`s the child env, so the control run is a clean OFF.
+- **Agent:** none (`minimal` fixture; empty dashboard).
+- **Asserts:** with the env var set, the rendered grid shows the `experimental: on` footer once the dashboard is up; the control launch (no env var) never shows it once the dashboard is up and quiescent.
+- **Does not assert:** the TOML-file enable path or env-vs-file precedence (covered by `features/reload/001` and the unit suite); the footer's absolute grid coordinates.
+- **Platform coverage:** mac+linux.
+
+#### features/reload
+
+##### features/reload/001 — A live `[features]` flip from OFF to ON re-surfaces the footer on the next render, no restart.
+- **Layer:** L1 (in-process `TestBackend` + a synthetic config-file event; PRD #139 M2.2).
+- **Agent:** none.
+- **Asserts:** starting from a shared `Features` value (M1.2's per-process `Arc<RwLock<Features>>`) with `experimental = false`, the wrapper `features::show_experimental_footer()` reports hidden and the rendered footer is absent; after a synthetic `.dot-agent-deck.toml` change flips `experimental -> true` (modeled via `features::set_for_test(..)`), the wrapper re-evaluates to visible and the next render shows the `experimental: on` footer — with no process restart.
+- **Does not assert:** the real file-watcher / debounce mechanics (the synthetic event stands in for the watcher's apply step); env-override precedence; partial/invalid-TOML reload handling (unit-covered).
+- **Platform coverage:** mac+linux+windows.
+
 ### Docs cross-reference skips
 
 Per Decision 27, documented user-facing behaviors that are deliberately not catalogued at M1:

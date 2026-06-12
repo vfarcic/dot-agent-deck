@@ -20,6 +20,7 @@ use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
 use crate::event::{AgentType, EventType};
+use crate::features::Features;
 // PRD #80 introduced a UI-dispatch `Action` enum in this module (the renamed
 // `KeyResult`), which collides with the keybinding-action enum. Import the
 // latter under an alias so both coexist: `Action` = the UI dispatch action,
@@ -7611,7 +7612,21 @@ fn render_frame(
     tab_view: &ActiveTabView,
     tab_bar: &TabBarInfo,
 ) {
-    let area = frame.area();
+    // PRD #139 M4.1: throwaway experimental footer, gated at the single
+    // user-visible seam via `features::show_experimental_footer()` (the one
+    // wrapper for this feature — CLAUDE.md #9). When ON, reserve the bottom
+    // row for the `experimental: on` label and lay the rest of the frame out
+    // above it; when OFF the layout is byte-for-byte the pre-feature baseline.
+    let area = {
+        let full = frame.area();
+        if crate::features::show_experimental_footer() {
+            let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(full);
+            render_experimental_footer(frame, &crate::features::current(), chunks[1]);
+            chunks[0]
+        } else {
+            full
+        }
+    };
     ui.side_pane_rects.clear();
     ui.agent_pane_rect = None;
     // PRD #80 M4: rebuilt below only for the dashboard card grid; clearing here
@@ -10621,6 +10636,41 @@ pub fn render_stats_bar_to_buffer(
             height,
         };
         render_stats_bar(frame, stats, area, active_mode_name);
+    })
+}
+
+/// PRD #139 M4.1 — render the throwaway experimental footer into `area`.
+/// When `features.experimental` is set, draws the exact label
+/// `experimental: on`; otherwise renders nothing, leaving the row blank (the
+/// pre-feature baseline). Takes `&Features` by reference, matching every
+/// existing L1 render seam. The live dashboard calls this only when
+/// [`crate::features::show_experimental_footer`] is true (one wrapper, gated
+/// at the user-visible seam — CLAUDE.md #9).
+fn render_experimental_footer(frame: &mut Frame, features: &Features, area: Rect) {
+    if !features.experimental {
+        return;
+    }
+    let line = Line::from(Span::styled("experimental: on", text_primary()));
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// L1 test seam: render the experimental footer into a standalone Buffer.
+/// See `render_stats_bar_to_buffer` for the rationale. Renders the exact text
+/// `experimental: on` iff `features.experimental`, else a blank row.
+#[doc(hidden)]
+pub fn render_experimental_footer_to_buffer(
+    features: &Features,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    draw_to_buffer(width, height, |frame| {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        render_experimental_footer(frame, features, area);
     })
 }
 
