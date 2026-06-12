@@ -103,6 +103,6 @@ For the full configuration reference and more examples, see [Workspace Modes](wo
 
 Scheduled tasks let the daemon spawn an agent (or run a command) on a cron schedule — a nightly review, a recurring digest, a periodic health check — without you being at the keyboard. They are defined globally, so they apply across every project.
 
-The fastest way to create one is to let an agent author it: press `Ctrl+n`, cycle the **Mode** field to **schedule**, and the throwaway pane walks you through building the entry. Or press `s` on the dashboard to open the **Scheduled Tasks** manager and choose `[Add a]`. Every schedule needs a command — `claude` or `opencode` for full status tracking.
+The fastest way to create one is to let an agent author it: press `Ctrl+n`, cycle the **Mode** field to **schedule**, and the throwaway pane walks you through building the entry. Or press `s` on the dashboard to open the **Scheduled Tasks** manager and choose `[Add a]`. Every schedule needs a command that launches a `claude` or `opencode` agent — directly (`claude`, `opencode`) or via a wrapper like `devbox run agent-new` — which is what gives the run full status tracking.
 
 For the full reference — cron syntax, the global config file, tab reuse, and supervisor recipes — see [Scheduled Tasks](scheduled-tasks.md).
