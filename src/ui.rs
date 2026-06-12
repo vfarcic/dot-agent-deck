@@ -3095,6 +3095,17 @@ fn switch_tab_with_focus(
     // move to a different tab (`switch_to` returns `true` even for the current
     // index), so a no-op cycle on a single-tab layout can't spuriously clear
     // the highlight.
+    //
+    // PR #151 (Greptile P2): the leave-clear below mutates the OUTGOING
+    // Dashboard, so it must run while that tab is still active — i.e. before
+    // `switch_to`. That is safe here because `will_move` already guarantees the
+    // switch will succeed: `switch_to(i)` returns `true` *iff* `i < tabs.len()`
+    // (its only guard — see `TabManager::switch_to`), and `will_move` requires
+    // `target_index < tab_count()` (== `tabs.len()`) plus a real index change.
+    // Nothing between here and `switch_to` adds/removes tabs (`active_tab_mut`
+    // and `capture_focus_on_switch_out` only touch per-tab fields), so
+    // `tabs.len()` is invariant. Hence `will_move == true` ⇒ `switched == true`:
+    // the clear can never deactivate the selection without an actual transition.
     let will_move =
         target_index < tab_manager.tab_count() && target_index != tab_manager.active_index();
     if will_move
