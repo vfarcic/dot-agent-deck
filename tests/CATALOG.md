@@ -141,10 +141,10 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the active-state prev/wrap behaviour (`dashboard/selection/002`).
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/selection/008 — With the selection inactive, Enter focuses the first card.
-- **Layer:** L1 (in-process `handle_normal_key` + `dashboard_focus_target`).
-- **Agent:** none.
-- **Asserts:** Enter maps to `Action::Focus`; the focus target is the first card (index 0) when the selection is inactive, the highlighted card when active, and `None` when there are no cards.
+##### dashboard/selection/008 — With the selection inactive, Enter restores the previously-selected card (not card 0).
+- **Layer:** L1 (in-process `switch_tab_with_focus` round-trip + `handle_normal_key` + `dashboard_focus_target`).
+- **Agent:** none (3 synthetic dashboard cards; a Mode tab as the round-trip intermediate).
+- **Asserts:** with the highlight armed on a non-first card (index 1), a real Dashboard → Mode → Dashboard round-trip clears the live highlight (`selected_index == None`) but the Enter focus target (`dashboard_focus_target`) is the REMEMBERED card (index 1), not card 0; Enter still maps to `Action::Focus`; the active-selection target is the highlighted card and the no-cards target is `None` (both unchanged). Pins the PRD #113 design revision (2026-06-13) Enter-restores-previous behavior.
 - **Does not assert:** the pane-focus side effect of `Action::Focus` itself (exercised by `dashboard/selection/003`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -644,6 +644,20 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Asserts:** tab disappears; the daemon no longer carries the role agents.
 - **Does not assert:** the order in which roles are closed.
 - **Platform coverage:** mac+linux.
+
+##### tabs/orchestration/003 — Switching tabs clears the Orchestration deck highlight (symmetric with the Dashboard).
+- **Layer:** L1 (in-process `switch_tab_with_focus` + per-frame `reconcile_dashboard_selection`).
+- **Agent:** none (a real Orchestration tab with two roles).
+- **Asserts:** with the orchestration highlight armed on role 1 and the focus baseline established, a real Orchestration → Dashboard → Orchestration round-trip plus the real per-frame reconcile leaves the highlight inactive (`selected_index == None`) on return — the restored steady-state role-pane focus must not re-arm it. Pins the PRD #113 design revision (2026-06-13) Change 1 (symmetric clearing); analog of `dashboard/selection/011`/`013`.
+- **Does not assert:** the cyan controller focus border (driven separately, unaffected); the orchestrator's spawn-time role prompt.
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/orchestration/004 — Enter restores the previously-selected role on the Orchestration deck (not role 0).
+- **Layer:** L1 (in-process `switch_tab_with_focus` round-trip + `dashboard_focus_target`).
+- **Agent:** none (a real Orchestration tab with two roles; a Mode tab as the round-trip intermediate).
+- **Asserts:** with the orchestration highlight armed on role 1, a real Orchestration → Mode → Orchestration round-trip clears the live highlight (`selected_index == None`) but the Enter focus target (`dashboard_focus_target`, the same SSOT the Dashboard uses) is the REMEMBERED role (index 1), not role 0. Pins the PRD #113 design revision (2026-06-13) Change 2 (Enter restores previous) for the Orchestration deck.
+- **Does not assert:** the pane-focus side effect of activating the role; the active-selection target.
+- **Platform coverage:** mac+linux+windows.
 
 #### tabs/selection
 

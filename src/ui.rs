@@ -888,6 +888,16 @@ struct UiState {
     /// focused on return). Without this, switching away and back re-armed the
     /// highlight a tab switch had cleared (violating SC1).
     last_focused_pane_id: Option<String>,
+    /// PRD #113 design revision (2026-06-13): the last *active* deck selection,
+    /// remembered across tab switches so Enter can RESTORE it when the deck is
+    /// currently inactive (no live highlight), instead of jumping to card 0.
+    /// Shared by both the Dashboard and the Orchestration deck (they route Enter
+    /// through the same `dashboard_focus_target` SSOT). Kept SEPARATE from the
+    /// live `selected_index` / `selected_session_id` so the switch-in re-focus
+    /// can't auto-reactivate it — it is consumed ONLY on an explicit Enter. Only
+    /// ever stores a `Some`: leaving a deck while inactive must not overwrite it
+    /// (or a round-trip's return leg would clobber the remembered value).
+    last_active_selection: Option<usize>,
     filter_text: String,
     rename_text: String,
     display_names: HashMap<String, String>,
@@ -1118,6 +1128,9 @@ impl UiState {
             // first-launch UX is unchanged.
             selected_index: Some(0),
             last_focused_pane_id: None,
+            // PRD #113 revision: defaults to card 0 so first-launch Enter (before
+            // anything has been selected) targets the first card, unchanged.
+            last_active_selection: Some(0),
             filter_text: String::new(),
             rename_text: String::new(),
             display_names: HashMap::new(),
@@ -3061,17 +3074,22 @@ pub fn sync_and_derive_selection(
 }
 
 /// PRD #113 M3 — resolve the card index a *focus* action (Enter / double-click)
-/// should target on the Dashboard. When the selection is active the highlighted
-/// card is used; when it's inactive (`None`) Enter falls back to the first card;
-/// with no cards there is no target. Pure (no I/O), so the Enter fallback is
-/// unit-tested directly.
+/// should target on a deck (Dashboard or Orchestration — both route Enter here).
+/// When the selection is active the highlighted card is used; with no cards
+/// there is no target. Pure (no I/O), so it's unit-tested directly.
+///
+/// PRD #113 design revision (2026-06-13): when the deck is inactive (`None`,
+/// e.g. just after returning from another tab) Enter RESTORES the last *active*
+/// selection (`last_active_selection`) instead of jumping to card 0 — defaulting
+/// to card 0 only before anything was ever selected. The index is clamped to the
+/// current card count so a stale remembered index can't point past the list.
 fn dashboard_focus_target(ui: &UiState, total: usize) -> Option<usize> {
     if total == 0 {
         return None;
     }
     Some(match ui.selected_index {
         Some(idx) => idx.min(total - 1),
-        None => 0,
+        None => ui.last_active_selection.unwrap_or(0).min(total - 1),
     })
 }
 
@@ -3112,11 +3130,13 @@ fn reconcile_dashboard_selection(
     let focus_changed = focused_pane_id != ui.last_focused_pane_id.as_deref();
     ui.last_focused_pane_id = focused_pane_id.map(str::to_string);
 
-    // On the Dashboard, only reactivate an inactive selection when a focused
-    // pane TRANSITIONS to a visible card; otherwise leave it inactive so a
-    // tab-switch deactivation isn't undone by the per-frame sync (the restored
-    // steady-state focus is not a transition).
-    if let Tab::Dashboard { .. } = tab {
+    // On a deck (Dashboard OR Orchestration — PRD #113 revision Change 1 makes
+    // the clearing symmetric), only reactivate an inactive selection when a
+    // focused pane TRANSITIONS to a visible card; otherwise leave it inactive so
+    // a tab-switch deactivation isn't undone by the per-frame sync (the restored
+    // steady-state focus is not a transition). The guard expression itself is
+    // unchanged from PR #151.
+    if let Tab::Dashboard { .. } | Tab::Orchestration { .. } = tab {
         let focus_maps_to_card = focused_pane_id
             .map(|fid| filtered.iter().any(|(_, pid)| *pid == Some(fid)))
             .unwrap_or(false);
@@ -3172,27 +3192,60 @@ fn switch_tab_with_focus(
     // the clear can never deactivate the selection without an actual transition.
     let will_move =
         target_index < tab_manager.tab_count() && target_index != tab_manager.active_index();
-    if will_move
-        && let Tab::Dashboard {
-            selected_session_id,
-        } = tab_manager.active_tab_mut()
-    {
-        *selected_session_id = None;
-        ui.selected_index = None;
+    if will_move {
+        // PRD #113 revision (2026-06-13): leaving a deck (Dashboard OR
+        // Orchestration) with an ACTIVE highlight remembers it so Enter can
+        // restore it on return. Only a `Some` is stored — an inactive leave must
+        // NOT clobber the remembered value, or a round-trip's return leg (which
+        // leaves while already inactive) would erase it.
+        let leaving_deck = matches!(
+            tab_manager.active_tab(),
+            Tab::Dashboard { .. } | Tab::Orchestration { .. }
+        );
+        if leaving_deck && let Some(idx) = ui.selected_index {
+            ui.last_active_selection = Some(idx);
+        }
+        // Symmetric clearing: both decks deactivate the live highlight on leave.
+        match tab_manager.active_tab_mut() {
+            Tab::Dashboard {
+                selected_session_id,
+            } => {
+                // Clear the remembered session id so the switch-in re-focus block
+                // below can't re-focus (and thus re-arm) the prior pane on return.
+                *selected_session_id = None;
+                ui.selected_index = None;
+            }
+            Tab::Orchestration { .. } => {
+                // CRITICAL ASYMMETRY: do NOT clear `focused_role_pane_id`.
+                // `restore_focus_on_switch_in` defaults to the start role when it
+                // is `None`, so clearing it would re-focus role 0 on return — a
+                // genuine focus TRANSITION the reconcile guard would treat as a
+                // legitimate reactivation and re-arm the highlight. Keeping it
+                // intact re-focuses the SAME role (steady state, no transition), so
+                // the guard keeps the deck inactive. (orchestration_003 pins this.)
+                ui.selected_index = None;
+            }
+            Tab::Mode { .. } => {}
+        }
     }
     tab_manager.capture_focus_on_switch_out();
     let switched = tab_manager.switch_to(target_index);
     if switched {
         tab_manager.restore_focus_on_switch_in();
-        // PRD #113 finding 1: entering the Dashboard via a real tab move starts
-        // the selection INACTIVE — symmetric to the leave-deactivation above.
-        // The Orchestration tab shares `selected_index` and its always-active
-        // reconcile can re-arm `Some(0)` while in transit, so without this a
-        // Dashboard→Orchestration→Dashboard round-trip would leave a stale
-        // highlight (violating SC1). The per-frame `reconcile_dashboard_selection`
-        // reactivates only when a focused pane maps to a visible card (M4 /
-        // selection_009), so legitimate reactivation is preserved.
-        if will_move && matches!(tab_manager.active_tab(), Tab::Dashboard { .. }) {
+        // PRD #113 finding 1 + revision Change 1: entering a deck (Dashboard OR
+        // Orchestration) via a real tab move starts the selection INACTIVE —
+        // symmetric to the leave-deactivation above and across both decks. The
+        // shared `selected_index` can be re-armed by a deck's always-active
+        // reconcile while in transit, so without this a deck→deck→deck round-trip
+        // would leave a stale highlight (violating SC1). The per-frame
+        // `reconcile_dashboard_selection` reactivates only on a genuine focus
+        // transition (M4 / selection_009), so legitimate reactivation is preserved.
+        if will_move
+            && matches!(
+                tab_manager.active_tab(),
+                Tab::Dashboard { .. } | Tab::Orchestration { .. }
+            )
+        {
             ui.selected_index = None;
         }
         if let Tab::Dashboard {
@@ -14692,17 +14745,58 @@ mod tests {
         );
     }
 
-    /// Scenario: With the dashboard selection inactive, Enter must fall back to
-    /// the FIRST card: the Enter key maps to `Action::Focus`, and the focus
-    /// target derived from the UI state (`dashboard_focus_target`) is card 0
-    /// when inactive — yet the highlighted card when the selection is active.
-    /// (PRD #113 M3 / SC4.)
+    /// Scenario: PRD #113 design revision (2026-06-13) — when a deck has no
+    /// active highlight (e.g. just after returning from another tab), Enter must
+    /// RESTORE the previously-selected card, not jump to card 0. Arm the
+    /// dashboard highlight on a NON-first card (index 1), drive a REAL tab
+    /// round-trip (Dashboard → Mode → Dashboard via `switch_tab_with_focus`,
+    /// using a Mode tab as a non-deck intermediate so only the Dashboard-leave
+    /// records the prior selection) which clears the live highlight but must
+    /// REMEMBER index 1, then assert Enter still maps to `Action::Focus` and the
+    /// focus target (`dashboard_focus_target`) is the remembered card (index 1),
+    /// NOT card 0. The active-selection and no-cards targets are unchanged.
     #[spec("dashboard/selection/008")]
     #[test]
-    fn selection_008_enter_from_inactive_focuses_first() {
-        // Enter is bound to FocusPane → Action::Focus (with cards present).
+    fn selection_008_enter_restores_previous_selection() {
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (mode_idx, _side_ids) = tab_manager
+            .open_mode_tab(
+                &mode_config_local("m", 1),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open a second (mode) tab");
+        // open_mode_tab leaves the mode tab active — start on the Dashboard.
+        assert!(tab_manager.switch_to(0));
+
+        let snapshot = dashboard_snapshot(3);
+
         let mut ui = default_ui();
-        ui.selected_index = None; // inactive
+        // Arm the highlight on a NON-first card (index 1).
+        ui.selected_index = Some(1);
+        if let Tab::Dashboard {
+            selected_session_id,
+        } = tab_manager.active_tab_mut()
+        {
+            *selected_session_id = Some("s1".to_string());
+        }
+
+        // Real round-trip: Dashboard → Mode → Dashboard. Leaving the Dashboard
+        // clears the live highlight but must REMEMBER the prior selection
+        // (index 1). The Mode tab is a non-deck intermediate, so the return leg
+        // does not overwrite the remembered selection.
+        switch_tab_with_focus(&mut tab_manager, mode_idx, &*pc, &snapshot, &mut ui);
+        switch_tab_with_focus(&mut tab_manager, 0, &*pc, &snapshot, &mut ui);
+
+        // SC1 still holds: no live highlight on return (selection_011/013/015).
+        assert_eq!(
+            ui.selected_index, None,
+            "the live highlight is still cleared on return (SC1 unchanged)"
+        );
+
+        // Enter still maps to the focus action.
         let action = handle_normal_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut ui,
@@ -14715,14 +14809,15 @@ mod tests {
             "Enter on the dashboard maps to Action::Focus"
         );
 
-        // Inactive → Enter focuses the FIRST card (index 0).
+        // THE REVISION: Enter with an inactive selection RESTORES the
+        // previously-selected card (index 1), NOT card 0.
         assert_eq!(
             dashboard_focus_target(&ui, 3),
-            Some(0),
-            "Enter with an inactive selection falls back to the first card"
+            Some(1),
+            "Enter restores the previously-selected card (index 1), not card 0"
         );
 
-        // Active → Enter focuses the highlighted card (current behaviour).
+        // Unchanged: an active selection focuses the highlighted card.
         ui.selected_index = Some(2);
         assert_eq!(
             dashboard_focus_target(&ui, 3),
@@ -14730,7 +14825,7 @@ mod tests {
             "Enter with an active selection focuses the highlighted card"
         );
 
-        // No cards → no focus target.
+        // Unchanged: no cards → no focus target.
         assert_eq!(
             dashboard_focus_target(&ui, 0),
             None,
@@ -15188,6 +15283,133 @@ mod tests {
             ui.selected_index,
             Some(0),
             "a genuine focus transition to a card still reactivates the highlight (M4 preserved)"
+        );
+    }
+
+    /// Scenario: PRD #113 design revision (2026-06-13) Change 1 — SYMMETRIC
+    /// clearing. Switching tabs must clear the active highlight on the
+    /// Orchestration deck too, not just the Dashboard. The Orchestration deck
+    /// shares `ui.selected_index` (derived from `Tab::Orchestration.focused_role_pane_id`
+    /// via `sync_and_derive_selection`), but `reconcile_dashboard_selection`
+    /// currently guards only `Tab::Dashboard`, so the orchestration highlight is
+    /// re-armed from its restored steady-state focus on return. This arms role 1,
+    /// establishes the focus baseline, drives a REAL round-trip (Orchestration →
+    /// Dashboard → Orchestration via `switch_tab_with_focus`) + the real per-frame
+    /// reconcile, and asserts the orchestration highlight is inactive (`None`) on
+    /// return — symmetric with `selection_011`/`013` for the Dashboard.
+    #[spec("tabs/orchestration/003")]
+    #[test]
+    fn orchestration_003_highlight_clears_on_tab_round_trip() {
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (orch_idx, role_pane_ids) = tab_manager
+            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, (24, 80))
+            .expect("open an orchestration tab");
+        // open_orchestration_tab leaves the orchestration tab active.
+        assert_eq!(tab_manager.active_index(), orch_idx);
+
+        let snapshot = AppState::default();
+        let r1 = role_pane_ids[1].clone();
+        // The orchestration deck's filtered list maps each role to its pane id.
+        let orch_filtered: Vec<(&str, Option<&str>)> = role_pane_ids
+            .iter()
+            .map(|p| (p.as_str(), Some(p.as_str())))
+            .collect();
+
+        let mut ui = default_ui();
+        // Arm the orchestration highlight on the 2nd role (index 1).
+        ui.selected_index = Some(1);
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = tab_manager.active_tab_mut()
+        {
+            *focused_role_pane_id = Some(r1.clone());
+        }
+        // Establish the focus baseline on the orchestration tab (focused = role 1).
+        reconcile_dashboard_selection(
+            &mut ui,
+            tab_manager.active_tab_mut(),
+            Some(r1.as_str()),
+            &orch_filtered,
+        );
+
+        // Round-trip: Orchestration → Dashboard → Orchestration. Switching away
+        // must clear the orchestration highlight, and the restored steady-state
+        // focus on return must NOT re-arm it (no genuine focus transition).
+        switch_tab_with_focus(&mut tab_manager, 0, &*pc, &snapshot, &mut ui);
+        switch_tab_with_focus(&mut tab_manager, orch_idx, &*pc, &snapshot, &mut ui);
+        reconcile_dashboard_selection(
+            &mut ui,
+            tab_manager.active_tab_mut(),
+            Some(r1.as_str()),
+            &orch_filtered,
+        );
+
+        assert_eq!(
+            ui.selected_index, None,
+            "switching away from the Orchestration deck and back must clear its highlight (symmetric with the Dashboard)"
+        );
+    }
+
+    /// Scenario: PRD #113 design revision (2026-06-13) Change 2 — Enter restores
+    /// the previously-selected role on the Orchestration deck. The orchestration
+    /// deck routes Enter through the same `dashboard_focus_target` SSOT as the
+    /// Dashboard. Arm role 1, drive a REAL round-trip via a Mode tab (a non-deck
+    /// intermediate: Orchestration → Mode → Orchestration) which clears the live
+    /// highlight but must REMEMBER role 1, then assert the Enter focus target is
+    /// the remembered role (index 1), NOT role 0.
+    #[spec("tabs/orchestration/004")]
+    #[test]
+    fn orchestration_004_enter_restores_previous_role() {
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (orch_idx, role_pane_ids) = tab_manager
+            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, (24, 80))
+            .expect("open an orchestration tab");
+        let (mode_idx, _side_ids) = tab_manager
+            .open_mode_tab(
+                &mode_config_local("m", 1),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open a mode tab");
+        // Start on the Orchestration deck.
+        assert!(tab_manager.switch_to(orch_idx));
+
+        let snapshot = AppState::default();
+        let r1 = role_pane_ids[1].clone();
+        let role_count = role_pane_ids.len();
+
+        let mut ui = default_ui();
+        // Arm the orchestration highlight on the 2nd role (index 1).
+        ui.selected_index = Some(1);
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = tab_manager.active_tab_mut()
+        {
+            *focused_role_pane_id = Some(r1.clone());
+        }
+
+        // Round-trip via a Mode tab (a non-deck intermediate, so only the
+        // Orchestration-leave records the prior selection): Orch → Mode → Orch.
+        switch_tab_with_focus(&mut tab_manager, mode_idx, &*pc, &snapshot, &mut ui);
+        switch_tab_with_focus(&mut tab_manager, orch_idx, &*pc, &snapshot, &mut ui);
+
+        // SC1 still holds for the orchestration deck: no live highlight on return.
+        assert_eq!(
+            ui.selected_index, None,
+            "the orchestration highlight is cleared on return"
+        );
+
+        // THE REVISION: Enter on the orchestration deck with an inactive
+        // selection RESTORES the previously-selected role (index 1), NOT role 0.
+        assert_eq!(
+            dashboard_focus_target(&ui, role_count),
+            Some(1),
+            "Enter restores the previously-selected role (index 1), not role 0"
         );
     }
 
