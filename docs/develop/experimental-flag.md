@@ -1,9 +1,6 @@
----
-sidebar_position: 7.2
-title: Experimental Flag
----
-
 # Experimental Flag
+
+> **Developer / maintainer reference.** This page documents an internal development mechanism and is intentionally excluded from the published documentation site.
 
 `dot-agent-deck` can hide in-flight, work-in-progress surfaces behind a single boolean feature flag named `experimental`. It is **off by default**, so a normal install never shows half-finished features. Enable it only when you want to test a surface that a PRD has explicitly marked as experimental.
 

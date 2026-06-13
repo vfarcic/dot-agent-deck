@@ -9,7 +9,6 @@ const sidebars = {
     'workspace-modes',
     'scheduled-tasks',
     'configuration',
-    'experimental-flag',
     {
       type: 'category',
       label: 'Remote Environments',
