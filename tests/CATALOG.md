@@ -197,6 +197,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the cyan controller focus border (driven separately, unaffected); the keyboard nav/wrap semantics (covered by `dashboard/selection/001`–`002`).
 - **Platform coverage:** mac+linux.
 
+##### dashboard/selection/016 — The inactive-selection close no-op (012) does NOT suppress closing an active Mode/Orchestration tab via Ctrl+W.
+- **Layer:** L1 (in-process `dispatch_action(Action::CloseSelected)` against a recording `PaneController`).
+- **Agent:** none (a real Mode tab, then a real Orchestration tab; no dashboard cards armed).
+- **Asserts:** with a Mode tab active and `selected_index == None`, dispatching `Action::CloseSelected` closes that tab (tab count drops back to the lone Dashboard); the same holds for an active Orchestration tab. Bounds the `dashboard/selection/012` no-op gate: the inactive-selection guard suppresses closing an unarmed dashboard CARD, but a Mode/Orchestration TAB still closes via Ctrl+W. Regression for the PR #151 e2e failure `e2e_render_contract::layout_002` (keyboard Ctrl+W stopped closing a Mode tab because the close routed through the inactive-selection gate).
+- **Does not assert:** the per-pane PTY teardown / role-pane stop (covered by the L2 `tabs/mode/002`, `tabs/orchestration/002`); the dashboard-card close no-op itself (covered by `dashboard/selection/012`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/filter
 
 ##### dashboard/filter/001 — `/` opens the filter input; typing narrows visible cards by display-name substring.
@@ -645,10 +652,10 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the order in which roles are closed.
 - **Platform coverage:** mac+linux.
 
-##### tabs/orchestration/003 — Switching tabs clears the Orchestration deck highlight (symmetric with the Dashboard).
+##### tabs/orchestration/003 — Switching tabs clears the Orchestration deck highlight across ALL tab switches, including orchestration-to-orchestration.
 - **Layer:** L1 (in-process `switch_tab_with_focus` + per-frame `reconcile_dashboard_selection`).
-- **Agent:** none (a real Orchestration tab with two roles).
-- **Asserts:** with the orchestration highlight armed on role 1 and the focus baseline established, a real Orchestration → Dashboard → Orchestration round-trip plus the real per-frame reconcile leaves the highlight inactive (`selected_index == None`) on return — the restored steady-state role-pane focus must not re-arm it. Pins the PRD #113 design revision (2026-06-13) Change 1 (symmetric clearing); analog of `dashboard/selection/011`/`013`.
+- **Agent:** none (two real Orchestration tabs, two roles each).
+- **Asserts:** with the orchestration highlight armed on role 1 and the focus baseline established, the highlight is inactive (`selected_index == None`) on the destination after a real round-trip plus the real per-frame reconcile, in BOTH cases: (Part 1) Orchestration → Dashboard → Orchestration — the destination restores the SAME role pane (steady-state focus, no transition); and (Part 2, PR #151 follow-up) Orchestration A → Orchestration B — the destination restores a DIFFERENT role pane than the source, which the first reconcile frame would otherwise read as a focus transition and re-arm. Pins the PRD #113 design revision (2026-06-13) Change 1 (symmetric clearing); analog of `dashboard/selection/011`/`013`.
 - **Does not assert:** the cyan controller focus border (driven separately, unaffected); the orchestrator's spawn-time role prompt.
 - **Platform coverage:** mac+linux+windows.
 
@@ -657,6 +664,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Agent:** none (a real Orchestration tab with two roles; a Mode tab as the round-trip intermediate).
 - **Asserts:** with the orchestration highlight armed on role 1, a real Orchestration → Mode → Orchestration round-trip clears the live highlight (`selected_index == None`) but the Enter focus target (`dashboard_focus_target`, the same SSOT the Dashboard uses) is the REMEMBERED role (index 1), not role 0. Pins the PRD #113 design revision (2026-06-13) Change 2 (Enter restores previous) for the Orchestration deck.
 - **Does not assert:** the pane-focus side effect of activating the role; the active-selection target.
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/orchestration/005 — Enter restore is per-deck: the Orchestration deck restores ITS OWN previous role, not a Dashboard selection leaked through shared state.
+- **Layer:** L1 (in-process `switch_tab_with_focus` round-trip + `dashboard_focus_target`).
+- **Agent:** none (a real Orchestration tab with three roles; the Dashboard as the round-trip intermediate).
+- **Asserts:** arm the Orchestration deck on role 1, leave to the Dashboard, arm the Dashboard on card 2, then return to the (now inactive) Orchestration deck — Enter restores the Orchestration's OWN remembered role (index 1), NOT the Dashboard's leaked index 2. Pins per-deck independence of the Enter-restore state (the remembered selection must be stored per deck, not in a single shared field). Complements `tabs/orchestration/004` (which restores via a non-deck Mode-tab intermediate that can't clobber the shared field).
+- **Does not assert:** the pane-focus side effect of activating the role; the Dashboard's own restore (covered by `dashboard/selection/008`).
 - **Platform coverage:** mac+linux+windows.
 
 #### tabs/selection
@@ -1215,6 +1229,15 @@ without depending on the config struct API.
 - **Asserts:** worker's pane gains an error line; no task is delivered to any role.
 - **Does not assert:** the daemon-side log entry.
 - **Platform coverage:** mac+linux.
+
+#### orchestration/identity
+
+##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).
+- **Layer:** L1 (in-process — dispatch the real `Action::SpawnPane` through `dispatch_action` against a recording `PaneController`; no daemon, no PTY).
+- **Agent:** none (stub role commands; orchestration_config carries `name = "dot-agent-deck"` with a `coder` role at `clear = true`).
+- **Asserts:** when the new-pane form's Name field defaults to the worktree basename (`dot-agent-deck-prd-113-foo`) while the config name is `dot-agent-deck`, every role pane's `TabMembership::Orchestration.name` (the IDENTITY the daemon's `lookup_orchestration_role` compares) equals the canonical config name `dot-agent-deck` — so the role resolves and `clear = true` respawn fires — while the tab TITLE (`Tab::Orchestration.name`) still shows the basename. Pre-fix the PRD #107 SpawnPane override copies the basename into `orch_config.name`, so the identity is the basename and the lookup misses.
+- **Does not assert:** the daemon-side `pane_orchestration_map` recording or the live delegate respawn (L2 path); the on-disk config reload inside `lookup_orchestration_role`.
+- **Platform coverage:** mac+linux+windows.
 
 #### orchestration/layout
 
