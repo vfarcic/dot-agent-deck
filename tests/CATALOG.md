@@ -964,6 +964,78 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** which layout is the "default" (already a settled product call).
 - **Platform coverage:** mac+linux.
 
+#### resize/render
+
+##### resize/render/001 — Enlarging the outer terminal fills the new width across an embedded pane — no empty band on the right edge.
+- **Layer:** L2.
+- **Agent:** none (a long-lived `sleep` pane gives a focusable embedded PTY without LLM credentials).
+- **Asserts:** with an embedded pane present, after `deck.resize(W+10, H)` and the deck quiescent, the rendered frame spans the full new width and the pane's bordered region reaches the new right edge — no unfilled column band between the deck's chrome and the new edge.
+- **Does not assert:** the pane *program's* own reflow (a non-redrawing `sleep` pane never repaints newly exposed columns — expected terminal behaviour, not the deck bug); exact per-cell colours; the transient single-frame band itself.
+- **Platform coverage:** mac+linux.
+- **M1 status (PRD #84):** RED side of the M4 chain (`Event::Resize` → recompute layout → resize PTYs → render). The empty-band symptom is a one-frame race the current code self-heals once the resize handler fires, so this is written as an **invariant guard**: it pins "the post-resize frame fills the new width" and currently passes after quiescence. It *flags* (does not hard-fail) because the transient band is not deterministically observable through the PTY+vt100 harness. The widget-level half of the same defect (the `min(area, screen)` col clamp) is covered deterministically by `render/widget/001` and `render/widget/002`. Goes/stays GREEN at M4.
+- **Post-M5 resolution (PRD #84):** **GREEN.** After M4 (layout-driven PTY resize) and M5 (1:1 widget render with the contract `debug_assert!` live in debug builds), the enlarge path drives recompute-layout → resize-PTYs-to-match → render, and the settled frame fills the new width. The guard now exercises that contract chain with the col clamp gone, rather than masking a self-healing race. Confirmed green post-M5.
+
+### Render contract (PRD #84)
+
+The rendering-contract reproducers for the PRD #84 (`prds/84-rendering-layer-rework.md`)
+rework: one reproducer per known render-path defect, each the RED side of a TDD chain that
+goes GREEN at M4 (layout-driven PTY resize) or M5 (1:1 `TerminalWidget`). They target the
+`src/terminal_widget.rs` `min(area, screen)` col clamp + cursor-anchored row window (removed
+in M5) and the scattered, per-path layout/resize math (unified in M3/M4). `render/widget/*`
+are deterministic L1/unit tests over `TerminalWidget` rendered against a `ratatui` buffer;
+`render/layout/*` drive the real spawned-binary layout-change pipelines and are invariant
+guards where the underlying glitch is transient/race-y (per the PRD's "race-y resize timing"
+note).
+
+#### render/widget
+
+##### render/widget/001 — `TerminalWidget` renders the PTY screen 1:1 from row 0 — no cursor-anchored row window that drops or shifts the top rows.
+- **Layer:** L1 (in-process `TerminalWidget` rendered into a `ratatui::buffer::Buffer`; no PTY, no subprocess).
+- **Agent:** none.
+- **Asserts:** given a vt100 screen taller than the widget's inner area with the cursor parked on the bottom row, the widget maps screen cell (r, c) → inner cell (r, c) so the inner top row shows screen row 0 — i.e. the top-of-screen marker is rendered at the top of the pane.
+- **Does not assert:** behaviour when the screen fits the area exactly (already correct today); colours / cursor-highlight styling; scrollback.
+- **Platform coverage:** mac+linux.
+- **M1 status (PRD #84):** **RED.** Current `src/terminal_widget.rs:96-117` anchors a row window on the cursor (`start_row = effective_rows - rows`), so with the cursor low it shows the *bottom* rows and the row-0 marker is absent → assertion fails today. Core gate for M5 (the 1:1 widget maps screen row 0 → area row 0). Deterministic at the widget level — the fixture intentionally violates the (future) upstream size contract to exercise the windowing heuristic M5 removes.
+- **Post-M5 resolution (PRD #84):** **GREEN.** M5 removed the cursor-anchored row window (and the `min(area, screen)` col clamp) from `src/terminal_widget.rs`, so the widget now maps screen cell (r, c) → inner cell (r, c) and renders 1:1 from row 0: the inner top row shows screen row 0 (`TOP_ROW_0`) and the assertion passes. Confirmed RED→GREEN post-M5 — the core M5 gate is met.
+
+##### render/widget/002 — `TerminalWidget` tolerates an inner area larger than the PTY screen — falls back to drawing the available cells at the top-left, no panic, no out-of-bounds read.
+- **Layer:** unit (in-process `TerminalWidget` rendered into a `ratatui::buffer::Buffer`).
+- **Agent:** none.
+- **Asserts:** rendering a small (e.g. 3×6) PTY screen into a larger (e.g. 6×12) inner area completes without panicking; the PTY content lands at the top-left and the excess rows/columns stay blank (the `min(area, pty)` fallback).
+- **Does not assert:** the debug-build `debug_assert!(pty == inner)` invariant M5 adds (a dev guard, not a runtime assertion — see PRD #84 M5); the single release-mode log line on mismatch.
+- **Platform coverage:** mac+linux.
+- **M1 status (PRD #84):** **Flag / guard (passes today).** Pins the release-path contract M5 must preserve: area > PTY must fall back to `min` and never panic. Current code already does `min` and does not panic, so this is GREEN now and stays GREEN through M5's release fallback. (M5's debug-only `debug_assert!` is explicitly out of scope here — orchestrator brief: "test the release fallback path".)
+- **Post-M5 resolution (PRD #84):** **GREEN (unchanged throughout M1→M5).** M5 preserved the release `min(area, pty)` no-panic fallback (log-once on mismatch) alongside the new debug-build contract `debug_assert!`, so this release-path guard stays green and now pins the fallback the M5 contract intentionally keeps.
+
+#### render/layout
+
+##### render/layout/001 — After a tab/layout switch with N panes the embedded pane's bottom rows show correct (non-stale) content — no off-by-one row shift.
+- **Layer:** L2.
+- **Agent:** none (long-lived `sleep` panes).
+- **Asserts:** with ≥1 embedded pane carrying a known bottom-row marker, after a layout change (`Ctrl+t` toggle) and quiescence, the pane's bottom row still shows its marker — not a stale fragment of the pre-switch layout, and not shifted by a row.
+- **Does not assert:** which layout is default; the pane program's own redraw; that the defect reproduces every run.
+- **Platform coverage:** mac+linux.
+- **M1 status (PRD #84):** **Flag / invariant-check (riskiest entry).** The PRD risk row flags this symptom as possibly a vt100/parser issue below scope. The current code resizes panes on every layout-change path (`Action::ToggleLayout` routes through `resize_*_panes`), so the area/PTY mismatch that would scramble the bottom rows self-heals and is not deterministically observable through the harness. Written as an invariant guard on bottom-row content (PTY size == inner area, observed via rendered content). If it reproduces deterministically after M4+M5, that's follow-up signal — NOT a reason to re-add the clamp.
+- **Post-M5 resolution (PRD #84):** **GREEN.** Stays green after M4+M5 and now runs with the M5 contract `debug_assert!` live in debug builds: a layout toggle that left a pane's PTY out of step with its rect would trip the debug assert instead of self-healing, so the guard exercises the layout-driven resize + 1:1 render contract rather than masking the race. No deterministic bottom-row scramble survived M4+M5 — no below-scope (vt100/parser) follow-up signal, and the clamp stays removed.
+
+##### render/layout/002 — Reactive pane recreation/replace leaves no scrambled fragments — the replacement pane renders cleanly.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** after a pane is recreated/replaced in place (open a second pane, close the first), the rendered grid contains the surviving pane's content and no leftover fragment of the removed pane at a stale position.
+- **Does not assert:** the exact recreation trigger internals; per-cell colours.
+- **Platform coverage:** mac+linux.
+- **M1 status (PRD #84):** **Flag / invariant-check.** Pane open/close and reactive recreation (`src/ui.rs:1510`, `:2147` areas) currently resize the affected PTYs on the spot, so any scramble is transient. Invariant guard on "no stale fragment after replace". GREEN target at M4/M5.
+- **Post-M5 resolution (PRD #84):** **GREEN.** Stays green after M4+M5 and now exercises the pane open/close replace through layout-driven resize + 1:1 widget render with the M5 contract `debug_assert!` live in debug builds — asserting the replace contract rather than masking a self-healing race.
+
+##### render/layout/003 — A mode switch (the `render_mode_tab` path) leaves no short-lived render artefacts after the transition settles.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** after switching into a mode tab and quiescence, the rendered grid shows the destination layout cleanly with no leftover fragment from the dashboard/source layout.
+- **Does not assert:** mode-tab content semantics; the transient mid-transition frame.
+- **Platform coverage:** mac+linux.
+- **M1 status (PRD #84):** **Flag / invariant-check.** Mode switch (`src/ui.rs:2828` area) resizes panes through `resize_mode_tab_panes`, so artefacts are transient. Invariant guard on post-transition cleanliness. GREEN target at M4/M5.
+- **Post-M5 resolution (PRD #84):** **GREEN.** Stays green after M4+M5 and now exercises the `render_mode_tab` switch through layout-driven resize + 1:1 widget render with the M5 contract `debug_assert!` live in debug builds — asserting the mode-switch contract rather than masking a self-healing race.
+
 ### Keybindings (PRD #40)
 
 Keybindings resolve **client-side**: the config file lives on the machine

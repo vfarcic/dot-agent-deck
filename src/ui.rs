@@ -1202,13 +1202,13 @@ impl Default for UiState {
 
 // PRD #76 M2.15 layout-math helpers — single source of truth for the
 // dimensions a freshly-spawned agent PTY (`AgentSpawnOptions.rows/cols`)
-// and a resize-time `resize_pane_pty` call should agree on. Before this,
-// every spawn site hardcoded 24×80 and every resize site reimplemented
-// the layout math inline, so the two could (and did) drift. Now the spawn
-// callsites and `resize_dashboard_panes` / `resize_mode_tab_panes` all
-// call these, so the agent's first frame paints at the eventual size and
-// stays there. All helpers return `(rows, cols)` (= `(height, width)` of
-// the inner area inside the pane's border).
+// should open at. Before this, every spawn site hardcoded 24×80, so the
+// agent's first frame painted at the wrong size. The spawn callsites call
+// these so the PTY opens close to its eventual size; PRD #84 M4 then made
+// the per-frame `resize_panes_to_layout` pass (driven by
+// `compute_frame_layout`) the single owner of resize-time PTY sizing, so
+// these helpers are now spawn-time-only. All return `(rows, cols)` (=
+// `(height, width)` of the inner area inside the pane's border).
 
 /// Agent pane of a mode tab: left half × full height minus 3 rows of
 /// chrome (tab bar + hints bar). Mirrors the mode-tab render layout.
@@ -1300,14 +1300,11 @@ pub(crate) fn dashboard_pane_dims(
 /// than the dashboard's `[33%, 67%]` to leave room for the role status
 /// gutter), height divided across `role_count` role panes per `layout`.
 ///
-/// `role_index` and `focused_role_index` matter only in `Stacked` mode.
-/// The helper treats the role at `focused_role_index` as expanded so
-/// the daemon-side PTY dims match the renderer's "expanded slot"
-/// decision in `render_terminal_panes` (see ui.rs Stacked branch around
-/// `focused_idx`). When `focused_role_index` is `None`, role 0 is
-/// expanded — mirroring the renderer's "expand the first slot if
-/// nothing is focused" fallback. In `Tiled` mode both indices are
-/// ignored.
+/// `role_index` matters only in `Stacked` mode, where role 0 is the
+/// expanded slot and every other role collapses to a 1-row title bar —
+/// mirroring the renderer's "expand the first slot if nothing is
+/// focused" fallback (see `render_terminal_panes` Stacked branch). In
+/// `Tiled` mode `role_index` is ignored (height divides equally).
 ///
 /// `show_tab_bar` is exposed for symmetry with `dashboard_pane_dims` and
 /// because hydration-time callers may briefly be in a "single-tab" state
@@ -1320,32 +1317,24 @@ pub(crate) fn dashboard_pane_dims(
 /// column wider than the rendered area, recreating exactly the
 /// spawn-vs-render drift M2.15 was meant to fix.
 ///
-/// PRD #76 M2.15 fixup pass 2 G2 — before this parameter existed, the
-/// helper hardcoded `role_index == 0` as the expanded slot. That
-/// matched the renderer only when nothing was focused. As soon as the
-/// orchestrator handed off to a non-zero role (or the user tabbed
-/// across roles), the resize sweep gave role 0 the expanded height
-/// while the visibly-expanded focused role kept the collapsed height —
-/// recreating the exact spawn-vs-render drift M2.15 was meant to fix.
-/// `focused_role_index` lets resize callers thread the renderer's
-/// focus decision (via [`focused_orchestration_role_index`]) through
-/// to the helper so the two stay aligned by construction.
+/// PRD #84 M4 removed the resize sweep that once threaded a live
+/// focused-role index through this helper (so role panes could re-expand
+/// on focus). The per-frame `resize_panes_to_layout` pass now owns PTY
+/// sizing from `compute_frame_layout`, so the sole remaining caller is
+/// the spawn path, which spawns `Tiled` with no role focused yet — hence
+/// the `focused_role_index` parameter is gone and role 0 is the
+/// Stacked expanded slot.
 pub(crate) fn orchestration_role_pane_dims(
     frame_area: Rect,
     role_count: usize,
     role_index: usize,
-    focused_role_index: Option<usize>,
     layout: PaneLayout,
     show_tab_bar: bool,
 ) -> (u16, u16) {
-    let is_focused = match focused_role_index {
-        Some(focused) => focused == role_index,
-        // Mirror the renderer's "expand the first slot if nothing is
-        // focused" fallback (see `render_terminal_panes` Stacked
-        // branch — when `focused_idx` is None it sets index 0 to
-        // `Constraint::Fill(1)`).
-        None => role_index == 0,
-    };
+    // Stacked: role 0 is the expanded slot, mirroring the renderer's
+    // "expand the first slot if nothing is focused" fallback. Tiled
+    // ignores `is_focused` (equal division).
+    let is_focused = role_index == 0;
     right_column_pane_dims(
         frame_area,
         ORCHESTRATION_PANES_PERCENT,
@@ -1354,136 +1343,6 @@ pub(crate) fn orchestration_role_pane_dims(
         layout,
         show_tab_bar,
     )
-}
-
-/// PRD #76 M2.15 fixup pass 2 G2 — single source of truth for "which
-/// orchestration role is currently the expanded slot". Used by both
-/// the resize sweep (so PTY dims match the renderer's expanded slot)
-/// and any callsite that needs the same notion of focused-role index.
-/// Mirrors `render_terminal_panes` Stacked branch: a slot is focused
-/// iff `embedded.focused_pane_id()` points at its pane id. Returns
-/// `None` if the embedded controller reports no focused pane, or the
-/// focused pane id doesn't belong to `role_pane_ids` (e.g. focus moved
-/// to the dashboard before the resize sweep ran).
-///
-/// `role_pane_ids` may include the empty-string sentinels that the
-/// hydration path uses for dead orchestration slots (M2.12); those
-/// entries never match a live focused pane id, so they're handled
-/// implicitly without an extra filter step.
-pub(crate) fn focused_orchestration_role_index(
-    embedded: &EmbeddedPaneController,
-    role_pane_ids: &[String],
-) -> Option<usize> {
-    let focused = embedded.focused_pane_id()?;
-    role_pane_ids.iter().position(|id| id == &focused)
-}
-
-/// Resize dashboard panes to match the dashboard layout after a tab switch.
-/// Resize PTYs for a mode tab's agent + side panes to 50% width.
-fn resize_mode_tab_panes(pane: &dyn PaneController, tab_manager: &TabManager, area: Rect) {
-    let (agent_pane_id, side_pane_ids) = match tab_manager.active_tab() {
-        Tab::Mode {
-            agent_pane_id,
-            mode_manager,
-            ..
-        } => (agent_pane_id.clone(), mode_manager.managed_pane_ids()),
-        _ => return,
-    };
-    resize_mode_tab_panes_for(pane, &agent_pane_id, &side_pane_ids, area);
-}
-
-/// Inner helper: resize a specific mode tab's agent + side panes regardless
-/// of which tab is currently active. Pulled out so the M2.15 post-hydration
-/// sweep can iterate every rebuilt mode tab without temporarily switching
-/// tabs to make each one "active" first.
-fn resize_mode_tab_panes_for(
-    pane: &dyn PaneController,
-    agent_pane_id: &str,
-    side_pane_ids: &[String],
-    area: Rect,
-) {
-    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-        let (agent_rows, agent_cols) = mode_agent_pane_dims(area);
-        if agent_rows > 0 && agent_cols > 0 {
-            let _ = embedded.resize_pane_pty(agent_pane_id, agent_rows, agent_cols);
-        }
-        let side_count = side_pane_ids.len().max(1) as u16;
-        let (side_rows, side_cols) = mode_side_pane_dims(area, side_count);
-        if side_rows > 0 && side_cols > 0 {
-            for id in side_pane_ids {
-                let _ = embedded.resize_pane_pty(id, side_rows, side_cols);
-            }
-        }
-    }
-}
-
-fn resize_dashboard_panes(
-    pane: &dyn PaneController,
-    ui: &UiState,
-    tab_manager: &TabManager,
-    area: Rect,
-) {
-    // PRD #76 M2.15 fixup F3: orchestration role panes live in the
-    // `[34%, 66%]` column, not the dashboard's `[33%, 67%]`. Branch on
-    // active tab so each routes through the matching SSOT helper.
-    let is_orchestration = matches!(tab_manager.active_tab(), Tab::Orchestration { .. });
-    let orch_pane_ids = match tab_manager.active_tab() {
-        Tab::Dashboard { .. } => None,
-        Tab::Orchestration { role_pane_ids, .. } => Some(role_pane_ids.clone()),
-        _ => return,
-    };
-    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-        let all = embedded.pane_ids();
-        let pane_ids: Vec<String> = if let Some(ref include) = orch_pane_ids {
-            all.into_iter().filter(|id| include.contains(id)).collect()
-        } else {
-            let exclude = tab_manager.all_managed_pane_ids();
-            all.into_iter().filter(|id| !exclude.contains(id)).collect()
-        };
-        if pane_ids.is_empty() {
-            return;
-        }
-
-        let pane_count = pane_ids.len() as u16;
-        let focused = embedded.focused_pane_id();
-        let show_tab_bar = tab_manager.show_tab_bar();
-
-        // PRD #76 M2.15 fixup pass 2 G2 — derive the focused role index
-        // via the shared helper so the resize sweep agrees with the
-        // renderer's "which slot is expanded" decision in Stacked
-        // layout. Before this, the helper hardcoded role_index==0 as
-        // the expanded slot, so a non-zero focused role would get the
-        // collapsed height while role 0 got the expanded height.
-        let orch_focused_role_index = if is_orchestration {
-            focused_orchestration_role_index(embedded, &pane_ids)
-        } else {
-            None
-        };
-
-        // PRD #76 M2.15: route through the shared layout helpers so the
-        // spawn callsites (which call the same helpers to pre-compute
-        // `AgentSpawnOptions.rows/cols`) agree by construction with what
-        // resize-time eventually applies.
-        for (idx, pane_id) in pane_ids.iter().enumerate() {
-            let is_focused = focused.as_deref() == Some(pane_id.as_str())
-                || (focused.is_none() && pane_id == &pane_ids[0]);
-            let (rows, cols) = if is_orchestration {
-                orchestration_role_pane_dims(
-                    area,
-                    pane_ids.len(),
-                    idx,
-                    orch_focused_role_index,
-                    ui.pane_layout,
-                    show_tab_bar,
-                )
-            } else {
-                dashboard_pane_dims(area, pane_count, is_focused, ui.pane_layout, show_tab_bar)
-            };
-            if rows > 0 && cols > 0 {
-                let _ = embedded.resize_pane_pty(pane_id, rows, cols);
-            }
-        }
-    }
 }
 
 /// PRD #76 M2.15 fixup F1 — saved-session restore spawn dims for a
@@ -1495,13 +1354,13 @@ fn resize_dashboard_panes(
 /// fell through to `AgentSpawnOptions::default()` and opened the
 /// daemon-side PTY at 24×80 — the exact bug M2.15 was meant to
 /// eliminate, just on the restore entry point that wasn't on the
-/// original radar. The post-loop `resize_dashboard_panes` sweep still
-/// runs and reconciles any rounding, but spawning at the right size
-/// removes the visible 24×80 hiccup.
+/// original radar. PRD #84 M4: the per-frame `resize_panes_to_layout`
+/// pass reconciles any rounding once the pane is in the layout, but
+/// spawning at the right size removes the visible 24×80 hiccup.
 ///
 /// `is_focused=false` is used because the restore loop doesn't focus
-/// any pane until the post-loop sweep; the helper is forgiving in
-/// Tiled mode where `is_focused` is ignored.
+/// any pane until after restore; the helper is forgiving in Tiled mode
+/// where `is_focused` is ignored.
 fn dashboard_restore_pane_dims(
     pane: &dyn PaneController,
     tab_manager: &TabManager,
@@ -1520,57 +1379,6 @@ fn dashboard_restore_pane_dims(
         PaneLayout::Tiled,
         tab_manager.show_tab_bar(),
     )
-}
-
-/// Inner helper for orchestration role panes: routes through
-/// `orchestration_role_pane_dims` (right 66% column) rather than the
-/// dashboard's 67% column, matching the orchestration renderer's
-/// `[34%, 66%]` horizontal split. Reachable regardless of which tab is
-/// active so the M2.15 post-hydration sweep can iterate every rebuilt
-/// orchestration tab even though hydration ends with the dashboard
-/// active. Uses `PaneLayout::Tiled` as a spawn-time approximation;
-/// switching to the orchestration tab re-runs `resize_dashboard_panes`
-/// with the real focus state.
-fn resize_orchestration_role_panes_for(
-    pane: &dyn PaneController,
-    role_pane_ids: &[String],
-    area: Rect,
-    show_tab_bar: bool,
-) {
-    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-        // Filter out empty-string sentinels for dead orchestration slots
-        // (M2.12) so we don't issue a resize against a non-existent pane id.
-        // Symptom 2 fix: also drop synthetic dead-slot pane ids
-        // (`__dead-slot__-...`) — they have no PTY to resize.
-        let live: Vec<&String> = role_pane_ids
-            .iter()
-            .filter(|id| !id.is_empty() && !is_dead_slot_pane_id(id))
-            .collect();
-        if live.is_empty() {
-            return;
-        }
-        let role_count = live.len();
-        // PRD #76 M2.15 fixup pass 2 G2 — share the focused-role
-        // decision with the renderer. `Tiled` is hardcoded below so
-        // focus doesn't affect the geometry today, but threading the
-        // value keeps the API consistent and prevents future drift if
-        // this path ever uses `Stacked`.
-        let live_owned: Vec<String> = live.iter().map(|s| (*s).clone()).collect();
-        let focused_role_index = focused_orchestration_role_index(embedded, &live_owned);
-        for (role_index, pane_id) in live.into_iter().enumerate() {
-            let (rows, cols) = orchestration_role_pane_dims(
-                area,
-                role_count,
-                role_index,
-                focused_role_index,
-                PaneLayout::Tiled,
-                show_tab_bar,
-            );
-            if rows > 0 && cols > 0 {
-                let _ = embedded.resize_pane_pty(pane_id, rows, cols);
-            }
-        }
-    }
 }
 
 fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
@@ -2920,18 +2728,13 @@ fn focus_deck(
                         ),
                         std::time::Instant::now(),
                     ));
-                    // PRD #76 M2.15 fixup F2: the post-focus resize sweep is
-                    // performed by the caller (which has access to
-                    // `tab_manager` + the real `frame_area`) via
-                    // `resize_dashboard_panes`, the same SSOT helper used
-                    // at spawn and tab-switch time. The inline `crossterm::
+                    // PRD #84 M4: focusing a pane just updates focus state; the
+                    // per-frame `resize_panes_to_layout` pass sizes the (now
+                    // possibly expanded) pane to its inner area on the next
+                    // frame. No inline resize here — the inline `crossterm::
                     // terminal::size()` + hardcoded `(term_w * 67 / 100)` /
-                    // `saturating_sub(3)` math that used to live here
-                    // diverged from the helpers (no orchestration `66%`
-                    // branch, no `show_tab_bar` chrome accounting) so
-                    // stacked / orchestration focuses produced
-                    // off-by-one-column PTYs until the next user-triggered
-                    // resize.
+                    // `saturating_sub(3)` math that used to live here diverged
+                    // from the real layout and produced off-by-one-column PTYs.
                 }
                 Err(PaneError::CommandFailed(ref msg)) => {
                     state.blocking_write().sessions.remove(*sid);
@@ -4087,8 +3890,6 @@ fn close_tab_by_index(
     ui: &mut UiState,
     state: &SharedState,
     tab_manager: &mut TabManager,
-    pane: &dyn PaneController,
-    frame_area: Rect,
 ) {
     match tab_manager.close_tab(idx) {
         Ok(outcome) => {
@@ -4134,7 +3935,8 @@ fn close_tab_by_index(
                     std::time::Instant::now(),
                 ));
             }
-            resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+            // PRD #84 M4: the pre-draw `resize_panes_to_layout` sizes the
+            // remaining panes on the next frame — no resize pushed here.
         }
         Err(e) => {
             ui.status_message = Some((
@@ -4198,7 +4000,6 @@ fn send_config_gen_prompt(
     ui: &mut UiState,
     pane: &dyn PaneController,
     tab_manager: &mut TabManager,
-    frame_area: Rect,
 ) {
     let prompt = crate::config_gen::config_gen_prompt(cwd);
     match pane.write_to_pane(pane_id, &prompt) {
@@ -4215,8 +4016,8 @@ fn send_config_gen_prompt(
                 tab_manager.capture_focus_on_switch_out();
                 tab_manager.switch_to(tab_idx);
                 tab_manager.record_focus(pane_id);
-                resize_dashboard_panes(pane, ui, tab_manager, frame_area);
-                resize_mode_tab_panes(pane, tab_manager, frame_area);
+                // PRD #84 M4: the destination tab's panes are sized by the
+                // pre-draw `resize_panes_to_layout` on the next frame.
             }
             let _ = pane.focus_pane(pane_id);
             ui.mode = UiMode::PaneInput;
@@ -4312,13 +4113,9 @@ fn dispatch_action(
                 PaneLayout::Stacked => "stacked",
                 PaneLayout::Tiled => "tiled",
             };
-            // PRD #76 M2.15 fixup F2: route through the same SSOT sweep helpers
-            // that handle spawn / tab-switch resize.
-            if tab_manager.active_mode_name().is_some() {
-                resize_mode_tab_panes(pane, tab_manager, frame_area);
-            } else {
-                resize_dashboard_panes(pane, ui, tab_manager, frame_area);
-            }
+            // PRD #84 M4: toggling the layout just flips `ui.pane_layout`; the
+            // pre-draw `resize_panes_to_layout` re-sizes every pane to the new
+            // split on the next frame (it reads `pane_layout`).
             ui.status_message = Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
         }
         // Ctrl+d: enter Normal (command) mode, stay on current tab.
@@ -4418,7 +4215,8 @@ fn dispatch_action(
                                     std::time::Instant::now(),
                                 ));
                             }
-                            resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                            // PRD #84 M4: remaining panes are sized by the
+                            // pre-draw `resize_panes_to_layout` next frame.
                         }
                         Err(e) => {
                             ui.status_message = Some((
@@ -4475,21 +4273,19 @@ fn dispatch_action(
         Action::GlobalNextTab => {
             if tab_manager.show_tab_bar() {
                 let prev_idx = tab_manager.active_index();
-                if switch_tab_with_focus(tab_manager, prev_idx + 1, pane, snapshot, ui) {
-                    resize_dashboard_panes(pane, ui, tab_manager, frame_area);
-                    resize_mode_tab_panes(pane, tab_manager, frame_area);
-                }
+                // PRD #84 M4: switching just updates tab state; the pre-draw
+                // `resize_panes_to_layout` sizes the destination tab's panes on
+                // the next frame. PRD #113: pass `ui` so the deck selection
+                // highlight is deactivated on leave/enter.
+                switch_tab_with_focus(tab_manager, prev_idx + 1, pane, snapshot, ui);
             }
         }
         // Ctrl+PageUp: previous tab (clamped, gated on a visible tab bar).
         Action::GlobalPrevTab => {
             if tab_manager.show_tab_bar() {
                 let prev_idx = tab_manager.active_index();
-                if prev_idx > 0
-                    && switch_tab_with_focus(tab_manager, prev_idx - 1, pane, snapshot, ui)
-                {
-                    resize_dashboard_panes(pane, ui, tab_manager, frame_area);
-                    resize_mode_tab_panes(pane, tab_manager, frame_area);
+                if prev_idx > 0 {
+                    switch_tab_with_focus(tab_manager, prev_idx - 1, pane, snapshot, ui);
                 }
             }
         }
@@ -4499,10 +4295,7 @@ fn dispatch_action(
             if count > 0 {
                 let prev_idx = tab_manager.active_index();
                 let next = (prev_idx + 1) % count;
-                if switch_tab_with_focus(tab_manager, next, pane, snapshot, ui) {
-                    resize_dashboard_panes(pane, ui, tab_manager, frame_area);
-                    resize_mode_tab_panes(pane, tab_manager, frame_area);
-                }
+                switch_tab_with_focus(tab_manager, next, pane, snapshot, ui);
             }
         }
         // Normal-mode BackTab / Left / h: cycle to the previous tab (wraps).
@@ -4511,25 +4304,19 @@ fn dispatch_action(
             if count > 0 {
                 let prev_idx = tab_manager.active_index();
                 let prev = (prev_idx + count - 1) % count;
-                if switch_tab_with_focus(tab_manager, prev, pane, snapshot, ui) {
-                    resize_dashboard_panes(pane, ui, tab_manager, frame_area);
-                    resize_mode_tab_panes(pane, tab_manager, frame_area);
-                }
+                switch_tab_with_focus(tab_manager, prev, pane, snapshot, ui);
             }
         }
-        // PRD #80 M3: click a tab header → switch to that tab (same resize
-        // sweep as the keyboard tab-switch paths). PRD #83: preserve per-tab
-        // focus across the switch.
+        // PRD #80 M3: click a tab header → switch to that tab. PRD #83: preserve
+        // per-tab focus across the switch. PRD #84 M4: PTY sizing happens in the
+        // pre-draw resize pass, not here.
         Action::SelectTab(idx) => {
-            if switch_tab_with_focus(tab_manager, idx, pane, snapshot, ui) {
-                resize_dashboard_panes(pane, ui, tab_manager, frame_area);
-                resize_mode_tab_panes(pane, tab_manager, frame_area);
-            }
+            switch_tab_with_focus(tab_manager, idx, pane, snapshot, ui);
         }
         // PRD #80 M3: click a tab's [×] → close that tab, reusing Ctrl+W's
         // tab-teardown semantics for the clicked tab.
         Action::CloseTab(idx) => {
-            close_tab_by_index(idx, ui, state, tab_manager, pane, frame_area);
+            close_tab_by_index(idx, ui, state, tab_manager);
         }
         // PRD #80 M4 / PRD #83: single-click a card → select exactly that card
         // (PRD #68). Under #83 the Dashboard's selection is keyed by session id
@@ -4575,7 +4362,8 @@ fn dispatch_action(
                 entry.dismissed = true;
             }
             focus_deck(idx, ui, filtered, snapshot, state, pane);
-            resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+            // PRD #84 M4: focusing a card can change which Stacked pane expands;
+            // the pre-draw `resize_panes_to_layout` re-sizes it next frame.
         }
         // Mode tab in-tab navigation (j/Down): move side-pane focus down.
         // PRD #83: focus is tracked by stable pane id (`focused_pane_id`), so
@@ -4747,9 +4535,8 @@ fn dispatch_action(
                         tab_manager.capture_focus_on_switch_out();
                         tab_manager.switch_to(tab_idx);
                         tab_manager.record_focus(pane_id);
-                        let area = frame_area;
-                        resize_dashboard_panes(pane, ui, tab_manager, area);
-                        resize_mode_tab_panes(pane, tab_manager, area);
+                        // PRD #84 M4: the destination tab's panes are sized by
+                        // the pre-draw `resize_panes_to_layout` next frame.
                     }
                     match pane.focus_pane(pane_id) {
                         Ok(()) => {
@@ -4858,21 +4645,18 @@ fn dispatch_action(
                     // adds a new tab next to Dashboard, so the
                     // post-spawn render has ≥2 tabs.
                     // All roles share the same spawn dims (Tiled
-                    // layout); pass role_index=0 and
-                    // focused_role_index=None so the helper falls
+                    // layout); pass role_index=0 so the helper falls
                     // back to "role 0 expanded" — matching the
                     // renderer's "first slot expands" default when
                     // no role is focused yet (panes haven't been
-                    // created at this point).
-                    // PRD #76 M2.15 fixup pass 2 G2 — `Tiled` is
-                    // hardcoded here so the focused_role_index
-                    // parameter is geometrically a no-op, but pass
-                    // it for symmetry / future safety.
+                    // created at this point). `Tiled` makes role_index
+                    // a geometric no-op anyway; the per-frame
+                    // `resize_panes_to_layout` reconciles the exact
+                    // rects once the tab is active.
                     let spawn_dims = orchestration_role_pane_dims(
                         frame_area,
                         orch_config.roles.len(),
                         0,
-                        None,
                         PaneLayout::Tiled,
                         true,
                     );
@@ -4939,9 +4723,10 @@ fn dispatch_action(
                             let _ = pane.focus_pane(&role_pane_ids[start_idx]);
                             ui.mode = UiMode::PaneInput;
 
-                            // Resize role panes to dashboard layout.
-                            let area = frame_area;
-                            resize_dashboard_panes(pane, ui, tab_manager, area);
+                            // PRD #84 M4: role panes were spawned at the
+                            // orchestration layout dims (above); the pre-draw
+                            // `resize_panes_to_layout` reconciles them to the
+                            // exact rect on the next frame.
 
                             // Record creation time for delayed prompt injection fallback.
                             if let Tab::Orchestration { id, .. } = tab_manager.active_tab() {
@@ -5109,14 +4894,12 @@ fn dispatch_action(
                                         }
                                         let _ = pane.focus_pane(&new_id);
                                         ui.mode = UiMode::PaneInput;
-                                        // PRD #76 M2.15: shared
-                                        // layout helpers — spawn
-                                        // and resize math are now
-                                        // identical.
-                                        resize_mode_tab_panes_for(
-                                            pane, &new_id, &side_ids, frame_area,
-                                        );
-                                        // Start commands now that panes are correctly sized
+                                        // PRD #84 M4: the agent + side panes were
+                                        // already spawned at the mode-tab dims
+                                        // (above), so commands start at the right
+                                        // PTY size; the pre-draw
+                                        // `resize_panes_to_layout` reconciles the
+                                        // exact rect next frame. No resize here.
                                         let _ = tab_manager.start_mode_commands();
                                         // Send the agent pane command after resize
                                         // so it starts at the correct PTY dimensions.
@@ -5165,11 +4948,10 @@ fn dispatch_action(
                                 ui.mode = UiMode::PaneInput;
                                 // PRD #113: the freshly-created card is active.
                                 ui.selected_index = Some(filtered.len());
-                                // PRD #76 M2.15: route through the
-                                // shared dashboard-layout helper so
-                                // spawn-time and resize-time math
-                                // can't drift.
-                                resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+                                // PRD #84 M4: the pane was spawned at the
+                                // dashboard layout dims (above); the pre-draw
+                                // `resize_panes_to_layout` reconciles it to the
+                                // exact rect next frame. No resize here.
                                 // PRD #127: a single-agent card carrying a
                                 // `seed_prompt` (the built-in "schedule"
                                 // authoring session) enqueues it for the SAME
@@ -5201,7 +4983,7 @@ fn dispatch_action(
             }
         }
         Action::SendConfigGenPrompt { pane_id, cwd } => {
-            send_config_gen_prompt(&pane_id, &cwd, ui, pane, tab_manager, frame_area);
+            send_config_gen_prompt(&pane_id, &cwd, ui, pane, tab_manager);
         }
         // ===== PRD #80 M5: modal button actions =====
         // quit-confirm [Stop]: resolve like Enter-on-Stop — straight to
@@ -5227,7 +5009,7 @@ fn dispatch_action(
         Action::ConfigGenConfirm => {
             ui.mode = UiMode::Normal;
             if let Some((pane_id, cwd)) = ui.config_gen_target.take() {
-                send_config_gen_prompt(&pane_id, &cwd, ui, pane, tab_manager, frame_area);
+                send_config_gen_prompt(&pane_id, &cwd, ui, pane, tab_manager);
             }
         }
         // config-gen [No]: dismiss for now (hint stays on the card).
@@ -5717,9 +5499,9 @@ pub fn run_tui(
         // PRD #76 M2.15 fixup pass 2 G1 — compute side-pane dims for
         // hydration mode-tab rebuilds. Side panes spawn fresh from the
         // project config (they're not daemon-tracked), so they need
-        // viewport-aware dims at create time. The post-loop hydration
-        // resize sweep below also runs, but spawning at the right size
-        // avoids the 24×80 hiccup.
+        // viewport-aware dims at create time. PRD #84 M4: the per-frame
+        // `resize_panes_to_layout` pass reconciles the exact rects once a tab
+        // is active, but spawning at the right size avoids the 24×80 hiccup.
         let hydration_frame_area = terminal.get_frame().area();
         for bucket in &partition.mode_buckets {
             let cfg = lookup_config(&mut config_cache, &bucket.cwd);
@@ -5965,54 +5747,12 @@ pub fn run_tui(
         preferred_start_tab = first_orchestration_tab_index.unwrap_or(0);
         tab_manager.switch_to(preferred_start_tab);
 
-        // PRD #76 M2.15: push the real viewport dims to every hydrated
-        // pane's daemon-side PTY. `hydrate_from_daemon` rebuilt panes from
-        // the daemon's existing PTYs (at whatever dims the previous TUI
-        // session resized them to) and the local vt100 parsers were seeded
-        // at 24×80. Without this sweep, the agent keeps drawing at the
-        // previous viewport size — often visibly mismatched when the new
-        // session has a different terminal size — until the user's next
-        // window resize or tab switch fires `resize_dashboard_panes` /
-        // `resize_mode_tab_panes`. One pass here covers it.
-        //
-        // We need `terminal.autoresize()` first so `get_frame().area()`
-        // reflects the current terminal, not stale init defaults (no
-        // `draw()` has happened yet at this point in startup).
-        //
-        // Each tab gets the inner helper that matches its layout, not
-        // the active-tab-only public wrappers — at this point the
-        // dashboard is active, so a naive `resize_mode_tab_panes` call
-        // would early-return and leave every mode/orchestration tab's
-        // panes at the wrong dims until the user navigates to them.
-        let _ = terminal.autoresize();
-        let frame_area = terminal.get_frame().area();
-        resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
-        let show_tab_bar = tab_manager.show_tab_bar();
-        for tab in tab_manager.tabs() {
-            match tab {
-                Tab::Mode {
-                    agent_pane_id,
-                    mode_manager,
-                    ..
-                } => {
-                    resize_mode_tab_panes_for(
-                        &*pane,
-                        agent_pane_id,
-                        &mode_manager.managed_pane_ids(),
-                        frame_area,
-                    );
-                }
-                Tab::Orchestration { role_pane_ids, .. } => {
-                    resize_orchestration_role_panes_for(
-                        &*pane,
-                        role_pane_ids,
-                        frame_area,
-                        show_tab_bar,
-                    );
-                }
-                Tab::Dashboard { .. } => {}
-            }
-        }
+        // PRD #84 M4: the post-hydration resize sweep is gone. The panes were
+        // rebuilt from the daemon's existing PTYs (or seeded at 24×80), and the
+        // per-frame `resize_panes_to_layout` (invariant 2) sizes the active tab
+        // on the very first frame; a background mode/orchestration tab is sized
+        // the frame it becomes active — before it is ever rendered — so no tab
+        // is shown at the wrong dims.
     }
 
     if continue_session {
@@ -6085,9 +5825,9 @@ pub fn run_tui(
             // PRD #76 M2.15 fixup F1: route through `create_pane_with_options`
             // with real viewport dims so the restored pane's daemon-side PTY
             // opens at the dashboard layout instead of the legacy 24×80
-            // bleed-through from `AgentSpawnOptions::default()`. The
-            // post-loop `resize_dashboard_panes` sweep still runs to
-            // reconcile any rounding once every restored pane is in place.
+            // bleed-through from `AgentSpawnOptions::default()`. PRD #84 M4:
+            // the per-frame `resize_panes_to_layout` pass reconciles any
+            // rounding once every restored pane is in the layout.
             let (rows, cols) =
                 dashboard_restore_pane_dims(&*pane, &tab_manager, terminal.get_frame().area());
             // PRD #76 M2.13: infer agent_type from the restored command so
@@ -6215,11 +5955,11 @@ pub fn run_tui(
                             for id in &side_ids {
                                 state.blocking_write().register_pane(id.clone());
                             }
-                            // PRD #76 M2.15: route through the shared
-                            // helpers so spawn-time and resize-time use the
-                            // same layout math.
-                            let frame_area = terminal.get_frame().area();
-                            resize_mode_tab_panes_for(&*pane, &new_id, &side_ids, frame_area);
+                            // PRD #84 M4: the restored agent + side panes were
+                            // spawned at the mode-tab dims (above), so commands
+                            // start at the right PTY size; the per-frame
+                            // `resize_panes_to_layout` reconciles the exact rect
+                            // once this tab is active. No resize here.
                             let _ = tab_manager.start_mode_commands();
                             if let Some(ref init_cmd) = mode_config.init_command {
                                 let _ = pane.write_to_pane(&new_id, init_cmd);
@@ -6375,11 +6115,11 @@ pub fn run_tui(
         // overview-first behaviour for non-orchestration sessions.
         tab_manager.switch_to(preferred_start_tab);
 
-        // Resize all restored panes to match the terminal layout, focus the first,
-        // and enter PaneInput mode so the user can type immediately.
+        // Focus the first restored pane and enter PaneInput mode so the user
+        // can type immediately. PRD #84 M4: PTY sizing is handled by the
+        // per-frame `resize_panes_to_layout` on the first loop iteration — no
+        // startup resize sweep here.
         if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-            let frame_area = terminal.get_frame().area();
-            resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
             let ids = embedded.pane_ids();
             if let Some(first_id) = ids.first() {
                 let _ = pane.focus_pane(first_id);
@@ -6425,20 +6165,10 @@ pub fn run_tui(
             st.unregister_pane(old_id);
             st.register_pane(new_id.clone());
             drop(st);
-            // Resize the new pane PTY to match the current side pane
-            // dimensions. PRD #76 M2.15 fixup F2: route through the SSOT
-            // helper instead of recomputing `(width/2).saturating_sub(2)`
-            // / `height/side_count - 2` inline — the helper clamps
-            // `side_count` to 1 so the previous `checked_div` fallback to
-            // `height - 3` is no longer needed.
-            if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-                let frame_area = terminal.get_frame().area();
-                let side_pane_count = embedded.pane_ids().len().saturating_sub(1) as u16; // exclude agent
-                let (pane_rows, half_width) = mode_side_pane_dims(frame_area, side_pane_count);
-                if pane_rows > 0 && half_width > 0 {
-                    let _ = embedded.resize_pane_pty(new_id, pane_rows, half_width);
-                }
-            }
+            // PRD #84 M4: the recreated pane's PTY is sized by the pre-draw
+            // `resize_panes_to_layout` on the next iteration (it was already
+            // spawned at the cached side-pane dims above), so no ad hoc resize
+            // is pushed here.
         }
 
         // PRD #83 M4 — remap every tab's focused pane after a reactive
@@ -6620,6 +6350,54 @@ pub fn run_tui(
             labels: tab_bar_labels,
             active_index: tab_manager.active_index(),
         };
+        // PRD #84 M4 (invariants 1, 2 & 4) — ONE layout pass per frame, then
+        // compute → resize → render, all against the SAME live frame area.
+        //
+        // `terminal.draw()` autoresizes the backing buffer to the live terminal
+        // size before invoking the closure, so we must autoresize HERE too
+        // before reading `get_frame().area()` (mirroring the hydration sweep at
+        // the `terminal.autoresize()` call above). Without it, the first frame
+        // after a terminal resize would size PTYs to the STALE pre-resize area
+        // while the widget renders into the NEW area — tripping the
+        // `contract_guaranteed` debug_assert in debug (one-frame empty band in
+        // release). `compute_frame_layout` is computed once here and fed to BOTH
+        // `resize_panes_to_layout` and `render_frame`, so PTY sizes and rendered
+        // rects are guaranteed identical this frame (no second layout pass).
+        let _ = terminal.autoresize();
+        let full_frame_area = terminal.get_frame().area();
+        // PRD #139 M4.1 + PRD #84: throwaway experimental footer, gated at the
+        // single user-visible seam (`show_experimental_footer()` — CLAUDE.md #9;
+        // grep that name to find this site at graduation). When ON, reserve the
+        // bottom row for the `experimental: on` label and lay the rest of the
+        // frame out above it; when OFF the layout is byte-for-byte the
+        // pre-feature baseline. The reservation happens HERE, before
+        // `compute_frame_layout`, so the whole layout pass (and the PTY sizing it
+        // drives) sits above the footer. Snapshot the flag ONCE per frame
+        // (Greptile P2) so the gate and the footer render observe the same
+        // value — reading it twice opened a TOCTOU window where the ~2s watcher
+        // could flip it between the reads, cropping the main content by a row.
+        let features_snap = crate::features::current();
+        let (frame_area, experimental_footer_area) = if features_snap.experimental {
+            let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
+                .split(full_frame_area);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (full_frame_area, None)
+        };
+        let embedded_panes = pane.as_any().downcast_ref::<EmbeddedPaneController>();
+        let all_pane_ids = embedded_panes.map(|e| e.pane_ids()).unwrap_or_default();
+        let focused_pane_id = embedded_panes.and_then(|e| e.focused_pane_id());
+        let frame_layout = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar_info,
+            &all_pane_ids,
+            pane_layout,
+            focused_pane_id.as_deref(),
+        );
+        if let Some(embedded) = embedded_panes {
+            resize_panes_to_layout(&frame_layout, embedded);
+        }
         terminal.draw(|frame| {
             render_frame(
                 frame,
@@ -6632,7 +6410,14 @@ pub fn run_tui(
                 pane_layout,
                 &tab_view,
                 &tab_bar_info,
+                &frame_layout,
             );
+            // PRD #139: draw the experimental footer into the reserved bottom
+            // row (disjoint from `frame_layout`), using the SAME flag snapshot
+            // the reservation above used.
+            if let Some(footer_area) = experimental_footer_area {
+                render_experimental_footer(frame, &features_snap, footer_area);
+            }
         })?;
         tick = tick.wrapping_add(1);
 
@@ -6745,12 +6530,12 @@ pub fn run_tui(
         loop {
             let ev = event::read()?;
 
-            // Handle terminal resize: update PTY dimensions for all embedded panes.
+            // PRD #84 M4 (invariant 4): a terminal resize is now just a
+            // re-render trigger. The pre-draw `resize_panes_to_layout` at the
+            // top of the next loop iteration recomputes the layout and commits
+            // the new PTY sizes — no PTY work happens in the event handler.
             if let Event::Resize(_w, _h) = ev {
-                let frame_area = terminal.get_frame().area();
-                resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
-                resize_mode_tab_panes(&*pane, &tab_manager, frame_area);
-                break; // re-render after resize
+                break; // re-render; layout-driven resize handles PTY sizing
             }
 
             // Handle mouse events: scroll, text selection, and copy.
@@ -7851,6 +7636,326 @@ fn render_tab_strip(
     TabStripRects { headers, closes }
 }
 
+/// PRD #84 M3/M4 — the result of the single per-frame layout pass. Holds every
+/// structural rect the render path draws into: the optional tab-bar row, the
+/// hints/button-bar row, and the per-tab-variant content rects. `render_frame`
+/// and `render_mode_tab` read their rects from here instead of splitting layout
+/// inline (contract invariant 1: one layout pass per frame). M4: it also
+/// carries each terminal pane's OUTER rect so `resize_panes_to_layout` can
+/// derive PTY size from the layout (invariant 2). See
+/// `docs/develop/rendering-contract.md`.
+struct FrameLayout {
+    /// Tab-bar row, present only when the tab strip is shown this frame
+    /// (`TabBarInfo::show`).
+    tab_bar: Option<Rect>,
+    /// Bottom hints / button-bar row.
+    hints: Rect,
+    /// Per-tab-variant content rects.
+    content: FrameContent,
+}
+
+/// The content region of a frame, resolved per active-tab variant.
+enum FrameContent {
+    /// Dashboard / Orchestration: card grid on the left, optional terminal
+    /// pane column on the right. `pane_ids` is the filtered, render-ordered set
+    /// of panes shown in `panes_area`. `pane_rects` is each pane's OUTER rect
+    /// in that column (M4: same `pane_stack_rects` split `render_terminal_panes`
+    /// draws into, so the PTY-resize target and the rendered rect can't drift).
+    Cards {
+        dashboard_area: Rect,
+        panes_area: Option<Rect>,
+        pane_ids: Vec<String>,
+        pane_rects: Vec<(String, Rect)>,
+    },
+    /// Mode tab: single agent pane (left 50%) and stacked side panes
+    /// (right 50%). `side_pane_rects` is the per-side-pane OUTER rect keyed by
+    /// pane id, in render order — the source for `ui.side_pane_rects` (scroll +
+    /// click hit-testing) and (M4) the side-pane PTY-resize targets.
+    /// `agent_pane_id` keys the agent pane, whose OUTER rect is `agent_area`.
+    Mode {
+        agent_area: Rect,
+        side_area: Rect,
+        agent_pane_id: String,
+        side_pane_rects: Vec<(String, Rect)>,
+    },
+}
+
+impl FrameLayout {
+    /// PRD #84 M4 — every local terminal pane's target PTY size `(rows, cols)`
+    /// keyed by pane id, derived from its layout rect: the bordered
+    /// `TerminalWidget`'s inner content area is the OUTER rect shrunk by the
+    /// 1-cell border on each side, so `(rows, cols) = (h - 2, w - 2)`. This is
+    /// the single source `resize_panes_to_layout` drives PTYs from (invariant
+    /// 2). Collapsed Stacked panes resolve to a zero dimension and are filtered
+    /// by the caller.
+    fn pane_target_dims(&self) -> Vec<(&str, u16, u16)> {
+        // Inner area of a bordered pane = outer minus 1 cell on each side.
+        let dims = |rect: Rect| (rect.height.saturating_sub(2), rect.width.saturating_sub(2));
+        let mut out = Vec::new();
+        match &self.content {
+            FrameContent::Cards { pane_rects, .. } => {
+                for (id, rect) in pane_rects {
+                    let (rows, cols) = dims(*rect);
+                    out.push((id.as_str(), rows, cols));
+                }
+            }
+            FrameContent::Mode {
+                agent_area,
+                agent_pane_id,
+                side_pane_rects,
+                ..
+            } => {
+                if !agent_pane_id.is_empty() {
+                    let (rows, cols) = dims(*agent_area);
+                    out.push((agent_pane_id.as_str(), rows, cols));
+                }
+                for (id, rect) in side_pane_rects {
+                    let (rows, cols) = dims(*rect);
+                    out.push((id.as_str(), rows, cols));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// PRD #84 M3/M4 — the single per-frame layout pass. Given the frame area, the
+/// active tab view, the tab-bar snapshot, the full set of embedded pane ids,
+/// the active `PaneLayout`, and the controller's focused pane, produce every
+/// structural rect the render path draws into — including each terminal pane's
+/// OUTER rect (M4, used to size PTYs). The split math mirrors
+/// `render_frame` / `render_mode_tab` / `render_terminal_panes` exactly, so the
+/// rendered output and the resize target agree by construction.
+fn compute_frame_layout(
+    frame_area: Rect,
+    tab_view: &ActiveTabView,
+    tab_bar: &TabBarInfo,
+    all_pane_ids: &[String],
+    pane_layout: PaneLayout,
+    focused_pane_id: Option<&str>,
+) -> FrameLayout {
+    // Vertical: optional tab bar at top, main content, hints bar at bottom.
+    let (tab_bar_rect, main_area, hints) = if tab_bar.show {
+        let chunks = Layout::vertical([
+            Constraint::Length(1), // tab bar
+            Constraint::Fill(1),   // main content
+            Constraint::Length(1), // hints bar
+        ])
+        .split(frame_area);
+        (Some(chunks[0]), chunks[1], chunks[2])
+    } else {
+        let chunks =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(frame_area);
+        (None, chunks[0], chunks[1])
+    };
+
+    let content = match tab_view {
+        ActiveTabView::Mode {
+            agent_pane_id,
+            side_pane_ids,
+            ..
+        } => {
+            // 50/50 horizontal split: agent pane left, side panes right.
+            let chunks =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(main_area);
+            let agent_area = chunks[0];
+            let side_area = chunks[1];
+            // Side-pane rects: the same Tiled vertical split
+            // `render_terminal_panes` draws the side panes into (and the source
+            // for `ui.side_pane_rects`). Skipped when there are no side panes
+            // (the old code only pushed these inside its non-empty guard).
+            let side_pane_rects: Vec<(String, Rect)> = if side_pane_ids.is_empty() {
+                Vec::new()
+            } else {
+                let chunks =
+                    pane_stack_rects(side_area, side_pane_ids, PaneLayout::Tiled, focused_pane_id);
+                side_pane_ids.iter().cloned().zip(chunks).collect()
+            };
+            FrameContent::Mode {
+                agent_area,
+                side_area,
+                agent_pane_id: agent_pane_id.clone(),
+                side_pane_rects,
+            }
+        }
+        ActiveTabView::Dashboard { exclude_pane_ids } => {
+            let pane_ids: Vec<String> = all_pane_ids
+                .iter()
+                .filter(|&id| !exclude_pane_ids.contains(id))
+                .cloned()
+                .collect();
+            let (dashboard_area, panes_area) = split_cards_area(
+                main_area,
+                &pane_ids,
+                DASHBOARD_LEFT_PERCENT,
+                DASHBOARD_PANES_PERCENT,
+            );
+            let pane_rects = cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id);
+            FrameContent::Cards {
+                dashboard_area,
+                panes_area,
+                pane_ids,
+                pane_rects,
+            }
+        }
+        ActiveTabView::Orchestration { role_pane_ids, .. } => {
+            let pane_ids: Vec<String> = all_pane_ids
+                .iter()
+                .filter(|&id| role_pane_ids.contains(id))
+                .cloned()
+                .collect();
+            let (dashboard_area, panes_area) = split_cards_area(
+                main_area,
+                &pane_ids,
+                ORCHESTRATION_LEFT_PERCENT,
+                ORCHESTRATION_PANES_PERCENT,
+            );
+            let pane_rects = cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id);
+            FrameContent::Cards {
+                dashboard_area,
+                panes_area,
+                pane_ids,
+                pane_rects,
+            }
+        }
+    };
+
+    FrameLayout {
+        tab_bar: tab_bar_rect,
+        hints,
+        content,
+    }
+}
+
+/// Per-pane OUTER rects for the dashboard / orchestration right pane column,
+/// keyed by pane id. `None` (no panes) yields an empty list; otherwise the
+/// `pane_stack_rects` split that `render_terminal_panes` draws the panes into.
+fn cards_pane_rects(
+    panes_area: Option<Rect>,
+    pane_ids: &[String],
+    pane_layout: PaneLayout,
+    focused_pane_id: Option<&str>,
+) -> Vec<(String, Rect)> {
+    match panes_area {
+        Some(area) if !pane_ids.is_empty() => {
+            let chunks = pane_stack_rects(area, pane_ids, pane_layout, focused_pane_id);
+            pane_ids.iter().cloned().zip(chunks).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Split a dashboard / orchestration main area into the left card grid and the
+/// optional right pane column. With no panes the whole area is the grid (no
+/// right column); otherwise a `[left_percent, panes_percent]` horizontal split.
+fn split_cards_area(
+    main_area: Rect,
+    pane_ids: &[String],
+    left_percent: u16,
+    panes_percent: u16,
+) -> (Rect, Option<Rect>) {
+    if pane_ids.is_empty() {
+        (main_area, None)
+    } else {
+        let chunks = Layout::horizontal([
+            Constraint::Percentage(left_percent),
+            Constraint::Percentage(panes_percent),
+        ])
+        .split(main_area);
+        (chunks[0], Some(chunks[1]))
+    }
+}
+
+/// PRD #84 — which pane index is the expanded (full-height) slot in a `Stacked`
+/// pane column: the focused pane, or — when nothing in the stack is focused —
+/// the first pane. `None` only for an empty stack. Single source of truth so
+/// the rect split and `render_terminal_panes`' per-pane render agree on which
+/// slot expands.
+fn stacked_expanded_index(pane_ids: &[String], focused_id: Option<&str>) -> Option<usize> {
+    if let Some(i) = pane_ids
+        .iter()
+        .position(|id| focused_id == Some(id.as_str()))
+    {
+        Some(i)
+    } else if pane_ids.is_empty() {
+        None
+    } else {
+        Some(0)
+    }
+}
+
+/// PRD #84 — the per-pane OUTER rects for a vertical terminal stack, matching
+/// exactly how `render_terminal_panes` lays panes out for the given
+/// `PaneLayout` and resolved focus. Single source of truth so the layout pass
+/// (which drives PTY resize) and the renderer can't disagree on a pane's rect.
+/// `Tiled`: equal vertical division. `Stacked`: the expanded slot fills, every
+/// other pane collapses to a 1-row title bar.
+fn pane_stack_rects(
+    area: Rect,
+    pane_ids: &[String],
+    layout: PaneLayout,
+    focused_id: Option<&str>,
+) -> Vec<Rect> {
+    if pane_ids.is_empty() {
+        return Vec::new();
+    }
+    let constraints: Vec<Constraint> = match layout {
+        PaneLayout::Tiled => pane_ids
+            .iter()
+            .map(|_| Constraint::Ratio(1, pane_ids.len() as u32))
+            .collect(),
+        PaneLayout::Stacked => {
+            // Focused pane gets remaining space; unfocused get a single
+            // collapsed title row (`title_bar_height = 1`).
+            let expanded = stacked_expanded_index(pane_ids, focused_id);
+            pane_ids
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    if expanded == Some(i) {
+                        Constraint::Fill(1)
+                    } else {
+                        Constraint::Length(1)
+                    }
+                })
+                .collect()
+        }
+    };
+    Layout::vertical(constraints).split(area).to_vec()
+}
+
+/// PRD #84 M4 (invariant 2) — derive each local pane's PTY size from its layout
+/// rect and commit only the deltas. Runs once per frame, after
+/// `compute_frame_layout` and before `terminal.draw`, so every layout-changing
+/// path (resize, tab open/close, mode switch, reactive pane recreation,
+/// orchestration role transition) converges here instead of pushing its own
+/// `resize_pane_pty` from a private dimension calculation.
+///
+/// A pane whose target inner area has a zero dimension (a collapsed Stacked
+/// slot, or a viewport too small for the border) is skipped — matching the old
+/// helpers' `rows > 0 && cols > 0` guard. `resize_pane_pty` is the one resize
+/// primitive and handles local vs stream-backed panes itself (stream panes
+/// coalesce to the daemon; see `embedded_pane.rs`), so no per-backend
+/// special-casing is needed here.
+fn resize_panes_to_layout(layout: &FrameLayout, embedded: &EmbeddedPaneController) {
+    for (pane_id, rows, cols) in layout.pane_target_dims() {
+        if rows == 0 || cols == 0 {
+            continue;
+        }
+        // Compare against the pane's current parser size (kept in lockstep with
+        // the PTY by `resize_pane_pty`) and only commit a real delta, so a
+        // steady frame issues no resize traffic.
+        let current = embedded.get_screen(pane_id).and_then(|arc| {
+            let parser = arc.lock().ok()?;
+            Some(parser.screen().size())
+        });
+        if current != Some((rows, cols)) {
+            let _ = embedded.resize_pane_pty(pane_id, rows, cols);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     frame: &mut Frame,
@@ -7863,31 +7968,14 @@ fn render_frame(
     pane_layout: PaneLayout,
     tab_view: &ActiveTabView,
     tab_bar: &TabBarInfo,
+    layout: &FrameLayout,
 ) {
-    // PRD #139 M4.1: throwaway experimental footer, gated at the single
-    // user-visible seam for this feature (the `show_experimental_footer()`
-    // wrapper — CLAUDE.md #9; grep that name to find this site at graduation).
-    // When ON, reserve the bottom row for the `experimental: on` label and lay
-    // the rest of the frame out above it; when OFF the layout is byte-for-byte
-    // the pre-feature baseline.
-    let area = {
-        let full = frame.area();
-        // Greptile P2: snapshot the flag ONCE per frame so the gate decision and
-        // the render observe the same value. Reading it twice (gate, then render)
-        // opened a TOCTOU window where the ~2s watcher could flip it between the
-        // reads — reserving a footer row but drawing nothing (cropping the main
-        // content by a row), or vice versa. `features_snap.experimental` is
-        // exactly what `show_experimental_footer()` returns, without a second
-        // lock acquisition.
-        let features_snap = crate::features::current();
-        if features_snap.experimental {
-            let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(full);
-            render_experimental_footer(frame, &features_snap, chunks[1]);
-            chunks[0]
-        } else {
-            full
-        }
-    };
+    // PRD #84 + #139: `render_frame` reads the precomputed `FrameLayout` (one
+    // layout pass per frame). The PRD #139 experimental-footer row is reserved
+    // in the main loop BEFORE `compute_frame_layout` (so the whole layout, and
+    // the PTY sizing it drives, sits above the footer) and the footer itself is
+    // drawn there in the same `terminal.draw` — see the gating block around the
+    // `compute_frame_layout` call. So there is nothing footer-related to do here.
     ui.side_pane_rects.clear();
     ui.agent_pane_rect = None;
     // PRD #80 M4: rebuilt below only for the dashboard card grid; clearing here
@@ -7904,15 +7992,22 @@ fn render_frame(
     // shows through (`Color::Reset`). Filling it with an absolute color was
     // the original light-terminal bug — a black slab over a light theme.
 
-    // Layout: optional tab bar at top, main content, hints bar at bottom.
-    let (main_area, hints_area) = if tab_bar.show {
-        let chunks = Layout::vertical([
-            Constraint::Length(1), // tab bar
-            Constraint::Fill(1),   // main content
-            Constraint::Length(1), // hints bar
-        ])
-        .split(area);
+    // Determine if we have embedded terminal panes to show on the right.
+    let embedded = pane_controller
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>();
 
+    // PRD #84 M3/M4 — one layout pass per frame (invariant 1). The single
+    // `FrameLayout` is computed once by the caller from the live frame area and
+    // fed to BOTH the pre-draw `resize_panes_to_layout` (PTY sizing) and this
+    // render pass, so the rects drawn here are exactly the PTY-resize targets.
+    // This function only reads from it; it never splits layout itself. See
+    // `docs/develop/rendering-contract.md`.
+    let hints_area = layout.hints;
+
+    // Tab strip: render into the bar rect the layout pass reserved, or drop any
+    // stale click rects when no strip is shown this frame.
+    if let Some(tab_bar_rect) = layout.tab_bar {
         // PRD #80 M3: the Dashboard tab (always index 0) carries no close
         // affordance; Mode and Orchestration tabs do. Pass the per-tab
         // closeable mask to the tab-strip renderer, and record the clickable
@@ -7922,91 +8017,66 @@ fn render_frame(
         let closeable: Vec<bool> = (0..tab_bar.labels.len()).map(|i| i != 0).collect();
         let strip = render_tab_strip(
             frame,
-            chunks[0],
+            tab_bar_rect,
             &tab_bar.labels,
             &closeable,
             tab_bar.active_index,
         );
         ui.tab_header_rects = strip.headers;
         ui.tab_close_rects = strip.closes;
-
-        (chunks[1], chunks[2])
     } else {
         // No tab strip this frame — drop any stale rects so a click can't hit a
         // tab affordance that isn't on screen.
         ui.tab_header_rects.clear();
         ui.tab_close_rects.clear();
-        let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
-        (chunks[0], chunks[1])
-    };
-
-    // Determine if we have embedded terminal panes to show on the right.
-    let embedded = pane_controller
-        .as_any()
-        .downcast_ref::<EmbeddedPaneController>();
-
-    // ── Mode tab rendering ─────────────────────────────────────────────
-    if let ActiveTabView::Mode {
-        agent_pane_id,
-        side_pane_ids,
-        focused_pane_id,
-        ..
-    } = tab_view
-    {
-        render_mode_tab(
-            frame,
-            ui,
-            embedded,
-            agent_pane_id,
-            side_pane_ids,
-            main_area,
-            hints_area,
-            has_pane_control,
-            active_mode_name,
-            focused_pane_id.as_deref(),
-        );
-        return;
     }
 
-    // ── Dashboard / Orchestration tab rendering ──────────────────────
-    let all_pane_ids = embedded.map(|e| e.pane_ids()).unwrap_or_default();
-    let (pane_ids, dashboard_area, panes_area) = match tab_view {
-        ActiveTabView::Dashboard { exclude_pane_ids } => {
-            let pane_ids: Vec<String> = all_pane_ids
-                .into_iter()
-                .filter(|id| !exclude_pane_ids.contains(id))
-                .collect();
-            let (dashboard_area, panes_area) = if pane_ids.is_empty() {
-                (main_area, None)
-            } else {
-                let chunks = Layout::horizontal([
-                    Constraint::Percentage(DASHBOARD_LEFT_PERCENT),
-                    Constraint::Percentage(DASHBOARD_PANES_PERCENT),
-                ])
-                .split(main_area);
-                (chunks[0], Some(chunks[1]))
+    // Branch on the content the layout pass resolved. Mode tabs render and
+    // return here; dashboard / orchestration fall through to the card grid.
+    let (dashboard_area, panes_area, pane_ids, pane_rects) = match &layout.content {
+        FrameContent::Mode {
+            agent_area,
+            side_area,
+            side_pane_rects,
+            ..
+        } => {
+            let ActiveTabView::Mode {
+                agent_pane_id,
+                side_pane_ids,
+                focused_pane_id,
+                ..
+            } = tab_view
+            else {
+                unreachable!("FrameContent::Mode is produced only for ActiveTabView::Mode")
             };
-            (pane_ids, dashboard_area, panes_area)
+            render_mode_tab(
+                frame,
+                ui,
+                embedded,
+                agent_pane_id,
+                side_pane_ids,
+                *agent_area,
+                *side_area,
+                side_pane_rects,
+                hints_area,
+                has_pane_control,
+                active_mode_name,
+                focused_pane_id.as_deref(),
+            );
+            return;
         }
-        ActiveTabView::Orchestration { role_pane_ids, .. } => {
-            let pane_ids: Vec<String> = all_pane_ids
-                .into_iter()
-                .filter(|id| role_pane_ids.contains(id))
-                .collect();
-            let (dashboard_area, panes_area) = if pane_ids.is_empty() {
-                (main_area, None)
-            } else {
-                let chunks = Layout::horizontal([
-                    Constraint::Percentage(ORCHESTRATION_LEFT_PERCENT),
-                    Constraint::Percentage(ORCHESTRATION_PANES_PERCENT),
-                ])
-                .split(main_area);
-                (chunks[0], Some(chunks[1]))
-            };
-            (pane_ids, dashboard_area, panes_area)
-        }
-        _ => unreachable!(),
+        FrameContent::Cards {
+            dashboard_area,
+            panes_area,
+            pane_ids,
+            pane_rects,
+        } => (*dashboard_area, *panes_area, pane_ids, pane_rects),
     };
+
+    // PRD #84: the OUTER rect each pane in the right column was sized to this
+    // frame, in `pane_ids` order — threaded into `render_terminal_panes` so it
+    // draws into exactly these (single source of truth with the PTY resize).
+    let pane_outer_rects: Vec<Rect> = pane_rects.iter().map(|(_, rect)| *rect).collect();
 
     // Orchestration tabs use the same dashboard card rendering as the main dashboard.
 
@@ -8031,11 +8101,12 @@ fn render_frame(
                 frame,
                 embedded,
                 right,
-                &pane_ids,
+                pane_ids,
                 pane_layout,
                 &ui.pane_display_names,
                 &ui.selection,
                 None,
+                Some(&pane_outer_rects),
             );
         }
 
@@ -8118,11 +8189,12 @@ fn render_frame(
                 frame,
                 embedded,
                 right,
-                &pane_ids,
+                pane_ids,
                 pane_layout,
                 &ui.pane_display_names,
                 &ui.selection,
                 None,
+                Some(&pane_outer_rects),
             );
         }
         render_overlays(frame, ui, active_mode_name);
@@ -8233,11 +8305,12 @@ fn render_frame(
             frame,
             embedded,
             right,
-            &pane_ids,
+            pane_ids,
             pane_layout,
             &ui.pane_display_names,
             &ui.selection,
             None,
+            Some(&pane_outer_rects),
         );
     }
 
@@ -8314,6 +8387,12 @@ fn render_terminal_panes(
     display_names: &HashMap<String, String>,
     selection: &Option<TextSelection>,
     visual_focus_id: Option<&str>,
+    // PRD #84: per-pane OUTER rects (aligned 1:1 with `pane_ids`) precomputed by
+    // `compute_frame_layout` — the SAME rects `resize_panes_to_layout` sized the
+    // PTYs to this frame. `Some` => draw into exactly those; `None` => recompute
+    // via `pane_stack_rects` (used by callers without a `FrameLayout` rect list,
+    // e.g. the mode-tab agent / side panes).
+    precomputed_rects: Option<&[Rect]>,
 ) -> Option<Rect> {
     let ctrl = embedded?;
     if pane_ids.is_empty() {
@@ -8341,18 +8420,37 @@ fn render_terminal_panes(
     let mut focused_pane_rect: Option<Rect> = None;
     let mut focused_screen: Option<std::sync::Arc<std::sync::Mutex<vt100::Parser>>> = None;
 
+    // PRD #84: the per-pane OUTER rects are the single source of truth shared
+    // with `resize_panes_to_layout`. When the caller threads in the exact
+    // `FrameLayout` rects the PTYs were sized to (the Cards render path), draw
+    // into THOSE — the drawn rect is the resized rect, no second
+    // `pane_stack_rects` pass, no correctness-by-timing assumption. Callers
+    // without a `FrameLayout` rect list recompute via the same helper.
+    let computed_chunks;
+    let chunks: &[Rect] = match precomputed_rects {
+        Some(rects) => {
+            debug_assert_eq!(
+                rects.len(),
+                pane_ids.len(),
+                "precomputed pane rects must align 1:1 with pane_ids"
+            );
+            rects
+        }
+        None => {
+            computed_chunks = pane_stack_rects(area, pane_ids, layout, focused_id.as_deref());
+            &computed_chunks
+        }
+    };
     match layout {
         PaneLayout::Tiled => {
-            let constraints: Vec<Constraint> = pane_ids
-                .iter()
-                .map(|_| Constraint::Ratio(1, pane_ids.len() as u32))
-                .collect();
-            let chunks = Layout::vertical(constraints).split(area);
             for (i, pane_id) in pane_ids.iter().enumerate() {
                 if let Some(screen) = ctrl.get_screen(pane_id) {
                     let focused = focused_id.as_deref() == Some(pane_id.as_str());
                     let title = pane_name(pane_id);
-                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused);
+                    // PRD #84 M5: this pane was sized to `chunks[i]` by
+                    // `resize_panes_to_layout` this frame, so attest the contract.
+                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused)
+                        .contract_guaranteed(true);
                     if focused {
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
@@ -8362,35 +8460,20 @@ fn render_terminal_panes(
             }
         }
         PaneLayout::Stacked => {
-            // Focused pane gets remaining space; unfocused get a single collapsed title row.
-            let title_bar_height: u16 = 1;
-            let mut constraints: Vec<Constraint> = Vec::new();
-            let mut focused_idx: Option<usize> = None;
-
-            for (i, pane_id) in pane_ids.iter().enumerate() {
-                let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
-                if is_focused {
-                    constraints.push(Constraint::Fill(1));
-                    focused_idx = Some(i);
-                } else {
-                    constraints.push(Constraint::Length(title_bar_height));
-                }
-            }
-
-            // If no pane is focused, expand the first one.
-            if focused_idx.is_none() && !pane_ids.is_empty() {
-                constraints[0] = Constraint::Fill(1);
-                focused_idx = Some(0);
-            }
-
-            let chunks = Layout::vertical(constraints).split(area);
+            // Focused pane gets remaining space; unfocused get a single
+            // collapsed title row. `stacked_expanded_index` resolves which slot
+            // expands (focused, else first) — the same decision the split used.
+            let focused_idx = stacked_expanded_index(pane_ids, focused_id.as_deref());
             for (i, pane_id) in pane_ids.iter().enumerate() {
                 let is_expanded = focused_idx == Some(i);
                 let title = pane_name(pane_id);
                 if is_expanded {
                     if let Some(screen) = ctrl.get_screen(pane_id) {
                         let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
-                        let widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused);
+                        // PRD #84 M5: the expanded pane was sized to `chunks[i]`
+                        // by `resize_panes_to_layout` this frame — attest it.
+                        let widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused)
+                            .contract_guaranteed(true);
                         if is_focused {
                             focused_pane_rect = Some(chunks[i]);
                             focused_screen = Some(screen);
@@ -8470,6 +8553,10 @@ fn render_terminal_panes(
 }
 
 /// Render a mode tab: agent pane on left 50%, side panes stacked on right 50%.
+///
+/// PRD #84 M3: the 50/50 split and the side-pane hit-test rects are computed by
+/// `compute_frame_layout` and passed in (`agent_area`, `side_area`,
+/// `side_pane_rects`); this function no longer splits layout itself.
 #[allow(clippy::too_many_arguments)]
 fn render_mode_tab(
     frame: &mut Frame,
@@ -8477,7 +8564,9 @@ fn render_mode_tab(
     embedded: Option<&EmbeddedPaneController>,
     agent_pane_id: &str,
     side_pane_ids: &[String],
-    main_area: Rect,
+    agent_area: Rect,
+    side_area: Rect,
+    side_pane_rects: &[(String, Rect)],
     hints_area: Rect,
     has_pane_control: bool,
     active_mode_name: Option<&str>,
@@ -8495,13 +8584,7 @@ fn render_mode_tab(
         None
     };
 
-    // 50/50 horizontal split
-    let chunks = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(main_area);
-    let agent_area = chunks[0];
-    let side_area = chunks[1];
-
-    // Track agent pane rect for click-to-focus.
+    // Track agent pane rect for click-to-focus (sourced from FrameLayout).
     ui.agent_pane_rect = Some(agent_area);
 
     // Left side: single agent pane
@@ -8516,6 +8599,9 @@ fn render_mode_tab(
             &ui.pane_display_names,
             &ui.selection,
             agent_visual_focus,
+            // Mode-tab panes recompute their rects (out of the Cards finding's
+            // scope); the agent pane is a single Stacked pane filling agent_area.
+            None,
         );
         if rect.is_some() {
             ui.focused_pane_rect = rect;
@@ -8533,22 +8619,18 @@ fn render_mode_tab(
             &ui.pane_display_names,
             &ui.selection,
             side_visual_focus.as_deref(),
+            // Mode side panes recompute via pane_stack_rects (Tiled) — same
+            // split as the `side_pane_rects` above; out of the Cards finding's scope.
+            None,
         );
         // Use side pane rect when a side pane is visually focused, or as fallback.
         if side_visual_focus.is_some() || ui.focused_pane_rect.is_none() {
             ui.focused_pane_rect = rect;
         }
 
-        // Track side pane rects for scroll hit-testing
-        let count = side_pane_ids.len() as u32;
-        let constraints: Vec<Constraint> = side_pane_ids
-            .iter()
-            .map(|_| Constraint::Ratio(1, count))
-            .collect();
-        let chunks = Layout::vertical(constraints).split(side_area);
-        for (i, pane_id) in side_pane_ids.iter().enumerate() {
-            ui.side_pane_rects.push((pane_id.clone(), chunks[i]));
-        }
+        // Track side pane rects for scroll / click hit-testing — sourced from
+        // the FrameLayout pass (same vertical split that draws them).
+        ui.side_pane_rects.extend(side_pane_rects.iter().cloned());
     }
 
     // Full-width hints bar — mode tabs show only the global buttons (no
@@ -11474,14 +11556,8 @@ mod tests {
         // 100 * 66 / 100 = 66; cols = 64. Critical assertion: cols = 64,
         // NOT 65 (which is what `dashboard_pane_dims` would return for
         // the same input). The 1-col gap is exactly the F3 drift bug.
-        let (rows, cols) = orchestration_role_pane_dims(
-            Rect::new(0, 0, 100, 30),
-            2,
-            0,
-            None,
-            PaneLayout::Tiled,
-            false,
-        );
+        let (rows, cols) =
+            orchestration_role_pane_dims(Rect::new(0, 0, 100, 30), 2, 0, PaneLayout::Tiled, false);
         assert_eq!((rows, cols), (12, 64));
     }
 
@@ -11494,7 +11570,7 @@ mod tests {
         // re-introduces the F3 spawn-vs-render drift.
         let area = Rect::new(0, 0, 200, 50);
         let (_rows, helper_cols) =
-            orchestration_role_pane_dims(area, 3, 0, None, PaneLayout::Tiled, false);
+            orchestration_role_pane_dims(area, 3, 0, PaneLayout::Tiled, false);
         // Inner cols = right-column width - 2 (pane borders).
         let renderer_cols = (area.width * ORCHESTRATION_PANES_PERCENT / 100).saturating_sub(2);
         assert_eq!(helper_cols, renderer_cols);
@@ -11508,10 +11584,10 @@ mod tests {
     fn orchestration_role_pane_dims_tiled_divides_height_equally() {
         // 4 roles, Tiled: every role_index returns the same dims.
         let area = Rect::new(0, 0, 100, 30);
-        let r0 = orchestration_role_pane_dims(area, 4, 0, None, PaneLayout::Tiled, true);
-        let r1 = orchestration_role_pane_dims(area, 4, 1, None, PaneLayout::Tiled, true);
-        let r2 = orchestration_role_pane_dims(area, 4, 2, None, PaneLayout::Tiled, true);
-        let r3 = orchestration_role_pane_dims(area, 4, 3, None, PaneLayout::Tiled, true);
+        let r0 = orchestration_role_pane_dims(area, 4, 0, PaneLayout::Tiled, true);
+        let r1 = orchestration_role_pane_dims(area, 4, 1, PaneLayout::Tiled, true);
+        let r2 = orchestration_role_pane_dims(area, 4, 2, PaneLayout::Tiled, true);
+        let r3 = orchestration_role_pane_dims(area, 4, 3, PaneLayout::Tiled, true);
         assert_eq!(r0, r1);
         assert_eq!(r1, r2);
         assert_eq!(r2, r3);
@@ -11527,72 +11603,25 @@ mod tests {
         // resize).
         let area = Rect::new(0, 0, 100, 30);
         let (rows_focused, _) =
-            orchestration_role_pane_dims(area, 3, 0, None, PaneLayout::Stacked, false);
+            orchestration_role_pane_dims(area, 3, 0, PaneLayout::Stacked, false);
         let (rows_unfocused, _) =
-            orchestration_role_pane_dims(area, 3, 1, None, PaneLayout::Stacked, false);
+            orchestration_role_pane_dims(area, 3, 1, PaneLayout::Stacked, false);
         assert!(rows_focused > rows_unfocused);
         assert_eq!(rows_unfocused, 0);
     }
 
-    // PRD #76 M2.15 fixup pass 2 G2 — pin the focus-aware behavior so a
-    // future refactor of `orchestration_role_pane_dims` can't silently
-    // re-introduce the "role 0 hardcoded as expanded" bug.
+    // PRD #84 M4 removed the `focused_role_index` parameter (and the resize
+    // sweep that threaded a live focused-role index through this helper), so
+    // the Stacked expanded slot is always role 0. The two tests that pinned the
+    // `focused_role_index = Some(non-zero)` behavior are gone with the param;
+    // the renderer-match drift guard below now pins role 0's expanded height.
 
     #[test]
-    fn orchestration_role_pane_dims_stacked_expands_focused_non_zero_role() {
-        // The reviewer R1 / fixup-pass-2 G2 bug: when the focused role
-        // is non-zero, the resize sweep must expand THAT role's PTY,
-        // not role 0. Pre-fix, the helper hardcoded role_index==0 as
-        // expanded, so a focused non-zero role got the collapsed (1
-        // row → 0 inner rows after border) height while role 0 got
-        // the lion's share. With `focused_role_index=Some(2)`, the
-        // helper must give role 2 the expanded rows and role 0 the
-        // collapsed sentinel.
-        let area = Rect::new(0, 0, 100, 30);
-        let (r0_rows, _) =
-            orchestration_role_pane_dims(area, 3, 0, Some(2), PaneLayout::Stacked, false);
-        let (r1_rows, _) =
-            orchestration_role_pane_dims(area, 3, 1, Some(2), PaneLayout::Stacked, false);
-        let (r2_rows, _) =
-            orchestration_role_pane_dims(area, 3, 2, Some(2), PaneLayout::Stacked, false);
-        assert_eq!(r0_rows, 0, "role 0 must collapse when role 2 is focused");
-        assert_eq!(r1_rows, 0, "role 1 must collapse when role 2 is focused");
-        assert!(
-            r2_rows > 0,
-            "focused role must receive the expanded rows, got {r2_rows}"
-        );
-        // The focused row count must match what role 0 would have
-        // received under the no-focus fallback — i.e. swapping which
-        // slot is expanded, not changing the geometry.
-        let (rows_when_role0_expanded, _) =
-            orchestration_role_pane_dims(area, 3, 0, None, PaneLayout::Stacked, false);
-        assert_eq!(
-            r2_rows, rows_when_role0_expanded,
-            "focused role's expanded rows must equal the no-focus role-0 expansion"
-        );
-    }
-
-    #[test]
-    fn orchestration_role_pane_dims_tiled_ignores_focused_role_index() {
-        // Tiled layout divides height equally across all roles, so
-        // `focused_role_index` must be a geometric no-op there.
-        let area = Rect::new(0, 0, 100, 30);
-        let none_dims = orchestration_role_pane_dims(area, 3, 1, None, PaneLayout::Tiled, false);
-        let focused_self =
-            orchestration_role_pane_dims(area, 3, 1, Some(1), PaneLayout::Tiled, false);
-        let focused_other =
-            orchestration_role_pane_dims(area, 3, 1, Some(2), PaneLayout::Tiled, false);
-        assert_eq!(none_dims, focused_self);
-        assert_eq!(none_dims, focused_other);
-    }
-
-    #[test]
-    fn orchestration_role_pane_dims_matches_renderer_when_focused_role_nonzero() {
-        // Extended drift guard (fixup pass 2 G2): the helper's
-        // expanded-row height for a focused role must equal the
-        // renderer's expanded height for the same slot. The renderer
-        // gives the focused slot `Constraint::Fill(1)` after carving
-        // 1-row title bars off the other (count-1) slots — i.e. the
+    fn orchestration_role_pane_dims_stacked_role_zero_matches_renderer_expanded_height() {
+        // Drift guard: the helper's expanded-row height for the Stacked
+        // expanded slot (role 0) must equal the renderer's expanded height.
+        // The renderer gives the expanded slot `Constraint::Fill(1)` after
+        // carving 1-row title bars off the other (count-1) slots — i.e. the
         // expanded inner height = main_height - (count-1) - 2 (border).
         let area = Rect::new(0, 0, 200, 50);
         let role_count: u16 = 4;
@@ -11600,14 +11629,8 @@ mod tests {
         let main_height = area.height.saturating_sub(chrome_rows);
         let expanded_outer = main_height.saturating_sub(role_count - 1);
         let expanded_inner = expanded_outer.saturating_sub(2);
-        let (helper_rows, _) = orchestration_role_pane_dims(
-            area,
-            role_count as usize,
-            2,
-            Some(2),
-            PaneLayout::Stacked,
-            false,
-        );
+        let (helper_rows, _) =
+            orchestration_role_pane_dims(area, role_count as usize, 0, PaneLayout::Stacked, false);
         assert_eq!(helper_rows, expanded_inner);
     }
 
@@ -11615,17 +11638,130 @@ mod tests {
     fn orchestration_role_pane_dims_zero_role_count_does_not_divide_by_zero() {
         // Defensive: role_count = 0 (transient state during a tab
         // teardown). Clamp to 1 so the helper returns a sane value.
-        let (rows, cols) = orchestration_role_pane_dims(
-            Rect::new(0, 0, 100, 30),
-            0,
-            0,
-            None,
-            PaneLayout::Tiled,
-            false,
-        );
+        let (rows, cols) =
+            orchestration_role_pane_dims(Rect::new(0, 0, 100, 30), 0, 0, PaneLayout::Tiled, false);
         // main_height = 29, count = 1, chunk = 29, rows = 27.
         // right_width = 66, cols = 64.
         assert_eq!((rows, cols), (27, 64));
+    }
+
+    // PRD #84 (deferred render/layout/004) — pin `compute_frame_layout`, the
+    // single per-frame layout pass that is now the source of truth BOTH the
+    // pre-draw `resize_panes_to_layout` (PTY sizing) and `render_frame` read.
+    // These exercise the named rects of a representative Cards layout and a
+    // Mode layout for a fixed 100x40 frame. Plain unit tests of a private
+    // pure-data fn — not `#[spec]`/CATALOG reproducers.
+
+    #[test]
+    fn compute_frame_layout_cards_two_panes_geometry() {
+        // 100x40 frame, tab bar shown, 2 dashboard panes, Tiled pane column.
+        let frame_area = Rect::new(0, 0, 100, 40);
+        let tab_view = ActiveTabView::Dashboard {
+            exclude_pane_ids: vec![],
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Dashboard".into(), "Mode".into()],
+            active_index: 0,
+        };
+        let pane_ids = vec!["p0".to_string(), "p1".to_string()];
+        let layout = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            &pane_ids,
+            PaneLayout::Tiled,
+            None,
+        );
+
+        // Vertical chrome: a 1-row tab bar at the top, a 1-row hints bar at the
+        // bottom, the main content in between.
+        assert_eq!(layout.tab_bar, Some(Rect::new(0, 0, 100, 1)));
+        assert_eq!(layout.hints, Rect::new(0, 39, 100, 1));
+
+        let FrameContent::Cards {
+            dashboard_area,
+            panes_area,
+            pane_ids: laid_out_ids,
+            pane_rects,
+        } = layout.content
+        else {
+            panic!("Dashboard tab must produce FrameContent::Cards");
+        };
+
+        // Main area (rows 1..39, height 38) splits 33% / 67% horizontally: the
+        // card grid on the left, the pane column on the right, together
+        // spanning the full width with no gap.
+        assert_eq!(dashboard_area, Rect::new(0, 1, 33, 38));
+        let panes_area = panes_area.expect("two panes => a right pane column");
+        assert_eq!(panes_area, Rect::new(33, 1, 67, 38));
+        assert_eq!(dashboard_area.width + panes_area.width, frame_area.width);
+        assert_eq!(panes_area.x, dashboard_area.width);
+        assert_eq!(laid_out_ids, pane_ids);
+
+        // Tiled: the pane column divides equally, keyed by pane id in order,
+        // stacked top-to-bottom (pane 1 starts where pane 0 ends).
+        assert_eq!(
+            pane_rects,
+            vec![
+                ("p0".to_string(), Rect::new(33, 1, 67, 19)),
+                ("p1".to_string(), Rect::new(33, 20, 67, 19)),
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_frame_layout_mode_geometry() {
+        // 100x40 frame, tab bar shown, agent pane + 2 stacked side panes.
+        let frame_area = Rect::new(0, 0, 100, 40);
+        let tab_view = ActiveTabView::Mode {
+            mode_name: "demo".to_string(),
+            agent_pane_id: "agent".to_string(),
+            side_pane_ids: vec!["s0".to_string(), "s1".to_string()],
+            focused_pane_id: None,
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Dashboard".into(), "demo".into()],
+            active_index: 1,
+        };
+        let layout = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            &[],
+            PaneLayout::Tiled,
+            None,
+        );
+
+        assert_eq!(layout.tab_bar, Some(Rect::new(0, 0, 100, 1)));
+        assert_eq!(layout.hints, Rect::new(0, 39, 100, 1));
+
+        let FrameContent::Mode {
+            agent_area,
+            side_area,
+            agent_pane_id,
+            side_pane_rects,
+        } = layout.content
+        else {
+            panic!("Mode tab must produce FrameContent::Mode");
+        };
+
+        // 50 / 50 horizontal split of the main area: agent pane left, side
+        // panes right.
+        assert_eq!(agent_area, Rect::new(0, 1, 50, 38));
+        assert_eq!(side_area, Rect::new(50, 1, 50, 38));
+        assert_eq!(agent_pane_id, "agent");
+
+        // Side panes: equal vertical division of the right half, keyed in
+        // order — the source for `ui.side_pane_rects`.
+        assert_eq!(
+            side_pane_rects,
+            vec![
+                ("s0".to_string(), Rect::new(50, 1, 50, 19)),
+                ("s1".to_string(), Rect::new(50, 20, 50, 19)),
+            ]
+        );
     }
 
     // PRD #76 M2.12: pin the hydration partition's bucket semantics so
@@ -12903,6 +13039,24 @@ mod tests {
         terminal
             .draw(|frame| {
                 let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                // PRD #84: render_frame now reads a precomputed FrameLayout
+                // (one layout pass per frame); compute it from the same inputs.
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                );
                 render_frame(
                     frame,
                     &state,
@@ -12912,14 +13066,9 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
-                    &ActiveTabView::Dashboard {
-                        exclude_pane_ids: vec![],
-                    },
-                    &TabBarInfo {
-                        show: false,
-                        labels: vec!["Dashboard".into()],
-                        active_index: 0,
-                    },
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
                 )
             })
             .unwrap();
@@ -12972,6 +13121,24 @@ mod tests {
         terminal
             .draw(|frame| {
                 let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                // PRD #84: render_frame now reads a precomputed FrameLayout
+                // (one layout pass per frame); compute it from the same inputs.
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                );
                 render_frame(
                     frame,
                     &state,
@@ -12981,14 +13148,9 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
-                    &ActiveTabView::Dashboard {
-                        exclude_pane_ids: vec![],
-                    },
-                    &TabBarInfo {
-                        show: false,
-                        labels: vec!["Dashboard".into()],
-                        active_index: 0,
-                    },
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
                 )
             })
             .unwrap();
@@ -13090,6 +13252,24 @@ mod tests {
         terminal
             .draw(|frame| {
                 let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                // PRD #84: render_frame now reads a precomputed FrameLayout
+                // (one layout pass per frame); compute it from the same inputs.
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                );
                 render_frame(
                     frame,
                     &state,
@@ -13099,14 +13279,9 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
-                    &ActiveTabView::Dashboard {
-                        exclude_pane_ids: vec![],
-                    },
-                    &TabBarInfo {
-                        show: false,
-                        labels: vec!["Dashboard".into()],
-                        active_index: 0,
-                    },
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
                 )
             })
             .unwrap();
@@ -13309,6 +13484,24 @@ mod tests {
         terminal
             .draw(|frame| {
                 let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                // PRD #84: render_frame now reads a precomputed FrameLayout
+                // (one layout pass per frame); compute it from the same inputs.
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                );
                 render_frame(
                     frame,
                     &state,
@@ -13318,14 +13511,9 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
-                    &ActiveTabView::Dashboard {
-                        exclude_pane_ids: vec![],
-                    },
-                    &TabBarInfo {
-                        show: false,
-                        labels: vec!["Dashboard".into()],
-                        active_index: 0,
-                    },
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
                 )
             })
             .unwrap();
@@ -13387,6 +13575,24 @@ mod tests {
         terminal
             .draw(|frame| {
                 let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                // PRD #84: render_frame now reads a precomputed FrameLayout
+                // (one layout pass per frame); compute it from the same inputs.
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                );
                 render_frame(
                     frame,
                     &state,
@@ -13396,14 +13602,9 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
-                    &ActiveTabView::Dashboard {
-                        exclude_pane_ids: vec![],
-                    },
-                    &TabBarInfo {
-                        show: false,
-                        labels: vec!["Dashboard".into()],
-                        active_index: 0,
-                    },
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
                 )
             })
             .unwrap();
@@ -13440,6 +13641,24 @@ mod tests {
         terminal
             .draw(|frame| {
                 let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                // PRD #84: render_frame now reads a precomputed FrameLayout
+                // (one layout pass per frame); compute it from the same inputs.
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                );
                 render_frame(
                     frame,
                     &state,
@@ -13449,14 +13668,9 @@ mod tests {
                     false,
                     &noop,
                     PaneLayout::Stacked,
-                    &ActiveTabView::Dashboard {
-                        exclude_pane_ids: vec![],
-                    },
-                    &TabBarInfo {
-                        show: false,
-                        labels: vec!["Dashboard".into()],
-                        active_index: 0,
-                    },
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
                 )
             })
             .unwrap();

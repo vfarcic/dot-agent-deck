@@ -40,3 +40,4 @@ For a watch loop, `bacon test-fast` (or `bacon test-e2e`) reruns on every save; 
 Maintainer-facing references that are intentionally **not** published to the documentation site live under [`docs/develop/`](docs/develop/) (excluded from the Docusaurus build). They render as plain Markdown here on GitHub:
 
 - [Experimental flag](docs/develop/experimental-flag.md) — gate in-flight, work-in-progress surfaces behind the `experimental` flag during development, so unfinished UI can merge to `main` without showing up in normal use.
+- [Rendering contract](docs/develop/rendering-contract.md) — the four render-path invariants (single layout pass, layout-driven PTY size, 1:1 widget render, fixed resize sequencing) and the call sites that enforce them.
