@@ -849,6 +849,15 @@ struct UiState {
     /// can't go stale relative to what's actually armed. The Orchestration tab
     /// reuses this field but keeps its selection always active (`Some`).
     selected_index: Option<usize>,
+    /// PRD #113 (PR #151 manual-test fix): the embedded controller's focused
+    /// pane id as of the previous `reconcile_dashboard_selection` frame. The
+    /// focused-pane sync (M4) reactivates the highlight only on a genuine focus
+    /// *transition* — when the focused pane CHANGED to a visible dashboard card
+    /// — not on a steady-state focus the tab-switch restore leaves in place
+    /// (e.g. a Mode tab's agent pane, which is a dashboard card and stays
+    /// focused on return). Without this, switching away and back re-armed the
+    /// highlight a tab switch had cleared (violating SC1).
+    last_focused_pane_id: Option<String>,
     filter_text: String,
     rename_text: String,
     display_names: HashMap<String, String>,
@@ -1078,6 +1087,7 @@ impl UiState {
             // PRD #113 M1: startup default is an ACTIVE selection on card 0 so
             // first-launch UX is unchanged.
             selected_index: Some(0),
+            last_focused_pane_id: None,
             filter_text: String::new(),
             rename_text: String::new(),
             display_names: HashMap::new(),
@@ -3041,24 +3051,47 @@ fn dashboard_focus_target(ui: &UiState, total: usize) -> Option<usize> {
 /// (`UiState.selected_index: Option<usize>`): an inactive selection (`None`,
 /// set when the user switched tabs away) must stay inactive across frames so a
 /// card never *looks* selected when nothing is armed — UNLESS a focused pane
-/// maps to a visible dashboard card, in which case the highlight reactivates on
-/// that card (M4 focused-pane sync). When the selection is already active, or
-/// for the Orchestration/Mode tabs (whose selection is separate, always-on
-/// state), the pre-existing `sync_and_derive_selection` derive is preserved.
+/// *transitions* to a visible dashboard card, in which case the highlight
+/// reactivates on that card (M4 focused-pane sync). When the selection is
+/// already active, or for the Orchestration/Mode tabs (whose selection is
+/// separate, always-on state), the pre-existing `sync_and_derive_selection`
+/// derive is preserved.
+///
+/// PR #151 (manual-test fix): M4 reactivates only on a genuine focus
+/// TRANSITION — the focused pane id must have *changed* since the previous
+/// frame. The original code reactivated whenever the focused pane merely
+/// *mapped* to a card, which re-armed a just-cleared selection on tab return:
+/// a Mode tab's agent pane is a dashboard card (only its side panes are in
+/// `all_managed_pane_ids`, so the agent pane isn't filtered out), and switching
+/// to a Mode tab focuses that agent pane while the return to the Dashboard
+/// restores nothing — so the agent pane stays focused. That steady-state focus
+/// is not a transition, so it no longer reactivates the highlight. The cyan
+/// focus border (driven by the controller's focus, not this function) is
+/// unaffected. Orchestration role panes are already excluded from the card
+/// list, which is why that path never exhibited the bug.
 fn reconcile_dashboard_selection(
     ui: &mut UiState,
     tab: &mut Tab,
     focused_pane_id: Option<&str>,
     filtered: &[(&str, Option<&str>)],
 ) {
+    // A genuine focus transition = the focused pane id changed since last frame.
+    // Record the current focus first so every frame (any tab) keeps the
+    // baseline fresh — otherwise a stale baseline would read a restored
+    // steady-state focus as a transition on the next dashboard frame.
+    let focus_changed = focused_pane_id != ui.last_focused_pane_id.as_deref();
+    ui.last_focused_pane_id = focused_pane_id.map(str::to_string);
+
     // On the Dashboard, only reactivate an inactive selection when a focused
-    // pane maps to a visible card; otherwise leave it inactive so a tab-switch
-    // deactivation isn't instantly undone by the per-frame sync.
+    // pane TRANSITIONS to a visible card; otherwise leave it inactive so a
+    // tab-switch deactivation isn't undone by the per-frame sync (the restored
+    // steady-state focus is not a transition).
     if let Tab::Dashboard { .. } = tab {
         let focus_maps_to_card = focused_pane_id
             .map(|fid| filtered.iter().any(|(_, pid)| *pid == Some(fid)))
             .unwrap_or(false);
-        if ui.selected_index.is_none() && !focus_maps_to_card {
+        let focus_reactivates = focus_maps_to_card && focus_changed;
+        if ui.selected_index.is_none() && !focus_reactivates {
             return;
         }
     }
@@ -3081,9 +3114,10 @@ fn reconcile_dashboard_selection(
 /// (`selected_session_id = None`). With the remembered card cleared, the
 /// re-focus block below no longer fires on return, so the per-frame
 /// `reconcile_dashboard_selection` keeps the selection inactive — a card never
-/// *looks* selected when nothing is armed. (Mode/Orchestration panes that stay
-/// focused are excluded from the Dashboard's card list, so they can't
-/// reactivate it either.)
+/// *looks* selected when nothing is armed. (A Mode tab's agent pane stays
+/// focused on return and *is* a dashboard card, but `reconcile_dashboard_selection`
+/// only reactivates on a focus *transition*, so a restored steady-state focus
+/// can't re-arm the highlight — see PR #151.)
 fn switch_tab_with_focus(
     tab_manager: &mut TabManager,
     target_index: usize,
@@ -14944,6 +14978,122 @@ mod tests {
             state.blocking_read().sessions.len(),
             sessions_before,
             "no session may be removed when the selection is inactive"
+        );
+    }
+
+    /// Scenario: PRD #113 / PR #151 real-app regression — the blue highlight must
+    /// NOT reappear after a Dashboard → Mode → Dashboard round-trip when the
+    /// restored focus is steady. A Mode tab's AGENT pane is also a Dashboard card
+    /// (only its side panes are in `all_managed_pane_ids`), and switching to a
+    /// Mode tab focuses that agent pane while the return to the Dashboard restores
+    /// nothing — so the agent pane STAYS focused. This drives the REAL per-frame
+    /// `reconcile_dashboard_selection` on both the mode frame and the return
+    /// dashboard frame with that SAME focused pane id (no transition); because the
+    /// focus did not change, the inactive selection stays inactive (`None`).
+    /// `selection_005`/`selection_011` cannot catch this (they drive
+    /// `dispatch_action` directly or pass `focused = None`, so the per-frame
+    /// reconcile never sees a steady-state focused dashboard card).
+    #[spec("dashboard/selection/013")]
+    #[test]
+    fn selection_013_steady_state_focus_does_not_reactivate() {
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        // A Mode tab whose AGENT pane id ("agent-m") is also a Dashboard card.
+        let (mode_idx, _side_ids) = tab_manager
+            .open_mode_tab(
+                &mode_config_local("m", 1),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open a mode tab");
+        // open_mode_tab leaves the mode tab active — start on the Dashboard.
+        assert!(tab_manager.switch_to(0));
+
+        let snapshot = AppState::default();
+        // Dashboard cards INCLUDE the Mode agent pane "agent-m" (card index 1) —
+        // exactly the real-app condition (the agent pane isn't filtered out).
+        let dash_filtered: [(&str, Option<&str>); 3] = [
+            ("s0", Some("p0")),
+            ("agent-sess", Some("agent-m")),
+            ("s2", Some("p2")),
+        ];
+
+        let mut ui = default_ui();
+        // Arm the highlight on the Dashboard (what the user sees before leaving).
+        ui.selected_index = Some(1);
+        if let Tab::Dashboard {
+            selected_session_id,
+        } = tab_manager.active_tab_mut()
+        {
+            *selected_session_id = Some("agent-sess".to_string());
+        }
+
+        // Switch Dashboard → Mode (leaving the Dashboard deactivates the highlight).
+        switch_tab_with_focus(&mut tab_manager, mode_idx, &*pc, &snapshot, &mut ui);
+        // Mode frame: the agent pane "agent-m" is focused; the per-frame reconcile
+        // records it as the focus baseline (a Mode tab doesn't touch the dashboard
+        // selection).
+        reconcile_dashboard_selection(
+            &mut ui,
+            tab_manager.active_tab_mut(),
+            Some("agent-m"),
+            &dash_filtered,
+        );
+
+        // Switch Mode → Dashboard. Nothing is restored, so "agent-m" STAYS focused.
+        switch_tab_with_focus(&mut tab_manager, 0, &*pc, &snapshot, &mut ui);
+        // Return dashboard frame: SAME focused pane "agent-m" as the mode frame —
+        // no focus TRANSITION — so the highlight must NOT reappear.
+        reconcile_dashboard_selection(
+            &mut ui,
+            tab_manager.active_tab_mut(),
+            Some("agent-m"),
+            &dash_filtered,
+        );
+
+        assert_eq!(
+            ui.selected_index, None,
+            "a steady-state restored focus (no transition) must not reactivate the highlight on tab return"
+        );
+    }
+
+    /// Scenario: PRD #113 M4 guard — the focus-transition fix must NOT
+    /// over-suppress legitimate reactivation. From an inactive selection, hold a
+    /// non-card pane focused across two frames (a steady-state baseline that does
+    /// NOT reactivate), then TRANSITION the focus to a dashboard card and confirm
+    /// the highlight reactivates on that card. This is distinct from
+    /// `selection_009` (which reactivates on the very first reconcile, a
+    /// transition from the `None` baseline): here the transition happens AFTER an
+    /// established steady-state baseline, proving the per-frame baseline tracking
+    /// still admits a genuine focus change.
+    #[spec("dashboard/selection/014")]
+    #[test]
+    fn selection_014_genuine_transition_after_steady_state_reactivates() {
+        let mut ui = default_ui();
+        ui.selected_index = None; // inactive
+        let mut tab = Tab::Dashboard {
+            selected_session_id: None,
+        };
+        let filtered: [(&str, Option<&str>); 3] =
+            [("s0", Some("p0")), ("s1", Some("p1")), ("s2", Some("p2"))];
+
+        // Steady-state baseline: a non-card pane ("side-x") stays focused across
+        // two frames — it never maps to a card, so the selection stays inactive.
+        reconcile_dashboard_selection(&mut ui, &mut tab, Some("side-x"), &filtered);
+        assert_eq!(ui.selected_index, None);
+        reconcile_dashboard_selection(&mut ui, &mut tab, Some("side-x"), &filtered);
+        assert_eq!(
+            ui.selected_index, None,
+            "a steady-state non-card focus must not reactivate the highlight"
+        );
+
+        // Genuine transition: focus moves to a dashboard card → reactivate.
+        reconcile_dashboard_selection(&mut ui, &mut tab, Some("p0"), &filtered);
+        assert_eq!(
+            ui.selected_index,
+            Some(0),
+            "a genuine focus transition to a card still reactivates the highlight (M4 preserved)"
         );
     }
 

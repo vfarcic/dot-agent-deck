@@ -169,6 +169,20 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the active-selection close behaviour, or mode/orchestration whole-tab teardown.
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/selection/013 — A steady-state restored focus must not reactivate the highlight after a tab round-trip.
+- **Layer:** L1 (in-process `switch_tab_with_focus` + per-frame `reconcile_dashboard_selection`).
+- **Agent:** none (a real Mode tab whose agent pane is also a Dashboard card; 3 synthetic cards).
+- **Asserts:** driving the real per-frame reconcile across a Dashboard → Mode → Dashboard round-trip, where the Mode agent pane stays focused on both the mode frame and the return dashboard frame (no focus transition), leaves `selected_index == None` — the blue highlight does not reappear. Regression for PR #151; this is the steady-state-focus path `selection_005`/`selection_011` cannot reach.
+- **Does not assert:** the cyan controller focus border (driven separately, unaffected).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/014 — A genuine focus transition after a steady-state baseline still reactivates the highlight (M4 not over-suppressed).
+- **Layer:** L1 (in-process `reconcile_dashboard_selection`).
+- **Agent:** none (3 synthetic `(session_id, pane_id)` pairs).
+- **Asserts:** from an inactive selection, holding a non-card pane focused across two frames keeps the selection inactive; then transitioning the focus to a dashboard card reactivates the highlight on that card (`Some(0)`). Guards that the focus-transition fix does not block legitimate M4 reactivation; distinct from `selection_009` (transition from the `None` baseline).
+- **Does not assert:** the active-selection derive path (covered by `dashboard/pane/005`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/filter
 
 ##### dashboard/filter/001 — `/` opens the filter input; typing narrows visible cards by display-name substring.
