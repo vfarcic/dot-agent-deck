@@ -7749,7 +7749,7 @@ fn render_frame(
 
     // Branch on the content the layout pass resolved. Mode tabs render and
     // return here; dashboard / orchestration fall through to the card grid.
-    let (dashboard_area, panes_area, pane_ids) = match &layout.content {
+    let (dashboard_area, panes_area, pane_ids, pane_rects) = match &layout.content {
         FrameContent::Mode {
             agent_area,
             side_area,
@@ -7785,9 +7785,14 @@ fn render_frame(
             dashboard_area,
             panes_area,
             pane_ids,
-            ..
-        } => (*dashboard_area, *panes_area, pane_ids),
+            pane_rects,
+        } => (*dashboard_area, *panes_area, pane_ids, pane_rects),
     };
+
+    // PRD #84: the OUTER rect each pane in the right column was sized to this
+    // frame, in `pane_ids` order — threaded into `render_terminal_panes` so it
+    // draws into exactly these (single source of truth with the PTY resize).
+    let pane_outer_rects: Vec<Rect> = pane_rects.iter().map(|(_, rect)| *rect).collect();
 
     // Orchestration tabs use the same dashboard card rendering as the main dashboard.
 
@@ -7817,6 +7822,7 @@ fn render_frame(
                 &ui.pane_display_names,
                 &ui.selection,
                 None,
+                Some(&pane_outer_rects),
             );
         }
 
@@ -7904,6 +7910,7 @@ fn render_frame(
                 &ui.pane_display_names,
                 &ui.selection,
                 None,
+                Some(&pane_outer_rects),
             );
         }
         render_overlays(frame, ui, active_mode_name);
@@ -8009,6 +8016,7 @@ fn render_frame(
             &ui.pane_display_names,
             &ui.selection,
             None,
+            Some(&pane_outer_rects),
         );
     }
 
@@ -8085,6 +8093,12 @@ fn render_terminal_panes(
     display_names: &HashMap<String, String>,
     selection: &Option<TextSelection>,
     visual_focus_id: Option<&str>,
+    // PRD #84: per-pane OUTER rects (aligned 1:1 with `pane_ids`) precomputed by
+    // `compute_frame_layout` — the SAME rects `resize_panes_to_layout` sized the
+    // PTYs to this frame. `Some` => draw into exactly those; `None` => recompute
+    // via `pane_stack_rects` (used by callers without a `FrameLayout` rect list,
+    // e.g. the mode-tab agent / side panes).
+    precomputed_rects: Option<&[Rect]>,
 ) -> Option<Rect> {
     let ctrl = embedded?;
     if pane_ids.is_empty() {
@@ -8112,10 +8126,27 @@ fn render_terminal_panes(
     let mut focused_pane_rect: Option<Rect> = None;
     let mut focused_screen: Option<std::sync::Arc<std::sync::Mutex<vt100::Parser>>> = None;
 
-    // PRD #84 M4: the per-pane rects come from the shared `pane_stack_rects`
-    // split — the same one `compute_frame_layout` uses to size PTYs — so the
-    // rendered rect and the resize target can't drift.
-    let chunks = pane_stack_rects(area, pane_ids, layout, focused_id.as_deref());
+    // PRD #84: the per-pane OUTER rects are the single source of truth shared
+    // with `resize_panes_to_layout`. When the caller threads in the exact
+    // `FrameLayout` rects the PTYs were sized to (the Cards render path), draw
+    // into THOSE — the drawn rect is the resized rect, no second
+    // `pane_stack_rects` pass, no correctness-by-timing assumption. Callers
+    // without a `FrameLayout` rect list recompute via the same helper.
+    let computed_chunks;
+    let chunks: &[Rect] = match precomputed_rects {
+        Some(rects) => {
+            debug_assert_eq!(
+                rects.len(),
+                pane_ids.len(),
+                "precomputed pane rects must align 1:1 with pane_ids"
+            );
+            rects
+        }
+        None => {
+            computed_chunks = pane_stack_rects(area, pane_ids, layout, focused_id.as_deref());
+            &computed_chunks
+        }
+    };
     match layout {
         PaneLayout::Tiled => {
             for (i, pane_id) in pane_ids.iter().enumerate() {
@@ -8274,6 +8305,9 @@ fn render_mode_tab(
             &ui.pane_display_names,
             &ui.selection,
             agent_visual_focus,
+            // Mode-tab panes recompute their rects (out of the Cards finding's
+            // scope); the agent pane is a single Stacked pane filling agent_area.
+            None,
         );
         if rect.is_some() {
             ui.focused_pane_rect = rect;
@@ -8291,6 +8325,9 @@ fn render_mode_tab(
             &ui.pane_display_names,
             &ui.selection,
             side_visual_focus.as_deref(),
+            // Mode side panes recompute via pane_stack_rects (Tiled) — same
+            // split as the `side_pane_rects` above; out of the Cards finding's scope.
+            None,
         );
         // Use side pane rect when a side pane is visually focused, or as fallback.
         if side_visual_focus.is_some() || ui.focused_pane_rect.is_none() {
