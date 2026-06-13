@@ -6,9 +6,9 @@
 //! `dashboard/*/NNN` land in this file with function names
 //! `<sub-area>_<NNN>_<short_suffix>` per Decision 17.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
-use dot_agent_deck::event::AgentType;
+use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 use dot_agent_deck::state::{ActiveTool, DashboardStats, SessionState, SessionStatus};
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::ui::{
@@ -414,4 +414,239 @@ fn pane_005_highlight_follows_selected_session_id() {
         80,
     );
     insta::assert_snapshot!(buffer_to_text(&buffer));
+}
+
+/// Build one event-rich session fixture that fills `render_session_card`
+/// to capacity at every density tier: three user prompts (Spacious shows 3,
+/// Normal/Compact show the latest 1) and three `ToolStart` events
+/// (Normal/Spacious show 3, Compact shows 1). With this fixture the rendered
+/// card carries its maximum content lines on every tier, so any rows left
+/// blank inside the border are reserved-but-unused — exactly what
+/// `dashboard/density/004` asserts must not happen.
+///
+/// `last_activity = now` keeps the inline `Last: Xs ago` text at `0s ago`
+/// (mirrors `pane_004`); these tests only inspect blank/non-blank rows, so the
+/// elapsed value never affects the assertion.
+fn filled_session() -> SessionState {
+    let now = chrono::Utc::now();
+    let mut events: VecDeque<AgentEvent> = VecDeque::new();
+    for prompt in ["first prompt", "second prompt", "third prompt"] {
+        events.push_back(AgentEvent {
+            session_id: "sess-fill".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: now,
+            user_prompt: Some(prompt.to_string()),
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+        });
+    }
+    for (name, detail) in [
+        ("Read", "src/main.rs"),
+        ("Edit", "src/ui.rs"),
+        ("Bash", "cargo test"),
+    ] {
+        events.push_back(AgentEvent {
+            session_id: "sess-fill".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::ToolStart,
+            tool_name: Some(name.to_string()),
+            tool_detail: Some(detail.to_string()),
+            cwd: None,
+            timestamp: now,
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+        });
+    }
+    SessionState {
+        session_id: "sess-fill".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        cwd: Some("/home/dev/example-project".to_string()),
+        status: SessionStatus::Working,
+        active_tool: Some(ActiveTool {
+            name: "Bash".to_string(),
+            detail: Some("cargo test".to_string()),
+        }),
+        started_at: now,
+        last_activity: now,
+        recent_events: events,
+        tool_count: 12,
+        last_user_prompt: Some("third prompt".to_string()),
+        first_prompts: vec!["first prompt".to_string()],
+        pane_id: Some("pane-1".to_string()),
+        agent_id: Some("1".to_string()),
+        display_name: None,
+    }
+}
+
+/// Count inner card rows that are blank starting from the row directly above
+/// the bottom border and scanning upward, stopping at the first row that
+/// carries content. Inner columns only (`1..width-1`) so the left/right border
+/// `│` glyphs are ignored. The result is the number of reserved-but-empty rows
+/// the card holds below its real content — `0` means the reserved card height
+/// equals the rendered content height. The mid-card blank separator line
+/// (Normal/Spacious) is never counted because the scan stops at the tool line
+/// rendered beneath it.
+fn trailing_blank_inner_rows(buffer: &ratatui::buffer::Buffer) -> usize {
+    let area = buffer.area();
+    let (w, h) = (area.width, area.height);
+    if h < 3 || w < 3 {
+        return 0;
+    }
+    let mut count = 0usize;
+    let mut y = h - 2; // last inner row (the one just above the bottom border)
+    loop {
+        let row_blank = (1..w - 1).all(|x| buffer[(x, y)].symbol().trim().is_empty());
+        if row_blank {
+            count += 1;
+        } else {
+            break;
+        }
+        if y == 1 {
+            break;
+        }
+        y -= 1;
+    }
+    count
+}
+
+/// Scenario: Render a single fully-populated session card at each density tier
+/// (Compact, Normal, Spacious) in a wide 80-column viewport sized to the tier's
+/// own `rendered_height`, then assert the card has zero trailing blank rows —
+/// the row directly above the bottom border carries rendered content on every
+/// tier. This locks in PRD #147's content-derived `card_height`: the reserved
+/// height equals the lines `render_session_card` actually emits (wide 5/8/10),
+/// so no row is reserved-but-empty. Before #147 the heights were hardcoded
+/// larger than the content (Compact 7 rows for 3 content lines, Normal 9 for 6,
+/// Spacious 11 for 8), which would trip this assertion as trailing blank rows.
+#[spec("dashboard/density/004")]
+#[test]
+fn density_004_no_trailing_blank_rows() {
+    // PRD #147 M2: reserved card height must equal rendered content height, so
+    // a card shows no empty rows below its content at any tier. The fixture
+    // fills every tier to capacity (3 prompts + 3 tools); we render at the
+    // width-80 "wide" branch (inline stats row) at the tier's declared
+    // `rendered_height`, then count trailing blank inner rows — which must be 0.
+    let session = filled_session();
+    let width: u16 = 80;
+    let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
+    for (density, label) in [
+        (CardDensityKind::Compact, "Compact"),
+        (CardDensityKind::Normal, "Normal"),
+        (CardDensityKind::Spacious, "Spacious"),
+    ] {
+        let height = density.rendered_height(wide);
+        let buffer = render_card_to_buffer(
+            &session,
+            Some("example-coder"),
+            Some(1),
+            density,
+            0,     // animation tick
+            false, // not selected
+            width,
+            height,
+        );
+        let trailing = trailing_blank_inner_rows(&buffer);
+        assert_eq!(
+            trailing,
+            0,
+            "{label} card reserves {trailing} blank row(s) below its content \
+             (height={height}); reserved height must match rendered content:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+}
+
+/// Replicate `choose_density`'s tier selection using the public
+/// `rendered_height` seam: pick the largest tier whose stacked card rows fit
+/// in `avail`, falling back to Compact. Mirrors `src/ui.rs::choose_density` so
+/// the orchestration capacity test tracks the same selection the renderer uses
+/// without depending on the private function.
+fn pick_density(n_decks: usize, cols: usize, avail: u16, wide: bool) -> CardDensityKind {
+    let rows = n_decks.div_ceil(cols.max(1)) as u16;
+    for density in [
+        CardDensityKind::Spacious,
+        CardDensityKind::Normal,
+        CardDensityKind::Compact,
+    ] {
+        if rows * density.rendered_height(wide) <= avail {
+            return density;
+        }
+    }
+    CardDensityKind::Compact
+}
+
+/// Scenario: Model the single-column orchestration deck card area (the ~34%
+/// width column → one grid column) at a typical terminal where ~48 rows are
+/// available for cards, and compute the renderer's own capacity
+/// (`visible_rows = available / card_height`) for 7 decks; assert all 7 fit
+/// without scrolling and that the 7th deck actually renders in the visible
+/// slice, while a much larger deck count still engages scrolling. This locks in
+/// PRD #147: with the content-derived Compact height of 5, 48 / 5 = 9 rows fit
+/// so all 7 decks show. Before #147 the hardcoded Compact height of 7 fit only
+/// 48 / 7 = 6 rows, dropping the 7th deck to a scroll — the regression this
+/// test guards against.
+#[spec("orchestration/layout/001")]
+#[test]
+fn layout_001_seven_decks_fit_single_column() {
+    // PRD #147 M2: on the orchestration tab decks stack in one column and
+    // density bottoms out at Compact. The renderer fits
+    // `visible_rows = available_for_density / card_height` rows (src/ui.rs
+    // ~7861); the rest scroll. We mirror that math through the public
+    // `rendered_height` seam, then confirm it with a real card render.
+
+    // Card-area rows available for cards (production: dashboard_area.height - 2,
+    // i.e. a ~50-row card column). WIDE = single orchestration column rendered
+    // wide enough (inner width >= 60) to show the inline stats row — the branch
+    // PRD #147's capacity example is worked through.
+    const AVAILABLE: u16 = 48;
+    const COLS: usize = 1;
+    const WIDE: bool = true;
+    const DECKS: usize = 7;
+
+    let density = pick_density(DECKS, COLS, AVAILABLE, WIDE);
+    let card_height = density.rendered_height(WIDE);
+    let visible_rows = (AVAILABLE / card_height).max(1) as usize;
+
+    // (1) Capacity: all 7 decks must fit in the single column with no scrolling.
+    assert!(
+        visible_rows >= DECKS,
+        "all {DECKS} orchestration decks must fit without scrolling at \
+         card-area height {AVAILABLE} (density={density:?}, card_height={card_height}); \
+         only {visible_rows} fit"
+    );
+
+    // (2) Buffer proof: the orchestration renderer draws only the first
+    //     `visible_rows` of the deck rows (src/ui.rs ~7871); render that visible
+    //     slice as real cards and assert the 7th deck shows. If the cards were
+    //     too tall to all fit, the 7th would be scrolled off and absent.
+    let visible = visible_rows.min(DECKS);
+    let session = filled_session();
+    let names: Vec<String> = (1..=visible).map(|i| format!("deck-{i}")).collect();
+    let cards: Vec<(&SessionState, Option<&str>)> =
+        names.iter().map(|n| (&session, Some(n.as_str()))).collect();
+    let buffer = render_dashboard_cards_to_buffer(&cards, usize::MAX, density, 0, 64);
+    let text = buffer_to_text(&buffer);
+    assert!(
+        text.contains("deck-7"),
+        "the 7th orchestration deck must render in the visible card area \
+         (rendered {visible} of {DECKS} decks):\n{text}"
+    );
+
+    // (3) Over-correction guard: a deck count well past the (now tighter)
+    //     capacity must still engage scrolling — the fix right-sizes the cards,
+    //     it does not remove scrolling for genuinely too-many decks.
+    const MANY: usize = 20;
+    let many_density = pick_density(MANY, COLS, AVAILABLE, WIDE);
+    let many_visible = (AVAILABLE / many_density.rendered_height(WIDE)).max(1) as usize;
+    assert!(
+        many_visible < MANY,
+        "with {MANY} decks scrolling must still engage (only {many_visible} fit)"
+    );
 }
