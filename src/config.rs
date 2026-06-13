@@ -873,6 +873,160 @@ pub(crate) fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/"))
 }
 
+// ---------------------------------------------------------------------------
+// Experimental feature flag — `[features]` table in `.dot-agent-deck.toml`
+// (PRD #139). The flag plumbing lives in `crate::features`; this module owns
+// only the parse + env-merge + file-load helpers it builds on.
+// ---------------------------------------------------------------------------
+
+/// Env var that overrides the `[features] experimental` value. A
+/// case-insensitive `1`/`true` forces the flag ON; any other set value
+/// forces it OFF. Env WINS over the file (PRD #139 OQ3), so once it is set,
+/// file edits to that field are ignored on reload.
+pub const EXPERIMENTAL_ENV: &str = "DOT_AGENT_DECK_EXPERIMENTAL";
+
+/// Internal mirror of the `.dot-agent-deck.toml` shape for the `[features]`
+/// table only. Every other key (`[[modes]]`, `[[orchestrations]]`, …) is
+/// ignored, so this loader is decoupled from `ProjectConfig`'s schema and an
+/// absent `[features]` table deserializes to the default (experimental =
+/// false).
+#[derive(Debug, Default, Deserialize)]
+struct FeaturesFile {
+    #[serde(default)]
+    features: crate::features::Features,
+}
+
+/// Parse the `[features]` table out of `.dot-agent-deck.toml` contents. An
+/// absent table (or empty file) yields the default (`experimental = false`).
+/// Returns `Err` on malformed TOML so the hot-reload path can keep the
+/// previous value (PRD #139 M2.1).
+pub fn parse_features(contents: &str) -> Result<crate::features::Features, toml::de::Error> {
+    Ok(toml::from_str::<FeaturesFile>(contents)?.features)
+}
+
+/// Apply the env override to a file-derived value. `DOT_AGENT_DECK_EXPERIMENTAL`
+/// WINS over the file when set (OQ3): a case-insensitive `1`/`true` forces ON,
+/// any other set value forces OFF, and an unset var defers to `file`.
+pub fn resolve_features(file: crate::features::Features) -> crate::features::Features {
+    let experimental = match std::env::var(EXPERIMENTAL_ENV) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        }
+        Err(_) => file.experimental,
+    };
+    crate::features::Features { experimental }
+}
+
+/// Path of the `.dot-agent-deck.toml` whose `[features]` table backs the
+/// flag — the file in the current working directory, so the TUI and daemon
+/// (launched in the same dir) read the same source of truth.
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` is an explicit override so tests never
+/// touch the real cwd.
+pub fn features_config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG") {
+        return PathBuf::from(p);
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(crate::project_config::CONFIG_FILE_NAME)
+}
+
+/// Upper bound on the `.dot-agent-deck.toml` the feature-flag loader will
+/// read. A `[features]` table is a handful of bytes; this cap stops a
+/// pathological `DOT_AGENT_DECK_FEATURES_CONFIG` target (a huge regular file)
+/// from exhausting memory on the detached ~2s watcher thread (audit LOW-1).
+const MAX_FEATURES_CONFIG_BYTES: u64 = 64 * 1024;
+
+/// Load the `[features]` table from `path`. A missing file is the default
+/// (OFF). A non-regular target (FIFO, device, …), an oversized file, or
+/// malformed/partial TOML keeps `previous` — the partial-write tolerance the
+/// watcher relies on (PRD #139 M2.1) plus the runaway-target guard from audit
+/// LOW-1. Warnings never echo file content (audit INFO-2): only the path is
+/// logged, so pointing the override at a sensitive file can't leak its bytes.
+pub fn load_features_file(
+    path: &std::path::Path,
+    previous: crate::features::Features,
+) -> crate::features::Features {
+    use std::io::Read;
+
+    // Stat first so a non-regular or oversized target is rejected before any
+    // read. `metadata` follows symlinks, so a symlink to /dev/zero or a FIFO
+    // is caught by the `is_file()` check on the resolved target (audit LOW-1).
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return crate::features::Features::default();
+        }
+        Err(_) => {
+            tracing::warn!(
+                "failed to stat {}; keeping previous experimental={}",
+                path.display(),
+                previous.experimental
+            );
+            return previous;
+        }
+    };
+    if !metadata.is_file() {
+        tracing::warn!(
+            "features config {} is not a regular file; keeping previous experimental={}",
+            path.display(),
+            previous.experimental
+        );
+        return previous;
+    }
+    if metadata.len() > MAX_FEATURES_CONFIG_BYTES {
+        tracing::warn!(
+            "features config {} exceeds {MAX_FEATURES_CONFIG_BYTES} bytes; keeping previous experimental={}",
+            path.display(),
+            previous.experimental
+        );
+        return previous;
+    }
+
+    // Read with a hard cap as defense-in-depth against a TOCTOU grow between
+    // the stat above and this read.
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => {
+            tracing::warn!(
+                "failed to open {}; keeping previous experimental={}",
+                path.display(),
+                previous.experimental
+            );
+            return previous;
+        }
+    };
+    let mut contents = String::new();
+    if file
+        .take(MAX_FEATURES_CONFIG_BYTES)
+        .read_to_string(&mut contents)
+        .is_err()
+    {
+        tracing::warn!(
+            "failed to read {}; keeping previous experimental={}",
+            path.display(),
+            previous.experimental
+        );
+        return previous;
+    }
+
+    match parse_features(&contents) {
+        Ok(features) => features,
+        // audit INFO-2: never include the toml error's Display — it embeds a
+        // snippet of the offending input, which could leak a sensitive file's
+        // contents if the override path is pointed at one.
+        Err(_) => {
+            tracing::warn!(
+                "invalid [features] table in {}: malformed TOML; keeping previous experimental={}",
+                path.display(),
+                previous.experimental
+            );
+            previous
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

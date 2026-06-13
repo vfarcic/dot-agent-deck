@@ -1,0 +1,6 @@
+---
+source: tests/experimental_flag.rs
+assertion_line: 83
+expression: text
+---
+experimental: on

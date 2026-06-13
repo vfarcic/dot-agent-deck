@@ -20,6 +20,7 @@ use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
 use crate::event::{AgentType, EventType};
+use crate::features::Features;
 // PRD #80 introduced a UI-dispatch `Action` enum in this module (the renamed
 // `KeyResult`), which collides with the keybinding-action enum. Import the
 // latter under an alias so both coexist: `Action` = the UI dispatch action,
@@ -81,21 +82,29 @@ const MOD_KEY: &str = "Ctrl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardDensity {
-    Compact,  // 6 rows: 1 prompt, 1 tool
-    Normal,   // 8 rows: 1 prompt, 3 tools
-    Spacious, // 10 rows: 3 prompts, 3 tools
+    Compact,  // wide 5 / narrow 6 rows: 1 prompt, 1 tool
+    Normal,   // wide 8 / narrow 9 rows: 1 prompt, 3 tools
+    Spacious, // wide 10 / narrow 11 rows: 3 prompts, 3 tools
 }
 
 impl CardDensity {
-    /// Card height in rows. When `wide` is false an extra stats line is rendered,
-    /// so each non-compact mode needs one more row.
+    /// Card height in rows, derived from the exact lines `render_session_card`
+    /// emits so reserved height never drifts from rendered content:
+    ///   Dir (1) + prompts + [narrow: inline stats line] + [non-compact: blank
+    ///   separator] + tools, plus 2 rows for the top/bottom border.
+    ///
+    /// Resulting heights — wide: Compact 5, Normal 8, Spacious 10;
+    /// narrow: 6 / 9 / 11.
     fn card_height(self, wide: bool) -> u16 {
-        let extra = if wide { 0 } else { 1 };
-        match self {
-            CardDensity::Compact => 7 + extra,
-            CardDensity::Normal => 9 + extra,
-            CardDensity::Spacious => 11 + extra,
-        }
+        let prompts = self.max_prompts() as u16;
+        let tools = self.max_tools() as u16;
+        let stats_line = if wide { 0 } else { 1 };
+        let separator = if matches!(self, CardDensity::Compact) {
+            0
+        } else {
+            1
+        };
+        (1 + prompts + stats_line + separator + tools) + 2 // +2 top/bottom border
     }
 
     fn max_tools(self) -> usize {
@@ -131,6 +140,27 @@ fn choose_density(
         }
     }
     CardDensity::Compact
+}
+
+/// Clamp a (possibly stale) vertical scroll offset to the largest value that
+/// still fills the visible window: `scroll_offset.min(total_rows - visible_rows)`
+/// (saturating at 0).
+///
+/// When a terminal resize *grows* `visible_rows` so that more — or all — card
+/// rows now fit, an offset left over from the previous overflow state would
+/// otherwise scroll the top rows off and leave blank space below the last card
+/// until the next navigation keystroke. This only ever *reduces* an over-large
+/// offset; while content genuinely overflows (`total_rows > visible_rows`) a
+/// legitimate offset is returned unchanged, so normal scrolling is untouched.
+///
+/// Crate-private: the only consumers are the render call site and the in-crate
+/// unit test, so it needs no crate-external visibility.
+pub(crate) fn clamp_scroll_offset(
+    scroll_offset: usize,
+    total_rows: usize,
+    visible_rows: usize,
+) -> usize {
+    scroll_offset.min(total_rows.saturating_sub(visible_rows))
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +405,7 @@ Collect these fields:
 - name: unique id for the schedule (also the reuse-tab key; renaming is forbidden — to rename, remove + add).
 - cron: a cron expression (5-field POSIX, e.g. \"0 9 * * MON-FRI\", evaluated in local time).
 - working_dir: directory the prompt runs in (the CLI expands ~ and $VAR — pass them literally).
-- command: REQUIRED — the agent command for a single-agent card. dot-agent-deck supports ONLY \"claude\" and \"opencode\"; offer and pass ONLY one of those — never suggest other CLIs (e.g. gemini), which have no deck integration. ALWAYS ask the user which of the two to run and ALWAYS pass --command; a scheduled task needs an agent to act on its prompt (there is no $SHELL fallback). Ignored only when working_dir has an [[orchestrations]] block (the orchestration's role commands win).
+- command: REQUIRED — the command that launches the single-agent card. It must RESULT IN a \"claude\" or \"opencode\" process: either run one directly (\"claude\", \"claude --model opus\", \"opencode --model gpt-4o\") OR use a project wrapper that ends up launching one (e.g. \"devbox run agent-new\", \"npm run agent\", \"task agent\"). Those are the two CLIs the deck integrates with for live status tracking — a command that does NOT result in claude/opencode still runs but gets no status tracking, so prefer one of them and don't suggest unrelated CLIs (e.g. gemini). ALWAYS ask the user what launches their agent (bare \"claude\"/\"opencode\" is the simple default) and ALWAYS pass --command; a scheduled task needs an agent to act on its prompt (there is no $SHELL fallback). Ignored only when working_dir has an [[orchestrations]] block (the orchestration's role commands win).
 - prompt: the prompt text to deliver on each fire.
 - new_tab_per_fire: true to open a fresh tab every fire, false (default) to reuse one tab.
 - enabled: true (default) or false.
@@ -6118,7 +6148,26 @@ pub fn run_tui(
         // `resize_panes_to_layout` and `render_frame`, so PTY sizes and rendered
         // rects are guaranteed identical this frame (no second layout pass).
         let _ = terminal.autoresize();
-        let frame_area = terminal.get_frame().area();
+        let full_frame_area = terminal.get_frame().area();
+        // PRD #139 M4.1 + PRD #84: throwaway experimental footer, gated at the
+        // single user-visible seam (`show_experimental_footer()` — CLAUDE.md #9;
+        // grep that name to find this site at graduation). When ON, reserve the
+        // bottom row for the `experimental: on` label and lay the rest of the
+        // frame out above it; when OFF the layout is byte-for-byte the
+        // pre-feature baseline. The reservation happens HERE, before
+        // `compute_frame_layout`, so the whole layout pass (and the PTY sizing it
+        // drives) sits above the footer. Snapshot the flag ONCE per frame
+        // (Greptile P2) so the gate and the footer render observe the same
+        // value — reading it twice opened a TOCTOU window where the ~2s watcher
+        // could flip it between the reads, cropping the main content by a row.
+        let features_snap = crate::features::current();
+        let (frame_area, experimental_footer_area) = if features_snap.experimental {
+            let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
+                .split(full_frame_area);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (full_frame_area, None)
+        };
         let embedded_panes = pane.as_any().downcast_ref::<EmbeddedPaneController>();
         let all_pane_ids = embedded_panes.map(|e| e.pane_ids()).unwrap_or_default();
         let focused_pane_id = embedded_panes.and_then(|e| e.focused_pane_id());
@@ -6147,6 +6196,12 @@ pub fn run_tui(
                 &tab_bar_info,
                 &frame_layout,
             );
+            // PRD #139: draw the experimental footer into the reserved bottom
+            // row (disjoint from `frame_layout`), using the SAME flag snapshot
+            // the reservation above used.
+            if let Some(footer_area) = experimental_footer_area {
+                render_experimental_footer(frame, &features_snap, footer_area);
+            }
         })?;
         tick = tick.wrapping_add(1);
 
@@ -7692,6 +7747,12 @@ fn render_frame(
     tab_bar: &TabBarInfo,
     layout: &FrameLayout,
 ) {
+    // PRD #84 + #139: `render_frame` reads the precomputed `FrameLayout` (one
+    // layout pass per frame). The PRD #139 experimental-footer row is reserved
+    // in the main loop BEFORE `compute_frame_layout` (so the whole layout, and
+    // the PTY sizing it drives, sits above the footer) and the footer itself is
+    // drawn there in the same `terminal.draw` — see the gating block around the
+    // `compute_frame_layout` call. So there is nothing footer-related to do here.
     ui.side_pane_rects.clear();
     ui.agent_pane_rect = None;
     // PRD #80 M4: rebuilt below only for the dashboard card grid; clearing here
@@ -7931,6 +7992,12 @@ fn render_frame(
     } else if selected_row >= ui.scroll_offset + visible_rows {
         ui.scroll_offset = selected_row + 1 - visible_rows;
     }
+
+    // Re-clamp after a resize may have grown `visible_rows`: an offset left over
+    // from a previous overflow state must shrink so the last card row still sits
+    // at the bottom (no scrolled-off top / blank tail). Only reduces an
+    // over-large offset; legitimate scrolling is unchanged.
+    ui.scroll_offset = clamp_scroll_offset(ui.scroll_offset, total_rows, visible_rows);
 
     let end = (ui.scroll_offset + visible_rows).min(total_rows);
     let rows = &all_rows[ui.scroll_offset..end];
@@ -10695,6 +10762,41 @@ pub fn render_stats_bar_to_buffer(
             height,
         };
         render_stats_bar(frame, stats, area, active_mode_name);
+    })
+}
+
+/// PRD #139 M4.1 — render the throwaway experimental footer into `area`.
+/// When `features.experimental` is set, draws the exact label
+/// `experimental: on`; otherwise renders nothing, leaving the row blank (the
+/// pre-feature baseline). Takes `&Features` by reference, matching every
+/// existing L1 render seam. The live dashboard calls this only when
+/// [`crate::features::show_experimental_footer`] is true (one wrapper, gated
+/// at the user-visible seam — CLAUDE.md #9).
+fn render_experimental_footer(frame: &mut Frame, features: &Features, area: Rect) {
+    if !features.experimental {
+        return;
+    }
+    let line = Line::from(Span::styled("experimental: on", text_primary()));
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// L1 test seam: render the experimental footer into a standalone Buffer.
+/// See `render_stats_bar_to_buffer` for the rationale. Renders the exact text
+/// `experimental: on` iff `features.experimental`, else a blank row.
+#[doc(hidden)]
+pub fn render_experimental_footer_to_buffer(
+    features: &Features,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    draw_to_buffer(width, height, |frame| {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        render_experimental_footer(frame, features, area);
     })
 }
 
@@ -14477,22 +14579,22 @@ mod tests {
     #[test]
     fn test_choose_density_wide() {
         // Wide layout (no extra stats line)
-        // Spacious=11, Normal=9, Compact=7
+        // Spacious=10, Normal=8, Compact=5
 
         // 1 session, 1 col, plenty of height -> Spacious
         assert_eq!(choose_density(1, 1, 20, true), CardDensity::Spacious);
 
-        // 2 sessions, 2 cols = 1 row, height 11 -> Spacious (1*11=11)
-        assert_eq!(choose_density(2, 2, 11, true), CardDensity::Spacious);
+        // 2 sessions, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
+        assert_eq!(choose_density(2, 2, 10, true), CardDensity::Spacious);
 
-        // 2 sessions, 2 cols = 1 row, height 10 -> Normal (1*9=9 fits)
-        assert_eq!(choose_density(2, 2, 10, true), CardDensity::Normal);
+        // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
+        assert_eq!(choose_density(2, 2, 9, true), CardDensity::Normal);
 
-        // 4 sessions, 2 cols = 2 rows, height 18 -> Normal (2*9=18)
-        assert_eq!(choose_density(4, 2, 18, true), CardDensity::Normal);
+        // 4 sessions, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
+        assert_eq!(choose_density(4, 2, 16, true), CardDensity::Normal);
 
-        // 4 sessions, 2 cols = 2 rows, height 17 -> Compact (2*7=14 fits)
-        assert_eq!(choose_density(4, 2, 17, true), CardDensity::Compact);
+        // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*5=10 fits)
+        assert_eq!(choose_density(4, 2, 15, true), CardDensity::Compact);
 
         // Many sessions, small screen -> Compact
         assert_eq!(choose_density(10, 1, 20, true), CardDensity::Compact);
@@ -14504,19 +14606,50 @@ mod tests {
     #[test]
     fn test_choose_density_narrow() {
         // Narrow layout: each mode needs 1 extra row for stats line
-        // Spacious=12, Normal=10, Compact=8
+        // Spacious=11, Normal=9, Compact=6
 
-        // 1 session, height 12 -> Spacious (1*12=12)
-        assert_eq!(choose_density(1, 1, 12, false), CardDensity::Spacious);
+        // 1 session, height 11 -> Spacious (1*11=11)
+        assert_eq!(choose_density(1, 1, 11, false), CardDensity::Spacious);
 
-        // 1 session, height 11 -> Normal (1*10=10 fits)
-        assert_eq!(choose_density(1, 1, 11, false), CardDensity::Normal);
+        // 1 session, height 10 -> Normal (1*9=9 fits)
+        assert_eq!(choose_density(1, 1, 10, false), CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 20 -> Normal (2*10=20)
-        assert_eq!(choose_density(2, 1, 20, false), CardDensity::Normal);
+        // 2 sessions, 1 col, height 18 -> Normal (2*9=18)
+        assert_eq!(choose_density(2, 1, 18, false), CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 19 -> Compact (2*8=16 fits)
-        assert_eq!(choose_density(2, 1, 19, false), CardDensity::Compact);
+        // 2 sessions, 1 col, height 17 -> Compact (2*6=12 fits)
+        assert_eq!(choose_density(2, 1, 17, false), CardDensity::Compact);
+    }
+
+    /// Acceptance criterion 1: `card_height` is derived from rendered content,
+    /// so it returns exactly Compact=5 / Normal=8 / Spacious=10 (wide) and
+    /// 6 / 9 / 11 (narrow). Locks the six values against future drift.
+    #[test]
+    fn card_height_001_content_derived_values() {
+        // Wide layout (no inline stats line).
+        assert_eq!(CardDensity::Compact.card_height(true), 5);
+        assert_eq!(CardDensity::Normal.card_height(true), 8);
+        assert_eq!(CardDensity::Spacious.card_height(true), 10);
+
+        // Narrow layout (+1 row for the inline stats line on every tier).
+        assert_eq!(CardDensity::Compact.card_height(false), 6);
+        assert_eq!(CardDensity::Normal.card_height(false), 9);
+        assert_eq!(CardDensity::Spacious.card_height(false), 11);
+    }
+
+    /// Review finding S1: the card grid must re-clamp a stale scroll offset
+    /// when a resize grows `visible_rows`. While content still overflows the
+    /// window a valid offset is left alone; once everything (or more) fits, the
+    /// offset is reduced so no rows scroll off the top leaving a blank tail.
+    #[test]
+    fn clamp_scroll_offset_reclamps_on_resize_grow() {
+        // Overflow, offset still valid (7 rows, window 3, max offset 7-3=4):
+        // scrolled to 4 stays 4.
+        assert_eq!(clamp_scroll_offset(4, 7, 3), 4);
+
+        // Resize grew the window to 10 so all 7 rows fit: the stale offset 4
+        // must clamp back to 0 (7.saturating_sub(10) == 0).
+        assert_eq!(clamp_scroll_offset(4, 7, 10), 0);
     }
 
     #[test]

@@ -30,6 +30,16 @@ const config = {
           routeBasePath: 'docs',
           sidebarPath: './sidebars.js',
           editUrl: 'https://github.com/vfarcic/dot-agent-deck/edit/main/',
+          // Developer/maintainer docs under docs/develop/ are intentionally NOT
+          // published to the site (see CONTRIBUTING.md). These are Docusaurus's
+          // default content excludes plus the develop/ tree.
+          exclude: [
+            '**/_*.{js,jsx,ts,tsx,md,mdx}',
+            '**/_*/**',
+            '**/*.test.{js,jsx,ts,tsx}',
+            '**/__tests__/**',
+            'develop/**',
+          ],
         },
         blog: false,
         theme: {
