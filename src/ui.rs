@@ -81,21 +81,29 @@ const MOD_KEY: &str = "Ctrl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardDensity {
-    Compact,  // 6 rows: 1 prompt, 1 tool
-    Normal,   // 8 rows: 1 prompt, 3 tools
-    Spacious, // 10 rows: 3 prompts, 3 tools
+    Compact,  // wide 5 / narrow 6 rows: 1 prompt, 1 tool
+    Normal,   // wide 8 / narrow 9 rows: 1 prompt, 3 tools
+    Spacious, // wide 10 / narrow 11 rows: 3 prompts, 3 tools
 }
 
 impl CardDensity {
-    /// Card height in rows. When `wide` is false an extra stats line is rendered,
-    /// so each non-compact mode needs one more row.
+    /// Card height in rows, derived from the exact lines `render_session_card`
+    /// emits so reserved height never drifts from rendered content:
+    ///   Dir (1) + prompts + [narrow: inline stats line] + [non-compact: blank
+    ///   separator] + tools, plus 2 rows for the top/bottom border.
+    ///
+    /// Resulting heights — wide: Compact 5, Normal 8, Spacious 10;
+    /// narrow: 6 / 9 / 11.
     fn card_height(self, wide: bool) -> u16 {
-        let extra = if wide { 0 } else { 1 };
-        match self {
-            CardDensity::Compact => 7 + extra,
-            CardDensity::Normal => 9 + extra,
-            CardDensity::Spacious => 11 + extra,
-        }
+        let prompts = self.max_prompts() as u16;
+        let tools = self.max_tools() as u16;
+        let stats_line = if wide { 0 } else { 1 };
+        let separator = if matches!(self, CardDensity::Compact) {
+            0
+        } else {
+            1
+        };
+        (1 + prompts + stats_line + separator + tools) + 2 // +2 top/bottom border
     }
 
     fn max_tools(self) -> usize {
@@ -131,6 +139,27 @@ fn choose_density(
         }
     }
     CardDensity::Compact
+}
+
+/// Clamp a (possibly stale) vertical scroll offset to the largest value that
+/// still fills the visible window: `scroll_offset.min(total_rows - visible_rows)`
+/// (saturating at 0).
+///
+/// When a terminal resize *grows* `visible_rows` so that more — or all — card
+/// rows now fit, an offset left over from the previous overflow state would
+/// otherwise scroll the top rows off and leave blank space below the last card
+/// until the next navigation keystroke. This only ever *reduces* an over-large
+/// offset; while content genuinely overflows (`total_rows > visible_rows`) a
+/// legitimate offset is returned unchanged, so normal scrolling is untouched.
+///
+/// Crate-private: the only consumers are the render call site and the in-crate
+/// unit test, so it needs no crate-external visibility.
+pub(crate) fn clamp_scroll_offset(
+    scroll_offset: usize,
+    total_rows: usize,
+    visible_rows: usize,
+) -> usize {
+    scroll_offset.min(total_rows.saturating_sub(visible_rows))
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +404,7 @@ Collect these fields:
 - name: unique id for the schedule (also the reuse-tab key; renaming is forbidden — to rename, remove + add).
 - cron: a cron expression (5-field POSIX, e.g. \"0 9 * * MON-FRI\", evaluated in local time).
 - working_dir: directory the prompt runs in (the CLI expands ~ and $VAR — pass them literally).
-- command: REQUIRED — the agent command for a single-agent card. dot-agent-deck supports ONLY \"claude\" and \"opencode\"; offer and pass ONLY one of those — never suggest other CLIs (e.g. gemini), which have no deck integration. ALWAYS ask the user which of the two to run and ALWAYS pass --command; a scheduled task needs an agent to act on its prompt (there is no $SHELL fallback). Ignored only when working_dir has an [[orchestrations]] block (the orchestration's role commands win).
+- command: REQUIRED — the command that launches the single-agent card. It must RESULT IN a \"claude\" or \"opencode\" process: either run one directly (\"claude\", \"claude --model opus\", \"opencode --model gpt-4o\") OR use a project wrapper that ends up launching one (e.g. \"devbox run agent-new\", \"npm run agent\", \"task agent\"). Those are the two CLIs the deck integrates with for live status tracking — a command that does NOT result in claude/opencode still runs but gets no status tracking, so prefer one of them and don't suggest unrelated CLIs (e.g. gemini). ALWAYS ask the user what launches their agent (bare \"claude\"/\"opencode\" is the simple default) and ALWAYS pass --command; a scheduled task needs an agent to act on its prompt (there is no $SHELL fallback). Ignored only when working_dir has an [[orchestrations]] block (the orchestration's role commands win).
 - prompt: the prompt text to deliver on each fire.
 - new_tab_per_fire: true to open a fresh tab every fire, false (default) to reuse one tab.
 - enabled: true (default) or false.
@@ -8042,6 +8071,12 @@ fn render_frame(
         }
     }
 
+    // Re-clamp after a resize may have grown `visible_rows`: an offset left over
+    // from a previous overflow state must shrink so the last card row still sits
+    // at the bottom (no scrolled-off top / blank tail). Only reduces an
+    // over-large offset; legitimate scrolling is unchanged.
+    ui.scroll_offset = clamp_scroll_offset(ui.scroll_offset, total_rows, visible_rows);
+
     let end = (ui.scroll_offset + visible_rows).min(total_rows);
     let rows = &all_rows[ui.scroll_offset..end];
     let row_ids = &all_row_ids[ui.scroll_offset..end];
@@ -15232,22 +15267,22 @@ mod tests {
     #[test]
     fn test_choose_density_wide() {
         // Wide layout (no extra stats line)
-        // Spacious=11, Normal=9, Compact=7
+        // Spacious=10, Normal=8, Compact=5
 
         // 1 session, 1 col, plenty of height -> Spacious
         assert_eq!(choose_density(1, 1, 20, true), CardDensity::Spacious);
 
-        // 2 sessions, 2 cols = 1 row, height 11 -> Spacious (1*11=11)
-        assert_eq!(choose_density(2, 2, 11, true), CardDensity::Spacious);
+        // 2 sessions, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
+        assert_eq!(choose_density(2, 2, 10, true), CardDensity::Spacious);
 
-        // 2 sessions, 2 cols = 1 row, height 10 -> Normal (1*9=9 fits)
-        assert_eq!(choose_density(2, 2, 10, true), CardDensity::Normal);
+        // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
+        assert_eq!(choose_density(2, 2, 9, true), CardDensity::Normal);
 
-        // 4 sessions, 2 cols = 2 rows, height 18 -> Normal (2*9=18)
-        assert_eq!(choose_density(4, 2, 18, true), CardDensity::Normal);
+        // 4 sessions, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
+        assert_eq!(choose_density(4, 2, 16, true), CardDensity::Normal);
 
-        // 4 sessions, 2 cols = 2 rows, height 17 -> Compact (2*7=14 fits)
-        assert_eq!(choose_density(4, 2, 17, true), CardDensity::Compact);
+        // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*5=10 fits)
+        assert_eq!(choose_density(4, 2, 15, true), CardDensity::Compact);
 
         // Many sessions, small screen -> Compact
         assert_eq!(choose_density(10, 1, 20, true), CardDensity::Compact);
@@ -15259,19 +15294,50 @@ mod tests {
     #[test]
     fn test_choose_density_narrow() {
         // Narrow layout: each mode needs 1 extra row for stats line
-        // Spacious=12, Normal=10, Compact=8
+        // Spacious=11, Normal=9, Compact=6
 
-        // 1 session, height 12 -> Spacious (1*12=12)
-        assert_eq!(choose_density(1, 1, 12, false), CardDensity::Spacious);
+        // 1 session, height 11 -> Spacious (1*11=11)
+        assert_eq!(choose_density(1, 1, 11, false), CardDensity::Spacious);
 
-        // 1 session, height 11 -> Normal (1*10=10 fits)
-        assert_eq!(choose_density(1, 1, 11, false), CardDensity::Normal);
+        // 1 session, height 10 -> Normal (1*9=9 fits)
+        assert_eq!(choose_density(1, 1, 10, false), CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 20 -> Normal (2*10=20)
-        assert_eq!(choose_density(2, 1, 20, false), CardDensity::Normal);
+        // 2 sessions, 1 col, height 18 -> Normal (2*9=18)
+        assert_eq!(choose_density(2, 1, 18, false), CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 19 -> Compact (2*8=16 fits)
-        assert_eq!(choose_density(2, 1, 19, false), CardDensity::Compact);
+        // 2 sessions, 1 col, height 17 -> Compact (2*6=12 fits)
+        assert_eq!(choose_density(2, 1, 17, false), CardDensity::Compact);
+    }
+
+    /// Acceptance criterion 1: `card_height` is derived from rendered content,
+    /// so it returns exactly Compact=5 / Normal=8 / Spacious=10 (wide) and
+    /// 6 / 9 / 11 (narrow). Locks the six values against future drift.
+    #[test]
+    fn card_height_001_content_derived_values() {
+        // Wide layout (no inline stats line).
+        assert_eq!(CardDensity::Compact.card_height(true), 5);
+        assert_eq!(CardDensity::Normal.card_height(true), 8);
+        assert_eq!(CardDensity::Spacious.card_height(true), 10);
+
+        // Narrow layout (+1 row for the inline stats line on every tier).
+        assert_eq!(CardDensity::Compact.card_height(false), 6);
+        assert_eq!(CardDensity::Normal.card_height(false), 9);
+        assert_eq!(CardDensity::Spacious.card_height(false), 11);
+    }
+
+    /// Review finding S1: the card grid must re-clamp a stale scroll offset
+    /// when a resize grows `visible_rows`. While content still overflows the
+    /// window a valid offset is left alone; once everything (or more) fits, the
+    /// offset is reduced so no rows scroll off the top leaving a blank tail.
+    #[test]
+    fn clamp_scroll_offset_reclamps_on_resize_grow() {
+        // Overflow, offset still valid (7 rows, window 3, max offset 7-3=4):
+        // scrolled to 4 stays 4.
+        assert_eq!(clamp_scroll_offset(4, 7, 3), 4);
+
+        // Resize grew the window to 10 so all 7 rows fit: the stale offset 4
+        // must clamp back to 0 (7.saturating_sub(10) == 0).
+        assert_eq!(clamp_scroll_offset(4, 7, 10), 0);
     }
 
     #[test]

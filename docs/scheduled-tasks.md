@@ -27,7 +27,7 @@ The easiest door: converse with an agent that builds the entry and runs the comm
 Either way a throwaway **`claude`** session opens and walks you through it. It:
 
 - asks you for the fields (name, cron, working dir, command, prompt, …);
-- offers **only `claude` or `opencode`** for the command — the two CLIs the deck integrates with — and never suggests others (e.g. `gemini`), which have no deck integration. It **always asks which of the two to run** because the command is **required**;
+- asks for the **command that launches your agent** — it must result in a `claude` or `opencode` process, either directly (`claude`, `claude --model opus`, `opencode --model gpt-4o`) or via a project wrapper that ends up launching one (`devbox run agent-new`, `npm run agent`). Those are the two CLIs the deck integrates with for **live status tracking**; a command that doesn't result in one still runs but gets no status tracking, so the agent won't suggest unrelated CLIs (e.g. `gemini`). The command is **required** (there is no `$SHELL` fallback);
 - lets you **test the prompt in the same session** ("run it now, show me") before committing;
 - **confirms the full entry** with you, then calls `schedule add` (or `schedule update` on the edit path).
 
