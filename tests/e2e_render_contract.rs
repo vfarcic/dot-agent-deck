@@ -9,15 +9,17 @@
 //! settled grid through the `vt100` parser. No LLM tokens are spent — panes
 //! run `sleep` or open the fixture's empty `demo` mode pane.
 //!
-//! IMPORTANT (PRD #84, and the PRD's own "race-y resize timing" note): the
-//! current code resizes every embedded pane's PTY on *every* layout-change
-//! path (`Event::Resize`, `Action::ToggleLayout` → `resize_*_panes`, tab
-//! open/close, mode switch). The scramble / empty-band symptoms are therefore
-//! transient one-frame races that self-heal once the path's resize fires, and
-//! are NOT deterministically observable through a PTY+vt100 harness that reads
-//! the settled grid. These tests are written as **invariant guards**: they
-//! exercise the real path and assert the contract property the settled frame
-//! must satisfy. They flag (pass) today and pin the invariant for the M3/M4/M5
+//! IMPORTANT (PRD #84, and the PRD's own "race-y resize timing" note): these
+//! reproducers were written against the PRE-M4 (pre-rework) code, which
+//! resized every embedded pane's PTY on *every* layout-change path
+//! (`Event::Resize`, `Action::ToggleLayout` → `resize_*_panes`, tab
+//! open/close, mode switch). In that pre-rework state the scramble /
+//! empty-band symptoms were transient one-frame races that self-healed once
+//! the path's resize fired, and so were NOT deterministically observable
+//! through a PTY+vt100 harness that reads the settled grid. These tests are
+//! therefore written as **invariant guards**: they exercise the real path and
+//! assert the contract property the settled frame must satisfy. They flagged
+//! (passed) against the pre-M4 code and pin the invariant for the M3/M4/M5
 //! contract work — a regression that leaves the frame in the broken state
 //! turns the guard RED. The deterministic widget-level RED for the same
 //! defect class lives in `tests/render_terminal_widget.rs`.
@@ -66,9 +68,10 @@ fn max_row_width(grid: &str) -> usize {
 /// next settled frame must fill the new width — a rendered row (the pane border
 /// or the bottom bar) reaches close to column 120 — with no band of unfilled
 /// columns leaving the frame stuck near the old 80-col width. Invariant guard:
-/// the empty-band symptom is a transient pre-resize-propagation race that the
-/// current code self-heals, so this pins the post-resize "fills the new width"
-/// contract (extends the `resize/sigwinch` area; goes/stays GREEN at M4).
+/// against the PRE-M4 (pre-rework) code the empty-band symptom was a transient
+/// pre-resize-propagation race that self-healed, so this pins the post-resize
+/// "fills the new width" contract (extends the `resize/sigwinch` area;
+/// goes/stays GREEN at M4).
 #[spec("resize/render/001")]
 #[test]
 fn render_001_enlarge_fills_new_width() {

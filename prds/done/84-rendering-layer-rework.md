@@ -80,7 +80,7 @@ The contract we are aiming for:
 
 - [x] **M5 — Simplify `TerminalWidget`.** Remove the `min(area, screen)` col clamp and the cursor-anchored row windowing in `src/terminal_widget.rs:94-117`. Add `debug_assert!` for the PTY-size-equals-area invariant; in release, log once on mismatch and fall back to `min` so we never panic in production. Re-run the M1 catalog: every reproducer must pass. If any still fail, the contract has a hole — fix the upstream code path, do *not* re-add the clamp.
 
-- [ ] **M6 — Tests and pre-PR validation.** Promote the M1 reproducers from "scenarios we ran by hand" to permanent CI tests covering the contract's invariants. Then a single end-to-end pass per `feedback_validate_pre_pr.md`: drive the failure scenarios from the Problem section interactively (resize, tab switch with N panes, mode switch, reactive pane replace) and confirm no scrambling, no empty bands, no glitches. Then PR.
+- [x] **M6 — Tests and pre-PR validation.** Promote the M1 reproducers from "scenarios we ran by hand" to permanent CI tests covering the contract's invariants. Then a single end-to-end pass per `feedback_validate_pre_pr.md`: drive the failure scenarios from the Problem section interactively (resize, tab switch with N panes, mode switch, reactive pane replace) and confirm no scrambling, no empty bands, no glitches. Then PR.
 
 ## Validation Strategy
 
