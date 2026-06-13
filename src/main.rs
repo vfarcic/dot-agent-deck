@@ -666,6 +666,13 @@ fn init_logging_from_env() {
 /// runs return `ExitCode::SUCCESS` — including TUI-task errors, which are
 /// already surfaced to stderr.
 async fn run_tui_session(continue_session: bool) -> ExitCode {
+    // PRD #139 M1.2/M1.3: initialize the process-global experimental flag from
+    // `.dot-agent-deck.toml` `[features]` (env override wins) and start the
+    // live re-read watcher. The startup state is recorded via a single
+    // `tracing::info!` line, which surfaces only when file logging is enabled
+    // (`DOT_AGENT_DECK_LOG`); it is never printed to the terminal.
+    dot_agent_deck::features::init_and_watch();
+
     let state = Arc::new(RwLock::new(AppState::default()));
     let attach_path = attach_socket_path();
 
@@ -1022,6 +1029,10 @@ async fn run_daemon_restart_cli(force: bool) -> ExitCode {
 #[tokio::main]
 async fn run_daemon_serve_cli() -> ExitCode {
     init_logging_from_env();
+    // PRD #139 M1.2/M2.1: the daemon reads the experimental flag from the same
+    // `.dot-agent-deck.toml` source of truth and watches it independently of
+    // the TUI (the file is the contract; no cross-process sync).
+    dot_agent_deck::features::init_and_watch();
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();
     let attach_path = attach_socket_path();
