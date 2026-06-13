@@ -7420,7 +7420,7 @@ fn render_tab_strip(
 /// inline (contract invariant 1: one layout pass per frame). M4: it also
 /// carries each terminal pane's OUTER rect so `resize_panes_to_layout` can
 /// derive PTY size from the layout (invariant 2). See
-/// `docs/rendering-contract.md`.
+/// `docs/develop/rendering-contract.md`.
 struct FrameLayout {
     /// Tab-bar row, present only when the tab strip is shown this frame
     /// (`TabBarInfo::show`).
@@ -7779,7 +7779,7 @@ fn render_frame(
     // fed to BOTH the pre-draw `resize_panes_to_layout` (PTY sizing) and this
     // render pass, so the rects drawn here are exactly the PTY-resize targets.
     // This function only reads from it; it never splits layout itself. See
-    // `docs/rendering-contract.md`.
+    // `docs/develop/rendering-contract.md`.
     let hints_area = layout.hints;
 
     // Tab strip: render into the bar rect the layout pass reserved, or drop any
