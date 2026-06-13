@@ -853,20 +853,66 @@ fn is_reachability_error(err: &RemoteConnectError) -> bool {
     matches!(err, RemoteConnectError::HostUnreachable { .. })
 }
 
+/// PRD #148: which situation triggered a transport failure. This controls
+/// ONLY the user-visible "we'll retry" line printed before the backoff — the
+/// give-up message, terminal restore, and bounded-retry logic are identical
+/// for both. Distinguishing them matters because the two read very differently
+/// to a user (Greptile PR #152 finding 1): a dropped live session is "you were
+/// connected and it broke", a still-unreachable reconnect probe is "the host
+/// hasn't come back yet".
+#[derive(Clone, Copy)]
+enum TransportFailureKind {
+    /// A live `ssh -t` session was up and then dropped (spawn returned 255).
+    SessionDropped,
+    /// A reconnect-attempt probe found the host still unreachable; no session
+    /// ran this round.
+    StillUnreachable,
+}
+
+/// PRD #148: the stderr line printed before backing off for another attempt.
+/// Pure (no I/O) so it can be unit-tested directly without capturing process
+/// stderr. `attempt` is the 1-based number of the attempt that just failed;
+/// the message advertises `attempt + 1`, the one we're about to make.
+fn retry_message(kind: TransportFailureKind, name: &str, attempt: usize) -> String {
+    let next = attempt + 1;
+    match kind {
+        // Live session dropped — "connection lost" is accurate here.
+        TransportFailureKind::SessionDropped => {
+            format!(
+                "connection to '{name}' lost — reconnecting… (attempt {next}/{MAX_CONNECT_ATTEMPTS})"
+            )
+        }
+        // Host was already unreachable this round; "connection lost" would
+        // mislead the user into thinking a fresh session dropped again.
+        TransportFailureKind::StillUnreachable => {
+            format!(
+                "'{name}' not reachable yet — retrying… (attempt {next}/{MAX_CONNECT_ATTEMPTS})"
+            )
+        }
+    }
+}
+
 /// PRD #148: shared bounded-retry decision for a transport failure on attempt
-/// `attempt` (1-based) — either a spawn that returned 255 or a reconnect-time
-/// reachability probe failure. Returns `Some(exit_code)` when the retry budget
-/// is exhausted (caller should `return Ok(code)`); returns `None` after backing
-/// off (caller should `continue` to the next attempt).
+/// `attempt` (1-based) — either a spawn that returned 255 ([`TransportFailureKind::SessionDropped`])
+/// or a reconnect-time reachability probe failure
+/// ([`TransportFailureKind::StillUnreachable`]). Returns `Some(exit_code)` when
+/// the retry budget is exhausted (caller should `return Ok(code)`); returns
+/// `None` after backing off (caller should `continue` to the next attempt).
 ///
 /// On give-up it restores a sane local terminal — the remote TUI never got to
 /// leave alt screen / raw mode when the transport died — and prints the
-/// "giving up" line to stderr, so BOTH the spawn-255 path and the
-/// reconnect-probe-failure path restore the terminal and surface the same
-/// message. Keeping this in one place is what guarantees a still-unreachable
-/// host on a reconnect can't escape the loop without counting against the
-/// budget, backing off, and (on exhaustion) restoring the terminal.
-fn on_transport_failure(attempt: usize, name: &str, backoff: &dyn ReconnectBackoff) -> Option<i32> {
+/// "giving up" line to stderr, so BOTH paths restore the terminal and surface
+/// the same give-up message (only the per-attempt "we'll retry" line, via
+/// [`retry_message`], differs by `kind`). Keeping this in one place is what
+/// guarantees a still-unreachable host on a reconnect can't escape the loop
+/// without counting against the budget, backing off, and (on exhaustion)
+/// restoring the terminal.
+fn on_transport_failure(
+    attempt: usize,
+    name: &str,
+    kind: TransportFailureKind,
+    backoff: &dyn ReconnectBackoff,
+) -> Option<i32> {
     if attempt >= MAX_CONNECT_ATTEMPTS {
         // Budget exhausted: the remote stayed unreachable across every attempt.
         restore_local_terminal();
@@ -877,13 +923,7 @@ fn on_transport_failure(attempt: usize, name: &str, backoff: &dyn ReconnectBacko
         return Some(SSH_TRANSPORT_FAILURE_EXIT_CODE);
     }
     // Message goes to stderr, between the handed-over terminal sessions.
-    // `attempt + 1` is the attempt we're about to make.
-    eprintln!(
-        "connection to '{}' lost — reconnecting… (attempt {}/{})",
-        name,
-        attempt + 1,
-        MAX_CONNECT_ATTEMPTS
-    );
+    eprintln!("{}", retry_message(kind, name, attempt));
     backoff.backoff(attempt);
     None
 }
@@ -965,7 +1005,12 @@ pub fn run_connect(
                 );
             }
             Err(e) if attempt > 1 && is_reachability_error(&e) => {
-                match on_transport_failure(attempt, &entry.name, backoff) {
+                match on_transport_failure(
+                    attempt,
+                    &entry.name,
+                    TransportFailureKind::StillUnreachable,
+                    backoff,
+                ) {
                     Some(code) => return Ok(code),
                     None => continue,
                 }
@@ -984,7 +1029,12 @@ pub fn run_connect(
         match probe_remote_protocol(executor, &target, &entry.name, install_path) {
             Ok(()) => {}
             Err(e) if attempt > 1 && is_reachability_error(&e) => {
-                match on_transport_failure(attempt, &entry.name, backoff) {
+                match on_transport_failure(
+                    attempt,
+                    &entry.name,
+                    TransportFailureKind::StillUnreachable,
+                    backoff,
+                ) {
                     Some(code) => return Ok(code),
                     None => continue,
                 }
@@ -1003,7 +1053,12 @@ pub fn run_connect(
         // Stage 3: route on the exit code. Reconnect ONLY on ssh's
         // transport-failure code (255); any other code is terminal.
         if exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE {
-            match on_transport_failure(attempt, &entry.name, backoff) {
+            match on_transport_failure(
+                attempt,
+                &entry.name,
+                TransportFailureKind::SessionDropped,
+                backoff,
+            ) {
                 Some(code) => return Ok(code),
                 None => continue,
             }
@@ -1630,6 +1685,36 @@ mod tests {
         assert!(
             reloaded.remotes[0].last_connected.is_none(),
             "no bookkeeping when reconnects exhaust on an unreachable host"
+        );
+    }
+
+    #[test]
+    fn retry_message_differentiates_drop_from_unreachable() {
+        // Greptile PR #152 finding 1: the spawn-255 live-drop path and the
+        // reconnect-time probe-unreachable path must read differently. Both
+        // advertise the *next* attempt (attempt + 1) and share the em-dash +
+        // ellipsis style; only the live-drop line says "connection … lost".
+        let dropped = retry_message(TransportFailureKind::SessionDropped, "prod", 1);
+        assert_eq!(
+            dropped,
+            format!("connection to 'prod' lost — reconnecting… (attempt 2/{MAX_CONNECT_ATTEMPTS})")
+        );
+
+        let unreachable = retry_message(TransportFailureKind::StillUnreachable, "prod", 2);
+        assert_eq!(
+            unreachable,
+            format!("'prod' not reachable yet — retrying… (attempt 3/{MAX_CONNECT_ATTEMPTS})")
+        );
+
+        // The whole point of the fix: the two paths must NOT print the same
+        // line, and the unreachable line must not claim a connection was lost.
+        assert_ne!(
+            retry_message(TransportFailureKind::SessionDropped, "prod", 1),
+            retry_message(TransportFailureKind::StillUnreachable, "prod", 1),
+        );
+        assert!(
+            !unreachable.contains("lost"),
+            "the still-unreachable line must not say a connection was 'lost': {unreachable}"
         );
     }
 }
