@@ -14,6 +14,7 @@ pub mod daemon_stop;
 pub mod embedded_pane;
 pub mod error;
 pub mod event;
+pub mod features;
 pub mod hook;
 pub mod hooks_manage;
 pub mod hyperlink;

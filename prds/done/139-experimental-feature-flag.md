@@ -1,6 +1,7 @@
 # PRD #139: Experimental feature flag (single-toggle gating for in-flight features)
 
-**Status**: Planning
+**Status**: Complete
+**Completed**: 2026-06-12
 **Priority**: Medium
 **Created**: 2026-06-08
 **GitHub Issue**: [#139](https://github.com/vfarcic/dot-agent-deck/issues/139)
@@ -96,30 +97,30 @@ Key design choices and the rationale for each:
 
 ### Phase 1: Core flag plumbing
 
-- [ ] **M1.1** — `src/features.rs` (new): `Features { experimental: bool }`, `experimental_enabled()` accessor, env-override precedence, unit tests for TOML parse + env override.
-- [ ] **M1.2** — Wire `Features` into existing config loading. Both TUI and daemon read `[features]` from `.dot-agent-deck.toml` at startup. Single shared `Arc<RwLock<Features>>` per process.
-- [ ] **M1.3** — Startup log line indicating flag state. Documented in code, covered by a startup-log unit test if one exists for related output.
+- [x] **M1.1** — `src/features.rs` (new): `Features { experimental: bool }`, `experimental_enabled()` accessor, env-override precedence, unit tests for TOML parse + env override.
+- [x] **M1.2** — Wire `Features` into existing config loading. Both TUI and daemon read `[features]` from `.dot-agent-deck.toml` at startup. Single shared `Arc<RwLock<Features>>` per process.
+- [x] **M1.3** — Startup log line indicating flag state. Documented in code, covered by a startup-log unit test if one exists for related output.
 
 ### Phase 2: Live reload
 
-- [ ] **M2.1** — File watcher for `.dot-agent-deck.toml`. On change, re-parse the `[features]` table and update the shared `Features` value. Env override still wins.
-- [ ] **M2.2** — Test that surfaces re-evaluate the wrapper on the next render after a file change. Use the in-process `TestBackend` + a synthetic file event.
+- [x] **M2.1** — File watcher for `.dot-agent-deck.toml`. On change, re-parse the `[features]` table and update the shared `Features` value. Env override still wins.
+- [x] **M2.2** — Test that surfaces re-evaluate the wrapper on the next render after a file change. Use the in-process `TestBackend` + a synthetic file event.
 
 ### Phase 3: Project policy
 
-- [ ] **M3.1** — Add a permanent instruction to this repo's `CLAUDE.md` describing the flag-gating policy: ask the question at PRD start, follow the wrapper convention, note the flag in PRD / changelog / docs, file a `graduate-<feature>` follow-up issue when shipping.
-- [ ] **M3.2** — Document the wrapper convention in `CLAUDE.md` or a referenced docs page: gate at the user-visible seam, one wrapper function per feature, no flag-checks scattered through implementation code.
+- [x] **M3.1** — Add a permanent instruction to this repo's `CLAUDE.md` describing the flag-gating policy: ask the question at PRD start, follow the wrapper convention, note the flag in PRD / changelog / docs, file a `graduate-<feature>` follow-up issue when shipping.
+- [x] **M3.2** — Document the wrapper convention in `CLAUDE.md` or a referenced docs page: gate at the user-visible seam, one wrapper function per feature, no flag-checks scattered through implementation code.
 
 ### Phase 4: Tests + initial gated surface
 
-- [ ] **M4.1** — L1 snapshot tests for an initial gated surface (either the first real flag-gated feature in another PRD, or a trivial throwaway footer label). One snapshot with flag forced ON, one with flag forced OFF.
-- [ ] **M4.2** — Test helper: `Features::test_with(experimental: true/false)` constructor for per-test forcing. PTY/E2E tests can inject via env (`DOT_AGENT_DECK_EXPERIMENTAL=1`).
+- [x] **M4.1** — L1 snapshot tests for an initial gated surface (either the first real flag-gated feature in another PRD, or a trivial throwaway footer label). One snapshot with flag forced ON, one with flag forced OFF.
+- [x] **M4.2** — Test helper: `Features::test_with(experimental: true/false)` constructor for per-test forcing. PTY/E2E tests can inject via env (`DOT_AGENT_DECK_EXPERIMENTAL=1`).
 
 ### Phase 5: Docs, ship
 
-- [ ] **M5.1** — Documentation under `site/`: a short section on the `experimental` flag (what it does, how to enable, why features are gated).
-- [ ] **M5.2** — Changelog fragment via `dot-ai-changelog-fragment`. Frame as "new project-wide convention: in-flight features can be gated behind an `experimental` flag; off by default."
-- [ ] **M5.3** — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test-fast`, `cargo test-e2e` all green. PR, review, audit, merge.
+- [x] **M5.1** — Documentation under `site/`: a short section on the `experimental` flag (what it does, how to enable, why features are gated).
+- [x] **M5.2** — Changelog fragment via `dot-ai-changelog-fragment`. Frame as "new project-wide convention: in-flight features can be gated behind an `experimental` flag; off by default."
+- [x] **M5.3** — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test-fast`, `cargo test-e2e` all green. PR, review, audit, merge.
 
 ## Key Files
 

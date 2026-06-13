@@ -1,6 +1,6 @@
 # PRD #148: Remote connect survives laptop sleep/wake
 
-**Status**: Planning
+**Status**: In Progress — implementation, tests, and docs complete (M1–M3, M5); pending real-remote sleep/wake verification (M4)
 **Priority**: High
 **Created**: 2026-06-12
 **GitHub Issue**: [#148](https://github.com/vfarcic/dot-agent-deck/issues/148)
@@ -85,28 +85,28 @@ Why this is safe and correct:
 ## Acceptance Criteria
 
 ### Keepalive on live session
-- [ ] `build_connect_command` emits `-o ServerAliveInterval=<n>` and `-o ServerAliveCountMax=<m>` in addition to the existing `ConnectTimeout`.
-- [ ] After a real sleep/wake (or a simulated transport drop), the ssh session terminates within roughly `interval × countMax` seconds instead of hanging indefinitely.
-- [ ] The probe path in `src/remote.rs` is unchanged (still `ServerAliveCountMax=1`).
+- [x] `build_connect_command` emits `-o ServerAliveInterval=<n>` and `-o ServerAliveCountMax=<m>` in addition to the existing `ConnectTimeout`. *(M1: `LIVE_KEEPALIVE_INTERVAL_SECS=15`, `LIVE_KEEPALIVE_COUNT_MAX=3`; arg-assertion test updated.)*
+- [ ] After a real sleep/wake (or a simulated transport drop), the ssh session terminates within roughly `interval × countMax` seconds instead of hanging indefinitely. *(Runtime ssh behavior — pending M4 real-remote verification.)*
+- [x] The probe path in `src/remote.rs` is unchanged (still `ServerAliveCountMax=1`). *(Confirmed untouched by reviewer + auditor.)*
 
 ### Auto-reconnect
-- [ ] When `spawn` returns 255, `run_connect` re-probes and re-spawns rather than returning; the user is shown a "reconnecting to `<name>`…" message between sessions.
-- [ ] On reconnect, the remote TUI re-attaches to the still-running agents (verified the session resumes, not a fresh empty dashboard).
-- [ ] A clean remote exit (0), a Ctrl-C/signal exit (e.g. 130/143), and a non-255 remote-TUI crash all return immediately with that exit code — **no** reconnect.
-- [ ] Reconnection is bounded by a retry/backoff budget; once exhausted, `run_connect` returns a clear error and restores a sane local terminal.
-- [ ] `last_connected` bookkeeping still updates only on a genuine clean exit (status 0), not on intermediate reconnects.
+- [x] When `spawn` returns 255, `run_connect` re-probes and re-spawns rather than returning; the user is shown a "reconnecting to `<name>`…" message between sessions. *(M2; test `reconnect_then_clean_exit_returns_zero`.)*
+- [ ] On reconnect, the remote TUI re-attaches to the still-running agents (verified the session resumes, not a fresh empty dashboard). *(Real-remote behavior — pending M4 verification.)*
+- [x] A clean remote exit (0), a Ctrl-C/signal exit (e.g. 130/143), and a non-255 remote-TUI crash all return immediately with that exit code — **no** reconnect. *(Tests `clean_exit_does_not_reconnect`, `ctrl_c_exit_is_terminal_no_reconnect`.)*
+- [x] Reconnection is bounded by a retry/backoff budget; once exhausted, `run_connect` returns a clear error and restores a sane local terminal. *(`MAX_CONNECT_ATTEMPTS=5`; tests `repeated_transport_failure_is_bounded`, `reconnect_time_unreachable_is_bounded_not_immediate`; terminal restore on both give-up routes.)*
+- [x] `last_connected` bookkeeping still updates only on a genuine clean exit (status 0), not on intermediate reconnects. *(Asserted in reconnect tests.)*
 
 ### Tests
-- [ ] Unit test: `build_connect_command` arg assertion updated to expect the new keepalive options.
-- [ ] Unit tests via the fake `ConnectSpawner` + fake `SshExecutor`: `[255, 0]` ⇒ exactly two spawns + one reconnect, returns 0; `[0]` ⇒ one spawn, no reconnect; `[130]` ⇒ one spawn, no reconnect; repeated `255` ⇒ bounded number of spawns then a terminal error (backoff sleep is injectable so tests don't actually wait).
+- [x] Unit test: `build_connect_command` arg assertion updated to expect the new keepalive options.
+- [x] Unit tests via the fake `ConnectSpawner` + fake `SshExecutor`: `[255, 0]` ⇒ exactly two spawns + one reconnect, returns 0; `[0]` ⇒ one spawn, no reconnect; `[130]` ⇒ one spawn, no reconnect; repeated `255` ⇒ bounded number of spawns then a terminal error (backoff sleep is injectable so tests don't actually wait). *(All present; plus reconnect-time probe-failure bounded-retry coverage.)*
 
 ## Milestones
 
-- [ ] **M1 — Keepalive on the live session.** Add `ServerAliveInterval`/`ServerAliveCountMax` to `build_connect_command` with named constants; update the existing arg-assertion unit test. (Layer 1 alone already removes the freeze.)
-- [ ] **M2 — Auto-reconnect loop.** Wrap spawn/bookkeeping in `run_connect` with the 255-keyed, probe-gated, bounded-backoff reconnect loop, including user-visible messaging and local-terminal restore on give-up. Make the backoff sleep injectable for tests.
-- [ ] **M3 — Tests.** Fake-spawner/fake-executor unit tests covering the reconnect state machine and exit-code routing (M2 acceptance list); confirm `cargo test-fast`, `cargo fmt --check`, `cargo clippy -- -D warnings` are green.
-- [ ] **M4 — Verified against a real remote.** Connect to a remote daemon, sleep/wake the laptop (or drop the network), and confirm the session is dropped promptly and auto-reconnects to the running agents without closing the tab. Run `cargo test-e2e` before the PR.
-- [ ] **M5 — Docs.** Update the Remote Environments docs to note that sessions now survive sleep/wake and auto-reconnect, including the keepalive tuning knobs and the bounded-retry behavior.
+- [x] **M1 — Keepalive on the live session.** Add `ServerAliveInterval`/`ServerAliveCountMax` to `build_connect_command` with named constants; update the existing arg-assertion unit test. (Layer 1 alone already removes the freeze.)
+- [x] **M2 — Auto-reconnect loop.** Wrap spawn/bookkeeping in `run_connect` with the 255-keyed, probe-gated, bounded-backoff reconnect loop, including user-visible messaging and local-terminal restore on give-up. Make the backoff sleep injectable for tests. *(Review blocker found + fixed: reconnect-time `HostUnreachable` probe failures now fold into the same bounded retry/restore path via `is_reachability_error` + shared `on_transport_failure`.)*
+- [x] **M3 — Tests.** Fake-spawner/fake-executor unit tests covering the reconnect state machine and exit-code routing (M2 acceptance list); confirm `cargo test-fast`, `cargo fmt --check`, `cargo clippy -- -D warnings` are green. *(`cargo test-fast` 708 passed; fmt clean; clippy 0 warnings.)*
+- [ ] **M4 — Verified against a real remote.** Connect to a remote daemon, sleep/wake the laptop (or drop the network), and confirm the session is dropped promptly and auto-reconnects to the running agents without closing the tab. Run `cargo test-e2e` before the PR. *(`cargo test-e2e` 1026 passed; real-hardware sleep/wake manual check still pending — a user step.)*
+- [x] **M5 — Docs.** Update the Remote Environments docs to note that sessions now survive sleep/wake and auto-reconnect, including the keepalive tuning knobs and the bounded-retry behavior. *(`docs/remote-environments.md`: new "Surviving sleep/wake" section + updated Stop-vs-detach row.)*
 
 ## Out of Scope
 
