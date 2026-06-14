@@ -37,7 +37,7 @@ User-visible symptom (reported): creating a new dashboard card from inside an or
 
 ## Solution
 
-In the "regular dashboard pane" branch of `Action::SpawnPane`, switch to the Dashboard tab (always index 0) **before** applying focus and selection, so the existing `focus_pane` / `selected_index` / `resize_dashboard_panes` calls act on the now-visible Dashboard:
+In the "regular dashboard pane" branch of `Action::SpawnPane`, switch to the Dashboard tab (always index 0) **before** applying focus and selection, so the existing `focus_pane` / `selected_index` calls act on the now-visible Dashboard. The switch is preceded by `capture_focus_on_switch_out()` — mirroring every other production `switch_to` — so the leaving tab's live focus is snapshotted and restores correctly on return:
 
 ```rust
 } else {
@@ -46,11 +46,18 @@ In the "regular dashboard pane" branch of `Action::SpawnPane`, switch to the Das
     // otherwise, when launched from an orchestration/mode tab, the new card
     // lands on a tab the user isn't viewing. (Orchestration/mode creation
     // already switch to their own new tab via open_*_tab.)
+    //
+    // Capture the leaving tab's live focus before the switch, mirroring
+    // the established switch-out invariant, so its prior focus restores
+    // on return.
+    tab_manager.capture_focus_on_switch_out();
     tab_manager.switch_to(0);
     let _ = pane.focus_pane(&new_id);
     ui.mode = UiMode::PaneInput;
-    ui.selected_index = filtered.len();
-    resize_dashboard_panes(pane, ui, tab_manager, frame_area);
+    ui.selected_index = Some(filtered.len());
+    // PRD #84 M4: the pane was spawned at the dashboard layout dims; the
+    // pre-draw `resize_panes_to_layout` reconciles it to the exact rect
+    // next frame. No resize here.
     ...
 }
 ```

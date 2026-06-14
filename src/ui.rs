@@ -5052,6 +5052,17 @@ fn dispatch_action(
                                 // otherwise, when launched from an orchestration/mode tab, the new card
                                 // lands on a tab the user isn't viewing. (Orchestration/mode creation
                                 // already switch to their own new tab via open_*_tab.)
+                                //
+                                // Capture the leaving tab's live focus before the switch, mirroring
+                                // the established switch-out invariant (every other production
+                                // `switch_to` — src/ui.rs:3059, 4074, 4625, and the
+                                // `switch_tab_with_focus` helper — is preceded by
+                                // `capture_focus_on_switch_out`). Without it, a card created from a
+                                // non-Dashboard tab never snapshots that tab's `focused_pane_id`, so
+                                // its prior focus goes stale and fails to restore on return. Safe
+                                // here: focus is still the leaving tab's pane at this point, and the
+                                // `pane.focus_pane(&new_id)` below then moves focus to the new card.
+                                tab_manager.capture_focus_on_switch_out();
                                 tab_manager.switch_to(0);
                                 let _ = pane.focus_pane(&new_id);
                                 ui.mode = UiMode::PaneInput;
