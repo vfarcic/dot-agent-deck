@@ -6522,6 +6522,10 @@ pub fn run_tui(
         let embedded_panes = pane.as_any().downcast_ref::<EmbeddedPaneController>();
         let all_pane_ids = embedded_panes.map(|e| e.pane_ids()).unwrap_or_default();
         let focused_pane_id = embedded_panes.and_then(|e| e.focused_pane_id());
+        // PRD #144: the bottom bar wraps to a second row when its full-label
+        // buttons don't fit one row, so reserve its actual height up front (the
+        // layout pass feeds both the PTY resize and the render this frame).
+        let bar_rows = bottom_bar_rows(&ui, frame_area.width, &tab_view);
         let frame_layout = compute_frame_layout(
             frame_area,
             &tab_view,
@@ -6529,6 +6533,7 @@ pub fn run_tui(
             &all_pane_ids,
             pane_layout,
             focused_pane_id.as_deref(),
+            bar_rows,
         );
         if let Some(embedded) = embedded_panes {
             resize_panes_to_layout(&frame_layout, embedded);
@@ -7868,19 +7873,24 @@ fn compute_frame_layout(
     all_pane_ids: &[String],
     pane_layout: PaneLayout,
     focused_pane_id: Option<&str>,
+    bottom_bar_rows: u16,
 ) -> FrameLayout {
+    // PRD #144: the bottom bar may WRAP to more than one row, so reserve its
+    // ACTUAL height (`bottom_bar_rows`, at least 1) — the main content area
+    // above shrinks by exactly that, preventing card/pane clip or overlap.
+    let bar_rows = bottom_bar_rows.max(1);
     // Vertical: optional tab bar at top, main content, hints bar at bottom.
     let (tab_bar_rect, main_area, hints) = if tab_bar.show {
         let chunks = Layout::vertical([
-            Constraint::Length(1), // tab bar
-            Constraint::Fill(1),   // main content
-            Constraint::Length(1), // hints bar
+            Constraint::Length(1),        // tab bar
+            Constraint::Fill(1),          // main content
+            Constraint::Length(bar_rows), // hints bar (1 or more wrapped rows)
         ])
         .split(frame_area);
         (Some(chunks[0]), chunks[1], chunks[2])
     } else {
         let chunks =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(frame_area);
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(bar_rows)]).split(frame_area);
         (None, chunks[0], chunks[1])
     };
 
@@ -8948,14 +8958,54 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
     buttons
 }
 
-/// PRD #80 M2: render the persistent global button bar into `area` (one row)
+/// PRD #144 — greedy line-wrap for the bottom button bar. Lay the buttons out
+/// left-to-right separated by one space, keeping every button's FULL label;
+/// when the next button would overflow `width`, wrap it to a fresh row rather
+/// than collapsing to shortcut-only chips (the pre-#144 degradation). Returns
+/// one `Rect` per input width — `x` in `[0, width)`, `y` the 0-based row,
+/// `height` 1 — in input order, plus the total number of rows occupied (0 for
+/// an empty input). A button wider than `width` is still placed at the start of
+/// its own row (the caller clips it to the buffer). Pure data: no rendering, so
+/// the same layout drives the render AND the reserved height budget.
+fn layout_button_bar(label_widths: &[u16], width: u16) -> (Vec<Rect>, u16) {
+    const SEP: u16 = 1;
+    let mut rects = Vec::with_capacity(label_widths.len());
+    let mut x = 0u16;
+    let mut y = 0u16;
+    let mut row_has_button = false;
+    for &w in label_widths {
+        if row_has_button && x.saturating_add(SEP).saturating_add(w) > width {
+            // Would overflow the current row — wrap to a fresh one.
+            y += 1;
+            x = 0;
+            row_has_button = false;
+        }
+        if row_has_button {
+            x = x.saturating_add(SEP);
+        }
+        rects.push(Rect {
+            x,
+            y,
+            width: w,
+            height: 1,
+        });
+        x = x.saturating_add(w);
+        row_has_button = true;
+    }
+    let rows = if label_widths.is_empty() { 0 } else { y + 1 };
+    (rects, rows)
+}
+
+/// PRD #80 M2 / PRD #144: render the persistent global button bar into `area`
 /// and return the `(Action, Rect)` pairs to record in `UiState::button_rects`
-/// so a later click hit-tests back to the right action. Two-tier labels: the
-/// full `[Label Shortcut]` set when it fits the row width, otherwise the
-/// shortcut-only `[Shortcut]` fallback (the same width-pressure approach the
-/// old status legend faced). Buttons are separated by one space and laid out
-/// left to right; a button that would overflow the row is dropped whole rather
-/// than truncated mid-label, so every rendered button stays identifiable.
+/// so a later click hit-tests back to the right action. Every button keeps its
+/// FULL `[Label Shortcut]` label; when the full set doesn't fit one row it WRAPS
+/// to a second (or further) row (PRD #144) rather than collapsing to
+/// shortcut-only chips — degradation is uniform, no button is special-cased.
+/// Buttons are separated by one space and laid out left to right via
+/// [`layout_button_bar`]; a button whose wrapped row falls outside `area`'s
+/// reserved height is dropped whole (the height budget reserves the bar's
+/// actual row count, so on the dashboard this never clips a real button).
 fn render_button_bar(
     frame: &mut Frame,
     keybindings: &KeybindingConfig,
@@ -8963,58 +9013,68 @@ fn render_button_bar(
     has_pane_control: bool,
     extra_buttons: &[Button],
 ) -> Vec<(Action, Rect)> {
-    const SEP: u16 = 1;
     // Global commands first, then any context-specific buttons (e.g. the
     // dashboard's Filter / Rename / Generate). One funnel, one bar.
     let mut buttons = global_bar_buttons(keybindings, has_pane_control);
     buttons.extend(extra_buttons.iter().cloned());
 
-    // Choose full vs shortcut-only based on whether the full set fits the row.
-    let full_width: u16 = buttons
+    let widths: Vec<u16> = buttons
         .iter()
         .map(|b| b.display_label().chars().count() as u16)
-        .sum::<u16>()
-        + SEP * (buttons.len().saturating_sub(1) as u16);
-    let use_full = full_width <= area.width;
+        .collect();
+    let (placements, _rows) = layout_button_bar(&widths, area.width);
 
-    let end = area.x.saturating_add(area.width);
     let mut rects = Vec::with_capacity(buttons.len());
     let buf = frame.buffer_mut();
-    let mut x = area.x;
-    for (i, button) in buttons.iter().enumerate() {
-        if i > 0 {
-            x = x.saturating_add(SEP);
-        }
-        let label = if use_full {
-            button.display_label()
-        } else {
-            button.shortcut_only_label()
-        };
-        let w = label.chars().count() as u16;
-        if x.saturating_add(w) > end {
-            // Would overflow the row — drop this (and every later) button whole.
-            break;
+    for (button, rel) in buttons.iter().zip(placements) {
+        // Drop any button whose wrapped row falls outside the reserved height.
+        if rel.y >= area.height {
+            continue;
         }
         let rect = Rect {
-            x,
-            y: area.y,
-            width: w,
+            x: area.x.saturating_add(rel.x),
+            y: area.y.saturating_add(rel.y),
+            width: rel.width,
             height: 1,
         };
-        let pair = if use_full {
-            button.render(rect, buf)
-        } else {
-            button.render_compact(rect, buf)
-        };
+        let pair = button.render(rect, buf);
         // PRD #80 review FIX 3: a disabled button renders dimmed but is inert —
         // its rect is NOT recorded, so a click on it is a no-op (matching the
         // keyboard, where the bound key is a silent no-op).
         if button.enabled {
             rects.push(pair);
         }
-        x = x.saturating_add(w);
     }
     rects
+}
+
+/// PRD #144 — how many rows the bottom bar will occupy this frame, so the layout
+/// pass can reserve exactly that height (a wrapped 2-row bar must cede one row
+/// from the dashboard/pane region or the cards clip/overlap). Input / status
+/// modes render a single-row bar (an input field or a status message); the
+/// default button bar wraps via [`layout_button_bar`] across the full frame
+/// width. Mirrors the button set `render_bottom_bar` builds: the dashboard /
+/// orchestration views append the context buttons, the Mode view shows only the
+/// global commands. The enabled/disabled state never changes a button's width
+/// (disabled buttons render full-label-but-dimmed), so it is irrelevant here.
+fn bottom_bar_rows(ui: &UiState, width: u16, tab_view: &ActiveTabView) -> u16 {
+    match ui.mode {
+        UiMode::Filter | UiMode::Rename | UiMode::PaneInput => return 1,
+        _ => {}
+    }
+    if ui.status_message.is_some() {
+        return 1;
+    }
+    let mut buttons = global_bar_buttons(&ui.keybindings, true);
+    if !matches!(tab_view, ActiveTabView::Mode { .. }) {
+        buttons.extend(dashboard_context_buttons(&ui.keybindings, true));
+    }
+    let widths: Vec<u16> = buttons
+        .iter()
+        .map(|b| b.display_label().chars().count() as u16)
+        .collect();
+    let (_, rows) = layout_button_bar(&widths, width);
+    rows.max(1)
 }
 
 fn render_bottom_bar(
@@ -9203,6 +9263,39 @@ fn render_right_aligned_buttons(
         height: 1,
     };
     render_modal_button_row(frame, buttons, row, 0)
+}
+
+/// PRD #144 — shared modal sizing. Given a modal's desired (content-driven)
+/// `desired_w` × `desired_h`, the `terminal` area, and per-modal minimum
+/// dimensions, return a centered modal `Rect` clamped so that:
+///   * it is never smaller than `min_w` × `min_h` (small content → the minimum),
+///   * it never exceeds 90% of the terminal in either axis (large content → the
+///     90% cap), and
+///   * it therefore never exceeds the terminal bounds even on a very narrow /
+///     short terminal (the 90% cap wins over the minimum — the very-narrow
+///     clamp), and the centered rect always fits inside `terminal`.
+///
+/// Pure data — no rendering, fully unit-testable. Supersedes the per-modal width
+/// caps and the wrap / truncate band-aids (PRD #127) with one consistent
+/// content-driven sizing rule.
+fn modal_rect(desired_w: u16, desired_h: u16, terminal: Rect, min_w: u16, min_h: u16) -> Rect {
+    // Clamp a single axis: up to the per-modal minimum, then down to the 90%
+    // cap. Because the 90% cap is always < the terminal extent, the result is
+    // guaranteed to fit — even when `min` itself exceeds the terminal.
+    let clamp_axis = |desired: u16, min: u16, term: u16| -> u16 {
+        let cap = (term as u32 * 9 / 10) as u16; // 90% of the terminal axis
+        desired.max(min).min(cap).min(term)
+    };
+    let width = clamp_axis(desired_w, min_w, terminal.width);
+    let height = clamp_axis(desired_h, min_h, terminal.height);
+    let x = terminal.x + terminal.width.saturating_sub(width) / 2;
+    let y = terminal.y + terminal.height.saturating_sub(height) / 2;
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 fn render_quit_confirm(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect)> {
@@ -9975,19 +10068,33 @@ type ScheduledTasksClickTargets = (Vec<(Action, Rect)>, Vec<(usize, Rect)>);
 /// parity for `j`/`k`); empty while the delete confirmation is armed.
 fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClickTargets {
     let area = frame.area();
-    // PRD #127: the modal width is capped (never grows with the schedule name) —
-    // a long name is handled by WRAPPING the delete confirmation onto more lines
-    // so the modal grows in HEIGHT and the message stays inside the border.
-    let popup_width = 72.min(area.width.saturating_sub(4));
-    let inner_width = popup_width.saturating_sub(2) as usize;
-    // Confirmation text wraps within a 2-space left margin inside the inner width.
-    let confirm_text_width = inner_width.saturating_sub(2).max(1);
+    // PRD #144: the manager dialog is content-sized via `modal_rect` (no fixed
+    // 72-col cap). The list columns size to the widest schedule name / next-fire
+    // cell so a long name renders un-clipped, and the modal grows wide enough to
+    // contain the delete confirmation on its natural lines — superseding the
+    // PRD #127 width cap + `truncate_cell` + `wrap_to_width` band-aids.
+    let count_chars = |s: &str| s.chars().count();
+    let name_col = ui
+        .scheduled_tasks
+        .iter()
+        .map(|t| count_chars(&t.name))
+        .max()
+        .unwrap_or(0)
+        .max("NAME".len());
+    let next_col = ui
+        .scheduled_tasks
+        .iter()
+        .map(|t| count_chars(&schedule_next_fire_display(t)))
+        .max()
+        .unwrap_or(0)
+        .max("NEXT FIRE".len());
+    let status_col = 11usize; // widest status ("disabled") + padding
     let row_count = ui.scheduled_tasks.len().max(1) as u16;
 
-    // PRD #127: when the delete confirmation is armed, pre-wrap it so the
-    // variable-length schedule name lands on its own line(s) and the fixed
-    // trailer (`… (y/n)`) is never pushed past the border. Built up-front so the
-    // modal height can grow to fit the wrapped lines.
+    // PRD #144: the delete confirmation renders on its natural lines (the name
+    // on its own line, the fixed `… (y/n)` trailer on the next). The modal is
+    // sized to contain them below, so the trailer is never pushed past the
+    // border — replacing the PRD #127 `wrap_to_width` band-aid.
     let confirm_style = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
@@ -9997,33 +10104,59 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
             .get(ui.scheduled_selected)
             .map(|t| t.name.as_str())
             .unwrap_or("");
-        let mut out: Vec<Line> = Vec::new();
-        for seg in [
-            format!("Delete schedule '{name}'?"),
-            "definition only — open tab kept. (y/n)".to_string(),
-        ] {
-            for wrapped in wrap_to_width(&seg, confirm_text_width) {
-                out.push(Line::styled(format!("  {wrapped}"), confirm_style));
-            }
-        }
-        out
+        vec![
+            Line::styled(format!("  Delete schedule '{name}'?"), confirm_style),
+            Line::styled(
+                "  definition only \u{2014} open tab kept. (y/n)".to_string(),
+                confirm_style,
+            ),
+        ]
     } else {
         Vec::new()
     };
 
     // Chrome inside the border: leading blank + column header + trailing blank +
-    // footer. The footer is the wrapped confirmation (≥1 line) when armed, else
-    // the button-placeholder row plus a dedicated `Esc close` hint row below it.
+    // footer. The footer is the confirmation (≥1 line) when armed, else the
+    // button-placeholder row plus a dedicated `Esc close` hint row below it.
     let footer_lines = if ui.scheduled_delete_confirm {
         confirm_lines.len().max(1)
     } else {
         2
     };
     let chrome_lines = 3 + footer_lines;
-    let popup_height = (row_count + chrome_lines as u16 + 3).min(area.height.saturating_sub(4));
-    let x = (area.width.saturating_sub(popup_width)) / 2;
-    let y = (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    // Widest content line drives the modal width. The padded field rows fill to
+    // the inner width, so they don't drive it — the list columns, the header,
+    // the confirmation, the action-button row, the title, and the empty-state
+    // message do. (`[Add a] [Edit e] [Delete d] [Run now r]`, indented one cell.)
+    const BUTTON_ROW_W: usize = 1 + 7 + 1 + 8 + 1 + 10 + 1 + 11;
+    let list_w = 2 + name_col + status_col + next_col;
+    let header_w = 2 + name_col + status_col + "NEXT FIRE".len();
+    let confirm_w = confirm_lines.iter().map(|l| l.width()).max().unwrap_or(0);
+    let empty_w = if ui.scheduled_tasks.is_empty() {
+        count_chars("  No schedules configured. Press `a` to add one.")
+    } else {
+        0
+    };
+    let content_w = [
+        list_w,
+        header_w,
+        confirm_w,
+        BUTTON_ROW_W,
+        count_chars("  Esc close"),
+        empty_w,
+        count_chars(" Scheduled Tasks "),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+
+    // Size & center the modal: content width + borders + a little right margin,
+    // content height + borders. Clamped to [min, 90% of terminal] by `modal_rect`.
+    let desired_w = (content_w as u16).saturating_add(4);
+    let desired_h = row_count + chrome_lines as u16 + 3;
+    let popup_area = modal_rect(desired_w, desired_h, area, 56, 9);
+    let popup_height = popup_area.height;
 
     frame.render_widget(Clear, popup_area);
 
@@ -10063,7 +10196,7 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
         };
         lines.push(Line::styled(
             format!(
-                "  {:<22}{:<11}{}{}",
+                "  {:<name_col$}{:<status_col$}{}{}",
                 "NAME", "STATUS", "NEXT FIRE", scroll_hint
             ),
             text_primary().add_modifier(Modifier::BOLD),
@@ -10080,11 +10213,11 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
             let next = schedule_next_fire_display(task);
             let selected = i == ui.scheduled_selected;
             let marker = if selected { "\u{25b6} " } else { "  " };
+            // PRD #144: render the FULL name (no `truncate_cell`) — the modal is
+            // sized to the widest name, so the `name_col`-padded cell never clips.
             let row = format!(
-                "{marker}{:<22}{:<11}{}",
-                truncate_cell(&task.name, 21),
-                status,
-                next,
+                "{marker}{:<name_col$}{:<status_col$}{}",
+                task.name, status, next,
             );
             let style = if selected {
                 text_primary().add_modifier(Modifier::BOLD)
@@ -10196,68 +10329,6 @@ fn visible_window(len: usize, selected: usize, max_rows: usize) -> (usize, usize
     (start, start + window)
 }
 
-/// Wrap `text` to at most `max_width` display columns, breaking on Unicode
-/// whitespace (via [`str::split_whitespace`]) and hard-splitting any single
-/// word longer than the width. Counts columns by `char` (matching
-/// [`truncate_cell`]). Returns at least one (possibly empty) line. PRD #127:
-/// keeps the Scheduled-Tasks delete confirmation inside the modal border
-/// regardless of schedule-name length.
-fn wrap_to_width(text: &str, max_width: usize) -> Vec<String> {
-    if max_width == 0 {
-        return vec![String::new()];
-    }
-    let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut current_w = 0usize;
-    for word in text.split_whitespace() {
-        let word_w = word.chars().count();
-        // A word longer than the line is hard-split across as many lines as needed.
-        if word_w > max_width {
-            if !current.is_empty() {
-                lines.push(std::mem::take(&mut current));
-                current_w = 0;
-            }
-            for ch in word.chars() {
-                if current_w == max_width {
-                    lines.push(std::mem::take(&mut current));
-                    current_w = 0;
-                }
-                current.push(ch);
-                current_w += 1;
-            }
-            continue;
-        }
-        let sep = usize::from(!current.is_empty());
-        if current_w + sep + word_w > max_width {
-            lines.push(std::mem::take(&mut current));
-            current.push_str(word);
-            current_w = word_w;
-        } else {
-            if sep == 1 {
-                current.push(' ');
-            }
-            current.push_str(word);
-            current_w += sep + word_w;
-        }
-    }
-    if !current.is_empty() || lines.is_empty() {
-        lines.push(current);
-    }
-    lines
-}
-
-/// Truncate a cell to `max` display chars, appending `…` when cut. Keeps the
-/// manager list columns aligned without wrapping a long schedule name.
-fn truncate_cell(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-        out.push('\u{2026}'); // …
-        out
-    }
-}
-
 /// PRD #80 M8: clickable geometry returned by [`render_new_pane_form`] — the
 /// field rows (each paired with the [`FormField`] it focuses), the mode chips
 /// (each paired with its option index), and the `[Submit]`/`[Cancel]` button
@@ -10268,57 +10339,42 @@ type FormClickTargets = (
     Vec<(Action, Rect)>,
 );
 
-/// PRD #127 follow-up: lay out the new-pane Mode chip row, WRAPPING chips onto
-/// additional lines when the row would overflow the modal's inner width (rather
-/// than dropping the trailing chip). Given each chip's display width, the inner
-/// content width, and the x-offset of the first chip (one space after the
-/// `  Mode: ` label), returns one `(line, x_offset)` per chip — both relative to
-/// the chip area's top-left. The render loop adds the modal origin to place each
-/// chip (and its click rect) at its wrapped position, and the height calc uses
-/// `max line + 1` to reserve enough rows, so the two never disagree. A chip too
-/// wide for an empty line is placed (and later clipped) in place rather than
-/// looping forever.
-fn layout_mode_chips(chip_widths: &[u16], inner_width: u16, first_chip_x: u16) -> Vec<(u16, u16)> {
-    let mut out = Vec::with_capacity(chip_widths.len());
-    let mut cx = first_chip_x;
-    let mut line = 0u16;
-    let mut placed_on_line = 0u16;
-    for &w in chip_widths {
-        if cx.saturating_add(w) > inner_width && placed_on_line > 0 {
-            line += 1;
-            cx = first_chip_x;
-            placed_on_line = 0;
-        }
-        out.push((line, cx));
-        cx = cx.saturating_add(w).saturating_add(1); // chip + trailing space
-        placed_on_line += 1;
-    }
-    out
-}
-
 fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClickTargets {
     let area = frame.area();
-    let popup_width = 56.min(area.width.saturating_sub(4));
-    // PRD #127 follow-up: the Mode chip row WRAPS when its chips would overflow
-    // the modal's inner width, so its height is no longer fixed at one line.
-    // Lay the chips out up front (the wrap count depends only on the chip widths
-    // and the modal width, both known here) so the same layout drives both the
-    // reserved height below and the overlaid render later. `  Mode: ` is 8 cols;
-    // chips start one space after it.
+    // PRD #144: the Mode chips render on a SINGLE row (no `layout_mode_chips`
+    // wrap band-aid) and the modal is content-sized via `modal_rect` to be wide
+    // enough to contain the whole row — so the trailing `[schedule]` chip is
+    // never clipped. `  Mode: ` is 8 cols; chips start one space after it.
     let chip_label_w: u16 = 8; // "  Mode: "
     let first_chip_x: u16 = chip_label_w + 1;
-    let chip_layout: Vec<(u16, u16)> = if form.has_mode_field {
-        let widths: Vec<u16> = (0..form.mode_option_count())
+    let chip_widths: Vec<u16> = if form.has_mode_field {
+        (0..form.mode_option_count())
             .map(|i| form.mode_option_name(i).chars().count() as u16 + 2) // [name]
-            .collect();
-        layout_mode_chips(&widths, popup_width.saturating_sub(2), first_chip_x)
+            .collect()
     } else {
         Vec::new()
     };
-    let mode_lines: u16 = chip_layout.iter().map(|(l, _)| l + 1).max().unwrap_or(1);
+    // x-offset of each chip on the single chip row (relative to the inner area):
+    // each chip follows the previous one plus a trailing space.
+    let chip_x_offsets: Vec<u16> = {
+        let mut xs = Vec::with_capacity(chip_widths.len());
+        let mut cx = first_chip_x;
+        for &w in &chip_widths {
+            xs.push(cx);
+            cx = cx.saturating_add(w).saturating_add(1);
+        }
+        xs
+    };
+    // Inner width the chip row needs: the rightmost chip's end column.
+    let chip_row_w = chip_x_offsets
+        .iter()
+        .zip(&chip_widths)
+        .map(|(&x, &w)| x.saturating_add(w))
+        .max()
+        .unwrap_or(first_chip_x);
+    let mode_lines: u16 = 1;
     // The mode field (when modes exist) or the tip line (when they don't) needs
-    // its content line(s) plus one spacing row before the next field. The chip
-    // row grows by however many extra lines the wrap added.
+    // its content line plus one spacing row before the next field.
     let mode_extra: u16 = mode_lines + 1;
     // PRD #106: when the Command field is hidden (orchestration selected) the
     // form is two rows shorter — Command's label row plus its spacing row.
@@ -10327,11 +10383,13 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // PRD #127 M3.2: the "schedule" authoring option adds one separator/label
     // row marking it as a throwaway authoring session.
     let schedule_rows: u16 = if form.is_schedule_selected() { 1 } else { 0 };
-    let popup_height =
-        (10 + mode_extra + cmd_rows + schedule_rows).min(area.height.saturating_sub(4));
-    let x = (area.width.saturating_sub(popup_width)) / 2;
-    let y = (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    // PRD #144: content-size & center. Width grows to fit the chip row (plus
+    // borders + a little margin) but never below the comfortable 56-col base;
+    // height is the reserved field rows. `modal_rect` clamps to 90% of terminal.
+    let desired_w = chip_row_w.saturating_add(4).max(56);
+    let desired_h = 10 + mode_extra + cmd_rows + schedule_rows;
+    let popup_area = modal_rect(desired_w, desired_h, area, 56, 10);
+    let popup_width = popup_area.width;
 
     frame.render_widget(Clear, popup_area);
 
@@ -10484,17 +10542,15 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     }
 
     // Mode chip row: render `  Mode: ` then one `[name]` chip per option, the
-    // selected one highlighted. The chips WRAP onto additional lines when the
-    // row is wider than the modal (PRD #127 follow-up) — `chip_layout`, computed
-    // up front, gives each chip's `(line, x_offset)` so the trailing chip (e.g.
-    // `[schedule]`) is never dropped. Each chip records its own clickable rect at
-    // its wrapped screen position, so the mode-chip click hit-test still selects
-    // the right option on any line.
+    // selected one highlighted. PRD #144: the chips sit on a SINGLE row —
+    // `chip_x_offsets`, computed up front, gives each chip's x-offset, and the
+    // modal was sized wide enough to contain the rightmost chip (e.g.
+    // `[schedule]`) un-clipped. Each chip records its own clickable rect so the
+    // mode-chip click hit-test still selects the right option.
     let mut chip_rects: Vec<(usize, Rect)> = Vec::new();
     if let Some(mi) = mode_line_idx {
         let mode_y = line_y(mi);
-        // Whole chip area (off-chip clicks focus the Mode field) — spans every
-        // wrapped chip line.
+        // Whole chip area (off-chip clicks focus the Mode field).
         field_rects.push((
             FormField::Mode,
             Rect {
@@ -10515,17 +10571,14 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         let selected_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
         let chip_style = text_primary();
         let buf = frame.buffer_mut();
-        // The `  Mode: ` label sits on the first line; wrapped chips align under
-        // the first chip (`first_chip_x`), not under the label.
         let _ = buf.set_span(
             row_x,
             mode_y,
             &Span::styled("  Mode: ", mode_label_style),
             inner_end.saturating_sub(row_x),
         );
-        for (i, &(line_off, x_off)) in chip_layout.iter().enumerate() {
+        for (i, &x_off) in chip_x_offsets.iter().enumerate() {
             let cx = row_x + x_off;
-            let cy = mode_y + line_off;
             let chip = format!("[{}]", form.mode_option_name(i));
             let w = chip.chars().count() as u16;
             let style = if i == form.selection_index {
@@ -10534,12 +10587,12 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
                 chip_style
             };
             let avail = inner_end.saturating_sub(cx);
-            let (_after, _) = buf.set_span(cx, cy, &Span::styled(chip, style), avail);
+            let (_after, _) = buf.set_span(cx, mode_y, &Span::styled(chip, style), avail);
             chip_rects.push((
                 i,
                 Rect {
                     x: cx,
-                    y: cy,
+                    y: mode_y,
                     width: w.min(avail),
                     height: 1,
                 },
@@ -11800,6 +11853,8 @@ mod tests {
             active_index: 0,
         };
         let pane_ids = vec!["p0".to_string(), "p1".to_string()];
+        // A 1-row bottom bar (this fixture exercises the split math, not the
+        // PRD #144 wrap height — that is covered by `render/layout/004`).
         let layout = compute_frame_layout(
             frame_area,
             &tab_view,
@@ -11807,6 +11862,7 @@ mod tests {
             &pane_ids,
             PaneLayout::Tiled,
             None,
+            1,
         );
 
         // Vertical chrome: a 1-row tab bar at the top, a 1-row hints bar at the
@@ -11867,6 +11923,7 @@ mod tests {
             &[],
             PaneLayout::Tiled,
             None,
+            1,
         );
 
         assert_eq!(layout.tab_bar, Some(Rect::new(0, 0, 100, 1)));
@@ -11897,6 +11954,54 @@ mod tests {
                 ("s1".to_string(), Rect::new(50, 20, 50, 19)),
             ]
         );
+    }
+
+    // PRD #144 — `modal_rect` is the shared content-driven modal sizer: clamp the
+    // desired content dims into `[min, 90% of terminal]`, never exceeding the
+    // terminal bounds, and center the result. Pure data, so a plain unit test.
+    #[test]
+    fn modal_rect_clamps_to_min_max_and_terminal() {
+        let term = Rect::new(0, 0, 200, 60);
+
+        // Small content clamps UP to the per-modal minimum, centered.
+        let small = modal_rect(10, 5, term, 40, 12);
+        assert_eq!((small.width, small.height), (40, 12));
+        assert_eq!((small.x, small.y), ((200 - 40) / 2, (60 - 12) / 2));
+
+        // Large content is capped at 90% of the terminal in each axis.
+        let large = modal_rect(500, 500, term, 40, 12);
+        assert_eq!((large.width, large.height), (180, 54)); // 90% of 200 / 60
+        assert!(large.width <= term.width && large.height <= term.height);
+
+        // A narrow/short terminal clamps the modal to fit (the 90% cap wins over
+        // the larger minimum), and the centered rect stays within the bounds.
+        let narrow = Rect::new(0, 0, 50, 20);
+        let clamped = modal_rect(500, 500, narrow, 72, 16);
+        assert_eq!((clamped.width, clamped.height), (45, 18)); // 90% of 50 / 20
+        assert!(clamped.x + clamped.width <= narrow.width);
+        assert!(clamped.y + clamped.height <= narrow.height);
+    }
+
+    // PRD #144 — `layout_button_bar` greedily wraps the full-label buttons across
+    // rows when they don't fit one row, keeping every label (no shortcut chips).
+    #[test]
+    fn layout_button_bar_wraps_when_row_overflows() {
+        // Three 10-wide buttons + 1-space separators = 32 cols. At 32 they fit on
+        // one row; at 31 the third wraps to a second row.
+        let widths = [10u16, 10, 10];
+
+        let (fit, rows) = layout_button_bar(&widths, 32);
+        assert_eq!(rows, 1, "32 cols fits all three on one row");
+        assert_eq!(fit[0], Rect::new(0, 0, 10, 1));
+        assert_eq!(fit[1], Rect::new(11, 0, 10, 1)); // after a 1-col separator
+        assert_eq!(fit[2], Rect::new(22, 0, 10, 1));
+
+        let (wrapped, rows) = layout_button_bar(&widths, 31);
+        assert_eq!(rows, 2, "31 cols forces the third button onto a second row");
+        assert_eq!(wrapped[2], Rect::new(0, 1, 10, 1));
+
+        // Empty input occupies no rows.
+        assert_eq!(layout_button_bar(&[], 80), (Vec::new(), 0));
     }
 
     // PRD #76 M2.12: pin the hydration partition's bucket semantics so
@@ -13260,6 +13365,7 @@ mod tests {
                     &[],
                     PaneLayout::Stacked,
                     None,
+                    1,
                 );
                 render_frame(
                     frame,
@@ -13342,6 +13448,7 @@ mod tests {
                     &[],
                     PaneLayout::Stacked,
                     None,
+                    1,
                 );
                 render_frame(
                     frame,
@@ -13473,6 +13580,7 @@ mod tests {
                     &[],
                     PaneLayout::Stacked,
                     None,
+                    1,
                 );
                 render_frame(
                     frame,
@@ -13705,6 +13813,7 @@ mod tests {
                     &[],
                     PaneLayout::Stacked,
                     None,
+                    1,
                 );
                 render_frame(
                     frame,
@@ -13796,6 +13905,7 @@ mod tests {
                     &[],
                     PaneLayout::Stacked,
                     None,
+                    1,
                 );
                 render_frame(
                     frame,
@@ -13862,6 +13972,7 @@ mod tests {
                     &[],
                     PaneLayout::Stacked,
                     None,
+                    1,
                 );
                 render_frame(
                     frame,
@@ -17141,33 +17252,6 @@ mod tests {
         // Degenerate inputs.
         assert_eq!(visible_window(0, 0, 4), (0, 0));
         assert_eq!(visible_window(5, 0, 0), (0, 0));
-    }
-
-    // PRD #127 — `wrap_to_width` keeps the delete confirmation inside the modal:
-    // whitespace wrapping, hard-splitting an over-long word, and the degenerate
-    // empty-text / zero-width inputs.
-    #[test]
-    fn wrap_to_width_whitespace_split_and_edges() {
-        // Whitespace wrap: words are packed up to the width, then broken.
-        assert_eq!(
-            wrap_to_width("aa bb cc dd", 5),
-            vec!["aa bb".to_string(), "cc dd".to_string()],
-        );
-        // A single word longer than the width is hard-split across lines.
-        assert_eq!(
-            wrap_to_width("abcdefg", 3),
-            vec!["abc".to_string(), "def".to_string(), "g".to_string()],
-        );
-        // A long word after a short one: the short word flushes first, then the
-        // long word hard-splits.
-        assert_eq!(
-            wrap_to_width("hi abcdef", 3),
-            vec!["hi".to_string(), "abc".to_string(), "def".to_string()],
-        );
-        // Empty text still yields exactly one (empty) line.
-        assert_eq!(wrap_to_width("", 5), vec![String::new()]);
-        // Zero width is degenerate: one empty line regardless of input.
-        assert_eq!(wrap_to_width("anything here", 0), vec![String::new()]);
     }
 
     // PRD #127 N2 — the manager dialog stays OPEN after run-now and after a
