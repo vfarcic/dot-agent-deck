@@ -1331,6 +1331,26 @@ without depending on the config struct API.
 - **Does not assert:** which other panes survive (deterministic from the file order).
 - **Platform coverage:** mac+linux.
 
+### Session save (snapshot freshness, PRD #89 Phase 1)
+
+These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.
+
+#### session/save
+
+##### session/save/001 — A meaningful TUI state change (creating a new dashboard pane) writes a fresh saved-session snapshot to disk without quitting.
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path).
+- **Agent:** none (the pane runs `sleep 600`; no LLM).
+- **Asserts:** starting with no prior snapshot on disk, creating a new dashboard pane via the new-pane flow (Ctrl+N → dir-picker → form → submit) — and NOT quitting — causes a `session.toml` to be written that contains the newly created pane's command.
+- **Does not assert:** the coalescing/debounce window (covered by `session/save/003`); restore-on-startup behavior (PRD #89 Phase 2).
+- **Platform coverage:** mac+linux.
+
+##### session/save/002 — Triggering a detach path (Ctrl+W close-pane) flushes a fresh snapshot reflecting the workspace, without quitting.
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path).
+- **Agent:** none (panes run `sleep 600`; no LLM).
+- **Asserts:** with two dashboard panes present and any prior snapshot removed, closing a pane with Ctrl+W writes a fresh `session.toml` that still reflects the (non-empty) workspace — proving the detach path flushes the snapshot mid-session, not only at clean quit.
+- **Does not assert:** which specific pane survives the close; the coalescing/debounce window (`session/save/003`).
+- **Platform coverage:** mac+linux.
+
 ### Chain-smoke (real-agent) coverage
 
 #### chain-smoke/claude
