@@ -428,3 +428,66 @@ fn manager_006_click_row_moves_selection() {
     );
     drop(scratch);
 }
+
+/// Scenario: With a fixture `schedules.toml` holding one enabled task whose name
+/// is LONGER than the legacy fixed-width name cell, open the "Scheduled Tasks"
+/// manager at a roomy (200-col) terminal and again at a windowed (80-col)
+/// terminal. Assert the task's FULL name renders un-clipped on the grid at BOTH
+/// widths — proving the dialog auto-sizes to its content (PRD #144 shared modal
+/// sizing helper, clamped within the windowed terminal) instead of truncating
+/// the field to a fixed 72-col modal. RED today: the modal is hard-capped at 72
+/// columns and the name is truncated to 21 chars (`truncate_cell`), so the full
+/// name never appears at either width.
+#[spec("scheduler/manager/007")]
+#[test]
+fn manager_007_dialog_content_sized_unclipped_at_both_widths() {
+    // Longer than the legacy 21-char name cell, yet short enough to fit a
+    // content-sized modal even at the 80-col windowed floor.
+    const LONG_NAME: &str = "nightly-backup-and-report";
+
+    let (scratch, sched_path) = scratch_with_schedules(&format!(
+        "[[scheduled_tasks]]\n\
+         name = \"{LONG_NAME}\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"backup prompt\"\n\
+         enabled = true\n"
+    ));
+
+    // Open the manager at a given terminal size and return the rendered grid.
+    fn manager_grid(cols: u16, rows: u16, sched_path: &std::path::Path) -> String {
+        let deck = TuiDeck::builder()
+            .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+            .with_pty_size(cols, rows)
+            .launch_with_fixture("minimal");
+        deck.wait_for_string("No active sessions");
+        deck.send_keys(MANAGER_KEY);
+        // `NEXT FIRE` only renders once the dialog is open with its rows loaded —
+        // an unambiguous "dialog is up" signal (also proves the column labels
+        // render un-clipped).
+        deck.wait_for_string("NEXT FIRE");
+        deck.snapshot_grid()
+    }
+
+    // Roomy width: the content-sized modal grows to show the full name.
+    let roomy = manager_grid(200, 40, &sched_path);
+    assert!(
+        roomy.contains(LONG_NAME),
+        "at a roomy 200-col width the manager dialog must auto-size to its \
+         content and render the full schedule name `{LONG_NAME}` un-clipped \
+         (today the modal is capped at 72 cols and the name is truncated to 21 \
+         chars).\nGrid:\n{roomy}"
+    );
+
+    // Windowed width: the modal clamps within the terminal but still renders the
+    // full name un-clipped (no field clipped off the modal border).
+    let windowed = manager_grid(80, 30, &sched_path);
+    assert!(
+        windowed.contains(LONG_NAME),
+        "at a windowed 80-col width the manager dialog must still render the \
+         full schedule name `{LONG_NAME}` un-clipped within the modal.\nGrid:\n{windowed}"
+    );
+
+    drop(scratch);
+}
