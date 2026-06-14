@@ -155,3 +155,87 @@ fn save_002_detach_path_writes_snapshot() {
         session_file.exists()
     );
 }
+
+/// Drive the new-pane dialog to open the single orchestration in the `orch-deck`
+/// fixture. With no `[[modes]]` defined the Mode chip row is `[No mode] [Orch:
+/// demo-orch] [schedule]`, so ONE Right selects the orchestration; selecting an
+/// orchestration HIDES the Command field, so a second Enter submits the form.
+/// Mirrors `e2e_dashboard_selection`'s `open_orchestration`.
+fn open_orchestration(deck: &TuiDeck) {
+    deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    deck.send_keys(b" "); // Space → confirm current dir → new-pane form
+    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
+    deck.send_keys(b"\x1b[C"); // Right → [Orch: demo-orch]
+    deck.send_keys(b"\r"); // Mode → Name
+    deck.send_keys(b"\r"); // submit (Command hidden for an orchestration)
+}
+
+/// Scenario: Launch the deck against the `orch-deck` fixture (one orchestration
+/// `demo-orch` with `orchestrator`+`worker` `cat` roles) with
+/// `DOT_AGENT_DECK_SESSION` redirected to a test-owned path, then open the
+/// orchestration via the new-pane form (Ctrl+N → Right → Enter → Enter) and DO
+/// NOT quit. Opening an orchestration tab is a meaningful state change (Phase 1
+/// M1.1), so the coalescer flushes a fresh snapshot — and that snapshot must
+/// capture the orchestration metadata (a `[panes.orchestration]` block carrying
+/// the resolved `config_name`, the roles in display order, and the
+/// `start_role_index`) so the daemon-empty restore path can later rebuild the
+/// tab. RED today: the snapshot builder never populates `SavedPane.orchestration`
+/// (it writes `orchestration = None`) and the orchestration SpawnPane path
+/// records no `pane_metadata` for the role panes, so no `[panes.orchestration]`
+/// block is ever written.
+#[spec("session/save/004")]
+#[test]
+fn save_004_orchestration_tab_capture_writes_orchestration_metadata() {
+    let session_dir = common::race_safe_tempdir();
+    let session_file = session_dir.path().join("session.toml");
+
+    let deck = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_file.to_str().expect("session path is UTF-8"),
+        )
+        .launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active sessions");
+
+    // Open the orchestration tab; its two `cat` role panes render as deck cards.
+    open_orchestration(&deck);
+    deck.wait_for_string("worker"); // the 2nd role card → orchestration tab is up
+
+    // The flushed snapshot MUST carry the orchestration metadata. RED today:
+    // capture is deferred to Step 2, so the `[panes.orchestration]` block never
+    // appears (the snapshot has empty `pane_metadata` for orchestration panes,
+    // so it is cleared rather than written with the block).
+    let captured = common::wait_for_file_substr_count(
+        &session_file,
+        "[panes.orchestration]",
+        1,
+        Duration::from_secs(10),
+    );
+    assert!(
+        captured,
+        "opening an orchestration tab must capture orchestration metadata into the snapshot \
+         (PRD #89 M2b.2/M2b.3 capture): a `[panes.orchestration]` block must be written to \
+         {session_file:?} WITHOUT quitting, but none appeared.\nFile contents: {:?}",
+        std::fs::read_to_string(&session_file).ok()
+    );
+
+    // The captured block must name the resolved orchestration config, its roles
+    // (in display order), and the start cursor so the restore branch can rebuild
+    // the tab faithfully.
+    let toml = std::fs::read_to_string(&session_file).unwrap_or_default();
+    assert!(
+        toml.contains("config_name = \"demo-orch\""),
+        "the captured orchestration block must record the resolved config name \
+         (`config_name = \"demo-orch\"`).\nFile contents:\n{toml}"
+    );
+    assert!(
+        toml.contains("orchestrator") && toml.contains("worker"),
+        "the captured orchestration block must record both fixture roles \
+         (`orchestrator`, `worker`).\nFile contents:\n{toml}"
+    );
+    assert!(
+        toml.contains("start_role_index = 0"),
+        "the captured orchestration block must record the start cursor \
+         (`start_role_index = 0`, the `start = true` orchestrator at index 0).\nFile contents:\n{toml}"
+    );
+}
