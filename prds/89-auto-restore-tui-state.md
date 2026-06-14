@@ -3,7 +3,10 @@
 **Status**: Planning
 **Priority**: Medium
 **Created**: 2026-05-16
+**Last Updated**: 2026-06-14
 **GitHub Issue**: [#89](https://github.com/vfarcic/dot-agent-deck/issues/89)
+
+> **2026-06-14 refresh — read before implementing.** This PRD predates the daemon architecture shipping. The landscape has moved: PRD #76 (Remote Agent Environments) **shipped**, and PRD #93 (always-external daemon) made the daemon the **unified architecture even locally** — `run_tui_session` now always connects to an external daemon (`ensure_external_daemon_or_die`). Two consequences: (1) the original line references below are **stale** (e.g. the `continue_session` gate is no longer at `src/ui.rs:2748` — it is threaded through `run_tui` around `src/ui.rs:5862`, plus `5426/5462/5849`); re-locate by symbol, not line number, at implementation time. (2) Several milestones are **partially delivered** by #76/#93 and the scope has **grown** to absorb orchestration-tab restore (formerly PRD #74, now closed). See the new Design Decision entries dated 2026-06-14 and the revised Dependencies/Scope/Milestones below.
 
 ## Problem Statement
 
@@ -35,7 +38,10 @@ As a side effect, daemon crash recovery is "free": a respawned-empty daemon trig
 ### In Scope
 
 - **Continuous snapshot freshness.** Write the saved-session snapshot to disk on detach (ssh disconnect, Ctrl+W) and on every meaningful TUI state change (new pane, rename, mode tab open/close, agent stop/restart, orchestration changes). Coalesce/debounce as needed so we're not writing on every keystroke.
-- **Auto-restore on TUI startup.** Both `dot-agent-deck` (local) and `dot-agent-deck connect` (remote): attempt daemon hydration, fall back to snapshot if daemon is empty, fall through to empty dashboard only if both are empty. Daemon state wins over snapshot when both exist.
+- **Auto-restore on TUI startup.** Both `dot-agent-deck` (local) and `dot-agent-deck connect` (remote): attempt daemon hydration, fall back to snapshot if daemon is empty, fall through to empty dashboard only if both are empty. Daemon state wins over snapshot when both exist. (Post-#93, local startup is itself daemon-backed, so this is one uniform path, not separate local/remote logic.)
+- **Orchestration-tab restore (absorbed from closed PRD #74).** A single-agent/mode workspace is not enough — the restore model must also recreate **orchestration tabs**: the orchestrator pane and its prompt, the role panes in their saved order, and the `start_role_index` cursor. Two sub-paths, and they are NOT equivalent:
+  - *Daemon-hydration path (warm daemon):* PRD #76 M2.12 + PRD #111 already hydrate orchestration tabs from the daemon registry. **Verify** this covers orchestrator+role panes, prompts, role order, and `start_role_index` end-to-end; if hydration is already complete, no new capture work is needed for the warm-daemon case — only a regression test asserting it.
+  - *Snapshot-fallback path (daemon empty — fresh machine or crash recovery):* the disk snapshot must carry enough orchestration metadata to rebuild the tab when the daemon has nothing to hydrate from. This is where the old #74 schema work (orchestration metadata on the saved pane: role order, `orchestrator_prompt`, resolved config name+project for re-resolution, `start_role_index`, a `version` field) genuinely re-homes. On config drift (config deleted, orchestration renamed, role removed) surface a clear `session_warnings` message and fall back to a plain dashboard pane rather than a half-broken tab.
 - **Delete the `--continue` flag.** Remove the CLI argument, the `continue_session` plumbing, and the conditional in `src/ui.rs:2748`. The saved-session-load path becomes unconditional (gated only on whether the daemon was empty).
 - **Fresh-start escape hatch.** For remote: confirm `dot-agent-deck remove <name>` clears the deck's saved state (or add the wiring if it doesn't). For local: add `dot-agent-deck reset` (or equivalent — exact CLI shape is a Design Decision) that deletes the local snapshot.
 - **Backward-compat consideration.** This changes the meaning of `dot-agent-deck` (no flag) from "empty session" to "restore last setup." Document as a deliberate breaking change in the changelog.
@@ -70,16 +76,27 @@ As a side effect, daemon crash recovery is "free": a respawned-empty daemon trig
 
 ### Phase 2: Auto-restore on TUI startup
 
-- [ ] **M2.1** — Make the snapshot-load path in `src/ui.rs:2748` unconditional (no longer gated on `continue_session`). Restore from snapshot on every TUI startup.
+> **2026-06-14:** Post-#93 the local TUI is daemon-backed, so hydration-first applies uniformly — M2.2 is one path, not local-vs-remote. The snapshot-load gate is no longer at `src/ui.rs:2748`; it is the `continue_session` block around `src/ui.rs:5862` in `run_tui`. Re-locate by symbol.
+
+- [ ] **M2.1** — Make the snapshot-load path (the `if continue_session { … }` block in `run_tui`, ~`src/ui.rs:5862` — verify current location) unconditional (no longer gated on `continue_session`). Restore from snapshot on every TUI startup.
 - [ ] **M2.2** — Wire the daemon-state-vs-snapshot precedence: if M2.11/M2.12 hydration produced any panes, skip snapshot restore. If hydration produced zero panes, load and apply the snapshot. Decide via a structural check (any hydrated `managed_pane_id` in `state`), not a flag.
 - [ ] **M2.3** — Verify the existing M2.11/M2.12 hydration path still works unchanged in the common detach/reattach case. No regressions for users currently relying on automatic remote restore.
 - [ ] **M2.4** — Tests: daemon-with-agents wins over snapshot; daemon-empty + non-empty-snapshot recreates from snapshot; both empty lands at empty dashboard.
 
+### Phase 2b: Orchestration-tab restore (absorbed from closed PRD #74)
+
+- [ ] **M2b.1** — **Verify the daemon-hydration path.** Confirm by inspection + a regression test that PRD #76 M2.12 + PRD #111 hydration already recreate an orchestration tab end-to-end from a warm daemon: orchestrator pane + prompt, role panes in saved order, and `start_role_index`. If complete, no new capture code is needed for the warm case.
+- [ ] **M2b.2** — **Snapshot-fallback capture.** For the daemon-empty case (fresh machine / crash recovery), extend the saved-pane schema with orchestration metadata (role order, `orchestrator_prompt`, resolved config name + project path for re-resolution, `start_role_index`, and a `version: u32`), `Option<…>` + `#[serde(default)]` so old snapshots still parse. Port the design from `prds/done/74-restore-orchestration-tabs-on-continue.md`.
+- [ ] **M2b.3** — **Snapshot-fallback restore branch.** Rebuild the orchestration tab from the snapshot when the daemon is empty: re-resolve the `OrchestrationConfig`, recreate orchestrator + role panes in order, re-issue commands, restore `start_role_index`. On config drift (config deleted, orchestration renamed, role removed) surface a clear `session_warnings` message and fall back to a plain dashboard pane — never a half-broken tab.
+- [ ] **M2b.4** — Tests: warm-daemon hydration restores an orchestration tab (M2b.1); daemon-empty + snapshot recreates it; old snapshot without the orchestration field still parses; drift triggers the warning + plain-pane fallback.
+
 ### Phase 3: Delete `--continue`
 
-- [ ] **M3.1** — Remove the `--continue` argument from `Cli` in `src/main.rs:24-25`.
-- [ ] **M3.2** — Remove the `continue_session: bool` parameter from `run_dashboard`, `run_tui_session`, `run_connect`, the TUI internals (`src/ui.rs:2405`), and any other callers found by `grep continue_session`.
-- [ ] **M3.3** — Update help text and `src/ui.rs:5639` ("Restore: dot-agent-deck --continue") to remove the obsolete reference.
+> **2026-06-14:** The remote side is **already done** — `run_connect` ignores `_continue_session` ("applies to a laptop-side TUI that no longer exists"). Remaining live work is the **local** plumbing. Line numbers below are stale; re-locate by symbol (`grep continue_session`).
+
+- [ ] **M3.1** — Remove the `--continue` argument from `Cli` (currently `src/main.rs:25-26` — `#[arg(long = "continue")] continue_session: bool`).
+- [ ] **M3.2** — Remove the `continue_session: bool` parameter from `run_dashboard`, `run_tui_session`, the TUI internals (`run_tui`, ~`src/ui.rs:5426`), and drop the already-ignored `_continue_session` from `run_connect`. Sweep all callers via `grep continue_session`.
+- [ ] **M3.3** — Update help text and the in-TUI restore hint (`"  Restore: dot-agent-deck --continue"`, currently ~`src/ui.rs:9698`) to remove the obsolete reference. Also sweep the explanatory `--continue` comments elsewhere in `run_tui` (~`5459`, `5465`, `5850`, `6216`, `7590`) so they don't describe a removed flag.
 - [ ] **M3.4** — Add a friendly error message if a user runs `dot-agent-deck --continue` after removal (clap will reject the unknown flag with its default message; a custom message that tells them auto-restore is the new default is a nice touch).
 
 ### Phase 4: Fresh-start escape hatch
@@ -90,23 +107,25 @@ As a side effect, daemon crash recovery is "free": a respawned-empty daemon trig
 
 ### Phase 5: Documentation + release
 
-- [ ] **M5.1** — Update `docs/getting-started.mdx` and any other user-facing doc that mentions `--continue` to describe the new auto-restore model and the fresh-start escape hatch.
+- [ ] **M5.1** — Update the user-facing docs that mention `--continue` — verified current set: `docs/getting-started.md` and `docs/session-management.md` — to describe the new auto-restore model and the fresh-start escape hatch. (`session-management.md` is also where closed PRD #74 would have added its orchestration-restore paragraph; cover orchestration-tab restore here instead.)
 - [ ] **M5.2** — Draft a changelog fragment (via the `dot-ai-changelog-fragment` skill) flagging this as a breaking change with a one-line migration note ("Remove `--continue` from any wrapper scripts; auto-restore is now the default.").
 - [ ] **M5.3** — Tag a release (`dot-ai-tag-release`) once everything lands.
 
 ## Dependencies
 
-- **PRD #76 (Remote Agent Environments) shipping first.** This PRD assumes M2.11/M2.12 hydration is the in-place mechanism for daemon-state restore in remote mode. If #76 is still in flight, the auto-restore logic in M2.2 will conflict with whatever interim state #76 leaves behind.
-- **PRD #76's M2.14 narrowed.** This PRD deletes `--continue`, so M2.14 in PRD #76 will be amended to drop `--continue` propagation from its scope (M2.14 will then only cover `--theme` propagation through `ssh -t`).
+- **PRD #76 (Remote Agent Environments) — ✅ SHIPPED (archived `prds/done/`, merged PR #95).** Its M2.11/M2.12 hydration (extended by PRD #111 for orchestration tabs) is now the in-place mechanism for daemon-state restore. The dependency is satisfied; the auto-restore logic in M2.2 can build on hydration directly rather than racing interim state.
+- **PRD #76's M2.14 — ✅ already resolved in #76's favour of this PRD.** #76 M2.14 is recorded as *"`--continue` was originally in scope, but PRD #89 replaces the flag with unconditional auto-restore; nothing left to propagate for that case"* (M2.14's remaining `--theme` propagation was deferred to PRD #93). So the remote/`connect` side **already** treats `--continue` as a no-op (`run_connect` ignores `_continue_session` — *"applies to a laptop-side TUI that no longer exists in this flow"*). Phase 3 (delete the flag) is therefore partly done on the remote side; the live work is the **local** `run_dashboard`/`run_tui_session` path that still threads `continue_session`.
+- **PRD #93 (Always-external daemon) — ⏳ IN PROGRESS (Phases 1–3 complete; Phase 4 in flight), now the primary architectural dependency.** #93 collapsed local and remote into one daemon-backed architecture: `run_tui_session` always connects to an external daemon, even locally, so **daemon hydration now applies to local startup too** — not just `connect`. This *simplifies* this PRD (M2.2's "daemon-state-vs-snapshot precedence" is one uniform path, not local-vs-remote), but it means #89 should **land after #93's Phase 4** (or coordinate closely) so it builds on the settled unified flow rather than a moving target. Re-validate every code reference against the post-#93 source.
 
 ## Key Files
 
 - `src/main.rs` — `Cli` flag removal, parameter plumbing changes.
-- `src/ui.rs` — snapshot-load unconditional, daemon-state-vs-snapshot precedence, snapshot-write triggers on TUI state changes (~`2748`, `4542-4554`, plus new triggers throughout).
-- `src/config.rs` — `SavedSession::snapshot` / `load` may grow a debounce/coalesce wrapper.
-- `src/connect.rs` — `run_connect` parameter cleanup (`_continue_session` goes away).
-- `src/state.rs` — possibly a "is this hydration empty?" helper for M2.2.
-- `docs/getting-started.mdx`, `docs/` user-facing pages — remove `--continue` references.
+- `src/ui.rs` — snapshot-load unconditional, daemon-state-vs-snapshot precedence, snapshot-write triggers on TUI state changes, and the in-TUI restore hint. **Line refs below are stale (post-#93); locate by symbol:** the `continue_session` gate is in `run_tui` (~`5862`; param ~`5426`), the restore hint is ~`9698`, the pre-teardown snapshot is ~`7590`.
+- `src/config.rs` — `SavedSession::snapshot` / `load`; the orchestration-metadata schema extension (M2b.2) and a possible debounce/coalesce wrapper.
+- `src/main.rs` — `Cli` flag removal (~`25-26`) and `run_dashboard`/`run_tui_session` parameter plumbing; drop the already-ignored `_continue_session` from `run_connect` (~`872`).
+- `src/state.rs` — the daemon-hydration partition + a "is this hydration empty?" helper for M2.2.
+- `src/tab.rs`, `src/pane.rs`, `src/spawn.rs` — orchestration-tab hydration/rebuild glue (PRD #76 M2.12 + #111) that M2b.1 must verify and M2b.3 reuses for the snapshot-fallback path.
+- `docs/getting-started.md`, `docs/session-management.md` — remove `--continue` references; document auto-restore + the orchestration-tab restore paragraph.
 
 ## Design Decisions
 
@@ -125,3 +144,30 @@ Removing `--continue` and making restore the default flips the meaning of plain 
 ### Open: shape of the local "fresh start" command
 
 The remote case is clear: `dot-agent-deck remove <name>` already removes the deck and (per M4.1) clears its snapshot. The local case needs an analogous action. Options: `dot-agent-deck reset`, `dot-agent-deck --reset`, `dot-agent-deck snapshot clear`, or a TUI affordance ("Quit and clear saved state" in the quit-confirm dialog). Decide during M4.2 implementation.
+
+### 2026-06-14: Refresh against the shipped daemon architecture (#76 shipped, #93 unified local+remote)
+
+**Decision.** Re-anchor this PRD on the daemon architecture that shipped after it was written, rather than the local-only `--continue` mental model it was drafted against.
+
+**Rationale.** When #89 was written, #76 was in flight and the daemon was a remote-only concern. Since then: #76 **shipped** (hydration M2.11/M2.12, plus #111 for orchestration), and #93 made the daemon the **unified architecture even locally** — `run_tui_session` always connects to an external daemon. Verified in current source: `ensure_external_daemon_or_die` runs on every local startup, and `run_connect` already ignores `_continue_session`.
+
+**Impact.**
+- *Dependencies:* #76 dependency satisfied; **#93 (in flight) becomes the primary dependency** — land #89 after #93 Phase 4 to build on the settled flow.
+- *Phase 2 (auto-restore):* M2.2's daemon-vs-snapshot precedence is now **one uniform path** (local is daemon-backed too), not local-vs-remote branching — a simplification.
+- *Phase 3 (delete `--continue`):* the **remote side is already done** (flag ignored on `connect`); remaining live work is the **local** `run_dashboard`/`run_tui_session` plumbing that still threads `continue_session`.
+- *Code refs:* all original `src/ui.rs:NNNN` line numbers are **stale** — `continue_session` now lives around `src/ui.rs:5862` (plus `5426/5462/5849`). Re-locate by symbol at implementation time.
+
+**Owner.** Viktor (decided in 2026-06-14 planning discussion).
+
+### 2026-06-14: Absorb PRD #74 (orchestration-tab restore); #74 closed as superseded
+
+**Decision.** Close PRD #74 ("Restore orchestration tabs with `--continue`") as *No Longer Needed* and **re-home its goal into #89's restore scope**.
+
+**Rationale.** #74 was designed to extend the `--continue` + clean-quit snapshot mechanism to orchestration tabs. #89 **deletes that flag** and replaces the mechanism with daemon-hydration-first + continuous snapshot, so #74 would have built on a foundation this PRD removes — a direct conflict. The *user need* (orchestration tabs survive restart/reattach) stays valid and belongs wherever the restore model now lives: here.
+
+**Impact.**
+- New In-Scope item: **orchestration-tab restore**, split into the daemon-hydration path (verify #76/#111 already cover it; add a regression test) and the snapshot-fallback path (port #74's orchestration-metadata schema onto the saved pane for the daemon-empty case).
+- New milestone phase (below) for orchestration restore + drift-fallback warnings.
+- #74's schema sketch and restore-branch design remain useful as implementation reference in `prds/done/74-*.md`.
+
+**Owner.** Viktor (decided in 2026-06-14 planning discussion).
