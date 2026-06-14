@@ -8167,6 +8167,19 @@ fn render_frame(
         ui.tab_close_rects.clear();
     }
 
+    // PRD #155 (M3): map each managed pane to its agent status from the SAME
+    // source the deck cards read (`state.sessions[*].status`), so an embedded
+    // pane's border encodes its status with the SAME centralized-palette color
+    // the deck card uses — closing the deck/pane consistency gap (criterion #2).
+    // Borrowed `&str` keys avoid a per-frame clone of every pane id; the status
+    // enum clone is cheap (fieldless). Built once and threaded into every
+    // `render_terminal_panes` call below (and into `render_mode_tab`).
+    let pane_status: HashMap<&str, SessionStatus> = state
+        .sessions
+        .values()
+        .filter_map(|s| s.pane_id.as_deref().map(|pid| (pid, s.status.clone())))
+        .collect();
+
     // Branch on the content the layout pass resolved. Mode tabs render and
     // return here; dashboard / orchestration fall through to the card grid.
     let (dashboard_area, panes_area, pane_ids, pane_rects) = match &layout.content {
@@ -8198,6 +8211,7 @@ fn render_frame(
                 has_pane_control,
                 active_mode_name,
                 focused_pane_id.as_deref(),
+                &pane_status,
             );
             return;
         }
@@ -8240,6 +8254,7 @@ fn render_frame(
                 pane_ids,
                 pane_layout,
                 &ui.pane_display_names,
+                &pane_status,
                 &ui.selection,
                 None,
                 Some(&pane_outer_rects),
@@ -8328,6 +8343,7 @@ fn render_frame(
                 pane_ids,
                 pane_layout,
                 &ui.pane_display_names,
+                &pane_status,
                 &ui.selection,
                 None,
                 Some(&pane_outer_rects),
@@ -8444,6 +8460,7 @@ fn render_frame(
             pane_ids,
             pane_layout,
             &ui.pane_display_names,
+            &pane_status,
             &ui.selection,
             None,
             Some(&pane_outer_rects),
@@ -8521,6 +8538,13 @@ fn render_terminal_panes(
     pane_ids: &[String],
     layout: PaneLayout,
     display_names: &HashMap<String, String>,
+    // PRD #155 (M3): per-pane agent status keyed by pane_id, sourced from the
+    // SAME `state.sessions[*].status` the deck cards render through
+    // `status_style`. Threaded so a non-focused pane's border encodes its status
+    // via the centralized `palette` — the SAME color the deck card uses for that
+    // state (criterion #2). A pane absent from the map (no backing session)
+    // keeps the legacy focus-only border (the `TerminalWidget::new` default).
+    pane_status: &HashMap<&str, SessionStatus>,
     selection: &Option<TextSelection>,
     visual_focus_id: Option<&str>,
     // PRD #84: per-pane OUTER rects (aligned 1:1 with `pane_ids`) precomputed by
@@ -8585,8 +8609,15 @@ fn render_terminal_panes(
                     let title = pane_name(pane_id);
                     // PRD #84 M5: this pane was sized to `chunks[i]` by
                     // `resize_panes_to_layout` this frame, so attest the contract.
-                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused)
+                    let mut widget = TerminalWidget::new(Arc::clone(&screen), title, focused)
                         .contract_guaranteed(true);
+                    // PRD #155 (M3): supply the pane's status so a non-focused
+                    // pane renders its status-colored border via the palette (the
+                    // focus override stays inside TerminalWidget). Panes without a
+                    // backing session keep the legacy focus-only border.
+                    if let Some(status) = pane_status.get(pane_id.as_str()) {
+                        widget = widget.with_status(status.clone());
+                    }
                     if focused {
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
@@ -8608,8 +8639,13 @@ fn render_terminal_panes(
                         let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
                         // PRD #84 M5: the expanded pane was sized to `chunks[i]`
                         // by `resize_panes_to_layout` this frame — attest it.
-                        let widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused)
-                            .contract_guaranteed(true);
+                        let mut widget =
+                            TerminalWidget::new(Arc::clone(&screen), title, is_focused)
+                                .contract_guaranteed(true);
+                        // PRD #155 (M3): same status threading as the Tiled arm.
+                        if let Some(status) = pane_status.get(pane_id.as_str()) {
+                            widget = widget.with_status(status.clone());
+                        }
                         if is_focused {
                             focused_pane_rect = Some(chunks[i]);
                             focused_screen = Some(screen);
@@ -8707,6 +8743,10 @@ fn render_mode_tab(
     has_pane_control: bool,
     active_mode_name: Option<&str>,
     focused_pane_id: Option<&str>,
+    // PRD #155 (M3): per-pane agent status (pane_id → status) forwarded from
+    // `render_frame` into both `render_terminal_panes` calls below, so mode-tab
+    // panes get the same status-colored borders as the dashboard's panes.
+    pane_status: &HashMap<&str, SessionStatus>,
 ) {
     // PRD #83: `focused_pane_id` is keyed by stable pane id. `None` (or an
     // id that isn't one of this tab's side panes) means the agent pane is
@@ -8733,6 +8773,7 @@ fn render_mode_tab(
             &agent_ids,
             PaneLayout::Stacked,
             &ui.pane_display_names,
+            pane_status,
             &ui.selection,
             agent_visual_focus,
             // Mode-tab panes recompute their rects (out of the Cards finding's
@@ -8753,6 +8794,7 @@ fn render_mode_tab(
             side_pane_ids,
             PaneLayout::Tiled,
             &ui.pane_display_names,
+            pane_status,
             &ui.selection,
             side_visual_focus.as_deref(),
             // Mode side panes recompute via pane_stack_rects (Tiled) — same
