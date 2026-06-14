@@ -1721,54 +1721,6 @@ pub(crate) struct HydrationPartition {
 /// orchestration buckets preserve the order in which their (cwd, name)
 /// pairing was first seen so the user's mental "which tab opened first"
 /// model survives reconnect (TabManager appends in iteration order).
-/// Key used by [`build_dedupe_budget`] / [`try_consume_dedupe_slot`] to
-/// match a saved pane against a daemon-hydrated pane. The tuple is
-/// `(dir, name, mode)`. `command` is intentionally excluded — daemon
-/// `list_agents` doesn't echo command, so hydration always stores
-/// `command = ""` and including it in the key would dedupe nothing for
-/// the common case.
-type SavedPaneDedupeKey = (String, String, Option<String>);
-
-/// Build the dedupe budget from the hydration metadata. The budget
-/// maps `(dir, name, mode)` keys to the COUNT of hydrated panes
-/// matching that key. The restore loop consumes slots via
-/// [`try_consume_dedupe_slot`] so it drops at most one saved pane per
-/// hydrated match — preserving distinct saved panes that happen to
-/// share a key (round-10 reviewer #2).
-fn build_dedupe_budget(
-    pane_metadata: &std::collections::HashMap<String, config::SavedPane>,
-) -> std::collections::HashMap<SavedPaneDedupeKey, usize> {
-    let mut budget: std::collections::HashMap<SavedPaneDedupeKey, usize> =
-        std::collections::HashMap::new();
-    for meta in pane_metadata.values() {
-        *budget
-            .entry((meta.dir.clone(), meta.name.clone(), meta.mode.clone()))
-            .or_insert(0) += 1;
-    }
-    budget
-}
-
-/// Returns true and decrements the budget if `saved_pane`'s
-/// `(dir, name, mode)` key has a free slot — the caller should then
-/// skip restoring it. Returns false otherwise.
-fn try_consume_dedupe_slot(
-    budget: &mut std::collections::HashMap<SavedPaneDedupeKey, usize>,
-    saved_pane: &config::SavedPane,
-) -> bool {
-    let key = (
-        saved_pane.dir.clone(),
-        saved_pane.name.clone(),
-        saved_pane.mode.clone(),
-    );
-    if let Some(slot) = budget.get_mut(&key)
-        && *slot > 0
-    {
-        *slot -= 1;
-        return true;
-    }
-    false
-}
-
 pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition {
     use std::collections::HashSet;
 
@@ -4901,6 +4853,12 @@ fn dispatch_action(
                                         config_name: orch_config.name.clone(),
                                         project_path: dir_str.clone(),
                                         started_role_indices: vec![start_idx],
+                                        // PRD #89 review-fix F4: capture the
+                                        // user-typed tab title so the
+                                        // daemon-empty restore rebuilds the tab
+                                        // under the user's name, not the
+                                        // canonical config/cwd name.
+                                        display_title: display_title.clone(),
                                     }),
                                 },
                             );
@@ -5551,16 +5509,33 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
     let live_panes = state.blocking_read().managed_pane_ids.clone();
     let session =
         config::SavedSession::snapshot(&mut ui.pane_metadata, &ui.pane_display_names, &live_panes);
-    if session.panes.is_empty() {
-        if let Err(e) = config::SavedSession::clear() {
-            ui.session_warnings
-                .push(format!("Warning: failed to clear session: {e}"));
+    // PRD #89 review-fix F10: only mark the write as done (clearing the dirty
+    // flag via `record_write`) when the persist actually SUCCEEDED. On a
+    // transient disk error we leave the coalescer dirty so the next loop
+    // iteration retries, rather than dropping the pending snapshot until the
+    // next unrelated state change re-dirties it.
+    let persisted = if session.panes.is_empty() {
+        match config::SavedSession::clear() {
+            Ok(()) => true,
+            Err(e) => {
+                ui.session_warnings
+                    .push(format!("Warning: failed to clear session: {e}"));
+                false
+            }
         }
-    } else if let Err(e) = session.save() {
-        ui.session_warnings
-            .push(format!("Warning: failed to save session: {e}"));
+    } else {
+        match session.save() {
+            Ok(()) => true,
+            Err(e) => {
+                ui.session_warnings
+                    .push(format!("Warning: failed to save session: {e}"));
+                false
+            }
+        }
+    };
+    if persisted {
+        ui.session_coalescer.record_write(now);
     }
-    ui.session_coalescer.record_write(now);
 }
 
 /// PRD #89 M2.2 — daemon-vs-snapshot restore precedence seam.
@@ -5597,11 +5572,47 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 /// On `Err`, the caller surfaces the reason via `session_warnings` and falls
 /// back to a PLAIN dashboard pane (never a half-broken orchestration tab),
 /// mirroring the mode-tab drift Path D/E fallback (PRD #69).
+///
+/// On `Ok`, returns the resolved config AND the validated start-role index to
+/// honor (the SAVED cursor, bounds-checked — PRD #89 review-fix F2/F3), so the
+/// caller drives prompt delivery from the saved start role rather than
+/// recomputing it from the live config's `start` flags.
 fn resolve_orchestration_for_restore(
     snap: &config::OrchestrationSnapshot,
-) -> Result<OrchestrationConfig, String> {
+    saved_dir: &str,
+) -> Result<(OrchestrationConfig, usize), String> {
+    // PRD #89 review-fix F1 (security): the snapshot's `project_path` and the
+    // saved pane's `dir` are written EQUAL on capture; a divergence only happens
+    // via a tampered `session.toml`. Re-resolving — and auto-running — the
+    // config at a divergent `project_path` would execute a `.dot-agent-deck.toml`
+    // an attacker controls. Canonicalize both and refuse to re-resolve unless
+    // they name the same directory; a divergence (or a `project_path` that no
+    // longer resolves) is treated as drift -> plain-pane fallback, so the
+    // planted config is never executed.
     let project_dir = std::path::Path::new(&snap.project_path);
-    let cfg = match load_project_config(project_dir) {
+    let canon_project = project_dir.canonicalize().map_err(|e| {
+        format!(
+            "orchestration '{}' project_path {} could not be resolved: {e}",
+            snap.config_name, snap.project_path
+        )
+    })?;
+    let canon_saved = std::path::Path::new(saved_dir)
+        .canonicalize()
+        .map_err(|e| {
+            format!(
+                "orchestration '{}' saved dir {saved_dir} could not be resolved: {e}",
+                snap.config_name
+            )
+        })?;
+    if canon_project != canon_saved {
+        return Err(format!(
+            "orchestration '{}' project_path {} does not match saved pane dir {saved_dir} — \
+             refusing to re-resolve a divergent config",
+            snap.config_name, snap.project_path
+        ));
+    }
+
+    let cfg = match load_project_config(&canon_project) {
         Ok(Some(cfg)) => cfg,
         Ok(None) => {
             return Err(format!(
@@ -5640,7 +5651,27 @@ fn resolve_orchestration_for_restore(
             current_roles.join(", "),
         ));
     }
-    Ok(orch)
+    // PRD #89 review-fix F2 (robustness): bounds-check the SAVED start cursor
+    // against the re-resolved role set. `load_project_config` runs no
+    // config_validation, so a whittled-down (or explicitly `roles = []`) config
+    // is structurally valid yet role-less, and a tampered cursor could point
+    // past the end. Either would index an empty/short `role_pane_ids` and panic
+    // at startup (crash-loop). Treat an out-of-range cursor — which includes
+    // every index of an empty role set — as drift, so the caller falls back to
+    // a plain pane instead of panicking.
+    if snap.start_role_index >= orch.roles.len() {
+        return Err(format!(
+            "orchestration '{}' has no role at saved start index {} (role count {}) — falling back",
+            snap.config_name,
+            snap.start_role_index,
+            orch.roles.len()
+        ));
+    }
+    // PRD #89 review-fix F3: honor the SAVED start cursor (now validated in
+    // range) instead of recomputing it from the live config's `start` flags, so
+    // a saved cursor that differs from the config default is preserved on
+    // restore.
+    Ok((orch, snap.start_role_index))
 }
 
 pub fn run_tui(
@@ -6103,10 +6134,6 @@ pub fn run_tui(
         let _ = terminal.autoresize();
 
         let saved = config::SavedSession::load();
-        // CodeRabbit round-9 #4 / round-10 #2: dedupe against panes
-        // the daemon already hydrated. See `build_dedupe_budget` and
-        // `try_consume_dedupe_slot` below for the algorithm.
-        let mut remaining_dedupe_budget = build_dedupe_budget(&ui.pane_metadata);
         // Collect deferred mode pane restores — we need the terminal ready
         // before we can resize PTYs, so mode tabs are opened after the loop.
         let mut deferred_mode_panes: Vec<(config::SavedPane, ModeConfig)> = Vec::new();
@@ -6123,15 +6150,6 @@ pub fn run_tui(
                 ));
                 continue;
             }
-            if try_consume_dedupe_slot(&mut remaining_dedupe_budget, saved_pane) {
-                tracing::debug!(
-                    dir = %saved_pane.dir,
-                    name = %saved_pane.name,
-                    mode = ?saved_pane.mode,
-                    "restore: skipping saved pane — already hydrated from daemon"
-                );
-                continue;
-            }
             // PRD #89 M2b.3 — orchestration-tab restore on the daemon-empty
             // path. A saved pane carrying orchestration metadata rebuilds the
             // WHOLE tab (orchestrator + role panes in saved order, the prompt
@@ -6145,8 +6163,8 @@ pub fn run_tui(
             // path REPLAYS the saved `orchestrator_prompt` to the start role —
             // there is no live agent with the prompt already in scrollback.
             if let Some(ref orch_snap) = saved_pane.orchestration {
-                match resolve_orchestration_for_restore(orch_snap) {
-                    Ok(orch_config) => {
+                match resolve_orchestration_for_restore(orch_snap, &saved_pane.dir) {
+                    Ok((orch_config, saved_start_idx)) => {
                         let frame_area = terminal.get_frame().area();
                         // All roles share spawn dims (Tiled); role_index=0 so the
                         // helper falls back to "role 0 expanded" — the per-frame
@@ -6169,10 +6187,28 @@ pub fn run_tui(
                             &orch_config,
                             &saved_pane.dir,
                             replay_prompt,
-                            None,
+                            // PRD #89 review-fix F4: thread the saved user title
+                            // so the rebuilt tab comes back under the user's name
+                            // rather than the canonical config/cwd name. `None`
+                            // when unset falls back to the canonical name.
+                            orch_snap.display_title.as_deref(),
                             spawn_dims,
                         ) {
                             Ok((tab_idx, role_pane_ids)) => {
+                                // PRD #89 review-fix F3: honor the SAVED start
+                                // cursor. `open_orchestration_tab` computed
+                                // `start_role_index` from the config's `start`
+                                // flags; override it with the validated saved
+                                // index so the prompt-delivery gate (and the
+                                // landing focus) target the role the user left
+                                // as start, even when it differs from the config
+                                // default. The just-opened tab is the active tab.
+                                if let Tab::Orchestration {
+                                    start_role_index, ..
+                                } = tab_manager.active_tab_mut()
+                                {
+                                    *start_role_index = saved_start_idx;
+                                }
                                 // Snapshot each role pane's daemon agent_id before
                                 // the placeholder insert so the strict-equality
                                 // reuse guard accepts each role agent's first
@@ -6216,10 +6252,15 @@ pub fn run_tui(
                                 // Re-capture the orchestration metadata onto the
                                 // start role pane so a later snapshot keeps the
                                 // tab (only the start role carries the block).
-                                let start_idx =
-                                    orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
-                                ui.pane_metadata
-                                    .insert(role_pane_ids[start_idx].clone(), saved_pane.clone());
+                                // PRD #89 review-fix F3: key it under the SAVED
+                                // (validated) start cursor — consistent with the
+                                // honored start role above — not the config
+                                // default, so a re-save preserves the saved
+                                // cursor on the same pane that carries the block.
+                                ui.pane_metadata.insert(
+                                    role_pane_ids[saved_start_idx].clone(),
+                                    saved_pane.clone(),
+                                );
                                 // Record creation time so the prompt-delivery
                                 // gate's 10s timeout fallback works for agents
                                 // that never signal `SessionStart`.
@@ -6657,8 +6698,11 @@ pub fn run_tui(
         {
             let _ = pane.focus_pane(&new_id);
         }
-        // PRD #89 M1.2 — a reactive pane recreation (agent stop/restart, e.g.
-        // after `/clear`) swaps live pane ids; keep the snapshot fresh.
+        // PRD #89 M1.2 — `route_reactive_commands` recreates Mode-tab reactive
+        // SIDE panes, swapping their live pane ids (`pane_changes`); keep the
+        // snapshot fresh so the new ids are reflected. NOTE: this covers only
+        // reactive side-pane swaps — it does NOT broadly cover an agent /clear
+        // restart, whose dirtying flows through other reactive seams.
         if !pane_changes.is_empty() {
             ui.mark_session_dirty();
         }
@@ -12272,104 +12316,6 @@ mod tests {
         assert_eq!(p.dashboard_pane_ids, vec!["1".to_string(), "2".to_string()]);
         assert!(p.mode_buckets.is_empty());
         assert!(p.orchestration_buckets.is_empty());
-    }
-
-    /// Round-10 reviewer #2: two saved panes that share
-    /// `(dir, name, mode)` must NOT both be dropped when only one was
-    /// hydrated. The pre-round-10 `HashSet` dedupe collapsed both;
-    /// the count-based budget drops at most one per match.
-    #[test]
-    fn dedupe_drops_only_count_matched_saved_panes() {
-        use config::SavedPane;
-        let mut metadata: HashMap<String, SavedPane> = HashMap::new();
-        // One hydrated dashboard pane with (dir=/w, name=foo, mode=None).
-        metadata.insert(
-            "pane-1".into(),
-            SavedPane {
-                dir: "/w".into(),
-                name: "foo".into(),
-                command: String::new(),
-                mode: None,
-                orchestration: None,
-            },
-        );
-        let mut budget = build_dedupe_budget(&metadata);
-
-        let saved_a = SavedPane {
-            dir: "/w".into(),
-            name: "foo".into(),
-            command: "vim".into(),
-            mode: None,
-            orchestration: None,
-        };
-        let saved_b = SavedPane {
-            dir: "/w".into(),
-            name: "foo".into(),
-            command: "tail -f log".into(),
-            mode: None,
-            orchestration: None,
-        };
-
-        // First saved pane matches the hydrated → consumed.
-        assert!(try_consume_dedupe_slot(&mut budget, &saved_a));
-        // Second saved pane shares the key but the budget is exhausted → restored.
-        assert!(!try_consume_dedupe_slot(&mut budget, &saved_b));
-    }
-
-    #[test]
-    fn dedupe_distinguishes_mode_panes_from_dashboard() {
-        use config::SavedPane;
-        let mut metadata: HashMap<String, SavedPane> = HashMap::new();
-        metadata.insert(
-            "pane-1".into(),
-            SavedPane {
-                dir: "/w".into(),
-                name: "foo".into(),
-                command: String::new(),
-                mode: Some("k8s-ops".into()),
-                orchestration: None,
-            },
-        );
-        let mut budget = build_dedupe_budget(&metadata);
-
-        // Same (dir, name) but different mode — must NOT dedupe.
-        let saved_dashboard = SavedPane {
-            dir: "/w".into(),
-            name: "foo".into(),
-            command: "vim".into(),
-            mode: None,
-            orchestration: None,
-        };
-        assert!(!try_consume_dedupe_slot(&mut budget, &saved_dashboard));
-
-        // Matching mode → DEDUPED.
-        let saved_mode = SavedPane {
-            dir: "/w".into(),
-            name: "foo".into(),
-            command: String::new(),
-            mode: Some("k8s-ops".into()),
-            orchestration: None,
-        };
-        assert!(try_consume_dedupe_slot(&mut budget, &saved_mode));
-    }
-
-    #[test]
-    fn dedupe_restores_saved_panes_when_daemon_empty() {
-        use config::SavedPane;
-        // No hydrated metadata (daemon restarted, hydration returned
-        // empty). The saved-session file is the only source of truth;
-        // every saved pane must restore.
-        let metadata: HashMap<String, SavedPane> = HashMap::new();
-        let mut budget = build_dedupe_budget(&metadata);
-
-        let saved = SavedPane {
-            dir: "/w".into(),
-            name: "foo".into(),
-            command: "vim".into(),
-            mode: None,
-            orchestration: None,
-        };
-        assert!(!try_consume_dedupe_slot(&mut budget, &saved));
     }
 
     #[test]

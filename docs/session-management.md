@@ -51,7 +51,7 @@ Restore happens in two layers, tried in order:
 1. **Daemon hydration first.** The background daemon owns your running agents, so on attach the dashboard rehydrates whatever the daemon currently holds — agents still in their previous state, with live output. This is the common case when you detach (close the TUI, or disconnect from a remote) and reattach later.
 2. **On-disk snapshot fallback.** If the daemon is empty — a fresh machine, the first launch after a reboot, or recovery after a daemon crash — Agent Deck falls back to the saved snapshot on disk and recreates the workspace structure: panes, names, directories, commands, and tabs. Agent processes are respawned fresh; each agent's own conversation state is restored by its own command line (for example, `claude --continue`), not by Agent Deck.
 
-If both the daemon and the snapshot are empty, you land on a clean, empty dashboard. After restore the dashboard is shown first so you get an overview before switching to a specific tab. If a saved directory no longer exists, that pane is skipped with a warning.
+If both the daemon and the snapshot are empty, you land on a clean, empty dashboard. When a snapshot restore rebuilds one or more orchestration tabs, Agent Deck opens the first restored orchestration tab so you land where you left off; otherwise — and after a daemon hydration with no orchestration to land on — you start on the dashboard for an overview. If a saved directory no longer exists, that pane is skipped with a warning.
 
 ### The snapshot stays fresh
 

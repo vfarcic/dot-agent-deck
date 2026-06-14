@@ -351,7 +351,10 @@ fn main() -> ExitCode {
     // gets a guiding message ("auto-restore is the default; just run
     // `dot-agent-deck`") instead of clap's bare "unexpected argument" error.
     // The exit is non-zero so wrapper scripts still fail loudly until updated.
-    if std::env::args().any(|a| a == "--continue") {
+    // Review-fix F8: also match the `--continue=<value>` form (e.g. a wrapper
+    // that passed `--continue=true`) so it keeps the friendly message instead of
+    // falling through to clap's generic error.
+    if std::env::args().any(|a| a == "--continue" || a.starts_with("--continue=")) {
         eprintln!(
             "error: the `--continue` flag has been removed. Auto-restore is now the default — \
              just run `dot-agent-deck` (no flag) and your previous session is restored \

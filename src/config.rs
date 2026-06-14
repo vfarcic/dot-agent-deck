@@ -348,31 +348,56 @@ pub struct SavedPane {
 ///
 /// This struct ONLY captures the metadata + its (de)serialization; the
 /// restore branch that rebuilds the tab from it is M2b.3 (a separate step).
+///
+/// PRD #89 review-fix F12: every sub-field carries `#[serde(default)]` so a
+/// MALFORMED partial `[panes.orchestration]` block degrades to a defaulted
+/// snapshot (which the restore path then drift-checks and falls back from)
+/// rather than failing the WHOLE-file TOML parse and dropping ALL panes. A
+/// zero-default `version`/empty `roles` is harmless — the restore path treats a
+/// role-less / out-of-range snapshot as drift (F2) and restores a plain pane.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrchestrationSnapshot {
     /// Schema version, for future migration. `1` is the initial format.
+    #[serde(default)]
     pub version: u32,
     /// Role names in DISPLAY order — the same order as the tab's
     /// `role_pane_ids`, so the restore branch can recreate the role panes
     /// in the order the user saw them.
+    #[serde(default)]
     pub roles: Vec<String>,
     /// Index into `roles` of the start (orchestrator) role — restores the
     /// "next role to start" cursor.
+    #[serde(default)]
     pub start_role_index: usize,
     /// Pre-built prompt injected into the start (orchestrator) role on
     /// restore. Empty string when the orchestration had no prompt.
+    #[serde(default)]
     pub orchestrator_prompt: String,
     /// Resolved orchestration config NAME — half of the reference used to
     /// re-resolve the `OrchestrationConfig` from disk on restore.
+    #[serde(default)]
     pub config_name: String,
     /// Project PATH the orchestration was resolved from (the directory that
     /// holds `.dot-agent-deck.toml`) — the other half of the re-resolution
     /// reference.
+    #[serde(default)]
     pub project_path: String,
     /// Which roles had been started, by index into `roles`. Optional —
     /// snapshots that predate this field load with an empty list.
+    ///
+    /// PRD #89 review-fix F3: FORWARD-COMPAT ONLY — captured (as
+    /// `vec![start_role_index]`) but not yet consumed on restore. Kept so a
+    /// later "restore which roles were started" feature has the data already
+    /// in old snapshots; do not assume a reader exists today.
     #[serde(default)]
     pub started_role_indices: Vec<usize>,
+    /// PRD #89 review-fix F4: the user-typed orchestration tab TITLE
+    /// (`Tab::Orchestration.name`), captured so the daemon-empty restore path
+    /// rebuilds the tab under the user's title rather than the canonical
+    /// config/cwd name. `None` when the user didn't name the orchestration
+    /// (the title then falls back to the resolved canonical name on restore).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -401,15 +426,62 @@ impl SavedSession {
     }
 
     pub fn save(&self) -> Result<(), String> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
         let path = session_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create session directory: {e}"))?;
-        }
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create session directory: {e}"))?;
+
         let contents = toml::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize session: {e}"))?;
-        std::fs::write(&path, contents)
-            .map_err(|e| format!("Failed to write session at {}: {e}", path.display()))
+
+        // PRD #89 review-fix F6/F7: write owner-only (0o600) AND atomically. The
+        // snapshot now carries command lines, project paths, and prompts and is
+        // written continuously, so (a) it must not be world-readable regardless
+        // of the user's umask, and (b) a crash mid-write must never leave a
+        // half-written `session.toml` for the next launch to choke on. Mirror
+        // remote.rs: write a sibling temp file opened with mode 0o600, then
+        // `rename(2)` it into place (atomic on a POSIX same-filesystem rename).
+        // The pid suffix avoids collisions between concurrently-saving decks.
+        let file_name = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "session.toml".to_string());
+        let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
+
+        let mut tmp_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to open temp session at {}: {e}", tmp_path.display()))?;
+
+        if let Err(e) = tmp_file.write_all(contents.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "Failed to write temp session at {}: {e}",
+                tmp_path.display()
+            ));
+        }
+        // Defense in depth: a stale temp file from a crashed previous save would
+        // keep its old mode (OpenOptions::mode only applies on create), so
+        // re-assert 0o600 explicitly before the rename.
+        if let Err(e) = tmp_file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "Failed to set permissions on temp session at {}: {e}",
+                tmp_path.display()
+            ));
+        }
+        drop(tmp_file);
+
+        std::fs::rename(&tmp_path, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("Failed to write session at {}: {e}", path.display())
+        })
     }
 
     pub fn clear() -> Result<(), std::io::Error> {
@@ -1312,6 +1384,7 @@ on_idle = true
                     config_name: "tdd-cycle".to_string(),
                     project_path: "/repo/app".to_string(),
                     started_role_indices: vec![0, 1],
+                    display_title: Some("My TDD Run".to_string()),
                 }),
             }],
         };
@@ -1337,6 +1410,7 @@ on_idle = true
         assert_eq!(orch.config_name, "tdd-cycle");
         assert_eq!(orch.project_path, "/repo/app");
         assert_eq!(orch.started_role_indices, vec![0, 1]);
+        assert_eq!(orch.display_title.as_deref(), Some("My TDD Run"));
 
         // (b) A legacy session.toml predating the orchestration field still
         // parses, with orchestration == None (the #[serde(default)] guarantee).
