@@ -1,10 +1,20 @@
 # PRD #74: Restore Orchestration Tabs With `--continue`
 
-**Status**: Not started
+**Status**: No Longer Needed (superseded by PRD #89)
 **Priority**: Medium
 **Created**: 2026-05-05
+**Last Updated**: 2026-06-14
+**Closed**: 2026-06-14
 **GitHub Issue**: https://github.com/vfarcic/dot-agent-deck/issues/74
 **Parent context**: split out of PRD #69 (mode-tab restore). See PRD #69 Decision Log entry 2026-05-05 for the rationale.
+
+## Closure Note (2026-06-14)
+
+Closed as **No Longer Needed** — the *mechanism* this PRD builds on is obsolete. Its entire design extends the `--continue` + clean-quit `session.toml` snapshot model to orchestration tabs. Since this PRD was written, the **daemon/client architecture (PRD #76) shipped and is now the default even locally**: the TUI hydrates its workspace from the daemon registry on every startup, and `--continue` is already a vestigial no-op on the `connect` path (`src/main.rs:868` — *"it applies to a laptop-side TUI that no longer exists in this flow"*). Building orchestration-tab restore on `--continue` would invest in a foundation the codebase has already abandoned.
+
+The underlying **user need remains valid** — orchestration tabs (orchestrator + role panes, prompts, role ordering, `start_role_index`) should survive restart/reattach. That need is being **re-homed onto the daemon-restore story tracked in PRD #89** ("Auto-restore TUI state on attach; remove `--continue`"), which deletes the very flag this PRD extends and makes daemon-hydration-first the unified restore model. Orchestration-tab capture/restore should be delivered there (or in a dedicated daemon-restore PRD), not via `--continue`.
+
+The schema sketch and restore-branch design below remain useful as **implementation reference** for whoever delivers orchestration restore under the daemon model.
 
 ## Problem
 
