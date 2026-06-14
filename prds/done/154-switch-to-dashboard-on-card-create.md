@@ -1,8 +1,9 @@
 # PRD #154: Switch to Dashboard when creating a single-agent card from a non-Dashboard tab
 
-**Status**: In Progress
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-06-13
+**Completed**: 2026-06-14
 **GitHub Issue**: [#154](https://github.com/vfarcic/dot-agent-deck/issues/154)
 **Related**: `src/ui.rs` (`Action::SpawnPane` handler, "regular dashboard pane" branch ~L4920), `src/tab.rs` (`TabManager::switch_to`, `open_orchestration_tab`, `open_mode_tab`)
 
