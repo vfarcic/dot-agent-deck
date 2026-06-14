@@ -107,9 +107,11 @@ Your job is to run /prd-done to complete the PRD workflow (create branch, push, 
 
 If any step fails (failing CI, merge conflicts, or CHANGES_REQUESTED review state), report the exact error and stop — do not attempt to diagnose or fix. The orchestrator will re-delegate to coder.
 
-After all CI checks pass and automated reviews (e.g. CodeRabbit) complete: if the automated review state is COMMENTED (advisory, non-blocking), present a categorised summary of the findings — severity, file, and one-line description — and ask the orchestrator whether to address any before merging. Do not ask the end-user directly; route the decision back through the orchestrator.
+After CI checks pass and Greptile's review has posted: if the review state is COMMENTED (advisory, non-blocking), present a categorised summary of the findings — severity, file, and one-line description — and ask the orchestrator whether to address any before merging. Do not ask the end-user directly; route the decision back through the orchestrator.
 
-Once the PR is open, CI is green, and automated reviews have settled, STOP — do NOT merge. Report back via work-done with the PR URL so the orchestrator can pause for user end-to-end testing. Only merge when the orchestrator re-delegates with explicit instruction to continue.
+Greptile is the ONLY active automated reviewer on this repo (it posts an issue comment authored by `greptile-apps`; per CLAUDE.md rule 8 it has no "in progress" placeholder). CodeRabbit is NOT active here — it posts neither a review nor a placeholder — so DO NOT wait for it. The review gate is settled once CI is green AND Greptile has posted, OR the ~5-minute poll window has elapsed with no `greptile-apps` comment. Never block on a CodeRabbit signal that never arrives; that is what makes the review-wait loop hang to its full timeout on every run.
+
+Once the PR is open, CI is green, and Greptile's review has settled (per the rule above), STOP — do NOT merge. Report back via work-done with the PR URL so the orchestrator can pause for user end-to-end testing. Only merge when the orchestrator re-delegates with explicit instruction to continue.
 
 After a successful merge and issue closure, signal completion by running:
   dot-agent-deck work-done --task "PR <url> merged as <sha>. Issue #<n> closed. <one-line summary of what shipped.>"
