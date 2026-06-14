@@ -378,7 +378,7 @@ impl SavedSession {
     /// every pane, including mode-tab agent panes that carry `mode = Some(...)`.
     /// `retain` here only prunes panes the user externally closed before exit;
     /// running it after teardown would also drop the mode-tab agent pane and lose
-    /// the mode field, breaking `--continue` restoration (PRD #69).
+    /// the mode field, breaking auto-restore of the mode tab (PRD #69).
     pub fn snapshot(
         pane_metadata: &mut HashMap<String, SavedPane>,
         pane_display_names: &HashMap<String, String>,

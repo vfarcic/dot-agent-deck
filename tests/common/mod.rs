@@ -319,11 +319,11 @@ impl TuiDeck {
             }
         }
 
-        // Write the saved-session file the deck reads under `--continue`,
-        // if the test asked for one. The pane runs `command` in the
-        // tempdir's working directory so the agent has a real cwd to
-        // operate against (the deck's restore path skips panes whose
-        // `dir` doesn't exist on disk).
+        // Write the saved-session file the deck auto-restores on startup
+        // (PRD #89: no `--continue` flag anymore), if the test asked for one.
+        // The pane runs `command` in the tempdir's working directory so the
+        // agent has a real cwd to operate against (the deck's restore path
+        // skips panes whose `dir` doesn't exist on disk).
         let session_toml_path = work.join("session.toml");
         if let Some(cs) = &builder.continue_session {
             write_continue_session_file(&session_toml_path, &work, &cs.pane_name, &cs.command)
@@ -351,11 +351,10 @@ impl TuiDeck {
         let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
         let mut cmd = CommandBuilder::new(bin);
         cmd.cwd(&work);
-        // Pass `--continue` when a saved session was staged so the deck
-        // auto-opens the chain-smoke pane on launch.
-        if builder.continue_session.is_some() {
-            cmd.arg("--continue");
-        }
+        // PRD #89: the `--continue` flag was removed — auto-restore is now the
+        // default. A staged saved session (pointed at by `DOT_AGENT_DECK_SESSION`
+        // below) is restored unconditionally on launch when the daemon is empty,
+        // so no flag is passed here.
         // M2.1 auditor S2: portable-pty 0.8 unconditionally env_clears
         // on Unix before applying our `cmd.env(...)` calls, but the old
         // comment claimed env_clear was avoided. Make the scrub
@@ -420,7 +419,7 @@ impl TuiDeck {
             final_env.insert((*k).into(), (*v).into());
         }
         // Point the deck's saved-session reader at our staged file so
-        // `--continue` picks up exactly the chain-smoke pane and
+        // auto-restore picks up exactly the chain-smoke pane and
         // nothing from the developer's real session.toml.
         if builder.continue_session.is_some() {
             final_env.insert(

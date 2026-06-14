@@ -21,10 +21,6 @@ use dot_agent_deck::ui::run_tui;
 #[derive(Parser)]
 #[command(name = "dot-agent-deck", about = "AI agent session dashboard", version = env!("DAD_VERSION"))]
 struct Cli {
-    /// Restore pane session from last exit
-    #[arg(long = "continue")]
-    continue_session: bool,
-
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -332,6 +328,20 @@ enum ConfigAction {
 }
 
 fn main() -> ExitCode {
+    // PRD #89 M3.4: the `--continue` flag was removed — auto-restore is now the
+    // default. Intercept a stale invocation before clap parsing so the user
+    // gets a guiding message ("auto-restore is the default; just run
+    // `dot-agent-deck`") instead of clap's bare "unexpected argument" error.
+    // The exit is non-zero so wrapper scripts still fail loudly until updated.
+    if std::env::args().any(|a| a == "--continue") {
+        eprintln!(
+            "error: the `--continue` flag has been removed. Auto-restore is now the default — \
+             just run `dot-agent-deck` (no flag) and your previous session is restored \
+             automatically."
+        );
+        return ExitCode::FAILURE;
+    }
+
     let keys_help = dot_agent_deck::config::config_keys_help();
     let cmd = Cli::command().mut_subcommand("config", |c| {
         c.mut_subcommand("get", |g| {
@@ -345,7 +355,7 @@ fn main() -> ExitCode {
         .expect("clap arg matches should be valid for Cli struct");
 
     match cli.command {
-        None => run_dashboard(cli.continue_session),
+        None => run_dashboard(),
         Some(Commands::Hook { agent }) => {
             let agent_str = match agent {
                 CliAgent::ClaudeCode => "claude-code",
@@ -580,7 +590,7 @@ fn main() -> ExitCode {
                 }
             }
         },
-        Some(Commands::Connect { name }) => run_connect(cli.continue_session, name),
+        Some(Commands::Connect { name }) => run_connect(name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
         Some(Commands::Validate { path }) => {
             use dot_agent_deck::config_validation::{has_errors, validate_config};
@@ -617,9 +627,9 @@ fn main() -> ExitCode {
 }
 
 #[tokio::main]
-async fn run_dashboard(continue_session: bool) -> ExitCode {
+async fn run_dashboard() -> ExitCode {
     init_logging_from_env();
-    run_tui_session(continue_session).await
+    run_tui_session().await
 }
 
 /// Optional file-based logging from `DOT_AGENT_DECK_LOG`. Pulled out of the
@@ -665,7 +675,7 @@ fn init_logging_from_env() {
 /// (spawn error, start timeout, or trust-check rejection). Successful TUI
 /// runs return `ExitCode::SUCCESS` — including TUI-task errors, which are
 /// already surfaced to stderr.
-async fn run_tui_session(continue_session: bool) -> ExitCode {
+async fn run_tui_session() -> ExitCode {
     // PRD #139 M1.2/M1.3: initialize the process-global experimental flag from
     // `.dot-agent-deck.toml` `[features]` (env override wins) and start the
     // live re-read watcher. The startup state is recorded via a single
@@ -771,13 +781,7 @@ async fn run_tui_session(continue_session: bool) -> ExitCode {
     ));
     let tui_state = state.clone();
     let tui_result = tokio::task::spawn_blocking(move || {
-        run_tui(
-            tui_state,
-            pane_controller,
-            config,
-            keybindings,
-            continue_session,
-        )
+        run_tui(tui_state, pane_controller, config, keybindings)
     })
     .await;
 
@@ -864,12 +868,7 @@ fn spawn_event_subscriber(
 /// `ssh -t` to run the deck TUI on the remote in M2.8 external-daemon
 /// mode. The laptop process blocks until ssh exits and propagates the
 /// exit code.
-///
-/// `_continue_session` is accepted to keep the `Commands::Connect` call shape
-/// stable but is intentionally ignored — it applies to a laptop-side TUI that
-/// no longer exists in this flow. See `connect::run_connect`'s doc comment for
-/// the rationale.
-fn run_connect(_continue_session: bool, name: Option<String>) -> ExitCode {
+fn run_connect(name: Option<String>) -> ExitCode {
     let registry_path = dot_agent_deck::remote::default_remotes_path();
 
     let entry = match name {

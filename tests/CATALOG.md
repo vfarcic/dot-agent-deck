@@ -1331,6 +1331,13 @@ without depending on the config struct API.
 - **Does not assert:** which other panes survive (deterministic from the file order).
 - **Platform coverage:** mac+linux.
 
+##### session/restore/005 — Daemon-with-agents wins over the disk snapshot; snapshot restore is skipped (PRD #89 Phase 2 M2.2).
+- **Layer:** pure-data (in-crate integration test on `ui::should_apply_snapshot` over `AppState.managed_pane_ids`; no TUI harness, runs in the fast tier).
+- **Agent:** none.
+- **Asserts:** with no hydrated managed panes `should_apply_snapshot` returns `true` (daemon empty → apply the disk snapshot); after one or more hydrated `managed_pane_id`s are registered it returns `false` (daemon owns the workspace → skip the snapshot so panes are not double-restored). Pins the M2.2 precedence as a structural decision, not a flag.
+- **Does not assert:** the end-to-end cross-deck PTY hydration path (would need a daemon pre-seeded with an agent that a fresh deck hydrates — a harness primitive not yet built); the snapshot-apply mechanics themselves (covered by `session/restore/001`).
+- **Platform coverage:** mac+linux+windows.
+
 ##### session/restore/006 — Empty daemon + no snapshot + no flag lands on a clean empty dashboard (PRD #89 Phase 2).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path with no file staged).
 - **Agent:** none.

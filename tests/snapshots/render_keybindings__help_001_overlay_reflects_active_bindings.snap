@@ -37,8 +37,8 @@ expression: text
         │  F1                 Toggle this help                                                                │         
         │                                                     Session                                         │         
         │                                                                                                     │         
-        │                                                     Panes auto-saved on exit.                       │         
-        │                                                     Restore: dot-agent-deck --continue              │         
+        │                                                     Panes auto-saved continuously.                  │         
+        │                                                     Restored automatically on launch.               │         
         │  [Close]                                                                                            │         
         │  Press ? or Esc to close                                                                            │         
         └─────────────────────────────────────────────────────────────────────────────────────────────────────┘

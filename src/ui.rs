@@ -5521,12 +5521,30 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
     ui.session_coalescer.record_write(now);
 }
 
+/// PRD #89 M2.2 — daemon-vs-snapshot restore precedence seam.
+///
+/// Returns `true` when the on-disk saved-session snapshot should be applied on
+/// startup, `false` when it must be skipped. On every startup the TUI hydrates
+/// from the daemon first; if that produced *any* managed pane (any
+/// `managed_pane_id` registered in `state`), the daemon already owns the live
+/// workspace and wins — restoring the snapshot on top of it would double up the
+/// panes. Only when hydration produced zero panes (a fresh daemon, or crash
+/// recovery into an empty registry) do we fall back to the disk snapshot. When
+/// both sources are empty, the snapshot load is attempted but yields nothing and
+/// the dashboard lands empty.
+///
+/// The decision is purely *structural* — the presence or absence of hydrated
+/// managed panes — never a flag, which keeps it a pure function that can be
+/// unit-tested in isolation (see `session/restore/005`).
+pub fn should_apply_snapshot(state: &AppState) -> bool {
+    state.managed_pane_ids.is_empty()
+}
+
 pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
     config: DashboardConfig,
     keybindings: KeybindingConfig,
-    continue_session: bool,
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -5559,13 +5577,13 @@ pub fn run_tui(
     }
 
     // PRD #111: preferred landing tab after both the hydration block and the
-    // `--continue` reconnect block have run. Defaults to dashboard (0); the
+    // snapshot-restore block have run. Defaults to dashboard (0); the
     // hydration block overwrites this to the first rebuilt orchestration tab
     // when one exists. Hoisted out of the embedded-pane scope so the
-    // `continue_session` block below can honour it instead of unconditionally
+    // snapshot-restore block below can honour it instead of unconditionally
     // snapping back to the dashboard — without the hoist, the second
-    // `switch_to(0)` in the reconnect path would undo the orchestration
-    // landing on every `--continue` reconnect.
+    // `switch_to(0)` in the restore path would undo the orchestration
+    // landing on every startup.
     let mut preferred_start_tab: usize = 0;
 
     // PRD #76 M2.x / M2.11: in external-daemon mode the daemon may already
@@ -5950,8 +5968,8 @@ pub fn run_tui(
         // failed — fall back to the dashboard so the user gets the
         // overview first (pre-PRD-111 behaviour). The chosen index is
         // also recorded in `preferred_start_tab` so the
-        // `continue_session` block below doesn't snap back to the
-        // dashboard on `--continue` reconnects (CodeRabbit PR #114).
+        // snapshot-restore block below doesn't snap back to the
+        // dashboard on startup (CodeRabbit PR #114).
         preferred_start_tab = first_orchestration_tab_index.unwrap_or(0);
         tab_manager.switch_to(preferred_start_tab);
 
@@ -5963,7 +5981,15 @@ pub fn run_tui(
         // is shown at the wrong dims.
     }
 
-    if continue_session {
+    // PRD #89 M2.1/M2.2: restore is now UNCONDITIONAL — there is no `--continue`
+    // gate. Daemon hydration (above) runs first and wins: if it produced any
+    // managed pane, the daemon already owns the workspace and we skip the disk
+    // snapshot to avoid double-restoring. Only when hydration produced zero
+    // panes (fresh daemon / crash recovery) do we load and apply the snapshot.
+    // The precedence decision lives in the pure `should_apply_snapshot` seam so
+    // it stays structural (any hydrated managed_pane_id) rather than flag-driven.
+    let apply_snapshot = should_apply_snapshot(&state.blocking_read());
+    if apply_snapshot {
         // Ensure the terminal has up-to-date dimensions before we resize
         // any PTYs — without this, get_frame().area() may return stale or
         // default values because no draw() call has happened yet.
@@ -6315,12 +6341,10 @@ pub fn run_tui(
         }
         // PRD #111 / CodeRabbit PR #114: land on the orchestration tab
         // chosen by the hydration block above (if any) instead of always
-        // snapping back to the dashboard. Without the hoist, an
-        // unconditional `switch_to(0)` here would undo the M3 fix for
-        // users who reconnect with `--continue`. `preferred_start_tab`
-        // defaults to 0 (dashboard) when the hydration block didn't run
-        // or didn't rebuild any orchestration tab, preserving the prior
-        // overview-first behaviour for non-orchestration sessions.
+        // snapping back to the dashboard. `preferred_start_tab` defaults to
+        // 0 (dashboard) — and stays there in this snapshot-restore branch,
+        // which only runs when hydration produced no panes — preserving the
+        // overview-first landing for snapshot-restored sessions.
         tab_manager.switch_to(preferred_start_tab);
 
         // Focus the first restored pane and enter PaneInput mode so the user
@@ -7703,7 +7727,7 @@ pub fn run_tui(
         } // end inner event-drain loop
     }
 
-    // Snapshot the session for --continue restore *before* tearing down mode
+    // Snapshot the session for auto-restore *before* tearing down mode
     // tabs. The teardown loop unregisters every mode-tab pane id from
     // `state.managed_pane_ids`; if the snapshot ran after teardown, the
     // `retain` step would drop the mode-tab agent pane (which carries
@@ -9810,8 +9834,8 @@ fn render_help_overlay(
         Line::from(""),
         Line::styled("  Session", cyan),
         Line::from(""),
-        Line::from("  Panes auto-saved on exit."),
-        Line::from("  Restore: dot-agent-deck --continue"),
+        Line::from("  Panes auto-saved continuously."),
+        Line::from("  Restored automatically on launch."),
     ];
 
     if let Some(name) = active_mode_name {
