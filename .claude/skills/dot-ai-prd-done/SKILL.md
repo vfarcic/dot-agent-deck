@@ -303,8 +303,8 @@ Closes #[issue-id]
   - **Critical**: Security issues, breaking changes, test failures - MUST address before merge
   - **Important**: Code quality, maintainability, performance - SHOULD address for production readiness
   - **Optional**: Style preferences, minor optimizations - MAY address based on project standards
-- [ ] **Wait for ALL reviews to complete**: Do NOT merge if any reviews are pending or in progress, including:
-  - **Automated code reviews** (CodeRabbit, CodeQL, etc.) - Must wait until complete even if CI passes
+- [ ] **Wait for ACTIVE reviews to complete**: Do NOT merge while a review that is actually running is pending or in progress, including:
+  - **Automated code reviews** (e.g. CodeRabbit, CodeQL, Greptile) - wait until complete even if CI passes, BUT only for reviewers that actually run on THIS repo. A reviewer that posts no comment AND no pending/in-progress status within a bounded poll window (~5 minutes) is not active and MUST NOT block the merge — otherwise the wait hangs to its full timeout on every run. Consult the project's repo rules (e.g. `CLAUDE.md`) for which reviewers are active and how they report (some, like Greptile, post no "in progress" placeholder and appear only when done).
   - **Security analysis** - Must complete and pass
   - **CI/CD processes** - All builds and tests must pass
   - **Human reviews** - If requested reviewers haven't approved

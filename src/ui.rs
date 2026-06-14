@@ -5047,7 +5047,23 @@ fn dispatch_action(
                                     }
                                 }
                             } else {
-                                // No mode — regular dashboard pane.
+                                // No mode — regular dashboard card. The card lives on the Dashboard
+                                // (tab 0), so make the Dashboard active before focusing/selecting it —
+                                // otherwise, when launched from an orchestration/mode tab, the new card
+                                // lands on a tab the user isn't viewing. (Orchestration/mode creation
+                                // already switch to their own new tab via open_*_tab.)
+                                //
+                                // Capture the leaving tab's live focus before the switch, mirroring
+                                // the established switch-out invariant (every other production
+                                // `switch_to` — src/ui.rs:3059, 4074, 4625, and the
+                                // `switch_tab_with_focus` helper — is preceded by
+                                // `capture_focus_on_switch_out`). Without it, a card created from a
+                                // non-Dashboard tab never snapshots that tab's `focused_pane_id`, so
+                                // its prior focus goes stale and fails to restore on return. Safe
+                                // here: focus is still the leaving tab's pane at this point, and the
+                                // `pane.focus_pane(&new_id)` below then moves focus to the new card.
+                                tab_manager.capture_focus_on_switch_out();
+                                tab_manager.switch_to(0);
                                 let _ = pane.focus_pane(&new_id);
                                 ui.mode = UiMode::PaneInput;
                                 // PRD #113: the freshly-created card is active.
@@ -18468,5 +18484,379 @@ mod tests {
             ),
             _ => panic!("expected an Orchestration tab to be active after SpawnPane"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #154 — a single-agent dashboard CARD (no mode, no orchestration)
+    // belongs to the Dashboard (tab 0). Creating one from a non-Dashboard tab
+    // must switch the active tab back to the Dashboard so the new card isn't
+    // stranded on a tab the user isn't viewing. See tabs/spawn/001-003.
+    // -----------------------------------------------------------------------
+
+    /// Build the `Action::SpawnPane` request for a *plain single-agent card* —
+    /// no mode, no orchestration — i.e. the exact shape the new-pane form
+    /// produces for the "regular dashboard pane" branch under test (PRD #154).
+    fn plain_card_request(dir: &str) -> NewPaneRequest {
+        NewPaneRequest {
+            dir: std::path::PathBuf::from(dir),
+            name: "card".to_string(),
+            command: "echo hi".to_string(),
+            mode_config: None,
+            orchestration_config: None,
+            seed_prompt: None,
+        }
+    }
+
+    /// The pane id OpenTabPC most recently handed out (its `mock-pane-{n}`
+    /// counter minus one) — the brand-new card's pane, since the dashboard
+    /// branch creates exactly one pane and focuses it last.
+    fn last_created_pane(pc: &OpenTabPC) -> String {
+        format!("mock-pane-{}", *pc.next.lock().unwrap() - 1)
+    }
+
+    /// Scenario: Open a REAL orchestration tab and leave it active (the
+    /// "launched from a non-Dashboard tab" precondition), then dispatch the
+    /// single-agent-card `Action::SpawnPane` (no mode, no orchestration). The
+    /// card belongs to the Dashboard (tab 0), so afterward the active tab must
+    /// be the Dashboard with the new card selected and its pane focused — not
+    /// left stranded on the orchestration tab the user launched from (PRD #154).
+    #[spec("tabs/spawn/001")]
+    #[test]
+    fn spawn_001_card_from_orchestration_lands_on_dashboard() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (orch_idx, _role_ids) = tab_manager
+            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .expect("open a real orchestration tab");
+        // open_orchestration_tab leaves the orchestration tab active — this is
+        // exactly the "launched from a non-Dashboard tab" precondition.
+        assert_eq!(
+            tab_manager.active_index(),
+            orch_idx,
+            "precondition: the orchestration tab is active before the card spawn"
+        );
+        assert_ne!(
+            orch_idx, 0,
+            "precondition: the orchestration tab is not the Dashboard"
+        );
+
+        let snapshot = dashboard_snapshot(2);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(plain_card_request("/work/card"))),
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            Rect::new(0, 0, 80, 24),
+        );
+
+        assert_eq!(
+            tab_manager.active_index(),
+            0,
+            "a single-agent card belongs to the Dashboard (tab 0): the active tab \
+             must switch back to the Dashboard, not stay on the orchestration tab"
+        );
+        assert_eq!(
+            ui.selected_index,
+            Some(filtered.len()),
+            "the new card must be the active selection on the Dashboard"
+        );
+        let new_card = last_created_pane(&pc);
+        assert_eq!(
+            pc.focused.lock().unwrap().last().map(String::as_str),
+            Some(new_card.as_str()),
+            "the new card's pane must be focused after the spawn"
+        );
+    }
+
+    /// Scenario: Open a REAL mode tab and leave it active, then dispatch the
+    /// single-agent-card `Action::SpawnPane` (no mode, no orchestration).
+    /// Afterward the active tab must be the Dashboard (tab 0) with the new card
+    /// selected and focused — the card must not land on the mode tab the user
+    /// launched from (PRD #154; same rule as the orchestration case).
+    #[spec("tabs/spawn/002")]
+    #[test]
+    fn spawn_002_card_from_mode_lands_on_dashboard() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        tab_manager
+            .open_mode_tab(
+                &mode_config_local("m", 1),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open a real mode tab");
+        // open_mode_tab leaves the mode tab active — the non-Dashboard launch
+        // precondition.
+        assert_ne!(
+            tab_manager.active_index(),
+            0,
+            "precondition: the mode tab is active (not the Dashboard) before the spawn"
+        );
+
+        let snapshot = dashboard_snapshot(3);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(plain_card_request("/work/card"))),
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            Rect::new(0, 0, 80, 24),
+        );
+
+        assert_eq!(
+            tab_manager.active_index(),
+            0,
+            "a single-agent card belongs to the Dashboard (tab 0): the active tab \
+             must switch back to the Dashboard, not stay on the mode tab"
+        );
+        assert_eq!(
+            ui.selected_index,
+            Some(filtered.len()),
+            "the new card must be the active selection on the Dashboard"
+        );
+        let new_card = last_created_pane(&pc);
+        assert_eq!(
+            pc.focused.lock().unwrap().last().map(String::as_str),
+            Some(new_card.as_str()),
+            "the new card's pane must be focused after the spawn"
+        );
+    }
+
+    /// Scenario: With only the Dashboard tab present (already active), dispatch
+    /// the single-agent-card `Action::SpawnPane`. This is the no-regression
+    /// guard: the active tab must stay on the Dashboard (tab 0) and the new
+    /// card must still be selected and focused (PRD #154). Expected to pass
+    /// even pre-fix — it pins that the tab switch never moves off the Dashboard.
+    #[spec("tabs/spawn/003")]
+    #[test]
+    fn spawn_003_card_from_dashboard_stays_on_dashboard() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        // A fresh TabManager has only the Dashboard, already active.
+        assert_eq!(
+            tab_manager.active_index(),
+            0,
+            "precondition: the Dashboard is the active tab"
+        );
+
+        let snapshot = dashboard_snapshot(2);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(plain_card_request("/work/card"))),
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            Rect::new(0, 0, 80, 24),
+        );
+
+        assert_eq!(
+            tab_manager.active_index(),
+            0,
+            "creating a card while already on the Dashboard must leave the \
+             Dashboard active (no regression)"
+        );
+        assert_eq!(
+            ui.selected_index,
+            Some(filtered.len()),
+            "the new card must be the active selection on the Dashboard"
+        );
+        let new_card = last_created_pane(&pc);
+        assert_eq!(
+            pc.focused.lock().unwrap().last().map(String::as_str),
+            Some(new_card.as_str()),
+            "the new card's pane must be focused after the spawn"
+        );
+    }
+
+    /// Pane controller like `OpenTabPC` (unique `mock-pane-N` ids, records every
+    /// `focus_pane`) but it ALSO reports the last-focused pane back through
+    /// `focused_pane_id()` — the live process-wide focus a real controller
+    /// exposes. `OpenTabPC` leaves `focused_pane_id()` at the trait default
+    /// (`None`), which makes `TabManager::capture_focus_on_switch_out` a no-op
+    /// (it returns early on `None`), so it can't exercise the switch-out focus
+    /// capture under test in `tabs/spawn/004`. This mock can.
+    struct FocusEchoPC {
+        next: std::sync::Mutex<u32>,
+        focused: std::sync::Mutex<Vec<String>>,
+    }
+    impl FocusEchoPC {
+        fn new() -> Self {
+            Self {
+                next: std::sync::Mutex::new(0),
+                focused: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl crate::pane::PaneController for FocusEchoPC {
+        fn create_pane(
+            &self,
+            _cmd: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<String, crate::pane::PaneError> {
+            let mut n = self.next.lock().unwrap();
+            let id = format!("mock-pane-{n}");
+            *n += 1;
+            Ok(id)
+        }
+        fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn rename_pane(
+            &self,
+            _id: &str,
+            name: &str,
+        ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+            Ok(crate::pane::RenameOutcome::applied(name))
+        }
+        fn focus_pane(&self, id: &str) -> Result<(), crate::pane::PaneError> {
+            self.focused.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+        /// Echo the last `focus_pane` target as the live focused pane — the
+        /// signal `capture_focus_on_switch_out` reads on the way out of a tab.
+        fn focused_pane_id(&self) -> Option<String> {
+            self.focused.lock().unwrap().last().cloned()
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "focus-echo-mock"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Scenario: Open a REAL Mode tab, focus one of its side panes, then create
+    /// a single-agent card from that Mode tab (the plain-card `Action::SpawnPane`
+    /// that switches to the Dashboard). Switch back to the Mode tab and restore
+    /// its focus: the side pane that was focused at create-time must be
+    /// re-focused. Without `capture_focus_on_switch_out()` before the
+    /// switch-to-Dashboard, the Mode tab's `focused_pane_id` is never captured,
+    /// so restore falls back to the agent pane and the user's prior focus is
+    /// lost (PRD #154 follow-up; mirrors the round-trip in `tabs/selection/002`).
+    #[spec("tabs/spawn/004")]
+    #[test]
+    fn spawn_004_card_from_mode_preserves_mode_focus_on_return() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (mode_idx, side_ids) = tab_manager
+            .open_mode_tab(
+                &mode_config_local("m", 2),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open a real mode tab");
+        // open_mode_tab leaves the mode tab active — the non-Dashboard launch
+        // precondition.
+        assert_eq!(
+            tab_manager.active_index(),
+            mode_idx,
+            "precondition: the mode tab is active before the spawn"
+        );
+        assert!(
+            side_ids.len() >= 2,
+            "precondition: the mode tab has at least two managed side panes"
+        );
+
+        // The user focuses a specific (non-default) side pane on the mode tab —
+        // this is the live focus that must survive the round-trip.
+        let target = side_ids[1].clone();
+        pc.focus_pane(&target).unwrap();
+
+        let snapshot = dashboard_snapshot(2);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(plain_card_request("/work/card"))),
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            Rect::new(0, 0, 80, 24),
+        );
+
+        // The card spawn switched the active tab to the Dashboard (tabs/spawn/002)
+        // — i.e. we genuinely LEFT the mode tab, which is what should have
+        // captured its focus.
+        assert_eq!(
+            tab_manager.active_index(),
+            0,
+            "the single-agent card spawn must switch to the Dashboard (so the \
+             mode tab is left behind)"
+        );
+
+        // Return to the mode tab and restore its remembered focus.
+        assert!(tab_manager.switch_to(mode_idx));
+        tab_manager.restore_focus_on_switch_in();
+
+        assert_eq!(
+            pc.focused.lock().unwrap().last().map(String::as_str),
+            Some(target.as_str()),
+            "switching back to the mode tab must restore the side pane that was \
+             focused when the card was created; without \
+             `capture_focus_on_switch_out()` before the switch-to-Dashboard, the \
+             mode tab's focused_pane_id was never captured, so restore falls back \
+             to the agent pane (`agent-m`) and the user's prior focus is lost"
+        );
     }
 }
