@@ -731,6 +731,36 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** rendering; this drives the `TabManager` capture/restore path directly.
 - **Platform coverage:** mac+linux+windows.
 
+#### tabs/spawn
+
+##### tabs/spawn/001 — Creating a single-agent card while an Orchestration tab is active switches the active tab back to the Dashboard with the new card selected and focused (PRD #154).
+- **Layer:** L1 (in-process — open a REAL Orchestration tab via `TabManager::open_orchestration_tab`, then dispatch the real `Action::SpawnPane` for a plain single-agent card through `dispatch_action` against a recording `OpenTabPC`; no daemon, no PTY).
+- **Agent:** none (mock `PaneController` hands out `mock-pane-N` ids and records `focus_pane` calls).
+- **Asserts:** with the orchestration tab active (the non-Dashboard launch precondition), dispatching the no-mode/no-orchestration `SpawnPane` leaves `tab_manager.active_index() == 0` (the Dashboard), sets `ui.selected_index` to the new card's index (`filtered.len()`), and focuses the freshly-created card pane (last `focus_pane` target). A single-agent card belongs to the Dashboard (tab 0), so it must not be stranded on the orchestration tab.
+- **Does not assert:** how the highlight is drawn (covered by `dashboard/selection/010`); orchestration/mode tab creation switching to their OWN tab (`open_*_tab` paths, unchanged by PRD #154).
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/spawn/002 — Creating a single-agent card while a Mode tab is active switches the active tab back to the Dashboard with the new card selected and focused (PRD #154).
+- **Layer:** L1 (in-process — open a REAL Mode tab via `TabManager::open_mode_tab`, then dispatch the real plain-card `Action::SpawnPane` through `dispatch_action` against a recording `OpenTabPC`; no daemon, no PTY).
+- **Agent:** none (mock `PaneController`).
+- **Asserts:** with the mode tab active, dispatching the no-mode/no-orchestration `SpawnPane` leaves `tab_manager.active_index() == 0` (the Dashboard), sets `ui.selected_index` to the new card's index, and focuses the new card pane — same "a card always lands on the Dashboard" rule as the orchestration case.
+- **Does not assert:** mode-tab geometry / side-pane layout (covered by `tabs/mode/001`); the spawned agent's command behavior.
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/spawn/003 — Creating a single-agent card while already on the Dashboard leaves the Dashboard active with the new card selected and focused (no-regression guard, PRD #154).
+- **Layer:** L1 (in-process — dispatch the real plain-card `Action::SpawnPane` through `dispatch_action` against a recording `OpenTabPC` with only the Dashboard tab present).
+- **Agent:** none (mock `PaneController`).
+- **Asserts:** with the Dashboard already active, dispatching the plain-card `SpawnPane` keeps `tab_manager.active_index() == 0`, sets `ui.selected_index` to the new card's index, and focuses the new card pane. Bounds the `tabs/spawn/001`/`002` switch-to-Dashboard fix so it never moves the active tab off the Dashboard in the common case (Ctrl+N from the Dashboard).
+- **Does not assert:** the non-Dashboard launch paths (covered by `tabs/spawn/001`/`002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/spawn/004 — Creating a single-agent card from a Mode tab captures that tab's focused side pane, so it is restored when the user returns to it (PRD #154 follow-up).
+- **Layer:** L1 (in-process — open a REAL Mode tab via `TabManager::open_mode_tab`, focus a side pane, dispatch the real plain-card `Action::SpawnPane` through `dispatch_action`, then `switch_to` the Mode tab and `restore_focus_on_switch_in` against a focus-echoing mock; no daemon, no PTY).
+- **Agent:** none (mock `PaneController` that, unlike `OpenTabPC`, reports the last `focus_pane` target back through `focused_pane_id()` so the switch-out capture has a live focus to read).
+- **Asserts:** after focusing side pane #2 on a Mode tab and creating a single-agent card (which switches to the Dashboard), returning to the Mode tab restores that exact side pane via `focus_pane`. Pins that the plain-card spawn calls `capture_focus_on_switch_out()` before leaving the Mode tab; without it the Mode tab's `focused_pane_id` is never captured and restore falls back to the agent pane (`agent-m`), losing the user's prior focus. (Mode is the genuine regression surface: `sync_and_derive_selection` returns `None` for Mode tabs and never refreshes `focused_pane_id`, unlike the Orchestration branch whose per-frame derive keeps `focused_role_pane_id` fresh regardless of the capture.)
+- **Does not assert:** the Orchestration-tab variant (masked by the per-frame `focused_role_pane_id` derive — not a faithful regression surface); the new card's own selection/focus on the Dashboard (covered by `tabs/spawn/002`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Embedded pane attach
 
 #### embed/attach
