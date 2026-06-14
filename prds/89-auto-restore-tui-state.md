@@ -29,7 +29,7 @@ Unify the restore model across local and remote into a single behavior:
 - **On every TUI startup**, attempt daemon hydration first. If the daemon has agents, that wins. If the daemon is empty (fresh spawn or crash recovery), fall back to the disk snapshot and recreate the workspace.
 - **Keep the snapshot fresh.** Write it on detach and on every meaningful TUI state change (new pane, rename, mode tab open/close, agent stop/restart, orchestration changes) — not only at clean quit.
 - **Delete the `--continue` flag.** With auto-restore as the default, there is no decision left for the user to express via a flag.
-- **Provide a "fresh start" escape hatch.** Per-deck removal for remote (existing `remove` flow clears that deck's saved state); a small CLI affordance for the local snapshot.
+- **Provide a "fresh start" escape hatch.** The snapshot is a single global file, so one CLI affordance covers it: `dot-agent-deck snapshot clear` deletes the global snapshot. (`dot-agent-deck remote remove <name>` is registry-only and does not touch it — see the 2026-06-14 escape-hatch Design Decision.)
 
 As a side effect, daemon crash recovery is "free": a respawned-empty daemon triggers the same snapshot fallback path as a first-time launch on a machine with prior state.
 
@@ -43,7 +43,7 @@ As a side effect, daemon crash recovery is "free": a respawned-empty daemon trig
   - *Daemon-hydration path (warm daemon):* PRD #76 M2.12 + PRD #111 already hydrate orchestration tabs from the daemon registry. **Verify** this covers orchestrator+role panes, prompts, role order, and `start_role_index` end-to-end; if hydration is already complete, no new capture work is needed for the warm-daemon case — only a regression test asserting it.
   - *Snapshot-fallback path (daemon empty — fresh machine or crash recovery):* the disk snapshot must carry enough orchestration metadata to rebuild the tab when the daemon has nothing to hydrate from. This is where the old #74 schema work (orchestration metadata on the saved pane: role order, `orchestrator_prompt`, resolved config name+project for re-resolution, `start_role_index`, a `version` field) genuinely re-homes. On config drift (config deleted, orchestration renamed, role removed) surface a clear `session_warnings` message and fall back to a plain dashboard pane rather than a half-broken tab.
 - **Delete the `--continue` flag.** Remove the CLI argument, the `continue_session` plumbing, and the conditional in `src/ui.rs:2748`. The saved-session-load path becomes unconditional (gated only on whether the daemon was empty).
-- **Fresh-start escape hatch.** For remote: confirm `dot-agent-deck remove <name>` clears the deck's saved state (or add the wiring if it doesn't). For local: add `dot-agent-deck reset` (or equivalent — exact CLI shape is a Design Decision) that deletes the local snapshot.
+- **Fresh-start escape hatch.** The saved snapshot is a single global file, not per-deck (see the 2026-06-14 escape-hatch Design Decision), so there is exactly one fresh-start action: `dot-agent-deck snapshot clear`, which deletes the global snapshot via `config::SavedSession::clear()`. `dot-agent-deck remote remove <name>` stays registry-only and intentionally does NOT touch the snapshot.
 - **Backward-compat consideration.** This changes the meaning of `dot-agent-deck` (no flag) from "empty session" to "restore last setup." Document as a deliberate breaking change in the changelog.
 - **Tests.** Snapshot is written on each in-scope state change; auto-restore prefers daemon over snapshot; empty daemon + non-empty snapshot recreates the workspace; empty daemon + empty snapshot lands at empty dashboard cleanly.
 - **Documentation.** Update `docs/` to reflect the new restore behavior, remove all references to `--continue`, document the fresh-start escape hatch.
@@ -61,7 +61,7 @@ As a side effect, daemon crash recovery is "free": a respawned-empty daemon trig
 - `dot-agent-deck connect <name>` (remote, no flag) attaches to the daemon and restores any hydrated agents; if the daemon is empty (fresh spawn, crash recovery), falls back to the snapshot and recreates the workspace.
 - After a daemon crash and reconnect, the TUI ends up with the same panes/tabs the user had before the crash (modulo in-flight state). Agent processes are respawned fresh; each agent's own conversation state is restored by the agent's own command line (e.g., `claude --continue`).
 - `--continue` is removed from the CLI surface and from `--help`. Existing users of `--continue` get a clear deprecation/removal message if they try to use it.
-- A user who wants a fresh start has one obvious action: remove the deck (remote) or run the local reset command (local). Both clear the snapshot.
+- A user who wants a fresh start has one obvious action: `dot-agent-deck snapshot clear`, which deletes the single global saved-session snapshot. (The snapshot is global, not per-deck; `dot-agent-deck remote remove <name>` is registry-only and intentionally does NOT clear it.)
 - Snapshot writes are coalesced so they don't impact TUI responsiveness during heavy interaction.
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` all pass.
 
@@ -101,9 +101,9 @@ As a side effect, daemon crash recovery is "free": a respawned-empty daemon trig
 
 ### Phase 4: Fresh-start escape hatch
 
-- [ ] **M4.1** — Confirm that `dot-agent-deck remove <name>` already clears that deck's saved state. If it doesn't, add the wiring.
-- [ ] **M4.2** — Add a `dot-agent-deck reset` (or `--reset`, or equivalent) subcommand that deletes the local snapshot. Exact CLI shape is a Design Decision; pick during implementation. Confirm with the deck-removal symmetry (one obvious action, no overlap).
-- [ ] **M4.3** — Tests for both escape hatches.
+- [ ] **M4.1** — *Resolved (see the 2026-06-14 escape-hatch Design Decision below).* Investigation found the saved snapshot is a **single global file** (`config::session_path()` → `DOT_AGENT_DECK_SESSION` or `~/.config/dot-agent-deck/session.toml`), not keyed per deck — there is no per-deck saved state on disk. There is also no top-level `dot-agent-deck remove`; the real command is `dot-agent-deck remote remove <name>`, which mutates only the local registry (`remotes.toml`). Decision (Option 1): `remote remove` stays **registry-only and intentionally does NOT clear the snapshot**. The one obvious global fresh-start action is `dot-agent-deck snapshot clear` (M4.2) — so there is no per-deck wiring to add.
+- [ ] **M4.2** — Add a `dot-agent-deck snapshot clear` subcommand — a `snapshot` subcommand **group** (room for future snapshot actions) with a `clear` **action** — that deletes the local snapshot by calling `config::SavedSession::clear()` (the same teardown clear, so it honors the `DOT_AGENT_DECK_SESSION` override). Ships visible by default (no experimental feature flag). Exact CLI shape resolved as a Design Decision (`snapshot clear`, not `reset`/`--reset`).
+- [ ] **M4.3** — Tests for the escape hatch: `snapshot clear` deletes the local snapshot and exits 0 (`session/snapshot/001`); and a green-guard that `remote remove <name>` leaves the global snapshot intact (`session/snapshot/002`).
 
 ### Phase 5: Documentation + release
 
@@ -141,9 +141,9 @@ Considered "make the daemon's registry survive its own crash" as a complementary
 
 Removing `--continue` and making restore the default flips the meaning of plain `dot-agent-deck` from "empty session" to "restore last setup." This is a deliberate breaking change. Justification: restoring is the common case; starting fresh is rare. The current CLI optimizes for the rare case. New users are better served by the new default; existing users get a one-line changelog migration. Worth it.
 
-### Open: shape of the local "fresh start" command
+### ~~Open: shape of the local "fresh start" command~~ — RESOLVED 2026-06-14
 
-The remote case is clear: `dot-agent-deck remove <name>` already removes the deck and (per M4.1) clears its snapshot. The local case needs an analogous action. Options: `dot-agent-deck reset`, `dot-agent-deck --reset`, `dot-agent-deck snapshot clear`, or a TUI affordance ("Quit and clear saved state" in the quit-confirm dialog). Decide during M4.2 implementation.
+The local case needed an analogous action to deck removal. Options considered: `dot-agent-deck reset`, `dot-agent-deck --reset`, `dot-agent-deck snapshot clear`, or a TUI affordance ("Quit and clear saved state" in the quit-confirm dialog). **Resolved** in favour of `dot-agent-deck snapshot clear` — see the 2026-06-14 escape-hatch Design Decision below for the full rationale (the snapshot turned out to be a single global file, which reshaped the whole escape-hatch model).
 
 ### 2026-06-14: Refresh against the shipped daemon architecture (#76 shipped, #93 unified local+remote)
 
@@ -187,3 +187,17 @@ The remote case is clear: `dot-agent-deck remove <name>` already removes the dec
 **Coalescing.** `mark_session_dirty` only sets a dirty flag on a `config::SnapshotCoalescer` (a pure-data leading-edge throttle, unit-tested as `session/save/003`). The main loop calls `flush_session_snapshot_if_due` once per iteration (including the 16ms idle ticks): the first pending change writes immediately, further changes are throttled to at most one write per `SNAPSHOT_COALESCE_INTERVAL` (750 ms), and a single trailing write flushes whatever accumulated during the quiet-down. A burst (e.g. orchestration setup spawning many panes) therefore collapses to one or two disk writes, not one per pane.
 
 **Owner.** Viktor (Phase 1 implementation, 2026-06-14).
+
+### 2026-06-14: Phase 4 escape-hatch — the snapshot is global, so `snapshot clear` is the single fresh-start action and `remote remove` stays registry-only
+
+**Decision (Option 1, chosen by Viktor).** There is exactly one local fresh-start action — `dot-agent-deck snapshot clear` — and `dot-agent-deck remote remove <name>` intentionally does NOT clear the snapshot.
+
+**Finding that reshaped M4.1/M4.2.** The PRD was drafted assuming a *per-deck* saved state that `dot-agent-deck remove <name>` would clear. Investigation during Phase 4 found two things that invalidate that framing: (1) the saved snapshot is a **single global file** — `config::session_path()` resolves to `DOT_AGENT_DECK_SESSION` or `~/.config/dot-agent-deck/session.toml`, not keyed per deck/remote — so there is no per-deck saved state on disk to clear; and (2) there is no top-level `dot-agent-deck remove` command at all — the real command is `dot-agent-deck remote remove <name>` (`RemoteCmd::Remove`), which mutates only the local registry (`remotes.toml`) and never references `SavedSession`.
+
+**Why Option 1 (remove stays registry-only).** Because the snapshot is global and shared with the local deck, wiring `remote remove` to call `SavedSession::clear()` would clear the *local* workspace as a side effect of removing an *unrelated remote* registry entry — surprising cross-deck coupling. Keeping `remote remove` registry-only preserves the principle of least surprise: removing a remote touches only remote metadata. The fresh-start need is then served by one explicit, obvious global action rather than smeared across the remove flow.
+
+**Shape.** `snapshot` is a subcommand **group** (parallel to `remote`/`schedule`) with a `clear` **action**, leaving room for future snapshot operations (e.g. `snapshot show`, `snapshot export`). `clear` calls `config::SavedSession::clear()` — the same teardown clear the TUI already uses — so it honors the `DOT_AGENT_DECK_SESSION` override and deletes the one global file. Ships visible by default; **no experimental feature flag** (decided in `.dot-agent-deck/prd-89-context.md`).
+
+**Test impact.** `session/snapshot/001` asserts `snapshot clear` exits 0 and deletes the staged snapshot. `session/snapshot/002` flips from "remove deletes the snapshot" to a **green-guard** asserting `remote remove <name>` leaves the global snapshot intact.
+
+**Owner.** Viktor (decided 2026-06-14).

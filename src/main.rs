@@ -130,6 +130,14 @@ enum Commands {
         #[command(subcommand)]
         action: ScheduleAction,
     },
+    /// Manage the local saved-session snapshot (PRD #89). Auto-restore reads
+    /// this on-disk snapshot on every TUI startup; this group is the local
+    /// fresh-start escape hatch. A subcommand group (not a bare flag) so future
+    /// snapshot operations can be added without changing the surface.
+    Snapshot {
+        #[command(subcommand)]
+        cmd: SnapshotCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -293,6 +301,16 @@ enum RemoteCmd {
         #[arg(long = "no-install")]
         no_install: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// Delete the local saved-session snapshot. With auto-restore on by
+    /// default (PRD #89), this is the one obvious "start fresh" action for the
+    /// local deck: the next `dot-agent-deck` startup begins from an empty
+    /// dashboard instead of restoring the previous workspace. Registry-only
+    /// `remote remove` intentionally does NOT touch this global snapshot.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -592,6 +610,24 @@ fn main() -> ExitCode {
         },
         Some(Commands::Connect { name }) => run_connect(name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
+        Some(Commands::Snapshot { cmd }) => match cmd {
+            // PRD #89 M4.2 — local fresh-start escape hatch. Reuses the same
+            // `SavedSession::clear()` the TUI calls at teardown, so it honors
+            // the `DOT_AGENT_DECK_SESSION` override and deletes the one global
+            // snapshot at `config::session_path()`.
+            SnapshotCmd::Clear => match dot_agent_deck::config::SavedSession::clear() {
+                Ok(()) => {
+                    println!(
+                        "Cleared the local saved-session snapshot. The next `dot-agent-deck` startup will begin from an empty dashboard."
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("Failed to clear the saved-session snapshot: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+        },
         Some(Commands::Validate { path }) => {
             use dot_agent_deck::config_validation::{has_errors, validate_config};
             use dot_agent_deck::project_config::load_project_config;
