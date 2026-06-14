@@ -873,7 +873,43 @@ struct PendingSeedPrompt {
 
 struct UiState {
     mode: UiMode,
-    selected_index: usize,
+    /// PRD #113: the Dashboard's selection is active/inactive. `Some(i)` paints
+    /// the blue highlight on flat card index `i`; `None` (set when the user
+    /// switches tabs away) means no card is highlighted, so the visual state
+    /// can't go stale relative to what's actually armed. The Orchestration tab
+    /// reuses this field but keeps its selection always active (`Some`).
+    selected_index: Option<usize>,
+    /// PRD #113 (PR #151 manual-test fix): the embedded controller's focused
+    /// pane id as of the previous `reconcile_dashboard_selection` frame. The
+    /// focused-pane sync (M4) reactivates the highlight only on a genuine focus
+    /// *transition* — when the focused pane CHANGED to a visible dashboard card
+    /// — not on a steady-state focus the tab-switch restore leaves in place
+    /// (e.g. a Mode tab's agent pane, which is a dashboard card and stays
+    /// focused on return). Without this, switching away and back re-armed the
+    /// highlight a tab switch had cleared (violating SC1).
+    last_focused_pane_id: Option<String>,
+    /// PRD #113 design revision (2026-06-13): the last *active* selection of the
+    /// CURRENTLY-ACTIVE deck, remembered across tab switches so Enter can RESTORE
+    /// it when the deck is inactive (no live highlight) instead of jumping to
+    /// card 0. This is a cache of `last_active_selection_by_deck`'s entry for the
+    /// active deck, refreshed on every deck switch-in (`switch_tab_with_focus`)
+    /// so the signature-frozen `dashboard_focus_target(&ui, total)` can read the
+    /// active deck's value without the tab. Kept SEPARATE from the live
+    /// `selected_index` / `selected_session_id` so the switch-in re-focus can't
+    /// auto-reactivate it — it is consumed ONLY on an explicit Enter.
+    last_active_selection: Option<usize>,
+    /// PRD #113 revision (PR #151 review #2): the remembered Enter-restore
+    /// selection PER DECK — the source of truth that `last_active_selection`
+    /// above caches. Keyed by deck identity (the single Dashboard, or a specific
+    /// Orchestration tab by its stable id, so multiple orchestrations each keep
+    /// their own remembered role). Recorded into the OUTGOING deck's entry on
+    /// leave and hoisted into the cache for the INCOMING deck on switch-in.
+    /// Storing per-deck stops one deck's armed index from leaking into another
+    /// deck's Enter-restore (the single shared field used to leak —
+    /// orchestration_005). Only ever stores a `Some`: leaving a deck while
+    /// inactive must not overwrite its entry (or a round-trip's return leg would
+    /// clobber the remembered value).
+    last_active_selection_by_deck: HashMap<DeckKey, usize>,
     filter_text: String,
     rename_text: String,
     display_names: HashMap<String, String>,
@@ -1100,7 +1136,17 @@ impl UiState {
     fn new(config: DashboardConfig, keybindings: KeybindingConfig) -> Self {
         Self {
             mode: UiMode::Normal,
-            selected_index: 0,
+            // PRD #113 M1: startup default is an ACTIVE selection on card 0 so
+            // first-launch UX is unchanged.
+            selected_index: Some(0),
+            last_focused_pane_id: None,
+            // PRD #113 revision: defaults to card 0 so first-launch Enter (before
+            // anything has been selected) targets the first card, unchanged.
+            last_active_selection: Some(0),
+            // Per-deck remembered selections; empty until a deck is left with an
+            // active highlight. The active deck's entry is hoisted into
+            // `last_active_selection` on switch-in.
+            last_active_selection_by_deck: HashMap::new(),
             filter_text: String::new(),
             rename_text: String::new(),
             display_names: HashMap::new(),
@@ -2666,7 +2712,8 @@ fn focus_deck(
     if idx >= filtered.len() {
         return false;
     }
-    ui.selected_index = idx;
+    // PRD #113 M3: a digit jump activates the highlight on the targeted card.
+    ui.selected_index = Some(idx);
     if let Some((sid, _)) = filtered.get(idx)
         && let Some(session) = snapshot.sessions.get(*sid)
     {
@@ -2736,13 +2783,14 @@ fn focus_deck(
 /// counterpart for the cycling keys. No-op when the index didn't
 /// change or the new selection lacks a `pane_id`.
 fn mirror_selection_into_focus(
-    prev_selected_index: usize,
+    prev_selected_index: Option<usize>,
     ui: &UiState,
     filtered: &[(&String, &SessionState)],
     pane: &dyn PaneController,
 ) {
     if ui.selected_index != prev_selected_index
-        && let Some((_, session)) = filtered.get(ui.selected_index)
+        && let Some(idx) = ui.selected_index
+        && let Some((_, session)) = filtered.get(idx)
         && let Some(pane_id) = session.pane_id.as_ref()
     {
         let _ = pane.focus_pane(pane_id);
@@ -2844,6 +2892,104 @@ pub fn sync_and_derive_selection(
     }
 }
 
+/// PRD #113 revision (PR #151 review #2): identity of a *deck* — a tab that
+/// carries a card selection (the Dashboard or an Orchestration). Used to key the
+/// per-deck remembered Enter-restore selection so one deck can't leak its armed
+/// index into another's restore. There is only ever one Dashboard, so it needs
+/// no id; each Orchestration tab is keyed by its stable [`TabId`] so multiple
+/// orchestrations each keep their own remembered role. `Mode` tabs are not decks.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum DeckKey {
+    Dashboard,
+    Orchestration(TabId),
+}
+
+/// The [`DeckKey`] for a tab, or `None` for a non-deck (`Mode`) tab.
+fn deck_key(tab: &Tab) -> Option<DeckKey> {
+    match tab {
+        Tab::Dashboard { .. } => Some(DeckKey::Dashboard),
+        Tab::Orchestration { id, .. } => Some(DeckKey::Orchestration(*id)),
+        Tab::Mode { .. } => None,
+    }
+}
+
+/// PRD #113 M3 — resolve the card index a *focus* action (Enter / double-click)
+/// should target on a deck (Dashboard or Orchestration — both route Enter here).
+/// When the selection is active the highlighted card is used; with no cards
+/// there is no target. Pure (no I/O), so it's unit-tested directly.
+///
+/// PRD #113 design revision (2026-06-13): when the deck is inactive (`None`,
+/// e.g. just after returning from another tab) Enter RESTORES the last *active*
+/// selection (`last_active_selection`) instead of jumping to card 0 — defaulting
+/// to card 0 only before anything was ever selected. The index is clamped to the
+/// current card count so a stale remembered index can't point past the list.
+fn dashboard_focus_target(ui: &UiState, total: usize) -> Option<usize> {
+    if total == 0 {
+        return None;
+    }
+    Some(match ui.selected_index {
+        Some(idx) => idx.min(total - 1),
+        None => ui.last_active_selection.unwrap_or(0).min(total - 1),
+    })
+}
+
+/// PRD #113 M2/M4 — reconcile the dashboard's *active* selection highlight with
+/// the focused pane each frame, replacing the bare `sync_and_derive_selection`
+/// call in the outer loop. The dashboard selection is now active/inactive
+/// (`UiState.selected_index: Option<usize>`): an inactive selection (`None`,
+/// set when the user switched tabs away) must stay inactive across frames so a
+/// card never *looks* selected when nothing is armed — UNLESS a focused pane
+/// *transitions* to a visible dashboard card, in which case the highlight
+/// reactivates on that card (M4 focused-pane sync). When the selection is
+/// already active, or for the Orchestration/Mode tabs (whose selection is
+/// separate, always-on state), the pre-existing `sync_and_derive_selection`
+/// derive is preserved.
+///
+/// PR #151 (manual-test fix): M4 reactivates only on a genuine focus
+/// TRANSITION — the focused pane id must have *changed* since the previous
+/// frame. The original code reactivated whenever the focused pane merely
+/// *mapped* to a card, which re-armed a just-cleared selection on tab return:
+/// a Mode tab's agent pane is a dashboard card (only its side panes are in
+/// `all_managed_pane_ids`, so the agent pane isn't filtered out), and switching
+/// to a Mode tab focuses that agent pane while the return to the Dashboard
+/// restores nothing — so the agent pane stays focused. That steady-state focus
+/// is not a transition, so it no longer reactivates the highlight. The cyan
+/// focus border (driven by the controller's focus, not this function) is
+/// unaffected. Orchestration role panes are already excluded from the card
+/// list, which is why that path never exhibited the bug.
+fn reconcile_dashboard_selection(
+    ui: &mut UiState,
+    tab: &mut Tab,
+    focused_pane_id: Option<&str>,
+    filtered: &[(&str, Option<&str>)],
+) {
+    // A genuine focus transition = the focused pane id changed since last frame.
+    // Record the current focus first so every frame (any tab) keeps the
+    // baseline fresh — otherwise a stale baseline would read a restored
+    // steady-state focus as a transition on the next dashboard frame.
+    let focus_changed = focused_pane_id != ui.last_focused_pane_id.as_deref();
+    ui.last_focused_pane_id = focused_pane_id.map(str::to_string);
+
+    // On a deck (Dashboard OR Orchestration — PRD #113 revision Change 1 makes
+    // the clearing symmetric), only reactivate an inactive selection when a
+    // focused pane TRANSITIONS to a visible card; otherwise leave it inactive so
+    // a tab-switch deactivation isn't undone by the per-frame sync (the restored
+    // steady-state focus is not a transition). The guard expression itself is
+    // unchanged from PR #151.
+    if let Tab::Dashboard { .. } | Tab::Orchestration { .. } = tab {
+        let focus_maps_to_card = focused_pane_id
+            .map(|fid| filtered.iter().any(|(_, pid)| *pid == Some(fid)))
+            .unwrap_or(false);
+        let focus_reactivates = focus_maps_to_card && focus_changed;
+        if ui.selected_index.is_none() && !focus_reactivates {
+            return;
+        }
+    }
+    if let Some(idx) = sync_and_derive_selection(tab, focused_pane_id, filtered) {
+        ui.selected_index = Some(idx);
+    }
+}
+
 /// PRD #83 M2 — switch to `target_index` while preserving per-tab focus.
 /// Captures the source tab's focused pane on the way out, switches, then
 /// restores the destination tab's remembered focus on the way in. The
@@ -2852,16 +2998,95 @@ pub fn sync_and_derive_selection(
 /// doesn't carry: the remembered card's pane is re-focused so the
 /// per-frame focused-pane→selection sync can't snap the dashboard onto a
 /// pane left focused by another tab. Returns whether the switch happened.
+///
+/// PRD #113 (UNIFIED deck behavior): leaving a deck (Dashboard OR Orchestration)
+/// deactivates its selection highlight (`ui.selected_index = None`) but KEEPS the
+/// deck's remembered selection, so on return the deck re-focuses its remembered
+/// pane and shows the same region — the Dashboard via the `selected_session_id`
+/// re-focus block below, the Orchestration via `restore_focus_on_switch_in`. The
+/// highlight stays inactive because `reconcile_dashboard_selection` only
+/// reactivates on a focus *transition* and the pre-seed below makes the restored
+/// focus a steady state (no transition): a card never *looks* selected until the
+/// user re-arms it with Enter. (A Mode tab's agent pane stays focused on return
+/// and *is* a dashboard card, but the same transition guard keeps it from
+/// re-arming — see PR #151.)
 fn switch_tab_with_focus(
     tab_manager: &mut TabManager,
     target_index: usize,
     pane: &dyn PaneController,
     snapshot: &AppState,
+    ui: &mut UiState,
 ) -> bool {
+    // Only treat this as "leaving the Dashboard" when the switch will actually
+    // move to a different tab (`switch_to` returns `true` even for the current
+    // index), so a no-op cycle on a single-tab layout can't spuriously clear
+    // the highlight.
+    //
+    // PR #151 (Greptile P2): the leave-clear below mutates the OUTGOING
+    // Dashboard, so it must run while that tab is still active — i.e. before
+    // `switch_to`. That is safe here because `will_move` already guarantees the
+    // switch will succeed: `switch_to(i)` returns `true` *iff* `i < tabs.len()`
+    // (its only guard — see `TabManager::switch_to`), and `will_move` requires
+    // `target_index < tab_count()` (== `tabs.len()`) plus a real index change.
+    // Nothing between here and `switch_to` adds/removes tabs (`active_tab_mut`
+    // and `capture_focus_on_switch_out` only touch per-tab fields), so
+    // `tabs.len()` is invariant. Hence `will_move == true` ⇒ `switched == true`:
+    // the clear can never deactivate the selection without an actual transition.
+    let will_move =
+        target_index < tab_manager.tab_count() && target_index != tab_manager.active_index();
+    // PRD #113 (UNIFIED deck behavior): leaving a deck (Dashboard OR
+    // Orchestration) runs ONE shared path — deactivate the live highlight
+    // (`selected_index = None`) but KEEP the deck's own remembered selection so
+    // the return leg can re-focus it. The two decks remember different keys
+    // (Dashboard: `selected_session_id`; Orchestration: `focused_role_pane_id`),
+    // but both are now treated the SAME: left intact on leave. The former
+    // Dashboard-only `selected_session_id = None` band-aid is gone — it existed
+    // to stop the switch-in re-focus block from re-arming the highlight, but the
+    // focus-transition guard (`reconcile_dashboard_selection`) + the focus-baseline
+    // pre-seed below now keep the highlight inactive without forgetting the card,
+    // so the Dashboard restores its remembered region on return exactly like
+    // Orchestration restores its role pane. An ACTIVE highlight is recorded into
+    // THIS deck's OWN per-deck slot (keyed by deck identity, not a shared field,
+    // so it can't leak into another deck's restore — orchestration_005) so Enter
+    // can restore it; only a `Some` is stored, since an inactive leave (e.g. a
+    // round-trip's return leg) must NOT clobber the remembered value.
+    if will_move && let Some(key) = deck_key(tab_manager.active_tab()) {
+        if let Some(idx) = ui.selected_index {
+            ui.last_active_selection_by_deck.insert(key, idx);
+        }
+        ui.selected_index = None;
+    }
     tab_manager.capture_focus_on_switch_out();
     let switched = tab_manager.switch_to(target_index);
     if switched {
-        tab_manager.restore_focus_on_switch_in();
+        // The pane focus is restored to on switch-in becomes the new focus
+        // baseline (see the PR #151 pre-seed below).
+        let mut restored_focus = tab_manager.restore_focus_on_switch_in();
+        // PRD #113 finding 1 + revision Change 1: entering a deck (Dashboard OR
+        // Orchestration) via a real tab move starts the selection INACTIVE —
+        // symmetric to the leave-deactivation above and across both decks. The
+        // shared `selected_index` can be re-armed by a deck's always-active
+        // reconcile while in transit, so without this a deck→deck→deck round-trip
+        // would leave a stale highlight (violating SC1). The per-frame
+        // `reconcile_dashboard_selection` reactivates only on a genuine focus
+        // transition (M4 / selection_009), so legitimate reactivation is preserved.
+        if will_move && let Some(key) = deck_key(tab_manager.active_tab()) {
+            ui.selected_index = None;
+            // PR #151 review #2: hoist the INCOMING deck's own remembered
+            // selection into the field `dashboard_focus_target` reads, so Enter
+            // restores THIS deck's prior selection — not whatever another deck
+            // last armed. `None` when this deck has nothing remembered yet
+            // (Enter then defaults to card 0, unchanged).
+            ui.last_active_selection = ui.last_active_selection_by_deck.get(&key).copied();
+        }
+        // Dashboard analog of the Orchestration role-pane restore: the Dashboard's
+        // selection is keyed by SESSION id (not a pane id) and `TabManager` carries
+        // no session→pane map, so `restore_focus_on_switch_in` can't resolve it —
+        // this block does, using the live `snapshot`. It re-focuses the remembered
+        // card's pane (kept on leave, like Orchestration keeps `focused_role_pane_id`)
+        // so the Dashboard returns showing the same region, and becomes the focus
+        // baseline below. Both decks thus run the SAME return shape: re-focus the
+        // remembered pane → feed `restored_focus` → pre-seed the baseline.
         if let Tab::Dashboard {
             selected_session_id,
         } = tab_manager.active_tab()
@@ -2870,6 +3095,28 @@ fn switch_tab_with_focus(
             && let Some(pane_id) = session.pane_id.as_ref()
         {
             let _ = pane.focus_pane(pane_id);
+            // The re-focus block is the final word on what's focused after the
+            // switch, so it (not `restore_focus_on_switch_in`) is the baseline.
+            restored_focus = Some(pane_id.clone());
+        }
+        // PR #151 orch→orch fix: pre-seed the focus baseline to the pane the
+        // switch RESTORED focus to, so the next `reconcile_dashboard_selection`
+        // frame computes `focus_changed == false` and the inactive-stays-inactive
+        // guard early-returns — keeping `selected_index` None. This generalizes
+        // the steady-state fix (selection_013, where the same pane stays focused
+        // on return) to a tab switch that restores a DIFFERENT pane (orch A →
+        // orch B, where each orchestration tab restores its own role): without
+        // it, the restored B role reads as a focus transition and re-arms the
+        // highlight one frame after the switch cleared it. Only overwrite when
+        // the switch actually restored a focus (`Some`); a None restore (e.g. a
+        // Dashboard return with no remembered card, which re-focuses nothing)
+        // leaves the prior baseline intact, matching the controller's still-focused
+        // pane. This does NOT
+        // suppress a genuine in-deck focus change: a later frame (no tab switch)
+        // that focuses a different pane still differs from this baseline and
+        // reactivates (M4 / selection_009 / selection_014).
+        if will_move && let Some(restored) = restored_focus {
+            ui.last_focused_pane_id = Some(restored);
         }
     }
     switched
@@ -2901,13 +3148,23 @@ fn handle_normal_key(
     // unchanged.
     if kb.matches(KbAction::MoveDown, &key) || key.code == KeyCode::Down {
         if total > 0 {
-            ui.selected_index = (ui.selected_index + 1) % total;
+            // PRD #113 M3: from an inactive selection `j`/Down jumps to the
+            // first card and activates; once active it advances with wrap.
+            ui.selected_index = Some(match ui.selected_index {
+                None => 0,
+                Some(i) => (i + 1) % total,
+            });
         }
         return Action::Continue;
     }
     if kb.matches(KbAction::MoveUp, &key) || key.code == KeyCode::Up {
         if total > 0 {
-            ui.selected_index = (ui.selected_index + total - 1) % total;
+            // PRD #113 M3: from an inactive selection `k`/Up jumps to the last
+            // card and activates; once active it retreats with wrap.
+            ui.selected_index = Some(match ui.selected_index {
+                None => total - 1,
+                Some(i) => (i + total - 1) % total,
+            });
         }
         return Action::Continue;
     }
@@ -3751,8 +4008,10 @@ fn close_tab_by_index(
     if ui.mode == UiMode::PaneInput {
         ui.mode = UiMode::Normal;
     }
-    if ui.selected_index > 0 {
-        ui.selected_index = ui.selected_index.saturating_sub(1);
+    if let Some(idx) = ui.selected_index
+        && idx > 0
+    {
+        ui.selected_index = Some(idx - 1);
     }
 }
 
@@ -3949,7 +4208,32 @@ fn dispatch_action(
         // PRD #92 F4: inspect each close result and preserve the card / session
         // on failure so the user can see the error and retry.
         Action::CloseSelected => {
-            if let Some(sid) = filtered.get(ui.selected_index).map(|(id, _)| (*id).clone())
+            // PR #151 (e2e layout_002 regression): branch on the ACTIVE tab.
+            // Ctrl+W routes here for BOTH "close the selected dashboard card" and
+            // "close the active Mode/Orchestration tab". The dashboard-card close
+            // below no-ops on an inactive selection (finding 2 / selection_012),
+            // but on a Mode/Orchestration tab the dashboard selection is `None`,
+            // so that gate wrongly suppressed the tab-close. When the active tab
+            // IS a closable tab, close it directly — regardless of
+            // `ui.selected_index` — mirroring the mouse [×] path
+            // (`close_tab_by_index`) so the keyboard closes the same tab the same
+            // way. (selection_016)
+            let active_is_closable_tab = matches!(
+                tab_manager.active_tab(),
+                Tab::Mode { .. } | Tab::Orchestration { .. }
+            );
+            if active_is_closable_tab {
+                close_tab_by_index(tab_manager.active_index(), ui, state, tab_manager);
+            }
+            // PRD #113 finding 2: on the Dashboard the destructive close requires
+            // a REAL active selection. When the selection is inactive (`None`)
+            // this is a no-op — no card-0 fallback (that fallback is reserved for
+            // Enter/Focus) — so an unarmed dashboard can never silently close
+            // card 0.
+            else if let Some(sid) = ui
+                .selected_index
+                .and_then(|i| filtered.get(i))
+                .map(|(id, _)| (*id).clone())
                 && let Some(session) = snapshot.sessions.get(&sid)
                 && let Some(ref pane_id) = session.pane_id
             {
@@ -4051,8 +4335,10 @@ fn dispatch_action(
                     ui.mode = UiMode::Normal;
                 }
                 // Clamp selected_index so it doesn't point past the now-shorter list.
-                if ui.selected_index > 0 {
-                    ui.selected_index = ui.selected_index.saturating_sub(1);
+                if let Some(idx) = ui.selected_index
+                    && idx > 0
+                {
+                    ui.selected_index = Some(idx - 1);
                 }
             }
         }
@@ -4065,8 +4351,9 @@ fn dispatch_action(
                 let prev_idx = tab_manager.active_index();
                 // PRD #84 M4: switching just updates tab state; the pre-draw
                 // `resize_panes_to_layout` sizes the destination tab's panes on
-                // the next frame.
-                switch_tab_with_focus(tab_manager, prev_idx + 1, pane, snapshot);
+                // the next frame. PRD #113: pass `ui` so the deck selection
+                // highlight is deactivated on leave/enter.
+                switch_tab_with_focus(tab_manager, prev_idx + 1, pane, snapshot, ui);
             }
         }
         // Ctrl+PageUp: previous tab (clamped, gated on a visible tab bar).
@@ -4074,7 +4361,7 @@ fn dispatch_action(
             if tab_manager.show_tab_bar() {
                 let prev_idx = tab_manager.active_index();
                 if prev_idx > 0 {
-                    switch_tab_with_focus(tab_manager, prev_idx - 1, pane, snapshot);
+                    switch_tab_with_focus(tab_manager, prev_idx - 1, pane, snapshot, ui);
                 }
             }
         }
@@ -4084,7 +4371,7 @@ fn dispatch_action(
             if count > 0 {
                 let prev_idx = tab_manager.active_index();
                 let next = (prev_idx + 1) % count;
-                switch_tab_with_focus(tab_manager, next, pane, snapshot);
+                switch_tab_with_focus(tab_manager, next, pane, snapshot, ui);
             }
         }
         // Normal-mode BackTab / Left / h: cycle to the previous tab (wraps).
@@ -4093,14 +4380,14 @@ fn dispatch_action(
             if count > 0 {
                 let prev_idx = tab_manager.active_index();
                 let prev = (prev_idx + count - 1) % count;
-                switch_tab_with_focus(tab_manager, prev, pane, snapshot);
+                switch_tab_with_focus(tab_manager, prev, pane, snapshot, ui);
             }
         }
         // PRD #80 M3: click a tab header → switch to that tab. PRD #83: preserve
         // per-tab focus across the switch. PRD #84 M4: PTY sizing happens in the
         // pre-draw resize pass, not here.
         Action::SelectTab(idx) => {
-            switch_tab_with_focus(tab_manager, idx, pane, snapshot);
+            switch_tab_with_focus(tab_manager, idx, pane, snapshot, ui);
         }
         // PRD #80 M3: click a tab's [×] → close that tab, reusing Ctrl+W's
         // tab-teardown semantics for the clicked tab.
@@ -4118,7 +4405,8 @@ fn dispatch_action(
         Action::SelectCard(idx) => {
             if idx < filtered.len() {
                 let prev = ui.selected_index;
-                ui.selected_index = idx;
+                // PRD #113: a click activates the highlight on the clicked card.
+                ui.selected_index = Some(idx);
                 if let Tab::Dashboard {
                     selected_session_id,
                 } = tab_manager.active_tab_mut()
@@ -4300,6 +4588,20 @@ fn dispatch_action(
             return perform_stop_and_quit(ui, pane);
         }
         Action::Focus => {
+            // PRD #113 (UNIFIED deck behavior, Issue 1): paint the selection
+            // highlight on the card Enter is about to focus, mirroring
+            // `focus_deck` (the digit-jump path, which sets `selected_index`
+            // directly and already paints on BOTH decks). Resolve the SAME
+            // target index the caller used to pick `selected_id`
+            // (`dashboard_focus_target`, which restores the remembered selection
+            // when the deck returned inactive). Without this, Enter on an
+            // Orchestration deck whose role pane is already focused on return
+            // never re-arms the highlight: the per-frame reconcile reactivates
+            // only on a focus TRANSITION, and re-focusing the already-focused
+            // pane isn't one (which is why the Dashboard happened to work and
+            // the Orchestration deck didn't). Setting it here is one shared
+            // change covering both decks.
+            ui.selected_index = dashboard_focus_target(ui, filtered.len());
             // Dismiss idle art on the focused card
             if let Some(sid) = selected_id
                 && let Some(entry) = ui.idle_art_cache.get_mut(sid)
@@ -4415,13 +4717,19 @@ fn dispatch_action(
                 let dir_str = req.dir.display().to_string();
 
                 // Orchestration path — manage own panes, no agent pane.
-                if let Some(mut orch_config) = req.orchestration_config {
-                    // PRD #107: use the name the user typed in the form, if any,
-                    // so the tab title matches their input rather than always
-                    // falling back to the TOML config name or cwd basename.
-                    if !req.name.is_empty() {
-                        orch_config.name = req.name.clone();
-                    }
+                if let Some(orch_config) = req.orchestration_config {
+                    // PRD #107 regression fix: do NOT overwrite
+                    // `orch_config.name` with the form name. That override
+                    // corrupted the orchestration IDENTITY — the canonical
+                    // config name is what the daemon's
+                    // `lookup_orchestration_role` compares to honor a role's
+                    // `clear`/`prompt_template`, and overwriting it with the
+                    // dir basename broke the delegate respawn in every
+                    // worktree (PRD #107 only worked in the main checkout
+                    // where basename == config name). Instead route the form
+                    // name to the tab TITLE only, via `display_title`; the
+                    // identity stays the canonical `orch_config.name`.
+                    let display_title = (!req.name.is_empty()).then(|| req.name.clone());
                     let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
                     // PRD #76 M2.15: pre-compute spawn dims using
                     // the orchestration-layout helper (right 66%
@@ -4452,6 +4760,7 @@ fn dispatch_action(
                         &orch_config,
                         &dir_str,
                         prompt,
+                        display_title.as_deref(),
                         spawn_dims,
                     ) {
                         Ok((_tab_idx, role_pane_ids)) => {
@@ -4529,7 +4838,14 @@ fn dispatch_action(
                             // in the agent's stdin, polluting the prompt buffer.
 
                             ui.status_message = Some((
-                                format!("Activated orchestration: {}", orch_config.name),
+                                // Show the same name as the tab title (PRD #107
+                                // display intent): the user's form name when
+                                // typed, else the canonical config name. This is
+                                // display-only and does not affect identity.
+                                format!(
+                                    "Activated orchestration: {}",
+                                    display_title.as_deref().unwrap_or(&orch_config.name)
+                                ),
                                 std::time::Instant::now(),
                             ));
                         }
@@ -4734,7 +5050,8 @@ fn dispatch_action(
                                 // No mode — regular dashboard pane.
                                 let _ = pane.focus_pane(&new_id);
                                 ui.mode = UiMode::PaneInput;
-                                ui.selected_index = filtered.len();
+                                // PRD #113: the freshly-created card is active.
+                                ui.selected_index = Some(filtered.len());
                                 // PRD #84 M4: the pane was spawned at the
                                 // dashboard layout dims (above); the pre-draw
                                 // `resize_panes_to_layout` reconciles it to the
@@ -5913,7 +6230,7 @@ pub fn run_tui(
                 ui.mode = UiMode::PaneInput;
             }
         }
-        ui.selected_index = 0;
+        ui.selected_index = Some(0);
     }
 
     'outer: loop {
@@ -6043,11 +6360,15 @@ pub fn run_tui(
         };
         let total = filtered.len();
 
-        // Clamp selection
+        // Clamp selection. PRD #113: an active selection (`Some`) is clamped
+        // into range; an inactive one (`None`) is left inactive. With no cards
+        // there is nothing to highlight.
         if total > 0 {
-            ui.selected_index = ui.selected_index.min(total - 1);
+            if let Some(idx) = ui.selected_index {
+                ui.selected_index = Some(idx.min(total - 1));
+            }
         } else {
-            ui.selected_index = 0;
+            ui.selected_index = None;
         }
 
         // PRD #83 M3/M4 — per-tab card selection. On the Dashboard and
@@ -6065,13 +6386,12 @@ pub fn run_tui(
             .iter()
             .map(|(id, s)| (id.as_str(), s.pane_id.as_deref()))
             .collect();
-        if let Some(idx) = sync_and_derive_selection(
+        reconcile_dashboard_selection(
+            &mut ui,
             tab_manager.active_tab_mut(),
             focused_pane_now.as_deref(),
             &filtered_ids,
-        ) {
-            ui.selected_index = idx;
-        }
+        );
 
         let term_width = terminal.get_frame().area().width;
         let has_embedded_panes = pane
@@ -6539,7 +6859,9 @@ pub fn run_tui(
                     {
                         let frame_area = terminal.get_frame().area();
                         let selected_id: Option<String> =
-                            filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+                            dashboard_focus_target(&ui, filtered.len())
+                                .and_then(|i| filtered.get(i))
+                                .map(|(id, _)| (*id).clone());
                         let flow = dispatch_action(
                             action,
                             &mut ui,
@@ -6595,7 +6917,9 @@ pub fn run_tui(
                     if is_down {
                         let frame_area = terminal.get_frame().area();
                         let selected_id: Option<String> =
-                            filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+                            dashboard_focus_target(&ui, filtered.len())
+                                .and_then(|i| filtered.get(i))
+                                .map(|(id, _)| (*id).clone());
                         let flow = dispatch_action(
                             action,
                             &mut ui,
@@ -6668,7 +6992,9 @@ pub fn run_tui(
                         // Double click → focus the now-selected card's pane.
                         if click_count >= 2 {
                             let selected_id: Option<String> =
-                                filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+                                dashboard_focus_target(&ui, filtered.len())
+                                    .and_then(|i| filtered.get(i))
+                                    .map(|(id, _)| (*id).clone());
                             let flow = dispatch_action(
                                 Action::Focus,
                                 &mut ui,
@@ -7130,8 +7456,9 @@ pub fn run_tui(
                 action = cycle_tab_action(&kb, &key);
             }
 
-            let selected_id: Option<String> =
-                filtered.get(ui.selected_index).map(|(id, _)| (*id).clone());
+            let selected_id: Option<String> = dashboard_focus_target(&ui, filtered.len())
+                .and_then(|i| filtered.get(i))
+                .map(|(id, _)| (*id).clone());
 
             // On a mode tab in Normal mode, move_down/move_up (defaults j/k,
             // plus Down/Up arrows) navigate side panes, Enter focuses, Esc
@@ -7985,12 +8312,16 @@ fn render_frame(
     // Calculate how many rows fit in the available area
     let visible_rows = (available_for_density / card_height).max(1) as usize;
 
-    // Adjust scroll offset to keep selected row visible
-    let selected_row = ui.selected_index / cols;
-    if selected_row < ui.scroll_offset {
-        ui.scroll_offset = selected_row;
-    } else if selected_row >= ui.scroll_offset + visible_rows {
-        ui.scroll_offset = selected_row + 1 - visible_rows;
+    // Adjust scroll offset to keep selected row visible. PRD #113: only when a
+    // card is actively highlighted — an inactive selection (`None`) leaves the
+    // scroll position alone.
+    if let Some(sel) = ui.selected_index {
+        let selected_row = sel / cols;
+        if selected_row < ui.scroll_offset {
+            ui.scroll_offset = selected_row;
+        } else if selected_row >= ui.scroll_offset + visible_rows {
+            ui.scroll_offset = selected_row + 1 - visible_rows;
+        }
     }
 
     // Re-clamp after a resize may have grown `visible_rows`: an offset left over
@@ -8022,7 +8353,7 @@ fn render_frame(
 
         for (col_idx, session) in row.iter().enumerate() {
             let flat_index = (ui.scroll_offset + vi) * cols + col_idx;
-            let is_selected = flat_index == ui.selected_index;
+            let is_selected = ui.selected_index == Some(flat_index);
             // PRD #127 finding #2: `ui.display_names` is populated by hydration
             // and explicit renames; a live scheduler-spawned card has no entry
             // there, so fall back to the friendly name the synthetic
@@ -10902,14 +11233,16 @@ pub fn render_card_to_buffer(
 }
 
 /// PRD #83 M3/M4 seam: render a vertical stack of dashboard cards into a
-/// `Buffer` for L1 tests, highlighting the card at `selected_index`. Mirrors
+/// `Buffer` for L1 tests, highlighting the card at `selected`. Mirrors
 /// [`render_card_to_buffer`] but lays out multiple cards exactly as the live
 /// dashboard does, so a test can assert that the selection highlight follows
-/// the derived `selected_index` (see `sync_and_derive_selection`).
+/// the derived index (see `sync_and_derive_selection`). PRD #113: `selected`
+/// is now `Option<usize>` — `Some(i)` paints the highlight on card `i`, `None`
+/// (an inactive selection) paints no highlight at all.
 #[doc(hidden)]
 pub fn render_dashboard_cards_to_buffer(
     cards: &[(&SessionState, Option<&str>)],
-    selected_index: usize,
+    selected: Option<usize>,
     density: CardDensityKind,
     tick: u64,
     width: u16,
@@ -10952,7 +11285,7 @@ pub fn render_dashboard_cards_to_buffer(
                     chunks[flat_index],
                     session,
                     tick,
-                    flat_index == selected_index,
+                    selected == Some(flat_index),
                     display_name.as_ref(),
                     card_number,
                     card_density,
@@ -11206,6 +11539,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use spec::spec;
     use std::collections::HashMap;
     use tempfile::tempdir;
 
@@ -14201,7 +14535,7 @@ mod tests {
     #[test]
     fn handle_normal_key_j_and_down_advance_with_wrap() {
         let mut ui = default_ui();
-        ui.selected_index = 0;
+        ui.selected_index = Some(0);
 
         // j advances 0 → 1
         let r = handle_normal_key(
@@ -14212,7 +14546,7 @@ mod tests {
             &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
-        assert_eq!(ui.selected_index, 1);
+        assert_eq!(ui.selected_index, Some(1));
 
         // Down advances 1 → 2
         let r = handle_normal_key(
@@ -14223,7 +14557,7 @@ mod tests {
             &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
-        assert_eq!(ui.selected_index, 2);
+        assert_eq!(ui.selected_index, Some(2));
 
         // wraps 2 → 0
         let r = handle_normal_key(
@@ -14234,13 +14568,13 @@ mod tests {
             &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
-        assert_eq!(ui.selected_index, 0);
+        assert_eq!(ui.selected_index, Some(0));
     }
 
     #[test]
     fn handle_normal_key_k_and_up_retreat_with_wrap() {
         let mut ui = default_ui();
-        ui.selected_index = 0;
+        ui.selected_index = Some(0);
 
         // k from 0 wraps to total - 1
         let r = handle_normal_key(
@@ -14251,7 +14585,7 @@ mod tests {
             &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
-        assert_eq!(ui.selected_index, 2);
+        assert_eq!(ui.selected_index, Some(2));
 
         // Up retreats 2 → 1
         let r = handle_normal_key(
@@ -14262,13 +14596,13 @@ mod tests {
             &KeybindingConfig::default(),
         );
         assert!(matches!(r, Action::Continue));
-        assert_eq!(ui.selected_index, 1);
+        assert_eq!(ui.selected_index, Some(1));
     }
 
     #[test]
     fn handle_normal_key_jk_no_op_when_no_cards() {
         // `total == 0` (empty dashboard): j/k/Up/Down must not panic
-        // and must not move `selected_index` off zero.
+        // and must leave the startup selection on card 0 (still active).
         let mut ui = default_ui();
         for code in [
             KeyCode::Char('j'),
@@ -14284,7 +14618,7 @@ mod tests {
                 &KeybindingConfig::default(),
             );
             assert!(matches!(r, Action::Continue));
-            assert_eq!(ui.selected_index, 0);
+            assert_eq!(ui.selected_index, Some(0));
         }
     }
 
@@ -14377,7 +14711,7 @@ mod tests {
         let mut ui = default_ui();
         let ok = focus_deck(1, &mut ui, &ids, &snapshot, &state, &pc);
         assert!(ok, "focus_deck must accept an in-range idx");
-        assert_eq!(ui.selected_index, 1);
+        assert_eq!(ui.selected_index, Some(1));
         // PaneInput transition is also part of the Ctrl+d → 1-9 contract.
         assert_eq!(ui.mode, UiMode::PaneInput);
         let calls = pc.focused.lock().unwrap();
@@ -14413,7 +14747,7 @@ mod tests {
         let total = filtered.len();
 
         let mut ui = default_ui();
-        ui.selected_index = 0;
+        ui.selected_index = Some(0);
 
         let kb = KeybindingConfig::default();
         let press = |ui: &mut UiState, key: KeyEvent| {
@@ -14425,22 +14759,1420 @@ mod tests {
             &mut ui,
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
         );
-        assert_eq!(ui.selected_index, 1);
+        assert_eq!(ui.selected_index, Some(1));
         // Down: 1 → 2, focus mirrored to p2.
         press(&mut ui, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(ui.selected_index, 2);
+        assert_eq!(ui.selected_index, Some(2));
         // k: 2 → 1, focus mirrored to p1.
         press(
             &mut ui,
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
         );
-        assert_eq!(ui.selected_index, 1);
+        assert_eq!(ui.selected_index, Some(1));
 
         let calls = pc.focused.lock().unwrap();
         assert_eq!(
             calls.as_slice(),
             &["p1".to_string(), "p2".to_string(), "p1".to_string()],
             "every j/k/Up/Down move must mirror the new selection into focus"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #113 — dashboard selection becomes active/inactive
+    //
+    // These pin the PRD #113 contract: the blue card highlight is painted
+    // ONLY while the dashboard selection is "active". Tab-switching
+    // deactivates it; explicit input (`1`-`9`, `j`, `k`, Enter) and the
+    // focused-pane sync reactivate it. The tests assert the observable
+    // outcome — the highlighted card *index* and whether the highlight is
+    // *painted at all* — via the selection state and the dashboard renderer.
+    //
+    // RED note (TDD): the production API does not exist yet. These tests
+    // reference the intended shape — `UiState.selected_index: Option<usize>`
+    // (`None` = inactive), `render_dashboard_cards_to_buffer(..)` taking
+    // `Option<usize>`, plus the new `dashboard_focus_target` and
+    // `reconcile_dashboard_selection` seams — so they fail to compile / fail
+    // assertions until the coder lands the feature. See the RED report.
+    // -----------------------------------------------------------------------
+
+    /// Stringify the whole rendered buffer (symbol layer) so an assertion can
+    /// look for the `▸ ` selection marker the dashboard paints on the
+    /// highlighted card.
+    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area();
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Stringify a single rendered row — used to assert the `▸` marker lands on
+    /// the FIRST card (whose title row is row 0) rather than just somewhere.
+    fn buf_row(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        let area = buf.area();
+        (0..area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// A minimal mode config with `side_pane_count` persistent side panes —
+    /// enough to open a real second tab so a tab-switch can be exercised.
+    /// Mirrors the verified helper in `tab.rs`'s test module (private there).
+    fn mode_config_local(name: &str, side_pane_count: usize) -> ModeConfig {
+        ModeConfig {
+            name: name.to_string(),
+            init_command: None,
+            seed_prompt: None,
+            panes: (0..side_pane_count)
+                .map(|i| crate::project_config::ModePersistentPane {
+                    command: format!("echo side-{i}"),
+                    name: Some(format!("side-{i}")),
+                    watch: false,
+                })
+                .collect(),
+            rules: Vec::new(),
+            reactive_panes: 0,
+        }
+    }
+
+    /// Pane controller that hands out UNIQUE pane ids (so `open_mode_tab`'s
+    /// `activate_mode` registers distinct side panes) and records every
+    /// `focus_pane` target. Ported from `tab.rs`'s `MockPaneController`
+    /// (private to that module); the existing `RecordingFocusPC` returns an
+    /// empty id from `create_pane`, which can't back a real mode tab.
+    struct OpenTabPC {
+        next: std::sync::Mutex<u32>,
+        focused: std::sync::Mutex<Vec<String>>,
+        closed: std::sync::Mutex<Vec<String>>,
+    }
+    impl OpenTabPC {
+        fn new() -> Self {
+            Self {
+                next: std::sync::Mutex::new(0),
+                focused: std::sync::Mutex::new(Vec::new()),
+                closed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl crate::pane::PaneController for OpenTabPC {
+        fn create_pane(
+            &self,
+            _cmd: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<String, crate::pane::PaneError> {
+            let mut n = self.next.lock().unwrap();
+            let id = format!("mock-pane-{n}");
+            *n += 1;
+            Ok(id)
+        }
+        fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, id: &str) -> Result<(), crate::pane::PaneError> {
+            self.closed.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+        fn rename_pane(
+            &self,
+            _id: &str,
+            name: &str,
+        ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+            Ok(crate::pane::RenameOutcome::applied(name))
+        }
+        fn focus_pane(&self, id: &str) -> Result<(), crate::pane::PaneError> {
+            self.focused.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "open-tab-mock"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Build N synthetic dashboard sessions `("s0","p0") .. ("sN","pN")` in a
+    /// snapshot, returning the snapshot plus a sorted `(session_id, &session)`
+    /// filtered view — the shape the dispatch/focus helpers expect.
+    fn dashboard_snapshot(n: usize) -> AppState {
+        let mut snapshot = AppState::default();
+        for i in 0..n {
+            let mut sess = make_session(SessionStatus::Idle);
+            sess.session_id = format!("s{i}");
+            sess.pane_id = Some(format!("p{i}"));
+            snapshot.sessions.insert(format!("s{i}"), sess);
+        }
+        snapshot
+    }
+
+    /// Scenario: Open a second (Mode) tab so a tab switch is possible, arm the
+    /// Dashboard's highlight on card 2 (active selection), then drive the real
+    /// tab-switch path — `Action::CycleTabNext` away from the Dashboard and
+    /// `Action::CycleTabPrev` back. After the round-trip the dashboard
+    /// selection must be inactive (`None`) and the rendered cards must carry no
+    /// `▸` selection marker, so a card never *looks* selected when nothing is
+    /// armed. (PRD #113 M2 / SC1.)
+    #[spec("dashboard/selection/005")]
+    #[test]
+    fn selection_005_tab_switch_clears_highlight() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        tab_manager
+            .open_mode_tab(
+                &mode_config_local("m", 1),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open a second tab");
+        // open_mode_tab leaves the mode tab active — return to the Dashboard.
+        assert!(tab_manager.switch_to(0));
+
+        let snapshot = dashboard_snapshot(3);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        // Active highlight armed on the 2nd card (index 1).
+        ui.selected_index = Some(1);
+        if let Tab::Dashboard {
+            selected_session_id,
+        } = tab_manager.active_tab_mut()
+        {
+            *selected_session_id = Some("s1".to_string());
+        }
+
+        let area = Rect::new(0, 0, 80, 24);
+        // Switch away from the Dashboard…
+        dispatch_action(
+            Action::CycleTabNext,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            area,
+        );
+        // …and back to it.
+        dispatch_action(
+            Action::CycleTabPrev,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            area,
+        );
+
+        assert_eq!(
+            ui.selected_index, None,
+            "a tab switch away from the Dashboard and back must deactivate the highlight"
+        );
+
+        // And the renderer paints no selection marker when inactive.
+        let cards: [(&SessionState, Option<&str>); 3] = [
+            (filtered[0].1, Some("alpha")),
+            (filtered[1].1, Some("beta")),
+            (filtered[2].1, Some("gamma")),
+        ];
+        let buf = render_dashboard_cards_to_buffer(
+            &cards,
+            ui.selected_index,
+            CardDensityKind::Normal,
+            0,
+            80,
+        );
+        assert!(
+            !buf_text(&buf).contains('▸'),
+            "no card may carry the `▸` selection marker after a tab switch"
+        );
+    }
+
+    /// Scenario: With the dashboard selection inactive (`None`), press `j`. The
+    /// highlight must land on the FIRST card (index 0) and the selection must
+    /// become active. (PRD #113 M3 / SC2.)
+    #[spec("dashboard/selection/006")]
+    #[test]
+    fn selection_006_j_from_inactive_jumps_to_first() {
+        let mut ui = default_ui();
+        ui.selected_index = None; // inactive
+
+        let r = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+            &KeybindingConfig::default(),
+        );
+        assert!(matches!(r, Action::Continue));
+        assert_eq!(
+            ui.selected_index,
+            Some(0),
+            "`j` from an inactive selection jumps to the first card and activates"
+        );
+    }
+
+    /// Scenario: With the dashboard selection inactive (`None`), press `k`. The
+    /// highlight must land on the LAST card (index `total - 1`) and the
+    /// selection must become active. (PRD #113 M3 / SC3.)
+    #[spec("dashboard/selection/007")]
+    #[test]
+    fn selection_007_k_from_inactive_jumps_to_last() {
+        let mut ui = default_ui();
+        ui.selected_index = None; // inactive
+
+        let r = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+            &KeybindingConfig::default(),
+        );
+        assert!(matches!(r, Action::Continue));
+        assert_eq!(
+            ui.selected_index,
+            Some(2),
+            "`k` from an inactive selection jumps to the last card and activates"
+        );
+    }
+
+    /// Scenario: PRD #113 design revision (2026-06-13) — when a deck has no
+    /// active highlight (e.g. just after returning from another tab), Enter must
+    /// RESTORE the previously-selected card, not jump to card 0. Arm the
+    /// dashboard highlight on a NON-first card (index 1), drive a REAL tab
+    /// round-trip (Dashboard → Mode → Dashboard via `switch_tab_with_focus`,
+    /// using a Mode tab as a non-deck intermediate so only the Dashboard-leave
+    /// records the prior selection) which clears the live highlight but must
+    /// REMEMBER index 1, then assert Enter still maps to `Action::Focus` and the
+    /// focus target (`dashboard_focus_target`) is the remembered card (index 1),
+    /// NOT card 0. The active-selection and no-cards targets are unchanged.
+    #[spec("dashboard/selection/008")]
+    #[test]
+    fn selection_008_enter_restores_previous_selection() {
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (mode_idx, _side_ids) = tab_manager
+            .open_mode_tab(
+                &mode_config_local("m", 1),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open a second (mode) tab");
+        // open_mode_tab leaves the mode tab active — start on the Dashboard.
+        assert!(tab_manager.switch_to(0));
+
+        let snapshot = dashboard_snapshot(3);
+
+        let mut ui = default_ui();
+        // Arm the highlight on a NON-first card (index 1).
+        ui.selected_index = Some(1);
+        if let Tab::Dashboard {
+            selected_session_id,
+        } = tab_manager.active_tab_mut()
+        {
+            *selected_session_id = Some("s1".to_string());
+        }
+
+        // Real round-trip: Dashboard → Mode → Dashboard. Leaving the Dashboard
+        // clears the live highlight but must REMEMBER the prior selection
+        // (index 1). The Mode tab is a non-deck intermediate, so the return leg
+        // does not overwrite the remembered selection.
+        switch_tab_with_focus(&mut tab_manager, mode_idx, &*pc, &snapshot, &mut ui);
+        switch_tab_with_focus(&mut tab_manager, 0, &*pc, &snapshot, &mut ui);
+
+        // SC1 still holds: no live highlight on return (selection_011/013/015).
+        assert_eq!(
+            ui.selected_index, None,
+            "the live highlight is still cleared on return (SC1 unchanged)"
+        );
+
+        // Enter still maps to the focus action.
+        let action = handle_normal_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+            &KeybindingConfig::default(),
+        );
+        assert!(
+            matches!(action, Action::Focus),
+            "Enter on the dashboard maps to Action::Focus"
+        );
+
+        // THE REVISION: Enter with an inactive selection RESTORES the
+        // previously-selected card (index 1), NOT card 0.
+        assert_eq!(
+            dashboard_focus_target(&ui, 3),
+            Some(1),
+            "Enter restores the previously-selected card (index 1), not card 0"
+        );
+
+        // Unchanged: an active selection focuses the highlighted card.
+        ui.selected_index = Some(2);
+        assert_eq!(
+            dashboard_focus_target(&ui, 3),
+            Some(2),
+            "Enter with an active selection focuses the highlighted card"
+        );
+
+        // Unchanged: no cards → no focus target.
+        assert_eq!(
+            dashboard_focus_target(&ui, 0),
+            None,
+            "Enter is a no-op when there are no cards"
+        );
+    }
+
+    /// Scenario: A digit jump (`1`-`9` → `focus_deck`) must select card N,
+    /// focus its embedded pane, and ACTIVATE the highlight — even when the
+    /// selection started inactive. Here the selection begins inactive (`None`);
+    /// `focus_deck(1, ..)` then leaves it active on index 1 with the pane
+    /// focused and the UI in PaneInput mode. (PRD #113 M3 / SC5.)
+    #[spec("dashboard/selection/003")]
+    #[test]
+    fn selection_003_digit_jump_focuses_and_activates() {
+        use tokio::sync::RwLock;
+
+        let snapshot = dashboard_snapshot(3);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let pc = RecordingFocusPC {
+            focused: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut ids: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        ids.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        ui.selected_index = None; // inactive before the digit jump
+
+        let ok = focus_deck(1, &mut ui, &ids, &snapshot, &state, &pc);
+        assert!(ok, "focus_deck must accept an in-range idx");
+        assert_eq!(
+            ui.selected_index,
+            Some(1),
+            "a digit jump activates the highlight on the targeted card"
+        );
+        assert_eq!(ui.mode, UiMode::PaneInput);
+        assert_eq!(
+            pc.focused.lock().unwrap().as_slice(),
+            &["p1".to_string()],
+            "the targeted card's pane is focused"
+        );
+    }
+
+    /// Scenario: While the selection is ACTIVE, `j` and `Down` advance to the
+    /// next card and wrap from the last card back to the first — and the
+    /// selection stays active throughout. (PRD #113 SC6.)
+    #[spec("dashboard/selection/001")]
+    #[test]
+    fn selection_001_active_j_down_next_with_wrap() {
+        let mut ui = default_ui();
+        ui.selected_index = Some(0); // active on card 0
+        let kb = KeybindingConfig::default();
+
+        // j: 0 → 1
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+            &kb,
+        );
+        assert_eq!(ui.selected_index, Some(1));
+        // Down: 1 → 2
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+            &kb,
+        );
+        assert_eq!(ui.selected_index, Some(2));
+        // j wraps: 2 → 0
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+            &kb,
+        );
+        assert_eq!(ui.selected_index, Some(0));
+    }
+
+    /// Scenario: While the selection is ACTIVE, `k` and `Up` retreat to the
+    /// previous card and wrap from the first card back to the last — and the
+    /// selection stays active throughout. (PRD #113 SC6.)
+    #[spec("dashboard/selection/002")]
+    #[test]
+    fn selection_002_active_k_up_prev_with_wrap() {
+        let mut ui = default_ui();
+        ui.selected_index = Some(0); // active on card 0
+        let kb = KeybindingConfig::default();
+
+        // k wraps: 0 → 2
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+            &kb,
+        );
+        assert_eq!(ui.selected_index, Some(2));
+        // Up: 2 → 1
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut ui,
+            3,
+            None,
+            &kb,
+        );
+        assert_eq!(ui.selected_index, Some(1));
+    }
+
+    /// Scenario: Focused-pane sync — with the selection inactive, when the
+    /// embedded controller's focused pane corresponds to a dashboard session's
+    /// pane, the per-frame reconcile reactivates the highlight on that card.
+    /// With no matching focused pane, an inactive selection stays inactive
+    /// (so a tab-switch deactivation isn't instantly undone). (PRD #113 M4.)
+    #[spec("dashboard/selection/009")]
+    #[test]
+    fn selection_009_focused_pane_sync_reactivates() {
+        let filtered: [(&str, Option<&str>); 3] =
+            [("s0", Some("p0")), ("s1", Some("p1")), ("s2", Some("p2"))];
+
+        // Focused pane maps to card 1 → reactivate on index 1.
+        let mut ui = default_ui();
+        ui.selected_index = None; // inactive
+        let mut tab = Tab::Dashboard {
+            selected_session_id: None,
+        };
+        reconcile_dashboard_selection(&mut ui, &mut tab, Some("p1"), &filtered);
+        assert_eq!(
+            ui.selected_index,
+            Some(1),
+            "a focused dashboard pane reactivates the highlight on its card"
+        );
+
+        // No focused dashboard pane → an inactive selection stays inactive.
+        let mut ui2 = default_ui();
+        ui2.selected_index = None;
+        let mut tab2 = Tab::Dashboard {
+            selected_session_id: None,
+        };
+        reconcile_dashboard_selection(&mut ui2, &mut tab2, None, &filtered);
+        assert_eq!(
+            ui2.selected_index, None,
+            "with no focused dashboard pane the selection stays inactive"
+        );
+    }
+
+    /// Scenario: A freshly-built dashboard is active on card 0 — the startup /
+    /// default state — so the renderer paints the `▸` highlight on the first
+    /// card (first-launch UX unchanged), while an inactive selection paints
+    /// none. (PRD #113 M1.)
+    #[spec("dashboard/selection/010")]
+    #[test]
+    fn selection_010_startup_active_at_card_zero() {
+        let ui = default_ui();
+        assert_eq!(
+            ui.selected_index,
+            Some(0),
+            "startup default is an ACTIVE selection on card 0"
+        );
+
+        let now = chrono::Utc::now();
+        let make = |sid: &str, pane: &str| SessionState {
+            session_id: sid.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            cwd: Some("/home/dev/x".to_string()),
+            status: SessionStatus::Working,
+            active_tool: None,
+            started_at: now,
+            last_activity: now,
+            recent_events: std::collections::VecDeque::new(),
+            tool_count: 0,
+            last_user_prompt: None,
+            first_prompts: Vec::new(),
+            pane_id: Some(pane.to_string()),
+            agent_id: None,
+            display_name: None,
+        };
+        let s0 = make("s0", "p0");
+        let s1 = make("s1", "p1");
+        let cards: [(&SessionState, Option<&str>); 2] = [(&s0, Some("alpha")), (&s1, Some("beta"))];
+
+        // Active at index 0 → the FIRST card's title row carries the marker.
+        let active = render_dashboard_cards_to_buffer(
+            &cards,
+            ui.selected_index,
+            CardDensityKind::Normal,
+            0,
+            80,
+        );
+        assert!(
+            buf_row(&active, 0).contains('▸'),
+            "startup paints the highlight on the first card"
+        );
+
+        // Inactive → no card carries the marker.
+        let inactive =
+            render_dashboard_cards_to_buffer(&cards, None, CardDensityKind::Normal, 0, 80);
+        assert!(
+            !buf_text(&inactive).contains('▸'),
+            "an inactive selection paints no highlight"
+        );
+    }
+
+    /// A minimal orchestration config with two roles — enough to open a real
+    /// Orchestration tab so the Dashboard→Orchestration→Dashboard path can be
+    /// exercised. Mirrors the verified helper in `tab.rs`'s test module.
+    fn orch_config_local(name: &str) -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: name.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "echo orch".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    name: "coder".to_string(),
+                    command: "echo coder".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        }
+    }
+
+    /// Scenario: PRD #113 review finding 1 — switching Dashboard → Orchestration
+    /// → Dashboard must leave the Dashboard selection INACTIVE. The Orchestration
+    /// tab shares `selected_index` and its always-active per-frame reconcile
+    /// re-arms `Some(0)` while that tab is active; tab-switch deactivation fires
+    /// only on Dashboard-LEAVE, so the return into the Dashboard does not clear
+    /// it. This drives the REAL switch path (`switch_tab_with_focus`) AND the
+    /// REAL per-frame `reconcile_dashboard_selection` on each frame — which is
+    /// why `selection_005` (Mode tab + direct `dispatch_action`, no per-frame
+    /// reconcile) cannot catch this. After the round-trip `selected_index` must
+    /// be `None` (SC1: switching to ANY other tab and back leaves no card armed).
+    #[spec("dashboard/selection/011")]
+    #[test]
+    fn selection_011_orchestration_round_trip_clears_highlight() {
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (orch_idx, _role_pane_ids) = tab_manager
+            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .expect("open an orchestration tab");
+        // open_orchestration_tab leaves the orchestration tab active — return to
+        // the Dashboard for the start state.
+        assert!(tab_manager.switch_to(0));
+
+        let snapshot = dashboard_snapshot(3);
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+        let dashboard_filtered: Vec<(&str, Option<&str>)> = filtered
+            .iter()
+            .map(|(id, s)| (id.as_str(), s.pane_id.as_deref()))
+            .collect();
+        // The orchestration tab carries no role sessions in this snapshot; with
+        // no focused role pane the orchestration reconcile falls back to
+        // `Some(0)` — which is exactly the stale re-arm this test pins.
+        let orch_filtered: [(&str, Option<&str>); 0] = [];
+
+        let mut ui = default_ui();
+        // Arm the dashboard highlight on the 2nd card (index 1).
+        ui.selected_index = Some(1);
+        if let Tab::Dashboard {
+            selected_session_id,
+        } = tab_manager.active_tab_mut()
+        {
+            *selected_session_id = Some("s1".to_string());
+        }
+
+        // Frame 1: Dashboard → Orchestration (leaving the Dashboard).
+        switch_tab_with_focus(&mut tab_manager, orch_idx, &*pc, &snapshot, &mut ui);
+        // Simulate the orchestration frame's per-frame reconcile.
+        reconcile_dashboard_selection(&mut ui, tab_manager.active_tab_mut(), None, &orch_filtered);
+
+        // Frame 2: Orchestration → Dashboard (returning).
+        switch_tab_with_focus(&mut tab_manager, 0, &*pc, &snapshot, &mut ui);
+        // Simulate the dashboard frame's per-frame reconcile.
+        reconcile_dashboard_selection(
+            &mut ui,
+            tab_manager.active_tab_mut(),
+            None,
+            &dashboard_filtered,
+        );
+
+        assert_eq!(
+            ui.selected_index, None,
+            "Dashboard → Orchestration → Dashboard must leave the selection inactive (SC1)"
+        );
+    }
+
+    /// Scenario: PRD #113 review finding 2 — an INACTIVE dashboard selection
+    /// means nothing is armed, so the close-pane action must be a NO-OP. With
+    /// three cards and `selected_index = None`, dispatching `Action::CloseSelected`
+    /// must NOT fall back to closing card 0: no `close_pane` call is issued and
+    /// no session is removed (matching the `dashboard/pane/003` "never close
+    /// without a real selection" invariant).
+    #[spec("dashboard/selection/012")]
+    #[test]
+    fn selection_012_inactive_close_is_noop() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let snapshot = dashboard_snapshot(3);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        ui.selected_index = None; // inactive — nothing armed
+
+        let sessions_before = state.blocking_read().sessions.len();
+        let area = Rect::new(0, 0, 80, 24);
+        dispatch_action(
+            Action::CloseSelected,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            area,
+        );
+
+        assert!(
+            pc.closed.lock().unwrap().is_empty(),
+            "an inactive selection must not close any card (no fallback to card 0)"
+        );
+        assert_eq!(
+            state.blocking_read().sessions.len(),
+            sessions_before,
+            "no session may be removed when the selection is inactive"
+        );
+    }
+
+    /// Scenario: PR #151 e2e regression (e2e_render_contract::layout_002) — the
+    /// inactive-selection close no-op (selection_012) must NOT suppress closing a
+    /// Mode/Orchestration TAB via Ctrl+W. With a Mode tab active and
+    /// `selected_index == None` (the real condition on a Mode tab — nothing armed
+    /// on the dashboard), dispatching `Action::CloseSelected` must close that tab;
+    /// likewise for an active Orchestration tab. Today this FAILS: the close
+    /// routes through the dashboard-selection gate that short-circuits on `None`,
+    /// so the tab persists (the keyboard Ctrl+W tab-close regressed while the
+    /// mouse click-to-close path, which bypasses the gate, still works).
+    #[spec("dashboard/selection/016")]
+    #[test]
+    fn selection_016_inactive_selection_does_not_block_tab_close() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let snapshot = AppState::default();
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        // No dashboard cards armed — the close must come from the active tab,
+        // not a selected card.
+        let filtered: Vec<(&String, &SessionState)> = Vec::new();
+        let area = Rect::new(0, 0, 80, 24);
+
+        let mut ui = default_ui();
+
+        // --- Mode tab: the exact case the e2e (layout_002) caught. ---
+        tab_manager
+            .open_mode_tab(
+                &mode_config_local("m", 1),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open a mode tab");
+        // open_mode_tab leaves the Mode tab active.
+        assert_eq!(tab_manager.tab_count(), 2, "Dashboard + Mode tab");
+
+        ui.selected_index = None; // inactive — nothing armed on the dashboard
+        dispatch_action(
+            Action::CloseSelected,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            area,
+        );
+        assert_eq!(
+            tab_manager.tab_count(),
+            1,
+            "Ctrl+W must close the active MODE tab even when the dashboard selection is inactive (None)"
+        );
+        assert!(
+            matches!(tab_manager.active_tab(), Tab::Dashboard { .. }),
+            "after the Mode tab closes the lone Dashboard is active"
+        );
+
+        // --- Orchestration tab: same contract (same gate). ---
+        tab_manager
+            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .expect("open an orchestration tab");
+        assert_eq!(tab_manager.tab_count(), 2, "Dashboard + Orchestration tab");
+
+        ui.selected_index = None;
+        dispatch_action(
+            Action::CloseSelected,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            area,
+        );
+        assert_eq!(
+            tab_manager.tab_count(),
+            1,
+            "Ctrl+W must close the active ORCHESTRATION tab even when the dashboard selection is inactive (None)"
+        );
+    }
+
+    /// Scenario: PR #151 manual-test regression (UNIFIED deck behavior, Issue 1) —
+    /// Enter (Action::Focus) on an inactive deck that has a remembered selection
+    /// must PAINT the highlight by setting `ui.selected_index = Some(restored
+    /// target)`, for BOTH the Orchestration and Dashboard decks. Today
+    /// Action::Focus only focuses the pane and never sets `selected_index`; on the
+    /// Orchestration deck the role pane is already focused on return, so the
+    /// per-frame reconcile (which reactivates only on a focus TRANSITION) never
+    /// re-arms the highlight and Enter leaves the deck unhighlighted. Pins the
+    /// unified fix: Action::Focus sets `selected_index` from the
+    /// `dashboard_focus_target` index for both decks. RED today (stays `None`).
+    #[spec("dashboard/selection/017")]
+    #[test]
+    fn selection_017_enter_paints_highlight_on_both_decks() {
+        use tokio::sync::RwLock;
+
+        // ---- Orchestration deck (the manifesting case — currently RED). ----
+        {
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let (_orch_idx, role_pane_ids) = tab_manager
+                .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+                .expect("open an orchestration tab");
+
+            // Placeholder sessions for the role panes, so the orchestration deck's
+            // filtered card list maps each index to a role pane (mirrors run_tui's
+            // per-tab scoping at ui.rs:6330).
+            let mut snapshot = AppState::default();
+            for (i, pid) in role_pane_ids.iter().enumerate() {
+                let mut s = make_session(SessionStatus::Idle);
+                s.session_id = format!("role{i}");
+                s.pane_id = Some(pid.clone());
+                snapshot.sessions.insert(format!("role{i}"), s);
+            }
+            let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+            let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+            filtered.sort_by_key(|(_, s)| {
+                s.pane_id
+                    .as_ref()
+                    .and_then(|pid| role_pane_ids.iter().position(|p| p == pid))
+                    .unwrap_or(usize::MAX)
+            });
+
+            let mut ui = default_ui();
+            ui.selected_index = None; // inactive on return
+            ui.last_active_selection = Some(1); // remembered role 1
+
+            // Mirror the real Enter path: resolve the restore target via the SSOT.
+            let target = dashboard_focus_target(&ui, filtered.len());
+            assert_eq!(
+                target,
+                Some(1),
+                "precondition: the restore target is the remembered role 1"
+            );
+            let selected_id: Option<String> = target
+                .and_then(|i| filtered.get(i))
+                .map(|(id, _)| (*id).clone());
+
+            dispatch_action(
+                Action::Focus,
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &filtered,
+                selected_id.as_deref(),
+                Rect::new(0, 0, 80, 24),
+            );
+            assert_eq!(
+                ui.selected_index,
+                Some(1),
+                "Enter on the ORCHESTRATION deck must paint the highlight \
+                 (set selected_index) on the restored role, not leave it None"
+            );
+        }
+
+        // ---- Dashboard deck (must hold the SAME — unified behavior). ----
+        {
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let snapshot = dashboard_snapshot(3);
+            let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+            let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+            filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+            let mut ui = default_ui();
+            ui.selected_index = None;
+            ui.last_active_selection = Some(1);
+
+            let target = dashboard_focus_target(&ui, filtered.len());
+            let selected_id: Option<String> = target
+                .and_then(|i| filtered.get(i))
+                .map(|(id, _)| (*id).clone());
+
+            dispatch_action(
+                Action::Focus,
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &filtered,
+                selected_id.as_deref(),
+                Rect::new(0, 0, 80, 24),
+            );
+            assert_eq!(
+                ui.selected_index,
+                Some(1),
+                "Enter on the DASHBOARD deck must paint the highlight on the restored card"
+            );
+        }
+    }
+
+    /// Scenario: PR #151 manual-test regression (UNIFIED deck behavior, Issue 2) —
+    /// after a tab round-trip with a remembered selection, the previously-selected
+    /// deck's PANE must be re-focused on return (so the remembered region is
+    /// shown) while the highlight stays clear (`selected_index == None`) until
+    /// Enter. Today the DASHBOARD re-focuses nothing on return (its
+    /// `selected_session_id` is cleared on leave and `restore_focus_on_switch_in`
+    /// returns `None`), reverting to the first card; the Orchestration deck
+    /// already re-focuses its remembered role pane. Pins the unified fix: the
+    /// Dashboard leave/return is symmetric with Orchestration. Consistent with
+    /// selection_013 (focused pane present on return, highlight `None`). RED today
+    /// for the Dashboard (no pane re-focused).
+    #[spec("dashboard/selection/018")]
+    #[test]
+    fn selection_018_return_refocuses_remembered_pane_both_decks() {
+        // ---- Dashboard (currently RED: focuses nothing on return). ----
+        {
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let (mode_idx, _side_ids) = tab_manager
+                .open_mode_tab(
+                    &mode_config_local("m", 1),
+                    "/work",
+                    "agent-m".to_string(),
+                    (24, 80),
+                )
+                .expect("open a mode tab");
+            assert!(tab_manager.switch_to(0)); // start on the Dashboard
+
+            let snapshot = dashboard_snapshot(3);
+
+            let mut ui = default_ui();
+            // Arm the dashboard on a non-first card (index 1 -> s1 -> pane p1).
+            ui.selected_index = Some(1);
+            if let Tab::Dashboard {
+                selected_session_id,
+            } = tab_manager.active_tab_mut()
+            {
+                *selected_session_id = Some("s1".to_string());
+            }
+
+            // Round-trip Dashboard -> Mode -> Dashboard.
+            switch_tab_with_focus(&mut tab_manager, mode_idx, &*pc, &snapshot, &mut ui);
+            switch_tab_with_focus(&mut tab_manager, 0, &*pc, &snapshot, &mut ui);
+
+            // The remembered card's pane is re-focused on return (symmetry with
+            // the Orchestration deck), so the remembered region is shown.
+            assert_eq!(
+                pc.focused.lock().unwrap().last().map(String::as_str),
+                Some("p1"),
+                "the Dashboard must re-focus the remembered card's pane (p1) on return, \
+                 like the Orchestration deck"
+            );
+            // Highlight stays inactive on return (SC1; consistent with
+            // selection_011/013/015).
+            assert_eq!(
+                ui.selected_index, None,
+                "the highlight stays inactive on return (no re-arm)"
+            );
+        }
+
+        // ---- Orchestration (already satisfies it — the target the Dashboard
+        // must match). ----
+        {
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let (orch_idx, role_pane_ids) = tab_manager
+                .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+                .expect("open an orchestration tab");
+            let (mode_idx, _side_ids) = tab_manager
+                .open_mode_tab(
+                    &mode_config_local("m", 1),
+                    "/work",
+                    "agent-m".to_string(),
+                    (24, 80),
+                )
+                .expect("open a mode tab");
+            assert!(tab_manager.switch_to(orch_idx)); // start on the Orchestration deck
+
+            let snapshot = AppState::default();
+
+            let mut ui = default_ui();
+            ui.selected_index = Some(1);
+            let r1 = role_pane_ids[1].clone();
+            if let Tab::Orchestration {
+                focused_role_pane_id,
+                ..
+            } = tab_manager.active_tab_mut()
+            {
+                *focused_role_pane_id = Some(r1.clone());
+            }
+
+            switch_tab_with_focus(&mut tab_manager, mode_idx, &*pc, &snapshot, &mut ui);
+            switch_tab_with_focus(&mut tab_manager, orch_idx, &*pc, &snapshot, &mut ui);
+
+            assert_eq!(
+                pc.focused.lock().unwrap().last().map(String::as_str),
+                Some(r1.as_str()),
+                "the Orchestration deck already re-focuses its remembered role pane on return"
+            );
+            assert_eq!(
+                ui.selected_index, None,
+                "the highlight stays inactive on return"
+            );
+        }
+    }
+
+    /// Scenario: PRD #113 / PR #151 real-app regression — the blue highlight must
+    /// NOT reappear after a Dashboard → Mode → Dashboard round-trip when the
+    /// restored focus is steady. A Mode tab's AGENT pane is also a Dashboard card
+    /// (only its side panes are in `all_managed_pane_ids`), and switching to a
+    /// Mode tab focuses that agent pane while the return to the Dashboard restores
+    /// nothing — so the agent pane STAYS focused. This drives the REAL per-frame
+    /// `reconcile_dashboard_selection` on both the mode frame and the return
+    /// dashboard frame with that SAME focused pane id (no transition); because the
+    /// focus did not change, the inactive selection stays inactive (`None`).
+    /// `selection_005`/`selection_011` cannot catch this (they drive
+    /// `dispatch_action` directly or pass `focused = None`, so the per-frame
+    /// reconcile never sees a steady-state focused dashboard card).
+    #[spec("dashboard/selection/013")]
+    #[test]
+    fn selection_013_steady_state_focus_does_not_reactivate() {
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        // A Mode tab whose AGENT pane id ("agent-m") is also a Dashboard card.
+        let (mode_idx, _side_ids) = tab_manager
+            .open_mode_tab(
+                &mode_config_local("m", 1),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open a mode tab");
+        // open_mode_tab leaves the mode tab active — start on the Dashboard.
+        assert!(tab_manager.switch_to(0));
+
+        let snapshot = AppState::default();
+        // Dashboard cards INCLUDE the Mode agent pane "agent-m" (card index 1) —
+        // exactly the real-app condition (the agent pane isn't filtered out).
+        let dash_filtered: [(&str, Option<&str>); 3] = [
+            ("s0", Some("p0")),
+            ("agent-sess", Some("agent-m")),
+            ("s2", Some("p2")),
+        ];
+
+        let mut ui = default_ui();
+        // Arm the highlight on the Dashboard (what the user sees before leaving).
+        ui.selected_index = Some(1);
+        if let Tab::Dashboard {
+            selected_session_id,
+        } = tab_manager.active_tab_mut()
+        {
+            *selected_session_id = Some("agent-sess".to_string());
+        }
+
+        // Switch Dashboard → Mode (leaving the Dashboard deactivates the highlight).
+        switch_tab_with_focus(&mut tab_manager, mode_idx, &*pc, &snapshot, &mut ui);
+        // Mode frame: the agent pane "agent-m" is focused; the per-frame reconcile
+        // records it as the focus baseline (a Mode tab doesn't touch the dashboard
+        // selection).
+        reconcile_dashboard_selection(
+            &mut ui,
+            tab_manager.active_tab_mut(),
+            Some("agent-m"),
+            &dash_filtered,
+        );
+
+        // Switch Mode → Dashboard. Nothing is restored, so "agent-m" STAYS focused.
+        switch_tab_with_focus(&mut tab_manager, 0, &*pc, &snapshot, &mut ui);
+        // Return dashboard frame: SAME focused pane "agent-m" as the mode frame —
+        // no focus TRANSITION — so the highlight must NOT reappear.
+        reconcile_dashboard_selection(
+            &mut ui,
+            tab_manager.active_tab_mut(),
+            Some("agent-m"),
+            &dash_filtered,
+        );
+
+        assert_eq!(
+            ui.selected_index, None,
+            "a steady-state restored focus (no transition) must not reactivate the highlight on tab return"
+        );
+    }
+
+    /// Scenario: PRD #113 M4 guard — the focus-transition fix must NOT
+    /// over-suppress legitimate reactivation. From an inactive selection, hold a
+    /// non-card pane focused across two frames (a steady-state baseline that does
+    /// NOT reactivate), then TRANSITION the focus to a dashboard card and confirm
+    /// the highlight reactivates on that card. This is distinct from
+    /// `selection_009` (which reactivates on the very first reconcile, a
+    /// transition from the `None` baseline): here the transition happens AFTER an
+    /// established steady-state baseline, proving the per-frame baseline tracking
+    /// still admits a genuine focus change.
+    #[spec("dashboard/selection/014")]
+    #[test]
+    fn selection_014_genuine_transition_after_steady_state_reactivates() {
+        let mut ui = default_ui();
+        ui.selected_index = None; // inactive
+        let mut tab = Tab::Dashboard {
+            selected_session_id: None,
+        };
+        let filtered: [(&str, Option<&str>); 3] =
+            [("s0", Some("p0")), ("s1", Some("p1")), ("s2", Some("p2"))];
+
+        // Steady-state baseline: a non-card pane ("side-x") stays focused across
+        // two frames — it never maps to a card, so the selection stays inactive.
+        reconcile_dashboard_selection(&mut ui, &mut tab, Some("side-x"), &filtered);
+        assert_eq!(ui.selected_index, None);
+        reconcile_dashboard_selection(&mut ui, &mut tab, Some("side-x"), &filtered);
+        assert_eq!(
+            ui.selected_index, None,
+            "a steady-state non-card focus must not reactivate the highlight"
+        );
+
+        // Genuine transition: focus moves to a dashboard card → reactivate.
+        reconcile_dashboard_selection(&mut ui, &mut tab, Some("p0"), &filtered);
+        assert_eq!(
+            ui.selected_index,
+            Some(0),
+            "a genuine focus transition to a card still reactivates the highlight (M4 preserved)"
+        );
+    }
+
+    /// Scenario: PRD #113 design revision (2026-06-13) Change 1 — SYMMETRIC
+    /// clearing across ALL tab switches, INCLUDING orchestration-to-orchestration.
+    /// The Orchestration deck shares `ui.selected_index` (derived from
+    /// `Tab::Orchestration.focused_role_pane_id` via `sync_and_derive_selection`),
+    /// and `reconcile_dashboard_selection`'s guard
+    /// (`focus_reactivates = focus_maps_to_card && focus_changed`) covers
+    /// `Tab::Dashboard | Tab::Orchestration`. Part 1 pins the orch → Dashboard →
+    /// orch round-trip (the destination restores the SAME role pane — a
+    /// steady-state focus, no transition). Part 2 (PR #151 follow-up) pins orch A
+    /// → orch B: the destination tab restores focus to a DIFFERENT role pane than
+    /// the source, so the first reconcile frame reads it as a focus TRANSITION
+    /// and re-arms the highlight unless the switch pre-seeds the focus baseline.
+    /// Both cases must leave `selected_index == None` on the destination.
+    #[spec("tabs/orchestration/003")]
+    #[test]
+    fn orchestration_003_highlight_clears_on_tab_round_trip() {
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (orch_a_idx, roles_a) = tab_manager
+            .open_orchestration_tab(&orch_config_local("orch-a"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab A");
+        let (orch_b_idx, roles_b) = tab_manager
+            .open_orchestration_tab(&orch_config_local("orch-b"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab B");
+
+        let snapshot = AppState::default();
+        let a1 = roles_a[1].clone();
+        // Tab B's start role — what `restore_focus_on_switch_in` focuses on
+        // switch-in (a DIFFERENT pane than tab A's `a1`).
+        let b_start = roles_b[0].clone();
+        // Each orchestration deck's filtered list maps each role to its pane id.
+        let orch_a_filtered: Vec<(&str, Option<&str>)> = roles_a
+            .iter()
+            .map(|p| (p.as_str(), Some(p.as_str())))
+            .collect();
+        let orch_b_filtered: Vec<(&str, Option<&str>)> = roles_b
+            .iter()
+            .map(|p| (p.as_str(), Some(p.as_str())))
+            .collect();
+
+        let mut ui = default_ui();
+
+        // ---- Part 1: orch A → Dashboard → orch A clears the highlight. ----
+        assert!(tab_manager.switch_to(orch_a_idx));
+        ui.selected_index = Some(1);
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = tab_manager.active_tab_mut()
+        {
+            *focused_role_pane_id = Some(a1.clone());
+        }
+        // Establish the focus baseline on tab A (focused = role 1).
+        reconcile_dashboard_selection(
+            &mut ui,
+            tab_manager.active_tab_mut(),
+            Some(a1.as_str()),
+            &orch_a_filtered,
+        );
+        // The restored steady-state focus on return must NOT re-arm it.
+        switch_tab_with_focus(&mut tab_manager, 0, &*pc, &snapshot, &mut ui);
+        switch_tab_with_focus(&mut tab_manager, orch_a_idx, &*pc, &snapshot, &mut ui);
+        reconcile_dashboard_selection(
+            &mut ui,
+            tab_manager.active_tab_mut(),
+            Some(a1.as_str()),
+            &orch_a_filtered,
+        );
+        assert_eq!(
+            ui.selected_index, None,
+            "orch → Dashboard → orch must clear the highlight (symmetric with the Dashboard)"
+        );
+
+        // ---- Part 2 (PR #151 follow-up): orch A → orch B clears the highlight. ----
+        // Re-arm on tab A and re-establish the baseline (focused = A's role 1).
+        assert!(tab_manager.switch_to(orch_a_idx));
+        ui.selected_index = Some(1);
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = tab_manager.active_tab_mut()
+        {
+            *focused_role_pane_id = Some(a1.clone());
+        }
+        reconcile_dashboard_selection(
+            &mut ui,
+            tab_manager.active_tab_mut(),
+            Some(a1.as_str()),
+            &orch_a_filtered,
+        );
+        // Switch DIRECTLY to ANOTHER orchestration tab. `restore_focus_on_switch_in`
+        // focuses tab B's start role (`b_start`) — a DIFFERENT pane than tab A's
+        // `a1`, so the reconcile reads it as a genuine focus transition and re-arms
+        // the highlight unless the switch pre-seeds the focus baseline to the
+        // restored pane.
+        switch_tab_with_focus(&mut tab_manager, orch_b_idx, &*pc, &snapshot, &mut ui);
+        reconcile_dashboard_selection(
+            &mut ui,
+            tab_manager.active_tab_mut(),
+            Some(b_start.as_str()),
+            &orch_b_filtered,
+        );
+        assert_eq!(
+            ui.selected_index, None,
+            "orch A → orch B must clear the highlight (a different restored role pane must not re-arm it)"
+        );
+    }
+
+    /// Scenario: PRD #113 design revision (2026-06-13) Change 2 — Enter restores
+    /// the previously-selected role on the Orchestration deck. The orchestration
+    /// deck routes Enter through the same `dashboard_focus_target` SSOT as the
+    /// Dashboard. Arm role 1, drive a REAL round-trip via a Mode tab (a non-deck
+    /// intermediate: Orchestration → Mode → Orchestration) which clears the live
+    /// highlight but must REMEMBER role 1, then assert the Enter focus target is
+    /// the remembered role (index 1), NOT role 0.
+    #[spec("tabs/orchestration/004")]
+    #[test]
+    fn orchestration_004_enter_restores_previous_role() {
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (orch_idx, role_pane_ids) = tab_manager
+            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .expect("open an orchestration tab");
+        let (mode_idx, _side_ids) = tab_manager
+            .open_mode_tab(
+                &mode_config_local("m", 1),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open a mode tab");
+        // Start on the Orchestration deck.
+        assert!(tab_manager.switch_to(orch_idx));
+
+        let snapshot = AppState::default();
+        let r1 = role_pane_ids[1].clone();
+        let role_count = role_pane_ids.len();
+
+        let mut ui = default_ui();
+        // Arm the orchestration highlight on the 2nd role (index 1).
+        ui.selected_index = Some(1);
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = tab_manager.active_tab_mut()
+        {
+            *focused_role_pane_id = Some(r1.clone());
+        }
+
+        // Round-trip via a Mode tab (a non-deck intermediate, so only the
+        // Orchestration-leave records the prior selection): Orch → Mode → Orch.
+        switch_tab_with_focus(&mut tab_manager, mode_idx, &*pc, &snapshot, &mut ui);
+        switch_tab_with_focus(&mut tab_manager, orch_idx, &*pc, &snapshot, &mut ui);
+
+        // SC1 still holds for the orchestration deck: no live highlight on return.
+        assert_eq!(
+            ui.selected_index, None,
+            "the orchestration highlight is cleared on return"
+        );
+
+        // THE REVISION: Enter on the orchestration deck with an inactive
+        // selection RESTORES the previously-selected role (index 1), NOT role 0.
+        assert_eq!(
+            dashboard_focus_target(&ui, role_count),
+            Some(1),
+            "Enter restores the previously-selected role (index 1), not role 0"
+        );
+    }
+
+    /// Scenario: Per-deck independence of the Enter-restore state. Open an
+    /// Orchestration deck with THREE roles, arm it on role 1, then leave to the
+    /// Dashboard (which records role 1 as the remembered selection) and arm the
+    /// Dashboard on card 2. Returning to the (now inactive) Orchestration deck,
+    /// Enter must restore the Orchestration's OWN previous role (index 1), NOT
+    /// the Dashboard's index 2. Today this FAILS: `last_active_selection` is a
+    /// single shared `UiState` field, so leaving the Dashboard clobbers the
+    /// orchestration's remembered 1 with the dashboard's 2, and
+    /// `dashboard_focus_target` returns the leaked index 2. Pins per-deck
+    /// storage of the remembered selection.
+    #[spec("tabs/orchestration/005")]
+    #[test]
+    fn orchestration_005_enter_restore_is_per_deck_not_leaked_from_dashboard() {
+        // A THREE-role orchestration so the dashboard's leaked index 2 is a
+        // valid role index — otherwise `dashboard_focus_target`'s clamp to
+        // `role_count - 1` would mask the leak by coincidentally yielding 1.
+        let three_role_orch = OrchestrationConfig {
+            name: "orch".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "echo orch".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    name: "coder".to_string(),
+                    command: "echo coder".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    name: "reviewer".to_string(),
+                    command: "echo reviewer".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        };
+
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        // TabManager::new seeds the Dashboard at index 0.
+        let dashboard_idx = 0;
+        let (orch_idx, role_pane_ids) = tab_manager
+            .open_orchestration_tab(&three_role_orch, "/work", None, None, (24, 80))
+            .expect("open an orchestration tab");
+        let role_count = role_pane_ids.len();
+        assert_eq!(
+            role_count, 3,
+            "test needs three roles for a distinguishable leak"
+        );
+
+        let snapshot = AppState::default();
+        let mut ui = default_ui();
+
+        // Start on the Orchestration deck and arm it on role 1.
+        assert!(tab_manager.switch_to(orch_idx));
+        ui.selected_index = Some(1);
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = tab_manager.active_tab_mut()
+        {
+            *focused_role_pane_id = Some(role_pane_ids[1].clone());
+        }
+
+        // Leave to the Dashboard (records the orchestration's role 1), then arm
+        // the Dashboard on card 2 (a DIFFERENT index).
+        switch_tab_with_focus(&mut tab_manager, dashboard_idx, &*pc, &snapshot, &mut ui);
+        ui.selected_index = Some(2);
+
+        // Return to the Orchestration deck. Leaving the Dashboard records its
+        // card 2 — into the SAME shared field, clobbering the orchestration's 1.
+        switch_tab_with_focus(&mut tab_manager, orch_idx, &*pc, &snapshot, &mut ui);
+
+        // The orchestration highlight is inactive on return (SC1).
+        assert_eq!(
+            ui.selected_index, None,
+            "the orchestration highlight is cleared on return"
+        );
+
+        // PER-DECK CONTRACT: Enter on the Orchestration deck restores the
+        // orchestration's OWN remembered role (index 1), NOT the Dashboard's
+        // leaked index 2.
+        assert_eq!(
+            dashboard_focus_target(&ui, role_count),
+            Some(1),
+            "Enter must restore the Orchestration deck's OWN previous role (1), \
+             not the Dashboard's selection (2) leaked through the shared \
+             last_active_selection field"
         );
     }
 
@@ -15608,10 +17340,16 @@ mod tests {
         }
     }
 
-    // PRD #107 regression: user-entered name in the new-pane form should
-    // override the orchestration config name so the tab title matches.
+    // PRD #107 / orchestration-identity fix: the user-entered name rides on
+    // `req.name` (which `dispatch_action` routes to the tab TITLE via
+    // `display_title`), while `req.orchestration_config.name` stays the
+    // canonical config name (the IDENTITY). The form must NOT clobber the
+    // config name — the override that used to do that was removed. The
+    // title/identity decoupling itself is covered end-to-end by
+    // `identity_001` (orchestration/identity/001); this test only pins the
+    // form handler's output.
     #[test]
-    fn orchestration_form_user_name_overrides_config_name() {
+    fn orchestration_form_user_name_rides_request_not_config() {
         let mut ui = default_ui();
         ui.mode = UiMode::NewPaneForm;
         ui.new_pane_form = Some(NewPaneFormState::new(
@@ -15645,19 +17383,19 @@ mod tests {
             other => panic!("Expected NewPane, got {:?}", other),
         };
 
-        // The form must carry the user's input in req.name.
+        // The form carries the user's input in req.name (later routed to the
+        // tab TITLE via display_title).
         assert_eq!(req.name, "user-typed-name");
 
-        // Simulate the handler fix (ui.rs Action::NewPane branch):
-        // when req.name is non-empty, orch_config.name is overridden before
-        // open_orchestration_tab is called, so the tab label matches user input.
-        let mut orch = req.orchestration_config.unwrap();
-        if !req.name.is_empty() {
-            orch.name = req.name.clone();
-        }
+        // The orchestration config name is left UNTOUCHED — it remains the
+        // canonical identity the daemon's delegate lookup compares. The form
+        // no longer overrides it (that override was removed by the
+        // orchestration-identity fix).
+        let orch = req.orchestration_config.expect("orchestration selected");
         assert_eq!(
-            orch.name, "user-typed-name",
-            "tab should show the user-entered name, not the TOML config name"
+            orch.name, "config-name",
+            "form must not clobber the config name; the user name rides req.name (the TITLE), \
+             while orch_config.name stays the canonical IDENTITY"
         );
     }
 
@@ -15689,11 +17427,10 @@ mod tests {
 
         assert!(req.name.is_empty());
 
-        // Simulate handler: empty name → no override → config name preserved.
-        let mut orch = req.orchestration_config.unwrap();
-        if !req.name.is_empty() {
-            orch.name = req.name.clone();
-        }
+        // With an empty form name there is no display title, so the tab falls
+        // back to the canonical config name. Either way the config name on the
+        // request is preserved — the form never overrides it.
+        let orch = req.orchestration_config.expect("orchestration selected");
         assert_eq!(
             orch.name, "config-name",
             "config name must be kept when the user left the Name field empty"
@@ -16530,5 +18267,206 @@ mod tests {
         assert_eq!(ui.stop_confirm_selected, 1);
         handle_stop_confirm_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut ui);
         assert_eq!(ui.stop_confirm_selected, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #107 regression — orchestration IDENTITY must be the canonical
+    // config name, NOT the new-pane form's display title (which defaults to
+    // the worktree dir basename). See orchestration/identity/001.
+    // -----------------------------------------------------------------------
+
+    /// A `PaneController` that records the `TabMembership` handed to every
+    /// `create_pane_with_options` call, so a test can read back the
+    /// orchestration IDENTITY that `open_orchestration_tab` stamped onto each
+    /// role pane — the exact string the daemon later compares in
+    /// `state::lookup_orchestration_role`.
+    struct CapturingPaneController {
+        next: std::sync::Mutex<u32>,
+        memberships: std::sync::Mutex<Vec<Option<TabMembership>>>,
+    }
+
+    impl CapturingPaneController {
+        fn new() -> Self {
+            Self {
+                next: std::sync::Mutex::new(0),
+                memberships: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The `name` of every `TabMembership::Orchestration` recorded —
+        /// i.e. the orchestration identity stamped on each role pane.
+        fn recorded_orchestration_names(&self) -> Vec<String> {
+            self.memberships
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|m| match m {
+                    Some(TabMembership::Orchestration { name, .. }) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    impl PaneController for CapturingPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            self.memberships
+                .lock()
+                .unwrap()
+                .push(opts.tab_membership.clone());
+            let mut n = self.next.lock().unwrap();
+            let id = format!("pane-{n}");
+            *n += 1;
+            let resolved = opts.display_name.unwrap_or("role").to_string();
+            Ok((id, resolved))
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "capturing"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Scenario: Submit the new-pane form for an orchestration opened in a
+    /// worktree whose dir basename (`dot-agent-deck-prd-113-foo`) differs from
+    /// the TOML config orchestration name (`dot-agent-deck`) — so the form's
+    /// Name field defaults to the basename while the loaded config still
+    /// carries the canonical name. Dispatch the real `Action::SpawnPane` that
+    /// the form produces and assert the IDENTITY stamped onto each role pane's
+    /// `TabMembership::Orchestration` (the value the daemon's delegate role
+    /// lookup compares) is the CANONICAL config name, not the basename, while
+    /// the tab TITLE still shows the basename. Pins the PRD #107 regression
+    /// fix: today the SpawnPane override stuffs the basename into
+    /// `orch_config.name`, so the identity is the basename and
+    /// `lookup_orchestration_role` misses (the `clear = true` respawn is
+    /// silently dropped in every worktree).
+    #[spec("orchestration/identity/001")]
+    #[test]
+    fn identity_001_orchestration_identity_is_config_name_not_form_title() {
+        const CONFIG_NAME: &str = "dot-agent-deck";
+        const FORM_TITLE: &str = "dot-agent-deck-prd-113-foo"; // worktree basename
+
+        // A worktree-like cwd whose basename differs from the config name.
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join(FORM_TITLE);
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+
+        // Canonical orchestration config as loaded from disk: name =
+        // "dot-agent-deck", a worker role `coder` with clear = true (the
+        // respawn the bug silently drops on each delegate).
+        let config = OrchestrationConfig {
+            name: CONFIG_NAME.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "echo orch".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    name: "coder".to_string(),
+                    command: "echo coder".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                },
+            ],
+        };
+
+        // The submitted new-pane form: its Name field defaults to the dir
+        // basename (transition_after_dir_pick), so req.name = FORM_TITLE while
+        // orchestration_config still carries the canonical CONFIG_NAME.
+        let req = NewPaneRequest {
+            dir: cwd.clone(),
+            name: FORM_TITLE.to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config),
+            seed_prompt: None,
+        };
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        // IDENTITY: every role pane's TabMembership must carry the canonical
+        // config name — the string the daemon's lookup_orchestration_role
+        // compares against the on-disk config's `o.name` to find the role
+        // (and thus honor clear = true). The form/basename title must NOT
+        // leak into this identity.
+        let identities = pc.recorded_orchestration_names();
+        assert!(
+            !identities.is_empty(),
+            "expected the orchestration to stamp a TabMembership identity on each role pane"
+        );
+        for identity in &identities {
+            assert_eq!(
+                identity, CONFIG_NAME,
+                "orchestration IDENTITY must be the canonical config name so \
+                 lookup_orchestration_role resolves and clear=true fires — not \
+                 the form/basename title {FORM_TITLE:?}"
+            );
+        }
+
+        // TITLE: the tab label still shows the user's form name (PRD #107).
+        match tm.active_tab() {
+            Tab::Orchestration { name, .. } => assert_eq!(
+                name, FORM_TITLE,
+                "tab TITLE should preserve the form/basename name (PRD #107)"
+            ),
+            _ => panic!("expected an Orchestration tab to be active after SpawnPane"),
+        }
     }
 }

@@ -92,32 +92,137 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 
 #### dashboard/selection
 
-##### dashboard/selection/001 — `j` / `Down` selects next card; wraps at end.
-- **Layer:** L2.
-- **Agent:** none (3 synthetic panes).
-- **Asserts:** selection indicator moves through cards in order and wraps to the first card after the last.
-- **Does not assert:** how the selection indicator is drawn beyond "present at card N".
-- **Platform coverage:** mac+linux.
+##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.
+- **Layer:** L1 (in-process `handle_normal_key` dispatch).
+- **Agent:** none (synthetic card count).
+- **Asserts:** starting active on card 0, `j` advances 0→1, `Down` advances 1→2, and `j` wraps 2→0; the selection stays active (`Some(idx)`) throughout.
+- **Does not assert:** how the highlight is drawn (covered by `dashboard/selection/010`); the inactive-start jump-to-first (`dashboard/selection/006`).
+- **Platform coverage:** mac+linux+windows.
 
-##### dashboard/selection/002 — `k` / `Up` selects previous card; wraps at start.
-- **Layer:** L2.
+##### dashboard/selection/002 — While the selection is active, `k` / `Up` selects the previous card and wraps at the start.
+- **Layer:** L1 (in-process `handle_normal_key` dispatch).
 - **Agent:** none.
-- **Asserts:** selection moves backwards and wraps from card 0 to the last card.
-- **Does not assert:** rendering of inactive cards.
-- **Platform coverage:** mac+linux.
+- **Asserts:** starting active on card 0, `k` wraps 0→2 and `Up` retreats 2→1; the selection stays active throughout.
+- **Does not assert:** the inactive-start jump-to-last (`dashboard/selection/007`).
+- **Platform coverage:** mac+linux+windows.
 
-##### dashboard/selection/003 — `1`–`9` jumps to card N and focuses its pane.
-- **Layer:** L2.
-- **Agent:** none.
-- **Asserts:** keystroke `3` (with 3+ cards) selects card index 2 and the corresponding agent pane gains the focus border.
+##### dashboard/selection/003 — `1`–`9` jumps to card N, focuses its pane, and activates the highlight — even when the selection was inactive.
+- **Layer:** L1 (in-process `focus_deck` dispatch).
+- **Agent:** none (3 synthetic sessions with pane ids).
+- **Asserts:** starting from an inactive selection, `focus_deck(1, …)` activates the highlight on index 1 (`Some(1)`), focuses that card's pane, and enters PaneInput mode.
 - **Does not assert:** what `0` or digits past the card count do (kept open until catalogued).
-- **Platform coverage:** mac+linux.
+- **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/selection/004 — `Esc` clears an active filter.
 - **Layer:** L2.
 - **Agent:** none.
 - **Asserts:** with the filter dialog populated, pressing `Esc` returns the visible cards to the unfiltered set.
 - **Does not assert:** filter dialog dismissal animation.
+- **Platform coverage:** mac+linux.
+
+##### dashboard/selection/005 — A tab switch away from the Dashboard and back clears the card highlight.
+- **Layer:** L1 (in-process `dispatch_action` tab-switch path + renderer).
+- **Agent:** none (a real second Mode tab; 3 synthetic dashboard cards).
+- **Asserts:** with the highlight active on card 2, driving `Action::CycleTabNext` then `Action::CycleTabPrev` leaves the dashboard selection inactive (`None`), and `render_dashboard_cards_to_buffer` paints no `▸` selection marker on any card.
+- **Does not assert:** the cyan focus border on embedded panes (unaffected); Mode/Orchestration tab side-pane focus (out of scope).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/006 — With the selection inactive, `j` jumps to the first card and activates the highlight.
+- **Layer:** L1 (in-process `handle_normal_key` dispatch).
+- **Agent:** none.
+- **Asserts:** from an inactive selection (`None`), `j` lands the highlight on the first card (`Some(0)`) and the selection becomes active.
+- **Does not assert:** the active-state next/wrap behaviour (`dashboard/selection/001`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/007 — With the selection inactive, `k` jumps to the last card and activates the highlight.
+- **Layer:** L1 (in-process `handle_normal_key` dispatch).
+- **Agent:** none.
+- **Asserts:** from an inactive selection (`None`) with 3 cards, `k` lands the highlight on the last card (`Some(2)`) and the selection becomes active.
+- **Does not assert:** the active-state prev/wrap behaviour (`dashboard/selection/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/008 — With the selection inactive, Enter restores the previously-selected card (not card 0).
+- **Layer:** L1 (in-process `switch_tab_with_focus` round-trip + `handle_normal_key` + `dashboard_focus_target`).
+- **Agent:** none (3 synthetic dashboard cards; a Mode tab as the round-trip intermediate).
+- **Asserts:** with the highlight armed on a non-first card (index 1), a real Dashboard → Mode → Dashboard round-trip clears the live highlight (`selected_index == None`) but the Enter focus target (`dashboard_focus_target`) is the REMEMBERED card (index 1), not card 0; Enter still maps to `Action::Focus`; the active-selection target is the highlighted card and the no-cards target is `None` (both unchanged). Pins the PRD #113 design revision (2026-06-13) Enter-restores-previous behavior.
+- **Does not assert:** the pane-focus side effect of `Action::Focus` itself (exercised by `dashboard/selection/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/009 — A focused dashboard pane reactivates the highlight on its card.
+- **Layer:** L1 (in-process `reconcile_dashboard_selection`).
+- **Agent:** none (3 synthetic `(session_id, pane_id)` pairs).
+- **Asserts:** from an inactive selection, reconciling with a focused pane that maps to card 1 activates the highlight on `Some(1)`; reconciling with no matching focused pane leaves the selection inactive.
+- **Does not assert:** how the focused pane id is obtained from the embedded controller (the per-frame `pane.focused_pane_id()` read).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/010 — Startup default: the dashboard is active on card 0 and paints its highlight.
+- **Layer:** L1 (in-process state + renderer).
+- **Agent:** none.
+- **Asserts:** a freshly-built `UiState` is active on card 0 (`Some(0)`); rendering with that selection paints the `▸` marker on the first card's title row, while rendering with an inactive selection (`None`) paints no marker.
+- **Does not assert:** the `Last: … Tools: …` card body (covered by `dashboard/pane/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/011 — Switching Dashboard → Orchestration → Dashboard leaves the selection inactive (SC1, any-other-tab path).
+- **Layer:** L1 (in-process `switch_tab_with_focus` + per-frame `reconcile_dashboard_selection`).
+- **Agent:** none (a real Orchestration tab; 3 synthetic dashboard cards).
+- **Asserts:** with the highlight armed on card 2, driving the real switch path to an Orchestration tab and back — running the real per-frame reconcile on each frame — leaves `selected_index == None`. Covers the path `selection/005` cannot (the Orchestration tab shares `selected_index` and its always-active reconcile re-arms `Some(0)` in transit, while deactivation fires only on Dashboard-leave).
+- **Does not assert:** Orchestration role-pane selection behaviour itself (covered by `tabs/selection/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/012 — An inactive selection makes the close-pane action a no-op (no fall back to card 0).
+- **Layer:** L1 (in-process `dispatch_action(Action::CloseSelected)`).
+- **Agent:** none (3 synthetic dashboard cards with pane ids).
+- **Asserts:** with `selected_index = None` (inactive, nothing armed), dispatching `Action::CloseSelected` issues no `close_pane` call and removes no session — it does NOT close card 0. Encodes the PRD invariant (inactive = nothing armed) alongside `dashboard/pane/003`.
+- **Does not assert:** the active-selection close behaviour, or mode/orchestration whole-tab teardown.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/013 — A steady-state restored focus must not reactivate the highlight after a tab round-trip.
+- **Layer:** L1 (in-process `switch_tab_with_focus` + per-frame `reconcile_dashboard_selection`).
+- **Agent:** none (a real Mode tab whose agent pane is also a Dashboard card; 3 synthetic cards).
+- **Asserts:** driving the real per-frame reconcile across a Dashboard → Mode → Dashboard round-trip, where the Mode agent pane stays focused on both the mode frame and the return dashboard frame (no focus transition), leaves `selected_index == None` — the blue highlight does not reappear. Regression for PR #151; this is the steady-state-focus path `selection_005`/`selection_011` cannot reach.
+- **Does not assert:** the cyan controller focus border (driven separately, unaffected).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/014 — A genuine focus transition after a steady-state baseline still reactivates the highlight (M4 not over-suppressed).
+- **Layer:** L1 (in-process `reconcile_dashboard_selection`).
+- **Agent:** none (3 synthetic `(session_id, pane_id)` pairs).
+- **Asserts:** from an inactive selection, holding a non-card pane focused across two frames keeps the selection inactive; then transitioning the focus to a dashboard card reactivates the highlight on that card (`Some(0)`). Guards that the focus-transition fix does not block legitimate M4 reactivation; distinct from `selection_009` (transition from the `None` baseline).
+- **Does not assert:** the active-selection derive path (covered by `dashboard/pane/005`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/015 — SC1 against the real binary: the highlight clears on a tab round-trip when the focused pane is a Mode agent pane that is also a dashboard card.
+- **Layer:** L2 (real `dot-agent-deck` binary in a PTY; vt100 grid scraping).
+- **Agent:** a Mode tab agent (fixture shell script) that self-posts `SessionStart` so its agent pane is also a dashboard card; no LLM tokens.
+- **Asserts:** with the highlight armed on the Dashboard (a `▸` marker present), switching away to the Mode tab and back to the Dashboard — where the Mode agent pane stays focused (steady state, no transition) and maps to a card — leaves NO `▸` selection marker on any card. This is the real-binary repro the L1 tests cannot provide (their mocks never restore focus to a Mode agent pane on return); pre-fix the steady-state focus re-armed the highlight.
+- **Does not assert:** the cyan controller focus border (driven separately, unaffected); the keyboard nav/wrap semantics (covered by `dashboard/selection/001`–`002`).
+- **Platform coverage:** mac+linux.
+
+##### dashboard/selection/016 — The inactive-selection close no-op (012) does NOT suppress closing an active Mode/Orchestration tab via Ctrl+W.
+- **Layer:** L1 (in-process `dispatch_action(Action::CloseSelected)` against a recording `PaneController`).
+- **Agent:** none (a real Mode tab, then a real Orchestration tab; no dashboard cards armed).
+- **Asserts:** with a Mode tab active and `selected_index == None`, dispatching `Action::CloseSelected` closes that tab (tab count drops back to the lone Dashboard); the same holds for an active Orchestration tab. Bounds the `dashboard/selection/012` no-op gate: the inactive-selection guard suppresses closing an unarmed dashboard CARD, but a Mode/Orchestration TAB still closes via Ctrl+W. Regression for the PR #151 e2e failure `e2e_render_contract::layout_002` (keyboard Ctrl+W stopped closing a Mode tab because the close routed through the inactive-selection gate).
+- **Does not assert:** the per-pane PTY teardown / role-pane stop (covered by the L2 `tabs/mode/002`, `tabs/orchestration/002`); the dashboard-card close no-op itself (covered by `dashboard/selection/012`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/017 — Enter (Action::Focus) paints the highlight on BOTH decks by setting `selected_index` to the restored target (unified deck behavior).
+- **Layer:** L1 (in-process `dispatch_action(Action::Focus)` against a recording `PaneController`).
+- **Agent:** none (a real Orchestration tab with placeholder role-pane sessions; 3 synthetic dashboard cards).
+- **Asserts:** with the deck inactive (`selected_index == None`) and a remembered selection (`last_active_selection == Some(1)`), dispatching `Action::Focus` (what Enter maps to) sets `ui.selected_index = Some(1)` — so the highlight paints — for the ORCHESTRATION deck AND the Dashboard. Pins the unified fix for the PR #151 manual-test regression where Enter never painted the highlight on the Orchestration deck (the role pane was already focused on return, so the reconcile focus-transition guard never re-armed it). Pre-fix RED: `Action::Focus` only focuses the pane and leaves `selected_index == None`.
+- **Does not assert:** the per-frame reconcile reactivation path (`dashboard/selection/009`/`014`); the focus side effect itself (`dashboard/selection/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/018 — On tab return, the previously-selected deck's PANE is re-focused while the highlight stays clear — symmetric across BOTH decks (unified deck behavior).
+- **Layer:** L1 (in-process `switch_tab_with_focus` round-trip + recording `PaneController`).
+- **Agent:** none (a real Mode tab as the round-trip intermediate; an Orchestration tab; 3 synthetic dashboard cards).
+- **Asserts:** after a Dashboard → Mode → Dashboard round-trip with a remembered selection (card index 1 → session `s1` → pane `p1`), the controller's last-focused pane is `p1` (the remembered card's pane is re-focused) AND `selected_index == None` (highlight clear). The Orchestration deck already satisfies this (it re-focuses its remembered role pane on return). Pins the unified fix making the Dashboard leave/return symmetric with Orchestration. Pre-fix RED for the Dashboard: it re-focuses nothing on return (its `selected_session_id` is cleared on leave), so the last-focused pane is the Mode pane, not `p1`. Consistent with `dashboard/selection/013` (focused pane present on return, highlight `None`).
+- **Does not assert:** the per-frame reconcile staying `None` under steady focus (covered by `dashboard/selection/013`); the scroll/viewport reveal of the remembered region.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/019 — Enter paints the selection highlight on the Orchestration deck after a tab round-trip (real binary).
+- **Layer:** L2 (real `dot-agent-deck` binary in a PTY; vt100 grid scraping; `e2e` feature).
+- **Agent:** none (an orchestration with two `cat` role panes that stay alive as deck cards; no LLM tokens).
+- **Asserts:** open the orchestration, detach to Normal mode, arm a role with `j` (a `▸` marker appears), round-trip Orchestration → Dashboard → Orchestration (the `▸` clears), then press Enter — the `▸` selection marker must reappear on the restored role. This is the real-binary repro of the PR #151 manual-test regression the L1 mocks missed (they never run the real reconcile + focus-restore on an orchestration tab): pre-fix the role pane is already focused on return, so Enter is not a focus transition and the highlight never repaints (the final wait times out).
+- **Does not assert:** which role index is restored; the cyan controller focus border; the Dashboard's own Enter-paint (already worked via the reconcile transition and is covered at L1 by `dashboard/selection/017`).
 - **Platform coverage:** mac+linux.
 
 #### dashboard/filter
@@ -567,6 +672,27 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Asserts:** tab disappears; the daemon no longer carries the role agents.
 - **Does not assert:** the order in which roles are closed.
 - **Platform coverage:** mac+linux.
+
+##### tabs/orchestration/003 — Switching tabs clears the Orchestration deck highlight across ALL tab switches, including orchestration-to-orchestration.
+- **Layer:** L1 (in-process `switch_tab_with_focus` + per-frame `reconcile_dashboard_selection`).
+- **Agent:** none (two real Orchestration tabs, two roles each).
+- **Asserts:** with the orchestration highlight armed on role 1 and the focus baseline established, the highlight is inactive (`selected_index == None`) on the destination after a real round-trip plus the real per-frame reconcile, in BOTH cases: (Part 1) Orchestration → Dashboard → Orchestration — the destination restores the SAME role pane (steady-state focus, no transition); and (Part 2, PR #151 follow-up) Orchestration A → Orchestration B — the destination restores a DIFFERENT role pane than the source, which the first reconcile frame would otherwise read as a focus transition and re-arm. Pins the PRD #113 design revision (2026-06-13) Change 1 (symmetric clearing); analog of `dashboard/selection/011`/`013`.
+- **Does not assert:** the cyan controller focus border (driven separately, unaffected); the orchestrator's spawn-time role prompt.
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/orchestration/004 — Enter restores the previously-selected role on the Orchestration deck (not role 0).
+- **Layer:** L1 (in-process `switch_tab_with_focus` round-trip + `dashboard_focus_target`).
+- **Agent:** none (a real Orchestration tab with two roles; a Mode tab as the round-trip intermediate).
+- **Asserts:** with the orchestration highlight armed on role 1, a real Orchestration → Mode → Orchestration round-trip clears the live highlight (`selected_index == None`) but the Enter focus target (`dashboard_focus_target`, the same SSOT the Dashboard uses) is the REMEMBERED role (index 1), not role 0. Pins the PRD #113 design revision (2026-06-13) Change 2 (Enter restores previous) for the Orchestration deck.
+- **Does not assert:** the pane-focus side effect of activating the role; the active-selection target.
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/orchestration/005 — Enter restore is per-deck: the Orchestration deck restores ITS OWN previous role, not a Dashboard selection leaked through shared state.
+- **Layer:** L1 (in-process `switch_tab_with_focus` round-trip + `dashboard_focus_target`).
+- **Agent:** none (a real Orchestration tab with three roles; the Dashboard as the round-trip intermediate).
+- **Asserts:** arm the Orchestration deck on role 1, leave to the Dashboard, arm the Dashboard on card 2, then return to the (now inactive) Orchestration deck — Enter restores the Orchestration's OWN remembered role (index 1), NOT the Dashboard's leaked index 2. Pins per-deck independence of the Enter-restore state (the remembered selection must be stored per deck, not in a single shared field). Complements `tabs/orchestration/004` (which restores via a non-deck Mode-tab intermediate that can't clobber the shared field).
+- **Does not assert:** the pane-focus side effect of activating the role; the Dashboard's own restore (covered by `dashboard/selection/008`).
+- **Platform coverage:** mac+linux+windows.
 
 #### tabs/selection
 
@@ -1124,6 +1250,15 @@ without depending on the config struct API.
 - **Asserts:** worker's pane gains an error line; no task is delivered to any role.
 - **Does not assert:** the daemon-side log entry.
 - **Platform coverage:** mac+linux.
+
+#### orchestration/identity
+
+##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).
+- **Layer:** L1 (in-process — dispatch the real `Action::SpawnPane` through `dispatch_action` against a recording `PaneController`; no daemon, no PTY).
+- **Agent:** none (stub role commands; orchestration_config carries `name = "dot-agent-deck"` with a `coder` role at `clear = true`).
+- **Asserts:** when the new-pane form's Name field defaults to the worktree basename (`dot-agent-deck-prd-113-foo`) while the config name is `dot-agent-deck`, every role pane's `TabMembership::Orchestration.name` (the IDENTITY the daemon's `lookup_orchestration_role` compares) equals the canonical config name `dot-agent-deck` — so the role resolves and `clear = true` respawn fires — while the tab TITLE (`Tab::Orchestration.name`) still shows the basename. Pre-fix the PRD #107 SpawnPane override copies the basename into `orch_config.name`, so the identity is the basename and the lookup misses.
+- **Does not assert:** the daemon-side `pane_orchestration_map` recording or the live delegate respawn (L2 path); the on-disk config reload inside `lookup_orchestration_role`.
+- **Platform coverage:** mac+linux+windows.
 
 #### orchestration/layout
 

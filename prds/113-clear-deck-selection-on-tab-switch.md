@@ -1,6 +1,6 @@
 # PRD #113: Clear deck selection highlight when switching tabs
 
-**Status**: Planning
+**Status**: Implemented
 **Priority**: Medium
 **Created**: 2026-05-24
 **GitHub Issue**: [#113](https://github.com/vfarcic/dot-agent-deck/issues/113)
@@ -21,12 +21,21 @@ Behavior:
 
 - **After tab switch away from Dashboard and back**: no card has the blue background (selection inactive).
 - **`1`-`9`**: selects (and focuses) that numbered card — unchanged from today, also activates the highlight.
-- **Enter**: when selection is inactive, focuses card 1 (first card). When active, focuses the highlighted card (current behavior).
+- **Enter**: when selection is inactive, **restores the previously-selected deck** (re-selects, highlights, and focuses whichever card was selected before the tab switch). When active, focuses the highlighted card (current behavior). See Design Revision below.
 - **`j`**: jumps to the first card and activates the highlight.
 - **`k`**: jumps to the last card and activates the highlight.
 - Once active, `j`/`k` navigate normally and the highlight persists until the next tab-switch away.
 
 Mode tab side-pane behavior is unchanged.
+
+### Design Revision — 2026-06-13 (post-implementation manual-test feedback)
+
+After the initial implementation, manual testing surfaced two behaviors the user expected that the original PRD did not specify. Both are now in scope for this PRD/PR:
+
+1. **Symmetric clearing across decks.** Switching tabs must clear the active selection highlight on **both** the Dashboard **and** the Orchestration deck, so the two behave consistently. (Originally the Orchestration tab's role selection was declared out of scope; it is now in scope for the clear-on-tab-switch behavior.)
+2. **Enter restores the previously-selected deck.** When a deck has no active highlight (e.g. just after returning from another tab), pressing Enter must re-select, highlight, and focus **whichever card/role was selected before the tab switch** — not jump to the first card. This requires *remembering* the prior selection rather than discarding it (the initial implementation cleared it). This applies to both the Dashboard and the Orchestration deck.
+
+`j`/`k`/`1`-`9` behavior is unchanged by this revision (they still jump-to-first/last/N and activate). The focus-transition reactivation guard added during implementation (highlight reactivates only on a genuine focus change, not on focus restored by the tab switch) remains in force; remembering the prior selection must not re-introduce the auto-reactivation it prevents.
 
 ## Scope
 
@@ -42,7 +51,7 @@ Mode tab side-pane behavior is unchanged.
 ### Out of Scope
 
 - Mode tab side-pane focus model — already correct.
-- Orchestration tab role selection — already separate state.
+- ~~Orchestration tab role selection — already separate state.~~ **Now in scope** (Design Revision 2026-06-13): the clear-on-tab-switch and Enter-restores-previous behaviors apply to the Orchestration deck too.
 - Any change to PaneInput-mode behavior or `focus_deck` semantics.
 - Mouse selection behavior.
 
@@ -55,11 +64,11 @@ Mode tab side-pane behavior is unchanged.
 
 ## Milestones
 
-- [ ] **M1 — Selection becomes optional**: `UiState` carries an "inactive" state for the dashboard selection; renderer paints blue bg only when active. Default state on startup remains "active at index 0" (no behavior change on first launch).
-- [ ] **M2 — Tab switch clears highlight**: Tab / BackTab / Left / Right / `h` / `l` deactivate the selection. Switching back to the Dashboard shows no blue card until the user acts.
-- [ ] **M3 — Key handlers updated**: `j` → first + activate; `k` → last + activate; Enter → first when inactive, otherwise focuses highlighted card; `1`-`9` unchanged but explicitly activates the highlight.
-- [ ] **M4 — Focused-pane sync still works**: When the embedded controller's focused pane corresponds to a dashboard session, the highlight reactivates on that card.
-- [ ] **M5 — Tests pass**: Unit tests cover the inactive-on-tab-switch, jump-to-first/last, Enter-fallback, and 1-9 paths. Existing dashboard tests still pass.
+- [x] **M1 — Selection becomes optional**: `UiState` carries an "inactive" state for the dashboard selection; renderer paints blue bg only when active. Default state on startup remains "active at index 0" (no behavior change on first launch).
+- [x] **M2 — Tab switch clears highlight**: Tab / BackTab / Left / Right / `h` / `l` deactivate the selection. Switching back to the Dashboard shows no blue card until the user acts.
+- [x] **M3 — Key handlers updated**: `j` → first + activate; `k` → last + activate; Enter → first when inactive, otherwise focuses highlighted card; `1`-`9` unchanged but explicitly activates the highlight.
+- [x] **M4 — Focused-pane sync still works**: When the embedded controller's focused pane corresponds to a dashboard session, the highlight reactivates on that card.
+- [x] **M5 — Tests pass**: Unit tests cover the inactive-on-tab-switch, jump-to-first/last, Enter-fallback, and 1-9 paths. Existing dashboard tests still pass.
 
 ## Success Criteria
 

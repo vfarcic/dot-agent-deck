@@ -408,7 +408,9 @@ fn pane_005_highlight_follows_selected_session_id() {
     ];
     let buffer = render_dashboard_cards_to_buffer(
         &cards,
-        selected_index,
+        // PRD #113: the renderer now takes an active/inactive `Option<usize>`;
+        // `Some(idx)` paints the highlight on that card.
+        Some(selected_index),
         CardDensityKind::Normal,
         0, // animation tick
         80,
@@ -631,7 +633,9 @@ fn layout_001_seven_decks_fit_single_column() {
     let names: Vec<String> = (1..=visible).map(|i| format!("deck-{i}")).collect();
     let cards: Vec<(&SessionState, Option<&str>)> =
         names.iter().map(|n| (&session, Some(n.as_str()))).collect();
-    let buffer = render_dashboard_cards_to_buffer(&cards, usize::MAX, density, 0, 64);
+    // PRD #113: `selected` is `Option<usize>`; this capacity test highlights
+    // nothing, so pass `None` (the old out-of-range `usize::MAX` sentinel).
+    let buffer = render_dashboard_cards_to_buffer(&cards, None, density, 0, 64);
     let text = buffer_to_text(&buffer);
     assert!(
         text.contains("deck-7"),

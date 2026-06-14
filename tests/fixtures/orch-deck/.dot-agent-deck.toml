@@ -1,0 +1,18 @@
+# Fixture for the L2 orchestration-deck selection test
+# (dashboard/selection/019). Defines a single orchestration with TWO roles so
+# the new-pane form exposes an `[Orch: demo-orch]` chip; selecting it opens an
+# Orchestration tab with two role cards (Dashboard + Orchestration = the ≥2
+# tabs the round-trip needs). Each role runs `cat`, which stays alive on stdin
+# so the role panes remain open (and rendered as deck cards) for the whole
+# test. No real LLM tokens spent.
+[[orchestrations]]
+name = "demo-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+start = true
+
+[[orchestrations.roles]]
+name = "worker"
+command = "cat"

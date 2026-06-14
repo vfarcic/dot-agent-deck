@@ -327,10 +327,16 @@ impl TabManager {
     /// `None`); Orchestration tabs focus their remembered role pane (or
     /// the start role pane). A remembered id that no longer exists in the
     /// tab's live pane set is cleared and the default is focused instead
-    /// (stale-id fallback). Dashboard is a no-op — it has no fixed pane
-    /// to focus and its card selection is derived from
-    /// `selected_session_id` each frame.
-    pub fn restore_focus_on_switch_in(&mut self) {
+    /// (stale-id fallback). Dashboard is a no-op HERE — its selection is keyed by
+    /// session id, not a pane id, and `TabManager` carries no session→pane map, so
+    /// its remembered card is re-focused by `switch_tab_with_focus` (which has the
+    /// live snapshot) instead. The two decks are otherwise symmetric: each keeps
+    /// its remembered selection on leave and re-focuses it on return.
+    /// Returns the pane id focus was restored to (if any) so callers can keep a
+    /// focus baseline in sync — PRD #113 (PR #151) uses it to pre-seed
+    /// `UiState.last_focused_pane_id`, so the switch-induced focus change isn't
+    /// read as a reactivating user transition by the next reconcile frame.
+    pub fn restore_focus_on_switch_in(&mut self) -> Option<String> {
         let target: Option<String> = match &mut self.tabs[self.active_index] {
             Tab::Dashboard { .. } => None,
             Tab::Mode {
@@ -377,9 +383,10 @@ impl TabManager {
                 })
             }
         };
-        if let Some(id) = target {
-            let _ = self.pane_controller.focus_pane(&id);
+        if let Some(id) = target.as_ref() {
+            let _ = self.pane_controller.focus_pane(id);
         }
+        target
     }
 
     pub fn show_tab_bar(&self) -> bool {
@@ -459,6 +466,16 @@ impl TabManager {
         config: &OrchestrationConfig,
         cwd: &str,
         orchestrator_prompt: Option<String>,
+        // PRD #107 / orchestration-identity fix: the user's form name (the
+        // name typed or accepted in the new-pane form — usually the dir
+        // basename). Routed to the tab TITLE only (`Tab::Orchestration.name`,
+        // rendered by `Tab::label`); when `None`/empty the title falls back
+        // to the resolved canonical name. The orchestration IDENTITY stamped
+        // on every role pane's `TabMembership` is ALWAYS derived from
+        // `resolve_orchestration_name(&config.name, cwd)` — never from this
+        // title — so the daemon's delegate role lookup compares against the
+        // canonical on-disk config name (see the in-body comment below).
+        display_title: Option<&str>,
         // PRD #76 M2.15: initial PTY dims for every role pane in this
         // orchestration. The caller computes these from
         // `terminal.get_frame().area()` + the dashboard-layout helper, so
@@ -486,6 +503,20 @@ impl TabManager {
         // would never match the role's `prompt_template` for
         // unnamed orchestrations.
         let resolved_name = resolve_orchestration_name(&config.name, std::path::Path::new(cwd));
+
+        // PRD #107 / orchestration-identity fix: decouple the display TITLE
+        // from the orchestration IDENTITY. `resolved_name` is the canonical
+        // identity (config name, or the cwd-basename fallback for an unnamed
+        // orchestration — matching `load_project_config`'s normalization so
+        // the daemon's `lookup_orchestration_role` resolves the role and its
+        // `clear`/`prompt_template`). The `title` is purely cosmetic and may
+        // be the user's form name. Pre-fix these were one field, so the
+        // form/basename leaked into the identity and broke the delegate
+        // respawn in every worktree whose basename != the config name.
+        let title = match display_title {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => resolved_name.clone(),
+        };
 
         // PRD #76 M2.12: tag each role pane with its orchestration tab
         // membership so the daemon-side registry can echo it back via
@@ -539,7 +570,10 @@ impl TabManager {
 
         self.tabs.push(Tab::Orchestration {
             id,
-            name: resolved_name,
+            // Display TITLE only (see `title` above). The IDENTITY lives on
+            // each role pane's `TabMembership::Orchestration.name`, which used
+            // `resolved_name`.
+            name: title,
             role_pane_ids: role_pane_ids.clone(),
             role_statuses: vec![OrchestrationRoleStatus::Waiting; config.roles.len()],
             cwd: cwd.to_string(),
@@ -1072,7 +1106,7 @@ mod tests {
             )
             .expect("open mode tab");
         let (orch_idx, role_ids) = tm
-            .open_orchestration_tab(&orch_config("orch"), "/work", None, (24, 80))
+            .open_orchestration_tab(&orch_config("orch"), "/work", None, None, (24, 80))
             .expect("open orchestration tab");
 
         // Stamp a distinct remembered id onto each tab variant.
@@ -1324,7 +1358,7 @@ mod tests {
             )
             .expect("open background mode tab");
         let (bg_orch, bg_roles) = tm
-            .open_orchestration_tab(&orch_config("bg-orch"), "/work", None, (24, 80))
+            .open_orchestration_tab(&orch_config("bg-orch"), "/work", None, None, (24, 80))
             .expect("open background orchestration tab");
         let (active_mode, active_sides) = tm
             .open_mode_tab(
@@ -1447,7 +1481,7 @@ mod tests {
             )
             .expect("mode 2");
         let (orch, role_ids) = tm
-            .open_orchestration_tab(&orch_config("orch"), "/work", None, (24, 80))
+            .open_orchestration_tab(&orch_config("orch"), "/work", None, None, (24, 80))
             .expect("orch");
 
         // Land on mode-1 and focus its side pane #1.
