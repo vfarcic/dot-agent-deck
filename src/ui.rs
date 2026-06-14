@@ -13328,6 +13328,60 @@ mod tests {
     }
 
     #[test]
+    fn build_pane_status_keys_by_pane_id_and_excludes_pane_less() {
+        // PRD #155 (R2): `build_pane_status` is the M3 deck/pane border join —
+        // the map render_frame uses to color each managed pane by its agent
+        // status. Guard the join directly: every pane-bearing session maps its
+        // `pane_id` to its own status, and a pane-less session (`pane_id ==
+        // None`) is dropped. Two pane-bearing sessions carry DISTINCT statuses
+        // so a broken key can't silently swap colors or leave a managed pane on
+        // the dimmed (idle) border.
+        let mut working = make_session(SessionStatus::Working);
+        working.session_id = "s-working".into();
+        working.pane_id = Some("pane-w".into());
+
+        let mut waiting = make_session(SessionStatus::WaitingForInput);
+        waiting.session_id = "s-waiting".into();
+        waiting.pane_id = Some("pane-y".into());
+
+        // Pane-less: distinct status (Thinking) so its absence is unambiguous.
+        let mut paneless = make_session(SessionStatus::Thinking);
+        paneless.session_id = "s-paneless".into();
+        paneless.pane_id = None;
+
+        let mut state = AppState::default();
+        state.sessions.insert("s-working".into(), working);
+        state.sessions.insert("s-waiting".into(), waiting);
+        state.sessions.insert("s-paneless".into(), paneless);
+
+        let map = build_pane_status(&state);
+
+        // Exactly the two pane-bearing sessions appear, each keyed by its own
+        // pane id and mapped to its own status.
+        assert_eq!(
+            map.len(),
+            2,
+            "only pane-bearing sessions appear in the join"
+        );
+        assert_eq!(
+            map.get("pane-w"),
+            Some(&SessionStatus::Working),
+            "the working pane keeps its working status"
+        );
+        assert_eq!(
+            map.get("pane-y"),
+            Some(&SessionStatus::WaitingForInput),
+            "the waiting pane keeps its waiting status"
+        );
+        // The pane-less session contributes no key (no pane to color) — and its
+        // Thinking status never leaks into the map.
+        assert!(
+            !map.values().any(|s| *s == SessionStatus::Thinking),
+            "the pane-less session must be absent from the join"
+        );
+    }
+
+    #[test]
     fn test_render_empty_state() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();

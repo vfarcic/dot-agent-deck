@@ -1549,11 +1549,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** runtime rendering behavior (covered by `theme/guard/001` and `theme/contrast/001`); absolute colors in other source files.
 - **Platform coverage:** mac+linux+windows.
 
-##### theme/guard/003 — The deck-card and embedded-pane render paths resolve colors through the centralized palette, not inline status literals (source lint).
+##### theme/guard/003 — The deck-card, embedded-pane and stats-bar render paths resolve colors through the centralized palette, not inline status literals (source lint).
 - **Layer:** L1 (source lint — reads `src/ui.rs` and `src/terminal_widget.rs` from disk; no rendering).
 - **Agent:** none.
-- **Asserts:** both render paths reference the centralized `palette`; the deck-card status mapping (`status_style`) and border resolver (`render_session_card`) in `src/ui.rs` carry no inline status/accent `Color::Green/Blue/Yellow/Red/Cyan`/`Color::Magenta` literals; and the embedded-pane path (`src/terminal_widget.rs`) carries no inline status `Color::Green/Blue/Yellow/Red` literal — the palette is the single source of truth (PRD #155 M4 tightening).
-- **Does not assert:** the palette module's exact API/shape (the rendered-color tests `theme/palette/001-004` cover behavior); absolute backgrounds (covered by `theme/guard/002`); inline literals in render paths other than the deck-card/pane status borders.
+- **Asserts:** both render paths reference the centralized `palette`; the deck-card status mapping (`status_style`) and border resolver (`render_session_card`) in `src/ui.rs` carry no inline status/accent `Color::Green/Blue/Yellow/Red/Cyan`/`Color::Magenta` literals; the embedded-pane path (`src/terminal_widget.rs`) carries no inline status `Color::Green/Blue/Yellow/Red` literal; and the stats bar (`render_stats_bar` in `src/ui.rs`) carries no inline status `Color::Green/Blue/Yellow/Red` literal — the palette is the single source of truth (PRD #155 M4 tightening).
+- **Does not assert:** the palette module's exact API/shape (the rendered-color tests `theme/palette/001-004` cover behavior); absolute backgrounds (covered by `theme/guard/002`); the stats bar's legitimate non-status `Color::Cyan` (active-count) and `Color::LightMagenta` (mode-label) accents, which are not status roles; inline literals in render paths other than the deck-card/pane/stats-bar status colors.
 - **Platform coverage:** mac+linux+windows.
 
 #### theme/palette

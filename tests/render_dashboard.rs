@@ -608,11 +608,12 @@ fn fn_region<'a>(src: &'a str, signature: &str) -> &'a str {
 /// embedded-pane render path (`src/terminal_widget.rs`): both must reference the
 /// centralized `palette`, the deck-card status mapping (`status_style`) and
 /// border resolver (`render_session_card`) must carry no inline status/accent
-/// `Color::Green/Blue/Yellow/Red/Cyan` literals, and the pane path must carry no
-/// inline status `Color::Green/Blue/Yellow/Red` literal. This is the M4
-/// tightening — the palette is the single source of truth. RED today because no
-/// `palette` exists, `status_style` hardcodes the status colors and
-/// `render_session_card` hardcodes the selection Cyan.
+/// `Color::Green/Blue/Yellow/Red/Cyan` literals, the pane path must carry no
+/// inline status `Color::Green/Blue/Yellow/Red` literal, and the stats bar
+/// (`render_stats_bar`) must carry no inline status `Color::Green/Blue/Yellow/Red`
+/// literal — its non-status `Cyan` (active-count) and `LightMagenta` (mode-label)
+/// accents stay legal. This is the M4 tightening: the palette is the single
+/// source of truth for every status color across all render paths.
 #[spec("theme/guard/003")]
 #[test]
 fn guard_003_render_paths_use_palette_roles() {
@@ -673,6 +674,20 @@ fn guard_003_render_paths_use_palette_roles() {
         assert!(
             !pane.contains(lit),
             "src/terminal_widget.rs still hardcodes inline `{lit}` — pane status colors must come from the palette"
+        );
+    }
+
+    // (5) The stats bar's per-status segments carry no inline STATUS literal —
+    //     every status color (working/thinking/compacting/waiting/error) routes
+    //     through `palette::status_color`. Only the four status roles are
+    //     checked here: `render_stats_bar` legitimately keeps the non-status
+    //     `Color::Cyan` (active-count header) and `Color::LightMagenta`
+    //     (mode label) accents, which are NOT status roles and must stay.
+    let stats = fn_region(&ui, "fn render_stats_bar");
+    for lit in ["Color::Green", "Color::Blue", "Color::Yellow", "Color::Red"] {
+        assert!(
+            !stats.contains(lit),
+            "render_stats_bar still hardcodes inline `{lit}` — status segment colors must come from the palette"
         );
     }
 }
