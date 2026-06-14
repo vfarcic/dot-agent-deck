@@ -513,10 +513,13 @@ impl TabManager {
         // be the user's form name. Pre-fix these were one field, so the
         // form/basename leaked into the identity and broke the delegate
         // respawn in every worktree whose basename != the config name.
-        let title = match display_title {
-            Some(t) if !t.is_empty() => t.to_string(),
-            _ => resolved_name.clone(),
-        };
+        // Normalise the user-typed form name once: `None`/empty collapses to
+        // `None` so both the local title and the persisted membership fall
+        // back to the canonical `resolved_name`.
+        let display_title_owned = display_title.filter(|t| !t.is_empty()).map(str::to_string);
+        let title = display_title_owned
+            .clone()
+            .unwrap_or_else(|| resolved_name.clone());
 
         // PRD #76 M2.12: tag each role pane with its orchestration tab
         // membership so the daemon-side registry can echo it back via
@@ -535,6 +538,10 @@ impl TabManager {
                     // so the daemon can disambiguate two unnamed
                     // orchestrations whose basenames collide.
                     orchestration_cwd: Some(cwd.to_string()),
+                    // PRD #107 follow-up: persist the user-typed title on
+                    // every role pane so reattach restores it (see the
+                    // hydration path in `open_orchestration_tab_with_existing_role_panes`).
+                    display_title: display_title_owned.clone(),
                 }),
                 rows: spawn_rows,
                 cols: spawn_cols,
@@ -642,6 +649,13 @@ impl TabManager {
         config: &OrchestrationConfig,
         cwd: &str,
         role_pane_ids: Vec<Option<String>>,
+        // PRD #107 follow-up: the user-typed title the daemon echoed back on
+        // each role pane's `TabMembership::Orchestration.display_title`. Used
+        // for the tab TITLE so detach/reattach preserves the name the user
+        // entered; `None`/empty falls back to the canonical resolved name
+        // (the pre-fix behaviour). The IDENTITY still derives from
+        // `resolve_orchestration_name` below — this is title-only.
+        display_title: Option<&str>,
     ) -> Result<(usize, Vec<String>), TabError> {
         // M2.12 fixup auditor #3: this is a hydration-oriented API, so
         // mismatched lengths must surface as a `TabError` for the
@@ -687,7 +701,12 @@ impl TabManager {
 
         let start_role_index = config.roles.iter().position(|r| r.start).unwrap_or(0);
 
-        let name = resolve_orchestration_name(&config.name, std::path::Path::new(cwd));
+        // Title-only: prefer the user-typed title the daemon round-tripped,
+        // falling back to the canonical resolved name when absent/empty.
+        let name = display_title
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| resolve_orchestration_name(&config.name, std::path::Path::new(cwd)));
 
         self.tabs.push(Tab::Orchestration {
             id,
@@ -1086,6 +1105,57 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// Scenario: Create an orchestration with a user-typed name ("My Custom
+    /// Run") and confirm the tab shows it; then simulate detach/reattach via
+    /// the hydration entry point and confirm the user-typed title is
+    /// restored (PRD #107 follow-up — the daemon round-trips it on
+    /// `TabMembership::Orchestration.display_title`). Finally, reattach with
+    /// no persisted title and confirm the tab falls back to the canonical
+    /// config name, matching daemon-spawned/older-client behaviour.
+    #[test]
+    fn orchestration_010_reattach_preserves_user_title() {
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+
+        // Create: the user-typed form name becomes the tab title.
+        let (created_idx, _) = tm
+            .open_orchestration_tab(
+                &orch_config("orch"),
+                "/work",
+                None,
+                Some("My Custom Run"),
+                (24, 80),
+            )
+            .expect("create orchestration");
+        assert_eq!(tm.tab_labels()[created_idx], "My Custom Run");
+
+        // Reattach with the persisted title (the value the daemon
+        // round-trips via `TabMembership::Orchestration.display_title`): the
+        // tab keeps the user-typed name instead of the canonical config name.
+        let (reattach_idx, _) = tm
+            .open_orchestration_tab_with_existing_role_panes(
+                &orch_config("orch"),
+                "/work",
+                vec![Some("p0".into()), Some("p1".into())],
+                Some("My Custom Run"),
+            )
+            .expect("reattach with title");
+        assert_eq!(tm.tab_labels()[reattach_idx], "My Custom Run");
+
+        // Reattach without a persisted title falls back to the canonical
+        // resolved name (the config name) — the pre-fix behaviour preserved
+        // for daemon-spawned/older orchestrations.
+        let (fallback_idx, _) = tm
+            .open_orchestration_tab_with_existing_role_panes(
+                &orch_config("orch"),
+                "/work",
+                vec![Some("p0".into()), Some("p1".into())],
+                None,
+            )
+            .expect("reattach without title");
+        assert_eq!(tm.tab_labels()[fallback_idx], "orch");
     }
 
     /// Scenario: Give the Dashboard, a Mode tab, and an Orchestration tab

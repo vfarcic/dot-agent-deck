@@ -1530,6 +1530,7 @@ mod tests {
                 role_name: "coder".into(),
                 is_start_role: false,
                 orchestration_cwd: None,
+                display_title: None,
             }),
             agent_type: None,
         };
@@ -1551,6 +1552,7 @@ mod tests {
                         role_name: "coder".into(),
                         is_start_role: false,
                         orchestration_cwd: None,
+                        display_title: None,
                     })
                 );
             }
@@ -1574,6 +1576,7 @@ mod tests {
                 role_name: "coder".into(),
                 is_start_role: false,
                 orchestration_cwd: None,
+                display_title: None,
             }),
             agent_type: None,
             rows: 0,

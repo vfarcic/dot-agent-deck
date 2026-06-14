@@ -249,6 +249,16 @@ pub enum TabMembership {
         /// name-only, matching the pre-round-11 behavior.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orchestration_cwd: Option<String>,
+        /// PRD #107 follow-up: the user-typed orchestration name from the
+        /// new-pane form. Carried through the daemon round-trip so a
+        /// detach/reattach restores the displayed tab TITLE instead of
+        /// recomputing it from `resolve_orchestration_name` (config name or
+        /// cwd basename). The orchestration IDENTITY stays in `name` — this
+        /// is title-only and never feeds delegate/role lookups. `None` (the
+        /// common case for daemon-initiated/scheduled orchestrations and
+        /// older clients) means the title falls back to the canonical name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_title: Option<String>,
     },
 }
 
@@ -2463,6 +2473,7 @@ mod tests {
             role_name: "coder".into(),
             is_start_role: false,
             orchestration_cwd: Some("/proj/\0evil".into()),
+            display_title: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -2475,6 +2486,7 @@ mod tests {
             role_name: "coder".into(),
             is_start_role: false,
             orchestration_cwd: Some("/proj/\x1b[31m".into()),
+            display_title: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -2491,6 +2503,7 @@ mod tests {
             // or quietly collide with other orchs whose resolved
             // cwd happens to match.
             orchestration_cwd: Some("relative/proj".into()),
+            display_title: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -2504,6 +2517,7 @@ mod tests {
             role_name: "coder".into(),
             is_start_role: false,
             orchestration_cwd: Some(oversized),
+            display_title: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -2516,6 +2530,7 @@ mod tests {
             role_name: "coder".into(),
             is_start_role: false,
             orchestration_cwd: Some("/home/user/project-a".into()),
+            display_title: None,
         };
         assert!(validate_tab_membership(tm).is_some());
     }
@@ -2532,6 +2547,7 @@ mod tests {
             role_name: "coder".into(),
             is_start_role: false,
             orchestration_cwd: None,
+            display_title: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -2544,6 +2560,7 @@ mod tests {
             role_name: "coder".into(),
             is_start_role: false,
             orchestration_cwd: None,
+            display_title: None,
         };
         assert!(validate_tab_membership(tm).is_some());
     }
@@ -2560,6 +2577,7 @@ mod tests {
             role_name: "\x1b[31mpwn".into(),
             is_start_role: false,
             orchestration_cwd: None,
+            display_title: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -2572,6 +2590,7 @@ mod tests {
             role_name: "co\0der".into(),
             is_start_role: false,
             orchestration_cwd: None,
+            display_title: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -2587,6 +2606,7 @@ mod tests {
             role_name: String::new(),
             is_start_role: false,
             orchestration_cwd: None,
+            display_title: None,
         };
         assert!(validate_tab_membership(tm).is_some());
     }

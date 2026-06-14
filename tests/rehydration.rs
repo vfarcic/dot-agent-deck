@@ -956,6 +956,7 @@ async fn dead_role_stays_visible_on_reconnect_as_placeholder_card() {
                     role_name: (*role_name).to_string(),
                     is_start_role: role_index == 0,
                     orchestration_cwd: Some(cwd.clone()),
+                    display_title: None,
                 }),
                 ..Default::default()
             })
