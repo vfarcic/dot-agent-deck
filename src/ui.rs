@@ -4782,6 +4782,11 @@ fn dispatch_action(
                     // identity stays the canonical `orch_config.name`.
                     let display_title = (!req.name.is_empty()).then(|| req.name.clone());
                     let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
+                    // PRD #89 M2b.2: keep a copy of the prepared prompt for the
+                    // capture snapshot below — `prompt` itself is moved into
+                    // `open_orchestration_tab`. Empty when the orchestration
+                    // had no prompt.
+                    let captured_prompt = prompt.clone().unwrap_or_default();
                     // PRD #76 M2.15: pre-compute spawn dims using
                     // the orchestration-layout helper (right 66%
                     // column, matching the orchestration
@@ -4864,13 +4869,46 @@ fn dispatch_action(
                                 ui.pane_names
                                     .insert(role_pane_ids[i].clone(), role.name.clone());
                             }
+                            let start_idx =
+                                orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                            // PRD #89 M2b.2 — capture the orchestration metadata
+                            // onto the START (orchestrator) role pane so the
+                            // daemon-empty restore path can rebuild the whole tab
+                            // (orchestrator + role panes in display order, the
+                            // prompt, the start cursor) by re-resolving the
+                            // config from `project_path` + `config_name`. Only the
+                            // start role carries the snapshot — a single
+                            // `[panes.orchestration]` block — so restore rebuilds
+                            // the others from the re-resolved config rather than
+                            // duplicating them as plain panes. The non-start role
+                            // panes deliberately get NO `pane_metadata` entry.
+                            ui.pane_metadata.insert(
+                                role_pane_ids[start_idx].clone(),
+                                config::SavedPane {
+                                    dir: dir_str.clone(),
+                                    name: orch_config.roles[start_idx].name.clone(),
+                                    command: orch_config.roles[start_idx].command.clone(),
+                                    mode: None,
+                                    orchestration: Some(config::OrchestrationSnapshot {
+                                        version: 1,
+                                        roles: orch_config
+                                            .roles
+                                            .iter()
+                                            .map(|r| r.name.clone())
+                                            .collect(),
+                                        start_role_index: start_idx,
+                                        orchestrator_prompt: captured_prompt.clone(),
+                                        config_name: orch_config.name.clone(),
+                                        project_path: dir_str.clone(),
+                                        started_role_indices: vec![start_idx],
+                                    }),
+                                },
+                            );
                             // PRD #89 M1.2 — opening an orchestration tab is a
                             // meaningful state change; keep the snapshot fresh.
                             ui.mark_session_dirty();
 
                             // Focus the start role's pane.
-                            let start_idx =
-                                orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
                             let _ = pane.focus_pane(&role_pane_ids[start_idx]);
                             ui.mode = UiMode::PaneInput;
 
@@ -5544,6 +5582,67 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
     state.managed_pane_ids.is_empty()
 }
 
+/// PRD #89 M2b.3 — re-resolve the `OrchestrationConfig` for a snapshot's
+/// orchestration metadata on the daemon-empty restore path.
+///
+/// Returns the resolved config on success, or a human-readable drift reason
+/// (always NAMING the missing/renamed orchestration) when:
+/// - the project config can't be loaded (file gone / unreadable),
+/// - there is no project config at the saved `project_path`,
+/// - the named orchestration was renamed/removed (no match by `config_name`),
+/// - the saved roles no longer match the resolved config's roles (a role was
+///   added/removed/renamed/reordered) — the tab the user saved no longer
+///   exists as saved.
+///
+/// On `Err`, the caller surfaces the reason via `session_warnings` and falls
+/// back to a PLAIN dashboard pane (never a half-broken orchestration tab),
+/// mirroring the mode-tab drift Path D/E fallback (PRD #69).
+fn resolve_orchestration_for_restore(
+    snap: &config::OrchestrationSnapshot,
+) -> Result<OrchestrationConfig, String> {
+    let project_dir = std::path::Path::new(&snap.project_path);
+    let cfg = match load_project_config(project_dir) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => {
+            return Err(format!(
+                "orchestration '{}' not found — no project config in {}",
+                snap.config_name, snap.project_path
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "orchestration '{}' could not be resolved — failed to load project config from {}: {e}",
+                snap.config_name, snap.project_path
+            ));
+        }
+    };
+    let orch = cfg
+        .orchestrations
+        .into_iter()
+        .find(|o| o.name == snap.config_name)
+        .ok_or_else(|| {
+            format!(
+                "orchestration '{}' not found in {} (renamed or removed)",
+                snap.config_name, snap.project_path
+            )
+        })?;
+    // Drift guard: the saved role set must still match the resolved config's
+    // roles (same names, same order). A renamed/removed/reordered/added role
+    // means the saved tab no longer exists as saved — fall back rather than
+    // rebuild a different tab.
+    let current_roles: Vec<&str> = orch.roles.iter().map(|r| r.name.as_str()).collect();
+    let saved_roles: Vec<&str> = snap.roles.iter().map(String::as_str).collect();
+    if current_roles != saved_roles {
+        return Err(format!(
+            "orchestration '{}' role set changed (saved [{}], now [{}])",
+            snap.config_name,
+            saved_roles.join(", "),
+            current_roles.join(", "),
+        ));
+    }
+    Ok(orch)
+}
+
 pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
@@ -6011,6 +6110,10 @@ pub fn run_tui(
         // Collect deferred mode pane restores — we need the terminal ready
         // before we can resize PTYs, so mode tabs are opened after the loop.
         let mut deferred_mode_panes: Vec<(config::SavedPane, ModeConfig)> = Vec::new();
+        // PRD #89 M2b.3 — the first orchestration tab rebuilt from the snapshot,
+        // so we can land on it (start cursor) after the loop rather than snapping
+        // back to the dashboard — mirroring the hydration block's landing logic.
+        let mut first_restored_orch_tab: Option<usize> = None;
         for saved_pane in &saved.panes {
             let dir = std::path::Path::new(&saved_pane.dir);
             if !dir.is_dir() {
@@ -6028,6 +6131,124 @@ pub fn run_tui(
                     "restore: skipping saved pane — already hydrated from daemon"
                 );
                 continue;
+            }
+            // PRD #89 M2b.3 — orchestration-tab restore on the daemon-empty
+            // path. A saved pane carrying orchestration metadata rebuilds the
+            // WHOLE tab (orchestrator + role panes in saved order, the prompt
+            // replayed to the start role, the start cursor) by re-resolving its
+            // `OrchestrationConfig` from `project_path` + `config_name`. On
+            // success we `continue`; on drift (config gone, orchestration
+            // renamed/removed, role set changed) we push a clear warning NAMING
+            // the orchestration and fall through to the plain-pane restore below
+            // — never a half-broken tab (mirrors the mode-tab Path D/E fallback,
+            // PRD #69). Unlike warm-daemon hydration (session/restore/007), this
+            // path REPLAYS the saved `orchestrator_prompt` to the start role —
+            // there is no live agent with the prompt already in scrollback.
+            if let Some(ref orch_snap) = saved_pane.orchestration {
+                match resolve_orchestration_for_restore(orch_snap) {
+                    Ok(orch_config) => {
+                        let frame_area = terminal.get_frame().area();
+                        // All roles share spawn dims (Tiled); role_index=0 so the
+                        // helper falls back to "role 0 expanded" — the per-frame
+                        // `resize_panes_to_layout` reconciles the exact rects once
+                        // the tab is active. Mirrors the live new-pane path.
+                        let spawn_dims = orchestration_role_pane_dims(
+                            frame_area,
+                            orch_config.roles.len(),
+                            0,
+                            PaneLayout::Tiled,
+                            true,
+                        );
+                        // Empty saved prompt → `None` so the delivery gate
+                        // writes nothing (matching the live path's "no prompt"
+                        // semantics); a non-empty prompt is replayed to the
+                        // start role once it signals readiness.
+                        let replay_prompt = (!orch_snap.orchestrator_prompt.is_empty())
+                            .then(|| orch_snap.orchestrator_prompt.clone());
+                        match tab_manager.open_orchestration_tab(
+                            &orch_config,
+                            &saved_pane.dir,
+                            replay_prompt,
+                            None,
+                            spawn_dims,
+                        ) {
+                            Ok((tab_idx, role_pane_ids)) => {
+                                // Snapshot each role pane's daemon agent_id before
+                                // the placeholder insert so the strict-equality
+                                // reuse guard accepts each role agent's first
+                                // `SessionStart` (mirrors the live path).
+                                let role_agent_ids: Vec<Option<String>> = role_pane_ids
+                                    .iter()
+                                    .map(|id| pane.pane_agent_id(id))
+                                    .collect();
+                                {
+                                    let mut st = state.blocking_write();
+                                    for (id, agent_id) in
+                                        role_pane_ids.iter().zip(role_agent_ids.iter())
+                                    {
+                                        st.register_pane(id.clone());
+                                        st.insert_placeholder_session(
+                                            id.clone(),
+                                            Some(saved_pane.dir.clone()),
+                                            None,
+                                            agent_id.clone(),
+                                        );
+                                    }
+                                    for (i, role) in orch_config.roles.iter().enumerate() {
+                                        st.pane_role_map
+                                            .insert(role_pane_ids[i].clone(), role.name.clone());
+                                        st.pane_cwd_map.insert(
+                                            role_pane_ids[i].clone(),
+                                            saved_pane.dir.clone(),
+                                        );
+                                        if role.start {
+                                            st.orchestrator_pane_ids
+                                                .insert(role_pane_ids[i].clone());
+                                        }
+                                    }
+                                }
+                                for (i, role) in orch_config.roles.iter().enumerate() {
+                                    ui.pane_display_names
+                                        .insert(role_pane_ids[i].clone(), role.name.clone());
+                                    ui.pane_names
+                                        .insert(role_pane_ids[i].clone(), role.name.clone());
+                                }
+                                // Re-capture the orchestration metadata onto the
+                                // start role pane so a later snapshot keeps the
+                                // tab (only the start role carries the block).
+                                let start_idx =
+                                    orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                                ui.pane_metadata
+                                    .insert(role_pane_ids[start_idx].clone(), saved_pane.clone());
+                                // Record creation time so the prompt-delivery
+                                // gate's 10s timeout fallback works for agents
+                                // that never signal `SessionStart`.
+                                if let Tab::Orchestration { id, .. } = tab_manager.active_tab() {
+                                    ui.orchestration_created_at
+                                        .insert(*id, std::time::Instant::now());
+                                }
+                                if first_restored_orch_tab.is_none() {
+                                    first_restored_orch_tab = Some(tab_idx);
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                ui.session_warnings.push(format!(
+                                    "Warning: failed to rebuild orchestration '{}': {e}; restoring '{}' as a plain pane",
+                                    orch_snap.config_name, saved_pane.name
+                                ));
+                                // Fall through to the plain-pane restore below.
+                            }
+                        }
+                    }
+                    Err(reason) => {
+                        ui.session_warnings.push(format!(
+                            "Warning: {reason}; restoring '{}' as a plain pane",
+                            saved_pane.name
+                        ));
+                        // Fall through to the plain-pane restore below.
+                    }
+                }
             }
             // If the pane belonged to a mode tab, defer it so we can open a
             // full mode tab (with side panes) instead of a plain dashboard pane.
@@ -6353,7 +6574,12 @@ pub fn run_tui(
         // 0 (dashboard) — and stays there in this snapshot-restore branch,
         // which only runs when hydration produced no panes — preserving the
         // overview-first landing for snapshot-restored sessions.
-        tab_manager.switch_to(preferred_start_tab);
+        //
+        // PRD #89 M2b.3: when the snapshot rebuilt an orchestration tab, land
+        // on the first one (start cursor) so its role cards render — the
+        // daemon-empty analogue of the hydration landing above.
+        let landing_tab = first_restored_orch_tab.unwrap_or(preferred_start_tab);
+        tab_manager.switch_to(landing_tab);
 
         // Focus the first restored pane and enter PaneInput mode so the user
         // can type immediately. PRD #84 M4: PTY sizing is handled by the
