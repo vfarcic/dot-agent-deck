@@ -5047,7 +5047,12 @@ fn dispatch_action(
                                     }
                                 }
                             } else {
-                                // No mode — regular dashboard pane.
+                                // No mode — regular dashboard card. The card lives on the Dashboard
+                                // (tab 0), so make the Dashboard active before focusing/selecting it —
+                                // otherwise, when launched from an orchestration/mode tab, the new card
+                                // lands on a tab the user isn't viewing. (Orchestration/mode creation
+                                // already switch to their own new tab via open_*_tab.)
+                                tab_manager.switch_to(0);
                                 let _ = pane.focus_pane(&new_id);
                                 ui.mode = UiMode::PaneInput;
                                 // PRD #113: the freshly-created card is active.
