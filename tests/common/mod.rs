@@ -1,3 +1,9 @@
+// PRD #42 M8: this harness spawns the binary in a Unix PTY and uses libc /
+// std::os::unix process-group + PermissionsExt APIs directly, so it is Unix-only
+// at the source level. `#![cfg(unix)]` makes the module empty on Windows so the
+// cross-platform test build compiles; on Unix it is unchanged. The Windows
+// (ConPTY + named-pipe) port of this harness is tracked by #164 (M10).
+#![cfg(unix)]
 //! PRD #77 — TUI testing harness (L2 slice).
 //!
 //! Spawns the production `dot-agent-deck` binary inside a `portable-pty`
@@ -7,10 +13,10 @@
 //! deterministic; Decisions 12 + 21 + 28 govern per-test isolation,
 //! quiescence-based waits, and failure recordings.
 //!
-//! Intentionally compiled unconditionally so this single module can be
-//! shared by every L2 test under the `e2e` feature. The harness uses
-//! production deps only (`portable-pty`, `vt100`, `tempfile`, `libc`,
-//! `serde_json`), all already in `Cargo.toml`.
+//! On Unix this is compiled unconditionally (see the `#![cfg(unix)]` above)
+//! so this single module can be shared by every L2 test under the `e2e`
+//! feature. The harness uses production deps only (`portable-pty`, `vt100`,
+//! `tempfile`, `libc`, `serde_json`), all already in `Cargo.toml`.
 
 #![allow(dead_code)]
 

@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::io::Write as _;
-use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
 use chrono::Utc;
@@ -251,7 +250,7 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
 
 pub fn send_to_socket(json: &str) -> Option<()> {
     let path = socket_path();
-    let mut stream = UnixStream::connect(path).ok()?;
+    let mut stream = crate::platform::ipc::IpcClient::connect(&path).ok()?;
     let msg = format!("{json}\n");
     stream.write_all(msg.as_bytes()).ok()?;
     stream.flush().ok()?;

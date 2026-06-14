@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
+use crate::platform::ipc::{IpcReadHalf, IpcStream, IpcWriteHalf};
 
 pub use crate::agent_pty::{AgentRecord, TabMembership, validate_tab_membership};
 use crate::daemon_protocol::{
@@ -182,7 +182,7 @@ fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
 // ---------------------------------------------------------------------------
 
 /// Thin handle around the daemon's attach socket path. Cheap to clone — every
-/// operation opens its own short-lived `UnixStream` (matching the daemon's
+/// operation opens its own short-lived [`IpcStream`] (matching the daemon's
 /// per-connection state machine in [`crate::daemon_protocol`]).
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
@@ -208,8 +208,8 @@ impl DaemonClient {
         Ok(())
     }
 
-    async fn connect(&self) -> io::Result<UnixStream> {
-        UnixStream::connect(&self.socket_path).await
+    async fn connect(&self) -> io::Result<IpcStream> {
+        IpcStream::connect(&self.socket_path).await
     }
 
     /// List daemon-side agents. Returns one [`AgentRecord`] per agent,
@@ -537,12 +537,14 @@ impl DaemonClient {
 /// receiver fell behind) or the socket drops. Callers reconnect via
 /// [`DaemonClient::subscribe_events`].
 pub struct EventSubscription {
-    rd: OwnedReadHalf,
+    rd: IpcReadHalf,
     /// Held purely as a lifetime signal: dropping the subscription drops
-    /// `_wr`, which half-closes the socket via `SHUT_WR`, which trips the
-    /// daemon's read-side disconnect detector and tears the per-connection
-    /// receiver down promptly. Never written to after the request.
-    _wr: OwnedWriteHalf,
+    /// both halves, which closes the stream and trips the daemon's read-side
+    /// disconnect detector (EOF) promptly. Never written to after the request.
+    /// (Both halves come from [`tokio::io::split`], so the underlying stream
+    /// stays open until this *and* `rd` drop — which is exactly when the
+    /// subscription ends.)
+    _wr: IpcWriteHalf,
 }
 
 impl EventSubscription {
@@ -585,8 +587,8 @@ impl EventSubscription {
 /// the next read returns the daemon-supplied scrollback snapshot, then live
 /// STREAM_OUT frames until the agent exits or the client detaches.
 pub struct AttachConnection {
-    rd: OwnedReadHalf,
-    wr: OwnedWriteHalf,
+    rd: IpcReadHalf,
+    wr: IpcWriteHalf,
 }
 
 impl AttachConnection {
@@ -621,7 +623,7 @@ impl AttachConnection {
 
     /// Split into owned halves for callers that drive read and write tasks
     /// concurrently (the typical pane wiring).
-    pub fn into_split(self) -> (OwnedReadHalf, OwnedWriteHalf) {
+    pub fn into_split(self) -> (IpcReadHalf, IpcWriteHalf) {
         (self.rd, self.wr)
     }
 }
@@ -629,19 +631,34 @@ impl AttachConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // PRD #42 M8/review B1: the attach-server harness below binds a real
+    // listener at a filesystem tempdir path and spawns `/bin/sh`, neither of
+    // which exists on Windows (`IpcListener::bind` on a non-`\\.\pipe\` path
+    // → `ERROR_INVALID_NAME`; no `/bin/sh`). Gate the harness + the tests that
+    // use it to Unix so the Windows `cargo nextest run` step compiles and does
+    // not panic. The pure tests below (`ensure_socket_exists_reports_missing`,
+    // `sanitize_record_tab_membership_*`, `run_now_outcome_*`) stay
+    // cross-platform. No Unix coverage is lost — all of these still run on Unix.
+    #[cfg(unix)]
     use std::sync::{Arc, Mutex};
+    #[cfg(unix)]
     use tempfile::TempDir;
 
+    #[cfg(unix)]
     use crate::agent_pty::AgentPtyRegistry;
+    #[cfg(unix)]
     use crate::daemon_protocol::{bind_attach_listener, serve_attach};
+    #[cfg(unix)]
     use tokio::sync::broadcast;
 
     /// Mirror the harness lock from `tests/daemon_protocol.rs`: `bind_socket`
     /// flips the process-global umask while binding, and a tempdir created
     /// inside that window inherits 0o600, breaking later binds. Hold this
     /// across tempdir+bind for any in-process attach server.
+    #[cfg(unix)]
     static BIND_LOCK: Mutex<()> = Mutex::new(());
 
+    #[cfg(unix)]
     async fn spawn_test_server() -> (TempDir, PathBuf, Arc<AgentPtyRegistry>) {
         let registry = Arc::new(AgentPtyRegistry::new());
         let (dir, path, listener) = {
@@ -668,6 +685,7 @@ mod tests {
         assert!(matches!(err, ClientError::SocketMissing(p) if p == missing));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn start_list_stop_round_trip() {
         let (_dir, path, registry) = spawn_test_server().await;
@@ -689,6 +707,7 @@ mod tests {
         assert!(registry.is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn start_agent_blank_command_returns_server_error() {
         let (_dir, path, _registry) = spawn_test_server().await;
@@ -703,6 +722,7 @@ mod tests {
         assert!(matches!(err, ClientError::Server(_)));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn attach_streams_output_and_input() {
         let (_dir, path, registry) = spawn_test_server().await;

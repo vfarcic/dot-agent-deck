@@ -47,73 +47,29 @@ pub fn config_keys_help() -> String {
     help
 }
 
+/// Hook-ingestion endpoint path. Delegates to [`crate::platform::paths`] (PRD
+/// #42 M1): Unix resolves the `$XDG_RUNTIME_DIR`/per-uid-`/tmp` socket path,
+/// Windows resolves the named-pipe name. `DOT_AGENT_DECK_SOCKET` overrides.
 pub fn socket_path() -> PathBuf {
-    if let Ok(path) = std::env::var("DOT_AGENT_DECK_SOCKET") {
-        return PathBuf::from(path);
-    }
-
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("dot-agent-deck.sock");
-    }
-
-    // PRD #93 reviewer REV-2: the `/tmp` fallback must include the uid so
-    // two users on the same host can't collide on the same socket path
-    // (the daemon is per-user; the 0o600 mode is on the socket inode, but
-    // the *path* still has to be unique, otherwise the loser's `bind(2)`
-    // sees `EADDRINUSE` against the winner's inode). Same rationale as
-    // `attach_socket_path` below.
-    PathBuf::from(format!("/tmp/dot-agent-deck-{}.sock", current_uid()))
+    crate::platform::paths::socket_path()
 }
 
-/// Path of the M1.2 streaming-attach Unix socket. Separate from the existing
+/// Path of the M1.2 streaming-attach endpoint. Separate from the existing
 /// hook-ingestion socket (PRD #76 line 219) so the two protocols have
 /// disjoint, clearly-typed wire formats: hook ingestion is line-delimited
-/// JSON, attach is a binary frame protocol (see `daemon_protocol`). Same
-/// XDG-aware resolution pattern as `socket_path`, with `DOT_AGENT_DECK_ATTACH_SOCKET`
-/// as the explicit override.
+/// JSON, attach is a binary frame protocol (see `daemon_protocol`). Delegates
+/// to [`crate::platform::paths`]; `DOT_AGENT_DECK_ATTACH_SOCKET` overrides.
 pub fn attach_socket_path() -> PathBuf {
-    if let Ok(path) = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET") {
-        return PathBuf::from(path);
-    }
-
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("dot-agent-deck-attach.sock");
-    }
-
-    // PRD #93 reviewer REV-2: include the uid in the `/tmp` fallback path so
-    // two users on the same host get disjoint sockets (each daemon's
-    // `bind(2)` would otherwise collide with the other user's inode), and
-    // so the path itself can't be observed by another user to figure out
-    // *which* deck process to target. The 0o600 mode on the inode is
-    // already enforced; the per-user path is the missing half.
-    PathBuf::from(format!("/tmp/dot-agent-deck-attach-{}.sock", current_uid()))
-}
-
-/// Current OS uid, used to namespace the `/tmp` fallback sockets per user.
-/// Wraps `libc::getuid` so the unsafe is centralized in one place.
-fn current_uid() -> u32 {
-    // SAFETY: `getuid(2)` is async-signal-safe and has no failure mode; it
-    // simply returns the calling process's real uid.
-    unsafe { libc::getuid() }
+    crate::platform::paths::attach_socket_path()
 }
 
 /// Per-user state directory. Used by lazy-spawn (PRD #76 M4.3) for the
-/// detached daemon log and the spawn mutex (`spawn.lock`). Resolution order:
-///
-/// 1. `DOT_AGENT_DECK_STATE_DIR` — explicit override (tests use this).
-/// 2. `$XDG_STATE_HOME/dot-agent-deck` — freedesktop spec default.
-/// 3. `$HOME/.local/state/dot-agent-deck` — XDG fallback when the env var is
-///    unset (per the spec).
+/// detached daemon log and the spawn mutex (`spawn.lock`). Delegates to
+/// [`crate::platform::paths`] (PRD #42 M1); `DOT_AGENT_DECK_STATE_DIR`
+/// overrides, then `$XDG_STATE_HOME`/`$HOME` on Unix or `%LOCALAPPDATA%` on
+/// Windows.
 pub fn state_dir() -> PathBuf {
-    if let Ok(path) = std::env::var("DOT_AGENT_DECK_STATE_DIR") {
-        return PathBuf::from(path);
-    }
-    match std::env::var("XDG_STATE_HOME") {
-        Ok(state_home) if !state_home.is_empty() => {
-            PathBuf::from(state_home).join("dot-agent-deck")
-        }
-        _ => dirs_home().join(".local/state/dot-agent-deck"),
-    }
+    crate::platform::paths::state_dir()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -867,10 +823,11 @@ impl Drop for ConfigGenStateEnvGuard {
     }
 }
 
+/// Home directory used to anchor config/state/cache paths. Delegates to
+/// [`crate::platform::paths::home_dir`] (PRD #42 M1): `$HOME` (fallback `/`) on
+/// Unix, `%USERPROFILE%` on Windows.
 pub(crate) fn dirs_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/"))
+    crate::platform::paths::home_dir()
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,6 +1330,11 @@ timeout_secs = 600
         assert!(!dc.auto_config_prompt);
     }
 
+    // PRD #42 M2: asserts the Unix `/tmp` + per-uid fallback specifically
+    // (`current_uid()` is Unix-only and the path shape is POSIX), so it is
+    // gated to Unix. The Windows endpoint is a per-user named pipe with no
+    // `/tmp`/uid analogue — covered separately under PRD #163/#164.
+    #[cfg(unix)]
     #[test]
     fn attach_socket_fallback_is_per_user() {
         // PRD #93 round-2 reviewer REV-2: when XDG_RUNTIME_DIR is unset
@@ -1392,8 +1354,7 @@ timeout_secs = 600
             std::env::remove_var("XDG_RUNTIME_DIR");
         }
 
-        // SAFETY: getuid is async-signal-safe and infallible.
-        let uid = unsafe { libc::getuid() };
+        let uid = crate::platform::paths::current_uid();
         let attach = attach_socket_path();
         let hook = socket_path();
         let attach_str = attach.to_string_lossy();

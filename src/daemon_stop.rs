@@ -3,7 +3,7 @@
 //! Documented, non-`kill -9` way to recycle the local daemon. Three
 //! load-bearing properties:
 //!
-//! 1. **PID discovery via `peer_pid()`** ([`crate::daemon_attach::peer_pid`])
+//! 1. **PID discovery via `peer_pid()`** ([`crate::platform::peercred::peer_pid`])
 //!    — `SO_PEERCRED` / `LOCAL_PEERPID` on the connected attach socket.
 //!    No protocol surface required, so this works against *any* daemon
 //!    version including the v0.24.x daemon that motivated this PRD.
@@ -24,13 +24,13 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use tokio::net::UnixStream;
 use tracing::debug;
 
 use crate::build_version_handshake::{HandshakeError, TerminateOutcome, terminate_daemon_graceful};
-use crate::daemon_attach::peer_pid;
 use crate::daemon_client::issue_command;
 use crate::daemon_protocol::AttachRequest;
+use crate::platform::ipc::IpcStream;
+use crate::platform::peercred::peer_pid;
 
 /// SIGTERM grace before reporting "daemon did not exit cleanly". PRD #103
 /// M3.2: 5 s.
@@ -120,7 +120,7 @@ impl std::error::Error for StopError {}
 ///    - On timeout with `force`: SIGKILL, poll up to 1 s.
 ///    - On timeout without `force`: surface as `TimedOut`.
 pub async fn run_daemon_stop(attach_path: &Path, force: bool) -> Result<StopOutcome, StopError> {
-    let stream = match UnixStream::connect(attach_path).await {
+    let stream = match IpcStream::connect(attach_path).await {
         Ok(s) => s,
         Err(e)
             if e.kind() == io::ErrorKind::ConnectionRefused

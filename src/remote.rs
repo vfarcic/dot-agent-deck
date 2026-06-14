@@ -618,7 +618,6 @@ impl RemotesFile {
     /// owner-only (0o600) regardless of the user's umask.
     pub fn save(&self, path: &Path) -> Result<(), RemoteConfigError> {
         use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let parent = path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(parent).map_err(|source| RemoteConfigError::Io {
@@ -637,12 +636,13 @@ impl RemotesFile {
             .unwrap_or_else(|| "remotes.toml".to_string());
         let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
 
-        let open_result = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp_path);
+        // PRD #42 M1: owner-only (0o600) creation mode comes from the platform
+        // seam — `.mode(0o600)` on Unix, a no-op-under-`%LOCALAPPDATA%`-ACL on
+        // Windows (#163).
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.create(true).write(true).truncate(true);
+        crate::platform::fsperm::set_create_mode_owner_only(&mut open_opts);
+        let open_result = open_opts.open(&tmp_path);
         let mut tmp_file = open_result.map_err(|source| RemoteConfigError::Io {
             path: tmp_path.display().to_string(),
             source,
@@ -658,9 +658,10 @@ impl RemotesFile {
             });
         }
         // Defense in depth: if a stale temp file from a crashed previous save
-        // existed, OpenOptions::mode() would NOT have re-applied the bits, so
-        // re-set them explicitly before the rename.
-        let perm_result = tmp_file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        // existed, the create-mode would NOT have re-applied the bits, so
+        // re-set owner-only permissions explicitly before the rename (PRD #42
+        // M1: via the platform seam — set 0o600 on Unix, no-op on Windows).
+        let perm_result = crate::platform::fsperm::set_file_owner_only(&tmp_file);
         if let Err(source) = perm_result {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(RemoteConfigError::Io {

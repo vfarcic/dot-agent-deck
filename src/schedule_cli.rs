@@ -152,20 +152,16 @@ pub fn write_atomic(path: &Path, tasks: &[ScheduledTask]) -> Result<(), String> 
     let parent = path
         .parent()
         .ok_or_else(|| format!("schedules path {} has no parent directory", path.display()))?;
-    // PRD #127 S2: create the config dir 0700 (owner-only). `DirBuilder`'s mode
-    // applies only to directories it newly creates, so an existing shared dir
-    // keeps its mode — we don't surprise-tighten a dir we didn't make.
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(parent)
-        .map_err(|e| {
-            format!(
-                "failed to create config directory {}: {e}",
-                parent.display()
-            )
-        })?;
+    // PRD #127 S2 / #42 M1: create the config dir owner-only (0o700 on Unix;
+    // `%LOCALAPPDATA%` ACL on Windows). Create-only — the mode applies only to
+    // a dir we newly create, so an existing shared dir keeps its mode (we don't
+    // surprise-tighten a dir we didn't make).
+    crate::platform::fsperm::create_owner_only_dir(parent).map_err(|e| {
+        format!(
+            "failed to create config directory {}: {e}",
+            parent.display()
+        )
+    })?;
 
     let doc = SchedulesDoc {
         scheduled_tasks: tasks,
@@ -179,7 +175,6 @@ pub fn write_atomic(path: &Path, tasks: &[ScheduledTask]) -> Result<(), String> 
     // the rename preserves the 0600 inode, matching the daemon socket's trust
     // boundary. A unique temp name (pid + monotonic counter) avoids colliding
     // with a concurrent writer or a stale leftover.
-    use std::os::unix::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
     let unique = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -187,17 +182,17 @@ pub fn write_atomic(path: &Path, tasks: &[ScheduledTask]) -> Result<(), String> 
         ".schedules.toml.tmp.{}.{unique}",
         std::process::id()
     ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(|e| {
-            format!(
-                "failed to create temp schedules file {}: {e}",
-                tmp.display()
-            )
-        })?;
+    // PRD #42 M1: owner-only (0o600) creation mode from the platform seam.
+    // `create_new` keeps the O_EXCL / no-symlink-follow semantics on Unix.
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.write(true).create_new(true);
+    crate::platform::fsperm::set_create_mode_owner_only(&mut open_opts);
+    let mut file = open_opts.open(&tmp).map_err(|e| {
+        format!(
+            "failed to create temp schedules file {}: {e}",
+            tmp.display()
+        )
+    })?;
     use std::io::Write as _;
     let write_result = file
         .write_all(contents.as_bytes())
@@ -426,6 +421,11 @@ mod tests {
 
     // PRD #127 S1/S2 — schedules.toml (which may carry secret prompts) is
     // written owner-only (0600), and the temp it's renamed from is also 0600.
+    //
+    // PRD #42 M2: gated to Unix — it asserts POSIX mode bits (0o600/0o700) via
+    // `PermissionsExt`. On Windows the owner-only property comes from the
+    // per-user `%LOCALAPPDATA%` ACL (no mode bits), covered under PRD #163.
+    #[cfg(unix)]
     #[test]
     fn write_atomic_writes_owner_only_0600() {
         use std::os::unix::fs::PermissionsExt;
