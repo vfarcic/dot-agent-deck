@@ -1424,6 +1424,26 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** the exact wording of the rejection message (clap's default unknown-argument text or a custom friendly message both satisfy it).
 - **Platform coverage:** mac+linux.
 
+### Fresh-start escape hatch (PRD #89 Phase 4)
+
+These entries cover PRD #89 Phase 4: with auto-restore now the default, a user who wants to start clean has one obvious action per surface — a local `dot-agent-deck snapshot clear` subcommand (M4.2) and the per-deck `dot-agent-deck remote remove <name>` (M4.1). Both clear the saved-session snapshot.
+
+#### session/snapshot
+
+##### session/snapshot/001 — `dot-agent-deck snapshot clear` deletes the local saved-session snapshot (PRD #89 Phase 4 M4.2).
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path).
+- **Agent:** none.
+- **Asserts:** with a non-empty `session.toml` staged at the redirected path, running `dot-agent-deck snapshot clear` exits 0 and the snapshot file is gone afterward — the local fresh-start escape hatch. The command shape is a `snapshot` subcommand group with a `clear` action (decided; not `reset`/`--reset`).
+- **Does not assert:** the subsequent no-flag startup landing on an empty dashboard (that follows from the deleted snapshot + `session/restore/006`); the exact stdout wording of the success message.
+- **Platform coverage:** mac+linux.
+
+##### session/snapshot/002 — `dot-agent-deck remote remove <name>` clears that deck's saved state (PRD #89 Phase 4 M4.1).
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive; `DOT_AGENT_DECK_SESSION` + `DOT_AGENT_DECK_REMOTES` redirected to test-owned paths).
+- **Agent:** none.
+- **Asserts:** with a remote deck `myhost` registered in the staged `remotes.toml` and a non-empty `session.toml` staged, running `dot-agent-deck remote remove myhost` exits 0 AND clears that deck's saved state — the snapshot file is gone afterward — the per-deck fresh-start escape hatch.
+- **Does not assert:** that the registry entry was removed (that is `remote remove`'s pre-existing behavior, exercised elsewhere); the per-deck keying of saved state (the snapshot is a single global file today).
+- **Platform coverage:** mac+linux.
+
 ### Chain-smoke (real-agent) coverage
 
 #### chain-smoke/claude
