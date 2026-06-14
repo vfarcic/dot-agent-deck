@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.29.1] - 2026-06-14
+
+### Fixed
+
+- **Dashboard Switch on Single-Agent Card Create**
+  Creating a new single-agent card now always switches the view to the Dashboard tab with the new card selected and focused, regardless of which tab was active when the new-deck dialog was opened.
+  Previously, pressing `Ctrl+N` from an orchestration or mode tab and creating a plain card (no mode, no orchestration) left the active tab unchanged — the new card appeared on the Dashboard, but the view stayed in the orchestration or mode tab. Users had to manually switch back to the Dashboard to see and interact with their newly created card. Orchestration and mode creation were already unaffected (they switch to their own new tab on creation); this fix closes the gap for single-agent cards.
+  The leaving tab's live focus is captured before the switch, so switching back to the orchestration or mode tab afterward restores its previous focus correctly.
+- **Orchestration Tab Name Survives Detach/Reattach**
+  The custom name you type when launching an orchestration now persists across detach and reattach. Previously the typed name appeared correctly on creation, but reattaching to the orchestration — including after reconnecting to a remote daemon — silently reverted the tab title to the name from the TOML config (or the working-directory basename for unnamed orchestrations), discarding whatever you had entered.
+  The name now travels with each role through the daemon, so reattaching restores the title you chose. Orchestrations launched without a custom name continue to use the config name, with the existing cwd-basename fallback.
+
+
+
 ## [0.29.0] - 2026-06-14
 
 ### Added
