@@ -327,9 +327,11 @@ impl TabManager {
     /// `None`); Orchestration tabs focus their remembered role pane (or
     /// the start role pane). A remembered id that no longer exists in the
     /// tab's live pane set is cleared and the default is focused instead
-    /// (stale-id fallback). Dashboard is a no-op — it has no fixed pane
-    /// to focus and its card selection is derived from
-    /// `selected_session_id` each frame.
+    /// (stale-id fallback). Dashboard is a no-op HERE — its selection is keyed by
+    /// session id, not a pane id, and `TabManager` carries no session→pane map, so
+    /// its remembered card is re-focused by `switch_tab_with_focus` (which has the
+    /// live snapshot) instead. The two decks are otherwise symmetric: each keeps
+    /// its remembered selection on leave and re-focuses it on return.
     /// Returns the pane id focus was restored to (if any) so callers can keep a
     /// focus baseline in sync — PRD #113 (PR #151) uses it to pre-seed
     /// `UiState.last_focused_pane_id`, so the switch-induced focus change isn't

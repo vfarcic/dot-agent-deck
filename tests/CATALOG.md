@@ -204,6 +204,27 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the per-pane PTY teardown / role-pane stop (covered by the L2 `tabs/mode/002`, `tabs/orchestration/002`); the dashboard-card close no-op itself (covered by `dashboard/selection/012`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/selection/017 — Enter (Action::Focus) paints the highlight on BOTH decks by setting `selected_index` to the restored target (unified deck behavior).
+- **Layer:** L1 (in-process `dispatch_action(Action::Focus)` against a recording `PaneController`).
+- **Agent:** none (a real Orchestration tab with placeholder role-pane sessions; 3 synthetic dashboard cards).
+- **Asserts:** with the deck inactive (`selected_index == None`) and a remembered selection (`last_active_selection == Some(1)`), dispatching `Action::Focus` (what Enter maps to) sets `ui.selected_index = Some(1)` — so the highlight paints — for the ORCHESTRATION deck AND the Dashboard. Pins the unified fix for the PR #151 manual-test regression where Enter never painted the highlight on the Orchestration deck (the role pane was already focused on return, so the reconcile focus-transition guard never re-armed it). Pre-fix RED: `Action::Focus` only focuses the pane and leaves `selected_index == None`.
+- **Does not assert:** the per-frame reconcile reactivation path (`dashboard/selection/009`/`014`); the focus side effect itself (`dashboard/selection/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/018 — On tab return, the previously-selected deck's PANE is re-focused while the highlight stays clear — symmetric across BOTH decks (unified deck behavior).
+- **Layer:** L1 (in-process `switch_tab_with_focus` round-trip + recording `PaneController`).
+- **Agent:** none (a real Mode tab as the round-trip intermediate; an Orchestration tab; 3 synthetic dashboard cards).
+- **Asserts:** after a Dashboard → Mode → Dashboard round-trip with a remembered selection (card index 1 → session `s1` → pane `p1`), the controller's last-focused pane is `p1` (the remembered card's pane is re-focused) AND `selected_index == None` (highlight clear). The Orchestration deck already satisfies this (it re-focuses its remembered role pane on return). Pins the unified fix making the Dashboard leave/return symmetric with Orchestration. Pre-fix RED for the Dashboard: it re-focuses nothing on return (its `selected_session_id` is cleared on leave), so the last-focused pane is the Mode pane, not `p1`. Consistent with `dashboard/selection/013` (focused pane present on return, highlight `None`).
+- **Does not assert:** the per-frame reconcile staying `None` under steady focus (covered by `dashboard/selection/013`); the scroll/viewport reveal of the remembered region.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/019 — Enter paints the selection highlight on the Orchestration deck after a tab round-trip (real binary).
+- **Layer:** L2 (real `dot-agent-deck` binary in a PTY; vt100 grid scraping; `e2e` feature).
+- **Agent:** none (an orchestration with two `cat` role panes that stay alive as deck cards; no LLM tokens).
+- **Asserts:** open the orchestration, detach to Normal mode, arm a role with `j` (a `▸` marker appears), round-trip Orchestration → Dashboard → Orchestration (the `▸` clears), then press Enter — the `▸` selection marker must reappear on the restored role. This is the real-binary repro of the PR #151 manual-test regression the L1 mocks missed (they never run the real reconcile + focus-restore on an orchestration tab): pre-fix the role pane is already focused on return, so Enter is not a focus transition and the highlight never repaints (the final wait times out).
+- **Does not assert:** which role index is restored; the cyan controller focus border; the Dashboard's own Enter-paint (already worked via the reconcile transition and is covered at L1 by `dashboard/selection/017`).
+- **Platform coverage:** mac+linux.
+
 #### dashboard/filter
 
 ##### dashboard/filter/001 — `/` opens the filter input; typing narrows visible cards by display-name substring.
