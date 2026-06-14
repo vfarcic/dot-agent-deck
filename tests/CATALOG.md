@@ -1303,11 +1303,11 @@ without depending on the config struct API.
 
 #### session/restore
 
-##### session/restore/001 — `dot-agent-deck --continue` rehydrates dashboard panes from the saved session.
-- **Layer:** L2.
-- **Agent:** none (a saved `session.toml` with three panes; fixture redirects `DOT_AGENT_DECK_SESSION`).
-- **Asserts:** three cards appear; their display names match the saved session.
-- **Does not assert:** the agents' inner state (not preserved per docs).
+##### session/restore/001 — No-flag startup auto-restores dashboard panes from the saved session (PRD #89 Phase 2).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path).
+- **Agent:** none (a saved `session.toml` with two panes running `sleep 600`; daemon is freshly spawned and empty).
+- **Asserts:** launching with NO `--continue` flag against an empty daemon restores both saved panes as dashboard cards, with their saved display names. (Restore is unconditional now — the old `--continue` gate is gone.)
+- **Does not assert:** the agents' inner state (not preserved per docs); the daemon-vs-snapshot precedence (deferred to Phase 2 M2.2).
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/002 — A saved mode tab is restored as a full mode tab when the project's `.dot-agent-deck.toml` still has the mode.
@@ -1329,6 +1329,13 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** N-1 cards restore; stderr names the missing directory.
 - **Does not assert:** which other panes survive (deterministic from the file order).
+- **Platform coverage:** mac+linux.
+
+##### session/restore/006 — Empty daemon + no snapshot + no flag lands on a clean empty dashboard (PRD #89 Phase 2).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path with no file staged).
+- **Agent:** none.
+- **Asserts:** with both restore sources empty (fresh empty daemon, no snapshot on disk) and no `--continue`, the deck lands on the "No active sessions" dashboard with no restore warning and remains interactive (Ctrl+N opens the new-pane directory picker). Locks the post-Phase-2 invariant that unconditional restore still falls through cleanly when there is nothing to restore.
+- **Does not assert:** the daemon-with-agents-wins precedence (deferred to Phase 2 M2.2); the snapshot-restore path (covered by `session/restore/001`).
 - **Platform coverage:** mac+linux.
 
 ### Session save (snapshot freshness, PRD #89 Phase 1)
@@ -1357,6 +1364,17 @@ These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept con
 - **Asserts:** driving the coalescer (750 ms-style interval) with 50 rapid `mark_dirty` notifications observed at one instant — each followed by the loop's `is_due`/`record_write` check — produces only the leading-edge write; a single trailing check after the interval flushes the rest, for ≤2 total writes (and ≥1), and nothing is due once flushed.
 - **Does not assert:** the production interval value, real wall-clock timing, or that the on-disk file content is correct (covered by `session/save/001`–`002`).
 - **Platform coverage:** mac+linux+windows.
+
+### CLI surface (PRD #89 Phase 3)
+
+#### cli/continue-removed
+
+##### cli/continue-removed/001 — `--continue` is removed from the CLI surface and rejected on use (PRD #89 Phase 3).
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive).
+- **Agent:** none.
+- **Asserts:** `dot-agent-deck --help` no longer advertises `--continue`, and `dot-agent-deck --continue` exits non-zero with a message that references the flag (guiding the user toward the now-default auto-restore). Since auto-restore is unconditional, the flag has no remaining purpose.
+- **Does not assert:** the exact wording of the rejection message (clap's default unknown-argument text or a custom friendly message both satisfy it).
+- **Platform coverage:** mac+linux.
 
 ### Chain-smoke (real-agent) coverage
 
