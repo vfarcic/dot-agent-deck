@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -397,6 +398,67 @@ impl SavedSession {
                 .filter_map(|id| pane_metadata.get(id).cloned())
                 .collect(),
         }
+    }
+}
+
+/// PRD #89 M1.2 — leading-edge throttle that coalesces saved-session snapshot
+/// writes so a burst of meaningful state changes (e.g. orchestration setup
+/// spawning many panes) produces one or two disk writes, not one per change.
+///
+/// Behaviour: the first pending change writes immediately (leading edge), then
+/// writes are throttled to at most one per `interval`; a single trailing write
+/// flushes whatever accumulated while the throttle was closed. So a tight burst
+/// collapses to ≤2 writes (one leading + one trailing), and sustained activity
+/// is bounded to ~one write per `interval` regardless of how many changes occur.
+///
+/// Pure data + logic: the caller supplies the clock as a monotonic [`Duration`]
+/// from an arbitrary epoch (in production, `epoch.elapsed()`; in tests, any
+/// value), so it is fully unit-testable without wall-clock sleeps.
+#[derive(Debug, Clone)]
+pub struct SnapshotCoalescer {
+    /// Minimum spacing between disk writes.
+    interval: Duration,
+    /// A change is pending (recorded but not yet flushed to disk).
+    dirty: bool,
+    /// Clock value of the last write; `None` until the first write happens.
+    last_write: Option<Duration>,
+}
+
+impl SnapshotCoalescer {
+    /// Create a coalescer that allows at most one write per `interval`.
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            dirty: false,
+            last_write: None,
+        }
+    }
+
+    /// Record that a meaningful state change occurred. Does not write — the
+    /// actual coalesced write happens when the caller next sees [`Self::is_due`]
+    /// return `true`.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Whether a write is due at `now`: a change is pending AND either nothing
+    /// has been written yet (leading edge) or at least `interval` has elapsed
+    /// since the last write (trailing edge / throttle release).
+    pub fn is_due(&self, now: Duration) -> bool {
+        if !self.dirty {
+            return false;
+        }
+        match self.last_write {
+            None => true,
+            Some(last) => now.saturating_sub(last) >= self.interval,
+        }
+    }
+
+    /// Mark a write as completed at `now`, clearing the pending flag and arming
+    /// the throttle so the next write waits a full `interval`.
+    pub fn record_write(&mut self, now: Duration) {
+        self.dirty = false;
+        self.last_write = Some(now);
     }
 }
 
@@ -1030,6 +1092,59 @@ pub fn load_features_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
+
+    /// Scenario: Drive a `SnapshotCoalescer` (interval 500ms) synchronously with
+    /// a 50-change burst all observed at the same instant — after each
+    /// `mark_dirty` the simulated event loop checks `is_due(now)` and writes if
+    /// due — then perform one trailing check after the interval has elapsed.
+    /// The leading-edge write fires on the first change; the remaining 49 are
+    /// throttled; the trailing check flushes the accumulated burst — so the
+    /// burst collapses to at most two writes (here exactly two), never the 50 a
+    /// naive write-per-change would produce.
+    #[spec("session/save/003")]
+    #[test]
+    fn save_003_coalesces_burst_to_at_most_two_writes() {
+        let interval = Duration::from_millis(500);
+        let mut coalescer = SnapshotCoalescer::new(interval);
+        let mut writes = 0usize;
+
+        // A tight burst: 50 rapid changes, all at the same instant (now = 0),
+        // each followed by the event loop's `is_due` check — exactly how the
+        // main loop drives it. Only the leading-edge write should fire here.
+        let now = Duration::ZERO;
+        for _ in 0..50 {
+            coalescer.mark_dirty();
+            if coalescer.is_due(now) {
+                writes += 1;
+                coalescer.record_write(now);
+            }
+        }
+
+        // The loop keeps ticking; once `interval` has elapsed with a change
+        // still pending, the single trailing write flushes the coalesced burst.
+        let after = interval;
+        if coalescer.is_due(after) {
+            writes += 1;
+            coalescer.record_write(after);
+        }
+
+        assert!(
+            writes <= 2,
+            "a burst of 50 changes must coalesce to at most two disk writes, got {writes}"
+        );
+        assert!(
+            writes >= 1,
+            "the burst must still produce at least one write, got {writes}"
+        );
+
+        // After the trailing flush nothing is pending, so no further write is
+        // due no matter how far the clock advances.
+        assert!(
+            !coalescer.is_due(after + interval + interval),
+            "no write is due once the burst has been flushed and nothing new is dirty"
+        );
+    }
 
     #[test]
     fn bell_config_defaults() {

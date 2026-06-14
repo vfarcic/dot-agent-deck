@@ -171,3 +171,19 @@ The remote case is clear: `dot-agent-deck remove <name>` already removes the dec
 - #74's schema sketch and restore-branch design remain useful as implementation reference in `prds/done/74-*.md`.
 
 **Owner.** Viktor (decided in 2026-06-14 planning discussion).
+
+### 2026-06-14: M1.1 — the exact state-change events wired to a snapshot write, and how they coalesce
+
+**Decision.** Phase 1 keeps the saved-session snapshot continuously fresh by marking it *dirty* at each meaningful state-change / detach call site and flushing it from the main loop through a coalescer, rather than writing inline at every site. The exact set of events wired to mark the snapshot dirty (all funnel through one helper, `UiState::mark_session_dirty`):
+
+- **New dashboard pane created** — the new-pane form submit (`Action::SpawnPane`, non-orchestration path, right after the `pane_metadata` insert). Covers both a plain dashboard pane and a **mode tab opened** (the mode-tab branch shares that same insert).
+- **Orchestration tab opened** — the `Action::SpawnPane` orchestration path, on the `open_orchestration_tab` success branch.
+- **Pane / tab closed** — `Action::CloseSelected` (Ctrl+W: closable-tab close, mode/orchestration tab close from a dashboard card, and plain-pane close) and `close_tab_by_index` (the `[×]` click / `Action::CloseTab`), covering **mode tab closed** and **orchestration tab closed**.
+- **Pane renamed** — `Action::SaveRename` (after `commit_rename`).
+- **Agent stop / restart** — the main loop's reactive pane-pool change (`route_reactive_commands` returning `(old_id, new_id)` pairs, e.g. after a `/clear` restart), which swaps live pane ids.
+
+**Detach paths (M1.3).** Ctrl+W close-pane marks dirty as above. Explicit *detach from the quit-confirm dialog* (`Action::DetachAndQuit`) breaks the loop straight into the existing unconditional pre-teardown snapshot write, so no extra trigger is needed there. *SSH disconnect (remote)* never runs a clean teardown (the process dies on SIGHUP), so it is covered structurally by the continuous freshness above: the snapshot already reflects the latest state-change at disconnect time.
+
+**Coalescing.** `mark_session_dirty` only sets a dirty flag on a `config::SnapshotCoalescer` (a pure-data leading-edge throttle, unit-tested as `session/save/003`). The main loop calls `flush_session_snapshot_if_due` once per iteration (including the 16ms idle ticks): the first pending change writes immediately, further changes are throttled to at most one write per `SNAPSHOT_COALESCE_INTERVAL` (750 ms), and a single trailing write flushes whatever accumulated during the quiet-down. A burst (e.g. orchestration setup spawning many panes) therefore collapses to one or two disk writes, not one per pane.
+
+**Owner.** Viktor (Phase 1 implementation, 2026-06-14).

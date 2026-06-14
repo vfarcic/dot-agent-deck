@@ -1351,6 +1351,13 @@ These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept con
 - **Does not assert:** which specific pane survives the close; the coalescing/debounce window (`session/save/003`).
 - **Platform coverage:** mac+linux.
 
+##### session/save/003 — A burst of meaningful state changes coalesces to at most one or two snapshot writes, not one per change.
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SnapshotCoalescer`; no TUI harness, synchronous clock).
+- **Agent:** none.
+- **Asserts:** driving the coalescer (750 ms-style interval) with 50 rapid `mark_dirty` notifications observed at one instant — each followed by the loop's `is_due`/`record_write` check — produces only the leading-edge write; a single trailing check after the interval flushes the rest, for ≤2 total writes (and ≥1), and nothing is due once flushed.
+- **Does not assert:** the production interval value, real wall-clock timing, or that the on-disk file content is correct (covered by `session/save/001`–`002`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Chain-smoke (real-agent) coverage
 
 #### chain-smoke/claude

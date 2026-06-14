@@ -790,6 +790,15 @@ const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(1
 /// which was tuned empirically — keep the two values in sync.
 const SUBMIT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// PRD #89 M1.2 — throttle window for continuous saved-session snapshot writes.
+/// A meaningful state change marks the snapshot dirty; the main loop flushes it
+/// at most once per this interval (plus one trailing write per quiet-down), so
+/// a burst of changes coalesces to one or two disk writes instead of thrashing
+/// the disk on every keystroke. Small enough that a fresh snapshot lands well
+/// within a second of any change; large enough to absorb an orchestration
+/// setup's pane-spawn burst into a single trailing write.
+const SNAPSHOT_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// PRD #128 Direction B-1 — minimum gap between SessionStart being observed
 /// for the start-role pane and the orchestrator's role prompt being written
 /// into it. Claude Code's `SessionStart` hook fires before its TUI input is
@@ -1062,6 +1071,15 @@ struct UiState {
     /// (matches `write_to_pane`'s SUBMIT_DELAY rationale at
     /// src/embedded_pane.rs:199).
     last_pane_keystroke_at: Option<std::time::Instant>,
+    /// PRD #89 M1.2/M1.3 — coalesces saved-session snapshot writes so a burst
+    /// of meaningful state changes (or detaches) produces one or two disk
+    /// writes, not one per change. Marked dirty by [`UiState::mark_session_dirty`]
+    /// at every state-change/detach call site; flushed by
+    /// `flush_session_snapshot_if_due` once per main-loop iteration.
+    session_coalescer: config::SnapshotCoalescer,
+    /// PRD #89 M1.2 — monotonic reference the coalescer's `Duration` clock is
+    /// measured from (`session_epoch.elapsed()`), set once at construction.
+    session_epoch: std::time::Instant,
 }
 
 /// PRD #80 review FIX 4: which click region produced a [`LastClick`]. Multi-
@@ -1187,6 +1205,8 @@ impl UiState {
             scheduled_delete_confirm: false,
             scheduled_live_names: HashSet::new(),
             last_pane_keystroke_at: None,
+            session_coalescer: config::SnapshotCoalescer::new(SNAPSHOT_COALESCE_INTERVAL),
+            session_epoch: std::time::Instant::now(),
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             tab_header_rects: Vec::new(),
@@ -1199,6 +1219,16 @@ impl UiState {
             form_chip_rects: Vec::new(),
             form_button_rects: Vec::new(),
         }
+    }
+
+    /// PRD #89 M1.2/M1.3 — the single trigger every meaningful state-change and
+    /// detach call site invokes (new pane, rename, close, mode/orchestration tab
+    /// open/close, agent restart, Ctrl+W close-pane). It only marks the
+    /// saved-session snapshot dirty; the coalesced disk write happens in the
+    /// main loop via `flush_session_snapshot_if_due`, so a burst of triggers
+    /// collapses to one or two writes.
+    fn mark_session_dirty(&mut self) {
+        self.session_coalescer.mark_dirty();
     }
 }
 
@@ -4027,6 +4057,9 @@ fn close_tab_by_index(
     {
         ui.selected_index = Some(idx - 1);
     }
+    // PRD #89 M1.2 — closing a mode/orchestration tab (via `[×]` click or the
+    // CloseTab action) is a meaningful state change; keep the snapshot fresh.
+    ui.mark_session_dirty();
 }
 
 /// PRD #92 F1 / PRD #80 M5: finalise Stop — tell the daemon to terminate every
@@ -4355,6 +4388,10 @@ fn dispatch_action(
                     ui.selected_index = Some(idx - 1);
                 }
             }
+            // PRD #89 M1.3 — Ctrl+W close-pane is a detach path; flush a fresh
+            // snapshot reflecting the surviving workspace (every sub-path above:
+            // closable-tab close, mode/orchestration tab close, plain pane).
+            ui.mark_session_dirty();
         }
         // Ctrl+PageDown: next tab (clamped, gated on a visible tab bar).
         // PRD #83: route through `switch_tab_with_focus` so the source tab's
@@ -4827,6 +4864,9 @@ fn dispatch_action(
                                 ui.pane_names
                                     .insert(role_pane_ids[i].clone(), role.name.clone());
                             }
+                            // PRD #89 M1.2 — opening an orchestration tab is a
+                            // meaningful state change; keep the snapshot fresh.
+                            ui.mark_session_dirty();
 
                             // Focus the start role's pane.
                             let start_idx =
@@ -4988,6 +5028,9 @@ fn dispatch_action(
                                     mode: mode_name_for_save,
                                 },
                             );
+                            // PRD #89 M1.2 — a new dashboard pane / mode tab is a
+                            // meaningful state change; keep the snapshot fresh.
+                            ui.mark_session_dirty();
 
                             if let Some(mode_config) = req.mode_config {
                                 // Mode selected — open a mode tab.
@@ -5200,6 +5243,9 @@ fn dispatch_action(
             ui.rename_text.clear();
             ui.mode = UiMode::Normal;
             commit_rename(&new_name, ui, pane, snapshot, selected_id);
+            // PRD #89 M1.2 — a rename changes the saved display name; keep the
+            // snapshot fresh.
+            ui.mark_session_dirty();
         }
         // rename [Cancel]: abandon, leaving the existing name (== Esc).
         Action::CancelRename => {
@@ -5446,6 +5492,33 @@ fn dispatch_action(
         Action::Continue => {}
     }
     Flow::Continue
+}
+
+/// PRD #89 M1.2 — flush the saved-session snapshot to disk when the coalescer
+/// says a write is due (a state change is pending and the throttle interval has
+/// elapsed since the last write). Called once per main-loop iteration, so the
+/// snapshot stays continuously fresh on meaningful state changes and detaches
+/// without writing on every keystroke. Mirrors the pre-teardown snapshot block
+/// (build from the live panes, clear when empty), then records the write so the
+/// throttle re-arms.
+fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
+    let now = ui.session_epoch.elapsed();
+    if !ui.session_coalescer.is_due(now) {
+        return;
+    }
+    let live_panes = state.blocking_read().managed_pane_ids.clone();
+    let session =
+        config::SavedSession::snapshot(&mut ui.pane_metadata, &ui.pane_display_names, &live_panes);
+    if session.panes.is_empty() {
+        if let Err(e) = config::SavedSession::clear() {
+            ui.session_warnings
+                .push(format!("Warning: failed to clear session: {e}"));
+        }
+    } else if let Err(e) = session.save() {
+        ui.session_warnings
+            .push(format!("Warning: failed to save session: {e}"));
+    }
+    ui.session_coalescer.record_write(now);
 }
 
 pub fn run_tui(
@@ -6272,6 +6345,13 @@ pub fn run_tui(
             ui.status_message = None;
         }
 
+        // PRD #89 M1.2/M1.3 — keep the saved-session snapshot continuously
+        // fresh: if a meaningful state change / detach marked it dirty and the
+        // coalescer's throttle window has elapsed, flush it to disk now. This
+        // runs every iteration (including the 16ms idle ticks below), so the
+        // trailing write of a coalesced burst lands without further input.
+        flush_session_snapshot_if_due(&mut ui, &state);
+
         let snapshot = state.blocking_read().clone();
 
         // PRD #76 M2.15 fixup pass 2 G1 — refresh each Mode tab's cached
@@ -6318,6 +6398,11 @@ pub fn run_tui(
             && let Some(new_id) = tab_manager.remap_focus_after_reactive_change(&pane_changes)
         {
             let _ = pane.focus_pane(&new_id);
+        }
+        // PRD #89 M1.2 — a reactive pane recreation (agent stop/restart, e.g.
+        // after `/clear`) swaps live pane ids; keep the snapshot fresh.
+        if !pane_changes.is_empty() {
+            ui.mark_session_dirty();
         }
 
         // Pick up version-check result once
