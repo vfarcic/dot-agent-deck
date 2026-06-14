@@ -6525,7 +6525,7 @@ pub fn run_tui(
         // PRD #144: the bottom bar wraps to a second row when its full-label
         // buttons don't fit one row, so reserve its actual height up front (the
         // layout pass feeds both the PTY resize and the render this frame).
-        let bar_rows = bottom_bar_rows(&ui, frame_area.width, &tab_view);
+        let bar_rows = bottom_bar_rows(&ui, frame_area.width, frame_area.height, &tab_view);
         let frame_layout = compute_frame_layout(
             frame_area,
             &tab_view,
@@ -9057,24 +9057,31 @@ fn render_button_bar(
 /// orchestration views append the context buttons, the Mode view shows only the
 /// global commands. The enabled/disabled state never changes a button's width
 /// (disabled buttons render full-label-but-dimmed), so it is irrelevant here.
-fn bottom_bar_rows(ui: &UiState, width: u16, tab_view: &ActiveTabView) -> u16 {
-    match ui.mode {
-        UiMode::Filter | UiMode::Rename | UiMode::PaneInput => return 1,
-        _ => {}
-    }
-    if ui.status_message.is_some() {
-        return 1;
-    }
-    let mut buttons = global_bar_buttons(&ui.keybindings, true);
-    if !matches!(tab_view, ActiveTabView::Mode { .. }) {
-        buttons.extend(dashboard_context_buttons(&ui.keybindings, true));
-    }
-    let widths: Vec<u16> = buttons
-        .iter()
-        .map(|b| b.display_label().chars().count() as u16)
-        .collect();
-    let (_, rows) = layout_button_bar(&widths, width);
-    rows.max(1)
+///
+/// PRD #144 A2: at extreme-narrow widths the wrapped bar can request more rows
+/// than the frame is tall, which would starve the main content area to zero
+/// rows. The reservation is therefore capped at `frame_height - 1` so at least
+/// one content row always remains (Layout doesn't panic, but content vanishing
+/// is a usability bug).
+fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16, tab_view: &ActiveTabView) -> u16 {
+    let rows = match ui.mode {
+        UiMode::Filter | UiMode::Rename | UiMode::PaneInput => 1,
+        _ if ui.status_message.is_some() => 1,
+        _ => {
+            let mut buttons = global_bar_buttons(&ui.keybindings, true);
+            if !matches!(tab_view, ActiveTabView::Mode { .. }) {
+                buttons.extend(dashboard_context_buttons(&ui.keybindings, true));
+            }
+            let widths: Vec<u16> = buttons
+                .iter()
+                .map(|b| b.display_label().chars().count() as u16)
+                .collect();
+            let (_, rows) = layout_button_bar(&widths, width);
+            rows.max(1)
+        }
+    };
+    // Reserve at most `frame_height - 1` rows so the content region keeps ≥1 row.
+    rows.min(frame_height.saturating_sub(1))
 }
 
 fn render_bottom_bar(
@@ -9284,7 +9291,9 @@ fn modal_rect(desired_w: u16, desired_h: u16, terminal: Rect, min_w: u16, min_h:
     // guaranteed to fit — even when `min` itself exceeds the terminal.
     let clamp_axis = |desired: u16, min: u16, term: u16| -> u16 {
         let cap = (term as u32 * 9 / 10) as u16; // 90% of the terminal axis
-        desired.max(min).min(cap).min(term)
+        // `cap` is always ≤ `term`, so clamping to `cap` already fits the
+        // terminal — no separate `.min(term)` needed (R-Nit2).
+        desired.max(min).min(cap)
     };
     let width = clamp_axis(desired_w, min_w, terminal.width);
     let height = clamp_axis(desired_h, min_h, terminal.height);
@@ -10131,7 +10140,18 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
     // message do. (`[Add a] [Edit e] [Delete d] [Run now r]`, indented one cell.)
     const BUTTON_ROW_W: usize = 1 + 7 + 1 + 8 + 1 + 10 + 1 + 11;
     let list_w = 2 + name_col + status_col + next_col;
-    let header_w = 2 + name_col + status_col + "NEXT FIRE".len();
+    // R-Sug1: the header line appends a scroll indicator (e.g. `  (↑12 ↓34)`)
+    // when rows are hidden. Reserve its worst-case width in the header budget so
+    // a long name + a scrolling list never clips the up/down counts at the right
+    // border. Worst case is both arrows present, each count as wide as the digit
+    // count of the total row count: `  (↑` (4) + digits + ` ↓` (2) + digits +
+    // `)` (1) = 7 + 2·digits.
+    let scroll_hint_w = if ui.scheduled_tasks.is_empty() {
+        0
+    } else {
+        7 + 2 * ui.scheduled_tasks.len().to_string().len()
+    };
+    let header_w = 2 + name_col + status_col + "NEXT FIRE".len() + scroll_hint_w;
     let confirm_w = confirm_lines.iter().map(|l| l.width()).max().unwrap_or(0);
     let empty_w = if ui.scheduled_tasks.is_empty() {
         count_chars("  No schedules configured. Press `a` to add one.")
@@ -10151,8 +10171,11 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
     .max()
     .unwrap_or(0);
 
-    // Size & center the modal: content width + borders + a little right margin,
-    // content height + borders. Clamped to [min, 90% of terminal] by `modal_rect`.
+    // Size & center the modal: content width + borders + a little right margin
+    // (+4 = 2 borders + 2 margin), content height + borders + one slack row
+    // (+3 = 2 borders + 1 row, mirroring the width margin so the list never sits
+    // flush against the bottom border). Clamped to [min, 90% of terminal] by
+    // `modal_rect`.
     let desired_w = (content_w as u16).saturating_add(4);
     let desired_h = row_count + chrome_lines as u16 + 3;
     let popup_area = modal_rect(desired_w, desired_h, area, 56, 9);
@@ -10300,6 +10323,19 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
         Button::new("Delete", "d", Action::ScheduleArmDelete, has_rows),
         Button::new("Run now", "r", run_now_action, has_rows),
     ];
+    // R-Nit1: `BUTTON_ROW_W` (used above to budget the modal width before the
+    // buttons exist) must equal the actual rendered button-row width — indent
+    // (1) + each `[Label key]` label + one separator between buttons. Recompute
+    // it from the real labels so a label rename can't silently drift the budget.
+    debug_assert_eq!(
+        BUTTON_ROW_W,
+        1 + buttons
+            .iter()
+            .map(|b| b.display_label().chars().count())
+            .sum::<usize>()
+            + buttons.len().saturating_sub(1),
+        "BUTTON_ROW_W drifted from the rendered action-button labels; update the constant"
+    );
     let btn_row = Rect {
         x: popup_area.x + 1,
         y: popup_area.y + 1 + row_idx as u16,
@@ -10515,6 +10551,15 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
 
     // ── Clickable geometry (overlaid / computed after the Paragraph) ────────
     let line_y = |n: usize| popup_area.y + 1 + n as u16;
+    // PRD #144 A1: the overlays below (mode chips, Submit/Cancel row, cursor)
+    // are placed by absolute line index, but on a degenerate short terminal the
+    // `modal_rect`-clamped popup can be far shorter than the form's reserved
+    // rows. Any write whose row falls at/below `popup_bottom` would land past
+    // the buffer (`set_span` only guards the x-axis) → panic, so every overlay
+    // row is skipped when it doesn't fit — mirroring how `render_scheduled_tasks`
+    // bounds its rows. `popup_bottom <= buffer height` because `modal_rect`
+    // clamps the popup to the terminal.
+    let popup_bottom = popup_area.bottom();
     let row_x = popup_area.x + 1;
     let row_width = popup_area.width.saturating_sub(2);
     let inner_end = row_x + row_width;
@@ -10548,7 +10593,9 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // `[schedule]`) un-clipped. Each chip records its own clickable rect so the
     // mode-chip click hit-test still selects the right option.
     let mut chip_rects: Vec<(usize, Rect)> = Vec::new();
-    if let Some(mi) = mode_line_idx {
+    if let Some(mi) = mode_line_idx
+        && line_y(mi) < popup_bottom
+    {
         let mode_y = line_y(mi);
         // Whole chip area (off-chip clicks focus the Mode field).
         field_rects.push((
@@ -10611,14 +10658,23 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         width: row_width,
         height: 1,
     };
-    let button_rects = render_modal_button_row(frame, &buttons, btn_row, 1);
+    // PRD #144 A1: skip the button row entirely when it falls outside the
+    // clamped popup (degenerate short terminal) rather than writing past the
+    // buffer bottom.
+    let button_rects = if btn_row.y < popup_bottom {
+        render_modal_button_row(frame, &buttons, btn_row, 1)
+    } else {
+        Vec::new()
+    };
 
     // Cursor in the active text field (Mode uses chips, so no cursor there).
-    if form.focused == FormField::Name {
+    // PRD #144 A1: only place the cursor when its row fits inside the popup.
+    if form.focused == FormField::Name && line_y(name_line_idx) < popup_bottom {
         let cursor_x = popup_area.x + 12 + form.name.len() as u16;
         frame.set_cursor_position(Position::new(cursor_x, line_y(name_line_idx)));
     } else if form.focused == FormField::Command
         && let Some(ci) = cmd_line_idx
+        && line_y(ci) < popup_bottom
     {
         let cursor_x = popup_area.x + 12 + form.command.len() as u16;
         frame.set_cursor_position(Position::new(cursor_x, line_y(ci)));
@@ -12002,6 +12058,31 @@ mod tests {
 
         // Empty input occupies no rows.
         assert_eq!(layout_button_bar(&[], 80), (Vec::new(), 0));
+    }
+
+    // PRD #144 A2 — `bottom_bar_rows` must never reserve so many rows that the
+    // main content area is starved to zero. At an extreme-narrow width the
+    // full-label bar wraps to one row per button (9 on the dashboard), far more
+    // than a short frame is tall; the reservation is capped at `frame_height - 1`
+    // so at least one content row always remains. Pure data, so a plain unit test.
+    #[test]
+    fn bottom_bar_rows_caps_to_leave_a_content_row() {
+        let ui = UiState::default();
+        let tab_view = ActiveTabView::Dashboard {
+            exclude_pane_ids: Vec::new(),
+        };
+        // 8 cols is narrower than any single full button label, so every button
+        // wraps onto its own row — the uncapped count (9) exceeds each of these
+        // tiny frame heights, exercising the cap.
+        for frame_height in 2u16..=9 {
+            let rows = bottom_bar_rows(&ui, 8, frame_height, &tab_view);
+            assert!(
+                rows <= frame_height - 1,
+                "bottom_bar_rows at frame_height={frame_height} reserved {rows} \
+                 rows, leaving no content row (must be <= frame_height - 1)"
+            );
+            assert!(rows >= 1, "the bar still occupies at least one row");
+        }
     }
 
     // PRD #76 M2.12: pin the hydration partition's bucket semantics so
