@@ -7,16 +7,20 @@
 //! `<sub-area>_<NNN>_<short_suffix>` per Decision 17.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 use dot_agent_deck::state::{ActiveTool, DashboardStats, SessionState, SessionStatus};
 use dot_agent_deck::tab::Tab;
+use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
     CardDensityKind, render_card_to_buffer, render_config_gen_prompt_to_buffer,
     render_dashboard_cards_to_buffer, render_quit_confirm_to_buffer, render_star_prompt_to_buffer,
     render_stats_bar_to_buffer, render_stop_confirm_to_buffer, sync_and_derive_selection,
 };
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
+use ratatui::widgets::Widget;
 use spec::spec;
 
 /// Width (in terminal cells) at which `render_session_card` flips
@@ -244,12 +248,14 @@ fn contrast_001_overlays_reference_frame() {
 /// unselected and SELECTED states, then assert two terminal-relative
 /// properties. (a) NO rendered cell across any surface has a `Color::Rgb(..)`
 /// background — backgrounds must be `Color::Reset` so the terminal's own
-/// background shows through. (b) Selection is cued the PRD #13 Option-A way —
-/// a `▸ ` title prefix plus a `Color::Cyan` + `Modifier::BOLD` border — NOT an
-/// absolute background tint: the selected card's border style must differ from
-/// the unselected card's and be cyan-bold. A regression that filled any surface
-/// with an absolute background, or that dropped the cyan-bold selection border,
-/// would fail one of these assertions.
+/// background shows through. (b) Selection is cued the PRD #155 Option-A way —
+/// a `▸ ` title prefix plus a `Color::Magenta` + `Modifier::BOLD` border — NOT
+/// an absolute background tint, and Magenta is the dedicated `selected` accent
+/// role so it never collides with a status color (green/blue/yellow/red) or the
+/// `focused` cyan: the selected card's border style must differ from the
+/// unselected card's and be magenta-bold. A regression that filled any surface
+/// with an absolute background, or that reverted the selection border to a
+/// status/focus color, would fail one of these assertions.
 #[spec("theme/guard/001")]
 #[test]
 fn guard_001_no_absolute_backgrounds() {
@@ -270,12 +276,14 @@ fn guard_001_no_absolute_backgrounds() {
         );
     }
 
-    // (b) PRD #13 Option A: selection is signalled by a `▸ ` title prefix and a
-    //     Cyan+BOLD border — a terminal-relative cue, NOT an absolute
+    // (b) PRD #155 Option A: selection is signalled by a `▸ ` title prefix and a
+    //     Magenta+BOLD border — a terminal-relative cue, NOT an absolute
     //     background. Read the left-border cell (`│`, at a mid-height row) of
     //     each card: the selected one must DIFFER from the unselected one and
-    //     be Color::Cyan + Modifier::BOLD. (The unselected placeholder border is
-    //     a dimmed terminal foreground.)
+    //     be Color::Magenta + Modifier::BOLD. Magenta is the dedicated
+    //     `selected` accent role; it deliberately does not reuse the working
+    //     status green or the focused-pane cyan. (The unselected placeholder
+    //     border is a dimmed terminal foreground.)
     let border_style = |buf: &ratatui::buffer::Buffer| {
         let y = buf.area().height / 2;
         let cell = &buf[(0, y)];
@@ -290,8 +298,8 @@ fn guard_001_no_absolute_backgrounds() {
     );
     assert_eq!(
         sel_fg,
-        Color::Cyan,
-        "selected card border must use Color::Cyan (Option-A selection cue)"
+        Color::Magenta,
+        "selected card border must use the `selected` role (Color::Magenta), not a status/focus color (Option-A selection cue)"
     );
     assert!(
         sel_mod.contains(Modifier::BOLD),
@@ -331,6 +339,338 @@ fn guard_002_no_absolute_bg_in_source() {
             !src.contains(forbidden),
             "src/ui.rs still contains forbidden absolute-background pattern `{forbidden}` — \
              terminal-relative surfaces must use Color::Reset / Modifier::REVERSED"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PRD #155 — centralized color palette (Option A). Border encodes STATUS in
+// BOTH deck cards and embedded panes; the dedicated `selected` (Magenta) and
+// `focused` (Cyan) accent roles never reuse a status color. These tests read
+// the resolved border color out of the rendered buffer (the observable
+// end-state) so they survive the palette module's exact API — except
+// `theme/guard/003`, which is a deliberate source lint.
+// ---------------------------------------------------------------------------
+
+/// Build a live (non-placeholder) session fixture carrying `status`. Used to
+/// drive the deck-card border through `render_card_to_buffer` for every status
+/// role. `last_activity = now` keeps any rendered elapsed at `0s ago` (mirrors
+/// `pane_004`); these tests inspect only the border color, never the body.
+fn palette_session(status: SessionStatus) -> SessionState {
+    let now = chrono::Utc::now();
+    SessionState {
+        session_id: "sess-palette".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        cwd: Some("/home/dev/example-project".to_string()),
+        status,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: Some("do the thing".to_string()),
+        first_prompts: vec!["do the thing".to_string()],
+        pane_id: Some("pane-1".to_string()),
+        agent_id: Some("1".to_string()),
+        display_name: None,
+    }
+}
+
+/// Read the `(fg, modifier)` of a card/pane's left border at a mid-height row.
+/// The `Borders::ALL` block paints the left edge (`│`, x=0) with the resolved
+/// border style for every inner row, so a mid-height cell is the border color
+/// regardless of title/content layout (same seam as `guard_001`).
+fn border_style_at_mid(buffer: &ratatui::buffer::Buffer) -> (Color, Modifier) {
+    let y = buffer.area().height / 2;
+    let cell = &buffer[(0, y)];
+    (cell.fg, cell.modifier)
+}
+
+/// Render a single deck card for a live agent in `status` (not selected, not
+/// focused) and return its resolved border `(fg, modifier)`. 80 cells wide ⇒
+/// the wide layout; height comes from the density tier so geometry tracks the
+/// production layout module.
+fn card_border_at_mid(status: SessionStatus) -> (Color, Modifier) {
+    let session = palette_session(status);
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
+    let height = density.rendered_height(wide);
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("example-agent"),
+        Some(1),
+        density,
+        0,     // animation tick
+        false, // not selected
+        width,
+        height,
+    );
+    border_style_at_mid(&buffer)
+}
+
+/// Render an embedded pane (`TerminalWidget`) and return its resolved border
+/// `(fg, modifier)`. The outer 22×6 area gives a 20×4 inner area; the vt100
+/// screen is sized to match so the 1:1 render contract holds (no size-mismatch
+/// fallback). `status` is carried in the pane title so the parameter is
+/// meaningful today.
+///
+/// PRD #155 RED→GREEN seam: the embedded-pane border currently encodes ONLY
+/// `focused` (`src/terminal_widget.rs`). Option A requires it to encode STATUS
+/// when neither selected nor focused — the SAME role the deck card uses. When
+/// the coder makes `TerminalWidget` status-aware (resolving its border from the
+/// centralized palette), thread `status` into the widget construction below;
+/// the assertions read the rendered border and do not otherwise change.
+fn pane_border_at_mid(status: Option<SessionStatus>, focused: bool) -> (Color, Modifier) {
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 22,
+        height: 6,
+    };
+    // Inner area is 20×4; size the screen to match (no contract fallback).
+    let parser = vt100::Parser::new(4, 20, 0);
+    let parser = Arc::new(Mutex::new(parser));
+    let title = match &status {
+        Some(s) => format!("{s:?}"),
+        None => "pane".to_string(),
+    };
+    let widget = TerminalWidget::new(parser, title, focused);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    widget.render(area, &mut buf);
+    border_style_at_mid(&buf)
+}
+
+/// The five status roles in the centralized palette and the named-ANSI color
+/// each must resolve to (PRD #155 locked plan): working=Green, thinking=Blue,
+/// waiting=Yellow, error=Red, idle=DarkGray. The single source of truth shared
+/// by the deck-card (T1) and embedded-pane (T2) assertions.
+fn status_role_colors() -> [(SessionStatus, Color); 5] {
+    [
+        (SessionStatus::Working, Color::Green),
+        (SessionStatus::Thinking, Color::Blue),
+        (SessionStatus::WaitingForInput, Color::Yellow),
+        (SessionStatus::Error, Color::Red),
+        (SessionStatus::Idle, Color::DarkGray),
+    ]
+}
+
+/// Scenario: Render a deck card for each of the five agent statuses
+/// (working/thinking/waiting/error/idle), none selected or focused, and assert
+/// the card's border color is the matching centralized status role —
+/// working=Green, thinking=Blue, waiting=Yellow, error=Red, idle=DarkGray. This
+/// pins PRD #155 Option A: the deck-card border encodes status via the palette
+/// roles. RED today because `status_style` maps working→Yellow, thinking→Cyan,
+/// waiting→Red and idle→Green (only error→Red already matches).
+#[spec("theme/palette/001")]
+#[test]
+fn palette_001_deck_card_border_is_status_role() {
+    for (status, role) in status_role_colors() {
+        let (fg, _modifier) = card_border_at_mid(status.clone());
+        assert_eq!(
+            fg, role,
+            "deck card border for {status:?} must use the centralized status role color \
+             {role:?}, got {fg:?}"
+        );
+    }
+}
+
+/// Scenario: For each agent status, render the deck card AND an embedded pane
+/// (neither selected nor focused) and assert the pane's border color is the
+/// SAME as the deck card's for that status — and that both equal the palette
+/// status role color. This is the consistency criterion: a given state looks
+/// identical as a deck card and as an embedded pane. RED today because the pane
+/// border encodes only focus (dimmed terminal foreground when unfocused), so it
+/// does not match the deck card's status color for any state.
+#[spec("theme/palette/002")]
+#[test]
+fn palette_002_pane_border_matches_deck_status_color() {
+    for (status, role) in status_role_colors() {
+        let card_fg = card_border_at_mid(status.clone()).0;
+        let pane_fg = pane_border_at_mid(Some(status.clone()), false).0;
+        assert_eq!(
+            pane_fg, card_fg,
+            "embedded pane border for {status:?} must match the deck card's status color \
+             (deck={card_fg:?}, pane={pane_fg:?})"
+        );
+        assert_eq!(
+            card_fg, role,
+            "the shared status color for {status:?} must be the {role:?} palette role"
+        );
+    }
+}
+
+/// Scenario: Render a SELECTED deck card and assert its border is the dedicated
+/// `selected` accent role — Color::Magenta + Modifier::BOLD — plus the `▸ `
+/// title marker, and that this color is NOT a status color (≠ green) and NOT
+/// the focused accent (≠ cyan). This pins the Option-A rule that selection is
+/// conveyed by a non-status accent that never collides with the palette. RED
+/// today because the selected card border is still Color::Cyan + BOLD.
+#[spec("theme/palette/003")]
+#[test]
+fn palette_003_selected_card_border_is_magenta_bold_marker() {
+    let session = palette_session(SessionStatus::Working);
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
+    let height = density.rendered_height(wide);
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("example-agent"),
+        Some(1),
+        density,
+        0,    // animation tick
+        true, // SELECTED
+        width,
+        height,
+    );
+    let (fg, modifier) = border_style_at_mid(&buffer);
+    assert_eq!(
+        fg,
+        Color::Magenta,
+        "selected card border must use the `selected` role (Color::Magenta), got {fg:?}"
+    );
+    assert!(
+        modifier.contains(Modifier::BOLD),
+        "selected card border must be BOLD, got {modifier:?}"
+    );
+    assert_ne!(
+        fg,
+        Color::Green,
+        "the selected accent must not reuse the working-status green"
+    );
+    assert_ne!(
+        fg,
+        Color::Cyan,
+        "the selected accent must not reuse the focused-pane cyan"
+    );
+    assert!(
+        buffer_to_text(&buffer).contains('▸'),
+        "selected card must carry the `▸ ` selection title marker"
+    );
+}
+
+/// Scenario: Render a FOCUSED embedded pane and assert its border is the
+/// dedicated `focused` accent role — Color::Cyan — and that this color is
+/// distinct from every status role (green/blue/yellow/red/dark-gray) and from
+/// the `selected` accent (magenta). This pins the Option-A split that keeps
+/// focus on Cyan while selection moves to Magenta, so status/selection/focus
+/// are provably distinct. Already green today (the focused pane border is
+/// Color::Cyan); it locks that behavior against the palette rewire.
+#[spec("theme/palette/004")]
+#[test]
+fn palette_004_focused_pane_border_is_cyan_distinct() {
+    let (fg, _modifier) = pane_border_at_mid(None, true);
+    assert_eq!(
+        fg,
+        Color::Cyan,
+        "focused pane border must use the `focused` role (Color::Cyan), got {fg:?}"
+    );
+    for collide in [
+        Color::Green,
+        Color::Blue,
+        Color::Yellow,
+        Color::Red,
+        Color::DarkGray,
+        Color::Magenta,
+    ] {
+        assert_ne!(
+            fg, collide,
+            "the focused accent (cyan) must be distinct from the {collide:?} status/selection role"
+        );
+    }
+}
+
+/// Extract the source region of the top-level function whose signature contains
+/// `signature` — from the signature to the start of the next top-level `fn` /
+/// `pub fn` item. Brace-counting is avoided on purpose: bodies here carry
+/// `format!` strings with `{ }` placeholders that would skew a brace match.
+/// Panics with a clear message if the anchor is missing so a rename surfaces as
+/// an explicit lint failure rather than a silent skip.
+fn fn_region<'a>(src: &'a str, signature: &str) -> &'a str {
+    let start = src
+        .find(signature)
+        .unwrap_or_else(|| panic!("source lint anchor `{signature}` not found"));
+    let rest = &src[start..];
+    let next_fn = rest[1..]
+        .find("\nfn ")
+        .map(|i| i + 1)
+        .into_iter()
+        .chain(rest[1..].find("\npub fn ").map(|i| i + 1))
+        .min()
+        .unwrap_or(rest.len());
+    &rest[..next_fn]
+}
+
+/// Scenario: Source-lint the deck-card render path (`src/ui.rs`) and the
+/// embedded-pane render path (`src/terminal_widget.rs`): both must reference the
+/// centralized `palette`, the deck-card status mapping (`status_style`) and
+/// border resolver (`render_session_card`) must carry no inline status/accent
+/// `Color::Green/Blue/Yellow/Red/Cyan` literals, and the pane path must carry no
+/// inline status `Color::Green/Blue/Yellow/Red` literal. This is the M4
+/// tightening — the palette is the single source of truth. RED today because no
+/// `palette` exists, `status_style` hardcodes the status colors and
+/// `render_session_card` hardcodes the selection Cyan.
+#[spec("theme/guard/003")]
+#[test]
+fn guard_003_render_paths_use_palette_roles() {
+    let ui_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui.rs");
+    let pane_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/terminal_widget.rs");
+    let ui = std::fs::read_to_string(ui_path).expect("src/ui.rs should be readable");
+    let pane =
+        std::fs::read_to_string(pane_path).expect("src/terminal_widget.rs should be readable");
+
+    // (1) Both render paths reference the centralized palette (single source of
+    //     truth), rather than carrying their own inline literals.
+    assert!(
+        ui.contains("palette"),
+        "src/ui.rs must reference the centralized `palette` in its render paths"
+    );
+    assert!(
+        pane.contains("palette"),
+        "src/terminal_widget.rs (pane render path) must reference the centralized `palette`"
+    );
+
+    // (2) The deck-card status->color mapping carries no inline status/accent
+    //     literals — every status color comes from the palette.
+    let status_style = fn_region(&ui, "fn status_style");
+    for lit in [
+        "Color::Green",
+        "Color::Blue",
+        "Color::Yellow",
+        "Color::Red",
+        "Color::Cyan",
+    ] {
+        assert!(
+            !status_style.contains(lit),
+            "status_style still hardcodes inline `{lit}` — status colors must come from the palette"
+        );
+    }
+
+    // (3) The deck-card border resolver carries no inline accent/status literal
+    //     (notably the selection accent, formerly `Color::Cyan`).
+    let card = fn_region(&ui, "fn render_session_card");
+    for lit in [
+        "Color::Cyan",
+        "Color::Green",
+        "Color::Blue",
+        "Color::Yellow",
+        "Color::Red",
+        "Color::Magenta",
+    ] {
+        assert!(
+            !card.contains(lit),
+            "render_session_card still hardcodes inline `{lit}` — the border must resolve through the palette"
+        );
+    }
+
+    // (4) The embedded-pane render path carries no inline status literal — the
+    //     pane border's status colors must come from the palette (the
+    //     consistency criterion mirrored from the deck card).
+    for lit in ["Color::Green", "Color::Blue", "Color::Yellow", "Color::Red"] {
+        assert!(
+            !pane.contains(lit),
+            "src/terminal_widget.rs still hardcodes inline `{lit}` — pane status colors must come from the palette"
         );
     }
 }
