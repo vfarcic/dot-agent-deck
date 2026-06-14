@@ -1562,6 +1562,12 @@ pub(crate) struct ModeHydrationBucket {
 pub(crate) struct OrchestrationHydrationBucket {
     pub cwd: String,
     pub orchestration_name: String,
+    /// PRD #107 follow-up: the user-typed tab title echoed back by the
+    /// daemon on each role pane's `TabMembership::Orchestration.display_title`
+    /// (shared across roles, so the first non-`None` slot wins). Routed to
+    /// the rebuilt tab's TITLE so detach/reattach preserves the entered name;
+    /// `None` falls back to the canonical resolved name.
+    pub display_title: Option<String>,
     pub role_slots: Vec<OrchestrationRoleSlot>,
 }
 
@@ -1778,6 +1784,7 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
                 role_name,
                 is_start_role,
                 orchestration_cwd,
+                display_title,
             }) => {
                 // Round-12 reviewer #1: bucket by `(orchestration_cwd,
                 // name)` — the same identity tuple the daemon uses for
@@ -1817,11 +1824,18 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
                             .push(OrchestrationHydrationBucket {
                                 cwd: bucket_cwd,
                                 orchestration_name: name.clone(),
+                                display_title: display_title.clone(),
                                 role_slots: Vec::new(),
                             });
                         i
                     }
                 };
+                // All role panes of one orchestration carry the same
+                // display_title, but guard against a leading legacy/dead slot
+                // that omitted it: keep the first non-`None` value we see.
+                if out.orchestration_buckets[idx].display_title.is_none() {
+                    out.orchestration_buckets[idx].display_title = display_title.clone();
+                }
                 out.orchestration_buckets[idx]
                     .role_slots
                     .push(OrchestrationRoleSlot {
@@ -5793,6 +5807,7 @@ pub fn run_tui(
                 &orch_config,
                 &bucket.cwd,
                 role_pane_ids.clone(),
+                bucket.display_title.as_deref(),
             ) {
                 Ok((tab_index, _)) => {
                     if first_orchestration_tab_index.is_none() {
@@ -12095,6 +12110,7 @@ mod tests {
                     role_name: "orchestrator".into(),
                     is_start_role: true,
                     orchestration_cwd: Some(orch_cwd.clone()),
+                    display_title: None,
                 }),
             ),
             hydrated(
@@ -12107,6 +12123,7 @@ mod tests {
                     role_name: "coder".into(),
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
+                    display_title: None,
                 }),
             ),
             hydrated(
@@ -12119,6 +12136,7 @@ mod tests {
                     role_name: "reviewer".into(),
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
+                    display_title: None,
                 }),
             ),
         ];
@@ -12132,6 +12150,51 @@ mod tests {
         assert_eq!(bucket.cwd, orch_cwd);
         assert_eq!(bucket.orchestration_name, "tdd-cycle");
         assert_eq!(bucket.role_slots.len(), 3);
+    }
+
+    /// PRD #107 follow-up: the user-typed title persisted on each role
+    /// pane's `TabMembership::Orchestration.display_title` flows into the
+    /// hydration bucket so reattach can restore it. A leading slot that
+    /// omits the title (legacy/dead pane) must not mask a later slot that
+    /// carries it — the first non-`None` value wins.
+    #[test]
+    fn partition_propagates_orchestration_display_title_first_non_none_wins() {
+        let orch_cwd = "/proj".to_string();
+        let panes = vec![
+            hydrated(
+                "1",
+                "a-1",
+                Some("/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some(orch_cwd.clone()),
+                    display_title: None, // leading slot omits the title
+                }),
+            ),
+            hydrated(
+                "2",
+                "a-2",
+                Some("/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 1,
+                    role_name: "coder".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(orch_cwd.clone()),
+                    display_title: Some("My Custom Run".into()),
+                }),
+            ),
+        ];
+        let p = partition_hydrated_panes(&panes);
+        assert_eq!(p.orchestration_buckets.len(), 1);
+        assert_eq!(
+            p.orchestration_buckets[0].display_title.as_deref(),
+            Some("My Custom Run"),
+            "a later slot's display_title backfills a leading None slot"
+        );
     }
 
     /// Negative-case mirror of the above: two panes with the same
@@ -12151,6 +12214,7 @@ mod tests {
                     role_name: "orchestrator".into(),
                     is_start_role: true,
                     orchestration_cwd: Some("/home/u/project-a".into()),
+                    display_title: None,
                 }),
             ),
             hydrated(
@@ -12163,6 +12227,7 @@ mod tests {
                     role_name: "orchestrator".into(),
                     is_start_role: true,
                     orchestration_cwd: Some("/home/u/project-b".into()),
+                    display_title: None,
                 }),
             ),
         ];
@@ -12190,6 +12255,7 @@ mod tests {
                 role_name: "orchestrator".into(),
                 is_start_role: true,
                 orchestration_cwd: None,
+                display_title: None,
             }),
         )];
         let p = partition_hydrated_panes(&panes);
@@ -12210,6 +12276,7 @@ mod tests {
                     role_name: String::new(),
                     is_start_role: false,
                     orchestration_cwd: None,
+                    display_title: None,
                 }),
             ),
             hydrated(
@@ -12222,6 +12289,7 @@ mod tests {
                     role_name: String::new(),
                     is_start_role: false,
                     orchestration_cwd: None,
+                    display_title: None,
                 }),
             ),
         ];
@@ -12562,7 +12630,8 @@ mod tests {
         let mut tm = crate::tab::TabManager::new(Arc::new(NoopPC));
         let mut bad_vec = role_pane_ids.clone();
         bad_vec.truncate(role_pane_ids.len() - 1);
-        let result = tm.open_orchestration_tab_with_existing_role_panes(&cfg, "/work", bad_vec);
+        let result =
+            tm.open_orchestration_tab_with_existing_role_panes(&cfg, "/work", bad_vec, None);
         assert!(
             result.is_err(),
             "test precondition: mismatched-length role_pane_ids must Err"
@@ -12692,6 +12761,7 @@ mod tests {
                     role_name: String::new(),
                     is_start_role: false,
                     orchestration_cwd: None,
+                    display_title: None,
                 }),
             ),
             hydrated(
@@ -12704,6 +12774,7 @@ mod tests {
                     role_name: String::new(),
                     is_start_role: false,
                     orchestration_cwd: None,
+                    display_title: None,
                 }),
             ),
         ];
@@ -12732,6 +12803,7 @@ mod tests {
                     role_name: String::new(),
                     is_start_role: false,
                     orchestration_cwd: None,
+                    display_title: None,
                 }),
             ),
         ];
@@ -12768,6 +12840,7 @@ mod tests {
                     role_name: "orchestrator".into(),
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
+                    display_title: None,
                 }),
             ),
             hydrated(
@@ -12780,6 +12853,7 @@ mod tests {
                     role_name: "reviewer".into(),
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
+                    display_title: None,
                 }),
             ),
         ];
@@ -12824,6 +12898,7 @@ mod tests {
                     role_name: "orchestrator".into(),
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
+                    display_title: None,
                 }),
             ),
             hydrated(
@@ -12836,6 +12911,7 @@ mod tests {
                     role_name: "reviewer".into(),
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
+                    display_title: None,
                 }),
             ),
         ];
@@ -12928,7 +13004,12 @@ mod tests {
         }
         let mut tm = crate::tab::TabManager::new(Arc::new(NoopPC));
         let (tab_index, _flat) = tm
-            .open_orchestration_tab_with_existing_role_panes(&cfg, &bucket.cwd, role_pane_ids)
+            .open_orchestration_tab_with_existing_role_panes(
+                &cfg,
+                &bucket.cwd,
+                role_pane_ids,
+                bucket.display_title.as_deref(),
+            )
             .expect("synthesised-config hydration must succeed");
         assert_eq!(tab_index, 1, "first non-dashboard tab is at index 1");
         let labels = tm.tab_labels();
@@ -12959,6 +13040,7 @@ mod tests {
                     role_name: "first".into(),
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
+                    display_title: None,
                 }),
             ),
             hydrated(
@@ -12971,6 +13053,7 @@ mod tests {
                     role_name: "second".into(),
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
+                    display_title: None,
                 }),
             ),
         ];
@@ -13068,6 +13151,7 @@ mod tests {
         let bucket = OrchestrationHydrationBucket {
             cwd: "/remote/proj".into(),
             orchestration_name: "review".into(),
+            display_title: None,
             role_slots: vec![
                 OrchestrationRoleSlot {
                     role_index: 0,

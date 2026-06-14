@@ -261,6 +261,7 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
                 role_name: "coder".into(),
                 is_start_role: false,
                 orchestration_cwd: Some("/proj/\x1b[31m".into()),
+                display_title: None,
             }),
             agent_type: None,
         },
@@ -296,6 +297,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             role_name: "coder".into(),
             is_start_role: false,
             orchestration_cwd: None,
+            display_title: None,
         },
     )
     .await;
@@ -313,6 +315,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             role_name: "coder".into(),
             is_start_role: false,
             orchestration_cwd: None,
+            display_title: None,
         })
     );
     server.registry.shutdown_all();

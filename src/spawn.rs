@@ -308,6 +308,7 @@ pub async fn spawn(
                     role_name: role.role_name.clone(),
                     is_start_role: role.is_start_role,
                     orchestration_cwd: Some(req.working_dir.clone()),
+                    display_title: None,
                 };
                 let id = spawn_one(
                     registry,
