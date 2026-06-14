@@ -1,10 +1,22 @@
 # PRD #90: Remote daemon upgrade flow
 
-**Status**: Planning
+**Status**: No Longer Needed (superseded by PRD #76 + PRD #103)
 **Priority**: Medium
 **Created**: 2026-05-17
+**Last Updated**: 2026-06-14
+**Closed**: 2026-06-14
 **GitHub Issue**: [#90](https://github.com/vfarcic/dot-agent-deck/issues/90)
 **Depends on**: PRD #76 (Remote Agent Environments) shipping. Tightly related to PRD #91 (Hook freshness check).
+
+## Closure Note (2026-06-14)
+
+Closed as **No Longer Needed** — the core deliverables shipped under other PRDs:
+
+- **`remote upgrade` command exists** — `RemoteCmd::Upgrade` → `remote::upgrade()` (`src/remote.rs:1186`): downloads the matching release artifact, atomically installs it on the remote (tempfile + rename), and re-runs `hooks install`.
+- **Client/daemon build-version handshake shipped via PRD #103** — `src/build_version_handshake.rs` (`ensure_compatible_daemon_or_die`); `AttachRequest::Hello`/`AttachResponse` carry build versions. On mismatch it SIGTERMs the daemon so the next attach lazy-spawns a fresh one — covering the "daemon version compatibility" problem this PRD raised.
+- **Graceful `daemon stop`/`restart` shipped via PRD #103** — `src/daemon_stop.rs` (SIGTERM + poll + optional SIGKILL via peer-PID). The protocol-level `AttachRequest::DaemonStop` this PRD proposed was deliberately **not** built; #103 chose a better OS peer-credential approach instead.
+
+The remaining gaps are minor and below the bar for a standing PRD: an explicit graceful-stop-before-binary-swap (today the upgrade relies on #103's handshake to tear down a mismatched daemon on next attach), a `--from-local` flag (push the laptop binary instead of downloading a release), and a "same version → no-op" short-circuit. If wanted, file these as a single small issue rather than tracking them here.
 
 ## Problem Statement
 

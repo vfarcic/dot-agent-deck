@@ -239,7 +239,7 @@ pub struct AttachResponse {
 - `src/main.rs` — `run_tui_session` (around `:583` where `ensure_external_daemon_or_die` is called); `DaemonCmd` enum (`:135`); `cmd_daemon_hello` (`:777`); new `cmd_daemon_stop` / `cmd_daemon_restart`.
 - `src/connect.rs` — `probe_remote_protocol` (`:460`); the remote `AttachResponse` deserialization (`:495`) and `server_version` comparison (`:517`) — the new `build_version` comparison sits alongside.
 - `prds/93-always-external-daemon.md` — parent PRD. Line 39 references the promised "equivalent local command".
-- `prds/90-remote-daemon-upgrade.md` — related PRD that benefits from the M1.4 remote build-version comparison.
+- `prds/done/90-remote-daemon-upgrade.md` — related PRD (now closed; superseded by #76 + this PRD) that the M1.4 remote build-version comparison helped obsolete.
 - `docs/installation.md` and/or `docs/getting-started.mdx` — daemon-lifecycle docs introduced by PRD #93; this PRD extends them.
 
 ## Risks and Mitigations
