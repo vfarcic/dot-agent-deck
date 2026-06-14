@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.29.0] - 2026-06-14
+
+### Added
+
+- **Experimental Feature Flag**
+  In-flight features can now be gated behind a single `experimental` flag so work-in-progress surfaces merge to `main` without appearing in normal use.
+  The flag is **off by default**. Enable it two ways:
+  - **Config file** — add `[features] experimental = true` to `.dot-agent-deck.toml` while the deck is running; the flag reloads within ~2 seconds with no restart required.
+  - **Environment variable** — set `DOT_AGENT_DECK_EXPERIMENTAL=1` before starting the deck; the env value always wins over the config file.
+  Each flag-gated feature declares a thin per-feature wrapper (`features::show_<feature>()`) so a single `grep` finds every call site, enabling a mechanical, diff-clean removal when the feature graduates to fully visible.
+  See the [Experimental Flag](https://github.com/vfarcic/dot-agent-deck/blob/main/docs/develop/experimental-flag.md) reference for configuration details and the graduation workflow.
+- **Remote Connect Survives Sleep/Wake**
+  Remote sessions no longer freeze when your laptop sleeps. Previously, closing the lid dropped the underlying TCP connection silently — the SSH client had no way to detect the dead socket, so on wake the TUI was frozen, keystrokes went nowhere, and the only escape was closing the terminal tab entirely and reconnecting manually.
+  Two layers work together to eliminate this: SSH keepalive probing on the live session detects the dropped connection within roughly 45 seconds of wake and terminates the session cleanly (`ServerAliveInterval=15`, `ServerAliveCountMax=3`). An automatic reconnect loop then re-probes the remote host and re-spawns the session transparently — you see a brief "reconnecting to `<name>`…" message and land back in your running agents without having to touch anything. Because the remote daemon is persistent and agent state is preserved across reconnects, you re-attach to the same agents you were already working with.
+  Reconnection is bounded: if the host is unreachable after five attempts (`MAX_CONNECT_ATTEMPTS=5`), the session exits cleanly and restores the local terminal to a sane state. Only SSH transport failures (exit code 255) trigger reconnection — a deliberate quit, Ctrl-C, or remote TUI crash exits immediately as before.
+  See the [Remote Environments guide](https://devopstoolkit.ai/docs/ui/remote-environments) for details on the keepalive tuning and retry behaviour.
+
+### Fixed
+
+- **Deck Selection Highlight Now Clears on Tab Switch**
+  The blue selection highlight on Dashboard and Orchestration deck cards no longer persists after switching away to another tab. Previously, the highlight stayed active even after switching tabs, creating a visual/functional mismatch where a card appeared ready to act on but wasn't.
+  The selection highlight is now active only when the user has explicitly engaged with it. Switching away from or back to a deck deactivates the highlight. To reactivate: press `j` to jump to the first card, `k` to jump to the last card, `1`–`9` to select a numbered card directly, or `Enter` to restore the previously-selected card. Once active, `j`/`k` navigate normally and the highlight persists until the next tab switch. The highlight also reactivates when a deck pane genuinely becomes focused (a real focus change), but not merely from the focus restored by switching back to the tab. This behavior applies consistently to both the Dashboard and Orchestration decks.
+- **Orchestration deck card heights right-sized to content**
+  Orchestration deck cards previously reserved more vertical space than their content filled, showing 1–2 blank rows at the bottom of each card and forcing unnecessary scrolling with 7 or more decks.
+  Card heights are now derived from the exact lines `render_session_card` emits: Compact cards shrink from 7 to 5 rows (wide) or 8 to 6 rows (narrow), eliminating the 2-row gap that caused the most visible waste. Normal and Spacious tiers are also tightened by 1 row each. With the corrected Compact height, 7 decks in the single-column orchestration panel fit in ~35 rows — well within a typical ~48-row card area — so all decks are visible without scrolling. Scrolling still engages when the deck count genuinely exceeds the available space.
+- **Worker context now resets on delegation when the directory name differs from the orchestration name**
+  When an orchestration ran from a directory whose name differed from the `name` declared in its `.dot-agent-deck.toml` — most commonly a git **worktree** (e.g. `myproject-feature-x` vs a config named `myproject`) — delegating a task to a worker silently failed to restart that worker. The worker carried over the full conversation from its previous tasks instead of cold-starting, which let context accumulate and pushed agents into unnecessary context compaction. Orchestrations run from a directory whose name matched the config name (the common case) were unaffected, which is why the problem only surfaced in worktrees.
+  The cause was that the orchestration's internal identity and its display title were the same value: opening an orchestration seeded the title from the directory basename and that value overwrote the configured orchestration name, so the per-delegate role lookup (which re-reads the on-disk config) no longer matched and the clear/restart step was skipped.
+  Identity and title are now decoupled. Delegate routing and the per-role clear/restart decision use the orchestration `name` from `.dot-agent-deck.toml`, disambiguated per working directory, while the tab title still shows the name you entered when opening the orchestration. Worker roles using the default `clear = true` now reliably cold-start on each delegation regardless of the directory name; roles set to `clear = false` continue to retain their context as before.
+- **Rendering Contract — Eliminate Recurring Visual Glitches**
+  Fixes a class of recurring visual rendering bugs — scrambled text near the bottom of panes, empty space on the right edge after resize, and short-lived artefacts on tab switch or mode change — by replacing scattered, symptom-level patches with an explicit four-invariant rendering contract.
+  The render path now enforces: a single layout pass per frame (`compute_frame_layout` / `FrameLayout`) so no render function computes its own rects; layout-driven PTY resize via a single `resize_panes_to_layout` call that replaced all ad hoc per-site `resize_pane_pty` calls in tab open/close, mode switch, pane recreation, and `Event::Resize`; and `TerminalWidget` rendering 1:1 against its assigned area with no `min(area, screen)` clamp or cursor-anchored row windowing. Resize sequencing is fixed so compute, resize, and render always share the same live area within a frame.
+  A `debug_assert` guards the PTY-size-equals-area invariant in debug builds; release builds log once on mismatch and fall back to `min` rather than panicking. Six failure-mode reproducers are added to the test catalog and run in CI. Validated across 1 039 e2e scenarios with zero contract violations.
+  See the rendering contract (`docs/develop/rendering-contract.md`) in the repository for the full invariant specification.
+
+
+
 ## [0.28.0] - 2026-06-12
 
 ### Added
