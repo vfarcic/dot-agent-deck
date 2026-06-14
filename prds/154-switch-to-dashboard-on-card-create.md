@@ -1,6 +1,6 @@
 # PRD #154: Switch to Dashboard when creating a single-agent card from a non-Dashboard tab
 
-**Status**: Planning
+**Status**: In Progress
 **Priority**: Medium
 **Created**: 2026-06-13
 **GitHub Issue**: [#154](https://github.com/vfarcic/dot-agent-deck/issues/154)
@@ -72,23 +72,23 @@ In the "regular dashboard pane" branch of `Action::SpawnPane`, switch to the Das
 ## Acceptance Criteria
 
 ### Lands on the Dashboard
-- [ ] Creating a single-agent card (no mode, no orchestration) while an **orchestration tab** is active leaves the **Dashboard** tab active afterward, with the new card selected and focused.
-- [ ] Same when launched from a **mode tab**: the active tab afterward is the Dashboard, new card selected.
-- [ ] Creating a card while already on the Dashboard is unchanged (still selects/focuses the new card; no visible regression).
+- [x] Creating a single-agent card (no mode, no orchestration) while an **orchestration tab** is active leaves the **Dashboard** tab active afterward, with the new card selected and focused. — L1 test `tabs/spawn/001` (GREEN).
+- [x] Same when launched from a **mode tab**: the active tab afterward is the Dashboard, new card selected. — L1 test `tabs/spawn/002` (GREEN).
+- [x] Creating a card while already on the Dashboard is unchanged (still selects/focuses the new card; no visible regression). — L1 baseline guard `tabs/spawn/003` (GREEN).
 
 ### Other creation paths unchanged
-- [ ] Creating an **orchestration** from any tab still switches to the new orchestration tab (unchanged).
-- [ ] Creating a **mode** from any tab still switches to the new mode tab (unchanged).
+- [x] Creating an **orchestration** from any tab still switches to the new orchestration tab (unchanged). — fix is in the no-mode branch only; orch path untouched; e2e `spawn_002_orchestration_vs_single_agent` GREEN.
+- [x] Creating a **mode** from any tab still switches to the new mode tab (unchanged). — mode-creation path untouched; existing `tabs/mode/001` + full e2e GREEN.
 
 ### No regressions
-- [ ] `selected_index`, focus, and dashboard pane resize still apply to the new card after the tab switch.
-- [ ] `cargo fmt --check` and `cargo clippy -- -D warnings` clean; fast test tier green.
+- [x] `selected_index`, focus, and selection still apply to the new card after the tab switch; the leaving tab's focus is captured (via `capture_focus_on_switch_out`) and restores on return. — asserted by `tabs/spawn/001-003` (selection/focus) and `tabs/spawn/004` (leaving-tab focus round-trip). Layout reconciles next frame (PRD #84 M4), so no explicit resize call remains.
+- [x] `cargo fmt --check` and `cargo clippy -- -D warnings` clean; fast test tier green. — fast tier 747/747; e2e suite 1108/1108.
 
 ## Milestones
 
-- [ ] **M1 — Fix.** Add `tab_manager.switch_to(0)` (with explanatory comment) to the "regular dashboard pane" branch of `Action::SpawnPane`, before the focus/selection calls.
-- [ ] **M2 — Tests.** Add a TUI test (L1) asserting that creating a single-agent card while an orchestration tab is active results in `active_index == 0` (Dashboard) with the new card selected; add the mode-tab variant; assert orchestration/mode creation still switch to their own tab.
-- [ ] **M3 — Verified in the running TUI.** Launch the deck, open an orchestration tab, create a single-agent card, and confirm the view switches to the Dashboard with the new card selected (per `run-dot-agent-deck`).
+- [x] **M1 — Fix.** Add `tab_manager.switch_to(0)` (with explanatory comment) to the "regular dashboard pane" branch of `Action::SpawnPane`, before the focus/selection calls. Also prepends `capture_focus_on_switch_out()` (review finding) to preserve the leaving tab's focus-restore.
+- [x] **M2 — Tests.** L1 tests `tabs/spawn/001-004`: orchestration→Dashboard, mode→Dashboard, Dashboard-source baseline, and leaving Mode-tab focus round-trip; orchestration/mode creation remain covered by existing `tabs/orchestration/001` + `tabs/mode/001` and the e2e suite.
+- [ ] **M3 — Verified in the running TUI.** Launch the deck, open an orchestration tab, create a single-agent card, and confirm the view switches to the Dashboard with the new card selected (per `run-dot-agent-deck`). _(Pending post-PR manual verification.)_
 
 ## Out of Scope
 
