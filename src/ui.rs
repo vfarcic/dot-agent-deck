@@ -18688,4 +18688,164 @@ mod tests {
             "the new card's pane must be focused after the spawn"
         );
     }
+
+    /// Pane controller like `OpenTabPC` (unique `mock-pane-N` ids, records every
+    /// `focus_pane`) but it ALSO reports the last-focused pane back through
+    /// `focused_pane_id()` — the live process-wide focus a real controller
+    /// exposes. `OpenTabPC` leaves `focused_pane_id()` at the trait default
+    /// (`None`), which makes `TabManager::capture_focus_on_switch_out` a no-op
+    /// (it returns early on `None`), so it can't exercise the switch-out focus
+    /// capture under test in `tabs/spawn/004`. This mock can.
+    struct FocusEchoPC {
+        next: std::sync::Mutex<u32>,
+        focused: std::sync::Mutex<Vec<String>>,
+    }
+    impl FocusEchoPC {
+        fn new() -> Self {
+            Self {
+                next: std::sync::Mutex::new(0),
+                focused: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl crate::pane::PaneController for FocusEchoPC {
+        fn create_pane(
+            &self,
+            _cmd: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<String, crate::pane::PaneError> {
+            let mut n = self.next.lock().unwrap();
+            let id = format!("mock-pane-{n}");
+            *n += 1;
+            Ok(id)
+        }
+        fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn rename_pane(
+            &self,
+            _id: &str,
+            name: &str,
+        ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+            Ok(crate::pane::RenameOutcome::applied(name))
+        }
+        fn focus_pane(&self, id: &str) -> Result<(), crate::pane::PaneError> {
+            self.focused.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+        /// Echo the last `focus_pane` target as the live focused pane — the
+        /// signal `capture_focus_on_switch_out` reads on the way out of a tab.
+        fn focused_pane_id(&self) -> Option<String> {
+            self.focused.lock().unwrap().last().cloned()
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "focus-echo-mock"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Scenario: Open a REAL Mode tab, focus one of its side panes, then create
+    /// a single-agent card from that Mode tab (the plain-card `Action::SpawnPane`
+    /// that switches to the Dashboard). Switch back to the Mode tab and restore
+    /// its focus: the side pane that was focused at create-time must be
+    /// re-focused. Without `capture_focus_on_switch_out()` before the
+    /// switch-to-Dashboard, the Mode tab's `focused_pane_id` is never captured,
+    /// so restore falls back to the agent pane and the user's prior focus is
+    /// lost (PRD #154 follow-up; mirrors the round-trip in `tabs/selection/002`).
+    #[spec("tabs/spawn/004")]
+    #[test]
+    fn spawn_004_card_from_mode_preserves_mode_focus_on_return() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (mode_idx, side_ids) = tab_manager
+            .open_mode_tab(
+                &mode_config_local("m", 2),
+                "/work",
+                "agent-m".to_string(),
+                (24, 80),
+            )
+            .expect("open a real mode tab");
+        // open_mode_tab leaves the mode tab active — the non-Dashboard launch
+        // precondition.
+        assert_eq!(
+            tab_manager.active_index(),
+            mode_idx,
+            "precondition: the mode tab is active before the spawn"
+        );
+        assert!(
+            side_ids.len() >= 2,
+            "precondition: the mode tab has at least two managed side panes"
+        );
+
+        // The user focuses a specific (non-default) side pane on the mode tab —
+        // this is the live focus that must survive the round-trip.
+        let target = side_ids[1].clone();
+        pc.focus_pane(&target).unwrap();
+
+        let snapshot = dashboard_snapshot(2);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(plain_card_request("/work/card"))),
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            Rect::new(0, 0, 80, 24),
+        );
+
+        // The card spawn switched the active tab to the Dashboard (tabs/spawn/002)
+        // — i.e. we genuinely LEFT the mode tab, which is what should have
+        // captured its focus.
+        assert_eq!(
+            tab_manager.active_index(),
+            0,
+            "the single-agent card spawn must switch to the Dashboard (so the \
+             mode tab is left behind)"
+        );
+
+        // Return to the mode tab and restore its remembered focus.
+        assert!(tab_manager.switch_to(mode_idx));
+        tab_manager.restore_focus_on_switch_in();
+
+        assert_eq!(
+            pc.focused.lock().unwrap().last().map(String::as_str),
+            Some(target.as_str()),
+            "switching back to the mode tab must restore the side pane that was \
+             focused when the card was created; without \
+             `capture_focus_on_switch_out()` before the switch-to-Dashboard, the \
+             mode tab's focused_pane_id was never captured, so restore falls back \
+             to the agent pane (`agent-m`) and the user's prior focus is lost"
+        );
+    }
 }
