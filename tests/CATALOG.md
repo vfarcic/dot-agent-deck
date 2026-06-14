@@ -1560,15 +1560,15 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 ##### theme/palette/001 — Deck-card border encodes status via the centralized palette roles.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
-- **Agent:** none (five live session fixtures, one per status).
-- **Asserts:** rendering a deck card (not selected, not focused) for each agent status resolves its border to the matching centralized status role — working=`Color::Green`, thinking=`Color::Blue`, waiting=`Color::Yellow`, error=`Color::Red`, idle=`Color::DarkGray`.
+- **Agent:** none (six live session fixtures, one per status).
+- **Asserts:** rendering a deck card (not selected, not focused) for each agent status resolves its border to the matching centralized status role — working=`Color::Green`, thinking=`Color::Blue`, compacting=`Color::Blue` (shares the thinking role), waiting=`Color::Yellow`, error=`Color::Red`, idle=`Color::DarkGray`; and that no status border reuses an accent role (`Color::Magenta`=selected, `Color::Cyan`=focused), so a status never collides with selection/focus.
 - **Does not assert:** the per-card status badge text/glyph; selection/focus accents (covered by `theme/palette/003-004`); the palette module's internal API (reads the rendered border color).
 - **Platform coverage:** mac+linux+windows.
 
 ##### theme/palette/002 — Embedded-pane border uses the SAME status color the deck card uses (deck/pane consistency).
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
-- **Agent:** none (five live session fixtures + a `TerminalWidget` per status).
-- **Asserts:** for each agent status, the embedded pane's border color (neither selected nor focused) equals the deck card's border color for that status, and both equal the palette status role — so a given state looks identical as a deck card and as an embedded pane (PRD #155 success criterion #2).
+- **Agent:** none (six live session fixtures + a `TerminalWidget` per status).
+- **Asserts:** for each agent status (including compacting, which shares the thinking/Blue role), the embedded pane's border color (neither selected nor focused) equals the deck card's border color for that status, and both equal the palette status role — so a given state looks identical as a deck card and as an embedded pane (PRD #155 success criterion #2).
 - **Does not assert:** pane content/title rendering; the focused/selected pane accents (covered by `theme/palette/004` / `theme/guard/001`).
 - **Platform coverage:** mac+linux+windows.
 

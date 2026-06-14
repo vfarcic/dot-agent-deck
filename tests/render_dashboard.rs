@@ -443,27 +443,34 @@ fn pane_border_at_mid(status: Option<SessionStatus>, focused: bool) -> (Color, M
     border_style_at_mid(&buf)
 }
 
-/// The five status roles in the centralized palette and the named-ANSI color
-/// each must resolve to (PRD #155 locked plan): working=Green, thinking=Blue,
-/// waiting=Yellow, error=Red, idle=DarkGray. The single source of truth shared
-/// by the deck-card (T1) and embedded-pane (T2) assertions.
-fn status_role_colors() -> [(SessionStatus, Color); 5] {
+/// The six status roles in the centralized palette and the named-ANSI color each
+/// must resolve to (PRD #155 locked plan): working=Green, thinking=Blue,
+/// compacting=Blue (shares the thinking role), waiting=Yellow, error=Red,
+/// idle=DarkGray. The single source of truth shared by the deck-card (T1) and
+/// embedded-pane (T2) assertions.
+fn status_role_colors() -> [(SessionStatus, Color); 6] {
     [
         (SessionStatus::Working, Color::Green),
         (SessionStatus::Thinking, Color::Blue),
+        // Compacting is thinking-adjacent and shares the thinking/Blue role
+        // (`palette::status_color` maps Compacting -> Blue) rather than
+        // introducing a sixth status color — so it must render Blue in both the
+        // deck card and the embedded pane, never an accent (Magenta/Cyan).
+        (SessionStatus::Compacting, Color::Blue),
         (SessionStatus::WaitingForInput, Color::Yellow),
         (SessionStatus::Error, Color::Red),
         (SessionStatus::Idle, Color::DarkGray),
     ]
 }
 
-/// Scenario: Render a deck card for each of the five agent statuses
-/// (working/thinking/waiting/error/idle), none selected or focused, and assert
-/// the card's border color is the matching centralized status role —
-/// working=Green, thinking=Blue, waiting=Yellow, error=Red, idle=DarkGray. This
-/// pins PRD #155 Option A: the deck-card border encodes status via the palette
-/// roles. RED today because `status_style` maps working→Yellow, thinking→Cyan,
-/// waiting→Red and idle→Green (only error→Red already matches).
+/// Scenario: Render a deck card for each of the six agent statuses
+/// (working/thinking/compacting/waiting/error/idle), none selected or focused,
+/// and assert the card's border color is the matching centralized status role —
+/// working=Green, thinking=Blue, compacting=Blue (it shares the thinking role),
+/// waiting=Yellow, error=Red, idle=DarkGray. Also assert each status border is a
+/// status role and never an accent role (Magenta=selected, Cyan=focused), so a
+/// status can never collide with selection/focus. This pins PRD #155 Option A:
+/// the deck-card border encodes status via the centralized palette roles.
 #[spec("theme/palette/001")]
 #[test]
 fn palette_001_deck_card_border_is_status_role() {
@@ -474,16 +481,29 @@ fn palette_001_deck_card_border_is_status_role() {
             "deck card border for {status:?} must use the centralized status role color \
              {role:?}, got {fg:?}"
         );
+        // A status role must never collide with an accent role: Magenta is
+        // `selected`, Cyan is `focused` (PRD #155 criterion #3). This catches a
+        // status (notably Compacting) drifting onto an accent color.
+        assert_ne!(
+            fg,
+            Color::Magenta,
+            "status {status:?} border must not reuse the `selected` accent (Magenta)"
+        );
+        assert_ne!(
+            fg,
+            Color::Cyan,
+            "status {status:?} border must not reuse the `focused` accent (Cyan)"
+        );
     }
 }
 
-/// Scenario: For each agent status, render the deck card AND an embedded pane
-/// (neither selected nor focused) and assert the pane's border color is the
-/// SAME as the deck card's for that status — and that both equal the palette
-/// status role color. This is the consistency criterion: a given state looks
-/// identical as a deck card and as an embedded pane. RED today because the pane
-/// border encodes only focus (dimmed terminal foreground when unfocused), so it
-/// does not match the deck card's status color for any state.
+/// Scenario: For each of the six agent statuses
+/// (working/thinking/compacting/waiting/error/idle), render the deck card AND an
+/// embedded pane (neither selected nor focused) and assert the pane's border
+/// color is the SAME as the deck card's for that status — and that both equal the
+/// palette status role color. This is the consistency criterion: a given state
+/// looks identical as a deck card and as an embedded pane, including compacting,
+/// which shares the thinking/Blue role.
 #[spec("theme/palette/002")]
 #[test]
 fn palette_002_pane_border_matches_deck_status_color() {
@@ -584,24 +604,84 @@ fn palette_004_focused_pane_border_is_cyan_distinct() {
 }
 
 /// Extract the source region of the top-level function whose signature contains
-/// `signature` — from the signature to the start of the next top-level `fn` /
-/// `pub fn` item. Brace-counting is avoided on purpose: bodies here carry
-/// `format!` strings with `{ }` placeholders that would skew a brace match.
-/// Panics with a clear message if the anchor is missing so a rename surfaces as
-/// an explicit lint failure rather than a silent skip.
+/// `signature` — from the signature to the start of the next top-level `fn` item.
+/// The boundary is any column-0 `fn` / `pub fn` / `pub(crate) fn` (or any
+/// `pub(...) fn`) declaration: requiring column 0 makes restricted-visibility
+/// items like `pub(crate) fn` boundaries too (a missed `pub(crate) fn` between a
+/// checked function and the next plain/`pub` fn would otherwise over-extend the
+/// region), and it skips indented *nested* inner `fn`s so the region ends at this
+/// function's sibling rather than terminating early at an inner helper.
+/// Brace-counting is avoided on purpose: bodies here carry `format!` strings with
+/// `{ }` placeholders that would skew a brace match. Panics with a clear message
+/// if the anchor is missing so a rename surfaces as an explicit lint failure
+/// rather than a silent skip.
 fn fn_region<'a>(src: &'a str, signature: &str) -> &'a str {
+    /// True if `s` begins (at column 0) with a top-level fn declaration:
+    /// `fn `, `pub fn `, or any `pub(<vis>) fn ` (e.g. `pub(crate) fn `).
+    fn is_top_level_fn_start(s: &str) -> bool {
+        match s.strip_prefix("pub") {
+            Some(after_pub) => {
+                // `pub fn ...` (no visibility qualifier) or `pub(<vis>) fn ...`.
+                let after_vis = match after_pub.strip_prefix('(') {
+                    Some(inner) => match inner.find(')') {
+                        Some(close) => &inner[close + 1..],
+                        None => return false,
+                    },
+                    None => after_pub,
+                };
+                after_vis.starts_with(" fn ")
+            }
+            None => s.starts_with("fn "),
+        }
+    }
+
     let start = src
         .find(signature)
         .unwrap_or_else(|| panic!("source lint anchor `{signature}` not found"));
     let rest = &src[start..];
-    let next_fn = rest[1..]
-        .find("\nfn ")
-        .map(|i| i + 1)
-        .into_iter()
-        .chain(rest[1..].find("\npub fn ").map(|i| i + 1))
-        .min()
+    // The first newline whose following line (column 0) starts a sibling fn ends
+    // the region; that newline index is the region's exclusive upper bound.
+    let next_fn = rest
+        .match_indices('\n')
+        .find(|&(i, _)| is_top_level_fn_start(&rest[i + 1..]))
+        .map(|(i, _)| i)
         .unwrap_or(rest.len());
     &rest[..next_fn]
+}
+
+// Unit-guard for `fn_region` itself (not a `#[spec]` catalog entry): the real
+// `guard_003` anchors never sit next to a `pub(crate) fn` or contain a nested
+// inner fn, so these boundary paths would otherwise go unexercised. Pins that the
+// extracted region (a) reaches content *after* an indented nested inner fn rather
+// than terminating early, and (b) stops at a following `pub(crate) fn` sibling
+// rather than over-extending past it.
+#[test]
+fn fn_region_handles_nested_and_restricted_visibility_boundaries() {
+    let src = concat!(
+        "fn checked() {\n",
+        "    fn inner() {\n",
+        "        let _ = Color::Magenta;\n", // nested-fn body — must stay INSIDE
+        "    }\n",
+        "    let _ = Color::Green;\n", // after the nested fn — region must reach it
+        "}\n",
+        "pub(crate) fn sibling() {\n",
+        "    let _ = Color::Yellow;\n", // pub(crate) sibling — must be OUTSIDE
+        "}\n",
+        "fn last() {}\n",
+    );
+    let region = fn_region(src, "fn checked");
+    assert!(
+        region.contains("Color::Magenta"),
+        "region must include a nested inner fn's body:\n{region}"
+    );
+    assert!(
+        region.contains("Color::Green"),
+        "region must reach content after a nested inner fn (not terminate early):\n{region}"
+    );
+    assert!(
+        !region.contains("Color::Yellow"),
+        "region must stop at the following `pub(crate) fn` sibling, not over-extend:\n{region}"
+    );
 }
 
 /// Scenario: Source-lint the deck-card render path (`src/ui.rs`) and the
