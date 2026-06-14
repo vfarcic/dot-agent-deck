@@ -7,6 +7,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
+use crate::palette;
+use crate::state::SessionStatus;
+
 /// PRD #84 M5 (invariant 3): a process-wide one-shot guard so the release-mode
 /// "PTY size != inner area" fallback logs a single explicit line rather than
 /// spamming one per frame. Debug builds trip the `debug_assert!` instead.
@@ -53,6 +56,14 @@ pub struct TerminalWidget {
     parser: Arc<Mutex<vt100::Parser>>,
     title: String,
     focused: bool,
+    /// PRD #155: the agent's status driving the STATUS-aware border (Option A).
+    /// When the pane is neither selected nor focused, its border encodes this
+    /// status via the centralized [`palette`] — the SAME role the deck card
+    /// uses, so a given state looks identical as a deck card and as an embedded
+    /// pane. `None` (the [`TerminalWidget::new`] default) keeps the legacy
+    /// focus-only behavior: focused → cyan, else a dimmed terminal foreground.
+    /// Set it via [`TerminalWidget::with_status`].
+    status: Option<SessionStatus>,
     /// PRD #84 M5 (invariant 3): when `true`, the caller attests that the
     /// upstream layout/resize contract held for this pane — i.e. its PTY was
     /// sized to this widget's inner area by `resize_panes_to_layout` earlier in
@@ -72,8 +83,21 @@ impl TerminalWidget {
             parser,
             title,
             focused,
+            status: None,
             contract_guaranteed: false,
         }
+    }
+
+    /// PRD #155 (Option A): make the pane border STATUS-aware. When the pane is
+    /// neither selected nor focused, its border resolves to `status`'s
+    /// centralized [`palette`] role — the SAME color the deck card uses for that
+    /// state — so decks and panes stay visually consistent. A focused pane still
+    /// takes the `focused` accent (cyan); this only governs the unfocused case.
+    /// Non-breaking: callers that don't set a status keep the legacy focus-only
+    /// border ([`TerminalWidget::new`] leaves it `None`).
+    pub fn with_status(mut self, status: SessionStatus) -> Self {
+        self.status = Some(status);
+        self
     }
 
     /// Opt into the PRD #84 invariant-3 contract check (see the field doc).
@@ -95,12 +119,18 @@ impl TerminalWidget {
 
 impl Widget for TerminalWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // PRD #13: terminal-relative styling. Focused panes get a Cyan accent
-        // border; unfocused panes dim the terminal's own foreground rather than
-        // painting an absolute gray. The pane block is left unfilled so the
-        // terminal's background shows through (no absolute `terminal_bg` slab).
+        // PRD #13 + #155: terminal-relative styling, with an Option-A
+        // STATUS-aware border resolved through the centralized `palette` (the
+        // same precedence the deck card uses). A focused pane gets the `focused`
+        // accent (cyan); otherwise, when a status is known, the border encodes
+        // that status via the SAME palette role the deck card uses; with no
+        // status it falls back to a dimmed terminal foreground. The pane block is
+        // left unfilled so the terminal's background shows through (no absolute
+        // `terminal_bg` slab).
         let border_style = if self.focused {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(palette::FOCUSED)
+        } else if let Some(status) = self.status.as_ref() {
+            Style::default().fg(palette::status_color(status))
         } else {
             Style::default()
                 .fg(Color::Reset)

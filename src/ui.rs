@@ -26,6 +26,7 @@ use crate::features::Features;
 // latter under an alias so both coexist: `Action` = the UI dispatch action,
 // `KbAction` = a remappable keybinding action (MoveDown, Help, …).
 use crate::keybindings::{Action as KbAction, KeybindingConfig};
+use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
@@ -10643,8 +10644,11 @@ fn render_session_card(
     title_left = truncate_with_ellipsis(&title_left, max_title);
 
     let border_style = if is_selected {
+        // PRD #155 Option A: selection uses the dedicated `selected` accent role
+        // (Magenta + BOLD, paired with the `▸ ` title marker above) — distinct
+        // from every status color and from the focused-pane cyan.
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::SELECTED)
             .add_modifier(Modifier::BOLD)
     } else if is_placeholder {
         // Placeholder ("No agent") cards read as secondary: dim the terminal's
@@ -10845,16 +10849,19 @@ fn recent_tool_lines(session: &SessionState, max_tools: usize) -> Vec<Line<'stat
 }
 
 fn status_style(status: &SessionStatus) -> (&str, Style) {
+    // PRD #155: status colors are resolved through the centralized palette (the
+    // single source of truth), so the deck-card badge/border and the
+    // embedded-pane border agree for the same state. The label and the
+    // attention-grabbing BOLD on "Needs Input" stay here (presentation), only
+    // the color moves to the palette role.
+    let style = Style::default().fg(palette::status_color(status));
     match status {
-        SessionStatus::Thinking => ("Thinking", Style::default().fg(Color::Cyan)),
-        SessionStatus::Working => ("Working", Style::default().fg(Color::Yellow)),
-        SessionStatus::Compacting => ("Compacting", Style::default().fg(Color::Blue)),
-        SessionStatus::WaitingForInput => (
-            "Needs Input",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        SessionStatus::Idle => ("Idle", Style::default().fg(Color::Green)),
-        SessionStatus::Error => ("Error", Style::default().fg(Color::Red)),
+        SessionStatus::Thinking => ("Thinking", style),
+        SessionStatus::Working => ("Working", style),
+        SessionStatus::Compacting => ("Compacting", style),
+        SessionStatus::WaitingForInput => ("Needs Input", style.add_modifier(Modifier::BOLD)),
+        SessionStatus::Idle => ("Idle", style),
+        SessionStatus::Error => ("Error", style),
     }
 }
 
