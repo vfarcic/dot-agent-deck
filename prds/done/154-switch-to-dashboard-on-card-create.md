@@ -89,7 +89,7 @@ In the "regular dashboard pane" branch of `Action::SpawnPane`, switch to the Das
 
 - [x] **M1 — Fix.** Add `tab_manager.switch_to(0)` (with explanatory comment) to the "regular dashboard pane" branch of `Action::SpawnPane`, before the focus/selection calls. Also prepends `capture_focus_on_switch_out()` (review finding) to preserve the leaving tab's focus-restore.
 - [x] **M2 — Tests.** L1 tests `tabs/spawn/001-004`: orchestration→Dashboard, mode→Dashboard, Dashboard-source baseline, and leaving Mode-tab focus round-trip; orchestration/mode creation remain covered by existing `tabs/orchestration/001` + `tabs/mode/001` and the e2e suite.
-- [ ] **M3 — Verified in the running TUI.** Launch the deck, open an orchestration tab, create a single-agent card, and confirm the view switches to the Dashboard with the new card selected (per `run-dot-agent-deck`). _(Pending post-PR manual verification.)_
+- [x] **M3 — Verified in the running TUI.** Launch the deck, open an orchestration tab, create a single-agent card, and confirm the view switches to the Dashboard with the new card selected (per `run-dot-agent-deck`). — Verified manually: view switches to Dashboard with new card selected.
 
 ## Out of Scope
 
