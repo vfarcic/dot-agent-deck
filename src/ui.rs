@@ -13263,23 +13263,33 @@ mod tests {
 
     #[test]
     fn test_status_style() {
+        // PRD #155: status colors now resolve through the centralized palette
+        // (single source of truth). LOCKED mapping: Working=Green,
+        // Thinking=Blue, WaitingForInput=Yellow, Error=Red, Idle=DarkGray, with
+        // Compacting sharing the thinking/Blue role.
         let (label, style) = status_style(&SessionStatus::Thinking);
         assert_eq!(label, "Thinking");
-        assert_eq!(style.fg, Some(Color::Cyan));
+        assert_eq!(style.fg, Some(Color::Blue));
 
         let (label, style) = status_style(&SessionStatus::Working);
         assert_eq!(label, "Working");
-        assert_eq!(style.fg, Some(Color::Yellow));
+        assert_eq!(style.fg, Some(Color::Green));
 
         let (label, style) = status_style(&SessionStatus::WaitingForInput);
         assert_eq!(label, "Needs Input");
+        assert_eq!(style.fg, Some(Color::Yellow));
+
+        let (label, style) = status_style(&SessionStatus::Idle);
+        assert_eq!(label, "Idle");
+        assert_eq!(style.fg, Some(Color::DarkGray));
+
+        let (label, style) = status_style(&SessionStatus::Error);
+        assert_eq!(label, "Error");
         assert_eq!(style.fg, Some(Color::Red));
 
-        let (label, _) = status_style(&SessionStatus::Idle);
-        assert_eq!(label, "Idle");
-
-        let (label, _) = status_style(&SessionStatus::Error);
-        assert_eq!(label, "Error");
+        let (label, style) = status_style(&SessionStatus::Compacting);
+        assert_eq!(label, "Compacting");
+        assert_eq!(style.fg, Some(Color::Blue));
     }
 
     #[test]

@@ -412,15 +412,14 @@ fn card_border_at_mid(status: SessionStatus) -> (Color, Modifier) {
 /// Render an embedded pane (`TerminalWidget`) and return its resolved border
 /// `(fg, modifier)`. The outer 22×6 area gives a 20×4 inner area; the vt100
 /// screen is sized to match so the 1:1 render contract holds (no size-mismatch
-/// fallback). `status` is carried in the pane title so the parameter is
-/// meaningful today.
+/// fallback). `status` is both carried in the pane title and threaded into the
+/// widget via `TerminalWidget::with_status`, so the border resolves through the
+/// centralized palette.
 ///
-/// PRD #155 RED→GREEN seam: the embedded-pane border currently encodes ONLY
-/// `focused` (`src/terminal_widget.rs`). Option A requires it to encode STATUS
-/// when neither selected nor focused — the SAME role the deck card uses. When
-/// the coder makes `TerminalWidget` status-aware (resolving its border from the
-/// centralized palette), thread `status` into the widget construction below;
-/// the assertions read the rendered border and do not otherwise change.
+/// PRD #155 Option A: when the pane is neither selected nor focused, its border
+/// encodes STATUS — the SAME role the deck card uses (`src/terminal_widget.rs`
+/// resolves it from the centralized [`palette`]). With `status = None` the
+/// widget keeps the legacy focus-only border (focused → Cyan, else dimmed).
 fn pane_border_at_mid(status: Option<SessionStatus>, focused: bool) -> (Color, Modifier) {
     let area = Rect {
         x: 0,
@@ -435,7 +434,10 @@ fn pane_border_at_mid(status: Option<SessionStatus>, focused: bool) -> (Color, M
         Some(s) => format!("{s:?}"),
         None => "pane".to_string(),
     };
-    let widget = TerminalWidget::new(parser, title, focused);
+    let mut widget = TerminalWidget::new(parser, title, focused);
+    if let Some(s) = status {
+        widget = widget.with_status(s);
+    }
     let mut buf = ratatui::buffer::Buffer::empty(area);
     widget.render(area, &mut buf);
     border_style_at_mid(&buf)
