@@ -309,7 +309,7 @@ pub const ORCHESTRATION_ROLE_INDEX_MAX: usize = 256;
 /// `synthesize_from_bucket_metadata` allocates a placeholder vec of
 /// `max_index + 1` length). Both are wire-boundary checks so every
 /// downstream consumer is protected without per-call-site validation.
-pub fn validate_tab_membership(tm: TabMembership) -> Option<TabMembership> {
+pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
     if !is_valid_display_name(tm.name()) {
         return None;
     }
@@ -317,8 +317,9 @@ pub fn validate_tab_membership(tm: TabMembership) -> Option<TabMembership> {
         role_index,
         role_name,
         orchestration_cwd,
+        display_title,
         ..
-    } = &tm
+    } = &mut tm
     {
         if *role_index > ORCHESTRATION_ROLE_INDEX_MAX {
             return None;
@@ -330,10 +331,23 @@ pub fn validate_tab_membership(tm: TabMembership) -> Option<TabMembership> {
         if !role_name.is_empty() && !is_valid_display_name(role_name) {
             return None;
         }
-        if let Some(c) = orchestration_cwd
+        if let Some(c) = orchestration_cwd.as_deref()
             && !is_valid_orchestration_cwd(c)
         {
             return None;
+        }
+        // display_title flows to the tab label exactly like name/role_name,
+        // so it needs the same control-byte guard. But it's purely
+        // cosmetic with a defined `None` fallback (the title reverts to the
+        // canonical resolved name), so an invalid value is nulled out
+        // rather than rejecting the whole membership — dropping the
+        // orchestration tab over a bad cosmetic string would be a worse
+        // outcome than losing the custom title (Greptile PR #160 P1).
+        if display_title
+            .as_deref()
+            .is_some_and(|t| !is_valid_display_name(t))
+        {
+            *display_title = None;
         }
     }
     Some(tm)
@@ -2593,6 +2607,68 @@ mod tests {
             display_title: None,
         };
         assert!(validate_tab_membership(tm).is_none());
+    }
+
+    // Greptile PR #160 P1: display_title flows to the tab label like
+    // name/role_name, so a control-byte value must be neutralised. Unlike
+    // those identity fields it's cosmetic with a `None` fallback, so an
+    // invalid value is nulled out (membership preserved) rather than
+    // rejecting the whole membership and stranding the orchestration tab.
+    #[test]
+    fn validate_tab_membership_nulls_out_display_title_with_ansi_escape() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+            display_title: Some("\x1b[31mpwn".into()),
+        };
+        let validated = validate_tab_membership(tm).expect("membership preserved");
+        match validated {
+            TabMembership::Orchestration { display_title, .. } => {
+                assert_eq!(display_title, None, "invalid display_title nulled out");
+            }
+            _ => panic!("expected Orchestration variant"),
+        }
+    }
+
+    #[test]
+    fn validate_tab_membership_nulls_out_display_title_with_nul_byte() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+            display_title: Some("My\0Run".into()),
+        };
+        let validated = validate_tab_membership(tm).expect("membership preserved");
+        match validated {
+            TabMembership::Orchestration { display_title, .. } => {
+                assert_eq!(display_title, None);
+            }
+            _ => panic!("expected Orchestration variant"),
+        }
+    }
+
+    #[test]
+    fn validate_tab_membership_preserves_well_formed_display_title() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+            display_title: Some("My Custom Run".into()),
+        };
+        let validated = validate_tab_membership(tm).expect("membership preserved");
+        match validated {
+            TabMembership::Orchestration { display_title, .. } => {
+                assert_eq!(display_title.as_deref(), Some("My Custom Run"));
+            }
+            _ => panic!("expected Orchestration variant"),
+        }
     }
 
     #[test]
