@@ -8092,6 +8092,25 @@ fn resize_panes_to_layout(layout: &FrameLayout, embedded: &EmbeddedPaneControlle
     }
 }
 
+/// PRD #155 (M3): build the per-frame join from each managed pane id to its
+/// agent status, read from the SAME source the deck cards use
+/// (`state.sessions[*].status`). The result keys an embedded pane's border to
+/// the centralized-palette status color so deck cards and panes agree
+/// (criterion #2).
+///
+/// Only sessions that own a pane (`pane_id.is_some()`) appear — pane-less
+/// sessions are excluded, since there is no pane to color. Borrowed `&str` keys
+/// avoid a per-frame clone of every pane id; the status enum clone is cheap
+/// (fieldless). Extracted from `render_frame` so the join can be unit-tested
+/// without a live daemon.
+pub(crate) fn build_pane_status(state: &AppState) -> HashMap<&str, SessionStatus> {
+    state
+        .sessions
+        .values()
+        .filter_map(|s| s.pane_id.as_deref().map(|pid| (pid, s.status.clone())))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     frame: &mut Frame,
@@ -8171,14 +8190,10 @@ fn render_frame(
     // source the deck cards read (`state.sessions[*].status`), so an embedded
     // pane's border encodes its status with the SAME centralized-palette color
     // the deck card uses — closing the deck/pane consistency gap (criterion #2).
-    // Borrowed `&str` keys avoid a per-frame clone of every pane id; the status
-    // enum clone is cheap (fieldless). Built once and threaded into every
-    // `render_terminal_panes` call below (and into `render_mode_tab`).
-    let pane_status: HashMap<&str, SessionStatus> = state
-        .sessions
-        .values()
-        .filter_map(|s| s.pane_id.as_deref().map(|pid| (pid, s.status.clone())))
-        .collect();
+    // Built once and threaded into every `render_terminal_panes` call below (and
+    // into `render_mode_tab`). Extracted into `build_pane_status` so the join can
+    // be unit-tested without a live daemon.
+    let pane_status: HashMap<&str, SessionStatus> = build_pane_status(state);
 
     // Branch on the content the layout pass resolved. Mode tabs render and
     // return here; dashboard / orchestration fall through to the card grid.
@@ -8834,21 +8849,40 @@ fn render_stats_bar(
             .add_modifier(Modifier::BOLD),
     ));
 
-    // Semantic statuses keep their named-ANSI accent. Idle has no accent color,
-    // but its count is neutral text the user reads (like the tools count), so
-    // per the PRD #13 readability decision it renders at full contrast via
-    // text_primary() rather than dimmed. Only decoration — the `│` separators
-    // below — stays text_dim().
+    // Semantic statuses resolve their color through `palette::status_color` —
+    // the single source of truth shared with the deck-card and embedded-pane
+    // borders (PRD #155). This is why `compacting` shows Blue (it shares the
+    // thinking role) and never reuses the `selected` Magenta accent. Idle has no
+    // accent color, but its count is neutral text the user reads (like the tools
+    // count), so per the PRD #13 readability decision it renders at full contrast
+    // via text_primary() rather than the dimmed idle role. Only decoration — the
+    // `│` separators below — stays text_dim().
     let segments: &[(usize, &str, Style)] = &[
-        (stats.working, "working", Style::default().fg(Color::Green)),
-        (stats.thinking, "thinking", Style::default().fg(Color::Blue)),
+        (
+            stats.working,
+            "working",
+            Style::default().fg(palette::status_color(&SessionStatus::Working)),
+        ),
+        (
+            stats.thinking,
+            "thinking",
+            Style::default().fg(palette::status_color(&SessionStatus::Thinking)),
+        ),
         (
             stats.compacting,
             "compacting",
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(palette::status_color(&SessionStatus::Compacting)),
         ),
-        (stats.waiting, "waiting", Style::default().fg(Color::Yellow)),
-        (stats.errors, "error", Style::default().fg(Color::Red)),
+        (
+            stats.waiting,
+            "waiting",
+            Style::default().fg(palette::status_color(&SessionStatus::WaitingForInput)),
+        ),
+        (
+            stats.errors,
+            "error",
+            Style::default().fg(palette::status_color(&SessionStatus::Error)),
+        ),
         (stats.idle, "idle", text_primary()),
     ];
 
@@ -10715,9 +10749,10 @@ fn render_session_card(
         );
 
     // PRD #13 Option A: selection is cued by the `▸ ` title prefix and the
-    // Cyan+BOLD border above — no whole-card `Modifier::REVERSED`. The full-card
-    // inversion was too heavy and redundant with those two cues, and stays
-    // terminal-relative (no absolute `selected_bg` tint).
+    // Magenta+BOLD border above (the `selected` palette accent, PRD #155) — no
+    // whole-card `Modifier::REVERSED`. The full-card inversion was too heavy and
+    // redundant with those two cues, and stays terminal-relative (no absolute
+    // `selected_bg` tint).
 
     let inner = block.inner(area);
     frame.render_widget(block, area);

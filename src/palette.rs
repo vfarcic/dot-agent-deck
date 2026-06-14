@@ -42,7 +42,7 @@ pub const STATUS_WAITING: Color = Color::Yellow;
 /// Error — the agent hit a failure.
 pub const STATUS_ERROR: Color = Color::Red;
 /// Idle — no current activity (dimmed).
-pub const IDLE: Color = Color::DarkGray;
+pub const STATUS_IDLE: Color = Color::DarkGray;
 
 // ---------------------------------------------------------------------------
 // Accent roles (must be distinct from every status color and from each other)
@@ -70,6 +70,6 @@ pub fn status_color(status: &SessionStatus) -> Color {
         SessionStatus::Compacting => STATUS_THINKING,
         SessionStatus::WaitingForInput => STATUS_WAITING,
         SessionStatus::Error => STATUS_ERROR,
-        SessionStatus::Idle => IDLE,
+        SessionStatus::Idle => STATUS_IDLE,
     }
 }
