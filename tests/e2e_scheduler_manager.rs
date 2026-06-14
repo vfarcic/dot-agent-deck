@@ -258,21 +258,22 @@ fn manager_003_delete_removes_definition_but_keeps_open_tab() {
     drop(scratch);
 }
 
-/// Scenario: With a fixture task whose name is LONG (long enough that the
-/// single-line delete confirmation would overflow the modal's inner width),
-/// open the manager and press `d` to arm the delete confirmation. Assert the
-/// confirmation message is CONTAINED WITHIN the modal — its trailing `(y/n)`
-/// prompt still renders rather than being clipped off the right edge by the
-/// long name (the fix wraps the message inside the modal, growing it in height
-/// and keeping the name on its own line, instead of letting the text spill past
-/// the border). RED today: the long name pushes the message past the 70-col
-/// inner width, so the `(y/n)` tail is clipped and never appears.
+/// Scenario: With a fixture task whose name is LONG, open the manager and press
+/// `d` to arm the delete confirmation. The confirmation renders on two fixed
+/// natural lines — the name on its own line (`Delete schedule '…'?`) and the
+/// fixed `definition only — open tab kept. (y/n)` trailer on the next. Assert the
+/// trailing `(y/n)` prompt is CONTAINED WITHIN the modal: under PRD #144 the
+/// modal is content-sized, so it grows in WIDTH to contain the long name line
+/// (clamped to ≤90% of the terminal) and the second line's `(y/n)` tail is never
+/// clipped off the right border. (Supersedes the PRD #127 band-aid that wrapped
+/// the message to grow the modal in HEIGHT inside a fixed 72-col modal.)
 #[spec("scheduler/manager/005")]
 #[test]
 fn manager_005_delete_confirm_contained_within_modal() {
-    // A name far longer than the ~10 chars that still leave room for the
-    // confirmation's fixed text ("Delete schedule '…'? definition only — open
-    // tab kept. (y/n)") within the 70-col inner width of the 72-wide modal.
+    // A name long enough that the single-line form of the confirmation would
+    // overflow a fixed-width modal — exercising the PRD #144 content-driven WIDTH
+    // growth that keeps both natural lines (the name line; the `… (y/n)` trailer)
+    // un-clipped instead of spilling the tail past the border.
     const LONG_NAME: &str = "extremely-long-scheduled-task-name-that-overflows-the-modal";
 
     let (scratch, sched_path) = scratch_with_schedules(&format!(
@@ -297,10 +298,10 @@ fn manager_005_delete_confirm_contained_within_modal() {
 
     let grid = deck.snapshot_grid();
     // The full confirmation must stay inside the modal: its trailing `(y/n)`
-    // prompt — the only `(y/n)` in the whole app — must render. With a short
-    // name it fits; the long name pushes it past the modal's inner width and it
-    // is clipped. After the fix the message wraps within the modal (name on its
-    // own line) so `(y/n)` renders again.
+    // prompt — the only `(y/n)` in the whole app — must render. The confirmation
+    // sits on two fixed natural lines and the modal grows in WIDTH to contain the
+    // long name line (PRD #144 content-sizing), so the second line's `(y/n)` tail
+    // is never clipped off the right border.
     assert!(
         grid.contains("(y/n)"),
         "the delete confirmation overflowed the modal: the long schedule name pushed \
