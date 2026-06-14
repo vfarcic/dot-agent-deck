@@ -1345,6 +1345,13 @@ without depending on the config struct API.
 - **Does not assert:** the daemon-with-agents-wins precedence (deferred to Phase 2 M2.2); the snapshot-restore path (covered by `session/restore/001`).
 - **Platform coverage:** mac+linux.
 
+##### session/restore/007 — A warm daemon carrying an orchestration hydrates the orchestrator + role panes in their saved order (PRD #89 Phase 2b M2b.1).
+- **Layer:** in-process (real in-process attach daemon over a Unix socket; `EmbeddedPaneController::hydrate_from_daemon`; no real binary, no PTY drive). Runs in the fast tier.
+- **Agent:** none (each role agent runs `sh -c 'sleep 30'`; no LLM).
+- **Asserts:** spawning three orchestration role agents (orchestrator + coder + reviewer), each tagged with its `TabMembership::Orchestration` `role_index` / `role_name` / `is_start_role`, then hydrating a fresh controller from the warm daemon reproduces every role as a pane; placing each hydrated pane at its `role_index` yields the panes in their saved display order; and the start (orchestrator) role — the `start_role_index` cursor — is recoverable from `is_start_role`. Regression guard that warm-daemon orchestration hydration (PRD #76 M2.12 + #111) survives detach/reattach so M2b.3's snapshot fallback is only needed when the daemon is empty.
+- **Does not assert:** the daemon-empty snapshot-fallback rebuild (`session/restore/008`); the orchestrator-prompt replay (intentionally NOT replayed on warm reconnect — `src/tab.rs` design decision 3); the full `OrchestrationConfig` re-resolution (the partition + `resolve_orch_config_for_hydration` path, exercised elsewhere).
+- **Platform coverage:** mac+linux (Unix-only; `#![cfg(unix)]`).
+
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
 These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.
@@ -1370,6 +1377,19 @@ These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept con
 - **Agent:** none.
 - **Asserts:** driving the coalescer (750 ms-style interval) with 50 rapid `mark_dirty` notifications observed at one instant — each followed by the loop's `is_due`/`record_write` check — produces only the leading-edge write; a single trailing check after the interval flushes the rest, for ≤2 total writes (and ≥1), and nothing is due once flushed.
 - **Does not assert:** the production interval value, real wall-clock timing, or that the on-disk file content is correct (covered by `session/save/001`–`002`).
+- **Platform coverage:** mac+linux+windows.
+
+### Saved-session schema (orchestration metadata, PRD #89 Phase 2b)
+
+This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option<OrchestrationSnapshot>` (role order, `start_role_index`, `orchestrator_prompt`, resolved config name + project path, `version`, and which roles were started) so the daemon-empty restore path can rebuild an orchestration tab. The field is `Option` + `#[serde(default)]` so old `session.toml` files still parse.
+
+#### config/saved-session
+
+##### config/saved-session/001 — An `OrchestrationSnapshot` on a saved pane round-trips through TOML, and a legacy snapshot without the field still parses (PRD #89 Phase 2b M2b.2).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SavedSession` / `SavedPane` / `OrchestrationSnapshot`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** (a) a `SavedSession` whose pane carries an `OrchestrationSnapshot` (version, role order in display order, `start_role_index`, `orchestrator_prompt`, `config_name`, `project_path`, `started_role_indices`) serializes to TOML and deserializes back with every field intact; (b) a legacy `session.toml` string with no `orchestration` key parses with `orchestration == None` — the `#[serde(default)]` forward-compat guarantee for snapshots written before the field existed.
+- **Does not assert:** the snapshot-fallback restore branch that consumes the metadata (M2b.3 / `session/restore/008`–`009`); capture (populating the field when writing the snapshot); any TUI rendering.
 - **Platform coverage:** mac+linux+windows.
 
 ### CLI surface (PRD #89 Phase 3)

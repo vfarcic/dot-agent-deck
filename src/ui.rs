@@ -5026,6 +5026,10 @@ fn dispatch_action(
                                     name: req.name.clone(),
                                     command: req.command,
                                     mode: mode_name_for_save,
+                                    // PRD #89 M2b.2: capture is a later step
+                                    // (M2b.3); the schema field exists now so
+                                    // older/newer snapshots round-trip.
+                                    orchestration: None,
                                 },
                             );
                             // PRD #89 M1.2 — a new dashboard pane / mode tab is a
@@ -5658,6 +5662,10 @@ pub fn run_tui(
                             .unwrap_or_else(|| h.agent_id.clone()),
                         command: String::new(),
                         mode: mode_hint,
+                        // PRD #89 M2b.2: schema-only; orchestration capture
+                        // from a warm daemon is handled by hydration, not the
+                        // snapshot, so leave None here.
+                        orchestration: None,
                     },
                 );
             }
@@ -12056,6 +12064,7 @@ mod tests {
                 name: "foo".into(),
                 command: String::new(),
                 mode: None,
+                orchestration: None,
             },
         );
         let mut budget = build_dedupe_budget(&metadata);
@@ -12065,12 +12074,14 @@ mod tests {
             name: "foo".into(),
             command: "vim".into(),
             mode: None,
+            orchestration: None,
         };
         let saved_b = SavedPane {
             dir: "/w".into(),
             name: "foo".into(),
             command: "tail -f log".into(),
             mode: None,
+            orchestration: None,
         };
 
         // First saved pane matches the hydrated → consumed.
@@ -12090,6 +12101,7 @@ mod tests {
                 name: "foo".into(),
                 command: String::new(),
                 mode: Some("k8s-ops".into()),
+                orchestration: None,
             },
         );
         let mut budget = build_dedupe_budget(&metadata);
@@ -12100,6 +12112,7 @@ mod tests {
             name: "foo".into(),
             command: "vim".into(),
             mode: None,
+            orchestration: None,
         };
         assert!(!try_consume_dedupe_slot(&mut budget, &saved_dashboard));
 
@@ -12109,6 +12122,7 @@ mod tests {
             name: "foo".into(),
             command: String::new(),
             mode: Some("k8s-ops".into()),
+            orchestration: None,
         };
         assert!(try_consume_dedupe_slot(&mut budget, &saved_mode));
     }
@@ -12127,6 +12141,7 @@ mod tests {
             name: "foo".into(),
             command: "vim".into(),
             mode: None,
+            orchestration: None,
         };
         assert!(!try_consume_dedupe_slot(&mut budget, &saved));
     }

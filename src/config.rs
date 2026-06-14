@@ -323,6 +323,56 @@ pub struct SavedPane {
     /// The value is the mode name from the project config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// When set, this pane was the orchestrator pane of an orchestration
+    /// tab; the snapshot carries enough metadata to rebuild the whole tab
+    /// (orchestrator + role panes, prompt, role order, start cursor) on the
+    /// daemon-empty restore path. `Option` + `#[serde(default)]` so older
+    /// `session.toml` files (no `orchestration` key) still parse with
+    /// `orchestration == None`. See [`OrchestrationSnapshot`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<OrchestrationSnapshot>,
+}
+
+/// PRD #89 M2b.2 — orchestration metadata captured on a saved pane so the
+/// daemon-empty restore path (fresh machine / crash recovery, when there is
+/// no warm daemon to hydrate from) can rebuild the orchestration tab. Schema
+/// ported from the closed PRD #74 design.
+///
+/// Carried as `SavedPane::orchestration: Option<OrchestrationSnapshot>` with
+/// `#[serde(default)]`, so a `session.toml` written before this field existed
+/// (no `[panes.orchestration]` table) still parses, yielding
+/// `orchestration == None`. A `version` field is present from day one so a
+/// future schema change can be migrated rather than silently dropped. No
+/// `#[serde(deny_unknown_fields)]` — forward-compat with snapshots a newer
+/// binary may write with extra keys.
+///
+/// This struct ONLY captures the metadata + its (de)serialization; the
+/// restore branch that rebuilds the tab from it is M2b.3 (a separate step).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrchestrationSnapshot {
+    /// Schema version, for future migration. `1` is the initial format.
+    pub version: u32,
+    /// Role names in DISPLAY order — the same order as the tab's
+    /// `role_pane_ids`, so the restore branch can recreate the role panes
+    /// in the order the user saw them.
+    pub roles: Vec<String>,
+    /// Index into `roles` of the start (orchestrator) role — restores the
+    /// "next role to start" cursor.
+    pub start_role_index: usize,
+    /// Pre-built prompt injected into the start (orchestrator) role on
+    /// restore. Empty string when the orchestration had no prompt.
+    pub orchestrator_prompt: String,
+    /// Resolved orchestration config NAME — half of the reference used to
+    /// re-resolve the `OrchestrationConfig` from disk on restore.
+    pub config_name: String,
+    /// Project PATH the orchestration was resolved from (the directory that
+    /// holds `.dot-agent-deck.toml`) — the other half of the re-resolution
+    /// reference.
+    pub project_path: String,
+    /// Which roles had been started, by index into `roles`. Optional —
+    /// snapshots that predate this field load with an empty list.
+    #[serde(default)]
+    pub started_role_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1212,12 +1262,14 @@ on_idle = true
                     name: "api".to_string(),
                     command: "claude".to_string(),
                     mode: None,
+                    orchestration: None,
                 },
                 SavedPane {
                     dir: "/repo/ui".to_string(),
                     name: "ui".to_string(),
                     command: "".to_string(),
                     mode: None,
+                    orchestration: None,
                 },
             ],
         };
@@ -1228,6 +1280,79 @@ on_idle = true
         assert_eq!(loaded.panes[0].name, "api");
         assert_eq!(loaded.panes[0].command, "claude");
         assert_eq!(loaded.panes[1].command, "");
+    }
+
+    /// Scenario: Build a `SavedSession` whose single pane carries an
+    /// `OrchestrationSnapshot` (3 roles in display order, a start-role cursor,
+    /// an orchestrator prompt, the resolved config name + project path, and a
+    /// started-roles list), serialize it to TOML and deserialize it back —
+    /// asserting every orchestration field round-trips intact. Then deserialize
+    /// a legacy `session.toml` string that has NO `orchestration` key and
+    /// assert the pane still parses with `orchestration == None`, proving the
+    /// `#[serde(default)]` forward-compat guarantee for old snapshots.
+    #[spec("config/saved-session/001")]
+    #[test]
+    fn saved_session_001_orchestration_serde_round_trip_and_legacy_parse() {
+        // (a) Round-trip a pane carrying an OrchestrationSnapshot.
+        let session = SavedSession {
+            panes: vec![SavedPane {
+                dir: "/repo/app".to_string(),
+                name: "orchestrator".to_string(),
+                command: "claude".to_string(),
+                mode: None,
+                orchestration: Some(OrchestrationSnapshot {
+                    version: 1,
+                    roles: vec![
+                        "orchestrator".to_string(),
+                        "coder".to_string(),
+                        "reviewer".to_string(),
+                    ],
+                    start_role_index: 0,
+                    orchestrator_prompt: "Build the feature end to end".to_string(),
+                    config_name: "tdd-cycle".to_string(),
+                    project_path: "/repo/app".to_string(),
+                    started_role_indices: vec![0, 1],
+                }),
+            }],
+        };
+
+        let toml_str = toml::to_string_pretty(&session).unwrap();
+        let loaded: SavedSession = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(loaded.panes.len(), 1);
+        let pane = &loaded.panes[0];
+        assert_eq!(pane.dir, "/repo/app");
+        assert_eq!(pane.name, "orchestrator");
+        assert_eq!(pane.command, "claude");
+        assert_eq!(pane.mode, None);
+
+        let orch = pane
+            .orchestration
+            .as_ref()
+            .expect("orchestration must round-trip as Some");
+        assert_eq!(orch.version, 1);
+        assert_eq!(orch.roles, vec!["orchestrator", "coder", "reviewer"]);
+        assert_eq!(orch.start_role_index, 0);
+        assert_eq!(orch.orchestrator_prompt, "Build the feature end to end");
+        assert_eq!(orch.config_name, "tdd-cycle");
+        assert_eq!(orch.project_path, "/repo/app");
+        assert_eq!(orch.started_role_indices, vec![0, 1]);
+
+        // (b) A legacy session.toml predating the orchestration field still
+        // parses, with orchestration == None (the #[serde(default)] guarantee).
+        let legacy = r#"
+[[panes]]
+dir = "/repo/legacy"
+name = "old-pane"
+command = "vim"
+"#;
+        let legacy_loaded: SavedSession = toml::from_str(legacy).unwrap();
+        assert_eq!(legacy_loaded.panes.len(), 1);
+        assert_eq!(legacy_loaded.panes[0].dir, "/repo/legacy");
+        assert!(
+            legacy_loaded.panes[0].orchestration.is_none(),
+            "a legacy snapshot with no orchestration key must parse with orchestration == None"
+        );
     }
 
     #[test]
@@ -1263,6 +1388,7 @@ on_idle = true
                 name: "test".to_string(),
                 command: "echo hi".to_string(),
                 mode: None,
+                orchestration: None,
             }],
         };
         session.save().unwrap();
