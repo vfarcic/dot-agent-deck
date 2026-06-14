@@ -1582,7 +1582,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### theme/palette/004 — Focused-pane border is the dedicated `focused` accent (Cyan), distinct from every status and from `selected`.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none (one focused `TerminalWidget`).
-- **Asserts:** rendering a focused embedded pane resolves its border to `Color::Cyan`, and that this color is distinct from every status role (green/blue/yellow/red/dark-gray) and from the `selected` accent (magenta) — focus stays Cyan while selection moves to Magenta, so status/selection/focus are provably distinct (PRD #155 success criterion #3).
+- **Asserts:** rendering a focused embedded pane resolves its border to `Color::Cyan`, and that this color is distinct from every status role (green/blue/yellow/red/dark-gray) and from the `selected` accent (magenta) — focus stays Cyan while selection moves to Magenta, so status/selection/focus are provably distinct (PRD #155 success criterion #3). Also asserts the PRECEDENCE invariant: a pane that is focused AND carries a present `Working` status still renders the focused accent (Cyan), never the Working/Green status color — focus OVERRIDES a present status in the unified border precedence (Option A).
 - **Does not assert:** unfocused-pane status coloring (covered by `theme/palette/002`); pane content rendering.
 - **Platform coverage:** mac+linux+windows.
 

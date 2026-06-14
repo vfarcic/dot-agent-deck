@@ -577,8 +577,11 @@ fn palette_003_selected_card_border_is_magenta_bold_marker() {
 /// distinct from every status role (green/blue/yellow/red/dark-gray) and from
 /// the `selected` accent (magenta). This pins the Option-A split that keeps
 /// focus on Cyan while selection moves to Magenta, so status/selection/focus
-/// are provably distinct. Already green today (the focused pane border is
-/// Color::Cyan); it locks that behavior against the palette rewire.
+/// are provably distinct. Then render a pane that is focused AND carries a real
+/// `Working` status and assert its border is still Cyan (the focused accent),
+/// NOT Green (the Working status color) — locking the precedence invariant that
+/// focus OVERRIDES a present status color. Already green today; it locks that
+/// behavior against the palette rewire.
 #[spec("theme/palette/004")]
 #[test]
 fn palette_004_focused_pane_border_is_cyan_distinct() {
@@ -601,6 +604,27 @@ fn palette_004_focused_pane_border_is_cyan_distinct() {
             "the focused accent (cyan) must be distinct from the {collide:?} status/selection role"
         );
     }
+
+    // PRECEDENCE: focus must win over a PRESENT status color. The case above
+    // proves `focused -> Cyan` only when status is None; this constructs a pane
+    // that is focused=true AND has a real `Working` status (whose own status
+    // color is Green) and asserts the border still resolves to the focused
+    // accent (Cyan), never the Working/Green status color — locking Option A's
+    // "focused overrides status" rule in the unified border precedence.
+    let (focused_with_status_fg, _modifier) =
+        pane_border_at_mid(Some(SessionStatus::Working), true);
+    assert_eq!(
+        focused_with_status_fg,
+        Color::Cyan,
+        "a focused pane with a present `Working` status must still use the `focused` \
+         accent (Color::Cyan), got {focused_with_status_fg:?}"
+    );
+    assert_ne!(
+        focused_with_status_fg,
+        Color::Green,
+        "focus must OVERRIDE a present status: the border must not fall back to the \
+         Working-status Green when the pane is focused"
+    );
 }
 
 /// Extract the source region of the top-level function whose signature contains
