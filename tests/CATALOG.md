@@ -1426,7 +1426,7 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 
 ### Fresh-start escape hatch (PRD #89 Phase 4)
 
-These entries cover PRD #89 Phase 4: with auto-restore now the default, a user who wants to start clean has one obvious action per surface — a local `dot-agent-deck snapshot clear` subcommand (M4.2) and the per-deck `dot-agent-deck remote remove <name>` (M4.1). Both clear the saved-session snapshot.
+These entries cover PRD #89 Phase 4: with auto-restore now the default, a user who wants to start clean has one obvious action — `dot-agent-deck snapshot clear` (M4.2) — because the snapshot is a single GLOBAL file. `dot-agent-deck remote remove <name>` (M4.1) is registry-only and intentionally does NOT touch the snapshot (decided Option 1); there is no per-deck saved state to clear.
 
 #### session/snapshot
 
@@ -1437,11 +1437,11 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the subsequent no-flag startup landing on an empty dashboard (that follows from the deleted snapshot + `session/restore/006`); the exact stdout wording of the success message.
 - **Platform coverage:** mac+linux.
 
-##### session/snapshot/002 — `dot-agent-deck remote remove <name>` clears that deck's saved state (PRD #89 Phase 4 M4.1).
+##### session/snapshot/002 — `dot-agent-deck remote remove <name>` is registry-only and leaves the global snapshot intact (PRD #89 Phase 4 M4.1, Option 1).
 - **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive; `DOT_AGENT_DECK_SESSION` + `DOT_AGENT_DECK_REMOTES` redirected to test-owned paths).
 - **Agent:** none.
-- **Asserts:** with a remote deck `myhost` registered in the staged `remotes.toml` and a non-empty `session.toml` staged, running `dot-agent-deck remote remove myhost` exits 0 AND clears that deck's saved state — the snapshot file is gone afterward — the per-deck fresh-start escape hatch.
-- **Does not assert:** that the registry entry was removed (that is `remote remove`'s pre-existing behavior, exercised elsewhere); the per-deck keying of saved state (the snapshot is a single global file today).
+- **Asserts:** with a remote deck `myhost` registered in the staged `remotes.toml` and a non-empty `session.toml` staged, running `dot-agent-deck remote remove myhost` exits 0 AND leaves the global snapshot intact — the file is still present afterward with byte-for-byte unchanged contents. The snapshot is a single GLOBAL file, so remove is registry-only (decided Option 1); there is no per-deck saved state to clear and `snapshot clear` (001) is the one fresh-start action.
+- **Does not assert:** that the registry entry was removed (that is `remote remove`'s pre-existing behavior, exercised elsewhere); any per-deck keying of saved state (none exists — the snapshot is a single global file).
 - **Platform coverage:** mac+linux.
 
 ### Chain-smoke (real-agent) coverage

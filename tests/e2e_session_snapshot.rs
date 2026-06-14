@@ -5,13 +5,15 @@
 //! Auto-restore is now the default (Phase 2/2b), so a user who wants to start
 //! clean needs one obvious action. There are two:
 //!
-//!   * **Local (M4.2):** a NEW `dot-agent-deck snapshot clear` subcommand deletes
-//!     the local saved-session snapshot. `snapshot` is a subcommand GROUP with a
-//!     `clear` action (decided in `.dot-agent-deck/prd-89-context.md`; NOT
-//!     `reset`/`--reset`). It does not exist yet.
-//!   * **Remote / per-deck (M4.1):** removing a registered deck
-//!     (`dot-agent-deck remote remove <name>`) should also clear that deck's
-//!     saved state.
+//!   * **Local / global (M4.2):** a `dot-agent-deck snapshot clear` subcommand
+//!     deletes the local saved-session snapshot. `snapshot` is a subcommand GROUP
+//!     with a `clear` action (decided in `.dot-agent-deck/prd-89-context.md`; NOT
+//!     `reset`/`--reset`). The snapshot is a SINGLE GLOBAL file, so this is the one
+//!     fresh-start action.
+//!   * **Remote remove is registry-only (M4.1):** removing a registered deck
+//!     (`dot-agent-deck remote remove <name>`) edits ONLY the remote registry and
+//!     intentionally does NOT touch the global snapshot (decided Option 1 — there
+//!     is no per-deck saved state to clear). The 002 guard pins exactly that.
 //!
 //! Both are thin real-binary subprocess spawns — no PTY drive is needed. Each
 //! redirects `DOT_AGENT_DECK_SESSION` to a test-owned snapshot path (and
@@ -149,17 +151,21 @@ fn stage_remote_registry(remotes_file: &Path, name: &str) {
 /// Scenario: Register a remote deck `myhost` in a test-owned `remotes.toml`
 /// (`DOT_AGENT_DECK_REMOTES`) and stage a non-empty `session.toml`
 /// (`DOT_AGENT_DECK_SESSION`), then run `dot-agent-deck remote remove myhost`.
-/// Removing a deck is the per-deck fresh-start escape hatch (M4.1), so it must
-/// exit 0 AND clear that deck's saved state — the snapshot must be gone
-/// afterward. RED today: `remote remove` only edits the registry file; it never
-/// touches the saved-session snapshot, so the staged `session.toml` survives the
-/// removal.
+/// The snapshot is a single GLOBAL file, so `remote remove` is registry-only
+/// (decided Option 1): it must exit 0 AND LEAVE the global snapshot intact —
+/// same path, same contents — because there is no per-deck saved state to
+/// clear. The one fresh-start action is `snapshot clear` (covered by 001).
 #[spec("session/snapshot/002")]
 #[test]
-fn snapshot_002_remote_remove_clears_deck_saved_state() {
+fn snapshot_002_remote_remove_is_registry_only_leaves_snapshot_intact() {
     let session_dir = common::race_safe_tempdir();
     let session_file = session_dir.path().join("session.toml");
     stage_nonempty_snapshot(&session_file, session_dir.path());
+
+    // Capture the staged snapshot's exact contents so we can prove `remote
+    // remove` left it byte-for-byte untouched, not merely that some file exists.
+    let before =
+        std::fs::read_to_string(&session_file).expect("read staged snapshot before remove");
 
     let remotes_dir = common::race_safe_tempdir();
     let remotes_file = remotes_dir.path().join("remotes.toml");
@@ -173,9 +179,8 @@ fn snapshot_002_remote_remove_clears_deck_saved_state() {
         ],
     );
 
-    // The removal itself succeeds today (it edits the registry); that is not the
-    // behavior under test — keep it as a sanity guard so an unrelated failure is
-    // not silently read as the missing snapshot-clear.
+    // The removal succeeds (the registry entry exists). This is a sanity guard so
+    // an unrelated failure is not silently read as "snapshot preserved".
     assert!(
         out.status.success(),
         "`dot-agent-deck remote remove myhost` should exit 0 (the registry entry exists), \
@@ -183,12 +188,21 @@ fn snapshot_002_remote_remove_clears_deck_saved_state() {
         out.status.code()
     );
 
-    // The escape-hatch behavior: removing the deck must clear that deck's saved
-    // state. RED today: `remote remove` leaves the snapshot in place.
+    // The decided behavior (Option 1): `remote remove` is registry-only and must
+    // LEAVE the global snapshot intact — the file is still present afterward…
     assert!(
-        !session_file.exists(),
-        "PRD #89 M4.1: removing a deck (`dot-agent-deck remote remove myhost`) must clear that \
-         deck's saved state — the snapshot at {session_file:?} must be gone afterward — but it \
-         is still present. RED until `remote remove` clears the saved session.\noutput:\n{text}"
+        session_file.exists(),
+        "PRD #89 M4.1 (Option 1): `dot-agent-deck remote remove myhost` is registry-only and must \
+         LEAVE the global snapshot at {session_file:?} intact, but the file is gone afterward. \
+         There is no per-deck saved state to clear; `snapshot clear` is the one fresh-start \
+         action.\noutput:\n{text}"
+    );
+
+    // …with its contents unchanged: remove never reads or rewrites the snapshot.
+    let after = std::fs::read_to_string(&session_file).expect("read snapshot after remove");
+    assert_eq!(
+        before, after,
+        "PRD #89 M4.1 (Option 1): `remote remove` must not modify the global snapshot, but its \
+         contents at {session_file:?} changed.\noutput:\n{text}"
     );
 }
