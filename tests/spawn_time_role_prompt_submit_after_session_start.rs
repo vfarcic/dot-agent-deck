@@ -1,3 +1,9 @@
+// PRD #42 M8: this test uses the Unix-socket-based `common` PTY harness and
+// probes the daemon's attach socket with tokio::net::UnixStream + PermissionsExt,
+// so it is Unix-only at the source level. `#![cfg(unix)]` makes the crate empty
+// on Windows so the cross-platform test build compiles; on Unix it still runs
+// exactly as before. A named-pipe port of the harness for Windows is #164 (M10).
+#![cfg(unix)]
 //! PRD #128 Direction B-1 regression: the orchestrator spawn-time role
 //! prompt must wait `SPAWN_TIME_READINESS_BUFFER` after SessionStart is
 //! observed before the daemon writes the prompt + CR. Claude Code's

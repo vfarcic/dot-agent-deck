@@ -1,14 +1,14 @@
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
 use tokio::sync::{Notify, broadcast};
 use tracing::{error, info, warn};
+
+use crate::platform::ipc::{IpcListener, IpcStream};
 
 use crate::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_EXIT_WHEN_ORPHANED, DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS,
@@ -80,13 +80,6 @@ pub fn should_exit_orphaned(original_ppid: i32, current_ppid: i32) -> bool {
     current_ppid == 1 || current_ppid != original_ppid
 }
 
-/// The calling process's parent pid. Wraps `getppid(2)` (async-signal-safe,
-/// infallible) so the single `unsafe` lives in one place.
-fn current_ppid() -> i32 {
-    // SAFETY: `getppid(2)` has no failure mode and no side effects.
-    unsafe { libc::getppid() }
-}
-
 /// Daemon-wide broadcast capacity for hook-event `BroadcastMsg`s forwarded
 /// to attached TUIs (PRD #76 M2.17). Generous so a slow client doesn't
 /// drop events during a normal burst; a subscriber that falls further
@@ -99,19 +92,6 @@ fn current_ppid() -> i32 {
 /// `PendingBroadcasts` replay buffer, salvage loop, and test gate are
 /// gone; the PTY scrollback is the journal.
 const EVENT_BROADCAST_CAPACITY: usize = 1024;
-
-/// Mode for the daemon's Unix socket: owner-only read/write. Without this the
-/// socket file inherits the process umask, which on most systems leaves it
-/// world-connectable. See PRD #76 line 298.
-const SOCKET_MODE: u32 = 0o600;
-
-/// umask is process-global, so serialize the bind-with-restrictive-umask
-/// dance to keep concurrent tests from racing each other's restore. NOTE:
-/// this lock only serializes *cooperating* callers that go through
-/// `bind_socket`. Any other code path that calls `umask(2)` directly
-/// bypasses the lock and can still race with the swap-and-restore here —
-/// so don't treat this as a process-global umask guard.
-static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
 /// Lock file path for a daemon socket. Used to serialize concurrent
 /// `daemon serve` starts against the same `socket_path` (PRD #93 round-2
@@ -180,19 +160,6 @@ fn lock_root(override_root: Option<&Path>) -> PathBuf {
         .join("dot-agent-deck")
 }
 
-/// Create `dir` (recursively) with mode 0o700 and re-apply the mode to
-/// pre-existing directories — same defense-in-depth pattern as
-/// `daemon_attach::prepare_state_dir`. We invoke this just before
-/// acquiring the spawn lock so a fresh install on a system without a
-/// runtime dir or `~/.cache/dot-agent-deck` succeeds without manual setup.
-fn ensure_lock_root(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder.create(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-}
-
 /// PRD #93 M1.3 live-socket probe. Used by [`run_daemon_with`] to
 /// distinguish a still-running daemon from a stale inode left behind by a
 /// crashed daemon. Returns `true` only when `connect(2)` actually succeeds
@@ -202,35 +169,12 @@ fn ensure_lock_root(dir: &Path) -> io::Result<()> {
 /// This is a copy of [`crate::daemon_attach::probe_socket_alive`]'s logic
 /// rather than a re-export to keep the daemon module's run loop
 /// independent of the lazy-spawn machinery.
-async fn probe_socket_alive(path: &Path) -> bool {
-    tokio::net::UnixStream::connect(path).await.is_ok()
-}
-
-/// Bind a Unix listener at `path` with the socket inode created at 0o600
-/// directly. Setting umask before `bind(2)` closes the TOCTOU window between
-/// `bind` and a post-bind `chmod`: without this, a local attacker could
-/// connect via the world-readable inode that exists between the two calls.
 ///
-/// `pub(crate)` so the M1.2 attach-protocol server (`daemon_protocol`) and
-/// the M2.4 `connect` bridge (`crate::connect`) can reuse the same
-/// restrictive-umask bind dance for their sockets.
-pub(crate) fn bind_socket(path: &Path) -> io::Result<UnixListener> {
-    let _guard = UMASK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    // SAFETY: `umask(2)` is a thread-safe libc call that simply swaps a
-    // per-process value. We restore the previous mask immediately after
-    // `bind` so other code (file creation elsewhere) is unaffected.
-    //
-    // The kernel creates the socket inode with mode 0o777 & ~umask, so a
-    // mask of 0o177 strips the owner-execute bit and all group/other bits
-    // and produces 0o600 directly. (0o077 would yield 0o700 — owner exec is
-    // meaningless on a socket but the existing chmod target is 0o600, so we
-    // match it.)
-    let prev = unsafe { libc::umask(0o177) };
-    let result = UnixListener::bind(path);
-    unsafe {
-        libc::umask(prev);
-    }
-    result
+/// PRD #42 M2: the transport is abstracted behind
+/// [`crate::platform::ipc::IpcStream`]; on Unix this is the same
+/// `UnixStream::connect` liveness probe, unchanged.
+async fn probe_socket_alive(path: &Path) -> bool {
+    IpcStream::connect(path).await.is_ok()
 }
 
 /// Bundle of daemon state. Owns the hook-event `SharedState` and the agent
@@ -416,9 +360,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // for the target user. See `lock_path_for` for the resolution rules.
     let lock_path = lock_path_for(socket_path, daemon.lock_dir_override.as_deref());
     if let Some(parent) = lock_path.parent() {
-        ensure_lock_root(parent)?;
+        crate::platform::fsperm::ensure_owner_only_dir(parent)?;
     }
-    let _start_lock = crate::daemon_attach::acquire_spawn_lock(&lock_path).await?;
+    let _start_lock = crate::platform::lock::acquire_spawn_lock(&lock_path).await?;
 
     if socket_path.exists() {
         if probe_socket_alive(socket_path).await {
@@ -433,17 +377,17 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         std::fs::remove_file(socket_path)?;
     }
 
-    let listener = bind_socket(socket_path)?;
+    // PRD #42 M2: `IpcListener::bind` performs the umask-before-bind dance and
+    // the defense-in-depth 0o600 restate (both folded in from the former
+    // `bind_socket` + post-bind `set_permissions`), so the socket inode is
+    // owner-only exactly as before.
+    let listener = IpcListener::bind(socket_path)?;
     // Lock has done its job: subsequent starters' probe-connect will now
     // succeed against this listener and return AddrInUse without needing
     // to contend on the lock. Dropping releases the flock and closes the
     // fd; the `.lock` file itself stays on disk (cheap, empty, reused on
     // next start).
     drop(_start_lock);
-    // Defense in depth: `bind_socket` already created the inode at 0o600 via
-    // umask, but restating the mode here makes the requirement explicit and
-    // would cover any future code path that bypasses `bind_socket`.
-    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(SOCKET_MODE))?;
     info!("Daemon listening on {}", socket_path.display());
 
     // Hold the registry for the lifetime of the loop so its Drop fires
@@ -498,7 +442,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         .map(|v| parse_bool_flag(&v))
         .unwrap_or(false)
     {
-        let original_ppid = current_ppid();
+        let original_ppid = crate::platform::proc::current_ppid();
         let shutdown_signal = shutdown.clone();
         info!(
             original_ppid,
@@ -507,7 +451,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                let cur = current_ppid();
+                let cur = crate::platform::proc::current_ppid();
                 if should_exit_orphaned(original_ppid, cur) {
                     warn!(
                         original_ppid,
@@ -877,7 +821,7 @@ async fn run_idle_monitor(
 }
 
 async fn run_hook_loop(
-    listener: UnixListener,
+    listener: IpcListener,
     state: SharedState,
     event_tx: broadcast::Sender<BroadcastMsg>,
     pty_registry: Arc<AgentPtyRegistry>,
@@ -895,7 +839,7 @@ async fn run_hook_loop(
                 return Ok(());
             }
             accept_res = listener.accept() => match accept_res {
-            Ok((stream, _addr)) => {
+            Ok(stream) => {
                 let state = state.clone();
                 let event_tx = event_tx.clone();
                 let pty_registry = pty_registry.clone();

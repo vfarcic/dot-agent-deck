@@ -46,14 +46,13 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use tokio::net::UnixStream;
-
 use crate::build_id::local_build_id;
-use crate::daemon_attach::peer_pid;
 use crate::daemon_client::{DaemonClient, issue_command};
 use crate::daemon_protocol::{
     AttachRequest, AttachResponse, PROTOCOL_VERSION, RunningAgentsSummary,
 };
+use crate::platform::ipc::IpcStream;
+use crate::platform::peercred::peer_pid;
 
 /// How long to wait for the daemon's attach socket to disappear after a
 /// `SIGTERM` before reporting failure. The daemon's own teardown runs a
@@ -383,25 +382,25 @@ async fn terminate_and_recover(
 struct ProbeOutcome {
     response: AttachResponse,
     peer_pid: u32,
-    /// The original connected `UnixStream` is held alive across the
+    /// The original connected [`IpcStream`] is held alive across the
     /// interactive prompt so the kernel can't recycle the daemon's PID
     /// while the user is deciding S/Q (PRD #103 PID-reuse mitigation —
     /// see [`ensure_compatible_daemon_or_die`]). Used for the
     /// re-resolved `peer_pid()` call right before SIGTERM.
-    stream: UnixStream,
+    stream: IpcStream,
 }
 
 async fn probe_daemon(attach_path: &Path) -> Result<ProbeOutcome, HandshakeError> {
-    let mut stream = UnixStream::connect(attach_path)
+    let mut stream = IpcStream::connect(attach_path)
         .await
         .map_err(HandshakeError::Probe)?;
     let pid = peer_pid(&stream).map_err(HandshakeError::PeerPid)?;
     // Borrow-split so the original `stream` survives the Hello exchange
     // and can be held across the interactive prompt. `into_split()`
     // (which consumes the stream) would force us to reunite the halves
-    // afterwards; the borrow-split is simpler.
+    // afterwards; the borrow-split over `&mut stream` is simpler.
     let resp = {
-        let (mut rd, mut wr) = stream.split();
+        let (mut rd, mut wr) = tokio::io::split(&mut stream);
         let req = AttachRequest::Hello {
             client_version: PROTOCOL_VERSION,
             // Same `local_build_id()` the comparison uses — keeps the
@@ -469,7 +468,6 @@ pub async fn terminate_daemon_graceful(
     grace_timeout: Duration,
     force_kill_after: Option<Duration>,
 ) -> Result<TerminateOutcome, HandshakeError> {
-    let signal_pid = checked_signal_pid(pid)?;
     // TOCTOU residual risk: between `peer_pid()` (on the connected
     // attach socket) reading this PID and the SIGTERM below, the
     // daemon could exit and the kernel could recycle the PID for an
@@ -491,72 +489,24 @@ pub async fn terminate_daemon_graceful(
     // double-check the auditor suggested would only narrow the window,
     // not close it (the recycle could still happen between the
     // `kill(_, 0)` and the `kill(_, SIGTERM)`).
-    // SAFETY: `libc::kill` is async-signal-safe and has no in-process
-    // side effects beyond delivering the signal to the target PID.
-    let rc = unsafe { libc::kill(signal_pid, libc::SIGTERM) };
-    if rc != 0 {
-        let err = io::Error::last_os_error();
-        // ESRCH: no such process — the daemon already exited. There is nothing
-        // to terminate, so this is a clean already-gone success, not a failure.
-        // This matters for the re-resolve fallback above (a daemon that exited
-        // on its own) and for `daemon stop` racing a self-exiting daemon.
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(TerminateOutcome::Stopped);
-        }
-        return Err(HandshakeError::TerminateFailed(err));
-    }
+    //
+    // PRD #42 M1: the pid-guard + signal delivery moved to
+    // `crate::platform::proc::{terminate_pid, force_kill_pid}` (Unix `kill`;
+    // Windows `TerminateProcess` lands in #163). Guard failures (pid 0 /
+    // overflow) and `kill` errors both surface as `TerminateFailed`.
+    crate::platform::proc::terminate_pid(pid).map_err(HandshakeError::TerminateFailed)?;
     if poll_daemon_gone(attach_path, grace_timeout).await {
         return Ok(TerminateOutcome::Stopped);
     }
     let Some(kill_grace) = force_kill_after else {
         return Err(HandshakeError::TerminateTimedOut);
     };
-    // SAFETY: same as above; SIGKILL is uncatchable but the syscall
-    // itself is async-signal-safe.
-    let rc = unsafe { libc::kill(signal_pid, libc::SIGKILL) };
-    if rc != 0 {
-        return Err(HandshakeError::TerminateFailed(io::Error::last_os_error()));
-    }
+    crate::platform::proc::force_kill_pid(pid).map_err(HandshakeError::TerminateFailed)?;
     if poll_daemon_gone(attach_path, kill_grace).await {
         Ok(TerminateOutcome::Killed)
     } else {
         Err(HandshakeError::TerminateTimedOut)
     }
-}
-
-/// Convert a `u32` PID (as returned by `peer_pid()`) into the `pid_t`
-/// (`i32`) shape `libc::kill` wants, refusing values that would
-/// dangerously change the syscall's meaning:
-/// - `pid == 0`: `kill(0, sig)` broadcasts to every process in the
-///   calling process group — would take down the parent shell.
-/// - `pid > i32::MAX`: the `as i32` cast would wrap to a negative
-///   value. `kill(-pgid, sig)` means "signal every process in process
-///   group `pgid`" — a wildcard kill. Refuse rather than send.
-/// - resulting `i32 <= 0` after the cast: defense-in-depth for any
-///   path that bypasses the explicit checks above.
-fn checked_signal_pid(pid: u32) -> Result<libc::pid_t, HandshakeError> {
-    if pid == 0 {
-        return Err(HandshakeError::TerminateFailed(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "peer pid is 0; refusing to kill(0, SIGTERM) (would broadcast to process group)",
-        )));
-    }
-    if pid > i32::MAX as u32 {
-        return Err(HandshakeError::TerminateFailed(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "peer pid {pid} does not fit in pid_t; refusing kill() (negative i32 would target a process group)"
-            ),
-        )));
-    }
-    let signed = pid as libc::pid_t;
-    if signed <= 0 {
-        return Err(HandshakeError::TerminateFailed(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("peer pid {pid} resolves to non-positive pid_t {signed}; refusing kill()"),
-        )));
-    }
-    Ok(signed)
 }
 
 /// Poll until the daemon stops answering connects on `attach_path`, or
@@ -576,7 +526,7 @@ async fn poll_daemon_gone(attach_path: &Path, budget: Duration) -> bool {
         if !attach_path.exists() {
             return true;
         }
-        if tokio::net::UnixStream::connect(attach_path).await.is_err() {
+        if IpcStream::connect(attach_path).await.is_err() {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

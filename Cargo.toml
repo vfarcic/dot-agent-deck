@@ -26,7 +26,6 @@ toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 semver = "1"
 portable-pty = "0.8"
-libc = "0.2"
 vt100 = "0.16"
 futures-util = "=0.3.32"
 regex = "1"
@@ -38,14 +37,11 @@ cron = "0.16.0"
 tempfile = "3"
 tokio-test = "0.4"
 serial_test = "3"
-# Integration tests don't inherit the package's `[dependencies]`, so the
-# harness/L2 tests need `libc` listed here to call `kill(2)` directly (process-
-# group cleanup on Drop; orphan-exit liveness polling).
-libc = "0.2"
 # PRD #201 `pi/live/002`: the injection-seeded orchestration e2e stages a
 # `session.toml` with an `OrchestrationSnapshot` by serializing a real
 # `config::SavedSession` — integration tests don't inherit the package deps, so
-# `toml` is listed here too (same version pin as the package dep).
+# `toml` is listed here too (same version pin as the package dep). `libc` is now
+# Unix-only, declared under `[target.'cfg(unix)'.dev-dependencies]` below.
 toml = "0.8"
 # PRD #77 Decision 22: insta pinned to a specific version, not `latest`,
 # so a future patch release cannot silently reshape snapshot diffs.
@@ -55,6 +51,35 @@ spec = { path = "xtask/spec" }
 # regenerates the paired .md so local DOT_AGENT_DECK_RECORD=1 runs
 # keep the docs in sync without a separate `cargo xtask docs --tests`.
 xtask-docs = { path = "xtask/docs" }
+
+# PRD #42 M1: `libc` is Unix-only. Every `libc::` reference lives behind a
+# `#[cfg(unix)]` path (mostly `src/platform/*/unix.rs`), so on Windows the
+# symbols (`setsid`/`flock`/`killpg`/`umask`/`getuid`/`getppid`/…) are never
+# referenced.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# PRD #42: Windows platform backends — named pipes, Job Objects, security
+# descriptors, `GetNamedPipeServerProcessId`, `LockFileEx`. The dependencies
+# are declared here so the `#[cfg(windows)]` backends under `src/platform/`
+# have them available; the real implementations land in PRD #163.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+] }
+# `%USERPROFILE%` / `%LOCALAPPDATA%` resolution for `src/platform/paths.rs`.
+dirs = "6"
+
+# Integration tests don't inherit the package's `[dependencies]`, so the
+# harness/L2 tests need `libc` listed here to call `kill(2)` directly (process-
+# group cleanup on Drop; orphan-exit liveness polling). Unix-only, matching the
+# `[target.'cfg(unix)'.dependencies]` gating above.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [features]
 # PRD #77 Decision 6: `cargo test-e2e` (alias) enables this feature so
