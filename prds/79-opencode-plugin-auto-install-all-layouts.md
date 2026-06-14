@@ -4,6 +4,10 @@
 **Priority**: Medium
 **Created**: 2026-05-09
 
+## Validation refresh (2026-06-14)
+
+Re-validated against current code — verdict: **current**. The bug this PRD targets still exists exactly as described: `auto_install`/`install` in `src/opencode_manage.rs` write to a single `detect_opencode_root()` target (XDG-first), while `existing_plugin_dirs` already fans out across both roots for *uninstall* — the install/uninstall asymmetry is unfixed. The daemon refactor (#76/#93) does not touch this path. Only minor line-number drift in the references below; locate by symbol.
+
 ## Problem
 
 `auto_install` (`src/opencode_manage.rs:386-409`) refreshes the OpenCode plugin in exactly one location: whatever `detect_opencode_root` returns. That helper checks `~/.config/opencode/` first, falls back to `~/.opencode/`, and otherwise returns `None`. The decision is based purely on whether the **directory** exists.

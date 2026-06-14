@@ -5,6 +5,18 @@
 **Created**: 2026-03-31
 **GitHub Issue**: [#20](https://github.com/vfarcic/dot-agent-deck/issues/20)
 
+## Validation refresh + decision (2026-06-14)
+
+Re-validated against current code and re-scoped after a design discussion. Corrections to the original draft:
+
+- **OpenCode already shipped (PRD #30) — the dashboard is no longer "Claude only."** Agents are modeled today as a closed enum `AgentType { ClaudeCode, OpenCode, None }` (`src/event.rs`) with command-basename inference (`AgentType::from_command`). The real gap is Codex/Gemini/Aider "and beyond," not multi-agent from zero.
+- **Design decided: a curated, compiled-in agent registry + a small set of integration "strategies" — NOT a free-form string for runtime extensibility.** Because every change ships in a release anyway, requiring a recompile to add an agent is acceptable; the goal is **maintainability and separation of concerns for maintainers**, not letting end users add agents without a release. Runtime/user extensibility is an explicit **non-goal**, so the original "make `agent_type` a free-form string so new agents need no code changes" requirement is **dropped** — a typed identity keyed into the registry is fine.
+- **What the registry replaces:** each agent's data (label, badge colour, detection pattern, default command, which integration strategy it uses) moves out of scattered `match AgentType` arms (detection in `from_command`, colours/labels in `src/ui.rs`, hook/plugin install dispatch) into **one cohesive registry entry per agent**. The agent identity stays typed; the win is centralisation, not destructuring.
+- **Integration strategies are the code seam.** Events reach the deck by different mechanisms per agent: native hooks (Claude Code, `src/hooks_manage.rs`), a plugin (OpenCode, `src/opencode_manage.rs`), stdout-wrapping (`dot-agent-deck wrap` — Codex/Gemini), or log-watching (Aider). The two shipped agents already use two different mechanisms, which is why this layer is inherently code. Define a small finite set of strategies; each registry entry names one. Adding an agent that reuses an existing strategy = a registry entry (+ release); adding a genuinely new mechanism = a one-time strategy implementation, then config thereafter.
+- **Open design dial:** how far to push strategy parameters (wrapper regexes, log-parse rules) into registry data vs. code is left as an implementation-time design decision.
+- **Still genuinely future work:** `dot-agent-deck wrap` and `watch --agent` do not exist yet (`Commands::Watch` is currently a generic interval-runner, not a log watcher), and none of the `live_target`/`send_result` protocol fields are implemented — consistent with Status: Draft.
+- **Testing strategy (the registry move is behaviour-preserving for shipped agents):** the enum→registry refactor must not change observable behaviour for Claude Code or OpenCode, so the **existing test suite must pass unchanged** — that is the regression proof that detection (`from_command`), card rendering, and hook/plugin install for the two shipped agents still work after centralisation. Do **not** edit existing tests to make them pass; if they need changing, the refactor changed behaviour and that's a bug. **New coverage** is additive: L1/unit tests for the registry lookups and strategy dispatch, and **new L2 e2e tests** (`e2e_*.rs`, gated by `#[cfg(feature = "e2e")]`, per CLAUDE.md rules 4–5) per newly-added agent, exercising detection → events → dashboard status end-to-end. Run `cargo test-e2e` before the PR.
+
 ## Problem Statement
 
 The dashboard only supports Claude Code. Developers increasingly use multiple AI coding tools — OpenAI Codex CLI, Google Gemini CLI, Aider, and others. Each tool has its own terminal session but no unified view exists to monitor them all. Users running mixed agent setups must mentally track which terminals run which tools.
@@ -30,7 +42,7 @@ Aider        →  aider adapter (log watcher)            →  AgentEvent  →  d
 - `dot-agent-deck wrap <agent-command>` — generic wrapper that intercepts stdio to generate events
 - Agent-type visual distinction in the dashboard (colored badges, icons)
 - `dot-agent-deck hooks install --agent <type>` for agents with native hook support
-- Codex CLI adapter as the first non-Claude agent (uses wrapper approach)
+- Codex CLI adapter as the first *wrapper-based* agent (note: OpenCode, PRD #30, was the first non-Claude agent and uses the plugin strategy)
 - A per-session **live-target descriptor** so the dashboard can tell a writable session from a view-only one, plus an honest **send result** status when input is delivered (see Liveness & Write Semantics)
 
 ### Out of Scope
@@ -45,7 +57,7 @@ Aider        →  aider adapter (log watcher)            →  AgentEvent  →  d
 ### Event Protocol Stabilization (`src/event.rs`)
 - Document the `AgentEvent` JSON schema as a stable public API
 - Add `agent_version: Option<String>` field
-- Ensure `agent_type` is a free-form string (not an enum) to support future agents without code changes
+- ~~Ensure `agent_type` is a free-form string (not an enum)~~ **Superseded (2026-06-14):** runtime extensibility is a non-goal, so `agent_type` need not become a free-form string. Keep a typed identity and drive per-agent behaviour from the curated registry (see the decision above) instead of scattered `match` arms; recompile-per-agent is acceptable since every change ships in a release.
 - Add protocol version field for forward compatibility
 - Add `live_target: Option<LiveTarget>` to describe how (and whether) the session can receive input (see Liveness & Write Semantics)
 

@@ -4,7 +4,20 @@
 **Priority**: Medium
 **Created**: 2026-05-17
 **GitHub Issue**: [#91](https://github.com/vfarcic/dot-agent-deck/issues/91)
-**Related to**: PRD #90 (Remote daemon upgrade) — orthogonal; either can land first.
+**Related to**: PRD #90 (Remote daemon upgrade) — **now closed** (superseded by #76/#103).
+
+## Validation refresh + reframe (2026-06-14)
+
+Re-validated against current code — verdict: **the original premise is stale; scope reframed to the narrow remaining value.** Since this PRD was written, **PRD #50 shipped "auto-install hooks on TUI startup"**: `hooks_manage::auto_install()` now runs on every launch (`src/main.rs`) and rewrites all dot-agent-deck hook entries to point at the current binary. That **silently fixes scenarios 1, 2, 3, and 5** below (missing hooks, manual installs, new hook types after an upgrade, binary-path drift) by overwriting on every startup — so "Manually: never. Nothing else triggers it." (Problem Statement) is no longer true, and the original "detect staleness and tell the user to run `hooks install`" framing is moot (install already happens).
+
+**Reframed scope — the only value #50 does not already deliver:**
+
+1. **Notify-on-change.** `auto_install` only logs at `tracing` level; nothing reaches the TUI. When it actually changes hooks (first-time install, or a fix after drift/upgrade), surface a brief user-visible note (the user otherwise has no idea hooks were just (re)installed).
+2. **Handle a corrupt/unreadable `settings.json` gracefully.** Today `read_settings()` falls back to `{}` on a parse error and `auto_install` then overwrites the file with fresh hooks — silently clobbering a malformed settings.json that may hold the user's *other* hooks/config. Warn-instead-of-clobber: detect unreadable/unparseable settings and surface a specific message rather than overwriting. (This is the one genuine, if small, data-loss risk.)
+
+**Implementation notes for the reframe:** `session_warnings` currently flushes to **stderr after the TUI exits** (not an in-TUI banner), so a user-visible note needs a small render path, not just a `push`. The original Phase-1 `check_hooks`/`HookCheckIssue` design is largely unnecessary now — base the notification on `auto_install`'s *return value* (did it change anything? did it hit an unreadable file?) rather than a separate read-and-compare pass. Stale refs in the body below: `remote.rs:824` → the actual `hooks install` invocations are at `src/remote.rs:957` (in `add()`) and `1243` (in `upgrade()`); `ui.rs:3033-3036` → `session_warnings` usage is now ~`5879`.
+
+The original Problem Statement, Scope, and Milestones below are retained as historical context but are superseded by this reframe.
 
 ## Problem Statement
 

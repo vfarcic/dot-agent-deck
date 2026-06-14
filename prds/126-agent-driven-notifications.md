@@ -5,8 +5,12 @@
 **Created**: 2026-05-25
 **GitHub Issue**: [#126](https://github.com/vfarcic/dot-agent-deck/issues/126)
 **Closes**: [#99](https://github.com/vfarcic/dot-agent-deck/issues/99) (supersedes prior orchestrator-only design)
-**Prerequisite for**: scheduler PRD (to be drafted; will block #120)
+**Prerequisite for**: [#120](https://github.com/vfarcic/dot-agent-deck/issues/120) (scheduled issue dispatch). Note: the scheduler PRD #127 (cron-scheduled-prompt-dispatch) **shipped** and consumed this PRD's notification seam via a temporary `StderrNotifier` stub; #120 is the active downstream dependent.
 **Related**: PRD #8 (terminal bell — per-session, in-terminal), PRD #20 (multi-agent support), PRD #58 / #82 (orchestration lifecycle)
+
+## Validation refresh (2026-06-14)
+
+Re-validated against current code — verdict: **current**. Nothing here has shipped yet (no `src/notifications.rs`, no `[notifications]` config block, no inactivity timer). The dependency relationships are real and live: PRD #99 is correctly closed/superseded by this PRD, and PRD #127 (cron scheduler) shipped consuming this PRD's notification seam via a temporary `StderrNotifier` stub. When implementing M2.2, fill the existing `Notifier`/`NotifyEvent`/`StderrNotifier` seam in `src/scheduler.rs` rather than inventing a new one.
 
 ## Problem Statement
 

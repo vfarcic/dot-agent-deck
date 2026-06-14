@@ -7,6 +7,10 @@
 **Depends on**: [#127](https://github.com/vfarcic/dot-agent-deck/issues/127) (cron-scheduled prompt dispatch — provides the scheduler whose unattended use this enables)
 **Related**: `src/daemon.rs` (lazy-spawn, idle shutdown, M1.4 enabled-schedule keep-alive), `docs/scheduled-tasks.md`, `docs/getting-started.md` ("How it runs")
 
+## Validation refresh (2026-06-14)
+
+Re-validated against current code — verdict: **mostly current**. The premise holds: there is still no boot-time supervision — `DaemonCmd` in `src/main.rs` exposes `Serve`/`Hello`/`Stop`/`Restart` but no `Install`, and the daemon is only lazy-spawned on attach. The **#127 dependency has shipped** (archived in `prds/done/127-cron-scheduled-prompt-dispatch.md`): it provides the scheduler primitives, `src/daemon.rs`/`src/scheduler.rs`, and the `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` keep-alive this PRD assumes, so treat "Depends on #127" as satisfied. One concrete loose end to fold into scope: `docs/getting-started.md` already links readers to "supervisor recipes" in `docs/scheduled-tasks.md`, but commit `dac0ad0` removed those recipes — a live broken promise in published docs that this PRD should repair.
+
 ## Problem Statement
 
 Scheduled tasks (PRD #127) only fire while the daemon is running. The daemon is lazy-spawned when the user opens the deck, and an enabled schedule keeps it alive between fires — but it is **not** started at boot and **not** respawned after it exits. After a reboot, logout, or crash the daemon stays down until the next `dot-agent-deck` launch, and any fire due in that window is silently missed (there is no catch-up and no persisted last-fire timestamp). There is no built-in always-on mode.

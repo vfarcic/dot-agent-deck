@@ -4,6 +4,10 @@
 **Priority**: Medium
 **Created**: 2026-04-05
 
+## Validation refresh (2026-06-14)
+
+Re-validated against current code — verdict: **status accurate (not started), but scope materially understated**. The PRD's three Unix-specific categories predate the daemon refactor (#76/#93), which roughly **5–6×'d the Unix-only surface**. Beyond the listed sockets / `/dev/tty` / SIGWINCH, native Windows now also requires handling: `setsid(2)` + `CommandExt::pre_exec` daemon detach (`src/daemon_attach.rs`); `flock(2)`/`LOCK_EX` spawn serialization (`src/daemon_attach.rs`, `src/daemon.rs`); `SO_PEERCRED`/`LOCAL_PEERPID` peer-PID resolution used for SIGTERM targeting (`peer_pid()` in `src/daemon_attach.rs`, consumed by `src/daemon_stop.rs` and `src/build_version_handshake.rs`); `libc::kill`/`killpg` lifecycle signals (`src/agent_pty.rs`, `src/daemon_stop.rs`); and the `umask`/`O_NOFOLLOW`/mode-bit security model. `UnixListener`/`UnixStream` now spans ~8 files with a dual-socket layout (`socket_path()` for hooks, `attach_socket_path()` for TUI attach). The proposed `src/ipc/` abstraction must cover all of that. Recommend expanding the scope sections (and adding a Windows process-detach / file-lock / peer-credential plan) before any work starts.
+
 ## Problem
 
 dot-agent-deck only runs on macOS and Linux. Windows users must use WSL, which adds friction (extra setup, filesystem bridging, terminal quirks) and reduces discoverability — users who find the project may not realize they need WSL or may not have it configured.

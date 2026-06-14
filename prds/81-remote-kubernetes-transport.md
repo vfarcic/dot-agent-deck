@@ -4,7 +4,11 @@
 **Priority**: Medium
 **Created**: 2026-05-09
 **GitHub Issue**: [#81](https://github.com/vfarcic/dot-agent-deck/issues/81)
-**Depends on**: PRD #76 (Remote Agent Environments — ssh transport, daemon protocol, registry)
+**Depends on**: PRD #76 (Remote Agent Environments — ssh transport, daemon protocol, registry) — **shipped**
+
+## Validation refresh (2026-06-14)
+
+Re-validated against current code — verdict: **status accurate (not started), but the transport mechanism described is stale**. The CLI scaffold is in place (`CliRemoteType::Kubernetes` in `src/main.rs`; `remote add` / `connect` return `KubernetesNotYetImplemented` / `KubernetesNotYetSupported`, both referencing this PRD). BUT this PRD assumes it carries over a "local Unix socket **bridge**" from #76 M2.4 — that bridge was **deleted** in #76 M2.7. Today `connect` is a thin `ssh -t` exec wrapper (`src/connect.rs`), so the K8s path should be the analogous thin exec — `kubectl exec -it <pod> -- env DOT_AGENT_DECK_VIA_DAEMON=1 <install_path>` inheriting stdio — **not** a socket relay. Registry note: `RemoteEntry` (`src/remote.rs`) has no `context` / `namespace` / `install_image` fields yet (correctly flagged as a gap). DEPENDENCY: #76 shipped, but **#93 (always-external daemon) is in flight and is actively reshaping the connect/attach architecture** — review the connect approach (M2.2) against #93's final shape before starting.
 
 ## Problem Statement
 

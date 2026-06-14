@@ -1,6 +1,6 @@
 # PRD #120: Scheduled agent dispatch on open GitHub issues
 
-**Status**: Planning (blocked on #127)
+**Status**: Planning (unblocked — #127 shipped 2026-06-07; Phases 2–4 remain)
 **Priority**: Medium
 **Created**: 2026-05-25
 **GitHub Issue**: [#120](https://github.com/vfarcic/dot-agent-deck/issues/120)
@@ -8,6 +8,10 @@
 **Related**: `src/orchestration/`, `.dot-agent-deck.toml`, `src/worktree.rs`, the existing delegate / agent-card lifecycle
 
 > **Scope note (2026-05-25)**: This PRD's original "Phase 1: Scheduler primitive and config" section will be removed/subsumed once #127 lands. The general scheduler (cron primitive + spawn primitive + reuse-by-default tab lifecycle) belongs in #127. What remains in this PRD's scope is the GitHub-specific layer that composes those primitives: repo provisioning (clone/pull), per-issue worktrees, issue enumeration via `gh`, idempotency (worktree-exists + linked-PR check), per-issue dedup keys, and the tab-close → worktree-cleanup hook. The detailed scope below will be revised after #127 merges.
+
+## Validation refresh (2026-06-14)
+
+Re-validated against current code — verdict: **unblocked, mostly accurate**. The #127 dependency **shipped** (archived in `prds/done/`), so the primitives this PRD composes now exist: `Scheduler::{register,run_now,tick_at,reload_apply}` (`src/scheduler.rs`), `spawn(SpawnRequest{task_name,working_dir,command,prompt})` → `SpawnHandle` with the `on_tab_closed` cleanup seam (`src/spawn.rs`), and the **global** schedules config at `~/.config/dot-agent-deck/schedules.toml` (`src/config.rs`). The remaining work is genuinely the GitHub layer (Phases 2–4: `gh` issue enumeration, per-issue worktrees, idempotency, cleanup) — none of which exists yet. Open Question 6 (tab-close → worktree cleanup hook) is resolved: `SpawnHandle.on_tab_closed` exists. Corrected below: scheduled-task entries live in the global `schedules.toml`, **not** the per-project `.dot-agent-deck.toml` (which is only the spawn-target config).
 
 ## Problem Statement
 
@@ -85,7 +89,7 @@ The dispatch flow runs **in-process inside the deck**, not as a remote `/schedul
 
 ## Success Criteria
 
-- A user can add a `[[scheduled_tasks]]` block to `.dot-agent-deck.toml` declaring an `issue_dispatch` task with a cron expression, a list of repos, and a per-run cap; the deck loads it on startup without further configuration.
+- A user can add a `[[scheduled_tasks]]` block to the global `~/.config/dot-agent-deck/schedules.toml` declaring an `issue_dispatch` task with a cron expression, a list of repos, and a per-run cap; the daemon loads it on startup without further configuration. (The per-project `.dot-agent-deck.toml` only describes the spawn target — modes/orchestrations — not the schedule.)
 - When the cron fires (or the user invokes "run now"), the dispatch executes end-to-end against at least one configured repo: clone/pull, worktree, tab spawn, initial prompt delivered.
 - An issue with an existing worktree under `.worktrees/issue-<n>` *or* an open linked PR is skipped on subsequent runs — verified by running the dispatch twice with no intervening close.
 - For a repo with an `[[orchestrations]]` block, the dispatch opens an orchestration tab and the `orchestrator` role receives the initial prompt.

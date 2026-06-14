@@ -1,10 +1,25 @@
 # PRD #87: Remote Environments Documentation
 
-**Status**: Planning
+**Status**: Planning (re-scoped 2026-06-14 — most work already shipped; two cross-reference gaps remain)
 **Priority**: Medium
 **Created**: 2026-05-16
+**Last Updated**: 2026-06-14
 **GitHub Issue**: [#87](https://github.com/vfarcic/dot-agent-deck/issues/87)
-**Depends on**: PRD #76 (Remote Agent Environments) being shipped first.
+**Depends on**: PRD #76 (Remote Agent Environments) — **shipped**.
+
+## Validation refresh + re-scope (2026-06-14)
+
+Re-validated against the current docs tree — verdict: **most of this PRD is already done.** Verified firsthand:
+
+- The three pages **exist and are already published/wired**: `docs/remote-environments.md`, `docs/remote-recipes.md`, `docs/remote-requirements.md` are all on disk AND in `site/sidebars.js` under a "Remote Environments" category (`remote-environments` as the category link, `remote-requirements` + `remote-recipes` as items). So **M2.1 (sidebar wiring) is done**, and **M1.1/M1.2 (the pages exist, reconciled enough to publish) are effectively done.**
+- The pre-existing pages have moved on too: `docs/getting-started.mdx` is now `docs/getting-started.md`, and PRD #93's M4.1 already added a daemon **"How it runs"** section that covers the `connect`/remote model. So the remote story is partially cross-referenced already.
+
+**Remaining scope — just two cross-reference gaps:**
+
+1. **`docs/getting-started.md`** — add a short, dedicated "Running on a remote host" callout linking to `remote-environments.md` (today remote is only mentioned inline inside "How it runs").
+2. **`docs/installation.md`** — add a one-paragraph note that remote-host installs are handled automatically by `remote add`.
+
+Everything else in the milestones below (Phase 1 polish, M2.1 sidebar, the optional screenshots, the separate release) is either already done or optional. Note the `.mdx` → `.md` extension drift throughout the body. If those two cross-references are judged unnecessary (the "How it runs" sections may already suffice), this PRD can simply be closed as done instead.
 
 ## Problem Statement
 

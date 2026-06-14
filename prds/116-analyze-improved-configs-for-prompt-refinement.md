@@ -6,6 +6,10 @@
 **GitHub Issue**: [#116](https://github.com/vfarcic/dot-agent-deck/issues/116)
 **Related**: `assets/config_gen_prompt.md`, `assets/roles.toml`, `src/config_gen.rs`
 
+## Validation refresh (2026-06-14)
+
+Re-validated against current code — verdict: **current, with one minor schema gap**. The referenced assets and code all exist and work as described: `assets/config_gen_prompt.md` (embedded via `include_str!` in `src/config_gen.rs`), `assets/roles.toml`, and the Anthropic-by-default `src/llm.rs`. The structured-diff taxonomy should gain two regions the per-mode schema grew since this PRD: `seed_prompt` (optional per-mode seeding prompt, added by PRD #127) and `reactive_panes` (pane slot count) — both are real fields user-improved configs may set differently from the AI baseline.
+
 ## Problem Statement
 
 dot-agent-deck ships an AI config generator: an agent reads a project, follows the prompt in `assets/config_gen_prompt.md`, and writes an initial `.dot-agent-deck.toml`. That initial config is rarely the final one. In every project where the author actually uses the deck (`dot-ai/`, `dot-ai-infra/`, `youtube-automation/`, `dot-agent-deck/` itself, and the worktrees forked from it) the config has been edited by hand — sometimes lightly, sometimes substantially — to make modes, panes, rules, and orchestrations actually fit the work.

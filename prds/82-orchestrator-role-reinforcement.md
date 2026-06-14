@@ -5,6 +5,10 @@
 **Created**: 2026-05-10
 **GitHub Issue**: [#82](https://github.com/vfarcic/dot-agent-deck/issues/82)
 
+## Validation refresh (2026-06-14)
+
+Re-validated against current code — verdict: **current** as an investigation doc; the problem framing, open questions, and milestone structure still hold, and no reinforcement code has landed (`rg reinforc` over `src/` is empty). Two precision fixes applied below: the worker handoff is a **PTY-injected one-liner** written into the orchestrator's pane by the daemon's `handle_work_done` (`src/state.rs`), **not** a Claude Code system-reminder / `additionalContext`; and OpenCode's event map is now `map_opencode_event_type` (line drift only). The `PreCompact`/`PostCompact` mapping in `src/hook.rs` and the auto-install-list claims (`PreCompact` installed, `PostCompact` not) remain accurate.
+
 ## Problem
 
 The orchestrator agent — the role with `start = true` in an `[[orchestrations]]` block (e.g. `.dot-agent-deck.toml:21-44`) — drifts from delegation discipline over the course of a session. Two distinct triggers have been observed or are suspected:
@@ -26,7 +30,7 @@ The orchestrator is the user's only interface to a multi-agent flow. When it dri
 Concrete plumbing as of this PRD's creation date — relevant inputs to the investigation, not a prescription:
 
 - **Orchestrator role definition lives in project config.** `[[orchestrations.roles]]` with `start = true`, configured per-project (e.g. `.dot-agent-deck.toml:18-44` in this repo). The `prompt_template` is the standing instruction.
-- **Worker handoff goes through async `dot-agent-deck delegate` + `work-done-<role>.md`.** Per `feedback_delegate_workflow.md`: orchestrator delegates, waits for a system reminder, reads the work-done file, continues. Whatever emits that reminder is a candidate injection point.
+- **Worker handoff goes through async `dot-agent-deck delegate` + `work-done-<role>.md`.** `Commands::Delegate` / `Commands::WorkDone` (`src/main.rs`); on completion the daemon's `handle_work_done` (`src/state.rs`) writes a one-liner **directly into the orchestrator's pane** via `write_to_pane_and_submit` ("Worker {role} has completed their task. Read .dot-agent-deck/work-done-{role}.md…"). NOTE: this is a **PTY-injected message, not** a Claude Code system-reminder / `additionalContext` (an earlier draft described it as a "system reminder"). That PTY-write site is a candidate injection point.
 - **Claude Code emits `PreCompact` and `PostCompact` hooks.** Mapped in `src/hook.rs:95-96` (`PreCompact` → `Compacting`, `PostCompact` → `Thinking`). `PreCompact` is in the auto-installed hook list (`src/hooks_manage.rs:5-16`); **`PostCompact` is not auto-installed today** — we observe the post-compact moment via `PreCompact` for status only, not via a `PostCompact` hook that could carry context back to the agent.
 - **OpenCode's compaction hook surface is unknown.** `map_opencode_event_type` (`src/hook.rs:177-199`) covers `session.*`, `tool.execute.*`, and `permission.*`. No compaction event is mapped. Whether OpenCode even *has* a compaction event, and whether its hooks support emitting context back to the agent (the way Claude Code's `PostCompact` `additionalContext` does), is unverified.
 - **Hook auto-install plumbing already exists** for Claude Code (`src/hooks_manage.rs`) and for OpenCode (`src/opencode_manage.rs` plugin write). If a chosen solution wants to install a new hook per orchestrator role, the install path is not the hard part.
