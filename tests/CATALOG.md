@@ -1108,6 +1108,13 @@ note).
 - **Does not assert:** the card/pane rects themselves (no public full-frame layout seam at L1 — the post-transition card cleanliness is guarded at L2 by `render/layout/001`–`003`); which button lands on which row; the exact column widths.
 - **Platform coverage:** mac+linux+windows.
 
+##### render/layout/005 — The new-pane form modal renders without panicking on a wide-but-very-short terminal (PRD #144 bounds-safety guard).
+- **Layer:** L1 (in-process `TestBackend` via `render_new_pane_form_to_buffer`; no PTY, no subprocess).
+- **Agent:** none (renders the new-pane form with two mode options into an 80×3 buffer).
+- **Asserts:** rendering the content-sized new-pane form modal at a wide-but-very-short 80×3 terminal — where the modal is clamped to ~2 rows, far fewer than the form's reserved field rows — completes WITHOUT panicking, and returns a buffer of exactly the requested size so every overlay cell (mode chips, `[Submit]`/`[Cancel]` row, cursor) stayed within the clamped modal/buffer bounds instead of being placed by an absolute line index that runs past the buffer bottom. A TUI must not panic on a small-but-valid terminal.
+- **Does not assert:** the exact rows the overlays land on; which overlays are skipped when they don't fit; the modal's content/labels at this degenerate size; behaviour at roomy sizes (covered by `mouse/form/001`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Keybindings (PRD #40)
 
 Keybindings resolve **client-side**: the config file lives on the machine
