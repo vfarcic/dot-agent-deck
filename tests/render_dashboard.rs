@@ -526,8 +526,7 @@ fn palette_002_pane_border_matches_deck_status_color() {
 /// `selected` accent role — Color::Magenta + Modifier::BOLD — plus the `▸ `
 /// title marker, and that this color is NOT a status color (≠ green) and NOT
 /// the focused accent (≠ cyan). This pins the Option-A rule that selection is
-/// conveyed by a non-status accent that never collides with the palette. RED
-/// today because the selected card border is still Color::Cyan + BOLD.
+/// conveyed by a non-status accent that never collides with the palette.
 #[spec("theme/palette/003")]
 #[test]
 fn palette_003_selected_card_border_is_magenta_bold_marker() {
@@ -580,8 +579,7 @@ fn palette_003_selected_card_border_is_magenta_bold_marker() {
 /// are provably distinct. Then render a pane that is focused AND carries a real
 /// `Working` status and assert its border is still Cyan (the focused accent),
 /// NOT Green (the Working status color) — locking the precedence invariant that
-/// focus OVERRIDES a present status color. Already green today; it locks that
-/// behavior against the palette rewire.
+/// focus OVERRIDES a present status color.
 #[spec("theme/palette/004")]
 #[test]
 fn palette_004_focused_pane_border_is_cyan_distinct() {
