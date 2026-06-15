@@ -14,10 +14,8 @@ title: Getting Started
 brew tap vfarcic/tap && brew install dot-agent-deck
 
 # 2. Launch the dashboard (hooks are auto-installed for detected agents)
+# Your previous workspace is restored automatically
 dot-agent-deck
-
-# Or resume your previous session
-dot-agent-deck --continue
 ```
 
 ### Linux
@@ -27,10 +25,8 @@ dot-agent-deck --continue
 brew tap vfarcic/tap && brew install dot-agent-deck
 
 # 2. Launch the dashboard (hooks are auto-installed for detected agents)
+# Your previous workspace is restored automatically
 dot-agent-deck
-
-# Or resume your previous session
-dot-agent-deck --continue
 ```
 
 ### Windows

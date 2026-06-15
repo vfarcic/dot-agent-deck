@@ -791,6 +791,15 @@ const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(1
 /// which was tuned empirically — keep the two values in sync.
 const SUBMIT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// PRD #89 M1.2 — throttle window for continuous saved-session snapshot writes.
+/// A meaningful state change marks the snapshot dirty; the main loop flushes it
+/// at most once per this interval (plus one trailing write per quiet-down), so
+/// a burst of changes coalesces to one or two disk writes instead of thrashing
+/// the disk on every keystroke. Small enough that a fresh snapshot lands well
+/// within a second of any change; large enough to absorb an orchestration
+/// setup's pane-spawn burst into a single trailing write.
+const SNAPSHOT_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// PRD #128 Direction B-1 — minimum gap between SessionStart being observed
 /// for the start-role pane and the orchestrator's role prompt being written
 /// into it. Claude Code's `SessionStart` hook fires before its TUI input is
@@ -937,6 +946,14 @@ struct UiState {
     pane_layout: PaneLayout,
     /// Warnings collected during session save/restore, flushed after terminal restore.
     session_warnings: Vec<String>,
+    /// PRD #89 review-fix G1: tracks whether the most recent periodic snapshot
+    /// write (in `flush_session_snapshot_if_due`) failed. F10 keeps the
+    /// coalescer dirty on failure so the next loop retries; on a *persistent*
+    /// failure that retry fires every ~750ms, so we push the warning only on
+    /// the leading edge of a failure streak and suppress duplicates until a
+    /// later write succeeds (which clears this flag, re-arming the warning for
+    /// any subsequent new failure).
+    session_snapshot_write_failed: bool,
     /// Mouse text selection state for copy support.
     selection: Option<TextSelection>,
     /// Screen rect of the focused pane (set during render, used for mouse mapping).
@@ -1063,6 +1080,15 @@ struct UiState {
     /// (matches `write_to_pane`'s SUBMIT_DELAY rationale at
     /// src/embedded_pane.rs:199).
     last_pane_keystroke_at: Option<std::time::Instant>,
+    /// PRD #89 M1.2/M1.3 — coalesces saved-session snapshot writes so a burst
+    /// of meaningful state changes (or detaches) produces one or two disk
+    /// writes, not one per change. Marked dirty by [`UiState::mark_session_dirty`]
+    /// at every state-change/detach call site; flushed by
+    /// `flush_session_snapshot_if_due` once per main-loop iteration.
+    session_coalescer: config::SnapshotCoalescer,
+    /// PRD #89 M1.2 — monotonic reference the coalescer's `Duration` clock is
+    /// measured from (`session_epoch.elapsed()`), set once at construction.
+    session_epoch: std::time::Instant,
 }
 
 /// PRD #80 review FIX 4: which click region produced a [`LastClick`]. Multi-
@@ -1165,6 +1191,7 @@ impl UiState {
             update_available: None,
             pane_layout: PaneLayout::Stacked,
             session_warnings: Vec::new(),
+            session_snapshot_write_failed: false,
             selection: None,
             focused_pane_rect: None,
             side_pane_rects: Vec::new(),
@@ -1188,6 +1215,8 @@ impl UiState {
             scheduled_delete_confirm: false,
             scheduled_live_names: HashSet::new(),
             last_pane_keystroke_at: None,
+            session_coalescer: config::SnapshotCoalescer::new(SNAPSHOT_COALESCE_INTERVAL),
+            session_epoch: std::time::Instant::now(),
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             tab_header_rects: Vec::new(),
@@ -1200,6 +1229,16 @@ impl UiState {
             form_chip_rects: Vec::new(),
             form_button_rects: Vec::new(),
         }
+    }
+
+    /// PRD #89 M1.2/M1.3 — the single trigger every meaningful state-change and
+    /// detach call site invokes (new pane, rename, close, mode/orchestration tab
+    /// open/close, agent restart, Ctrl+W close-pane). It only marks the
+    /// saved-session snapshot dirty; the coalesced disk write happens in the
+    /// main loop via `flush_session_snapshot_if_due`, so a burst of triggers
+    /// collapses to one or two writes.
+    fn mark_session_dirty(&mut self) {
+        self.session_coalescer.mark_dirty();
     }
 }
 
@@ -1692,54 +1731,6 @@ pub(crate) struct HydrationPartition {
 /// orchestration buckets preserve the order in which their (cwd, name)
 /// pairing was first seen so the user's mental "which tab opened first"
 /// model survives reconnect (TabManager appends in iteration order).
-/// Key used by [`build_dedupe_budget`] / [`try_consume_dedupe_slot`] to
-/// match a saved pane against a daemon-hydrated pane. The tuple is
-/// `(dir, name, mode)`. `command` is intentionally excluded — daemon
-/// `list_agents` doesn't echo command, so hydration always stores
-/// `command = ""` and including it in the key would dedupe nothing for
-/// the common case.
-type SavedPaneDedupeKey = (String, String, Option<String>);
-
-/// Build the dedupe budget from the hydration metadata. The budget
-/// maps `(dir, name, mode)` keys to the COUNT of hydrated panes
-/// matching that key. The restore loop consumes slots via
-/// [`try_consume_dedupe_slot`] so it drops at most one saved pane per
-/// hydrated match — preserving distinct saved panes that happen to
-/// share a key (round-10 reviewer #2).
-fn build_dedupe_budget(
-    pane_metadata: &std::collections::HashMap<String, config::SavedPane>,
-) -> std::collections::HashMap<SavedPaneDedupeKey, usize> {
-    let mut budget: std::collections::HashMap<SavedPaneDedupeKey, usize> =
-        std::collections::HashMap::new();
-    for meta in pane_metadata.values() {
-        *budget
-            .entry((meta.dir.clone(), meta.name.clone(), meta.mode.clone()))
-            .or_insert(0) += 1;
-    }
-    budget
-}
-
-/// Returns true and decrements the budget if `saved_pane`'s
-/// `(dir, name, mode)` key has a free slot — the caller should then
-/// skip restoring it. Returns false otherwise.
-fn try_consume_dedupe_slot(
-    budget: &mut std::collections::HashMap<SavedPaneDedupeKey, usize>,
-    saved_pane: &config::SavedPane,
-) -> bool {
-    let key = (
-        saved_pane.dir.clone(),
-        saved_pane.name.clone(),
-        saved_pane.mode.clone(),
-    );
-    if let Some(slot) = budget.get_mut(&key)
-        && *slot > 0
-    {
-        *slot -= 1;
-        return true;
-    }
-    false
-}
-
 pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition {
     use std::collections::HashSet;
 
@@ -4028,6 +4019,9 @@ fn close_tab_by_index(
     {
         ui.selected_index = Some(idx - 1);
     }
+    // PRD #89 M1.2 — closing a mode/orchestration tab (via `[×]` click or the
+    // CloseTab action) is a meaningful state change; keep the snapshot fresh.
+    ui.mark_session_dirty();
 }
 
 /// PRD #92 F1 / PRD #80 M5: finalise Stop — tell the daemon to terminate every
@@ -4356,6 +4350,10 @@ fn dispatch_action(
                     ui.selected_index = Some(idx - 1);
                 }
             }
+            // PRD #89 M1.3 — Ctrl+W close-pane is a detach path; flush a fresh
+            // snapshot reflecting the surviving workspace (every sub-path above:
+            // closable-tab close, mode/orchestration tab close, plain pane).
+            ui.mark_session_dirty();
         }
         // Ctrl+PageDown: next tab (clamped, gated on a visible tab bar).
         // PRD #83: route through `switch_tab_with_focus` so the source tab's
@@ -4746,6 +4744,11 @@ fn dispatch_action(
                     // identity stays the canonical `orch_config.name`.
                     let display_title = (!req.name.is_empty()).then(|| req.name.clone());
                     let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
+                    // PRD #89 M2b.2: keep a copy of the prepared prompt for the
+                    // capture snapshot below — `prompt` itself is moved into
+                    // `open_orchestration_tab`. Empty when the orchestration
+                    // had no prompt.
+                    let captured_prompt = prompt.clone().unwrap_or_default();
                     // PRD #76 M2.15: pre-compute spawn dims using
                     // the orchestration-layout helper (right 66%
                     // column, matching the orchestration
@@ -4828,10 +4831,52 @@ fn dispatch_action(
                                 ui.pane_names
                                     .insert(role_pane_ids[i].clone(), role.name.clone());
                             }
-
-                            // Focus the start role's pane.
                             let start_idx =
                                 orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                            // PRD #89 M2b.2 — capture the orchestration metadata
+                            // onto the START (orchestrator) role pane so the
+                            // daemon-empty restore path can rebuild the whole tab
+                            // (orchestrator + role panes in display order, the
+                            // prompt, the start cursor) by re-resolving the
+                            // config from `project_path` + `config_name`. Only the
+                            // start role carries the snapshot — a single
+                            // `[panes.orchestration]` block — so restore rebuilds
+                            // the others from the re-resolved config rather than
+                            // duplicating them as plain panes. The non-start role
+                            // panes deliberately get NO `pane_metadata` entry.
+                            ui.pane_metadata.insert(
+                                role_pane_ids[start_idx].clone(),
+                                config::SavedPane {
+                                    dir: dir_str.clone(),
+                                    name: orch_config.roles[start_idx].name.clone(),
+                                    command: orch_config.roles[start_idx].command.clone(),
+                                    mode: None,
+                                    orchestration: Some(config::OrchestrationSnapshot {
+                                        version: 1,
+                                        roles: orch_config
+                                            .roles
+                                            .iter()
+                                            .map(|r| r.name.clone())
+                                            .collect(),
+                                        start_role_index: start_idx,
+                                        orchestrator_prompt: captured_prompt.clone(),
+                                        config_name: orch_config.name.clone(),
+                                        project_path: dir_str.clone(),
+                                        started_role_indices: vec![start_idx],
+                                        // PRD #89 review-fix F4: capture the
+                                        // user-typed tab title so the
+                                        // daemon-empty restore rebuilds the tab
+                                        // under the user's name, not the
+                                        // canonical config/cwd name.
+                                        display_title: display_title.clone(),
+                                    }),
+                                },
+                            );
+                            // PRD #89 M1.2 — opening an orchestration tab is a
+                            // meaningful state change; keep the snapshot fresh.
+                            ui.mark_session_dirty();
+
+                            // Focus the start role's pane.
                             let _ = pane.focus_pane(&role_pane_ids[start_idx]);
                             ui.mode = UiMode::PaneInput;
 
@@ -4987,8 +5032,15 @@ fn dispatch_action(
                                     name: req.name.clone(),
                                     command: req.command,
                                     mode: mode_name_for_save,
+                                    // PRD #89 M2b.2: capture is a later step
+                                    // (M2b.3); the schema field exists now so
+                                    // older/newer snapshots round-trip.
+                                    orchestration: None,
                                 },
                             );
+                            // PRD #89 M1.2 — a new dashboard pane / mode tab is a
+                            // meaningful state change; keep the snapshot fresh.
+                            ui.mark_session_dirty();
 
                             if let Some(mode_config) = req.mode_config {
                                 // Mode selected — open a mode tab.
@@ -5201,6 +5253,9 @@ fn dispatch_action(
             ui.rename_text.clear();
             ui.mode = UiMode::Normal;
             commit_rename(&new_name, ui, pane, snapshot, selected_id);
+            // PRD #89 M1.2 — a rename changes the saved display name; keep the
+            // snapshot fresh.
+            ui.mark_session_dirty();
         }
         // rename [Cancel]: abandon, leaving the existing name (== Esc).
         Action::CancelRename => {
@@ -5449,12 +5504,195 @@ fn dispatch_action(
     Flow::Continue
 }
 
+/// PRD #89 M1.2 — flush the saved-session snapshot to disk when the coalescer
+/// says a write is due (a state change is pending and the throttle interval has
+/// elapsed since the last write). Called once per main-loop iteration, so the
+/// snapshot stays continuously fresh on meaningful state changes and detaches
+/// without writing on every keystroke. Mirrors the pre-teardown snapshot block
+/// (build from the live panes, clear when empty), then records the write so the
+/// throttle re-arms.
+fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
+    let now = ui.session_epoch.elapsed();
+    if !ui.session_coalescer.is_due(now) {
+        return;
+    }
+    let live_panes = state.blocking_read().managed_pane_ids.clone();
+    let session =
+        config::SavedSession::snapshot(&mut ui.pane_metadata, &ui.pane_display_names, &live_panes);
+    // PRD #89 review-fix F10: only mark the write as done (clearing the dirty
+    // flag via `record_write`) when the persist actually SUCCEEDED. On a
+    // transient disk error we leave the coalescer dirty so the next loop
+    // iteration retries, rather than dropping the pending snapshot until the
+    // next unrelated state change re-dirties it.
+    let result = if session.panes.is_empty() {
+        config::SavedSession::clear().map_err(|e| format!("Warning: failed to clear session: {e}"))
+    } else {
+        session
+            .save()
+            .map_err(|e| format!("Warning: failed to save session: {e}"))
+    };
+    match result {
+        Ok(()) => {
+            // PRD #89 review-fix G1: a successful write/clear ends any ongoing
+            // failure streak, so re-arm the one-shot warning for the next time
+            // a *new* failure occurs.
+            ui.session_snapshot_write_failed = false;
+            ui.session_coalescer.record_write(now);
+        }
+        Err(warning) => {
+            // PRD #89 review-fix G1: F10 keeps the coalescer dirty so the next
+            // loop retries, but on a PERSISTENT failure (disk full, bad perms)
+            // that retry fires every ~750ms. Push the warning AT MOST ONCE per
+            // ongoing failure streak so `session_warnings` cannot grow unbounded.
+            if !ui.session_snapshot_write_failed {
+                ui.session_warnings.push(warning);
+                ui.session_snapshot_write_failed = true;
+            }
+        }
+    }
+}
+
+/// PRD #89 M2.2 — daemon-vs-snapshot restore precedence seam.
+///
+/// Returns `true` when the on-disk saved-session snapshot should be applied on
+/// startup, `false` when it must be skipped. On every startup the TUI hydrates
+/// from the daemon first; if that produced *any* managed pane (any
+/// `managed_pane_id` registered in `state`), the daemon already owns the live
+/// workspace and wins — restoring the snapshot on top of it would double up the
+/// panes. Only when hydration produced zero panes (a fresh daemon, or crash
+/// recovery into an empty registry) do we fall back to the disk snapshot. When
+/// both sources are empty, the snapshot load is attempted but yields nothing and
+/// the dashboard lands empty.
+///
+/// The decision is purely *structural* — the presence or absence of hydrated
+/// managed panes — never a flag, which keeps it a pure function that can be
+/// unit-tested in isolation (see `session/restore/005`).
+pub fn should_apply_snapshot(state: &AppState) -> bool {
+    state.managed_pane_ids.is_empty()
+}
+
+/// PRD #89 M2b.3 — re-resolve the `OrchestrationConfig` for a snapshot's
+/// orchestration metadata on the daemon-empty restore path.
+///
+/// Returns the resolved config on success, or a human-readable drift reason
+/// (always NAMING the missing/renamed orchestration) when:
+/// - the project config can't be loaded (file gone / unreadable),
+/// - there is no project config at the saved `project_path`,
+/// - the named orchestration was renamed/removed (no match by `config_name`),
+/// - the saved roles no longer match the resolved config's roles (a role was
+///   added/removed/renamed/reordered) — the tab the user saved no longer
+///   exists as saved.
+///
+/// On `Err`, the caller surfaces the reason via `session_warnings` and falls
+/// back to a PLAIN dashboard pane (never a half-broken orchestration tab),
+/// mirroring the mode-tab drift Path D/E fallback (PRD #69).
+///
+/// On `Ok`, returns the resolved config AND the validated start-role index to
+/// honor (the SAVED cursor, bounds-checked — PRD #89 review-fix F2/F3), so the
+/// caller drives prompt delivery from the saved start role rather than
+/// recomputing it from the live config's `start` flags.
+fn resolve_orchestration_for_restore(
+    snap: &config::OrchestrationSnapshot,
+    saved_dir: &str,
+) -> Result<(OrchestrationConfig, usize), String> {
+    // PRD #89 review-fix F1 (security): the snapshot's `project_path` and the
+    // saved pane's `dir` are written EQUAL on capture; a divergence only happens
+    // via a tampered `session.toml`. Re-resolving — and auto-running — the
+    // config at a divergent `project_path` would execute a `.dot-agent-deck.toml`
+    // an attacker controls. Canonicalize both and refuse to re-resolve unless
+    // they name the same directory; a divergence (or a `project_path` that no
+    // longer resolves) is treated as drift -> plain-pane fallback, so the
+    // planted config is never executed.
+    let project_dir = std::path::Path::new(&snap.project_path);
+    let canon_project = project_dir.canonicalize().map_err(|e| {
+        format!(
+            "orchestration '{}' project_path {} could not be resolved: {e}",
+            snap.config_name, snap.project_path
+        )
+    })?;
+    let canon_saved = std::path::Path::new(saved_dir)
+        .canonicalize()
+        .map_err(|e| {
+            format!(
+                "orchestration '{}' saved dir {saved_dir} could not be resolved: {e}",
+                snap.config_name
+            )
+        })?;
+    if canon_project != canon_saved {
+        return Err(format!(
+            "orchestration '{}' project_path {} does not match saved pane dir {saved_dir} — \
+             refusing to re-resolve a divergent config",
+            snap.config_name, snap.project_path
+        ));
+    }
+
+    let cfg = match load_project_config(&canon_project) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => {
+            return Err(format!(
+                "orchestration '{}' not found — no project config in {}",
+                snap.config_name, snap.project_path
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "orchestration '{}' could not be resolved — failed to load project config from {}: {e}",
+                snap.config_name, snap.project_path
+            ));
+        }
+    };
+    let orch = cfg
+        .orchestrations
+        .into_iter()
+        .find(|o| o.name == snap.config_name)
+        .ok_or_else(|| {
+            format!(
+                "orchestration '{}' not found in {} (renamed or removed)",
+                snap.config_name, snap.project_path
+            )
+        })?;
+    // Drift guard: the saved role set must still match the resolved config's
+    // roles (same names, same order). A renamed/removed/reordered/added role
+    // means the saved tab no longer exists as saved — fall back rather than
+    // rebuild a different tab.
+    let current_roles: Vec<&str> = orch.roles.iter().map(|r| r.name.as_str()).collect();
+    let saved_roles: Vec<&str> = snap.roles.iter().map(String::as_str).collect();
+    if current_roles != saved_roles {
+        return Err(format!(
+            "orchestration '{}' role set changed (saved [{}], now [{}])",
+            snap.config_name,
+            saved_roles.join(", "),
+            current_roles.join(", "),
+        ));
+    }
+    // PRD #89 review-fix F2 (robustness): bounds-check the SAVED start cursor
+    // against the re-resolved role set. `load_project_config` runs no
+    // config_validation, so a whittled-down (or explicitly `roles = []`) config
+    // is structurally valid yet role-less, and a tampered cursor could point
+    // past the end. Either would index an empty/short `role_pane_ids` and panic
+    // at startup (crash-loop). Treat an out-of-range cursor — which includes
+    // every index of an empty role set — as drift, so the caller falls back to
+    // a plain pane instead of panicking.
+    if snap.start_role_index >= orch.roles.len() {
+        return Err(format!(
+            "orchestration '{}' has no role at saved start index {} (role count {}) — falling back",
+            snap.config_name,
+            snap.start_role_index,
+            orch.roles.len()
+        ));
+    }
+    // PRD #89 review-fix F3: honor the SAVED start cursor (now validated in
+    // range) instead of recomputing it from the live config's `start` flags, so
+    // a saved cursor that differs from the config default is preserved on
+    // restore.
+    Ok((orch, snap.start_role_index))
+}
+
 pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
     config: DashboardConfig,
     keybindings: KeybindingConfig,
-    continue_session: bool,
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -5487,13 +5725,13 @@ pub fn run_tui(
     }
 
     // PRD #111: preferred landing tab after both the hydration block and the
-    // `--continue` reconnect block have run. Defaults to dashboard (0); the
+    // snapshot-restore block have run. Defaults to dashboard (0); the
     // hydration block overwrites this to the first rebuilt orchestration tab
     // when one exists. Hoisted out of the embedded-pane scope so the
-    // `continue_session` block below can honour it instead of unconditionally
+    // snapshot-restore block below can honour it instead of unconditionally
     // snapping back to the dashboard — without the hoist, the second
-    // `switch_to(0)` in the reconnect path would undo the orchestration
-    // landing on every `--continue` reconnect.
+    // `switch_to(0)` in the restore path would undo the orchestration
+    // landing on every startup.
     let mut preferred_start_tab: usize = 0;
 
     // PRD #76 M2.x / M2.11: in external-daemon mode the daemon may already
@@ -5568,6 +5806,10 @@ pub fn run_tui(
                             .unwrap_or_else(|| h.agent_id.clone()),
                         command: String::new(),
                         mode: mode_hint,
+                        // PRD #89 M2b.2: schema-only; orchestration capture
+                        // from a warm daemon is handled by hydration, not the
+                        // snapshot, so leave None here.
+                        orchestration: None,
                     },
                 );
             }
@@ -5878,8 +6120,8 @@ pub fn run_tui(
         // failed — fall back to the dashboard so the user gets the
         // overview first (pre-PRD-111 behaviour). The chosen index is
         // also recorded in `preferred_start_tab` so the
-        // `continue_session` block below doesn't snap back to the
-        // dashboard on `--continue` reconnects (CodeRabbit PR #114).
+        // snapshot-restore block below doesn't snap back to the
+        // dashboard on startup (CodeRabbit PR #114).
         preferred_start_tab = first_orchestration_tab_index.unwrap_or(0);
         tab_manager.switch_to(preferred_start_tab);
 
@@ -5891,20 +6133,28 @@ pub fn run_tui(
         // is shown at the wrong dims.
     }
 
-    if continue_session {
+    // PRD #89 M2.1/M2.2: restore is now UNCONDITIONAL — there is no `--continue`
+    // gate. Daemon hydration (above) runs first and wins: if it produced any
+    // managed pane, the daemon already owns the workspace and we skip the disk
+    // snapshot to avoid double-restoring. Only when hydration produced zero
+    // panes (fresh daemon / crash recovery) do we load and apply the snapshot.
+    // The precedence decision lives in the pure `should_apply_snapshot` seam so
+    // it stays structural (any hydrated managed_pane_id) rather than flag-driven.
+    let apply_snapshot = should_apply_snapshot(&state.blocking_read());
+    if apply_snapshot {
         // Ensure the terminal has up-to-date dimensions before we resize
         // any PTYs — without this, get_frame().area() may return stale or
         // default values because no draw() call has happened yet.
         let _ = terminal.autoresize();
 
         let saved = config::SavedSession::load();
-        // CodeRabbit round-9 #4 / round-10 #2: dedupe against panes
-        // the daemon already hydrated. See `build_dedupe_budget` and
-        // `try_consume_dedupe_slot` below for the algorithm.
-        let mut remaining_dedupe_budget = build_dedupe_budget(&ui.pane_metadata);
         // Collect deferred mode pane restores — we need the terminal ready
         // before we can resize PTYs, so mode tabs are opened after the loop.
         let mut deferred_mode_panes: Vec<(config::SavedPane, ModeConfig)> = Vec::new();
+        // PRD #89 M2b.3 — the first orchestration tab rebuilt from the snapshot,
+        // so we can land on it (start cursor) after the loop rather than snapping
+        // back to the dashboard — mirroring the hydration block's landing logic.
+        let mut first_restored_orch_tab: Option<usize> = None;
         for saved_pane in &saved.panes {
             let dir = std::path::Path::new(&saved_pane.dir);
             if !dir.is_dir() {
@@ -5914,14 +6164,146 @@ pub fn run_tui(
                 ));
                 continue;
             }
-            if try_consume_dedupe_slot(&mut remaining_dedupe_budget, saved_pane) {
-                tracing::debug!(
-                    dir = %saved_pane.dir,
-                    name = %saved_pane.name,
-                    mode = ?saved_pane.mode,
-                    "restore: skipping saved pane — already hydrated from daemon"
-                );
-                continue;
+            // PRD #89 M2b.3 — orchestration-tab restore on the daemon-empty
+            // path. A saved pane carrying orchestration metadata rebuilds the
+            // WHOLE tab (orchestrator + role panes in saved order, the prompt
+            // replayed to the start role, the start cursor) by re-resolving its
+            // `OrchestrationConfig` from `project_path` + `config_name`. On
+            // success we `continue`; on drift (config gone, orchestration
+            // renamed/removed, role set changed) we push a clear warning NAMING
+            // the orchestration and fall through to the plain-pane restore below
+            // — never a half-broken tab (mirrors the mode-tab Path D/E fallback,
+            // PRD #69). Unlike warm-daemon hydration (session/restore/007), this
+            // path REPLAYS the saved `orchestrator_prompt` to the start role —
+            // there is no live agent with the prompt already in scrollback.
+            if let Some(ref orch_snap) = saved_pane.orchestration {
+                match resolve_orchestration_for_restore(orch_snap, &saved_pane.dir) {
+                    Ok((orch_config, saved_start_idx)) => {
+                        let frame_area = terminal.get_frame().area();
+                        // All roles share spawn dims (Tiled); role_index=0 so the
+                        // helper falls back to "role 0 expanded" — the per-frame
+                        // `resize_panes_to_layout` reconciles the exact rects once
+                        // the tab is active. Mirrors the live new-pane path.
+                        let spawn_dims = orchestration_role_pane_dims(
+                            frame_area,
+                            orch_config.roles.len(),
+                            0,
+                            PaneLayout::Tiled,
+                            true,
+                        );
+                        // Empty saved prompt → `None` so the delivery gate
+                        // writes nothing (matching the live path's "no prompt"
+                        // semantics); a non-empty prompt is replayed to the
+                        // start role once it signals readiness.
+                        let replay_prompt = (!orch_snap.orchestrator_prompt.is_empty())
+                            .then(|| orch_snap.orchestrator_prompt.clone());
+                        match tab_manager.open_orchestration_tab(
+                            &orch_config,
+                            &saved_pane.dir,
+                            replay_prompt,
+                            // PRD #89 review-fix F4: thread the saved user title
+                            // so the rebuilt tab comes back under the user's name
+                            // rather than the canonical config/cwd name. `None`
+                            // when unset falls back to the canonical name.
+                            orch_snap.display_title.as_deref(),
+                            spawn_dims,
+                        ) {
+                            Ok((tab_idx, role_pane_ids)) => {
+                                // PRD #89 review-fix F3: honor the SAVED start
+                                // cursor. `open_orchestration_tab` computed
+                                // `start_role_index` from the config's `start`
+                                // flags; override it with the validated saved
+                                // index so the prompt-delivery gate (and the
+                                // landing focus) target the role the user left
+                                // as start, even when it differs from the config
+                                // default. The just-opened tab is the active tab.
+                                if let Tab::Orchestration {
+                                    start_role_index, ..
+                                } = tab_manager.active_tab_mut()
+                                {
+                                    *start_role_index = saved_start_idx;
+                                }
+                                // Snapshot each role pane's daemon agent_id before
+                                // the placeholder insert so the strict-equality
+                                // reuse guard accepts each role agent's first
+                                // `SessionStart` (mirrors the live path).
+                                let role_agent_ids: Vec<Option<String>> = role_pane_ids
+                                    .iter()
+                                    .map(|id| pane.pane_agent_id(id))
+                                    .collect();
+                                {
+                                    let mut st = state.blocking_write();
+                                    for (id, agent_id) in
+                                        role_pane_ids.iter().zip(role_agent_ids.iter())
+                                    {
+                                        st.register_pane(id.clone());
+                                        st.insert_placeholder_session(
+                                            id.clone(),
+                                            Some(saved_pane.dir.clone()),
+                                            None,
+                                            agent_id.clone(),
+                                        );
+                                    }
+                                    for (i, role) in orch_config.roles.iter().enumerate() {
+                                        st.pane_role_map
+                                            .insert(role_pane_ids[i].clone(), role.name.clone());
+                                        st.pane_cwd_map.insert(
+                                            role_pane_ids[i].clone(),
+                                            saved_pane.dir.clone(),
+                                        );
+                                        if role.start {
+                                            st.orchestrator_pane_ids
+                                                .insert(role_pane_ids[i].clone());
+                                        }
+                                    }
+                                }
+                                for (i, role) in orch_config.roles.iter().enumerate() {
+                                    ui.pane_display_names
+                                        .insert(role_pane_ids[i].clone(), role.name.clone());
+                                    ui.pane_names
+                                        .insert(role_pane_ids[i].clone(), role.name.clone());
+                                }
+                                // Re-capture the orchestration metadata onto the
+                                // start role pane so a later snapshot keeps the
+                                // tab (only the start role carries the block).
+                                // PRD #89 review-fix F3: key it under the SAVED
+                                // (validated) start cursor — consistent with the
+                                // honored start role above — not the config
+                                // default, so a re-save preserves the saved
+                                // cursor on the same pane that carries the block.
+                                ui.pane_metadata.insert(
+                                    role_pane_ids[saved_start_idx].clone(),
+                                    saved_pane.clone(),
+                                );
+                                // Record creation time so the prompt-delivery
+                                // gate's 10s timeout fallback works for agents
+                                // that never signal `SessionStart`.
+                                if let Tab::Orchestration { id, .. } = tab_manager.active_tab() {
+                                    ui.orchestration_created_at
+                                        .insert(*id, std::time::Instant::now());
+                                }
+                                if first_restored_orch_tab.is_none() {
+                                    first_restored_orch_tab = Some(tab_idx);
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                ui.session_warnings.push(format!(
+                                    "Warning: failed to rebuild orchestration '{}': {e}; restoring '{}' as a plain pane",
+                                    orch_snap.config_name, saved_pane.name
+                                ));
+                                // Fall through to the plain-pane restore below.
+                            }
+                        }
+                    }
+                    Err(reason) => {
+                        ui.session_warnings.push(format!(
+                            "Warning: {reason}; restoring '{}' as a plain pane",
+                            saved_pane.name
+                        ));
+                        // Fall through to the plain-pane restore below.
+                    }
+                }
             }
             // If the pane belonged to a mode tab, defer it so we can open a
             // full mode tab (with side panes) instead of a plain dashboard pane.
@@ -6243,13 +6625,16 @@ pub fn run_tui(
         }
         // PRD #111 / CodeRabbit PR #114: land on the orchestration tab
         // chosen by the hydration block above (if any) instead of always
-        // snapping back to the dashboard. Without the hoist, an
-        // unconditional `switch_to(0)` here would undo the M3 fix for
-        // users who reconnect with `--continue`. `preferred_start_tab`
-        // defaults to 0 (dashboard) when the hydration block didn't run
-        // or didn't rebuild any orchestration tab, preserving the prior
-        // overview-first behaviour for non-orchestration sessions.
-        tab_manager.switch_to(preferred_start_tab);
+        // snapping back to the dashboard. `preferred_start_tab` defaults to
+        // 0 (dashboard) — and stays there in this snapshot-restore branch,
+        // which only runs when hydration produced no panes — preserving the
+        // overview-first landing for snapshot-restored sessions.
+        //
+        // PRD #89 M2b.3: when the snapshot rebuilt an orchestration tab, land
+        // on the first one (start cursor) so its role cards render — the
+        // daemon-empty analogue of the hydration landing above.
+        let landing_tab = first_restored_orch_tab.unwrap_or(preferred_start_tab);
+        tab_manager.switch_to(landing_tab);
 
         // Focus the first restored pane and enter PaneInput mode so the user
         // can type immediately. PRD #84 M4: PTY sizing is handled by the
@@ -6272,6 +6657,13 @@ pub fn run_tui(
         {
             ui.status_message = None;
         }
+
+        // PRD #89 M1.2/M1.3 — keep the saved-session snapshot continuously
+        // fresh: if a meaningful state change / detach marked it dirty and the
+        // coalescer's throttle window has elapsed, flush it to disk now. This
+        // runs every iteration (including the 16ms idle ticks below), so the
+        // trailing write of a coalesced burst lands without further input.
+        flush_session_snapshot_if_due(&mut ui, &state);
 
         let snapshot = state.blocking_read().clone();
 
@@ -6319,6 +6711,14 @@ pub fn run_tui(
             && let Some(new_id) = tab_manager.remap_focus_after_reactive_change(&pane_changes)
         {
             let _ = pane.focus_pane(&new_id);
+        }
+        // PRD #89 M1.2 — `route_reactive_commands` recreates Mode-tab reactive
+        // SIDE panes, swapping their live pane ids (`pane_changes`); keep the
+        // snapshot fresh so the new ids are reflected. NOTE: this covers only
+        // reactive side-pane swaps — it does NOT broadly cover an agent /clear
+        // restart, whose dirtying flows through other reactive seams.
+        if !pane_changes.is_empty() {
+            ui.mark_session_dirty();
         }
 
         // Pick up version-check result once
@@ -7624,7 +8024,7 @@ pub fn run_tui(
         } // end inner event-drain loop
     }
 
-    // Snapshot the session for --continue restore *before* tearing down mode
+    // Snapshot the session for auto-restore *before* tearing down mode
     // tabs. The teardown loop unregisters every mode-tab pane id from
     // `state.managed_pane_ids`; if the snapshot ran after teardown, the
     // `retain` step would drop the mode-tab agent pane (which carries
@@ -9914,8 +10314,8 @@ fn render_help_overlay(
         Line::from(""),
         Line::styled("  Session", cyan),
         Line::from(""),
-        Line::from("  Panes auto-saved on exit."),
-        Line::from("  Restore: dot-agent-deck --continue"),
+        Line::from("  Panes auto-saved continuously."),
+        Line::from("  Restored automatically on launch."),
     ];
 
     if let Some(name) = active_mode_name {
@@ -12209,97 +12609,6 @@ mod tests {
         assert_eq!(p.dashboard_pane_ids, vec!["1".to_string(), "2".to_string()]);
         assert!(p.mode_buckets.is_empty());
         assert!(p.orchestration_buckets.is_empty());
-    }
-
-    /// Round-10 reviewer #2: two saved panes that share
-    /// `(dir, name, mode)` must NOT both be dropped when only one was
-    /// hydrated. The pre-round-10 `HashSet` dedupe collapsed both;
-    /// the count-based budget drops at most one per match.
-    #[test]
-    fn dedupe_drops_only_count_matched_saved_panes() {
-        use config::SavedPane;
-        let mut metadata: HashMap<String, SavedPane> = HashMap::new();
-        // One hydrated dashboard pane with (dir=/w, name=foo, mode=None).
-        metadata.insert(
-            "pane-1".into(),
-            SavedPane {
-                dir: "/w".into(),
-                name: "foo".into(),
-                command: String::new(),
-                mode: None,
-            },
-        );
-        let mut budget = build_dedupe_budget(&metadata);
-
-        let saved_a = SavedPane {
-            dir: "/w".into(),
-            name: "foo".into(),
-            command: "vim".into(),
-            mode: None,
-        };
-        let saved_b = SavedPane {
-            dir: "/w".into(),
-            name: "foo".into(),
-            command: "tail -f log".into(),
-            mode: None,
-        };
-
-        // First saved pane matches the hydrated → consumed.
-        assert!(try_consume_dedupe_slot(&mut budget, &saved_a));
-        // Second saved pane shares the key but the budget is exhausted → restored.
-        assert!(!try_consume_dedupe_slot(&mut budget, &saved_b));
-    }
-
-    #[test]
-    fn dedupe_distinguishes_mode_panes_from_dashboard() {
-        use config::SavedPane;
-        let mut metadata: HashMap<String, SavedPane> = HashMap::new();
-        metadata.insert(
-            "pane-1".into(),
-            SavedPane {
-                dir: "/w".into(),
-                name: "foo".into(),
-                command: String::new(),
-                mode: Some("k8s-ops".into()),
-            },
-        );
-        let mut budget = build_dedupe_budget(&metadata);
-
-        // Same (dir, name) but different mode — must NOT dedupe.
-        let saved_dashboard = SavedPane {
-            dir: "/w".into(),
-            name: "foo".into(),
-            command: "vim".into(),
-            mode: None,
-        };
-        assert!(!try_consume_dedupe_slot(&mut budget, &saved_dashboard));
-
-        // Matching mode → DEDUPED.
-        let saved_mode = SavedPane {
-            dir: "/w".into(),
-            name: "foo".into(),
-            command: String::new(),
-            mode: Some("k8s-ops".into()),
-        };
-        assert!(try_consume_dedupe_slot(&mut budget, &saved_mode));
-    }
-
-    #[test]
-    fn dedupe_restores_saved_panes_when_daemon_empty() {
-        use config::SavedPane;
-        // No hydrated metadata (daemon restarted, hydration returned
-        // empty). The saved-session file is the only source of truth;
-        // every saved pane must restore.
-        let metadata: HashMap<String, SavedPane> = HashMap::new();
-        let mut budget = build_dedupe_budget(&metadata);
-
-        let saved = SavedPane {
-            dir: "/w".into(),
-            name: "foo".into(),
-            command: "vim".into(),
-            mode: None,
-        };
-        assert!(!try_consume_dedupe_slot(&mut budget, &saved));
     }
 
     #[test]

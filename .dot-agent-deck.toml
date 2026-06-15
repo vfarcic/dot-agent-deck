@@ -1,3 +1,53 @@
+# =============================================================================
+# MANUAL TEST GUIDE — PRD #89: Auto-restore TUI state on attach; remove
+# `--continue` (PR #169). How to verify the shipped behavior by hand.
+#
+# Build first: `cargo build` (then use `./target/debug/dot-agent-deck`), or run
+# however you normally launch it. Use an ISOLATED snapshot so you don't touch
+# your real session:  export DOT_AGENT_DECK_SESSION=/tmp/dad89/session.toml
+#
+# Key distinction: a clean detach + relaunch restores via WARM DAEMON HYDRATION
+# (the daemon still holds the agents). The snapshot-specific paths below only
+# kick in on the COLD path — when the daemon is empty (fresh machine / crash) —
+# so for those, STOP THE DAEMON (not just the TUI) before relaunching.
+#
+# UI keys: New pane Ctrl+N · Close/detach pane Ctrl+W / Ctrl+D · Quit Ctrl+C · Help ?
+# -----------------------------------------------------------------------------
+# 1) AUTO-RESTORE IS THE DEFAULT (no flag)
+#    - dot-agent-deck                 -> empty dashboard on a fresh snapshot path
+#    - Ctrl+N -> pick a dir -> create 2 panes; rename one
+#    - Quit (Ctrl+C) or detach, then:  dot-agent-deck   (NO flag)
+#    - EXPECT: the panes you created are back.
+#
+# 2) `--continue` IS REMOVED
+#    - dot-agent-deck --continue      -> exits non-zero with a friendly message
+#      ("the --continue flag has been removed. Auto-restore is now the default ...")
+#    - dot-agent-deck --help          -> `--continue` is no longer listed.
+#
+# 3) SNAPSHOT STAYS FRESH (crash recovery, not just clean quit) — COLD path
+#    - dot-agent-deck ; create a pane (do NOT quit)
+#    - STOP THE DAEMON hard (so it has no agents to hydrate)
+#    - dot-agent-deck                 -> EXPECT: the pane is still restored
+#      (the snapshot was written on the state change, not only at clean quit).
+#
+# 4) ORCHESTRATION-TAB RESTORE
+#    - dot-agent-deck ; open the `dot-agent-deck` orchestration via the new-pane
+#      form (Ctrl+N -> cycle Mode to "Orch: dot-agent-deck" -> submit); give it a
+#      prompt
+#    - WARM: detach + relaunch          -> tab rebuilt via daemon hydration
+#    - COLD: stop the daemon + relaunch -> tab rebuilt from the snapshot:
+#      orchestrator + role panes in order, the prompt replayed, start-role cursor
+#    - DRIFT: rename the `dot-agent-deck` orchestration in THIS file, stop the
+#      daemon, relaunch -> a clear warning shows and the tab falls back to a
+#      PLAIN dashboard pane (never a half-broken tab).
+#
+# 5) FRESH-START ESCAPE HATCH
+#    - dot-agent-deck snapshot clear        -> deletes the local snapshot; the
+#      next launch is empty
+#    - dot-agent-deck remote remove <name>  -> registry-only: does NOT clear the
+#      snapshot (your panes still restore on next launch)
+# =============================================================================
+
 [[modes]]
 name = "dev"
 init_command = "devbox shell"

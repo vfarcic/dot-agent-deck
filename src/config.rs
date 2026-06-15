@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -322,6 +323,81 @@ pub struct SavedPane {
     /// The value is the mode name from the project config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// When set, this pane was the orchestrator pane of an orchestration
+    /// tab; the snapshot carries enough metadata to rebuild the whole tab
+    /// (orchestrator + role panes, prompt, role order, start cursor) on the
+    /// daemon-empty restore path. `Option` + `#[serde(default)]` so older
+    /// `session.toml` files (no `orchestration` key) still parse with
+    /// `orchestration == None`. See [`OrchestrationSnapshot`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<OrchestrationSnapshot>,
+}
+
+/// PRD #89 M2b.2 — orchestration metadata captured on a saved pane so the
+/// daemon-empty restore path (fresh machine / crash recovery, when there is
+/// no warm daemon to hydrate from) can rebuild the orchestration tab. Schema
+/// ported from the closed PRD #74 design.
+///
+/// Carried as `SavedPane::orchestration: Option<OrchestrationSnapshot>` with
+/// `#[serde(default)]`, so a `session.toml` written before this field existed
+/// (no `[panes.orchestration]` table) still parses, yielding
+/// `orchestration == None`. A `version` field is present from day one so a
+/// future schema change can be migrated rather than silently dropped. No
+/// `#[serde(deny_unknown_fields)]` — forward-compat with snapshots a newer
+/// binary may write with extra keys.
+///
+/// This struct ONLY captures the metadata + its (de)serialization; the
+/// restore branch that rebuilds the tab from it is M2b.3 (a separate step).
+///
+/// PRD #89 review-fix F12: every sub-field carries `#[serde(default)]` so a
+/// MALFORMED partial `[panes.orchestration]` block degrades to a defaulted
+/// snapshot (which the restore path then drift-checks and falls back from)
+/// rather than failing the WHOLE-file TOML parse and dropping ALL panes. A
+/// zero-default `version`/empty `roles` is harmless — the restore path treats a
+/// role-less / out-of-range snapshot as drift (F2) and restores a plain pane.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrchestrationSnapshot {
+    /// Schema version, for future migration. `1` is the initial format.
+    #[serde(default)]
+    pub version: u32,
+    /// Role names in DISPLAY order — the same order as the tab's
+    /// `role_pane_ids`, so the restore branch can recreate the role panes
+    /// in the order the user saw them.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// Index into `roles` of the start (orchestrator) role — restores the
+    /// "next role to start" cursor.
+    #[serde(default)]
+    pub start_role_index: usize,
+    /// Pre-built prompt injected into the start (orchestrator) role on
+    /// restore. Empty string when the orchestration had no prompt.
+    #[serde(default)]
+    pub orchestrator_prompt: String,
+    /// Resolved orchestration config NAME — half of the reference used to
+    /// re-resolve the `OrchestrationConfig` from disk on restore.
+    #[serde(default)]
+    pub config_name: String,
+    /// Project PATH the orchestration was resolved from (the directory that
+    /// holds `.dot-agent-deck.toml`) — the other half of the re-resolution
+    /// reference.
+    #[serde(default)]
+    pub project_path: String,
+    /// Which roles had been started, by index into `roles`. Optional —
+    /// snapshots that predate this field load with an empty list.
+    ///
+    /// PRD #89 review-fix F3: FORWARD-COMPAT ONLY — captured (as
+    /// `vec![start_role_index]`) but not yet consumed on restore. Kept so a
+    /// later "restore which roles were started" feature has the data already
+    /// in old snapshots; do not assume a reader exists today.
+    #[serde(default)]
+    pub started_role_indices: Vec<usize>,
+    /// PRD #89 review-fix F4: the user-typed orchestration tab TITLE
+    /// (`Tab::Orchestration.name`), captured so the daemon-empty restore path
+    /// rebuilds the tab under the user's title rather than the canonical
+    /// config/cwd name. `None` when the user didn't name the orchestration
+    /// (the title then falls back to the resolved canonical name on restore).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -350,15 +426,62 @@ impl SavedSession {
     }
 
     pub fn save(&self) -> Result<(), String> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
         let path = session_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create session directory: {e}"))?;
-        }
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create session directory: {e}"))?;
+
         let contents = toml::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize session: {e}"))?;
-        std::fs::write(&path, contents)
-            .map_err(|e| format!("Failed to write session at {}: {e}", path.display()))
+
+        // PRD #89 review-fix F6/F7: write owner-only (0o600) AND atomically. The
+        // snapshot now carries command lines, project paths, and prompts and is
+        // written continuously, so (a) it must not be world-readable regardless
+        // of the user's umask, and (b) a crash mid-write must never leave a
+        // half-written `session.toml` for the next launch to choke on. Mirror
+        // remote.rs: write a sibling temp file opened with mode 0o600, then
+        // `rename(2)` it into place (atomic on a POSIX same-filesystem rename).
+        // The pid suffix avoids collisions between concurrently-saving decks.
+        let file_name = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "session.toml".to_string());
+        let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
+
+        let mut tmp_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to open temp session at {}: {e}", tmp_path.display()))?;
+
+        if let Err(e) = tmp_file.write_all(contents.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "Failed to write temp session at {}: {e}",
+                tmp_path.display()
+            ));
+        }
+        // Defense in depth: a stale temp file from a crashed previous save would
+        // keep its old mode (OpenOptions::mode only applies on create), so
+        // re-assert 0o600 explicitly before the rename.
+        if let Err(e) = tmp_file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "Failed to set permissions on temp session at {}: {e}",
+                tmp_path.display()
+            ));
+        }
+        drop(tmp_file);
+
+        std::fs::rename(&tmp_path, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("Failed to write session at {}: {e}", path.display())
+        })
     }
 
     pub fn clear() -> Result<(), std::io::Error> {
@@ -377,7 +500,7 @@ impl SavedSession {
     /// every pane, including mode-tab agent panes that carry `mode = Some(...)`.
     /// `retain` here only prunes panes the user externally closed before exit;
     /// running it after teardown would also drop the mode-tab agent pane and lose
-    /// the mode field, breaking `--continue` restoration (PRD #69).
+    /// the mode field, breaking auto-restore of the mode tab (PRD #69).
     pub fn snapshot(
         pane_metadata: &mut HashMap<String, SavedPane>,
         pane_display_names: &HashMap<String, String>,
@@ -397,6 +520,67 @@ impl SavedSession {
                 .filter_map(|id| pane_metadata.get(id).cloned())
                 .collect(),
         }
+    }
+}
+
+/// PRD #89 M1.2 — leading-edge throttle that coalesces saved-session snapshot
+/// writes so a burst of meaningful state changes (e.g. orchestration setup
+/// spawning many panes) produces one or two disk writes, not one per change.
+///
+/// Behaviour: the first pending change writes immediately (leading edge), then
+/// writes are throttled to at most one per `interval`; a single trailing write
+/// flushes whatever accumulated while the throttle was closed. So a tight burst
+/// collapses to ≤2 writes (one leading + one trailing), and sustained activity
+/// is bounded to ~one write per `interval` regardless of how many changes occur.
+///
+/// Pure data + logic: the caller supplies the clock as a monotonic [`Duration`]
+/// from an arbitrary epoch (in production, `epoch.elapsed()`; in tests, any
+/// value), so it is fully unit-testable without wall-clock sleeps.
+#[derive(Debug, Clone)]
+pub struct SnapshotCoalescer {
+    /// Minimum spacing between disk writes.
+    interval: Duration,
+    /// A change is pending (recorded but not yet flushed to disk).
+    dirty: bool,
+    /// Clock value of the last write; `None` until the first write happens.
+    last_write: Option<Duration>,
+}
+
+impl SnapshotCoalescer {
+    /// Create a coalescer that allows at most one write per `interval`.
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            dirty: false,
+            last_write: None,
+        }
+    }
+
+    /// Record that a meaningful state change occurred. Does not write — the
+    /// actual coalesced write happens when the caller next sees [`Self::is_due`]
+    /// return `true`.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Whether a write is due at `now`: a change is pending AND either nothing
+    /// has been written yet (leading edge) or at least `interval` has elapsed
+    /// since the last write (trailing edge / throttle release).
+    pub fn is_due(&self, now: Duration) -> bool {
+        if !self.dirty {
+            return false;
+        }
+        match self.last_write {
+            None => true,
+            Some(last) => now.saturating_sub(last) >= self.interval,
+        }
+    }
+
+    /// Mark a write as completed at `now`, clearing the pending flag and arming
+    /// the throttle so the next write waits a full `interval`.
+    pub fn record_write(&mut self, now: Duration) {
+        self.dirty = false;
+        self.last_write = Some(now);
     }
 }
 
@@ -1030,6 +1214,61 @@ pub fn load_features_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
+
+    /// Scenario: Drive a `SnapshotCoalescer` (interval 500ms) synchronously with
+    /// a 50-change burst all observed at the same instant — after each
+    /// `mark_dirty` the simulated event loop checks `is_due(now)` and writes if
+    /// due — then perform one trailing check after the interval has elapsed.
+    /// The leading-edge write fires on the first change; the remaining 49 are
+    /// throttled; the trailing check flushes the accumulated burst — so the
+    /// burst collapses to at most two writes (here exactly two), never the 50 a
+    /// naive write-per-change would produce.
+    #[spec("session/save/003")]
+    #[test]
+    fn save_003_coalesces_burst_to_at_most_two_writes() {
+        let interval = Duration::from_millis(500);
+        let mut coalescer = SnapshotCoalescer::new(interval);
+        let mut writes = 0usize;
+
+        // A tight burst: 50 rapid changes, all at the same instant (now = 0),
+        // each followed by the event loop's `is_due` check — exactly how the
+        // main loop drives it. Only the leading-edge write should fire here.
+        let now = Duration::ZERO;
+        for _ in 0..50 {
+            coalescer.mark_dirty();
+            if coalescer.is_due(now) {
+                writes += 1;
+                coalescer.record_write(now);
+            }
+        }
+
+        // The loop keeps ticking; once `interval` has elapsed with a change
+        // still pending, the single trailing write flushes the coalesced burst.
+        let after = interval;
+        if coalescer.is_due(after) {
+            writes += 1;
+            coalescer.record_write(after);
+        }
+
+        // PRD #89 review-fix G2: assert the EXACT write count, not `<= 2` / `>= 1`.
+        // For this scenario the count is fully determined — one leading-edge write
+        // on the first change plus one trailing write after the interval elapses =
+        // 2 — so any off-by-one in the coalescer (an extra leading write, a missed
+        // trailing flush) flips this count and fails the test.
+        assert_eq!(
+            writes, 2,
+            "a 50-change burst must coalesce to exactly two writes \
+             (leading edge + one trailing flush), got {writes}"
+        );
+
+        // After the trailing flush nothing is pending, so no further write is
+        // due no matter how far the clock advances.
+        assert!(
+            !coalescer.is_due(after + interval + interval),
+            "no write is due once the burst has been flushed and nothing new is dirty"
+        );
+    }
 
     #[test]
     fn bell_config_defaults() {
@@ -1097,12 +1336,14 @@ on_idle = true
                     name: "api".to_string(),
                     command: "claude".to_string(),
                     mode: None,
+                    orchestration: None,
                 },
                 SavedPane {
                     dir: "/repo/ui".to_string(),
                     name: "ui".to_string(),
                     command: "".to_string(),
                     mode: None,
+                    orchestration: None,
                 },
             ],
         };
@@ -1113,6 +1354,81 @@ on_idle = true
         assert_eq!(loaded.panes[0].name, "api");
         assert_eq!(loaded.panes[0].command, "claude");
         assert_eq!(loaded.panes[1].command, "");
+    }
+
+    /// Scenario: Build a `SavedSession` whose single pane carries an
+    /// `OrchestrationSnapshot` (3 roles in display order, a start-role cursor,
+    /// an orchestrator prompt, the resolved config name + project path, and a
+    /// started-roles list), serialize it to TOML and deserialize it back —
+    /// asserting every orchestration field round-trips intact. Then deserialize
+    /// a legacy `session.toml` string that has NO `orchestration` key and
+    /// assert the pane still parses with `orchestration == None`, proving the
+    /// `#[serde(default)]` forward-compat guarantee for old snapshots.
+    #[spec("config/saved-session/001")]
+    #[test]
+    fn saved_session_001_orchestration_serde_round_trip_and_legacy_parse() {
+        // (a) Round-trip a pane carrying an OrchestrationSnapshot.
+        let session = SavedSession {
+            panes: vec![SavedPane {
+                dir: "/repo/app".to_string(),
+                name: "orchestrator".to_string(),
+                command: "claude".to_string(),
+                mode: None,
+                orchestration: Some(OrchestrationSnapshot {
+                    version: 1,
+                    roles: vec![
+                        "orchestrator".to_string(),
+                        "coder".to_string(),
+                        "reviewer".to_string(),
+                    ],
+                    start_role_index: 0,
+                    orchestrator_prompt: "Build the feature end to end".to_string(),
+                    config_name: "tdd-cycle".to_string(),
+                    project_path: "/repo/app".to_string(),
+                    started_role_indices: vec![0, 1],
+                    display_title: Some("My TDD Run".to_string()),
+                }),
+            }],
+        };
+
+        let toml_str = toml::to_string_pretty(&session).unwrap();
+        let loaded: SavedSession = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(loaded.panes.len(), 1);
+        let pane = &loaded.panes[0];
+        assert_eq!(pane.dir, "/repo/app");
+        assert_eq!(pane.name, "orchestrator");
+        assert_eq!(pane.command, "claude");
+        assert_eq!(pane.mode, None);
+
+        let orch = pane
+            .orchestration
+            .as_ref()
+            .expect("orchestration must round-trip as Some");
+        assert_eq!(orch.version, 1);
+        assert_eq!(orch.roles, vec!["orchestrator", "coder", "reviewer"]);
+        assert_eq!(orch.start_role_index, 0);
+        assert_eq!(orch.orchestrator_prompt, "Build the feature end to end");
+        assert_eq!(orch.config_name, "tdd-cycle");
+        assert_eq!(orch.project_path, "/repo/app");
+        assert_eq!(orch.started_role_indices, vec![0, 1]);
+        assert_eq!(orch.display_title.as_deref(), Some("My TDD Run"));
+
+        // (b) A legacy session.toml predating the orchestration field still
+        // parses, with orchestration == None (the #[serde(default)] guarantee).
+        let legacy = r#"
+[[panes]]
+dir = "/repo/legacy"
+name = "old-pane"
+command = "vim"
+"#;
+        let legacy_loaded: SavedSession = toml::from_str(legacy).unwrap();
+        assert_eq!(legacy_loaded.panes.len(), 1);
+        assert_eq!(legacy_loaded.panes[0].dir, "/repo/legacy");
+        assert!(
+            legacy_loaded.panes[0].orchestration.is_none(),
+            "a legacy snapshot with no orchestration key must parse with orchestration == None"
+        );
     }
 
     #[test]
@@ -1148,6 +1464,7 @@ on_idle = true
                 name: "test".to_string(),
                 command: "echo hi".to_string(),
                 mode: None,
+                orchestration: None,
             }],
         };
         session.save().unwrap();

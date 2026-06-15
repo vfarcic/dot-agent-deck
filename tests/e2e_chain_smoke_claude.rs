@@ -27,10 +27,13 @@ const PINNED_MODEL: &str = "claude-haiku-4-5-20251001";
 /// `claude -p "…use the Bash tool to run pwd…" --model
 /// claude-haiku-4-5-20251001 --allowedTools Bash`, then launch the
 /// deck with `--continue` so the agent process auto-starts. As the
-/// real Claude run unfolds, the deck's hook plugin posts events
-/// that drive the card through Thinking → Working → Idle, with the
-/// `Bash` tool name visible on the card during Working. Runs against
-/// the real Anthropic API; cost is bounded at one Haiku invocation.
+/// real Claude run unfolds, the deck's hook plugin posts events that
+/// drive the card through Thinking → Working (with the `Bash` tool
+/// name visible) and on to a terminal state — either a rendered
+/// `Idle` or, because the one-shot print-mode agent exits the instant
+/// it finishes, the stable "Launch an agent" placeholder the pane
+/// falls back to once the process is gone. Runs against the real
+/// Anthropic API; cost is bounded at one Haiku invocation.
 #[spec("chain-smoke/claude/001")]
 #[test]
 fn claude_001_thinking_working_idle() {
@@ -65,18 +68,30 @@ fn claude_001_thinking_working_idle() {
     // anchor and uses no LLM tokens.
     deck.wait_for_string("claude-smoke");
 
-    // Catalog assertion: status traverses Thinking → Working → Idle,
-    // and the Bash tool name appears on the card during Working.
+    // Catalog assertion: status traverses Thinking → Working (with the
+    // Bash tool name on the card) → a terminal state.
     //
-    // M4.6 P1: `wait_for_strings_in_order` walks the rolling byte
-    // history rather than the live vt100 grid, so two consecutive
-    // status transitions rendered in the same polling window (a
-    // realistic outcome on a fast Haiku response — Thinking →
-    // Working can both land in the same ~20 ms window) both stay
-    // matchable. The previous shape — four sequential
+    // M4.6 P1: the wait walks the rolling byte history rather than the
+    // live vt100 grid, so two consecutive status transitions rendered
+    // in the same polling window (a realistic outcome on a fast Haiku
+    // response — Thinking → Working can both land in the same ~20 ms
+    // window) both stay matchable. The previous shape — four sequential
     // `wait_for_string` calls against the current grid — could spin
     // past `Thinking` if `Working` had already overwritten the card
     // before the first poll, and would then timeout (Decision 9:
     // flake = bug).
-    deck.wait_for_strings_in_order(&["Thinking", "Working", "Bash", "Idle"]);
+    //
+    // prd-77 flake hardening: the strict prefix Thinking → Working →
+    // Bash still proves the live lifecycle ran, but the terminal needle
+    // is print-mode tolerant. A `claude -p` agent COMPLETES AND EXITS
+    // the instant it finishes responding, so the pane can jump from
+    // Bash straight to the stable "No agent" / "Launch an agent to get
+    // started" placeholder before a rendered `Idle` frame survives a
+    // ~20 ms poll. Either a captured `Idle` OR that clean-exit
+    // placeholder (observed AFTER the working lifecycle) satisfies the
+    // terminal condition — both mean the agent ran to completion.
+    deck.wait_for_strings_in_order_then_any(
+        &["Thinking", "Working", "Bash"],
+        &["Idle", "Launch an agent to get started"],
+    );
 }

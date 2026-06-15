@@ -1317,11 +1317,11 @@ without depending on the config struct API.
 
 #### session/restore
 
-##### session/restore/001 — `dot-agent-deck --continue` rehydrates dashboard panes from the saved session.
-- **Layer:** L2.
-- **Agent:** none (a saved `session.toml` with three panes; fixture redirects `DOT_AGENT_DECK_SESSION`).
-- **Asserts:** three cards appear; their display names match the saved session.
-- **Does not assert:** the agents' inner state (not preserved per docs).
+##### session/restore/001 — No-flag startup auto-restores dashboard panes from the saved session (PRD #89 Phase 2).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path).
+- **Agent:** none (a saved `session.toml` with two panes running `sleep 600`; daemon is freshly spawned and empty).
+- **Asserts:** launching with NO `--continue` flag against an empty daemon restores both saved panes as dashboard cards, with their saved display names. (Restore is unconditional now — the old `--continue` gate is gone.)
+- **Does not assert:** the agents' inner state (not preserved per docs); the daemon-vs-snapshot precedence (deferred to Phase 2 M2.2).
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/002 — A saved mode tab is restored as a full mode tab when the project's `.dot-agent-deck.toml` still has the mode.
@@ -1343,6 +1343,147 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** N-1 cards restore; stderr names the missing directory.
 - **Does not assert:** which other panes survive (deterministic from the file order).
+- **Platform coverage:** mac+linux.
+
+##### session/restore/005 — Daemon-with-agents wins over the disk snapshot; snapshot restore is skipped (PRD #89 Phase 2 M2.2).
+- **Layer:** pure-data (in-crate integration test on `ui::should_apply_snapshot` over `AppState.managed_pane_ids`; no TUI harness, runs in the fast tier).
+- **Agent:** none.
+- **Asserts:** with no hydrated managed panes `should_apply_snapshot` returns `true` (daemon empty → apply the disk snapshot); after one or more hydrated `managed_pane_id`s are registered it returns `false` (daemon owns the workspace → skip the snapshot so panes are not double-restored). Pins the M2.2 precedence as a structural decision, not a flag.
+- **Does not assert:** the end-to-end cross-deck PTY hydration path (would need a daemon pre-seeded with an agent that a fresh deck hydrates — a harness primitive not yet built); the snapshot-apply mechanics themselves (covered by `session/restore/001`).
+- **Platform coverage:** mac+linux+windows.
+
+##### session/restore/006 — Empty daemon + no snapshot + no flag lands on a clean empty dashboard (PRD #89 Phase 2).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path with no file staged).
+- **Agent:** none.
+- **Asserts:** with both restore sources empty (fresh empty daemon, no snapshot on disk) and no `--continue`, the deck lands on the "No active sessions" dashboard with no restore warning and remains interactive (Ctrl+N opens the new-pane directory picker). Locks the post-Phase-2 invariant that unconditional restore still falls through cleanly when there is nothing to restore.
+- **Does not assert:** the daemon-with-agents-wins precedence (deferred to Phase 2 M2.2); the snapshot-restore path (covered by `session/restore/001`).
+- **Platform coverage:** mac+linux.
+
+##### session/restore/007 — A warm daemon carrying an orchestration hydrates the orchestrator + role panes in their saved order (PRD #89 Phase 2b M2b.1).
+- **Layer:** in-process (real in-process attach daemon over a Unix socket; `EmbeddedPaneController::hydrate_from_daemon`; no real binary, no PTY drive). Runs in the fast tier.
+- **Agent:** none (each role agent runs `sh -c 'sleep 30'`; no LLM).
+- **Asserts:** spawning three orchestration role agents (orchestrator + coder + reviewer), each tagged with its `TabMembership::Orchestration` `role_index` / `role_name` / `is_start_role`, then hydrating a fresh controller from the warm daemon reproduces every role as a pane; placing each hydrated pane at its `role_index` yields the panes in their saved display order; and the start (orchestrator) role — the `start_role_index` cursor — is recoverable from `is_start_role`. Regression guard that warm-daemon orchestration hydration (PRD #76 M2.12 + #111) survives detach/reattach so M2b.3's snapshot fallback is only needed when the daemon is empty.
+- **Does not assert:** the daemon-empty snapshot-fallback rebuild (`session/restore/008`); the orchestrator-prompt replay (intentionally NOT replayed on warm reconnect — `src/tab.rs` design decision 3); the full `OrchestrationConfig` re-resolution (the partition + `resolve_orch_config_for_hydration` path, exercised elsewhere).
+- **Platform coverage:** mac+linux (Unix-only; `#![cfg(unix)]`).
+
+##### session/restore/008 — A daemon-empty launch with an orchestration snapshot rebuilds the orchestration tab and replays the orchestrator prompt (PRD #89 Phase 2b M2b.3).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (the orchestration's `coder`/`reviewer` roles run `sleep 600`; the `orchestrator` role runs a recorder shell script that self-posts `SessionStart` and appends its stdin to an absolute `record-orchestrator.log` — no LLM tokens).
+- **Asserts:** with a hand-staged `session.toml` whose single pane carries a `[panes.orchestration]` block (`config_name`/`project_path` pointing at a test-owned orchestration config, `orchestrator_prompt = "Build the feature end to end"`, `start_role_index = 0`) and an empty daemon, launching with NO `--continue` REBUILDS the orchestration tab: the `coder` and `reviewer` role panes appear as deck cards in their saved display order, and — unlike warm hydration (`session/restore/007`) — the saved `orchestrator_prompt` is replayed to the start (orchestrator) role and recorded (echo-immune), which also proves the start role was identified from `start_role_index`.
+- **Does not assert:** the warm-daemon hydration path (`session/restore/007`); the on-disk capture that produces the snapshot (`session/save/004`); the config-drift fallback (`session/restore/009`); the exact role-card styling / focus border.
+- **Platform coverage:** mac+linux.
+
+##### session/restore/009 — An orchestration snapshot whose config no longer resolves falls back to a plain dashboard pane with a `session_warnings` message naming the missing orchestration (PRD #89 Phase 2b M2b.3 drift).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (the fallback pane runs `sleep 600`; no LLM).
+- **Asserts:** with a hand-staged `session.toml` whose `[panes.orchestration]` block references `config_name = "tdd-cycle"` while the project config at `project_path` defines only a renamed `renamed-orch` (a re-resolution drift), launching against an empty daemon with no flag restores the saved pane as a PLAIN dashboard card (its saved name `orchestrator`, with no `coder`/`reviewer` role panes — never a half-broken tab) AND surfaces a clear `session_warnings` message naming the missing orchestration (`tdd-cycle`), flushed to stderr on detach-quit. Mirrors the mode-tab drift fallback (`session/restore/003`, PRD #69 Path D/E).
+- **Does not assert:** the exact warning wording (only that it names the missing orchestration); the successful rebuild path (`session/restore/008`); which other panes survive when multiple are staged (only one is here).
+- **Platform coverage:** mac+linux.
+
+##### session/restore/010 — A snapshot re-resolving to a zero-role orchestration falls back to a plain dashboard pane with a warning, never panicking at startup (PRD #89 review-fix F2).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (the fallback pane runs `sleep 600`; no LLM).
+- **Asserts:** with a project config that still names `tdd-cycle` but whittled to an EXPLICIT empty role set (`roles = []`, which `load_project_config` accepts since it runs no `config_validation`) and a hand-staged snapshot whose saved role set is also empty (so the name+order drift guard passes — `[] == []`) with a `start_role_index` of 0 that is out of range, launching against an empty daemon with no flag does NOT panic/crash-loop: the saved pane restores as a PLAIN dashboard card (`orchestrator`) and a `session_warnings` message naming the orchestration (`tdd-cycle`) is flushed to stderr on a clean detach-quit. Pins that an empty/no-start-role re-resolution is treated as drift, never indexed unguarded at the start cursor.
+- **Does not assert:** the exact warning wording (only that it names the orchestration); the successful rebuild path (`session/restore/008`); the non-empty role-set drift fallback (`session/restore/009`).
+- **Platform coverage:** mac+linux.
+
+##### session/restore/011 — A saved `start_role_index` that differs from the config default is honored on restore: the orchestrator prompt lands on the role at the saved index (PRD #89 review-fix F3).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (both roles run a recorder shell script that self-posts `SessionStart` and appends its stdin to an absolute `record-<role>.log` — no LLM tokens).
+- **Asserts:** with a `tdd-cycle` config whose default start role is `orchestrator` (index 0, `start = true`) and a recorder on BOTH roles, a hand-staged snapshot saving `start_role_index = 1` (`coder`) makes the replayed `orchestrator_prompt` land on and be recorded by the role at the SAVED index (`coder`, index 1) — and NOT by the config-default start role (`orchestrator`, index 0). Pins that restore reads `snap.start_role_index` rather than recomputing the start cursor from the live config's `start` flag.
+- **Does not assert:** the drift/bounds handling when the saved index is out of range (`session/restore/010`); `started_role_indices` replay (captured but has no reader); the exact role-card styling / focus border.
+- **Platform coverage:** mac+linux.
+
+##### session/restore/012 — A snapshot whose `project_path` diverges from the saved pane `dir` does not auto-run the config planted at `project_path` (PRD #89 review-fix F1).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (roles run `sleep 600`; no LLM).
+- **Asserts:** with the saved pane `dir` pointing at a legitimate working dir (no orchestration config) while the `[panes.orchestration]` `project_path` points at a SEPARATE planted dir whose config defines a uniquely-named `phantom-reviewer` role, launching against an empty daemon with no flag does NOT execute the planted config — `phantom-reviewer` never materializes as a deck card — while the saved pane still restores as a PLAIN card (`orchestrator`). Pins that the un-cross-checked `project_path` cannot auto-run a config from an unexpected directory (capture always writes `project_path == saved_pane.dir`, so divergence only arises via tampering).
+- **Does not assert:** which fix shape the coder chooses (drift fallback vs. re-resolving from `saved_pane.dir`) — only that the divergent config is not executed; path canonicalization edge cases (symlinks, `..`).
+- **Platform coverage:** mac+linux.
+
+##### session/restore/013 — A custom orchestration tab `display_title` saved in the snapshot is preserved on restore (PRD #89 review-fix F4, RED-pending-schema).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (roles run `sleep 600`; no LLM).
+- **Asserts:** with a hand-staged snapshot carrying a custom `display_title` (`MYDECKTITLE`) distinct from the canonical config name, the daemon-empty rebuild shows the user's saved title in the tab bar, not the canonical `tdd-cycle` config/cwd name. RED-pending-schema: `OrchestrationSnapshot` has no `display_title` field yet (the staged key parses but is dropped on load, since the struct sets no `deny_unknown_fields`) and restore passes `None` to `open_orchestration_tab`, so the tab comes back titled `tdd-cycle`; goes GREEN once the coder adds the field + capture + restore threading.
+- **Does not assert:** the live-path title plumbing (already covered by the new-pane orchestration flow); the serde round-trip of the new field in isolation (a unit test the coder adds with the field).
+- **Platform coverage:** mac+linux.
+
+### Session save (snapshot freshness, PRD #89 Phase 1)
+
+These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.
+
+#### session/save
+
+##### session/save/001 — A meaningful TUI state change (creating a new dashboard pane) writes a fresh saved-session snapshot to disk without quitting.
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path).
+- **Agent:** none (the pane runs `sleep 600`; no LLM).
+- **Asserts:** starting with no prior snapshot on disk, creating a new dashboard pane via the new-pane flow (Ctrl+N → dir-picker → form → submit) — and NOT quitting — causes a `session.toml` to be written that contains the newly created pane's command.
+- **Does not assert:** the coalescing/debounce window (covered by `session/save/003`); restore-on-startup behavior (PRD #89 Phase 2).
+- **Platform coverage:** mac+linux.
+
+##### session/save/002 — Triggering a detach path (Ctrl+W close-pane) flushes a fresh snapshot reflecting the workspace, without quitting.
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path).
+- **Agent:** none (panes run `sleep 600`; no LLM).
+- **Asserts:** with two dashboard panes present and any prior snapshot removed, closing a pane with Ctrl+W writes a fresh `session.toml` that still reflects the (non-empty) workspace — proving the detach path flushes the snapshot mid-session, not only at clean quit.
+- **Does not assert:** which specific pane survives the close; the coalescing/debounce window (`session/save/003`).
+- **Platform coverage:** mac+linux.
+
+##### session/save/003 — A burst of meaningful state changes coalesces to at most one or two snapshot writes, not one per change.
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SnapshotCoalescer`; no TUI harness, synchronous clock).
+- **Agent:** none.
+- **Asserts:** driving the coalescer (750 ms-style interval) with 50 rapid `mark_dirty` notifications observed at one instant — each followed by the loop's `is_due`/`record_write` check — produces only the leading-edge write; a single trailing check after the interval flushes the rest, for ≤2 total writes (and ≥1), and nothing is due once flushed.
+- **Does not assert:** the production interval value, real wall-clock timing, or that the on-disk file content is correct (covered by `session/save/001`–`002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### session/save/004 — Opening an orchestration tab captures its orchestration metadata into the saved-session snapshot (PRD #89 Phase 2b M2b.3 capture).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path).
+- **Agent:** none (the `orch-deck` fixture's `demo-orch` roles run `cat`; no LLM).
+- **Asserts:** opening the fixture orchestration via the new-pane form (a Phase 1 M1.1 meaningful state change that flushes the coalesced snapshot) — and NOT quitting — writes a `session.toml` carrying a `[panes.orchestration]` block that records the resolved `config_name` (`demo-orch`), the roles (`orchestrator`, `worker`) in display order, and the `start_role_index` (`0`, the `start = true` orchestrator), so the daemon-empty restore path (`session/restore/008`) can rebuild the tab.
+- **Does not assert:** the restore branch that consumes the metadata (`session/restore/008`–`009`); the serde round-trip of the schema in isolation (`config/saved-session/001`); the coalescing window (`session/save/003`).
+- **Platform coverage:** mac+linux.
+
+### Saved-session schema (orchestration metadata, PRD #89 Phase 2b)
+
+This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option<OrchestrationSnapshot>` (role order, `start_role_index`, `orchestrator_prompt`, resolved config name + project path, `version`, and which roles were started) so the daemon-empty restore path can rebuild an orchestration tab. The field is `Option` + `#[serde(default)]` so old `session.toml` files still parse.
+
+#### config/saved-session
+
+##### config/saved-session/001 — An `OrchestrationSnapshot` on a saved pane round-trips through TOML, and a legacy snapshot without the field still parses (PRD #89 Phase 2b M2b.2).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SavedSession` / `SavedPane` / `OrchestrationSnapshot`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** (a) a `SavedSession` whose pane carries an `OrchestrationSnapshot` (version, role order in display order, `start_role_index`, `orchestrator_prompt`, `config_name`, `project_path`, `started_role_indices`) serializes to TOML and deserializes back with every field intact; (b) a legacy `session.toml` string with no `orchestration` key parses with `orchestration == None` — the `#[serde(default)]` forward-compat guarantee for snapshots written before the field existed.
+- **Does not assert:** the snapshot-fallback restore branch that consumes the metadata (M2b.3 / `session/restore/008`–`009`); capture (populating the field when writing the snapshot); any TUI rendering.
+- **Platform coverage:** mac+linux+windows.
+
+### CLI surface (PRD #89 Phase 3)
+
+#### cli/continue-removed
+
+##### cli/continue-removed/001 — `--continue` is removed from the CLI surface and rejected on use (PRD #89 Phase 3).
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive).
+- **Agent:** none.
+- **Asserts:** `dot-agent-deck --help` no longer advertises `--continue`, and `dot-agent-deck --continue` exits non-zero with a message that references the flag (guiding the user toward the now-default auto-restore). Since auto-restore is unconditional, the flag has no remaining purpose.
+- **Does not assert:** the exact wording of the rejection message (clap's default unknown-argument text or a custom friendly message both satisfy it).
+- **Platform coverage:** mac+linux.
+
+### Fresh-start escape hatch (PRD #89 Phase 4)
+
+These entries cover PRD #89 Phase 4: with auto-restore now the default, a user who wants to start clean has one obvious action — `dot-agent-deck snapshot clear` (M4.2) — because the snapshot is a single GLOBAL file. `dot-agent-deck remote remove <name>` (M4.1) is registry-only and intentionally does NOT touch the snapshot (decided Option 1); there is no per-deck saved state to clear.
+
+#### session/snapshot
+
+##### session/snapshot/001 — `dot-agent-deck snapshot clear` deletes the local saved-session snapshot (PRD #89 Phase 4 M4.2).
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path).
+- **Agent:** none.
+- **Asserts:** with a non-empty `session.toml` staged at the redirected path, running `dot-agent-deck snapshot clear` exits 0 and the snapshot file is gone afterward — the local fresh-start escape hatch. The command shape is a `snapshot` subcommand group with a `clear` action (decided; not `reset`/`--reset`).
+- **Does not assert:** the subsequent no-flag startup landing on an empty dashboard (that follows from the deleted snapshot + `session/restore/006`); the exact stdout wording of the success message.
+- **Platform coverage:** mac+linux.
+
+##### session/snapshot/002 — `dot-agent-deck remote remove <name>` is registry-only and leaves the global snapshot intact (PRD #89 Phase 4 M4.1, Option 1).
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive; `DOT_AGENT_DECK_SESSION` + `DOT_AGENT_DECK_REMOTES` redirected to test-owned paths).
+- **Agent:** none.
+- **Asserts:** with a remote deck `myhost` registered in the staged `remotes.toml` and a non-empty `session.toml` staged, running `dot-agent-deck remote remove myhost` exits 0 AND leaves the global snapshot intact — the file is still present afterward with byte-for-byte unchanged contents. The snapshot is a single GLOBAL file, so remove is registry-only (decided Option 1); there is no per-deck saved state to clear and `snapshot clear` (001) is the one fresh-start action.
+- **Does not assert:** that the registry entry was removed (that is `remote remove`'s pre-existing behavior, exercised elsewhere); any per-deck keying of saved state (none exists — the snapshot is a single global file).
 - **Platform coverage:** mac+linux.
 
 ### Chain-smoke (real-agent) coverage

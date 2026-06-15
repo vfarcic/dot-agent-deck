@@ -42,16 +42,33 @@ The more agents you run in parallel, the more cards Agent Deck has to fit on the
 
 ## Resuming Sessions
 
-The dashboard automatically saves your open panes (directories, names, and commands) when you exit. To restore them next time:
+Agent Deck restores your workspace automatically. There is no flag to pass and no decision to make: every time you launch the TUI — `dot-agent-deck` locally or `dot-agent-deck connect <name>` for a remote machine — your previous panes, names, directories, commands, and tabs come back. If you would rather start from an empty dashboard, see [Starting Fresh](#starting-fresh) below.
+
+What you get back depends on whether your agents are still running:
+
+- **They're still running.** When you close the TUI or disconnect, your agents keep running in the background (see [How it runs](getting-started.md#how-it-runs)), so coming back brings them up exactly as they were, with their live output. This is the everyday case.
+- **They're gone.** On a fresh machine, the first launch after a reboot, or after an unexpected shutdown, Agent Deck rebuilds your workspace — panes, names, directories, commands, and tabs — and starts the agents fresh. It restores the *shape* of your workspace, not an agent's in-progress work; each agent picks its own conversation back up through its own command (for example, `claude --continue`).
+
+If there's nothing to bring back, you start on a clean, empty dashboard. If your workspace includes orchestration tabs, you land on the first one so you resume where you left off; otherwise you start on the dashboard for an overview. If a saved directory no longer exists, that pane is skipped with a warning.
+
+### Your setup stays up to date
+
+Agent Deck keeps your saved workspace current as you work — after every new pane, rename, tab, and agent change, and again whenever you disconnect — so what it brings back is your most recent setup, never a stale copy from the last time you happened to quit. That is what makes recovery worthwhile after an unexpected shutdown: you return to where you actually were, not to a workspace from days ago.
+
+### Mode and orchestration tabs come back too
+
+Mode tabs return in full — the tab and its name, the agent pane and its command, and every side pane. Orchestration tabs return too, with the orchestrator and its prompt, the role panes in their original order, and the start-role cursor where you left it.
+
+In every case only the workspace structure is restored, not an agent's internal conversation. If something in your project's `.dot-agent-deck.toml` has changed since you last ran it — the file is missing, a mode or orchestration was renamed, or a role was removed — Agent Deck shows a clear warning and brings that pane back as a plain dashboard pane instead of a broken tab.
+
+### Starting Fresh
+
+To discard the saved workspace and start from an empty dashboard next time, clear the snapshot:
 
 ```bash
-dot-agent-deck --continue
+dot-agent-deck snapshot clear
 ```
 
-Without `--continue`, the dashboard starts with a blank slate. If a saved directory no longer exists, that pane is skipped with a warning.
+This clears your saved workspace, so the next launch starts empty. Note that `dot-agent-deck remote remove <name>` does **not** do this — it only forgets a remote you had connected to and leaves your saved workspace untouched, so removing an unrelated remote never wipes your setup.
 
-After restore the dashboard is shown first so you get an overview before switching to a specific tab.
-
-Mode tabs are also restored: each agent pane records which mode it belonged to, and `--continue` reopens the full mode tab — tab name, agent pane and its command, and all side panes with their commands — by looking up the mode config from the project's `.dot-agent-deck.toml`. The agent's internal conversation state is not restored; only the workspace structure is. If `.dot-agent-deck.toml` is missing or the mode was renamed at restore time, a warning is printed to stderr and the pane falls back to a plain dashboard pane.
-
-Session data is stored in `~/.config/dot-agent-deck/session.toml`.
+Your saved workspace lives in `~/.config/dot-agent-deck/session.toml`.

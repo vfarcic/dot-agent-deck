@@ -319,11 +319,11 @@ impl TuiDeck {
             }
         }
 
-        // Write the saved-session file the deck reads under `--continue`,
-        // if the test asked for one. The pane runs `command` in the
-        // tempdir's working directory so the agent has a real cwd to
-        // operate against (the deck's restore path skips panes whose
-        // `dir` doesn't exist on disk).
+        // Write the saved-session file the deck auto-restores on startup
+        // (PRD #89: no `--continue` flag anymore), if the test asked for one.
+        // The pane runs `command` in the tempdir's working directory so the
+        // agent has a real cwd to operate against (the deck's restore path
+        // skips panes whose `dir` doesn't exist on disk).
         let session_toml_path = work.join("session.toml");
         if let Some(cs) = &builder.continue_session {
             write_continue_session_file(&session_toml_path, &work, &cs.pane_name, &cs.command)
@@ -351,11 +351,10 @@ impl TuiDeck {
         let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
         let mut cmd = CommandBuilder::new(bin);
         cmd.cwd(&work);
-        // Pass `--continue` when a saved session was staged so the deck
-        // auto-opens the chain-smoke pane on launch.
-        if builder.continue_session.is_some() {
-            cmd.arg("--continue");
-        }
+        // PRD #89: the `--continue` flag was removed — auto-restore is now the
+        // default. A staged saved session (pointed at by `DOT_AGENT_DECK_SESSION`
+        // below) is restored unconditionally on launch when the daemon is empty,
+        // so no flag is passed here.
         // M2.1 auditor S2: portable-pty 0.8 unconditionally env_clears
         // on Unix before applying our `cmd.env(...)` calls, but the old
         // comment claimed env_clear was avoided. Make the scrub
@@ -420,7 +419,7 @@ impl TuiDeck {
             final_env.insert((*k).into(), (*v).into());
         }
         // Point the deck's saved-session reader at our staged file so
-        // `--continue` picks up exactly the chain-smoke pane and
+        // auto-restore picks up exactly the chain-smoke pane and
         // nothing from the developer's real session.toml.
         if builder.continue_session.is_some() {
             final_env.insert(
@@ -708,6 +707,80 @@ impl TuiDeck {
                     matched + 1,
                     needles.len(),
                 );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Like [`wait_for_strings_in_order`], but tolerant of a one-shot
+    /// agent that completes and exits before a stable terminal frame is
+    /// ever rendered.
+    ///
+    /// `prefix` needles are matched STRICTLY in order against the
+    /// rolling byte history (so the test still proves the live
+    /// lifecycle ran); then ANY one of `terminal_alternatives`,
+    /// appearing AFTER the last prefix needle, satisfies the terminal
+    /// condition.
+    ///
+    /// This exists for the chain-smoke path. A `claude -p` print-mode
+    /// agent COMPLETES and EXITS the instant it finishes responding, so
+    /// the pane can jump from `Working`/`Bash` straight to the stable
+    /// "No agent" / "Launch an agent to get started" placeholder before
+    /// a rendered `Idle` frame survives a ~20 ms poll (a pre-existing
+    /// PRD #77 timing fragility — the agent demonstrably reaches
+    /// Thinking → Working → Bash, only the terminal `Idle` observation
+    /// races the exit). Accepting that clean exit as equivalent to a
+    /// captured `Idle` keeps the terminal assertion robust to the
+    /// print-mode lifecycle without weakening the strict prefix that
+    /// proves the agent traversed the working lifecycle.
+    ///
+    /// Searching the terminal alternatives only after the prefix cursor
+    /// is deliberate: a restored session renders a default `Idle` (and
+    /// may render the placeholder) *before* the agent starts, so an
+    /// early occurrence must not count — only a terminal state reached
+    /// AFTER the working lifecycle does.
+    pub fn wait_for_strings_in_order_then_any(
+        &self,
+        prefix: &[&str],
+        terminal_alternatives: &[&str],
+    ) {
+        let start_idx = self.byte_history.lock().unwrap().len();
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            let snapshot: Vec<u8> = {
+                let hist = self.byte_history.lock().unwrap();
+                if hist.len() > start_idx {
+                    hist[start_idx..].to_vec()
+                } else {
+                    Vec::new()
+                }
+            };
+            let (matched, terminal_found) =
+                match_prefix_then_terminal(&snapshot, prefix, terminal_alternatives);
+            if matched == prefix.len() && terminal_found {
+                return;
+            }
+            if Instant::now() > deadline {
+                let grid = self.snapshot_grid();
+                if matched < prefix.len() {
+                    let so_far = prefix[..matched].join(", ");
+                    let next = prefix[matched];
+                    panic!(
+                        "did not see prefix needle `{next}` (#{} of {} — already \
+                         matched in order: [{so_far}]) within {WAIT_TIMEOUT:?}.\n\
+                         Final grid:\n{grid}",
+                        matched + 1,
+                        prefix.len(),
+                    );
+                } else {
+                    let alts = terminal_alternatives.join("` | `");
+                    let pfx = prefix.join(", ");
+                    panic!(
+                        "matched the full prefix [{pfx}] but saw none of the \
+                         terminal alternatives [`{alts}`] after it within \
+                         {WAIT_TIMEOUT:?}.\nFinal grid:\n{grid}"
+                    );
+                }
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1023,6 +1096,40 @@ fn match_needles_in_order(haystack: &[u8], needles: &[&str]) -> usize {
         }
     }
     matched
+}
+
+/// Match `prefix` needles strictly in order against `haystack`, then
+/// check whether ANY of `terminals` appears AFTER the matched prefix.
+///
+/// Returns `(prefix_matched, terminal_found)`:
+/// - `prefix_matched` — how many prefix needles were found in order,
+///   advancing a cursor past each (the exact in-order semantics of
+///   [`match_needles_in_order`]). A value below `prefix.len()` means
+///   the prefix is incomplete, and `terminal_found` is then `false`.
+/// - `terminal_found` — once the full prefix matched, whether at least
+///   one terminal alternative occurs in the bytes AFTER the prefix's
+///   end cursor. Searching only after the prefix is what stops a stale
+///   pre-lifecycle status (e.g. a restored session's default `Idle`
+///   rendered *before* `Thinking`) from satisfying the terminal check.
+fn match_prefix_then_terminal(
+    haystack: &[u8],
+    prefix: &[&str],
+    terminals: &[&str],
+) -> (usize, bool) {
+    let text = String::from_utf8_lossy(haystack);
+    let mut cursor = 0usize;
+    let mut matched = 0usize;
+    for needle in prefix {
+        match text[cursor..].find(needle) {
+            Some(rel_idx) => {
+                cursor += rel_idx + needle.len();
+                matched += 1;
+            }
+            None => return (matched, false),
+        }
+    }
+    let terminal_found = terminals.iter().any(|t| text[cursor..].contains(t));
+    (matched, terminal_found)
 }
 
 fn locate_fixture(name: &str) -> PathBuf {
@@ -2491,7 +2598,7 @@ pub fn process_running(pid: i32) -> bool {
         Ok(stat) => match stat.rfind(')') {
             // `/proc/<pid>/stat` is `pid (comm) STATE ...`; comm may contain
             // spaces/parens, so the state char follows the last ')'.
-            Some(idx) => stat[idx + 1..].trim_start().chars().next() != Some('Z'),
+            Some(idx) => !stat[idx + 1..].trim_start().starts_with('Z'),
             None => true,
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -2637,5 +2744,64 @@ mod harness_unit_tests {
         let needles = ["Thinking", "Working", "Bash", "Idle"];
         let matched = match_needles_in_order(haystack, &needles);
         assert_eq!(matched, 2);
+    }
+
+    #[test]
+    fn match_prefix_then_terminal_accepts_idle_after_prefix() {
+        // prd-77 chain-smoke: full prefix in order, then a rendered
+        // Idle — the classic happy path. Terminal is satisfied.
+        let haystack = b"Thinking... Working with `Bash` then Idle now";
+        let (matched, terminal) =
+            match_prefix_then_terminal(haystack, &["Thinking", "Working", "Bash"], &["Idle"]);
+        assert_eq!(matched, 3);
+        assert!(terminal);
+    }
+
+    #[test]
+    fn match_prefix_then_terminal_accepts_placeholder_when_idle_absent() {
+        // print-mode lifecycle: the agent exits before any Idle
+        // frame, so the pane falls back to the placeholder. The
+        // placeholder alternative (seen AFTER Bash) satisfies the
+        // terminal even though `Idle` never appears.
+        let haystack =
+            b"Thinking... Working with `Bash`, agent exited, Launch an agent to get started";
+        let (matched, terminal) = match_prefix_then_terminal(
+            haystack,
+            &["Thinking", "Working", "Bash"],
+            &["Idle", "Launch an agent to get started"],
+        );
+        assert_eq!(matched, 3);
+        assert!(terminal);
+    }
+
+    #[test]
+    fn match_prefix_then_terminal_ignores_terminal_before_prefix_completes() {
+        // A restored session renders its default `Idle` (and may show
+        // the placeholder) BEFORE the agent starts. That stale early
+        // terminal must NOT count: searching only after the prefix
+        // cursor means a pre-lifecycle Idle is rejected.
+        let haystack = b"Idle (restored) then Thinking... Working with `Bash`, nothing after";
+        let (matched, terminal) = match_prefix_then_terminal(
+            haystack,
+            &["Thinking", "Working", "Bash"],
+            &["Idle", "Launch an agent to get started"],
+        );
+        assert_eq!(matched, 3);
+        assert!(!terminal);
+    }
+
+    #[test]
+    fn match_prefix_then_terminal_reports_incomplete_prefix() {
+        // Bash never shows up: prefix stalls at 2 and terminal is
+        // forced false, so the timeout path points at the missing
+        // prefix needle rather than the terminal alternatives.
+        let haystack = b"Thinking happened then Working took over, then Idle, no tool used";
+        let (matched, terminal) = match_prefix_then_terminal(
+            haystack,
+            &["Thinking", "Working", "Bash"],
+            &["Idle", "Launch an agent to get started"],
+        );
+        assert_eq!(matched, 2);
+        assert!(!terminal);
     }
 }

@@ -40,6 +40,7 @@ use dot_agent_deck::state::AppState;
 use dot_agent_deck::ui::{
     dead_slot_pane_id, fill_dead_slots_with_placeholders, is_dead_slot_pane_id,
 };
+use spec::spec;
 
 // `bind_attach_listener` flips the process-global umask while binding; share
 // the lock with the other M-series tests so concurrent tempdir creation
@@ -1136,4 +1137,149 @@ async fn hydrate_sizes_parser_to_daemon_reported_pty_dims() {
 
     drop(ctrl);
     let _ = server.registry.close_agent(&agent_id);
+}
+
+// ---------------------------------------------------------------------------
+// PRD #89 M2b.1 — warm-daemon orchestration-tab hydration regression guard.
+// ---------------------------------------------------------------------------
+// The snapshot-fallback restore branch (M2b.3) rebuilds an orchestration tab
+// from the disk snapshot only when the daemon is EMPTY. The warm-daemon case
+// is already covered by the PRD #76 M2.12 + #111 hydration path: each role
+// agent carries `TabMembership::Orchestration` and `hydrate_from_daemon`
+// echoes it back, so the TUI can place every role pane at its `role_index`
+// and recover the start-role cursor. This test pins that end-to-end so a
+// regression in warm-daemon orchestration hydration fails here rather than
+// silently shifting work onto the snapshot path.
+//
+// Written as a sync `#[test]` driving an explicit multi-thread runtime rather
+// than `#[tokio::test]`: the linkage-check (PRD #77 Decision 17) ties each
+// `#[spec(...)]` to the next `fn` definition and the function-name prefix, and
+// its scanner only recognises a plain `fn` (not `async fn`). `block_on` keeps
+// the async daemon/hydrate flow intact while exposing a sync `fn` to the gate.
+
+/// Scenario: Spawn three orchestration role agents (orchestrator + coder +
+/// reviewer) on a warm in-process daemon, each tagged with its
+/// `TabMembership::Orchestration` role_index / role_name / is_start_role, then
+/// build a fresh controller and hydrate. Asserts warm-daemon hydration
+/// reproduces every role as a pane, that placing each hydrated pane at its
+/// `role_index` yields the orchestrator + role panes in their saved display
+/// order, and that the start (orchestrator) role — i.e. the `start_role_index`
+/// cursor — is recoverable from `is_start_role`.
+#[spec("session/restore/007")]
+#[test]
+fn restore_007_warm_daemon_hydrates_orchestration_roles_in_order() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(restore_007_warm_daemon_hydrates_orchestration_roles_in_order_inner());
+}
+
+async fn restore_007_warm_daemon_hydrates_orchestration_roles_in_order_inner() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    let orchestration_name = "tdd-cycle";
+    let cwd = server._dir.path().to_string_lossy().into_owned();
+    let role_names = ["orchestrator", "coder", "reviewer"];
+    let mut spawned_ids: Vec<String> = Vec::new();
+    for (role_index, role_name) in role_names.iter().enumerate() {
+        let pane_env = format!("pane-{role_name}");
+        let id = client
+            .start_agent(StartAgentOptions {
+                command: Some("sh -c 'sleep 30'".to_string()),
+                cwd: Some(cwd.clone()),
+                display_name: Some((*role_name).to_string()),
+                env: vec![("DOT_AGENT_DECK_PANE_ID".to_string(), pane_env)],
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: orchestration_name.to_string(),
+                    role_index,
+                    role_name: (*role_name).to_string(),
+                    is_start_role: role_index == 0,
+                    orchestration_cwd: Some(cwd.clone()),
+                    display_title: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("start_agent should succeed");
+        spawned_ids.push(id);
+    }
+
+    let ctrl = Arc::new(EmbeddedPaneController::new(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(
+        hydrated.len(),
+        role_names.len(),
+        "every orchestration role should hydrate as a pane; got {hydrated:?}"
+    );
+
+    // Place each hydrated pane at its role_index, exactly as the production
+    // hydration loop in ui.rs does, then assert the orchestrator + role panes
+    // come back in their saved display order with the start role recoverable.
+    let mut role_pane_ids: Vec<Option<String>> = vec![None; role_names.len()];
+    let mut role_name_by_index: Vec<Option<String>> = vec![None; role_names.len()];
+    let mut start_role_index: Option<usize> = None;
+    for h in &hydrated {
+        let Some(TabMembership::Orchestration {
+            name,
+            role_index,
+            role_name,
+            is_start_role,
+            ..
+        }) = &h.tab_membership
+        else {
+            panic!("hydrated pane lost its Orchestration tab membership: {h:?}");
+        };
+        assert_eq!(
+            name, orchestration_name,
+            "hydrated pane must carry the orchestration name"
+        );
+        assert!(
+            *role_index < role_names.len(),
+            "role_index {role_index} out of range"
+        );
+        role_pane_ids[*role_index] = Some(h.pane_id.clone());
+        role_name_by_index[*role_index] = Some(role_name.clone());
+        if *is_start_role {
+            start_role_index = Some(*role_index);
+        }
+    }
+
+    // Every role slot is filled — no gaps in the orchestrator + role panes.
+    assert!(
+        role_pane_ids.iter().all(Option::is_some),
+        "every role slot must be filled by hydration; got {role_pane_ids:?}"
+    );
+    // The role names land back in their saved display order.
+    let recovered_order: Vec<String> = role_name_by_index
+        .into_iter()
+        .map(|n| n.expect("each filled slot has a role name"))
+        .collect();
+    let expected_order: Vec<String> = role_names.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        recovered_order, expected_order,
+        "warm-daemon hydration must reproduce the role panes in saved order"
+    );
+    // The start_role_index cursor (orchestrator at index 0) is recoverable.
+    assert_eq!(
+        start_role_index,
+        Some(0),
+        "the start (orchestrator) role must be recoverable from is_start_role"
+    );
+
+    drop(ctrl);
+    for id in &spawned_ids {
+        let _ = server.registry.close_agent(id);
+    }
 }
