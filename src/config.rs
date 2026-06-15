@@ -1863,7 +1863,21 @@ timeout_secs = 600
             std::env::set_var("XDG_STATE_HOME", "/var/lib/state");
         }
 
+        // Unix honors `$XDG_STATE_HOME`. Windows has no XDG concept, so the
+        // resolver ignores it and returns `%LOCALAPPDATA%\dot-agent-deck`
+        // (derived here from the same `dirs` crate the resolver uses, so no
+        // machine-specific username is hardcoded).
+        #[cfg(unix)]
         assert_eq!(state_dir(), PathBuf::from("/var/lib/state/dot-agent-deck"));
+        #[cfg(windows)]
+        {
+            let expected = dirs::data_local_dir()
+                .map(|p| p.join("dot-agent-deck"))
+                .unwrap_or_else(|| {
+                    crate::platform::paths::home_dir().join("AppData/Local/dot-agent-deck")
+                });
+            assert_eq!(state_dir(), expected);
+        }
 
         // SAFETY: same lock held; restoring previous values.
         unsafe {
@@ -1891,10 +1905,23 @@ timeout_secs = 600
             std::env::set_var("HOME", "/home/test-user");
         }
 
+        // Unix falls back to `$HOME/.local/state`. Windows ignores `$HOME`
+        // entirely and returns `%LOCALAPPDATA%\dot-agent-deck` (derived from the
+        // same `dirs` crate the resolver uses — no hardcoded username/prefix).
+        #[cfg(unix)]
         assert_eq!(
             state_dir(),
             PathBuf::from("/home/test-user/.local/state/dot-agent-deck")
         );
+        #[cfg(windows)]
+        {
+            let expected = dirs::data_local_dir()
+                .map(|p| p.join("dot-agent-deck"))
+                .unwrap_or_else(|| {
+                    crate::platform::paths::home_dir().join("AppData/Local/dot-agent-deck")
+                });
+            assert_eq!(state_dir(), expected);
+        }
 
         // SAFETY: same lock held; restoring previous values.
         unsafe {
@@ -2096,11 +2123,31 @@ prompt = "hi"
         assert!(!minimal.new_tab_per_fire, "new_tab_per_fire defaults false");
         assert!(minimal.enabled, "enabled defaults true");
         assert_eq!(minimal.command.as_deref(), Some("claude"));
+        // `~/...` is expanded at load time. On Unix the home is the `HOME` we
+        // set above; on Windows `~` resolves via the path resolver (e.g.
+        // `%USERPROFILE%`), so assert the expansion *logic* (anchored at the
+        // resolver's home, tilde gone, expected suffix) rather than a hardcoded
+        // path — the username varies per machine.
+        #[cfg(unix)]
         assert_eq!(minimal.working_dir, "/home/tester/scheduled/morning");
+        #[cfg(windows)]
+        {
+            let home = crate::platform::paths::home_dir();
+            assert!(minimal.working_dir.starts_with(&*home.to_string_lossy()));
+            assert!(minimal.working_dir.ends_with("scheduled/morning"));
+            assert!(!minimal.working_dir.contains('~'));
+        }
 
-        // Relative result (from $VAR) resolves against $HOME.
+        // Relative result (from $VAR) resolves against home.
         let with_var = &loaded.tasks[1];
+        #[cfg(unix)]
         assert_eq!(with_var.working_dir, "/home/tester/projects/digest");
+        #[cfg(windows)]
+        {
+            let home = crate::platform::paths::home_dir();
+            assert!(with_var.working_dir.starts_with(&*home.to_string_lossy()));
+            assert!(with_var.working_dir.ends_with("projects/digest"));
+        }
 
         // SAFETY: same lock held; restore previous values.
         unsafe {
@@ -2314,7 +2361,19 @@ label = "-rf"
         }
 
         assert_eq!(expand_path("/a/${DAD_BRACE}/b"), "/a/braced/b");
+        // `~` expands to the home directory. On Unix that is the `HOME` we set
+        // above; on Windows it resolves via the path resolver (`%USERPROFILE%`),
+        // so derive the expected value from the resolver instead of hardcoding a
+        // machine-specific path.
+        #[cfg(unix)]
         assert_eq!(expand_path("~"), "/home/tester");
+        #[cfg(windows)]
+        assert_eq!(
+            expand_path("~"),
+            crate::platform::paths::home_dir()
+                .to_string_lossy()
+                .into_owned()
+        );
         // A lone `$` and an undefined var don't panic.
         assert_eq!(expand_path("/lit/$"), "/lit/$");
         assert_eq!(expand_path("/x/$DAD_UNDEFINED/y"), "/x//y");
