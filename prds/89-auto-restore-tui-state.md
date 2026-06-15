@@ -1,9 +1,9 @@
 # PRD #89: Auto-restore TUI state on attach; remove `--continue` flag
 
-**Status**: Planning
+**Status**: Implementation complete — pending changelog fragment (M5.2) + release (M5.3)
 **Priority**: Medium
 **Created**: 2026-05-16
-**Last Updated**: 2026-06-14
+**Last Updated**: 2026-06-15
 **GitHub Issue**: [#89](https://github.com/vfarcic/dot-agent-deck/issues/89)
 
 > **2026-06-14 refresh — read before implementing.** This PRD predates the daemon architecture shipping. The landscape has moved: PRD #76 (Remote Agent Environments) **shipped**, and PRD #93 (always-external daemon) made the daemon the **unified architecture even locally** — `run_tui_session` now always connects to an external daemon (`ensure_external_daemon_or_die`). Two consequences: (1) the original line references below are **stale** (e.g. the `continue_session` gate is no longer at `src/ui.rs:2748` — it is threaded through `run_tui` around `src/ui.rs:5862`, plus `5426/5462/5849`); re-locate by symbol, not line number, at implementation time. (2) Several milestones are **partially delivered** by #76/#93 and the scope has **grown** to absorb orchestration-tab restore (formerly PRD #74, now closed). See the new Design Decision entries dated 2026-06-14 and the revised Dependencies/Scope/Milestones below.
@@ -69,45 +69,45 @@ As a side effect, daemon crash recovery is "free": a respawned-empty daemon trig
 
 ### Phase 1: Snapshot freshness
 
-- [ ] **M1.1** — Identify the set of "meaningful state change" events that should trigger a snapshot write: new pane created, pane renamed, pane closed, mode tab opened/closed, orchestration tab opened/closed/role-changed, agent stop, agent restart. Document the list inline in the PRD or as a Design Decision.
-- [ ] **M1.2** — Add a snapshot-write trigger to each of those events. Coalesce/debounce writes so a burst of changes (e.g., orchestration setup) produces one or two disk writes, not dozens.
-- [ ] **M1.3** — Add a snapshot-write trigger to the detach paths: ssh disconnect (remote), Ctrl+W close-pane (where applicable), explicit detach from the quit-confirm dialog.
-- [ ] **M1.4** — Tests confirming each trigger writes a snapshot and that coalescing actually coalesces.
+- [x] **M1.1** — Identify the set of "meaningful state change" events that should trigger a snapshot write: new pane created, pane renamed, pane closed, mode tab opened/closed, orchestration tab opened/closed/role-changed, agent stop, agent restart. Document the list inline in the PRD or as a Design Decision.
+- [x] **M1.2** — Add a snapshot-write trigger to each of those events. Coalesce/debounce writes so a burst of changes (e.g., orchestration setup) produces one or two disk writes, not dozens.
+- [x] **M1.3** — Add a snapshot-write trigger to the detach paths: ssh disconnect (remote), Ctrl+W close-pane (where applicable), explicit detach from the quit-confirm dialog.
+- [x] **M1.4** — Tests confirming each trigger writes a snapshot and that coalescing actually coalesces.
 
 ### Phase 2: Auto-restore on TUI startup
 
 > **2026-06-14:** Post-#93 the local TUI is daemon-backed, so hydration-first applies uniformly — M2.2 is one path, not local-vs-remote. The snapshot-load gate is no longer at `src/ui.rs:2748`; it is the `continue_session` block around `src/ui.rs:5862` in `run_tui`. Re-locate by symbol.
 
-- [ ] **M2.1** — Make the snapshot-load path (the `if continue_session { … }` block in `run_tui`, ~`src/ui.rs:5862` — verify current location) unconditional (no longer gated on `continue_session`). Restore from snapshot on every TUI startup.
-- [ ] **M2.2** — Wire the daemon-state-vs-snapshot precedence: if M2.11/M2.12 hydration produced any panes, skip snapshot restore. If hydration produced zero panes, load and apply the snapshot. Decide via a structural check (any hydrated `managed_pane_id` in `state`), not a flag.
-- [ ] **M2.3** — Verify the existing M2.11/M2.12 hydration path still works unchanged in the common detach/reattach case. No regressions for users currently relying on automatic remote restore.
-- [ ] **M2.4** — Tests: daemon-with-agents wins over snapshot; daemon-empty + non-empty-snapshot recreates from snapshot; both empty lands at empty dashboard.
+- [x] **M2.1** — Make the snapshot-load path (the `if continue_session { … }` block in `run_tui`, ~`src/ui.rs:5862` — verify current location) unconditional (no longer gated on `continue_session`). Restore from snapshot on every TUI startup.
+- [x] **M2.2** — Wire the daemon-state-vs-snapshot precedence: if M2.11/M2.12 hydration produced any panes, skip snapshot restore. If hydration produced zero panes, load and apply the snapshot. Decide via a structural check (any hydrated `managed_pane_id` in `state`), not a flag.
+- [x] **M2.3** — Verify the existing M2.11/M2.12 hydration path still works unchanged in the common detach/reattach case. No regressions for users currently relying on automatic remote restore.
+- [x] **M2.4** — Tests: daemon-with-agents wins over snapshot; daemon-empty + non-empty-snapshot recreates from snapshot; both empty lands at empty dashboard.
 
 ### Phase 2b: Orchestration-tab restore (absorbed from closed PRD #74)
 
-- [ ] **M2b.1** — **Verify the daemon-hydration path.** Confirm by inspection + a regression test that PRD #76 M2.12 + PRD #111 hydration already recreate an orchestration tab end-to-end from a warm daemon: orchestrator pane + prompt, role panes in saved order, and `start_role_index`. If complete, no new capture code is needed for the warm case.
-- [ ] **M2b.2** — **Snapshot-fallback capture.** For the daemon-empty case (fresh machine / crash recovery), extend the saved-pane schema with orchestration metadata (role order, `orchestrator_prompt`, resolved config name + project path for re-resolution, `start_role_index`, and a `version: u32`), `Option<…>` + `#[serde(default)]` so old snapshots still parse. Port the design from `prds/done/74-restore-orchestration-tabs-on-continue.md`.
-- [ ] **M2b.3** — **Snapshot-fallback restore branch.** Rebuild the orchestration tab from the snapshot when the daemon is empty: re-resolve the `OrchestrationConfig`, recreate orchestrator + role panes in order, re-issue commands, restore `start_role_index`. On config drift (config deleted, orchestration renamed, role removed) surface a clear `session_warnings` message and fall back to a plain dashboard pane — never a half-broken tab.
-- [ ] **M2b.4** — Tests: warm-daemon hydration restores an orchestration tab (M2b.1); daemon-empty + snapshot recreates it; old snapshot without the orchestration field still parses; drift triggers the warning + plain-pane fallback.
+- [x] **M2b.1** — **Verify the daemon-hydration path.** Confirm by inspection + a regression test that PRD #76 M2.12 + PRD #111 hydration already recreate an orchestration tab end-to-end from a warm daemon: orchestrator pane + prompt, role panes in saved order, and `start_role_index`. If complete, no new capture code is needed for the warm case.
+- [x] **M2b.2** — **Snapshot-fallback capture.** For the daemon-empty case (fresh machine / crash recovery), extend the saved-pane schema with orchestration metadata (role order, `orchestrator_prompt`, resolved config name + project path for re-resolution, `start_role_index`, and a `version: u32`), `Option<…>` + `#[serde(default)]` so old snapshots still parse. Port the design from `prds/done/74-restore-orchestration-tabs-on-continue.md`.
+- [x] **M2b.3** — **Snapshot-fallback restore branch.** Rebuild the orchestration tab from the snapshot when the daemon is empty: re-resolve the `OrchestrationConfig`, recreate orchestrator + role panes in order, re-issue commands, restore `start_role_index`. On config drift (config deleted, orchestration renamed, role removed) surface a clear `session_warnings` message and fall back to a plain dashboard pane — never a half-broken tab.
+- [x] **M2b.4** — Tests: warm-daemon hydration restores an orchestration tab (M2b.1); daemon-empty + snapshot recreates it; old snapshot without the orchestration field still parses; drift triggers the warning + plain-pane fallback.
 
 ### Phase 3: Delete `--continue`
 
 > **2026-06-14:** The remote side is **already done** — `run_connect` ignores `_continue_session` ("applies to a laptop-side TUI that no longer exists"). Remaining live work is the **local** plumbing. Line numbers below are stale; re-locate by symbol (`grep continue_session`).
 
-- [ ] **M3.1** — Remove the `--continue` argument from `Cli` (currently `src/main.rs:25-26` — `#[arg(long = "continue")] continue_session: bool`).
-- [ ] **M3.2** — Remove the `continue_session: bool` parameter from `run_dashboard`, `run_tui_session`, the TUI internals (`run_tui`, ~`src/ui.rs:5426`), and drop the already-ignored `_continue_session` from `run_connect`. Sweep all callers via `grep continue_session`.
-- [ ] **M3.3** — Update help text and the in-TUI restore hint (`"  Restore: dot-agent-deck --continue"`, currently ~`src/ui.rs:9698`) to remove the obsolete reference. Also sweep the explanatory `--continue` comments elsewhere in `run_tui` (~`5459`, `5465`, `5850`, `6216`, `7590`) so they don't describe a removed flag.
-- [ ] **M3.4** — Add a friendly error message if a user runs `dot-agent-deck --continue` after removal (clap will reject the unknown flag with its default message; a custom message that tells them auto-restore is the new default is a nice touch).
+- [x] **M3.1** — Remove the `--continue` argument from `Cli` (currently `src/main.rs:25-26` — `#[arg(long = "continue")] continue_session: bool`).
+- [x] **M3.2** — Remove the `continue_session: bool` parameter from `run_dashboard`, `run_tui_session`, the TUI internals (`run_tui`, ~`src/ui.rs:5426`), and drop the already-ignored `_continue_session` from `run_connect`. Sweep all callers via `grep continue_session`.
+- [x] **M3.3** — Update help text and the in-TUI restore hint (`"  Restore: dot-agent-deck --continue"`, currently ~`src/ui.rs:9698`) to remove the obsolete reference. Also sweep the explanatory `--continue` comments elsewhere in `run_tui` (~`5459`, `5465`, `5850`, `6216`, `7590`) so they don't describe a removed flag.
+- [x] **M3.4** — Add a friendly error message if a user runs `dot-agent-deck --continue` after removal (clap will reject the unknown flag with its default message; a custom message that tells them auto-restore is the new default is a nice touch).
 
 ### Phase 4: Fresh-start escape hatch
 
-- [ ] **M4.1** — *Resolved (see the 2026-06-14 escape-hatch Design Decision below).* Investigation found the saved snapshot is a **single global file** (`config::session_path()` → `DOT_AGENT_DECK_SESSION` or `~/.config/dot-agent-deck/session.toml`), not keyed per deck — there is no per-deck saved state on disk. There is also no top-level `dot-agent-deck remove`; the real command is `dot-agent-deck remote remove <name>`, which mutates only the local registry (`remotes.toml`). Decision (Option 1): `remote remove` stays **registry-only and intentionally does NOT clear the snapshot**. The one obvious global fresh-start action is `dot-agent-deck snapshot clear` (M4.2) — so there is no per-deck wiring to add.
-- [ ] **M4.2** — Add a `dot-agent-deck snapshot clear` subcommand — a `snapshot` subcommand **group** (room for future snapshot actions) with a `clear` **action** — that deletes the local snapshot by calling `config::SavedSession::clear()` (the same teardown clear, so it honors the `DOT_AGENT_DECK_SESSION` override). Ships visible by default (no experimental feature flag). Exact CLI shape resolved as a Design Decision (`snapshot clear`, not `reset`/`--reset`).
-- [ ] **M4.3** — Tests for the escape hatch: `snapshot clear` deletes the local snapshot and exits 0 (`session/snapshot/001`); and a green-guard that `remote remove <name>` leaves the global snapshot intact (`session/snapshot/002`).
+- [x] **M4.1** — *Resolved (see the 2026-06-14 escape-hatch Design Decision below).* Investigation found the saved snapshot is a **single global file** (`config::session_path()` → `DOT_AGENT_DECK_SESSION` or `~/.config/dot-agent-deck/session.toml`), not keyed per deck — there is no per-deck saved state on disk. There is also no top-level `dot-agent-deck remove`; the real command is `dot-agent-deck remote remove <name>`, which mutates only the local registry (`remotes.toml`). Decision (Option 1): `remote remove` stays **registry-only and intentionally does NOT clear the snapshot**. The one obvious global fresh-start action is `dot-agent-deck snapshot clear` (M4.2) — so there is no per-deck wiring to add.
+- [x] **M4.2** — Add a `dot-agent-deck snapshot clear` subcommand — a `snapshot` subcommand **group** (room for future snapshot actions) with a `clear` **action** — that deletes the local snapshot by calling `config::SavedSession::clear()` (the same teardown clear, so it honors the `DOT_AGENT_DECK_SESSION` override). Ships visible by default (no experimental feature flag). Exact CLI shape resolved as a Design Decision (`snapshot clear`, not `reset`/`--reset`).
+- [x] **M4.3** — Tests for the escape hatch: `snapshot clear` deletes the local snapshot and exits 0 (`session/snapshot/001`); and a green-guard that `remote remove <name>` leaves the global snapshot intact (`session/snapshot/002`).
 
 ### Phase 5: Documentation + release
 
-- [ ] **M5.1** — Update the user-facing docs that mention `--continue` — verified current set: `docs/getting-started.md` and `docs/session-management.md` — to describe the new auto-restore model and the fresh-start escape hatch. (`session-management.md` is also where closed PRD #74 would have added its orchestration-restore paragraph; cover orchestration-tab restore here instead.)
+- [x] **M5.1** — Update the user-facing docs that mention `--continue` — verified current set: `docs/getting-started.md` and `docs/session-management.md` — to describe the new auto-restore model and the fresh-start escape hatch. (`session-management.md` is also where closed PRD #74 would have added its orchestration-restore paragraph; cover orchestration-tab restore here instead.)
 - [ ] **M5.2** — Draft a changelog fragment (via the `dot-ai-changelog-fragment` skill) flagging this as a breaking change with a one-line migration note ("Remove `--continue` from any wrapper scripts; auto-restore is now the default.").
 - [ ] **M5.3** — Tag a release (`dot-ai-tag-release`) once everything lands.
 
