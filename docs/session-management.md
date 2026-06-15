@@ -42,9 +42,7 @@ The more agents you run in parallel, the more cards Agent Deck has to fit on the
 
 ## Resuming Sessions
 
-Agent Deck restores your workspace automatically. There is no flag to pass and no decision to make: every time you launch the TUI — `dot-agent-deck` locally or `dot-agent-deck connect <name>` for a remote machine — your previous panes, names, directories, commands, and tabs come back.
-
-> **Breaking change:** Auto-restore is now the default. Bare `dot-agent-deck` restores your previous workspace instead of starting empty, and the old `--continue` flag has been removed. If you have wrapper scripts or aliases that pass `--continue`, drop it — running `dot-agent-deck --continue` now prints a short message explaining that auto-restore is the default. To start from an empty dashboard on purpose, see [Starting Fresh](#starting-fresh) below.
+Agent Deck restores your workspace automatically. There is no flag to pass and no decision to make: every time you launch the TUI — `dot-agent-deck` locally or `dot-agent-deck connect <name>` for a remote machine — your previous panes, names, directories, commands, and tabs come back. If you would rather start from an empty dashboard, see [Starting Fresh](#starting-fresh) below.
 
 What you get back depends on whether your agents are still running:
 
