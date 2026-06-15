@@ -258,21 +258,22 @@ fn manager_003_delete_removes_definition_but_keeps_open_tab() {
     drop(scratch);
 }
 
-/// Scenario: With a fixture task whose name is LONG (long enough that the
-/// single-line delete confirmation would overflow the modal's inner width),
-/// open the manager and press `d` to arm the delete confirmation. Assert the
-/// confirmation message is CONTAINED WITHIN the modal — its trailing `(y/n)`
-/// prompt still renders rather than being clipped off the right edge by the
-/// long name (the fix wraps the message inside the modal, growing it in height
-/// and keeping the name on its own line, instead of letting the text spill past
-/// the border). RED today: the long name pushes the message past the 70-col
-/// inner width, so the `(y/n)` tail is clipped and never appears.
+/// Scenario: With a fixture task whose name is LONG, open the manager and press
+/// `d` to arm the delete confirmation. The confirmation renders on two fixed
+/// natural lines — the name on its own line (`Delete schedule '…'?`) and the
+/// fixed `definition only — open tab kept. (y/n)` trailer on the next. Assert the
+/// trailing `(y/n)` prompt is CONTAINED WITHIN the modal: under PRD #144 the
+/// modal is content-sized, so it grows in WIDTH to contain the long name line
+/// (clamped to ≤90% of the terminal) and the second line's `(y/n)` tail is never
+/// clipped off the right border. (Supersedes the PRD #127 band-aid that wrapped
+/// the message to grow the modal in HEIGHT inside a fixed 72-col modal.)
 #[spec("scheduler/manager/005")]
 #[test]
 fn manager_005_delete_confirm_contained_within_modal() {
-    // A name far longer than the ~10 chars that still leave room for the
-    // confirmation's fixed text ("Delete schedule '…'? definition only — open
-    // tab kept. (y/n)") within the 70-col inner width of the 72-wide modal.
+    // A name long enough that the single-line form of the confirmation would
+    // overflow a fixed-width modal — exercising the PRD #144 content-driven WIDTH
+    // growth that keeps both natural lines (the name line; the `… (y/n)` trailer)
+    // un-clipped instead of spilling the tail past the border.
     const LONG_NAME: &str = "extremely-long-scheduled-task-name-that-overflows-the-modal";
 
     let (scratch, sched_path) = scratch_with_schedules(&format!(
@@ -297,10 +298,10 @@ fn manager_005_delete_confirm_contained_within_modal() {
 
     let grid = deck.snapshot_grid();
     // The full confirmation must stay inside the modal: its trailing `(y/n)`
-    // prompt — the only `(y/n)` in the whole app — must render. With a short
-    // name it fits; the long name pushes it past the modal's inner width and it
-    // is clipped. After the fix the message wraps within the modal (name on its
-    // own line) so `(y/n)` renders again.
+    // prompt — the only `(y/n)` in the whole app — must render. The confirmation
+    // sits on two fixed natural lines and the modal grows in WIDTH to contain the
+    // long name line (PRD #144 content-sizing), so the second line's `(y/n)` tail
+    // is never clipped off the right border.
     assert!(
         grid.contains("(y/n)"),
         "the delete confirmation overflowed the modal: the long schedule name pushed \
@@ -426,5 +427,68 @@ fn manager_006_click_row_moves_selection() {
         !grid.contains("\u{25b6} alpha"),
         "after clicking `bravo`, the selection marker must leave `alpha`.\nGrid:\n{grid}"
     );
+    drop(scratch);
+}
+
+/// Scenario: With a fixture `schedules.toml` holding one enabled task whose name
+/// is LONGER than the legacy fixed-width name cell, open the "Scheduled Tasks"
+/// manager at a roomy (200-col) terminal and again at a windowed (80-col)
+/// terminal. Assert the task's FULL name renders un-clipped on the grid at BOTH
+/// widths — proving the dialog auto-sizes to its content (PRD #144 shared modal
+/// sizing helper, clamped within the windowed terminal) instead of truncating
+/// the field to a fixed 72-col modal. RED today: the modal is hard-capped at 72
+/// columns and the name is truncated to 21 chars (`truncate_cell`), so the full
+/// name never appears at either width.
+#[spec("scheduler/manager/007")]
+#[test]
+fn manager_007_dialog_content_sized_unclipped_at_both_widths() {
+    // Longer than the legacy 21-char name cell, yet short enough to fit a
+    // content-sized modal even at the 80-col windowed floor.
+    const LONG_NAME: &str = "nightly-backup-and-report";
+
+    let (scratch, sched_path) = scratch_with_schedules(&format!(
+        "[[scheduled_tasks]]\n\
+         name = \"{LONG_NAME}\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"backup prompt\"\n\
+         enabled = true\n"
+    ));
+
+    // Open the manager at a given terminal size and return the rendered grid.
+    fn manager_grid(cols: u16, rows: u16, sched_path: &std::path::Path) -> String {
+        let deck = TuiDeck::builder()
+            .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+            .with_pty_size(cols, rows)
+            .launch_with_fixture("minimal");
+        deck.wait_for_string("No active sessions");
+        deck.send_keys(MANAGER_KEY);
+        // `NEXT FIRE` only renders once the dialog is open with its rows loaded —
+        // an unambiguous "dialog is up" signal (also proves the column labels
+        // render un-clipped).
+        deck.wait_for_string("NEXT FIRE");
+        deck.snapshot_grid()
+    }
+
+    // Roomy width: the content-sized modal grows to show the full name.
+    let roomy = manager_grid(200, 40, &sched_path);
+    assert!(
+        roomy.contains(LONG_NAME),
+        "at a roomy 200-col width the manager dialog must auto-size to its \
+         content and render the full schedule name `{LONG_NAME}` un-clipped \
+         (today the modal is capped at 72 cols and the name is truncated to 21 \
+         chars).\nGrid:\n{roomy}"
+    );
+
+    // Windowed width: the modal clamps within the terminal but still renders the
+    // full name un-clipped (no field clipped off the modal border).
+    let windowed = manager_grid(80, 30, &sched_path);
+    assert!(
+        windowed.contains(LONG_NAME),
+        "at a windowed 80-col width the manager dialog must still render the \
+         full schedule name `{LONG_NAME}` un-clipped within the modal.\nGrid:\n{windowed}"
+    );
+
     drop(scratch);
 }

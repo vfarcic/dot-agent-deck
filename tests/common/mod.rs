@@ -962,6 +962,42 @@ impl TuiDeck {
 }
 
 // ---------------------------------------------------------------------------
+// L1 buffer-render helpers
+// ---------------------------------------------------------------------------
+//
+// Shared by the in-process `TestBackend` render tests (`tests/render_*.rs`),
+// which assert on a `ratatui::buffer::Buffer` rather than a PTY grid. Kept here
+// so the button-bar and layout suites read a single copy (PRD #144 DRY).
+
+/// Count the rows of `buffer` that carry any non-blank cell — i.e. how many
+/// rows the rendered bar actually occupies. One row means the bar fit on a
+/// single line; two or more means it wrapped (each extra row is one row the
+/// dashboard must cede from its height budget for the bottom bar).
+pub fn nonblank_rows(buffer: &ratatui::buffer::Buffer) -> usize {
+    let area = buffer.area();
+    (0..area.height)
+        .filter(|&y| (0..area.width).any(|x| !buffer[(x, y)].symbol().trim().is_empty()))
+        .count()
+}
+
+/// Join every row of a (possibly multi-row) bar buffer into one `\n`-separated
+/// string, for a readable failure message. A wrapped button bar spreads its
+/// full-label buttons across more than one row; each label stays contiguous
+/// within a single row, so a `\n`-joined `.contains(label)` finds it without
+/// crossing the boundary.
+pub fn joined_rows(buffer: &ratatui::buffer::Buffer) -> String {
+    let area = buffer.area();
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

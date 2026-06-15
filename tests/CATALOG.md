@@ -1101,6 +1101,20 @@ note).
 - **M1 status (PRD #84):** **Flag / invariant-check.** Mode switch (`src/ui.rs:2828` area) resizes panes through `resize_mode_tab_panes`, so artefacts are transient. Invariant guard on post-transition cleanliness. GREEN target at M4/M5.
 - **Post-M5 resolution (PRD #84):** **GREEN.** Stays green after M4+M5 and now exercises the `render_mode_tab` switch through layout-driven resize + 1:1 widget render with the M5 contract `debug_assert!` live in debug builds — asserting the mode-switch contract rather than masking a self-healing race.
 
+##### render/layout/004 — A wrapped button bar costs the dashboard exactly one extra row of its height budget (PRD #144).
+- **Layer:** L1 (in-process `TestBackend` via `render_button_bar_with_bindings_to_buffer`; no PTY, no subprocess).
+- **Agent:** none (renders the full global + dashboard context bar into a tall area at two widths).
+- **Asserts:** at the 120-col reference width the full button set (~133 cells) does not fit one row, so the bar wraps to EXACTLY two rendered rows — meaning the dashboard/pane region above must cede exactly that one extra row (the PRD #144 height-budget contract that keeps a 2-row bar from overlapping / clipping the cards); at a roomy 200-col width the same set fits one row, so the bar occupies exactly one row and the dashboard cedes nothing extra. Complements `mouse/buttonbar/006` (which pins the wrapped bar's label content) by pinning its height.
+- **Does not assert:** the card/pane rects themselves (no public full-frame layout seam at L1 — the post-transition card cleanliness is guarded at L2 by `render/layout/001`–`003`); which button lands on which row; the exact column widths.
+- **Platform coverage:** mac+linux+windows.
+
+##### render/layout/005 — The new-pane form modal renders without panicking on a wide-but-very-short terminal (PRD #144 bounds-safety guard).
+- **Layer:** L1 (in-process `TestBackend` via `render_new_pane_form_to_buffer`; no PTY, no subprocess).
+- **Agent:** none (renders the new-pane form with two mode options into an 80×3 buffer).
+- **Asserts:** rendering the content-sized new-pane form modal at a wide-but-very-short 80×3 terminal — where the modal is clamped to ~2 rows, far fewer than the form's reserved field rows — completes WITHOUT panicking, and returns a buffer of exactly the requested size so every overlay cell (mode chips, `[Submit]`/`[Cancel]` row, cursor) stayed within the clamped modal/buffer bounds instead of being placed by an absolute line index that runs past the buffer bottom. A TUI must not panic on a small-but-valid terminal.
+- **Does not assert:** the exact rows the overlays land on; which overlays are skipped when they don't fit; the modal's content/labels at this degenerate size; behaviour at roomy sizes (covered by `mouse/form/001`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Keybindings (PRD #40)
 
 Keybindings resolve **client-side**: the config file lives on the machine
@@ -1384,11 +1398,11 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** click behavior (covered by `mouse/buttonbar/003`).
 - **Platform coverage:** mac+linux+windows.
 
-##### mouse/buttonbar/002 — On a narrow terminal the global bar degrades to shortcut-only labels.
+##### mouse/buttonbar/002 — On a narrow/windowed terminal the full bar WRAPS to multiple rows keeping full labels (PRD #144 — no shortcut-only chips).
 - **Layer:** L1.
-- **Agent:** none.
-- **Asserts:** the bar shows `[Ctrl+N] [Ctrl+W] [Ctrl+T] [?] [Ctrl+C]` and the full `[New Pane Ctrl+N]` label is absent — graceful degradation, not mid-label truncation.
-- **Does not assert:** exact column widths.
+- **Agent:** none (renders the full global + dashboard context bar at 80 cols into a multi-row area).
+- **Asserts:** at a narrow/windowed 80 cols the full `[Label Shortcut]` set (~133 cells) does not fit one row, so PRD #144 has the bar WRAP to multiple rows keeping the full label of every button — `[New Pane Ctrl+N]`, `[Close Ctrl+W]`, `[Toggle Layout Ctrl+T]`, `[Help ?]`, `[Quit Ctrl+C]`, and `[Scheduled Tasks s]` all render somewhere across the rows — the shortcut-only `[Ctrl+N]` chip is absent, and the bar occupies ≥2 rows. Inverts the pre-#144 shortcut-only degradation.
+- **Does not assert:** exact column widths; which button lands on which row; the exact row count beyond "more than one".
 - **Platform coverage:** mac+linux+windows.
 
 ##### mouse/buttonbar/003 — Clicking the New Pane bar button opens the directory picker, like Ctrl+N.
@@ -1412,11 +1426,11 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** the exact label/shortcut beyond the `[Scheduled` prefix; click behavior (covered by `mouse/buttonbar/004`); the bar's narrow-width degradation.
 - **Platform coverage:** mac+linux+windows.
 
-##### mouse/buttonbar/006 — At the default 120-col PTY width the FULL dashboard button set degrades to shortcut-only chips (PRD #127 — locks in the responsive collapse the L2 mouse specs widen past).
+##### mouse/buttonbar/006 — At the default 120-col PTY width the FULL dashboard button set WRAPS to a second row keeping full labels (PRD #144 — no shortcut-only chips, Scheduled Tasks not special-cased).
 - **Layer:** L1.
-- **Agent:** none (renders the full global + dashboard context bar, including the always-shown Scheduled Tasks button).
-- **Asserts:** at 120 cols (`DEFAULT_COLS`) the full set (~133 cells) overflows, so the bar shows the shortcut-only `[Ctrl+N]` chip and NOT the full `[New Pane Ctrl+N]` label, while the Scheduled Tasks button stays present and identifiable as `[Scheduled Tasks s]`.
-- **Does not assert:** the exact column widths; click behavior; the full-label rendering at roomy widths (covered by `mouse/buttonbar/001` / `005`).
+- **Agent:** none (renders the full global + dashboard context bar, including the always-shown Scheduled Tasks button, into a multi-row area).
+- **Asserts:** at 120 cols (`DEFAULT_COLS`) the full set (~133 cells) overflows one row, so PRD #144 has the bar WRAP to a second row keeping EVERY button's full label — the full `[New Pane Ctrl+N]` label is present and the shortcut-only `[Ctrl+N]` chip is absent — and the bar occupies ≥2 rows. Degradation is uniform: `[Scheduled Tasks s]` is full-labelled like the rest, NOT special-cased to keep its label while others chip. Inverts the pre-#144 collapse-to-chips behavior at the reference width.
+- **Does not assert:** the exact column widths; click behavior; which button lands on which row; the exact ceded row count (pinned by `render/layout/004`); the full-label rendering at roomy widths (covered by `mouse/buttonbar/001` / `005`).
 - **Platform coverage:** mac+linux+windows.
 
 #### mouse/tabstrip
@@ -1677,8 +1691,8 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### scheduler/manager/005 — The delete confirmation stays contained within the modal even for a long schedule name (PRD #127 finding).
 - **Layer:** L2 (same no-L1-seam reason). Drives the real dialog via `S` + `d` and asserts on the rendered vt100 grid.
 - **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`, one enabled task with a deliberately long name).
-- **Asserts:** after arming delete (`d`) on a long-named row, the confirmation's trailing `(y/n)` prompt — the only `(y/n)` in the app — still renders, proving the message is contained within the modal (wrapped, name on its own line) instead of overflowing the inner width and clipping the tail off the right border.
-- **Does not assert:** the exact wrap points / line count; the modal's precise capped width; the confirmation wording beyond the `(y/n)` tail and `Delete schedule` prefix.
+- **Asserts:** after arming delete (`d`) on a long-named row, the confirmation's trailing `(y/n)` prompt — the only `(y/n)` in the app — still renders, proving the message is contained within the modal. Under PRD #144 the confirmation sits on two fixed natural lines (the name line; the `… (y/n)` trailer) and the content-sized modal grows in WIDTH to contain the long name line (clamped to ≤90% of the terminal), so the trailer is never clipped off the right border — superseding the PRD #127 wrap-to-grow-height band-aid.
+- **Does not assert:** the modal's precise content-sized width / clamp fraction; the confirmation wording beyond the `(y/n)` tail and `Delete schedule` prefix.
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/manager/006 — Clicking a schedule row moves the selection to that row (PRD #127 finding — mouse parity).
@@ -1686,6 +1700,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`, two enabled tasks).
 - **Asserts:** with two rows (`alpha` auto-selected, `bravo` not), clicking the `bravo` row moves the `▶` selection marker to it (`▶ bravo` renders and `▶ alpha` is gone), proving a row click hit-tests and re-selects.
 - **Does not assert:** that the click also fires an action (it only selects); keyboard j/k navigation (the pre-existing selection path); scroll-into-view when the clicked row is off-window.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/007 — The manager dialog auto-sizes to its content and renders all fields un-clipped at both a roomy and a windowed width (PRD #144).
+- **Layer:** L2 (no public L1 dialog render seam — same constraint as `scheduler/manager/001`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid, at two PTY sizes via `with_pty_size`). Opened with the `S` keybinding.
+- **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`, one enabled task whose name is longer than the legacy fixed-width name cell).
+- **Asserts:** opening the manager at a roomy (200-col) terminal AND at a windowed (80-col) terminal renders the task's FULL name un-clipped on the grid at both widths — proving the dialog auto-sizes to its content (PRD #144 shared modal sizing helper, clamped within the windowed terminal) instead of truncating the field to the fixed 72-col modal. RED today: the modal is hard-capped at 72 cols and the name is truncated to 21 chars (`truncate_cell`), so the full name never appears.
+- **Does not assert:** the exact modal width / clamp fraction at each terminal size; the `[min, max]` bounds of the shared helper (covered by the coder's pure-data unit test); the delete-confirmation containment (covered by `scheduler/manager/005`).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live
