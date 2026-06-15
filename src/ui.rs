@@ -945,6 +945,14 @@ struct UiState {
     pane_layout: PaneLayout,
     /// Warnings collected during session save/restore, flushed after terminal restore.
     session_warnings: Vec<String>,
+    /// PRD #89 review-fix G1: tracks whether the most recent periodic snapshot
+    /// write (in `flush_session_snapshot_if_due`) failed. F10 keeps the
+    /// coalescer dirty on failure so the next loop retries; on a *persistent*
+    /// failure that retry fires every ~750ms, so we push the warning only on
+    /// the leading edge of a failure streak and suppress duplicates until a
+    /// later write succeeds (which clears this flag, re-arming the warning for
+    /// any subsequent new failure).
+    session_snapshot_write_failed: bool,
     /// Mouse text selection state for copy support.
     selection: Option<TextSelection>,
     /// Screen rect of the focused pane (set during render, used for mouse mapping).
@@ -1182,6 +1190,7 @@ impl UiState {
             update_available: None,
             pane_layout: PaneLayout::Stacked,
             session_warnings: Vec::new(),
+            session_snapshot_write_failed: false,
             selection: None,
             focused_pane_rect: None,
             side_pane_rects: Vec::new(),
@@ -5514,27 +5523,31 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
     // transient disk error we leave the coalescer dirty so the next loop
     // iteration retries, rather than dropping the pending snapshot until the
     // next unrelated state change re-dirties it.
-    let persisted = if session.panes.is_empty() {
-        match config::SavedSession::clear() {
-            Ok(()) => true,
-            Err(e) => {
-                ui.session_warnings
-                    .push(format!("Warning: failed to clear session: {e}"));
-                false
-            }
-        }
+    let result = if session.panes.is_empty() {
+        config::SavedSession::clear().map_err(|e| format!("Warning: failed to clear session: {e}"))
     } else {
-        match session.save() {
-            Ok(()) => true,
-            Err(e) => {
-                ui.session_warnings
-                    .push(format!("Warning: failed to save session: {e}"));
-                false
+        session
+            .save()
+            .map_err(|e| format!("Warning: failed to save session: {e}"))
+    };
+    match result {
+        Ok(()) => {
+            // PRD #89 review-fix G1: a successful write/clear ends any ongoing
+            // failure streak, so re-arm the one-shot warning for the next time
+            // a *new* failure occurs.
+            ui.session_snapshot_write_failed = false;
+            ui.session_coalescer.record_write(now);
+        }
+        Err(warning) => {
+            // PRD #89 review-fix G1: F10 keeps the coalescer dirty so the next
+            // loop retries, but on a PERSISTENT failure (disk full, bad perms)
+            // that retry fires every ~750ms. Push the warning AT MOST ONCE per
+            // ongoing failure streak so `session_warnings` cannot grow unbounded.
+            if !ui.session_snapshot_write_failed {
+                ui.session_warnings.push(warning);
+                ui.session_snapshot_write_failed = true;
             }
         }
-    };
-    if persisted {
-        ui.session_coalescer.record_write(now);
     }
 }
 

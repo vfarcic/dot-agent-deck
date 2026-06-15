@@ -1251,13 +1251,15 @@ mod tests {
             coalescer.record_write(after);
         }
 
-        assert!(
-            writes <= 2,
-            "a burst of 50 changes must coalesce to at most two disk writes, got {writes}"
-        );
-        assert!(
-            writes >= 1,
-            "the burst must still produce at least one write, got {writes}"
+        // PRD #89 review-fix G2: assert the EXACT write count, not `<= 2` / `>= 1`.
+        // For this scenario the count is fully determined — one leading-edge write
+        // on the first change plus one trailing write after the interval elapses =
+        // 2 — so any off-by-one in the coalescer (an extra leading write, a missed
+        // trailing flush) flips this count and fails the test.
+        assert_eq!(
+            writes, 2,
+            "a 50-change burst must coalesce to exactly two writes \
+             (leading edge + one trailing flush), got {writes}"
         );
 
         // After the trailing flush nothing is pending, so no further write is
