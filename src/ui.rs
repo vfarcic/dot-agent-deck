@@ -9149,16 +9149,16 @@ fn render_bottom_bar(
         UiMode::PaneInput => {
             // PRD #80 M6: while interacting with a pane, keep the status
             // message (e.g. "PaneInput mode …") on the left and expose the
-            // [Detach Ctrl+D] affordance at the right edge — clicking it
-            // returns to the dashboard exactly as Ctrl+D does.
+            // [Command Mode Ctrl+D] affordance at the right edge — clicking it
+            // returns to the dashboard (command mode) exactly as Ctrl+D does.
             if let Some((ref msg, _)) = ui.status_message {
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
             }
-            let detach_label = button_shortcut_label(&ui.keybindings, KbAction::Dashboard);
+            let command_mode_label = button_shortcut_label(&ui.keybindings, KbAction::Dashboard);
             let buttons = [Button::new(
-                "Detach",
-                detach_label,
+                "Command Mode",
+                command_mode_label,
                 Action::DetachToNormal,
                 true,
             )];
