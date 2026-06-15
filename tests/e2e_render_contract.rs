@@ -63,7 +63,7 @@ fn max_row_width(grid: &str) -> usize {
 
 /// Scenario: Launch the deck at 80×24 with a `--continue` pane running
 /// `sleep 600`, which auto-focuses (PaneInput) so its bordered `TerminalWidget`
-/// renders nearly full-screen (bottom bar shows `[Detach Ctrl+D]`). Enlarge the
+/// renders nearly full-screen (bottom bar shows `[Command Mode Ctrl+D]`). Enlarge the
 /// outer terminal to 120×24 (W → W+40), driving the `Event::Resize` path. The
 /// next settled frame must fill the new width — a rendered row (the pane border
 /// or the bottom bar) reaches close to column 120 — with no band of unfilled
@@ -80,8 +80,8 @@ fn render_001_enlarge_fills_new_width() {
         .with_continue_session("rp", "sleep 600")
         .launch_with_fixture("minimal");
     // --continue auto-focuses the restored pane: its TerminalWidget renders
-    // nearly full-screen and the bottom bar shows [Detach Ctrl+D].
-    deck.wait_for_string("[Detach Ctrl+D]");
+    // nearly full-screen and the bottom bar shows [Command Mode Ctrl+D].
+    deck.wait_for_string("[Command Mode Ctrl+D]");
 
     // Enlarge the outer terminal by 40 columns. The Event::Resize handler must
     // recompute layout and re-render to the new width.
@@ -116,7 +116,7 @@ fn layout_001_toggle_layout_keeps_pane_intact() {
         .with_pty_size(200, 40)
         .with_continue_session("rp", "sleep 600")
         .launch_with_fixture("minimal");
-    deck.wait_for_string("[Detach Ctrl+D]");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_bytes(b"\x04"); // Ctrl+D → dashboard / Normal mode
     deck.wait_for_string("[New Pane Ctrl+N]");
     // The restored No-agent pane's card body anchors the assertion.

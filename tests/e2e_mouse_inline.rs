@@ -6,7 +6,7 @@
 //! the mouse via SGR reports through `TuiDeck::click` / `find_in_grid` /
 //! `send_bytes`. Covers the filter-row `[Apply]`/`[Cancel]`, rename-row
 //! `[Save]`/`[Cancel]`, click-in-field focus retention, and the PaneInput
-//! `[Detach Ctrl+D]` affordance — each asserted to equal the corresponding
+//! `[Command Mode Ctrl+D]` affordance — each asserted to equal the corresponding
 //! keystroke. Decision 6: gated behind the `e2e` feature so `cargo
 //! test-fast` never compiles it.
 
@@ -166,10 +166,10 @@ fn inline_001_rename_cancel_abandons() {
 
 /// Scenario: A real `--continue`-spawned pane (`realpane`, running a long-
 /// lived command) is auto-focused on launch, so the TUI is in PaneInput mode
-/// showing the `[Detach Ctrl+D]` affordance. Click that affordance — it must
+/// showing the `[Command Mode Ctrl+D]` affordance. Click that affordance — it must
 /// return to the dashboard exactly as pressing Ctrl+D (`Action::
-/// DetachToNormal`) does, so the PaneInput `[Detach Ctrl+D]` bar is replaced
-/// by the Normal-mode global bar. RED until M6 renders the `[Detach Ctrl+D]`
+/// DetachToNormal`) does, so the PaneInput `[Command Mode Ctrl+D]` bar is replaced
+/// by the Normal-mode global bar. RED until M6 renders the `[Command Mode Ctrl+D]`
 /// affordance.
 #[spec("mouse/inline/001")]
 #[test]
@@ -182,15 +182,15 @@ fn inline_001_pane_input_detach_returns_to_dashboard() {
         .with_continue_session("realpane", "sleep 600")
         .launch_with_fixture("minimal");
     // --continue auto-focuses the single restored pane → PaneInput, so the
-    // [Detach Ctrl+D] affordance is already shown. That is exactly the
+    // [Command Mode Ctrl+D] affordance is already shown. That is exactly the
     // affordance under test.
-    deck.wait_for_string("[Detach Ctrl+D]");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
 
     // Click the detach affordance — same outcome as pressing Ctrl+D.
-    click_button(&deck, "[Detach Ctrl+D]");
+    click_button(&deck, "[Command Mode Ctrl+D]");
 
     // Detached to the dashboard: PaneInput's affordance is replaced by the
     // Normal-mode global bar.
     deck.wait_for_string("[New Pane Ctrl+N]");
-    deck.wait_for_absence("[Detach Ctrl+D]");
+    deck.wait_for_absence("[Command Mode Ctrl+D]");
 }

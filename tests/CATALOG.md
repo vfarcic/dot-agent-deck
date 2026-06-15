@@ -1469,10 +1469,10 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 
 #### mouse/inline
 
-##### mouse/inline/001 — Inline filter/rename rows gain Apply/Save/Cancel buttons; PaneInput gains `[Detach Ctrl+D]`.
+##### mouse/inline/001 — Inline filter/rename rows gain Apply/Save/Cancel buttons; PaneInput gains `[Command Mode Ctrl+D]`.
 - **Layer:** L1 (button render) + L2 (click outcomes).
 - **Agent:** none (synthetic card + a real `--continue` pane for detach).
-- **Asserts:** the filter row renders `[Apply]`/`[Cancel]` and the rename row `[Save]`/`[Cancel]` alongside the input; clicking them commits/abandons like Enter/Esc; clicking inside the field keeps it focused (typing stays keyboard); `[Detach Ctrl+D]` returns from PaneInput to the dashboard.
+- **Asserts:** the filter row renders `[Apply]`/`[Cancel]` and the rename row `[Save]`/`[Cancel]` alongside the input; clicking them commits/abandons like Enter/Esc; clicking inside the field keeps it focused (typing stays keyboard); `[Command Mode Ctrl+D]` returns from PaneInput to the dashboard.
 - **Does not assert:** cursor pixel position within the field.
 - **Platform coverage:** mac+linux (L1 half: +windows).
 
