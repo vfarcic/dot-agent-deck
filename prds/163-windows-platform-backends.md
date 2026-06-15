@@ -4,7 +4,7 @@
 **Priority**: Medium
 **Created**: 2026-06-14
 
-> **Phase 2 of native Windows support.** This PRD depends on the platform-abstraction foundation in **[#42](42-native-windows-support.md)** (the `src/platform/` seam, `cfg`-gated `libc`, the IPC abstraction, and the `windows-latest` CI job). Read #42 first — it holds the canonical architecture, the per-category Unix→Windows mapping table, the behavior-equivalence risk analysis, and the locked v1 decisions. This PRD implements the remaining platform backends on top of that seam.
+> **Phase 2 of native Windows support.** This PRD depends on the platform-abstraction foundation in **[#42](done/42-native-windows-support.md)** (the `src/platform/` seam, `cfg`-gated `libc`, the IPC abstraction, and the `windows-latest` CI job). Read #42 first — it holds the canonical architecture, the per-category Unix→Windows mapping table, the behavior-equivalence risk analysis, and the locked v1 decisions. This PRD implements the remaining platform backends on top of that seam.
 
 ## Problem
 
