@@ -4,7 +4,7 @@
 **Priority**: Medium
 **Created**: 2026-06-14
 
-> **Phase 3 of native Windows support.** Depends on the foundation in **[#42](42-native-windows-support.md)** and the platform backends in **[#163](163-windows-platform-backends.md)**. Read #42 for the canonical architecture and decisions. This PRD ships the binaries, runs the full interactive validation, and documents Windows support — it is the "make it real for users" phase.
+> **Phase 3 of native Windows support.** Depends on the foundation in **[#42](done/42-native-windows-support.md)** and the platform backends in **[#163](163-windows-platform-backends.md)**. Read #42 for the canonical architecture and decisions. This PRD ships the binaries, runs the full interactive validation, and documents Windows support — it is the "make it real for users" phase.
 
 ## Problem
 
