@@ -1,6 +1,6 @@
 # PRD #89: Auto-restore TUI state on attach; remove `--continue` flag
 
-**Status**: Implementation complete — pending changelog fragment (M5.2) + release (M5.3)
+**Status**: Complete — 2026-06-15
 **Priority**: Medium
 **Created**: 2026-05-16
 **Last Updated**: 2026-06-15
@@ -108,7 +108,7 @@ As a side effect, daemon crash recovery is "free": a respawned-empty daemon trig
 ### Phase 5: Documentation + release
 
 - [x] **M5.1** — Update the user-facing docs that mention `--continue` — verified current set: `docs/getting-started.md` and `docs/session-management.md` — to describe the new auto-restore model and the fresh-start escape hatch. (`session-management.md` is also where closed PRD #74 would have added its orchestration-restore paragraph; cover orchestration-tab restore here instead.)
-- [ ] **M5.2** — Draft a changelog fragment (via the `dot-ai-changelog-fragment` skill) flagging this as a breaking change with a one-line migration note ("Remove `--continue` from any wrapper scripts; auto-restore is now the default.").
+- [x] **M5.2** — Draft a changelog fragment (via the `dot-ai-changelog-fragment` skill) flagging this as a breaking change with a one-line migration note ("Remove `--continue` from any wrapper scripts; auto-restore is now the default.").
 - [ ] **M5.3** — Tag a release (`dot-ai-tag-release`) once everything lands.
 
 ## Dependencies
