@@ -22,29 +22,8 @@ use dot_agent_deck::ui::{
 };
 use spec::spec;
 
-/// Count the rows of `buffer` that carry any non-blank cell — i.e. how many
-/// rows the rendered bar occupies. This is the height the dashboard layout must
-/// subtract from its budget for the bottom bar.
-fn nonblank_rows(buffer: &ratatui::buffer::Buffer) -> usize {
-    let area = buffer.area();
-    (0..area.height)
-        .filter(|&y| (0..area.width).any(|x| !buffer[(x, y)].symbol().trim().is_empty()))
-        .count()
-}
-
-/// Join every row of the bar buffer into one `\n`-separated string, for a
-/// readable failure message.
-fn joined_rows(buffer: &ratatui::buffer::Buffer) -> String {
-    let area = buffer.area();
-    (0..area.height)
-        .map(|y| {
-            (0..area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+mod common;
+use common::{joined_rows, nonblank_rows};
 
 /// Scenario: Render the full dashboard button bar (global + context buttons,
 /// ~133 cells) into a tall `TestBackend` area at the 120-col reference width and

@@ -22,6 +22,9 @@ use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{render_button_bar_to_buffer, render_button_bar_with_bindings_to_buffer};
 use spec::spec;
 
+mod common;
+use common::{joined_rows, nonblank_rows};
+
 /// Collapse the rendered single-row buffer into one string of cell
 /// symbols, so content assertions read like the on-screen bar.
 fn row_text(buffer: &ratatui::buffer::Buffer) -> String {
@@ -29,34 +32,6 @@ fn row_text(buffer: &ratatui::buffer::Buffer) -> String {
     (0..area.width)
         .map(|x| buffer[(x, 0)].symbol())
         .collect::<String>()
-}
-
-/// PRD #144: join every row of a (possibly multi-row) bar buffer into one
-/// string, rows separated by `\n`. A wrapped button bar spreads its full-label
-/// buttons across more than one row, so content assertions read each button
-/// wherever it landed. Each button label stays contiguous within a single row,
-/// so a `\n`-joined `.contains(label)` finds it without crossing the boundary.
-fn joined_rows(buffer: &ratatui::buffer::Buffer) -> String {
-    let area = buffer.area();
-    (0..area.height)
-        .map(|y| {
-            (0..area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// PRD #144: count the rows that carry any non-blank cell — i.e. how many rows
-/// the rendered bar actually occupies. One row means the bar fit on a single
-/// line; two or more means it wrapped (each extra row is one row the dashboard
-/// must cede from its height budget).
-fn nonblank_rows(buffer: &ratatui::buffer::Buffer) -> usize {
-    let area = buffer.area();
-    (0..area.height)
-        .filter(|&y| (0..area.width).any(|x| !buffer[(x, y)].symbol().trim().is_empty()))
-        .count()
 }
 
 /// Scenario: Render the global button bar into a 120-column (comfortable
