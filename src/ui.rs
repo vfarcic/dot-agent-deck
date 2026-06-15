@@ -8668,10 +8668,21 @@ fn render_terminal_panes(
                         frame.render_widget(widget, chunks[i]);
                     }
                 } else {
-                    // Collapsed: show a titled border block.
+                    // Collapsed: show a titled border block. PRD #155 (M3): a
+                    // collapsed pane is by definition not the expanded/focused
+                    // slot, so the unified Option-A precedence resolves its
+                    // border to the agent's STATUS color — the SAME palette role
+                    // the Tiled and expanded-Stacked arms apply via
+                    // `with_status`, so a given state looks identical across all
+                    // embedded-pane contexts (criterion #2). Panes without a
+                    // backing session status keep the dimmed fallback.
+                    let border_style = pane_status
+                        .get(pane_id.as_str())
+                        .map(|status| Style::default().fg(palette::status_color(status)))
+                        .unwrap_or_else(text_dim);
                     let block = Block::default()
                         .borders(Borders::TOP)
-                        .border_style(text_dim())
+                        .border_style(border_style)
                         .title(format!(" {title} "));
                     frame.render_widget(block, chunks[i]);
                 }
