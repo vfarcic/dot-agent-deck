@@ -8936,15 +8936,14 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
             has_cards,
         ),
     ];
-    // PRD #80 / PRD #127 finding #4: the `[Scheduled Tasks s]` open button is
-    // always shown — it opens the manager, which is itself how you CREATE the
-    // first schedule (its `[Add a]` action works on an empty list), so gating it
-    // on a non-empty schedule list would hide the only entry point. The label/
-    // shortcut are baked into `label` with an EMPTY shortcut on purpose: this
-    // button only ever appears once the bar has overflowed into shortcut-only
-    // mode (it cannot fit at full width), and an empty shortcut makes the
-    // shortcut-only fallback render `[Scheduled Tasks s]` rather than `[s]`, so
-    // the command stays identifiable and clickable. The notation is still
+    // PRD #80 / PRD #127 finding #4 / PRD #144: the `[Scheduled Tasks s]` open
+    // button is always shown — it opens the manager, which is itself how you
+    // CREATE the first schedule (its `[Add a]` action works on an empty list),
+    // so gating it on a non-empty schedule list would hide the only entry
+    // point. The notation is folded into `label` with an EMPTY shortcut field;
+    // since PRD #144 the bar always renders every button's full label and wraps
+    // any overflow onto a fresh row (no shortcut-only chips), so this renders
+    // `[Scheduled Tasks s]` in full like every other button. The notation is
     // config-derived so a remap of `open_scheduled_tasks` is reflected.
     buttons.push(Button::new(
         format!(
