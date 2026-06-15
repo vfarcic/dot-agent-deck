@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.30.0] - 2026-06-15
+
+### Changed
+
+- **Auto-Restore TUI State on Attach; `--continue` Flag Removed**
+  Running `dot-agent-deck` now **restores your previous workspace automatically** — panes, agents, and orchestration tabs are recreated from the last saved snapshot. Previously, an empty session was the default and `--continue` was required to restore state; that flag is now removed.
+  **What changed for users:**
+  - **Auto-restore is the new default.** Both `dot-agent-deck` (local) and `dot-agent-deck connect` (remote) restore the previous session on startup. On a fresh machine with no prior snapshot, the dashboard starts empty as before. On reconnect after a daemon crash, the workspace is recreated from the snapshot — agents are respawned and orchestration tabs are rebuilt.
+  - **`--continue` is removed.** Passing `--continue` prints a friendly message explaining that auto-restore is now the default and exits. Remove `--continue` from any wrapper scripts or aliases.
+  - **Fresh start via `dot-agent-deck snapshot clear`.** To begin a new session without the previous workspace, run `dot-agent-deck snapshot clear`. This deletes the global snapshot (`~/.config/dot-agent-deck/session.toml`, or the path set by `DOT_AGENT_DECK_SESSION`) and the next launch starts empty.
+  - **Snapshot stays continuously fresh.** The snapshot is written on every meaningful state change (new pane, rename, close, agent stop/restart, orchestration changes) and on detach — not only at clean quit. A 750 ms coalescer prevents excessive disk writes during bursts.
+  - **Orchestration tabs survive restart.** When the daemon is empty (first launch on a new machine, or after a crash), orchestration tabs are rebuilt from the snapshot: orchestrator pane, role panes in order, prompts, and role cursor position. On config drift (config deleted or roles removed), a warning is shown and the tab falls back to a plain dashboard pane.
+  **Migration:** Remove `--continue` from any wrapper scripts or shell aliases. Auto-restore is now the default — no flag needed.
+  See the [Session Management docs](https://agent-deck.devopstoolkit.ai/docs/session-management) for full details on the restore model and the `snapshot clear` escape hatch.
+
+### Added
+
+- **Roomier Button Bar and Auto-Sized Modals**
+  The bottom button bar and modal dialogs no longer cram content into fixed-footprint surfaces as the UI grows.
+  The button bar now wraps to a second row when full labels don't fit at the current terminal width, keeping complete labels for every button. Previously, at split-screen or windowed widths (~120 columns), the bar collapsed all buttons to shortcut-only chips while the Scheduled Tasks button inconsistently kept its label. The wrapped layout is uniform — every button degrades equally — and the dashboard or pane region shrinks by exactly the extra row so content is never overlapped or clipped (a minimum of one content row is always reserved).
+  Modal dialogs (Scheduled Tasks manager, new-pane/new-deck form, and confirmation prompts) are now content-driven auto-sized via a shared helper: each modal sizes itself to its content, is clamped to no more than 90% of the terminal in each dimension, and is centered on screen. The per-dialog band-aids introduced over prior sessions (`wrap_to_width`, `truncate_cell`, `layout_mode_chips`) have been removed and superseded by this single consistent approach.
+- **Consistent Color Scheme Across Deck Cards and Embedded Panes**
+  Agent status is now color-coded consistently whether an agent appears as a dashboard deck card or as an embedded pane — the same state looks the same everywhere in the TUI.
+  Previously, deck card borders encoded agent status (green = working, blue = thinking, yellow = waiting, red = error) while embedded pane borders encoded focus (cyan = focused, dimmed = unfocused), so the same agent could look different depending on the surface rendering it. Now both surfaces share a single semantic palette: border color encodes status in both contexts, selection is indicated by a Magenta highlight and `▸` arrow marker, and focus is indicated by Cyan — none of these roles overlap, so status, selection, and focus are always visually distinguishable.
+  The status color mapping is: Working = Green, Thinking = Blue, Waiting = Yellow, Error = Red, Idle = DarkGray.
+
+### Fixed
+
+- **Corrected Ctrl+D Footer Label**
+  The pane footer now correctly labels the Ctrl+D keybinding as `[Command Mode Ctrl+D]` instead of the misleading `[Detach Ctrl+D]` — the binding returns to the dashboard/command mode, not a daemon detach (daemon detach remains the Ctrl+C Quit modal).
+
+
+
 ## [0.29.1] - 2026-06-14
 
 ### Fixed
