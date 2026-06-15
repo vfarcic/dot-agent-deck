@@ -63,9 +63,9 @@ fn dashboard_001_click_selects_double_click_focuses() {
         .with_continue_session("realpane", "sleep 600")
         .launch_with_fixture("minimal");
     // --continue auto-focuses the single restored pane (PaneInput → the bottom
-    // bar shows [Detach Ctrl+D]). Detach to the dashboard Normal mode (bar
+    // bar shows [Command Mode Ctrl+D]). Detach to the dashboard Normal mode (bar
     // shows [New Pane Ctrl+N]) so the card is clickable.
-    deck.wait_for_string("[Detach Ctrl+D]");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_bytes(b"\x04"); // Ctrl+D → dashboard / Normal mode
     deck.wait_for_string("[New Pane Ctrl+N]");
     // The realpane card's body shows "Launch an agent..." (a No-agent pane).

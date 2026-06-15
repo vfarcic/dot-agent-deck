@@ -23,6 +23,7 @@ pub mod keybindings;
 pub mod llm;
 pub mod mode_manager;
 pub mod opencode_manage;
+pub mod palette;
 pub mod pane;
 pub mod pane_input;
 pub mod project_config;

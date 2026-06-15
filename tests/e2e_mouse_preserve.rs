@@ -32,12 +32,12 @@ fn send_session_start(deck: &TuiDeck, session_id: &str, pane_id: &str, cwd: &str
 
 /// Scenario: Verify existing pane mouse behavior survives the PRD #80 button
 /// layer. A real `--continue`-spawned pane (`realpane`, running a long-lived
-/// command) is auto-focused on launch (PaneInput → [Detach Ctrl+D]), which
+/// command) is auto-focused on launch (PaneInput → [Command Mode Ctrl+D]), which
 /// already exercises the focus_pane / focused_pane_rect path. (1) A non-button
 /// click inside the focused-pane region and (2) a scroll wheel event in that
 /// region must NOT be swallowed by the button hit-test layer (which only runs
 /// on Down/Up) — they reach the existing pane path, so no global button action
-/// (no picker) fires. We then detach via the [Detach Ctrl+D] affordance and
+/// (no picker) fires. We then detach via the [Command Mode Ctrl+D] affordance and
 /// return cleanly to Normal mode; if a mid-pane event had wrongly navigated
 /// away, the detach would not return us to the global bar. Should be GREEN
 /// (asserts existing behavior). DEFERRED, with reasons, in the body:
@@ -68,18 +68,18 @@ fn preserve_001_existing_pane_mouse_behavior_intact() {
         .with_continue_session("realpane", "sleep 600")
         .launch_with_fixture("minimal");
     // --continue auto-focuses the restored pane → PaneInput, shown by the
-    // [Detach Ctrl+D] affordance (the focus path works).
-    deck.wait_for_string("[Detach Ctrl+D]");
+    // [Command Mode Ctrl+D] affordance (the focus path works).
+    deck.wait_for_string("[Command Mode Ctrl+D]");
 
     // (1)+(2) A non-button click AND a scroll inside the focused-pane region
     // (right-hand preview) must NOT be swallowed by the button layer. Capture
-    // the [Detach Ctrl+D] affordance, then send mid-pane click, mid-pane
+    // the [Command Mode Ctrl+D] affordance, then send mid-pane click, mid-pane
     // scroll, and the detach click — buffered and processed in order. If a
     // mid-pane event had wrongly fired the New-Pane button, the picker would
     // cover the bar and the detach click would not return us to Normal.
     let (dcol, drow) = deck
-        .find_in_grid("[Detach Ctrl+D]")
-        .expect("PaneInput bottom bar should render [Detach Ctrl+D]");
+        .find_in_grid("[Command Mode Ctrl+D]")
+        .expect("PaneInput bottom bar should render [Command Mode Ctrl+D]");
     deck.click(60, 5); // non-button click inside the focused-pane preview
     deck.scroll(60, 5, true); // scroll inside the pane region (not Down/Up → never hits buttons)
     deck.click(dcol, drow); // detach
@@ -163,7 +163,7 @@ fn preserve_modal_click_miss_is_consumed() {
     // --continue auto-focuses the restored pane (PaneInput). Detach to the
     // dashboard so the modal opens over the dashboard, with the (now
     // unfocused) pane region behind the centered popup.
-    deck.wait_for_string("[Detach Ctrl+D]");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_bytes(b"\x04"); // Ctrl+D → dashboard / Normal
     deck.wait_for_string("[New Pane Ctrl+N]");
 

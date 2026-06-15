@@ -1,6 +1,6 @@
 # PRD #155: Centralized color palette for consistent deck and pane theming
 
-**Status**: Planning
+**Status**: Implementation complete — pending M6 visual verification (at PR review)
 **Priority**: Medium
 **Created**: 2026-06-14
 **GitHub Issue**: [#155](https://github.com/vfarcic/dot-agent-deck/issues/155)
@@ -55,12 +55,12 @@ The PRD plan phase will lock one of these (A/C lean) before implementation. What
 
 ## Milestones
 
-- [ ] **M1 — Role set + border policy decided**: The semantic role set and the per-context border policy (the key design decision A/B/C) are agreed and documented; selection/focus roles are distinct from the status palette (no green collision).
-- [ ] **M2 — Central palette in place**: Named roles defined as the single source of truth (global vars / module); the deck-card render path uses them instead of inline `Color::X`.
-- [ ] **M3 — Panes use the same scheme**: Embedded pane/agent rendering uses the same palette roles, so a given state looks identical in decks and panes.
-- [ ] **M4 — Guards hold (and tighten)**: `theme/guard/001-002` + `theme/contrast/001` still pass; optionally add a guard that the render paths use palette roles rather than raw `Color::X`.
-- [ ] **M5 — Tests**: L1 render coverage asserts deck and pane coloring per role (and that selection/focus/status are visually distinct); affected snapshots updated.
-- [ ] **M6 — Visual verification**: Run the app (run-dot-agent-deck) and confirm decks and panes are visually consistent across states; update any user-facing docs if applicable.
+- [x] **M1 — Role set + border policy decided**: **Option A** locked — border encodes status in both decks and panes; selection = Magenta + `▸` + BOLD, focus = Cyan, status = Green/Blue/Yellow/Red/DarkGray. Selection/focus roles are distinct from the status palette (no green collision). Documented in `.dot-agent-deck/prd-155-plan.md`.
+- [x] **M2 — Central palette in place**: New `src/palette.rs` defines the named roles (`STATUS_WORKING/THINKING/WAITING/ERROR/IDLE`, `FOCUSED`, `SELECTED`) + `status_color()` as the single source of truth; the deck-card render path uses them instead of inline `Color::X` (commit `932cc59`).
+- [x] **M3 — Panes use the same scheme**: `TerminalWidget` gained a status-aware border (`with_status`), and `render_frame` builds `build_pane_status` and threads it through `render_terminal_panes`/`render_mode_tab`, so a given state looks identical in decks and panes (commits `932cc59`, `e0fb794`).
+- [x] **M4 — Guards hold (and tighten)**: `theme/guard/001-002` + `theme/contrast/001` remain green; added `theme/guard/003` source-lint asserting the deck/pane render paths (incl. `render_stats_bar`) use palette roles, not raw status `Color::X` (commits `5feb78b`, `3ec8cac`).
+- [x] **M5 — Tests**: L1 render coverage (`theme/palette/001-004`) asserts deck and pane coloring per role and that selection/focus/status are visually distinct; `build_pane_status` unit test guards the M3 join; `test_status_style` updated to the locked mapping. Fast tier **758/758**, E2E **1119/1119** green; no snapshot churn.
+- [ ] **M6 — Visual verification**: Run the app (`run-dot-agent-deck`) and confirm decks and panes are visually consistent across states; update any user-facing docs if applicable. *(Deferred to PR review — the production `render_frame` pane path has no daemon-free L1 seam, so this manual check is load-bearing.)*
 
 ## Success Criteria
 

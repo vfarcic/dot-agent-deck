@@ -1483,10 +1483,10 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 
 #### mouse/inline
 
-##### mouse/inline/001 — Inline filter/rename rows gain Apply/Save/Cancel buttons; PaneInput gains `[Detach Ctrl+D]`.
+##### mouse/inline/001 — Inline filter/rename rows gain Apply/Save/Cancel buttons; PaneInput gains `[Command Mode Ctrl+D]`.
 - **Layer:** L1 (button render) + L2 (click outcomes).
 - **Agent:** none (synthetic card + a real `--continue` pane for detach).
-- **Asserts:** the filter row renders `[Apply]`/`[Cancel]` and the rename row `[Save]`/`[Cancel]` alongside the input; clicking them commits/abandons like Enter/Esc; clicking inside the field keeps it focused (typing stays keyboard); `[Detach Ctrl+D]` returns from PaneInput to the dashboard.
+- **Asserts:** the filter row renders `[Apply]`/`[Cancel]` and the rename row `[Save]`/`[Cancel]` alongside the input; clicking them commits/abandons like Enter/Esc; clicking inside the field keeps it focused (typing stays keyboard); `[Command Mode Ctrl+D]` returns from PaneInput to the dashboard.
 - **Does not assert:** cursor pixel position within the field.
 - **Platform coverage:** mac+linux (L1 half: +windows).
 
@@ -1549,10 +1549,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 #### theme/guard
 
-##### theme/guard/001 — No absolute background on any cheaply-seamable surface; selection is cued by the Cyan+BOLD border, not an absolute fill.
+##### theme/guard/001 — No absolute background on any cheaply-seamable surface; selection is cued by the Magenta+BOLD border, not an absolute fill.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none.
-- **Asserts:** rendering the five overlay seams plus a session card in both the unselected and selected states, (a) no cell carries a `Color::Rgb(..)` background — backgrounds must be `Color::Reset`; and (b) the selected card is distinguished from the unselected one by a terminal-relative cue (the `▸ ` title prefix and a Cyan+BOLD border) rather than an absolute `selected_bg` fill.
+- **Asserts:** rendering the five overlay seams plus a session card in both the unselected and selected states, (a) no cell carries a `Color::Rgb(..)` background — backgrounds must be `Color::Reset`; and (b) the selected card is distinguished from the unselected one by a terminal-relative cue (the `▸ ` title prefix and a `Color::Magenta`+BOLD border — the dedicated PRD #155 `selected` accent role, which never reuses a status color or the `focused` cyan) rather than an absolute `selected_bg` fill.
 - **Does not assert:** named-ANSI accents/status colors; the `render_frame` canvas/tab-bar fills (not cheaply reachable through a render seam — guarded by `theme/guard/002`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -1561,6 +1561,43 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none.
 - **Asserts:** `src/ui.rs` contains none of `bg(Color::Rgb`, `bg(palette.terminal_bg)`, `bg(palette.selected_bg)`, `bg(palette.tab_bar_bg)` — guarding the `render_frame` canvas/tab-bar fills that paint the whole window and aren't cheaply reachable through a render seam.
 - **Does not assert:** runtime rendering behavior (covered by `theme/guard/001` and `theme/contrast/001`); absolute colors in other source files.
+- **Platform coverage:** mac+linux+windows.
+
+##### theme/guard/003 — The deck-card, embedded-pane and stats-bar render paths resolve colors through the centralized palette, not inline status literals (source lint).
+- **Layer:** L1 (source lint — reads `src/ui.rs` and `src/terminal_widget.rs` from disk; no rendering).
+- **Agent:** none.
+- **Asserts:** both render paths reference the centralized `palette`; the deck-card status mapping (`status_style`) and border resolver (`render_session_card`) in `src/ui.rs` carry no inline status/accent `Color::Green/Blue/Yellow/Red/Cyan`/`Color::Magenta` literals; the embedded-pane path (`src/terminal_widget.rs`) carries no inline status `Color::Green/Blue/Yellow/Red` literal; and the stats bar (`render_stats_bar` in `src/ui.rs`) carries no inline status `Color::Green/Blue/Yellow/Red` literal — the palette is the single source of truth (PRD #155 M4 tightening).
+- **Does not assert:** the palette module's exact API/shape (the rendered-color tests `theme/palette/001-004` cover behavior); absolute backgrounds (covered by `theme/guard/002`); the stats bar's legitimate non-status `Color::Cyan` (active-count) and `Color::LightMagenta` (mode-label) accents, which are not status roles; inline literals in render paths other than the deck-card/pane/stats-bar status colors.
+- **Platform coverage:** mac+linux+windows.
+
+#### theme/palette
+
+##### theme/palette/001 — Deck-card border encodes status via the centralized palette roles.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
+- **Agent:** none (six live session fixtures, one per status).
+- **Asserts:** rendering a deck card (not selected, not focused) for each agent status resolves its border to the matching centralized status role — working=`Color::Green`, thinking=`Color::Blue`, compacting=`Color::Blue` (shares the thinking role), waiting=`Color::Yellow`, error=`Color::Red`, idle=`Color::DarkGray`; and that no status border reuses an accent role (`Color::Magenta`=selected, `Color::Cyan`=focused), so a status never collides with selection/focus.
+- **Does not assert:** the per-card status badge text/glyph; selection/focus accents (covered by `theme/palette/003-004`); the palette module's internal API (reads the rendered border color).
+- **Platform coverage:** mac+linux+windows.
+
+##### theme/palette/002 — Embedded-pane border uses the SAME status color the deck card uses (deck/pane consistency).
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
+- **Agent:** none (six live session fixtures + a `TerminalWidget` per status).
+- **Asserts:** for each agent status (including compacting, which shares the thinking/Blue role), the embedded pane's border color (neither selected nor focused) equals the deck card's border color for that status, and both equal the palette status role — so a given state looks identical as a deck card and as an embedded pane (PRD #155 success criterion #2).
+- **Does not assert:** pane content/title rendering; the focused/selected pane accents (covered by `theme/palette/004` / `theme/guard/001`).
+- **Platform coverage:** mac+linux+windows.
+
+##### theme/palette/003 — Selected deck-card border is the dedicated `selected` accent (Magenta+BOLD+marker), never a status/focus color.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
+- **Agent:** none (one selected live session fixture).
+- **Asserts:** rendering a selected deck card resolves its border to `Color::Magenta` + `Modifier::BOLD` with a `▸ ` title marker, and that this color is neither the working-status green nor the focused-pane cyan — the `selected` role never collides with the status palette or the `focused` accent.
+- **Does not assert:** the status badge (still shows status independent of selection); the absolute-background guard (covered by `theme/guard/001`).
+- **Platform coverage:** mac+linux+windows.
+
+##### theme/palette/004 — Focused-pane border is the dedicated `focused` accent (Cyan), distinct from every status and from `selected`.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
+- **Agent:** none (one focused `TerminalWidget`).
+- **Asserts:** rendering a focused embedded pane resolves its border to `Color::Cyan`, and that this color is distinct from every status role (green/blue/yellow/red/dark-gray) and from the `selected` accent (magenta) — focus stays Cyan while selection moves to Magenta, so status/selection/focus are provably distinct (PRD #155 success criterion #3). Also asserts the PRECEDENCE invariant: a pane that is focused AND carries a present `Working` status still renders the focused accent (Cyan), never the Working/Green status color — focus OVERRIDES a present status in the unified border precedence (Option A).
+- **Does not assert:** unfocused-pane status coloring (covered by `theme/palette/002`); pane content rendering.
 - **Platform coverage:** mac+linux+windows.
 
 

@@ -26,6 +26,7 @@ use crate::features::Features;
 // latter under an alias so both coexist: `Action` = the UI dispatch action,
 // `KbAction` = a remappable keybinding action (MoveDown, Help, …).
 use crate::keybindings::{Action as KbAction, KeybindingConfig};
+use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
@@ -8101,6 +8102,25 @@ fn resize_panes_to_layout(layout: &FrameLayout, embedded: &EmbeddedPaneControlle
     }
 }
 
+/// PRD #155 (M3): build the per-frame join from each managed pane id to its
+/// agent status, read from the SAME source the deck cards use
+/// (`state.sessions[*].status`). The result keys an embedded pane's border to
+/// the centralized-palette status color so deck cards and panes agree
+/// (criterion #2).
+///
+/// Only sessions that own a pane (`pane_id.is_some()`) appear — pane-less
+/// sessions are excluded, since there is no pane to color. Borrowed `&str` keys
+/// avoid a per-frame clone of every pane id; the status enum clone is cheap
+/// (fieldless). Extracted from `render_frame` so the join can be unit-tested
+/// without a live daemon.
+pub(crate) fn build_pane_status(state: &AppState) -> HashMap<&str, SessionStatus> {
+    state
+        .sessions
+        .values()
+        .filter_map(|s| s.pane_id.as_deref().map(|pid| (pid, s.status.clone())))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     frame: &mut Frame,
@@ -8176,6 +8196,15 @@ fn render_frame(
         ui.tab_close_rects.clear();
     }
 
+    // PRD #155 (M3): map each managed pane to its agent status from the SAME
+    // source the deck cards read (`state.sessions[*].status`), so an embedded
+    // pane's border encodes its status with the SAME centralized-palette color
+    // the deck card uses — closing the deck/pane consistency gap (criterion #2).
+    // Built once and threaded into every `render_terminal_panes` call below (and
+    // into `render_mode_tab`). Extracted into `build_pane_status` so the join can
+    // be unit-tested without a live daemon.
+    let pane_status: HashMap<&str, SessionStatus> = build_pane_status(state);
+
     // Branch on the content the layout pass resolved. Mode tabs render and
     // return here; dashboard / orchestration fall through to the card grid.
     let (dashboard_area, panes_area, pane_ids, pane_rects) = match &layout.content {
@@ -8207,6 +8236,7 @@ fn render_frame(
                 has_pane_control,
                 active_mode_name,
                 focused_pane_id.as_deref(),
+                &pane_status,
             );
             return;
         }
@@ -8249,6 +8279,7 @@ fn render_frame(
                 pane_ids,
                 pane_layout,
                 &ui.pane_display_names,
+                &pane_status,
                 &ui.selection,
                 None,
                 Some(&pane_outer_rects),
@@ -8337,6 +8368,7 @@ fn render_frame(
                 pane_ids,
                 pane_layout,
                 &ui.pane_display_names,
+                &pane_status,
                 &ui.selection,
                 None,
                 Some(&pane_outer_rects),
@@ -8453,6 +8485,7 @@ fn render_frame(
             pane_ids,
             pane_layout,
             &ui.pane_display_names,
+            &pane_status,
             &ui.selection,
             None,
             Some(&pane_outer_rects),
@@ -8530,6 +8563,13 @@ fn render_terminal_panes(
     pane_ids: &[String],
     layout: PaneLayout,
     display_names: &HashMap<String, String>,
+    // PRD #155 (M3): per-pane agent status keyed by pane_id, sourced from the
+    // SAME `state.sessions[*].status` the deck cards render through
+    // `status_style`. Threaded so a non-focused pane's border encodes its status
+    // via the centralized `palette` — the SAME color the deck card uses for that
+    // state (criterion #2). A pane absent from the map (no backing session)
+    // keeps the legacy focus-only border (the `TerminalWidget::new` default).
+    pane_status: &HashMap<&str, SessionStatus>,
     selection: &Option<TextSelection>,
     visual_focus_id: Option<&str>,
     // PRD #84: per-pane OUTER rects (aligned 1:1 with `pane_ids`) precomputed by
@@ -8594,8 +8634,15 @@ fn render_terminal_panes(
                     let title = pane_name(pane_id);
                     // PRD #84 M5: this pane was sized to `chunks[i]` by
                     // `resize_panes_to_layout` this frame, so attest the contract.
-                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused)
+                    let mut widget = TerminalWidget::new(Arc::clone(&screen), title, focused)
                         .contract_guaranteed(true);
+                    // PRD #155 (M3): supply the pane's status so a non-focused
+                    // pane renders its status-colored border via the palette (the
+                    // focus override stays inside TerminalWidget). Panes without a
+                    // backing session keep the legacy focus-only border.
+                    if let Some(status) = pane_status.get(pane_id.as_str()) {
+                        widget = widget.with_status(status.clone());
+                    }
                     if focused {
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
@@ -8617,8 +8664,13 @@ fn render_terminal_panes(
                         let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
                         // PRD #84 M5: the expanded pane was sized to `chunks[i]`
                         // by `resize_panes_to_layout` this frame — attest it.
-                        let widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused)
-                            .contract_guaranteed(true);
+                        let mut widget =
+                            TerminalWidget::new(Arc::clone(&screen), title, is_focused)
+                                .contract_guaranteed(true);
+                        // PRD #155 (M3): same status threading as the Tiled arm.
+                        if let Some(status) = pane_status.get(pane_id.as_str()) {
+                            widget = widget.with_status(status.clone());
+                        }
                         if is_focused {
                             focused_pane_rect = Some(chunks[i]);
                             focused_screen = Some(screen);
@@ -8626,10 +8678,21 @@ fn render_terminal_panes(
                         frame.render_widget(widget, chunks[i]);
                     }
                 } else {
-                    // Collapsed: show a titled border block.
+                    // Collapsed: show a titled border block. PRD #155 (M3): a
+                    // collapsed pane is by definition not the expanded/focused
+                    // slot, so the unified Option-A precedence resolves its
+                    // border to the agent's STATUS color — the SAME palette role
+                    // the Tiled and expanded-Stacked arms apply via
+                    // `with_status`, so a given state looks identical across all
+                    // embedded-pane contexts (criterion #2). Panes without a
+                    // backing session status keep the dimmed fallback.
+                    let border_style = pane_status
+                        .get(pane_id.as_str())
+                        .map(|status| Style::default().fg(palette::status_color(status)))
+                        .unwrap_or_else(text_dim);
                     let block = Block::default()
                         .borders(Borders::TOP)
-                        .border_style(text_dim())
+                        .border_style(border_style)
                         .title(format!(" {title} "));
                     frame.render_widget(block, chunks[i]);
                 }
@@ -8716,6 +8779,10 @@ fn render_mode_tab(
     has_pane_control: bool,
     active_mode_name: Option<&str>,
     focused_pane_id: Option<&str>,
+    // PRD #155 (M3): per-pane agent status (pane_id → status) forwarded from
+    // `render_frame` into both `render_terminal_panes` calls below, so mode-tab
+    // panes get the same status-colored borders as the dashboard's panes.
+    pane_status: &HashMap<&str, SessionStatus>,
 ) {
     // PRD #83: `focused_pane_id` is keyed by stable pane id. `None` (or an
     // id that isn't one of this tab's side panes) means the agent pane is
@@ -8742,6 +8809,7 @@ fn render_mode_tab(
             &agent_ids,
             PaneLayout::Stacked,
             &ui.pane_display_names,
+            pane_status,
             &ui.selection,
             agent_visual_focus,
             // Mode-tab panes recompute their rects (out of the Cards finding's
@@ -8762,6 +8830,7 @@ fn render_mode_tab(
             side_pane_ids,
             PaneLayout::Tiled,
             &ui.pane_display_names,
+            pane_status,
             &ui.selection,
             side_visual_focus.as_deref(),
             // Mode side panes recompute via pane_stack_rects (Tiled) — same
@@ -8801,21 +8870,40 @@ fn render_stats_bar(
             .add_modifier(Modifier::BOLD),
     ));
 
-    // Semantic statuses keep their named-ANSI accent. Idle has no accent color,
-    // but its count is neutral text the user reads (like the tools count), so
-    // per the PRD #13 readability decision it renders at full contrast via
-    // text_primary() rather than dimmed. Only decoration — the `│` separators
-    // below — stays text_dim().
+    // Semantic statuses resolve their color through `palette::status_color` —
+    // the single source of truth shared with the deck-card and embedded-pane
+    // borders (PRD #155). This is why `compacting` shows Blue (it shares the
+    // thinking role) and never reuses the `selected` Magenta accent. Idle has no
+    // accent color, but its count is neutral text the user reads (like the tools
+    // count), so per the PRD #13 readability decision it renders at full contrast
+    // via text_primary() rather than the dimmed idle role. Only decoration — the
+    // `│` separators below — stays text_dim().
     let segments: &[(usize, &str, Style)] = &[
-        (stats.working, "working", Style::default().fg(Color::Green)),
-        (stats.thinking, "thinking", Style::default().fg(Color::Blue)),
+        (
+            stats.working,
+            "working",
+            Style::default().fg(palette::status_color(&SessionStatus::Working)),
+        ),
+        (
+            stats.thinking,
+            "thinking",
+            Style::default().fg(palette::status_color(&SessionStatus::Thinking)),
+        ),
         (
             stats.compacting,
             "compacting",
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(palette::status_color(&SessionStatus::Compacting)),
         ),
-        (stats.waiting, "waiting", Style::default().fg(Color::Yellow)),
-        (stats.errors, "error", Style::default().fg(Color::Red)),
+        (
+            stats.waiting,
+            "waiting",
+            Style::default().fg(palette::status_color(&SessionStatus::WaitingForInput)),
+        ),
+        (
+            stats.errors,
+            "error",
+            Style::default().fg(palette::status_color(&SessionStatus::Error)),
+        ),
         (stats.idle, "idle", text_primary()),
     ];
 
@@ -9138,16 +9226,16 @@ fn render_bottom_bar(
         UiMode::PaneInput => {
             // PRD #80 M6: while interacting with a pane, keep the status
             // message (e.g. "PaneInput mode …") on the left and expose the
-            // [Detach Ctrl+D] affordance at the right edge — clicking it
-            // returns to the dashboard exactly as Ctrl+D does.
+            // [Command Mode Ctrl+D] affordance at the right edge — clicking it
+            // returns to the dashboard (command mode) exactly as Ctrl+D does.
             if let Some((ref msg, _)) = ui.status_message {
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
             }
-            let detach_label = button_shortcut_label(&ui.keybindings, KbAction::Dashboard);
+            let command_mode_label = button_shortcut_label(&ui.keybindings, KbAction::Dashboard);
             let buttons = [Button::new(
-                "Detach",
-                detach_label,
+                "Command Mode",
+                command_mode_label,
                 Action::DetachToNormal,
                 true,
             )];
@@ -10751,8 +10839,11 @@ fn render_session_card(
     title_left = truncate_with_ellipsis(&title_left, max_title);
 
     let border_style = if is_selected {
+        // PRD #155 Option A: selection uses the dedicated `selected` accent role
+        // (Magenta + BOLD, paired with the `▸ ` title marker above) — distinct
+        // from every status color and from the focused-pane cyan.
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::SELECTED)
             .add_modifier(Modifier::BOLD)
     } else if is_placeholder {
         // Placeholder ("No agent") cards read as secondary: dim the terminal's
@@ -10777,9 +10868,10 @@ fn render_session_card(
         );
 
     // PRD #13 Option A: selection is cued by the `▸ ` title prefix and the
-    // Cyan+BOLD border above — no whole-card `Modifier::REVERSED`. The full-card
-    // inversion was too heavy and redundant with those two cues, and stays
-    // terminal-relative (no absolute `selected_bg` tint).
+    // Magenta+BOLD border above (the `selected` palette accent, PRD #155) — no
+    // whole-card `Modifier::REVERSED`. The full-card inversion was too heavy and
+    // redundant with those two cues, and stays terminal-relative (no absolute
+    // `selected_bg` tint).
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -10953,16 +11045,19 @@ fn recent_tool_lines(session: &SessionState, max_tools: usize) -> Vec<Line<'stat
 }
 
 fn status_style(status: &SessionStatus) -> (&str, Style) {
+    // PRD #155: status colors are resolved through the centralized palette (the
+    // single source of truth), so the deck-card badge/border and the
+    // embedded-pane border agree for the same state. The label and the
+    // attention-grabbing BOLD on "Needs Input" stay here (presentation), only
+    // the color moves to the palette role.
+    let style = Style::default().fg(palette::status_color(status));
     match status {
-        SessionStatus::Thinking => ("Thinking", Style::default().fg(Color::Cyan)),
-        SessionStatus::Working => ("Working", Style::default().fg(Color::Yellow)),
-        SessionStatus::Compacting => ("Compacting", Style::default().fg(Color::Blue)),
-        SessionStatus::WaitingForInput => (
-            "Needs Input",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        SessionStatus::Idle => ("Idle", Style::default().fg(Color::Green)),
-        SessionStatus::Error => ("Error", Style::default().fg(Color::Red)),
+        SessionStatus::Thinking => ("Thinking", style),
+        SessionStatus::Working => ("Working", style),
+        SessionStatus::Compacting => ("Compacting", style),
+        SessionStatus::WaitingForInput => ("Needs Input", style.add_modifier(Modifier::BOLD)),
+        SessionStatus::Idle => ("Idle", style),
+        SessionStatus::Error => ("Error", style),
     }
 }
 
@@ -13399,23 +13494,87 @@ mod tests {
 
     #[test]
     fn test_status_style() {
+        // PRD #155: status colors now resolve through the centralized palette
+        // (single source of truth). LOCKED mapping: Working=Green,
+        // Thinking=Blue, WaitingForInput=Yellow, Error=Red, Idle=DarkGray, with
+        // Compacting sharing the thinking/Blue role.
         let (label, style) = status_style(&SessionStatus::Thinking);
         assert_eq!(label, "Thinking");
-        assert_eq!(style.fg, Some(Color::Cyan));
+        assert_eq!(style.fg, Some(Color::Blue));
 
         let (label, style) = status_style(&SessionStatus::Working);
         assert_eq!(label, "Working");
-        assert_eq!(style.fg, Some(Color::Yellow));
+        assert_eq!(style.fg, Some(Color::Green));
 
         let (label, style) = status_style(&SessionStatus::WaitingForInput);
         assert_eq!(label, "Needs Input");
+        assert_eq!(style.fg, Some(Color::Yellow));
+
+        let (label, style) = status_style(&SessionStatus::Idle);
+        assert_eq!(label, "Idle");
+        assert_eq!(style.fg, Some(Color::DarkGray));
+
+        let (label, style) = status_style(&SessionStatus::Error);
+        assert_eq!(label, "Error");
         assert_eq!(style.fg, Some(Color::Red));
 
-        let (label, _) = status_style(&SessionStatus::Idle);
-        assert_eq!(label, "Idle");
+        let (label, style) = status_style(&SessionStatus::Compacting);
+        assert_eq!(label, "Compacting");
+        assert_eq!(style.fg, Some(Color::Blue));
+    }
 
-        let (label, _) = status_style(&SessionStatus::Error);
-        assert_eq!(label, "Error");
+    #[test]
+    fn build_pane_status_keys_by_pane_id_and_excludes_pane_less() {
+        // PRD #155 (R2): `build_pane_status` is the M3 deck/pane border join —
+        // the map render_frame uses to color each managed pane by its agent
+        // status. Guard the join directly: every pane-bearing session maps its
+        // `pane_id` to its own status, and a pane-less session (`pane_id ==
+        // None`) is dropped. Two pane-bearing sessions carry DISTINCT statuses
+        // so a broken key can't silently swap colors or leave a managed pane on
+        // the dimmed (idle) border.
+        let mut working = make_session(SessionStatus::Working);
+        working.session_id = "s-working".into();
+        working.pane_id = Some("pane-w".into());
+
+        let mut waiting = make_session(SessionStatus::WaitingForInput);
+        waiting.session_id = "s-waiting".into();
+        waiting.pane_id = Some("pane-y".into());
+
+        // Pane-less: distinct status (Thinking) so its absence is unambiguous.
+        let mut paneless = make_session(SessionStatus::Thinking);
+        paneless.session_id = "s-paneless".into();
+        paneless.pane_id = None;
+
+        let mut state = AppState::default();
+        state.sessions.insert("s-working".into(), working);
+        state.sessions.insert("s-waiting".into(), waiting);
+        state.sessions.insert("s-paneless".into(), paneless);
+
+        let map = build_pane_status(&state);
+
+        // Exactly the two pane-bearing sessions appear, each keyed by its own
+        // pane id and mapped to its own status.
+        assert_eq!(
+            map.len(),
+            2,
+            "only pane-bearing sessions appear in the join"
+        );
+        assert_eq!(
+            map.get("pane-w"),
+            Some(&SessionStatus::Working),
+            "the working pane keeps its working status"
+        );
+        assert_eq!(
+            map.get("pane-y"),
+            Some(&SessionStatus::WaitingForInput),
+            "the waiting pane keeps its waiting status"
+        );
+        // The pane-less session contributes no key (no pane to color) — and its
+        // Thinking status never leaks into the map.
+        assert!(
+            !map.values().any(|s| *s == SessionStatus::Thinking),
+            "the pane-less session must be absent from the join"
+        );
     }
 
     #[test]
