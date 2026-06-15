@@ -42,28 +42,26 @@ The more agents you run in parallel, the more cards Agent Deck has to fit on the
 
 ## Resuming Sessions
 
-Agent Deck restores your workspace automatically. There is no flag to pass and no decision to make: every time you launch the TUI — `dot-agent-deck` locally or `dot-agent-deck connect <name>` against a remote daemon — your previous panes, names, directories, commands, and tabs come back.
+Agent Deck restores your workspace automatically. There is no flag to pass and no decision to make: every time you launch the TUI — `dot-agent-deck` locally or `dot-agent-deck connect <name>` for a remote machine — your previous panes, names, directories, commands, and tabs come back.
 
 > **Breaking change:** Auto-restore is now the default. Bare `dot-agent-deck` restores your previous workspace instead of starting empty, and the old `--continue` flag has been removed. If you have wrapper scripts or aliases that pass `--continue`, drop it — running `dot-agent-deck --continue` now prints a short message explaining that auto-restore is the default. To start from an empty dashboard on purpose, see [Starting Fresh](#starting-fresh) below.
 
-Restore happens in two layers, tried in order:
+What you get back depends on whether your agents are still running:
 
-1. **Daemon hydration first.** The background daemon owns your running agents, so on attach the dashboard rehydrates whatever the daemon currently holds — agents still in their previous state, with live output. This is the common case when you detach (close the TUI, or disconnect from a remote) and reattach later.
-2. **On-disk snapshot fallback.** If the daemon is empty — a fresh machine, the first launch after a reboot, or recovery after a daemon crash — Agent Deck falls back to the saved snapshot on disk and recreates the workspace structure: panes, names, directories, commands, and tabs. Agent processes are respawned fresh; each agent's own conversation state is restored by its own command line (for example, `claude --continue`), not by Agent Deck.
+- **They're still running.** When you close the TUI or disconnect, your agents keep running in the background (see [How it runs](getting-started.md#how-it-runs)), so coming back brings them up exactly as they were, with their live output. This is the everyday case.
+- **They're gone.** On a fresh machine, the first launch after a reboot, or after an unexpected shutdown, Agent Deck rebuilds your workspace — panes, names, directories, commands, and tabs — and starts the agents fresh. It restores the *shape* of your workspace, not an agent's in-progress work; each agent picks its own conversation back up through its own command (for example, `claude --continue`).
 
-If both the daemon and the snapshot are empty, you land on a clean, empty dashboard. When a snapshot restore rebuilds one or more orchestration tabs, Agent Deck opens the first restored orchestration tab so you land where you left off; otherwise — and after a daemon hydration with no orchestration to land on — you start on the dashboard for an overview. If a saved directory no longer exists, that pane is skipped with a warning.
+If there's nothing to bring back, you start on a clean, empty dashboard. If your workspace includes orchestration tabs, you land on the first one so you resume where you left off; otherwise you start on the dashboard for an overview. If a saved directory no longer exists, that pane is skipped with a warning.
 
-### The snapshot stays fresh
+### Your setup stays up to date
 
-The on-disk snapshot is written continuously, not only when you quit cleanly. Agent Deck saves it on every meaningful change to your workspace — a new pane, a rename, a mode or orchestration tab opening or closing, an agent stopping or restarting — and again when you detach. Writes are coalesced, so a burst of changes (such as spinning up a full orchestration) collapses to one or two disk writes rather than thrashing the disk on every keystroke. This is what makes crash recovery useful: because the snapshot reflects your latest state at detach time, a respawned-empty daemon falls back to an up-to-date workspace, not a weeks-stale one from your last clean quit.
+Agent Deck keeps your saved workspace current as you work — after every new pane, rename, tab, and agent change, and again whenever you disconnect — so what it brings back is your most recent setup, never a stale copy from the last time you happened to quit. That is what makes recovery worthwhile after an unexpected shutdown: you return to where you actually were, not to a workspace from days ago.
 
-### Mode and orchestration tabs are restored too
+### Mode and orchestration tabs come back too
 
-Mode tabs are restored in full: each agent pane records which mode it belonged to, and restore reopens the entire mode tab — tab name, agent pane and its command, and all side panes with their commands — by looking up the mode config from the project's `.dot-agent-deck.toml`.
+Mode tabs return in full — the tab and its name, the agent pane and its command, and every side pane. Orchestration tabs return too, with the orchestrator and its prompt, the role panes in their original order, and the start-role cursor where you left it.
 
-Orchestration tabs are restored as well. From a warm daemon they come back via hydration; when the daemon is empty they are rebuilt from the snapshot, which records the orchestrator pane and its prompt, the role panes in their saved order, and the start-role cursor. Agent Deck re-resolves the orchestration config from the project's `.dot-agent-deck.toml` to rebuild the tab.
-
-In every case only the workspace structure is restored, not an agent's internal conversation state. If the relevant config has drifted at restore time — `.dot-agent-deck.toml` is missing, the mode or orchestration was renamed, or a role was removed — a clear warning is shown and the affected pane falls back to a plain dashboard pane rather than a half-broken tab.
+In every case only the workspace structure is restored, not an agent's internal conversation. If something in your project's `.dot-agent-deck.toml` has changed since you last ran it — the file is missing, a mode or orchestration was renamed, or a role was removed — Agent Deck shows a clear warning and brings that pane back as a plain dashboard pane instead of a broken tab.
 
 ### Starting Fresh
 
@@ -73,6 +71,6 @@ To discard the saved workspace and start from an empty dashboard next time, clea
 dot-agent-deck snapshot clear
 ```
 
-This deletes the single global snapshot file. Note that `dot-agent-deck remote remove <name>` is registry-only — it removes a remote from your local registry and intentionally does **not** clear the snapshot, so removing an unrelated remote never wipes your local workspace.
+This clears your saved workspace, so the next launch starts empty. Note that `dot-agent-deck remote remove <name>` does **not** do this — it only forgets a remote you had connected to and leaves your saved workspace untouched, so removing an unrelated remote never wipes your setup.
 
-Session data is stored in `~/.config/dot-agent-deck/session.toml`.
+Your saved workspace lives in `~/.config/dot-agent-deck/session.toml`.
