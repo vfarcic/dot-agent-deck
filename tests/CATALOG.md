@@ -1869,11 +1869,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the exact next-fire timestamp formatting for enabled tasks; live-status rendering when a reused tab exists; the action buttons' click behavior (covered by `mouse/modal/001`).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/manager/002 — `a` (add) / `Enter`/`e` (edit) spawn the seeded authoring agent running the CONFIGURED command (`default_command`, not a hardcoded `claude`); edit pre-fills the row's current values (PRD #127 M3.3; PRD #170 M2.1).
-- **Layer:** L2 (same no-L1-seam reason). Two shims are on PATH: a distinctive `default_command` (e.g. `stub-authoring`) shimmed to a recorder that posts SessionStart and records its delivered seed, and `claude` shimmed to a separate neutralizing recorder (so the host's real `claude` is never invoked and so the hardcoded-`claude` regression is observable).
+##### scheduler/manager/002 — Editing a schedule opens the pick-agent modal; confirming the default selection spawns the seeded authoring agent running the CONFIGURED command (`default_command`), pre-filled with the row's current values (PRD #127 M3.3; PRD #170 M2.1 + round 2 Option B).
+- **Layer:** L2 (same no-L1-seam reason for the manager dialog; the modal's render is covered at L1 by `scheduler/manager/008`). Two shims are on PATH: a distinctive `default_command` (e.g. `stub-authoring`) shimmed to a recorder that posts SessionStart and records its delivered seed, and `claude` shimmed to a separate neutralizing recorder (so the host's real `claude` is never invoked and so a fall-back-to-`claude` regression is observable).
 - **Agent:** the shimmed authoring agent (records the gated-delivered seed, mirroring how `tabs/mode/005` observes seed delivery).
-- **Asserts:** with `default_command` set to the distinctive stub, pressing `e` on a row spawns the seeded authoring agent running THAT configured command — its recorder receives the authoring seed carrying the row's current prompt value (pre-fill), AND the `claude` recorder receives nothing (the authoring command is no longer the hardcoded `claude`). RED today: the authoring spawn is hardcoded to `SCHEDULE_AUTHORING_AGENT = "claude"`, so the configured stub's recorder is never written.
-- **Does not assert:** the full authoring seed-prompt text; that the agent ultimately calls `schedule update` (covered by the CLI + seed-delivery mechanism); the add (blank) path beyond reuse of the same seam; the agent-command picker UI (covered by `prompt/new-pane/010`).
+- **Asserts:** with `default_command` set to the distinctive stub, pressing `e` on a row FIRST opens the pick-agent modal (its `opencode` preset chip renders); confirming the default selection with Enter then spawns the seeded authoring agent running THAT configured command — its recorder receives the authoring seed carrying the row's current prompt value (pre-fill), AND the `claude` recorder receives nothing (the confirmed command came from `default_command`). RED until the pick-agent modal exists: today `e` spawns the authoring agent immediately with no modal, so the `opencode` preset chip never renders and the modal wait times out.
+- **Does not assert:** the full authoring seed-prompt text; that the agent ultimately calls `schedule update` (covered by the CLI + seed-delivery mechanism); the add (blank) path beyond reuse of the same seam; the modal's render layout (covered by `scheduler/manager/008`); non-default preset selection (covered by `scheduler/manager/009`).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/manager/003 — `d` + confirm removes the schedule definition but does NOT close an already-open tab for it (PRD #127 M3.3).
@@ -1908,6 +1908,27 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`, one enabled task whose name is longer than the legacy fixed-width name cell).
 - **Asserts:** opening the manager at a roomy (200-col) terminal AND at a windowed (80-col) terminal renders the task's FULL name un-clipped on the grid at both widths — proving the dialog auto-sizes to its content (PRD #144 shared modal sizing helper, clamped within the windowed terminal) instead of truncating the field to the fixed 72-col modal. RED today: the modal is hard-capped at 72 cols and the name is truncated to 21 chars (`truncate_cell`), so the full name never appears.
 - **Does not assert:** the exact modal width / clamp fraction at each terminal size; the `[min, max]` bounds of the shared helper (covered by the coder's pure-data unit test); the delete-confirmation containment (covered by `scheduler/manager/005`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/008 — The schedule pick-agent modal renders the agent-command presets (`claude` / `opencode`, visible by default) and defaults to the resolved authoring command (PRD #170 round 2, Option B).
+- **Layer:** L1 (ratatui `TestBackend` via a new public `render_schedule_agent_pick_to_buffer` seam, mirroring `render_new_pane_form_to_buffer`). RED is a COMPILE error until the coder adds the seam + the modal it renders.
+- **Agent:** none.
+- **Asserts:** the rendered pick-agent modal carries an agent-command picker — the `claude` and `opencode` presets both render, visible by default — AND shows the resolved authoring command (the seam's `mycmd`, which production fills from `default_command`) as the default selection, proving the modal defaults to the configured command while offering the presets as alternatives.
+- **Does not assert:** the modal's exact widget shape (chips vs. list); keyboard/mouse selection behavior (covered by `scheduler/manager/009`); the spawn on confirm (covered by `scheduler/manager/002`); insta byte-snapshot identity (plain substring assertions, matching `prompt/new-pane/010`).
+- **Platform coverage:** mac+linux+windows.
+
+##### scheduler/manager/009 — Selecting a NON-default agent preset in the pick-agent modal is honored: the chosen command spawns the authoring agent, not the default (PRD #170 round 2, Option B).
+- **Layer:** L2 (drives the real manager + modal via PTY keystrokes; observed via distinct-name recorder shims on disk). Two shims on PATH: `claude` (the `default_command`) and `opencode` (the non-default pick), each shimmed to a separate recorder so the test can tell WHICH spawned.
+- **Agent:** the shimmed authoring agent (records the gated-delivered seed).
+- **Asserts:** with `default_command = "claude"`, pressing `e` opens the pick-agent modal; moving the preset highlight to the non-default `opencode` (`l`) and confirming with Enter spawns the authoring agent running `opencode` (its recorder receives the authoring seed) while the default `claude` recorder stays empty. RED until the modal + selection wiring exist: today `e` spawns `claude` immediately with no modal.
+- **Does not assert:** the exact key/click that moves the highlight (the contract — `h`/`l` or Left/Right or a preset click — is the coder's; the observable is which command spawned); the modal render (covered by `scheduler/manager/008`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/010 — A blank/unset `default_command` falls back to `claude` (`AGENT_COMMAND_PRESETS[0]`) for the authoring agent, NOT a bare `$SHELL` (PRD #170 round 2, R1 fallback).
+- **Layer:** L2 (drives the real manager + modal via PTY; observed via a `claude` recorder shim on disk).
+- **Agent:** the shimmed `claude` authoring agent (records the gated-delivered seed).
+- **Asserts:** with `default_command = ""` (the unconfigured-user case), pressing `e` opens the pick-agent modal and confirming the default with Enter spawns `claude` — its recorder receives the authoring seed — proving the blank command resolves to the first preset instead of spawning a bare login shell that cannot act on the seed. RED today: a blank `default_command` spawns a bare `$SHELL` (no modal, no fallback), so the `claude` recorder is never written.
+- **Does not assert:** the whitespace-only variant of the fallback (the same code path); the new-pane form's copy of the default (covered by `prompt/new-pane/010`); the modal render (covered by `scheduler/manager/008`).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

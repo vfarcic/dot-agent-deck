@@ -16,8 +16,13 @@
 //! (per the PRD): `a` add, `Enter`/`e` edit, `d` delete (then a confirmation,
 //! confirmed with `y`), `r` run-now; the first row is auto-selected.
 //!
-//! RED today: there is no `S` binding and no manager dialog, so it never opens
-//! and none of the actions fire.
+//! ## Authoring flow (PRD #170)
+//! `a`/`e` no longer spawn the authoring agent immediately: they first open the
+//! pick-agent modal (`UiMode::ScheduleAgentPick`), which surfaces the
+//! agent-command presets (`claude` / `opencode`), defaulting to the resolved
+//! authoring command (the configured `default_command`, or `claude` when that is
+//! blank). Confirming the modal spawns the seeded authoring agent running the
+//! chosen command; the scheduled task's own run command is unaffected.
 
 mod common;
 
@@ -122,14 +127,17 @@ fn manager_001_lists_schedules_with_status_and_next_fire() {
 /// `default_command` configured to a DISTINCTIVE stub command (`stub-authoring`,
 /// not `claude`) shimmed (on PATH) to a recorder agent that posts SessionStart
 /// and records its delivered prompt, open the manager and press `e` on the row to
-/// edit. Assert the seeded authoring agent that gets spawned is the CONFIGURED
-/// command — the `stub-authoring` recorder receives the authoring seed carrying
-/// `digest`'s distinctive prompt text (proving both edit pre-fill AND that the
-/// command came from `default_command`) — while a separate `claude` neutralizer
-/// shim (kept on PATH so the host's real `claude` is never invoked) records
-/// nothing. RED today: the authoring spawn is hardcoded to
-/// `SCHEDULE_AUTHORING_AGENT = "claude"`, so the configured stub's recorder is
-/// never written.
+/// edit. Editing now FIRST opens the pick-agent modal (PRD #170 round 2, Option
+/// B): assert the modal surfaces the agent-command presets (the `opencode` chip),
+/// then confirm the DEFAULT selection with Enter. The seeded authoring agent that
+/// then gets spawned must be the CONFIGURED command — the `stub-authoring`
+/// recorder receives the authoring seed carrying `digest`'s distinctive prompt
+/// text (proving both edit pre-fill AND that the confirmed command came from
+/// `default_command`) — while a separate `claude` neutralizer shim (kept on PATH
+/// so the host's real `claude` is never invoked) records nothing. RED until the
+/// pick-agent modal exists: today `e` spawns the authoring agent immediately with
+/// no modal, so the `opencode` preset chip never renders and the modal wait times
+/// out.
 #[spec("scheduler/manager/002")]
 #[test]
 fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
@@ -174,8 +182,9 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
     };
 
     // The CONFIGURED authoring command is a distinctive stub — its recorder is
-    // the GREEN signal. A `claude` neutralizer recorder catches the pre-fix
-    // hardcoded-`claude` path (and shields the test from the host's real claude).
+    // the GREEN signal. A `claude` neutralizer recorder shields the test from the
+    // host's real `claude` AND catches any regression where the authoring command
+    // falls back to `claude` instead of honoring the configured `default_command`.
     let authoring_record = scratch.path().join("authoring-record.log");
     let claude_record = scratch.path().join("claude-record.log");
     write_recorder("stub-authoring", &authoring_record);
@@ -203,9 +212,19 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
 
     deck.send_keys(MANAGER_KEY);
     deck.wait_for_string("Scheduled Tasks");
-    deck.send_keys(b"e"); // edit the auto-selected `digest` row
+    deck.send_keys(b"e"); // edit the auto-selected `digest` row → opens the pick-agent modal
 
-    // The edit must spawn the CONFIGURED authoring command (not hardcoded
+    // PRD #170 round 2 (Option B): Edit now routes through the ScheduleAgentPick
+    // modal BEFORE spawning. The modal surfaces the agent-command presets
+    // (`claude` / `opencode`); wait for the `opencode` preset chip to confirm the
+    // modal is up, then confirm the DEFAULT selection (the resolved
+    // `default_command`) with Enter. RED until the modal exists: today `e` spawns
+    // the authoring agent immediately, so `opencode` never renders and this wait
+    // times out.
+    deck.wait_for_string("opencode");
+    deck.send_keys(b"\r"); // confirm the default selection → spawn the authoring agent
+
+    // Confirming the modal must spawn the CONFIGURED authoring command (not
     // `claude`) and pre-fill it: the stub's recorder receives the seed carrying
     // digest's current prompt value.
     assert!(
@@ -215,19 +234,19 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
             1,
             Duration::from_secs(15),
         ),
-        "editing a schedule must spawn the seeded authoring agent running the CONFIGURED \
-         `default_command` (`stub-authoring`), pre-filled with the row's current values — \
-         the configured command's recorder never received digest's prompt (the spawn is \
-         still hardcoded to `claude`)"
+        "editing a schedule must open the pick-agent modal, then on confirm spawn the seeded \
+         authoring agent running the CONFIGURED `default_command` (`stub-authoring`), pre-filled \
+         with the row's current values — the configured command's recorder never received \
+         digest's prompt"
     );
-    // The authoring command must NOT be the hardcoded `claude`: its neutralizer
+    // The confirmed authoring command must NOT be `claude`: its neutralizer
     // recorder must be empty (checked only after the positive assert passes, so
     // this is a clean point-in-time read, not a race).
     assert_eq!(
         common::count_file_substr(&claude_record, "DIGESTPROMPTMARKER"),
         0,
-        "the authoring command must come from `default_command`, not the hardcoded \
-         `claude` — but the `claude` shim received the authoring seed"
+        "the confirmed authoring command must come from `default_command`, not `claude` \
+         — but the `claude` shim received the authoring seed"
     );
     drop(scratch);
 }
@@ -529,5 +548,192 @@ fn manager_007_dialog_content_sized_unclipped_at_both_widths() {
          full schedule name `{LONG_NAME}` un-clipped within the modal.\nGrid:\n{windowed}"
     );
 
+    drop(scratch);
+}
+
+/// Write a recorder shim named `name` into `shim_dir`: it opens the
+/// gated-delivery readiness gate (posts SessionStart via the real hook path)
+/// then appends every delivered line to `record`, so the authoring seed a
+/// spawned agent receives is observable on disk. Distinct-name shims let a test
+/// tell WHICH agent command actually spawned. Mirrors the inline recorder in
+/// `manager_002`.
+fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::path::Path) {
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let path = shim_dir.join(name);
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"authoring\"}}' \
+             | \"{bin}\" hook claude-code >/dev/null 2>&1\n\
+             while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; done\n",
+            rec = record.to_string_lossy()
+        ),
+    )
+    .unwrap_or_else(|e| panic!("write {name} shim: {e}"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| panic!("chmod {name} shim: {e}"));
+    }
+}
+
+/// Scenario: With a fixture task (`digest`) and `default_command = "claude"`
+/// (so the pick-agent modal opens with `claude` as the default selection), put
+/// distinct-name recorder shims for BOTH `claude` and `opencode` on PATH, open
+/// the manager and press `e` to edit. When the pick-agent modal appears, select
+/// the NON-default `opencode` preset (`l` moves the highlight to the next preset)
+/// and confirm with Enter. Assert the seeded authoring agent that spawns is the
+/// CHOSEN `opencode` (its recorder receives digest's authoring seed) and that the
+/// default `claude` is NOT spawned (its recorder stays empty) — proving a
+/// non-default preset selection is honored. RED until the modal + selection
+/// wiring exist: today `e` spawns `claude` (the default) immediately with no
+/// modal, so `opencode` never renders and the modal wait times out.
+#[spec("scheduler/manager/009")]
+#[test]
+fn manager_009_pick_non_default_preset_is_honored() {
+    let (scratch, sched_path) = scratch_with_schedules(
+        "[[scheduled_tasks]]\n\
+         name = \"digest\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"DIGESTPROMPTMARKER\"\n\
+         enabled = true\n",
+    );
+
+    let shim_dir = scratch.path().join("shim");
+    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+    let claude_record = scratch.path().join("claude-record.log");
+    let opencode_record = scratch.path().join("opencode-record.log");
+    write_recorder_shim(&shim_dir, "claude", &claude_record);
+    write_recorder_shim(&shim_dir, "opencode", &opencode_record);
+
+    // `default_command = "claude"` → the modal opens defaulting to `claude`; the
+    // test then steers it to the non-default `opencode`.
+    let config_path = scratch.path().join("config.toml");
+    std::fs::write(&config_path, "default_command = \"claude\"\n").expect("write config.toml");
+
+    let path_env = format!(
+        "{}:{}",
+        shim_dir.to_string_lossy(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
+        .with_env("PATH", path_env)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    deck.send_keys(MANAGER_KEY);
+    deck.wait_for_string("Scheduled Tasks");
+    deck.send_keys(b"e"); // edit the auto-selected `digest` row → opens the pick-agent modal
+
+    // The pick-agent modal must appear with the presets; `opencode` (the
+    // non-default preset chip) is the unambiguous "modal is up" signal.
+    deck.wait_for_string("opencode");
+    // Steer the selection to the NON-default preset, then confirm: `l` moves the
+    // preset highlight right (claude → opencode), Enter confirms the chosen
+    // command and spawns the authoring agent.
+    deck.send_keys(b"l"); // claude → opencode
+    deck.send_keys(b"\r"); // confirm the chosen `opencode`
+
+    // GREEN signal: the CHOSEN `opencode` spawned — its recorder receives the
+    // authoring seed carrying digest's prompt value.
+    assert!(
+        common::wait_for_file_substr_count(
+            &opencode_record,
+            "DIGESTPROMPTMARKER",
+            1,
+            Duration::from_secs(15),
+        ),
+        "selecting the non-default `opencode` preset and confirming must spawn the authoring \
+         agent running `opencode` — its recorder never received digest's authoring seed"
+    );
+    // The default `claude` must NOT have spawned (checked only after the positive
+    // assert passes, so it is a clean point-in-time read, not a race).
+    assert_eq!(
+        common::count_file_substr(&claude_record, "DIGESTPROMPTMARKER"),
+        0,
+        "picking `opencode` must override the `claude` default — but the `claude` shim \
+         received the authoring seed"
+    );
+    drop(scratch);
+}
+
+/// Scenario: With a fixture task (`digest`) and `default_command` EMPTY/unset
+/// (the unconfigured-user case), put a `claude` recorder shim on PATH, open the
+/// manager and press `e` to edit. When the pick-agent modal appears, confirm the
+/// DEFAULT selection with Enter. Assert the authoring agent that spawns runs
+/// `claude` (`AGENT_COMMAND_PRESETS[0]`, caught by the `claude` recorder) — the
+/// R1 fallback: a blank `default_command` must resolve to `claude`, NOT spawn a
+/// bare `$SHELL` that cannot act on the seed. RED today: a blank `default_command`
+/// spawns a bare login shell (no modal, no fallback), so the `claude` recorder is
+/// never written and the modal wait times out.
+#[spec("scheduler/manager/010")]
+#[test]
+fn manager_010_blank_default_command_falls_back_to_claude() {
+    let (scratch, sched_path) = scratch_with_schedules(
+        "[[scheduled_tasks]]\n\
+         name = \"digest\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"DIGESTPROMPTMARKER\"\n\
+         enabled = true\n",
+    );
+
+    let shim_dir = scratch.path().join("shim");
+    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+    // The R1 fallback target: a blank `default_command` must resolve to `claude`.
+    let claude_record = scratch.path().join("claude-record.log");
+    write_recorder_shim(&shim_dir, "claude", &claude_record);
+
+    // `default_command = ""` — the unconfigured-user case (config.rs defaults it
+    // to an empty String). Written explicitly so the deck never inherits the
+    // host's real config.
+    let config_path = scratch.path().join("config.toml");
+    std::fs::write(&config_path, "default_command = \"\"\n").expect("write config.toml");
+
+    let path_env = format!(
+        "{}:{}",
+        shim_dir.to_string_lossy(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
+        .with_env("PATH", path_env)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    deck.send_keys(MANAGER_KEY);
+    deck.wait_for_string("Scheduled Tasks");
+    deck.send_keys(b"e"); // edit the auto-selected `digest` row → opens the pick-agent modal
+
+    // With a blank `default_command` the modal still renders the presets (its
+    // default selection is the `claude` fallback); `opencode` is the "modal is up"
+    // signal. Confirm the default with Enter.
+    deck.wait_for_string("opencode");
+    deck.send_keys(b"\r"); // confirm the default selection → spawn the authoring agent
+
+    // R1 fallback: a blank `default_command` must resolve to `claude`
+    // (`AGENT_COMMAND_PRESETS[0]`) so a real conversational agent runs — NOT a
+    // bare `$SHELL`. The `claude` recorder receiving the seed proves the fallback.
+    assert!(
+        common::wait_for_file_substr_count(
+            &claude_record,
+            "DIGESTPROMPTMARKER",
+            1,
+            Duration::from_secs(15),
+        ),
+        "an unset/blank `default_command` must fall back to `claude` (not spawn a bare \
+         `$SHELL`): the authoring agent must run `claude` and deliver digest's seed — \
+         the `claude` recorder never received it"
+    );
     drop(scratch);
 }
