@@ -914,9 +914,9 @@ fn manager_012_click_confirm_spawns_authoring_agent() {
 /// MANAGER dialog (its `NEXT FIRE` header re-renders) with NO authoring agent
 /// spawned (neither recorder is written). RED today: the modal renders no
 /// `[Cancel]` button, so `find_in_grid` finds no click target.
-#[spec("scheduler/manager/012")]
+#[spec("scheduler/manager/015")]
 #[test]
-fn manager_012_click_cancel_closes_to_manager_no_spawn() {
+fn manager_015_click_cancel_closes_to_manager_no_spawn() {
     let (scratch, sched_path) = scratch_with_schedules(
         "[[scheduled_tasks]]\n\
          name = \"digest\"\n\
