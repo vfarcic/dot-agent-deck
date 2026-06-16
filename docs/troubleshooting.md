@@ -73,6 +73,29 @@ dot-agent-deck hooks uninstall --agent opencode   # OpenCode
 
 > **Note:** If you uninstall hooks manually, the next dashboard launch will re-install them automatically.
 
+## A bare command like `claude` or `opencode` fails to spawn
+
+If a pane comes up with an error such as *"Unable to spawn `claude` because it doesn't exist on the filesystem and was not found in PATH"*, the daemon couldn't resolve that bare command against its `PATH`.
+
+### Why This Happens
+
+The daemon resolves a bare command against its own process `PATH`. At startup it captures your **login-shell PATH** (see [Configuration › Command Resolution and the Login-Shell PATH](configuration.md#command-resolution-and-the-login-shell-path)) so commands installed under, for example, `~/.local/bin` normally resolve. You can still hit this if the command isn't on your login shell's PATH at all, or if it was added — or the agent was installed — **after** the daemon last started, because the PATH is captured only once per daemon start.
+
+### Fix
+
+1. Confirm the command resolves in a fresh login shell of your own:
+   ```bash
+   $SHELL -lc 'command -v claude'
+   ```
+   If that prints nothing, fix your shell profile (for example, add the install directory to `PATH` in `~/.profile`) until it does.
+
+2. Restart the daemon so it re-captures the login-shell PATH:
+   ```bash
+   dot-agent-deck daemon restart
+   ```
+
+If `command -v` finds the command in your login shell but a pane still can't spawn it after a daemon restart, capture debug logs with `DOT_AGENT_DECK_LOG=1` and file an issue — the daemon logs the PATH it captured at startup.
+
 ## Delegate prompts silently no-op after an upgrade
 
 After upgrading the `dot-agent-deck` binary, the new TUI may attach to a daemon that was spawned by the *previous* version. The wire format stays compatible, but newer features (delegate role maps, orchestration tab fields, and similar internal refactors) silently no-op because the stale daemon doesn't know about the newer shape.

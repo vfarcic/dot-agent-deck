@@ -22,9 +22,9 @@ You can create and edit schedules three ways, listed below easiest-first.
 The easiest door: converse with an agent that builds the entry and runs the commands for you. There are two ways in, and both open the same guided authoring session:
 
 - **From the new-deck / new-pane dialog** — open it (`Ctrl+n`), confirm a directory, and cycle the **Mode** field to the end — past your project's workload modes — to the built-in **`schedule`** option (marked as an *authoring session*).
-- **From the Scheduled Tasks dialog** — press **`s`** on the dashboard, then **`a`** / **`[Add]`** to author a new one (or **`e`** / **`[Edit]`** to start from an existing row's values).
+- **From the Scheduled Tasks dialog** — press **`s`** on the dashboard, then **`a`** / **`[Add]`** to author a new one (or **`e`** / **`[Edit]`** to start from an existing row's values). A small **pick-agent** step appears first so you can choose which agent runs the authoring session — `claude`, `opencode`, or your own command (move with `h` / `l`, then **`[Confirm]`** / `Enter` to start, **`[Cancel]`** / `Esc` to back out to the dialog).
 
-Either way a throwaway **`claude`** session opens and walks you through it. It:
+Either way a throwaway authoring session opens — running your chosen agent command, which defaults to your configured [`default_command`](configuration.md#default-command) and falls back to `claude` when that is unset — and walks you through it. It:
 
 - asks you for the fields (name, cron, working dir, command, prompt, …);
 - asks for the **command that launches your agent** — it must result in a `claude` or `opencode` process, either directly (`claude`, `claude --model opus`, `opencode --model gpt-4o`) or via a project wrapper that ends up launching one (`devbox run agent-new`, `npm run agent`). Those are the two CLIs the deck integrates with for **live status tracking**; a command that doesn't result in one still runs but gets no status tracking, so the agent won't suggest unrelated CLIs (e.g. `gemini`). The command is **required** (there is no `$SHELL` fallback);
@@ -99,8 +99,8 @@ Actions — the footer buttons mirror the keys, shown as `[Add a]` `[Edit e]` `[
 
 | Key / Button | Action |
 |---|---|
-| `a` / `[Add a]` | **Add** — spawns the seeded authoring agent (blank). |
-| `Enter` / `e` / `[Edit e]` | **Edit** the selected row — spawns the seeded authoring agent **pre-filled** with the row's current values (it calls `schedule update`). |
+| `a` / `[Add a]` | **Add** — opens the **pick-agent** step (choose the authoring agent), then spawns the seeded authoring agent (blank). |
+| `Enter` / `e` / `[Edit e]` | **Edit** the selected row — opens the **pick-agent** step, then spawns the seeded authoring agent **pre-filled** with the row's current values (it calls `schedule update`). |
 | `d` then `y` / `[Delete d]` | **Delete** the selected row's **definition only** (a confirmation appears first). It does **not** close an open/running tab for that schedule — deleting a schedule must not nuke a conversation you're reading. |
 | `r` / `[Run now r]` | **Run now** — fire the selected task immediately. |
 | `j` / `k` | Move the selection. |

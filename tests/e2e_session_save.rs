@@ -29,7 +29,7 @@ use spec::spec;
 
 /// Create a plain dashboard pane (no mode) running `command` via the new-pane
 /// flow, then wait until it has spawned and auto-focused (PaneInput → the
-/// bottom bar shows `[Detach Ctrl+D]`). Mirrors `e2e_dashboard_selection`'s
+/// bottom bar shows `[Command Mode Ctrl+D]`). Mirrors `e2e_dashboard_selection`'s
 /// `spawn_mode` minus the mode-selection Right(s): Ctrl+N → dir-picker (Space
 /// confirms the cwd) → form (Enter past Mode, Enter past the default Name, type
 /// the command, Enter submits). The leading Ctrl+D guarantees we drive the
@@ -45,7 +45,7 @@ fn spawn_plain_pane(deck: &TuiDeck, command: &str) {
     deck.send_keys(b"\r"); // Name (default) → Command
     deck.send_keys(command.as_bytes());
     deck.send_keys(b"\r"); // submit
-    deck.wait_for_string("[Detach Ctrl+D]"); // pane spawned & auto-focused
+    deck.wait_for_string("[Command Mode Ctrl+D]"); // pane spawned & auto-focused
 }
 
 /// Scenario: Launch the deck with `DOT_AGENT_DECK_SESSION` redirected to a

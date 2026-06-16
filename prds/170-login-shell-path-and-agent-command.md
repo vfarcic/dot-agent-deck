@@ -1,6 +1,6 @@
 # PRD #170: Spawned panes inherit login-shell PATH + configurable agent command
 
-**Status**: Not Started
+**Status**: In Progress
 **Priority**: High
 **Created**: 2026-06-16
 **GitHub Issue**: [#170](https://github.com/vfarcic/dot-agent-deck/issues/170)
@@ -61,14 +61,14 @@ Two independent changes:
 
 ### Phase 1 — Login-shell PATH parity (bug fix)
 
-- [ ] **M1.1** — Add a login-shell PATH capture helper: run `$SHELL -lc 'printf %s "$PATH"'` with a timeout, returning `None` on missing `$SHELL`, non-zero exit, timeout, or empty output. Unit-test the parse/fallback logic.
-- [ ] **M1.2** — At daemon startup, before the async runtime/threads start, apply the captured PATH to the daemon's own environment (log the result); on `None`, leave the inherited PATH untouched.
-- [ ] **M1.3** — L2 e2e: with the daemon launched under a PATH stripped of `~/.local/bin`, a bare `claude`-style command resolves and spawns in a dashboard pane, a scheduled fire, and the authoring helper.
+- [x] **M1.1** — Add a login-shell PATH capture helper: run `$SHELL -lc 'printf %s "$PATH"'` with a timeout, returning `None` on missing `$SHELL`, non-zero exit, timeout, or empty output. Unit-test the parse/fallback logic.
+- [x] **M1.2** — At daemon startup, before the async runtime/threads start, apply the captured PATH to the daemon's own environment (log the result); on `None`, leave the inherited PATH untouched.
+- [x] **M1.3** — L2 e2e: with the daemon launched under a PATH stripped of `~/.local/bin`, a bare `claude`-style command resolves and spawns in a dashboard pane, a scheduled fire, and the authoring helper.
 
 ### Phase 2 — Configurable agent command (feature)
 
-- [ ] **M2.1** — Remove the hardcoded `SCHEDULE_AUTHORING_AGENT`; the authoring command resolves from config, defaulting to `default_command`.
-- [ ] **M2.2** — Surface an agent-command field/picker in the schedule authoring (Edit/Add) flow and the dashboard new-pane flow, visible by default; tests (L1 widget for the picker, behavior tests for default resolution).
+- [x] **M2.1** — Remove the hardcoded `SCHEDULE_AUTHORING_AGENT`; the authoring command resolves from config, defaulting to `default_command`.
+- [x] **M2.2** — Surface an agent-command field/picker in the schedule authoring (Edit/Add) flow and the dashboard new-pane flow, visible by default; tests (L1 widget for the picker, behavior tests for default resolution).
 
 ### Phase 3 — Docs & release gate
 
