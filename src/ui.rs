@@ -3459,17 +3459,26 @@ fn handle_schedule_agent_pick_key(key: KeyEvent, ui: &mut UiState) -> Action {
         KeyCode::Esc | KeyCode::Char('q') => Action::ScheduleAgentCancel,
         KeyCode::Char('h') | KeyCode::Left => {
             if let Some(pick) = ui.schedule_agent_pick.as_mut() {
-                pick.selected_preset = pick.selected_preset.saturating_sub(1);
-                pick.chosen = AGENT_COMMAND_PRESETS[pick.selected_preset].to_string();
+                // PRD #170 (Greptile P1): only reassign `chosen` when the
+                // highlight actually moves. At the leftmost preset
+                // (`selected_preset == 0`) `h` is a true no-op — reassigning
+                // here would clobber a CUSTOM chosen command to presets[0]
+                // (`claude`) even though nothing moved.
+                if pick.selected_preset > 0 {
+                    pick.selected_preset -= 1;
+                    pick.chosen = AGENT_COMMAND_PRESETS[pick.selected_preset].to_string();
+                }
             }
             Action::Continue
         }
         KeyCode::Char('l') | KeyCode::Right => {
             if let Some(pick) = ui.schedule_agent_pick.as_mut() {
+                // Symmetric to `h`: only reassign `chosen` when the highlight
+                // actually advances, so the rightmost preset is a no-op too.
                 if pick.selected_preset + 1 < AGENT_COMMAND_PRESETS.len() {
                     pick.selected_preset += 1;
+                    pick.chosen = AGENT_COMMAND_PRESETS[pick.selected_preset].to_string();
                 }
-                pick.chosen = AGENT_COMMAND_PRESETS[pick.selected_preset].to_string();
             }
             Action::Continue
         }
