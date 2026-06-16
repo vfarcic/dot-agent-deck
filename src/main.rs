@@ -525,7 +525,21 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(Commands::Daemon { cmd }) => match cmd {
-            DaemonCmd::Serve => run_daemon_serve_cli(),
+            DaemonCmd::Serve => {
+                // PRD #170 M1.2: capture the login-shell PATH and apply it to
+                // the daemon's OWN environment HERE — in the synchronous `main`
+                // dispatch, BEFORE `run_daemon_serve_cli` builds its tokio
+                // runtime (`#[tokio::main]`) and any worker threads exist. That
+                // single-threaded window is the PRD's stated `set_var`
+                // soundness condition. This covers BOTH the `daemon serve` path
+                // and the lazy-spawned daemon, since the deck lazy-spawns by
+                // fork-exec'ing this exact subcommand. Logging is initialized
+                // first so the capture result is recorded; `run_daemon_serve_cli`
+                // therefore no longer initializes it.
+                init_logging_from_env();
+                dot_agent_deck::login_shell::apply_login_shell_path();
+                run_daemon_serve_cli()
+            }
             DaemonCmd::Hello => run_daemon_hello_cli(),
             DaemonCmd::Stop { force } => run_daemon_stop_cli(force),
             DaemonCmd::Restart { force } => run_daemon_restart_cli(force),
@@ -1066,7 +1080,10 @@ async fn run_daemon_restart_cli(force: bool) -> ExitCode {
 /// the daemon starts.
 #[tokio::main]
 async fn run_daemon_serve_cli() -> ExitCode {
-    init_logging_from_env();
+    // NOTE: logging is initialized by the `DaemonCmd::Serve` dispatch arm in
+    // `main`, before the login-shell PATH capture and before this runtime is
+    // built — so it is intentionally NOT initialized again here (a second
+    // `tracing` global-default init would panic).
     // PRD #139 M1.2/M2.1: the daemon reads the experimental flag from the same
     // `.dot-agent-deck.toml` source of truth and watches it independently of
     // the TUI (the file is the contract; no cross-process sync).

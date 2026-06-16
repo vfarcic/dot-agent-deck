@@ -386,11 +386,11 @@ impl DirPickerState {
 /// authoring agent pre-seeded with [`SCHEDULE_AUTHORING_SEED_PROMPT`].
 const SCHEDULE_MODE_NAME: &str = "schedule";
 
-/// PRD #127 M3.2: default conversational agent for the "schedule" authoring
-/// session when the form's command is left blank. The authoring agent must be
-/// able to act on the seed prompt (call the `schedule add` CLI), so it cannot
-/// fall back to a bare `$SHELL`.
-const SCHEDULE_AUTHORING_AGENT: &str = "claude";
+/// PRD #170 M2.2: the agent-command picker presets surfaced in the new-pane
+/// form (and the schedule authoring flow, which reuses the same form). Clicking
+/// a preset fills the Command field; the field stays free-text so a path or a
+/// custom command still works. Visible by default — no experimental flag.
+const AGENT_COMMAND_PRESETS: &[&str] = &["claude", "opencode"];
 
 /// PRD #127 M3.2: the crisp seed prompt delivered (gated, like orchestrations)
 /// to the "schedule" authoring agent. It instructs the agent to converse with
@@ -2227,6 +2227,10 @@ pub enum Action {
     FormSubmit,
     /// PRD #80 M8: form `[Cancel]` — close the form without spawning (== Esc).
     FormCancel,
+    /// PRD #170 M2.2: click an agent-command preset chip in the new-pane form —
+    /// fill the Command field with that preset (e.g. `claude` / `opencode`) and
+    /// focus the field so it can be tweaked. Additive to free-text typing.
+    FormSetCommand(String),
     /// PRD #80: Normal-mode digit `1`-`9` — jump to card N and focus its pane.
     FocusCard(usize),
     /// PRD #80: on a mode tab, move the in-tab side-pane focus down (j/Down).
@@ -3315,7 +3319,10 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
         // Add: spawn the seeded authoring agent with a blank context.
         KeyCode::Char('a') => {
             ui.mode = UiMode::Normal;
-            Action::SpawnPane(Box::new(schedule_authoring_request(None)))
+            Action::SpawnPane(Box::new(schedule_authoring_request(
+                None,
+                &ui.config.default_command,
+            )))
         }
         // Edit the selected row: spawn the authoring agent pre-filled with the
         // row's current values (it calls `schedule update`). With no rows,
@@ -3323,7 +3330,10 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
         KeyCode::Enter | KeyCode::Char('e') => {
             let existing = ui.scheduled_tasks.get(ui.scheduled_selected).cloned();
             ui.mode = UiMode::Normal;
-            Action::SpawnPane(Box::new(schedule_authoring_request(existing.as_ref())))
+            Action::SpawnPane(Box::new(schedule_authoring_request(
+                existing.as_ref(),
+                &ui.config.default_command,
+            )))
         }
         // Delete (definition only) — ask to confirm first.
         KeyCode::Char('d') => {
@@ -3346,9 +3356,16 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
 
 /// Build the [`NewPaneRequest`] that spawns the seeded "schedule" authoring
 /// agent for the manager's add (`existing = None`) or edit (`existing =
-/// Some(..)`) action. Reuses the 3B-i authoring mode + 3A gated seed delivery;
-/// the agent command is the conversational `claude` (it must act on the seed).
-fn schedule_authoring_request(existing: Option<&config::ScheduledTask>) -> NewPaneRequest {
+/// Some(..)`) action. Reuses the 3B-i authoring mode + 3A gated seed delivery.
+///
+/// PRD #170 M2.1: the authoring command is no longer the hardcoded `claude` —
+/// it resolves from the configured `default_command` (the same value the
+/// new-pane form opens pre-filled with), so a user who runs `opencode` (or a
+/// path / custom command) gets their agent here too.
+fn schedule_authoring_request(
+    existing: Option<&config::ScheduledTask>,
+    default_command: &str,
+) -> NewPaneRequest {
     let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // PRD #127: the "schedule" authoring session is a throwaway single-agent
     // CARD, not a workload mode tab. Carry the authoring seed on `seed_prompt`
@@ -3358,7 +3375,7 @@ fn schedule_authoring_request(existing: Option<&config::ScheduledTask>) -> NewPa
     NewPaneRequest {
         dir,
         name: SCHEDULE_MODE_NAME.to_string(),
-        command: SCHEDULE_AUTHORING_AGENT.to_string(),
+        command: default_command.to_string(),
         mode_config: None,
         orchestration_config: None,
         seed_prompt: build_schedule_authoring_mode(existing).seed_prompt,
@@ -3591,7 +3608,7 @@ fn transition_after_dir_pick(ui: &mut UiState) {
 /// PRD #80 M8: build the [`NewPaneRequest`] from the current form values.
 /// Shared by the Enter-submit key arm and the `[Submit]` button
 /// ([`Action::FormSubmit`]) so click and key spawn an identical pane.
-fn build_new_pane_request(form: &NewPaneFormState) -> NewPaneRequest {
+fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> NewPaneRequest {
     // PRD #127: the built-in "schedule" authoring option is NOT a workload mode
     // tab — it is a throwaway single-agent authoring CARD that converses to
     // build a schedule entry. Spawn it as a dashboard card (`mode_config` None)
@@ -3600,14 +3617,16 @@ fn build_new_pane_request(form: &NewPaneFormState) -> NewPaneRequest {
     // form's `selected_mode()` still returns the synthetic mode for the Mode
     // cycler's title/separator rendering — only the spawned request differs.
     if form.is_schedule_selected() {
-        // PRD #127 M3.2: the authoring agent must be a real conversational agent
+        // PRD #170 M2.1: the authoring agent must be a real conversational agent
         // (it has to act on the seed prompt and call the `schedule add` CLI), so
-        // default a blank command to `claude` rather than spawning a bare $SHELL
-        // that can't author anything. Applied HERE — not only in the Enter arm —
-        // so BOTH submit doors (Enter on the final field AND the [Submit] button,
-        // which calls this directly) apply the default.
+        // default a blank command to the configured `default_command` (the same
+        // value the form opens pre-filled with) rather than spawning a bare
+        // $SHELL that can't author anything — replacing the former hardcoded
+        // `claude`. Applied HERE — not only in the Enter arm — so BOTH submit
+        // doors (Enter on the final field AND the [Submit] button, which calls
+        // this directly) apply the default.
         let command = if form.command.trim().is_empty() {
-            SCHEDULE_AUTHORING_AGENT.to_string()
+            default_command.to_string()
         } else {
             form.command.clone()
         };
@@ -3636,6 +3655,9 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
         ui.mode = UiMode::QuitConfirm;
         return Action::Continue;
     }
+    // PRD #170 M2.1: snapshot the configured default command before the mutable
+    // `form` borrow below so the blank-command authoring default resolves to it.
+    let default_command = ui.config.default_command.clone();
     let form = match ui.new_pane_form.as_mut() {
         Some(f) => f,
         None => {
@@ -3672,10 +3694,10 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
             // selected), pressing Enter on Name submits — there's no later
             // field to advance to.
             FormField::Name | FormField::Command => {
-                // The blank-command -> SCHEDULE_AUTHORING_AGENT default now lives
-                // in `build_new_pane_request`, so both this Enter door and the
-                // [Submit] button door apply it identically.
-                let req = build_new_pane_request(form);
+                // The blank-command -> `default_command` authoring default now
+                // lives in `build_new_pane_request`, so both this Enter door and
+                // the [Submit] button door apply it identically.
+                let req = build_new_pane_request(form, &default_command);
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
                 return Action::SpawnPane(Box::new(req));
@@ -5324,12 +5346,21 @@ fn dispatch_action(
                 form.focused = FormField::Mode;
             }
         }
+        // PRD #170 M2.2: click an agent-command preset → fill the Command field
+        // with it (== typing the command), then focus the field so the user can
+        // tweak it. The field stays free-text for paths / custom commands.
+        Action::FormSetCommand(cmd) => {
+            if let Some(form) = ui.new_pane_form.as_mut() {
+                form.command = cmd;
+                form.focused = FormField::Command;
+            }
+        }
         // [Submit] → spawn the pane from the form values (== Enter on the final
         // field). Reuses the SpawnPane arm so click and key spawn identically.
         Action::FormSubmit => {
             if let Some(form) = ui.new_pane_form.take() {
                 ui.mode = UiMode::Normal;
-                let req = build_new_pane_request(&form);
+                let req = build_new_pane_request(&form, &ui.config.default_command);
                 return dispatch_action(
                     Action::SpawnPane(Box::new(req)),
                     ui,
@@ -5388,7 +5419,7 @@ fn dispatch_action(
         // dialog and spawn the seeded authoring agent with a blank context.
         Action::ScheduleAdd => {
             ui.mode = UiMode::Normal;
-            let req = schedule_authoring_request(None);
+            let req = schedule_authoring_request(None, &ui.config.default_command);
             return dispatch_action(
                 Action::SpawnPane(Box::new(req)),
                 ui,
@@ -5407,7 +5438,7 @@ fn dispatch_action(
         Action::ScheduleEdit => {
             let existing = ui.scheduled_tasks.get(ui.scheduled_selected).cloned();
             ui.mode = UiMode::Normal;
-            let req = schedule_authoring_request(existing.as_ref());
+            let req = schedule_authoring_request(existing.as_ref(), &ui.config.default_command);
             return dispatch_action(
                 Action::SpawnPane(Box::new(req)),
                 ui,
@@ -10903,6 +10934,9 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // form is two rows shorter — Command's label row plus its spacing row.
     let cmd_visible = form.command_visible();
     let cmd_rows: u16 = if cmd_visible { 2 } else { 0 };
+    // PRD #170 M2.2: the agent-command picker row (a spacer + the picker line)
+    // shows whenever the Command field shows — it fills that same field.
+    let picker_rows: u16 = if cmd_visible { 2 } else { 0 };
     // PRD #127 M3.2: the "schedule" authoring option adds one separator/label
     // row marking it as a throwaway authoring session.
     let schedule_rows: u16 = if form.is_schedule_selected() { 1 } else { 0 };
@@ -10910,7 +10944,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // borders + a little margin) but never below the comfortable 56-col base;
     // height is the reserved field rows. `modal_rect` clamps to 90% of terminal.
     let desired_w = chip_row_w.saturating_add(4).max(56);
-    let desired_h = 10 + mode_extra + cmd_rows + schedule_rows;
+    let desired_h = 10 + mode_extra + cmd_rows + picker_rows + schedule_rows;
     let popup_area = modal_rect(desired_w, desired_h, area, 56, 10);
     let popup_width = popup_area.width;
 
@@ -11012,6 +11046,15 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
                 },
             ),
         ]));
+    }
+    // PRD #170 M2.2: reserve the agent-command picker row (label + preset chips,
+    // overlaid below). A spacer first, then the picker line itself. Only when the
+    // Command field is shown — the picker fills that field.
+    let mut picker_line_idx: Option<usize> = None;
+    if cmd_visible {
+        lines.push(Line::from(""));
+        picker_line_idx = Some(lines.len());
+        lines.push(Line::from(""));
     }
     lines.push(Line::from(""));
     // PRD #80 M8: reserve a row for the [Submit]/[Cancel] buttons (overlaid).
@@ -11134,6 +11177,40 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         }
     }
 
+    // PRD #170 M2.2: the agent-command preset picker — a `  Agent: ` label then
+    // one clickable `[preset]` chip per known agent (`claude` / `opencode`),
+    // visible by default and ADDITIVE to the free-text Command field above.
+    // Clicking a chip fills the Command field via `Action::FormSetCommand`. The
+    // row is skipped when it falls outside the clamped popup (PRD #144 A1).
+    let mut picker_button_rects: Vec<(Action, Rect)> = Vec::new();
+    if let Some(pi) = picker_line_idx
+        && line_y(pi) < popup_bottom
+    {
+        let picker_y = line_y(pi);
+        let label = "  Agent: ";
+        let label_w = label.chars().count() as u16;
+        {
+            let buf = frame.buffer_mut();
+            let _ = buf.set_span(
+                row_x,
+                picker_y,
+                &Span::styled(label, unfocused_label),
+                row_width,
+            );
+        }
+        let presets: Vec<Button> = AGENT_COMMAND_PRESETS
+            .iter()
+            .map(|p| Button::new(*p, "", Action::FormSetCommand((*p).to_string()), true))
+            .collect();
+        let presets_row = Rect {
+            x: row_x.saturating_add(label_w),
+            y: picker_y,
+            width: row_width.saturating_sub(label_w),
+            height: 1,
+        };
+        picker_button_rects = render_modal_button_row(frame, &presets, presets_row, 0);
+    }
+
     // [Submit] / [Cancel] buttons on the reserved row.
     let buttons = [
         Button::new("Submit", "", Action::FormSubmit, true),
@@ -11148,11 +11225,15 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // PRD #144 A1: skip the button row entirely when it falls outside the
     // clamped popup (degenerate short terminal) rather than writing past the
     // buffer bottom.
-    let button_rects = if btn_row.y < popup_bottom {
+    let mut button_rects = if btn_row.y < popup_bottom {
         render_modal_button_row(frame, &buttons, btn_row, 1)
     } else {
         Vec::new()
     };
+    // PRD #170 M2.2: the agent-command preset chips are also clickable form
+    // buttons (they fill the Command field). They don't overlap the
+    // Submit/Cancel row, so appending keeps hit-testing unambiguous.
+    button_rects.append(&mut picker_button_rects);
 
     // Cursor in the active text field (Mode uses chips, so no cursor there).
     // PRD #144 A1: only place the cursor when its row fits inside the popup.
@@ -17878,12 +17959,15 @@ mod tests {
         assert!(f.selected_orchestration().is_none());
     }
 
-    // PRD #127 Part 4 — a blank Command on the "schedule" authoring option must
-    // default to the conversational agent (SCHEDULE_AUTHORING_AGENT), never a
-    // bare $SHELL, for BOTH submit doors: the [Submit] button path (which calls
-    // `build_new_pane_request` directly) and the Enter-on-final-field key path.
+    // PRD #170 M2.1 (was PRD #127 Part 4) — a blank Command on the "schedule"
+    // authoring option must default to the configured `default_command` (not the
+    // formerly-hardcoded `claude`, and never a bare $SHELL), for BOTH submit
+    // doors: the [Submit] button path (which calls `build_new_pane_request`
+    // directly) and the Enter-on-final-field key path.
     #[test]
-    fn schedule_blank_command_defaults_to_agent_both_doors() {
+    fn schedule_blank_command_defaults_to_configured_default_command_both_doors() {
+        const DEFAULT_CMD: &str = "configured-agent";
+
         // Door 1: the [Submit] button path calls build_new_pane_request directly.
         let mut f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
@@ -17894,18 +17978,20 @@ mod tests {
         );
         f.select_next_mode(); // index 0 -> 1 = the built-in "schedule" option
         assert!(f.is_schedule_selected());
-        let req = build_new_pane_request(&f);
+        let req = build_new_pane_request(&f, DEFAULT_CMD);
         assert_eq!(
-            req.command, SCHEDULE_AUTHORING_AGENT,
-            "[Submit] door must default a blank schedule command to the agent, not $SHELL"
+            req.command, DEFAULT_CMD,
+            "[Submit] door must default a blank schedule command to default_command, not $SHELL"
         );
         assert!(
             req.seed_prompt.is_some(),
             "authoring seed prompt is carried"
         );
 
-        // Door 2: the Enter-on-final-field key path.
+        // Door 2: the Enter-on-final-field key path resolves default_command
+        // from `ui.config`.
         let mut ui = default_ui();
+        ui.config.default_command = DEFAULT_CMD.to_string();
         ui.mode = UiMode::NewPaneForm;
         ui.new_pane_form = Some(NewPaneFormState::new(
             PathBuf::from("/tmp"),
@@ -17923,8 +18009,8 @@ mod tests {
         let result = handle_new_pane_form_key(enter, &mut ui); // submit
         match result {
             Action::SpawnPane(req) => assert_eq!(
-                req.command, SCHEDULE_AUTHORING_AGENT,
-                "Enter door must default a blank schedule command to the agent, not $SHELL"
+                req.command, DEFAULT_CMD,
+                "Enter door must default a blank schedule command to default_command, not $SHELL"
             ),
             other => panic!("expected SpawnPane, got {other:?}"),
         }
