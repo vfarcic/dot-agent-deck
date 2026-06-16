@@ -688,6 +688,13 @@ async fn run_dashboard() -> ExitCode {
 /// Optional file-based logging from `DOT_AGENT_DECK_LOG`. Pulled out of the
 /// dashboard entry point so the `connect` subcommand (which builds its own
 /// tokio runtime) can call it once before launching the TUI body.
+///
+/// PRD #170 (Auditor-2): this MUST stay synchronous — a plain `std::fs::File`
+/// writer, NEVER a `tracing_appender::non_blocking` / worker-thread appender.
+/// On the `daemon serve` path it runs immediately before the pre-runtime
+/// `apply_login_shell_path` `set_var` (main.rs); a logging thread spawned here
+/// would land inside that single-threaded window and break the `set_var`
+/// soundness invariant the login-shell PATH capture relies on.
 fn init_logging_from_env() {
     if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
         let log_path = if log_val.is_empty() || log_val == "1" {

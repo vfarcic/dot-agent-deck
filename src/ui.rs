@@ -2302,6 +2302,15 @@ pub enum Action {
     /// to that preset (mouse parity for `h`/`l`). Confirming the modal then
     /// spawns it; this click alone does not confirm.
     ScheduleAgentSetCommand(String),
+    /// PRD #170 round 3 (F4): the pick-agent modal's `[Confirm]` button — mouse
+    /// parity for `Enter`. Spawns the seeded authoring agent running the
+    /// chosen/default command. Shared by the Enter key and the button click.
+    ScheduleAgentConfirm,
+    /// PRD #170 round 3 (F3/F4): the pick-agent modal's `[Cancel]` button —
+    /// mouse parity for `Esc`/`q`. Closes the modal WITHOUT spawning and returns
+    /// to the Scheduled-Tasks manager dialog (not the dashboard). Shared by the
+    /// Esc/q keys and the button click.
+    ScheduleAgentCancel,
     /// PRD #80: Normal-mode digit `1`-`9` — jump to card N and focus its pane.
     FocusCard(usize),
     /// PRD #80: on a mode tab, move the in-tab side-pane focus down (j/Down).
@@ -3438,13 +3447,16 @@ fn open_schedule_agent_pick(ui: &mut UiState, existing: Option<config::Scheduled
 /// (claude → opencode) — each sets the chosen command to that preset. `Enter`
 /// confirms the chosen command and spawns the seeded authoring agent;
 /// `Esc`/`q` close the modal without spawning.
+///
+/// PRD #170 round 3: confirm/cancel route through the shared
+/// [`Action::ScheduleAgentConfirm`] / [`Action::ScheduleAgentCancel`] arms so
+/// the keys and the clickable `[Confirm]`/`[Cancel]` buttons (F4) follow one
+/// path — and cancel returns to the manager dialog, not the dashboard (F3).
 fn handle_schedule_agent_pick_key(key: KeyEvent, ui: &mut UiState) -> Action {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            ui.schedule_agent_pick = None;
-            ui.mode = UiMode::Normal;
-            Action::Continue
-        }
+        // F3: Esc/q close back to the Scheduled-Tasks manager dialog (not the
+        // dashboard), via the shared Cancel path the `[Cancel]` button uses too.
+        KeyCode::Esc | KeyCode::Char('q') => Action::ScheduleAgentCancel,
         KeyCode::Char('h') | KeyCode::Left => {
             if let Some(pick) = ui.schedule_agent_pick.as_mut() {
                 pick.selected_preset = pick.selected_preset.saturating_sub(1);
@@ -3461,20 +3473,9 @@ fn handle_schedule_agent_pick_key(key: KeyEvent, ui: &mut UiState) -> Action {
             }
             Action::Continue
         }
-        KeyCode::Enter => {
-            // Take the state so the spawn borrows owned values (no `ui` borrow
-            // held across the `ui.mode` write below).
-            if let Some(pick) = ui.schedule_agent_pick.take() {
-                ui.mode = UiMode::Normal;
-                Action::SpawnPane(Box::new(schedule_authoring_request(
-                    pick.existing.as_ref(),
-                    &pick.chosen,
-                )))
-            } else {
-                ui.mode = UiMode::Normal;
-                Action::Continue
-            }
-        }
+        // F4: Enter confirms via the shared Confirm path the `[Confirm]` button
+        // uses too — spawn the seeded authoring agent running the chosen command.
+        KeyCode::Enter => Action::ScheduleAgentConfirm,
         _ => Action::Continue,
     }
 }
@@ -5565,14 +5566,49 @@ fn dispatch_action(
         }
         // PRD #170 round 2: a chip click in the pick-agent modal sets the chosen
         // authoring command to that preset (mouse parity for `h`/`l`). Does not
-        // confirm — Enter / a `[Confirm]`-equivalent still spawns.
+        // confirm — Enter / the `[Confirm]` button still spawns.
+        // PRD #170 round 3 (Auditor-1): defense-in-depth — trust only the preset
+        // membership, not the Action payload. Set `chosen` ONLY when `cmd` is a
+        // known `AGENT_COMMAND_PRESETS` member (the sole producer already emits
+        // presets); a stray non-preset payload is ignored rather than overwriting
+        // the resolved default with an arbitrary string.
         Action::ScheduleAgentSetCommand(cmd) => {
-            if let Some(pick) = ui.schedule_agent_pick.as_mut() {
-                if let Some(idx) = AGENT_COMMAND_PRESETS.iter().position(|p| *p == cmd) {
-                    pick.selected_preset = idx;
-                }
+            if let Some(pick) = ui.schedule_agent_pick.as_mut()
+                && let Some(idx) = AGENT_COMMAND_PRESETS.iter().position(|p| *p == cmd)
+            {
+                pick.selected_preset = idx;
                 pick.chosen = cmd;
             }
+        }
+        // PRD #170 round 3 (F4): the pick-agent modal's `[Confirm]` button (and
+        // the Enter key, which returns this action) — spawn the seeded authoring
+        // agent running the chosen/default command, the identical take()+spawn
+        // path the old inline Enter arm used. Reuses the `SpawnPane` arm so the
+        // click and the key spawn an identical pane.
+        Action::ScheduleAgentConfirm => {
+            if let Some(pick) = ui.schedule_agent_pick.take() {
+                ui.mode = UiMode::Normal;
+                let req = schedule_authoring_request(pick.existing.as_ref(), &pick.chosen);
+                return dispatch_action(
+                    Action::SpawnPane(Box::new(req)),
+                    ui,
+                    pane,
+                    state,
+                    tab_manager,
+                    snapshot,
+                    filtered,
+                    selected_id,
+                    frame_area,
+                );
+            }
+        }
+        // PRD #170 round 3 (F3/F4): the pick-agent modal's `[Cancel]` button (and
+        // the Esc/q keys, which return this action) — close the modal WITHOUT
+        // spawning and return to the Scheduled-Tasks MANAGER dialog you came from
+        // (re-open `ScheduledTasks`), NOT the bare dashboard (`Normal`).
+        Action::ScheduleAgentCancel => {
+            ui.schedule_agent_pick = None;
+            ui.mode = UiMode::ScheduledTasks;
         }
         // PRD #127 finding #4: `[Delete]` button parity for the `d` key — arm
         // the definition-only delete confirmation for the selected row (the
@@ -9100,9 +9136,11 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
         ui.scheduled_row_rects = row_rects;
     }
     if ui.mode == UiMode::ScheduleAgentPick {
-        // PRD #170 round 2: the pick-agent modal's preset chips are clickable —
-        // record their rects in `modal_button_rects` so the shared modal
-        // hit-test routes a chip click to `Action::ScheduleAgentSetCommand`.
+        // PRD #170 round 2/3: the pick-agent modal's preset chips AND its
+        // `[Confirm]`/`[Cancel]` buttons (F4) are clickable — record their rects
+        // in `modal_button_rects` so the shared modal hit-test routes a chip
+        // click to `Action::ScheduleAgentSetCommand` and a button click to
+        // `Action::ScheduleAgentConfirm` / `Action::ScheduleAgentCancel`.
         let captured = ui
             .schedule_agent_pick
             .as_ref()
@@ -10266,32 +10304,52 @@ fn agent_picker_row_width() -> u16 {
 /// agent (Option B). Shows the chosen/default authoring command plus the
 /// agent-command preset chips (`[claude]` / `[opencode]`) via
 /// [`render_modal_button_row`], both visible by default (no experimental flag).
-/// Returns the chips' `(Action, Rect)` pairs to record in
-/// `UiState::modal_button_rects` so a click sets the chosen command
-/// ([`Action::ScheduleAgentSetCommand`]).
+///
+/// PRD #170 round 3: also renders clickable `[Confirm]`/`[Cancel]` buttons
+/// (F4, mouse parity for Enter/Esc) and grows the modal so the bottom hint line
+/// renders un-clipped (F1). Returns the chips' AND the Confirm/Cancel buttons'
+/// `(Action, Rect)` pairs to record in `UiState::modal_button_rects` so the
+/// shared `hit_test_button` routes a chip click to
+/// [`Action::ScheduleAgentSetCommand`] and a button click to
+/// [`Action::ScheduleAgentConfirm`] / [`Action::ScheduleAgentCancel`].
 fn render_schedule_agent_pick(
     frame: &mut Frame,
     state: &ScheduleAgentPickState,
 ) -> Vec<(Action, Rect)> {
     let area = frame.area();
 
+    // The chip row's label, padded so the `[claude]`/`[opencode]` chips line up
+    // under the chosen-command VALUE on the row above (F5 label tidy):
+    // `  Agent:   ` (11 cols) matches `  Command: ` (11 cols) so both labels'
+    // colons and both value columns align.
+    let agent_label = "  Agent:   ";
+    let agent_label_w = agent_label.chars().count() as u16;
+
     // Content-size the modal: wide enough to contain the picker row (label +
     // chips, reviewer finding 7), the chosen-command line, and the title;
     // `modal_rect` clamps to [min, 90% of terminal].
     let chosen_line = format!("  Command: {}", state.chosen);
+    // `agent_picker_row_width()` counts the chips in full and a 9-col `  Agent: `
+    // label; the actual chip row uses the 2-col-wider padded label, comfortably
+    // covered by the `+4` margin and the 48-col floor below (reviewer finding 7:
+    // the chips never truncate).
     let desired_w = agent_picker_row_width()
         .max(chosen_line.chars().count() as u16)
         .max(" Pick authoring agent ".chars().count() as u16)
         .saturating_add(4)
         .max(48);
-    let desired_h = 9u16;
-    let popup_area = modal_rect(desired_w, desired_h, area, 48, 7);
+    // PRD #170 round 3 (F1): tall enough for EVERY row — title + the
+    // chosen-command line + the chips row + the new `[Confirm]`/`[Cancel]` row
+    // (F4) + the bottom hint line — so none is clipped by the clamped popup.
+    let desired_h = 11u16;
+    let popup_area = modal_rect(desired_w, desired_h, area, 48, 11);
 
     frame.render_widget(Clear, popup_area);
 
     let inner_width = popup_area.width.saturating_sub(2) as usize;
 
-    // Reserved lines; the `  Agent: ` row is overlaid with the chips below.
+    // Reserved lines; the `  Agent: ` row (idx 5) is overlaid with the chips and
+    // the `[Confirm]`/`[Cancel]` row (idx 7) with the buttons, both below.
     let lines = vec![
         Line::from(""),
         Line::styled("  Which agent runs this authoring session?", text_primary()),
@@ -10303,12 +10361,15 @@ fn render_schedule_agent_pick(
                 .add_modifier(Modifier::BOLD),
         ),
         Line::from(""),
-        Line::from(""), // reserved for the `  Agent: ` + chips overlay
+        Line::from(""), // idx 5: reserved for the `  Agent: ` + chips overlay
         Line::from(""),
+        Line::from(""), // idx 7: reserved for the `[Confirm]`/`[Cancel]` buttons
         Line::styled("  h/l select   Enter confirm   Esc cancel", text_primary()),
     ];
-    // Index of the reserved chip row within `lines` (0-based from the inner top).
+    // Indices of the reserved overlay rows within `lines` (0-based from the
+    // inner top).
     let picker_line_idx = 5usize;
+    let button_line_idx = 7usize;
 
     let block = Block::default()
         .title(" Pick authoring agent ")
@@ -10322,43 +10383,85 @@ fn render_schedule_agent_pick(
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 
+    let row_x = popup_area.x + 1;
+    let row_width = popup_area.width.saturating_sub(2);
+    let mut rects: Vec<(Action, Rect)> = Vec::new();
+
     // Overlay the `  Agent: ` label + the preset chips on the reserved row.
     // PRD #144 A1: skip the row if it falls outside the clamped popup (a
     // degenerate short terminal) rather than writing past the buffer bottom.
     let picker_y = popup_area.y + 1 + picker_line_idx as u16;
-    if picker_y >= popup_area.bottom() {
-        return Vec::new();
+    if picker_y < popup_area.bottom() {
+        {
+            let buf = frame.buffer_mut();
+            let _ = buf.set_span(
+                row_x,
+                picker_y,
+                &Span::styled(agent_label, text_dim()),
+                row_width,
+            );
+        }
+        let presets: Vec<Button> = AGENT_COMMAND_PRESETS
+            .iter()
+            .map(|p| {
+                Button::new(
+                    *p,
+                    "",
+                    Action::ScheduleAgentSetCommand((*p).to_string()),
+                    true,
+                )
+            })
+            .collect();
+        let presets_row = Rect {
+            x: row_x.saturating_add(agent_label_w),
+            y: picker_y,
+            width: row_width.saturating_sub(agent_label_w),
+            height: 1,
+        };
+        let mut chip_rects = render_modal_button_row(frame, &presets, presets_row, 0);
+        // PRD #170 round 2/3 (F2): highlight the selected chip REVERSED so the
+        // keyboard `h`/`l` movement (and a chip click) is visible — overlaid on
+        // top of the shared button-row render, since `render_modal_button_row`
+        // paints every chip with the terminal foreground. The chosen-command
+        // line above still shows the resolved value for non-preset defaults.
+        if let Some((_, rect)) = chip_rects.get(state.selected_preset)
+            && let Some(sel) = AGENT_COMMAND_PRESETS.get(state.selected_preset)
+        {
+            let rect = *rect;
+            let buf = frame.buffer_mut();
+            let _ = buf.set_span(
+                rect.x,
+                rect.y,
+                &Span::styled(
+                    format!("[{sel}]"),
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ),
+                rect.width,
+            );
+        }
+        rects.append(&mut chip_rects);
     }
-    let row_x = popup_area.x + 1;
-    let row_width = popup_area.width.saturating_sub(2);
-    let label = "  Agent: ";
-    let label_w = label.chars().count() as u16;
-    {
-        let buf = frame.buffer_mut();
-        let _ = buf.set_span(row_x, picker_y, &Span::styled(label, text_dim()), row_width);
+
+    // PRD #170 round 3 (F4): the `[Confirm]`/`[Cancel]` buttons on the reserved
+    // row — empty shortcuts so they render as plain `[Confirm]`/`[Cancel]`.
+    // Their rects join `modal_button_rects` so a click routes through the shared
+    // `hit_test_button`. Same A1 short-terminal guard as the chips row above.
+    let button_y = popup_area.y + 1 + button_line_idx as u16;
+    if button_y < popup_area.bottom() {
+        let buttons = [
+            Button::new("Confirm", "", Action::ScheduleAgentConfirm, true),
+            Button::new("Cancel", "", Action::ScheduleAgentCancel, true),
+        ];
+        let btn_row = Rect {
+            x: row_x,
+            y: button_y,
+            width: row_width,
+            height: 1,
+        };
+        rects.append(&mut render_modal_button_row(frame, &buttons, btn_row, 1));
     }
-    // PRD #170 round 2: the chip whose preset matches the current selection is
-    // highlighted (REVERSED) so the keyboard `h`/`l` movement is visible; the
-    // others use the terminal foreground. A click on any chip sets the chosen
-    // command via `Action::ScheduleAgentSetCommand`.
-    let presets: Vec<Button> = AGENT_COMMAND_PRESETS
-        .iter()
-        .map(|p| {
-            Button::new(
-                *p,
-                "",
-                Action::ScheduleAgentSetCommand((*p).to_string()),
-                true,
-            )
-        })
-        .collect();
-    let presets_row = Rect {
-        x: row_x.saturating_add(label_w),
-        y: picker_y,
-        width: row_width.saturating_sub(label_w),
-        height: 1,
-    };
-    render_modal_button_row(frame, &presets, presets_row, 0)
+
+    rects
 }
 
 /// Format one help row: a key column (left-padded to a fixed width so the
