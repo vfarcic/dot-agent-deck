@@ -37,10 +37,11 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// fills this from the configured `default_command`). Assert the modal surfaces
 /// the agent-command picker — both the `claude` and `opencode` presets render,
 /// visible by default — AND shows the resolved authoring command (`mycmd`) as the
-/// default selection, proving the modal defaults to the configured command while
-/// offering the presets as alternatives. RED until the modal + its
-/// `render_schedule_agent_pick_to_buffer` seam exist (the seam reference fails to
-/// compile today).
+/// default selection. PRD #170 round 3 also pins the modal's chrome: the
+/// instruction/hint line (`h/l select` / `Enter confirm` / `Esc cancel`) renders
+/// UN-CLIPPED (reviewer F1: the modal is one row too short today, clipping the
+/// bottom hint row) and the modal offers clickable `[Confirm]` / `[Cancel]`
+/// buttons (reviewer F4: mouse parity for Enter / Esc, absent today).
 #[spec("scheduler/manager/008")]
 #[test]
 fn manager_008_pick_agent_modal_renders_presets_and_default() {
@@ -60,6 +61,30 @@ fn manager_008_pick_agent_modal_renders_presets_and_default() {
             buf.contains(preset),
             "the pick-agent modal must surface the `{preset}` agent preset (visible by \
              default), got:\n{buf}"
+        );
+    }
+
+    // PRD #170 round 3 (reviewer F1): the modal's instruction/hint line must
+    // render UN-CLIPPED. Today the modal is one row too short, so the bottom hint
+    // row falls outside the clamped popup and none of these phrases appear.
+    for phrase in ["h/l select", "Enter confirm", "Esc cancel"] {
+        assert!(
+            buf.contains(phrase),
+            "the pick-agent modal must render its instruction/hint line un-clipped — the \
+             `{phrase}` hint must be visible (F1: the modal is one row too short today, \
+             clipping the hint row), got:\n{buf}"
+        );
+    }
+
+    // PRD #170 round 3 (reviewer F4): the modal must offer clickable `[Confirm]`
+    // and `[Cancel]` buttons (mouse parity for the Enter / Esc keyboard actions),
+    // absent today. The bracketed labels are the exact on-screen text a click test
+    // (`scheduler/manager/012`) finds and clicks.
+    for button in ["[Confirm]", "[Cancel]"] {
+        assert!(
+            buf.contains(button),
+            "the pick-agent modal must render a clickable `{button}` button (F4: mouse \
+             users can click preset chips but have no way to confirm/cancel today), got:\n{buf}"
         );
     }
 }

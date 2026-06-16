@@ -737,3 +737,261 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
     );
     drop(scratch);
 }
+
+/// Open the manager, press `e` to raise the pick-agent modal, send `close_key`
+/// (Esc or `q`), and assert the modal closes BACK to the Scheduled-Tasks manager
+/// dialog (its `NEXT FIRE` column header re-renders) — NOT the bare dashboard —
+/// with no authoring agent spawned. Shared body for the Esc and `q` variants of
+/// `scheduler/manager/011` (PRD #170 round 3, reviewer F3).
+fn assert_pick_modal_close_returns_to_manager(close_key: &[u8]) {
+    let (scratch, sched_path) = scratch_with_schedules(
+        "[[scheduled_tasks]]\n\
+         name = \"digest\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"digest prompt\"\n\
+         enabled = true\n",
+    );
+
+    // A benign `default_command` so the modal opens deterministically and any
+    // (erroneous) confirm-spawn would run `cat`, never the host's real `claude`.
+    let config_path = scratch.path().join("config.toml");
+    std::fs::write(&config_path, "default_command = \"cat\"\n").expect("write config.toml");
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    deck.send_keys(MANAGER_KEY);
+    // `NEXT FIRE` renders only when the manager dialog is open with its rows
+    // loaded — an unambiguous "dialog is up" signal (the bare `Scheduled Tasks`
+    // substring is already on the dashboard button bar before the dialog opens).
+    deck.wait_for_string("NEXT FIRE");
+
+    deck.send_keys(b"e"); // edit the auto-selected `digest` row → opens the pick-agent modal
+    deck.wait_for_string("opencode"); // the preset chip is the "modal is up" signal
+
+    // While the modal is up the manager dialog is not rendered, so `NEXT FIRE` is
+    // off-screen; closing the modal must bring it BACK.
+    deck.send_keys(close_key); // Esc / q → must return to the MANAGER, not the dashboard
+
+    // F3: closing the pick-agent modal returns to the Scheduled-Tasks MANAGER
+    // dialog (its `NEXT FIRE` header re-renders) you came from — NOT the bare
+    // dashboard. RED today: Esc/q drop to `UiMode::Normal` (dashboard), so the
+    // manager never reappears and this wait times out.
+    deck.wait_for_string("NEXT FIRE");
+
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("Pick authoring agent"),
+        "closing the pick-agent modal must dismiss it — its `Pick authoring agent` title \
+         must be gone.\nGrid:\n{grid}"
+    );
+
+    // No authoring agent spawned: closing must NOT fire the seeded `schedule`
+    // authoring pane (the spawn's display name is `SCHEDULE_MODE_NAME` = "schedule").
+    assert!(
+        !common::wait_for_agent_display_name(
+            deck.attach_socket_path(),
+            "schedule",
+            true,
+            Duration::from_millis(500),
+        ),
+        "closing the pick-agent modal must NOT spawn the authoring agent"
+    );
+    drop(scratch);
+}
+
+/// Scenario: Open the "Scheduled Tasks" manager, press `e` on the auto-selected
+/// row to raise the pick-agent modal, then press `Esc`. Assert the modal closes
+/// back to the MANAGER dialog (its `NEXT FIRE` header re-renders) — not the bare
+/// dashboard — with the `Pick authoring agent` title gone and no authoring agent
+/// spawned. RED today: Esc drops to the dashboard (`UiMode::Normal`), so the
+/// manager never reappears.
+#[spec("scheduler/manager/011")]
+#[test]
+fn manager_011_esc_returns_to_manager_dialog() {
+    assert_pick_modal_close_returns_to_manager(b"\x1b"); // Esc
+}
+
+/// Scenario: Like `manager_011_esc_returns_to_manager_dialog`, but closes the
+/// pick-agent modal with `q` instead of Esc — `q` must also return to the
+/// Scheduled-Tasks MANAGER dialog (mirroring the Esc behavior), not the bare
+/// dashboard, with no authoring agent spawned. RED today: `q` drops to the
+/// dashboard.
+#[spec("scheduler/manager/011")]
+#[test]
+fn manager_011_q_returns_to_manager_dialog() {
+    assert_pick_modal_close_returns_to_manager(b"q");
+}
+
+/// Scenario: With `default_command` configured to a distinctive `stub-authoring`
+/// recorder shim (and a `claude` neutralizer on PATH), open the manager, press
+/// `e` to raise the pick-agent modal, then LEFT-CLICK the `[Confirm]` button.
+/// Clicking `[Confirm]` must behave exactly like pressing Enter: the seeded
+/// authoring agent spawns running the chosen/default command (`stub-authoring`,
+/// whose recorder receives `digest`'s authoring seed) and NOT `claude`. RED
+/// today: the modal renders no `[Confirm]` button, so `find_in_grid` finds no
+/// click target and the test fails to locate it.
+#[spec("scheduler/manager/012")]
+#[test]
+fn manager_012_click_confirm_spawns_authoring_agent() {
+    let (scratch, sched_path) = scratch_with_schedules(
+        "[[scheduled_tasks]]\n\
+         name = \"digest\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"DIGESTPROMPTMARKER\"\n\
+         enabled = true\n",
+    );
+
+    let shim_dir = scratch.path().join("shim");
+    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+    let authoring_record = scratch.path().join("authoring-record.log");
+    let claude_record = scratch.path().join("claude-record.log");
+    write_recorder_shim(&shim_dir, "stub-authoring", &authoring_record);
+    write_recorder_shim(&shim_dir, "claude", &claude_record);
+
+    let config_path = scratch.path().join("config.toml");
+    std::fs::write(&config_path, "default_command = \"stub-authoring\"\n")
+        .expect("write config.toml");
+
+    let path_env = format!(
+        "{}:{}",
+        shim_dir.to_string_lossy(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
+        .with_env("PATH", path_env)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    deck.send_keys(MANAGER_KEY);
+    deck.wait_for_string("NEXT FIRE"); // manager dialog up
+    deck.send_keys(b"e"); // edit → opens the pick-agent modal
+    deck.wait_for_string("opencode"); // modal up
+
+    // F4 mouse parity: click `[Confirm]` (== Enter). RED today: no `[Confirm]`
+    // button renders, so `find_in_grid` returns None and this `expect` panics.
+    let (col, row) = deck
+        .find_in_grid("[Confirm]")
+        .expect("the pick-agent modal must render a clickable [Confirm] button (F4)");
+    deck.click(col, row);
+
+    // Confirming via click must spawn the CONFIGURED authoring command (not
+    // `claude`), pre-filled: the `stub-authoring` recorder receives digest's seed.
+    assert!(
+        common::wait_for_file_substr_count(
+            &authoring_record,
+            "DIGESTPROMPTMARKER",
+            1,
+            Duration::from_secs(15),
+        ),
+        "clicking [Confirm] must spawn the seeded authoring agent running the configured \
+         `default_command` (`stub-authoring`), pre-filled with the row's prompt — the \
+         recorder never received digest's authoring seed"
+    );
+    assert_eq!(
+        common::count_file_substr(&claude_record, "DIGESTPROMPTMARKER"),
+        0,
+        "clicking [Confirm] must spawn the configured command, not `claude` — but the \
+         `claude` shim received the authoring seed"
+    );
+    drop(scratch);
+}
+
+/// Scenario: With `default_command` configured to a `stub-authoring` recorder
+/// shim (and a `claude` neutralizer on PATH), open the manager, press `e` to
+/// raise the pick-agent modal, then LEFT-CLICK the `[Cancel]` button. Clicking
+/// `[Cancel]` must behave exactly like pressing Esc: the modal closes back to the
+/// MANAGER dialog (its `NEXT FIRE` header re-renders) with NO authoring agent
+/// spawned (neither recorder is written). RED today: the modal renders no
+/// `[Cancel]` button, so `find_in_grid` finds no click target.
+#[spec("scheduler/manager/012")]
+#[test]
+fn manager_012_click_cancel_closes_to_manager_no_spawn() {
+    let (scratch, sched_path) = scratch_with_schedules(
+        "[[scheduled_tasks]]\n\
+         name = \"digest\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"DIGESTPROMPTMARKER\"\n\
+         enabled = true\n",
+    );
+
+    let shim_dir = scratch.path().join("shim");
+    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+    let authoring_record = scratch.path().join("authoring-record.log");
+    let claude_record = scratch.path().join("claude-record.log");
+    write_recorder_shim(&shim_dir, "stub-authoring", &authoring_record);
+    write_recorder_shim(&shim_dir, "claude", &claude_record);
+
+    let config_path = scratch.path().join("config.toml");
+    std::fs::write(&config_path, "default_command = \"stub-authoring\"\n")
+        .expect("write config.toml");
+
+    let path_env = format!(
+        "{}:{}",
+        shim_dir.to_string_lossy(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
+        .with_env("PATH", path_env)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    deck.send_keys(MANAGER_KEY);
+    deck.wait_for_string("NEXT FIRE"); // manager dialog up
+    deck.send_keys(b"e"); // edit → opens the pick-agent modal
+    deck.wait_for_string("opencode"); // modal up
+
+    // F4 mouse parity: click `[Cancel]` (== Esc). RED today: no `[Cancel]` button
+    // renders, so `find_in_grid` returns None and this `expect` panics.
+    let (col, row) = deck
+        .find_in_grid("[Cancel]")
+        .expect("the pick-agent modal must render a clickable [Cancel] button (F4)");
+    deck.click(col, row);
+
+    // Cancelling via click closes back to the MANAGER dialog (F3): `NEXT FIRE`
+    // re-renders and the modal title is gone.
+    deck.wait_for_string("NEXT FIRE");
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("Pick authoring agent"),
+        "clicking [Cancel] must dismiss the pick-agent modal — its `Pick authoring agent` \
+         title must be gone.\nGrid:\n{grid}"
+    );
+
+    // And NO authoring agent spawned: neither recorder received digest's seed.
+    assert!(
+        !common::wait_for_agent_display_name(
+            deck.attach_socket_path(),
+            "schedule",
+            true,
+            Duration::from_millis(500),
+        ),
+        "clicking [Cancel] must NOT spawn the authoring agent"
+    );
+    assert_eq!(
+        common::count_file_substr(&authoring_record, "DIGESTPROMPTMARKER"),
+        0,
+        "clicking [Cancel] must not spawn anything — the `stub-authoring` recorder must stay empty"
+    );
+    assert_eq!(
+        common::count_file_substr(&claude_record, "DIGESTPROMPTMARKER"),
+        0,
+        "clicking [Cancel] must not spawn anything — the `claude` recorder must stay empty"
+    );
+    drop(scratch);
+}
