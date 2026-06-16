@@ -85,19 +85,62 @@ fn capture_path_via_shell(shell: &str) -> Option<String> {
     child.stdout.as_mut()?.read_to_string(&mut out).ok()?;
     let trimmed = out.trim();
     if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+        return None;
     }
+    // PRD #170 round 2 (auditor finding 1): reject a value carrying a NUL or any
+    // other control byte BEFORE it can reach `std::env::set_var`. `str::trim`
+    // strips surrounding whitespace but NOT an embedded NUL (U+0000 is valid
+    // UTF-8 and not whitespace), and `set_var` PANICS on a NUL — so a
+    // pathological / malicious `$SHELL` that printed one would crash daemon
+    // startup. A real shell printing a real PATH never contains a control byte,
+    // so a clean capture is unaffected; a tainted one falls back to the
+    // inherited PATH (no regression).
+    if trimmed.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
+
+/// PRD #170 round 2 (auditor finding 2): debug-only run-once latch. The
+/// `set_var` in [`apply_login_shell_path`] is sound ONLY while the process is
+/// still single-threaded — before the tokio runtime or any worker thread
+/// starts. The invariant is enforced by call placement (the synchronous `main`
+/// dispatch, as the first statement of the `daemon serve` arm); this latch is a
+/// cheap debug-build backstop that trips an assert if a future refactor ever
+/// calls this twice or relocates it after a thread/runtime has spawned, which
+/// would silently reintroduce a `getenv`/`setenv` data race (UB on glibc).
+#[cfg(debug_assertions)]
+static LOGIN_SHELL_PATH_APPLIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Apply the captured login-shell PATH to the daemon's OWN process environment.
 ///
-/// Call this ONCE at daemon-process startup, before the async runtime and any
-/// worker threads start. On `Some(path)` it sets `PATH` (so every pane the
-/// daemon later spawns inherits it); on `None` it leaves the inherited PATH
-/// untouched. Either outcome is logged.
+/// # Invariant (MUST hold — `set_var` soundness)
+///
+/// Call this EXACTLY ONCE at daemon-process startup, as early as possible and
+/// BEFORE the async runtime or any worker thread starts. `set_var` mutates the
+/// process-global environment; on glibc a concurrent `getenv` from another
+/// thread is a data race (undefined behavior). The sole call site
+/// (`src/main.rs`, the `DaemonCmd::Serve` arm) runs in the synchronous `fn main`
+/// — `run_daemon_serve_cli` is `#[tokio::main]`, so it builds its runtime only
+/// when *called*, after this returns — keeping this in the single-threaded
+/// startup window. Do NOT add a thread/`tokio::spawn` before this call, and do
+/// NOT move it later. A debug-build latch ([`LOGIN_SHELL_PATH_APPLIED`]) trips
+/// if it is ever called twice.
+///
+/// On `Some(path)` it sets `PATH` (so every pane the daemon later spawns
+/// inherits it); on `None` it leaves the inherited PATH untouched. Either
+/// outcome is logged.
 pub fn apply_login_shell_path() {
+    // PRD #170 round 2 (auditor finding 2): debug-build run-once backstop for
+    // the single-threaded-pre-runtime invariant documented above.
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        !LOGIN_SHELL_PATH_APPLIED.swap(true, std::sync::atomic::Ordering::SeqCst),
+        "apply_login_shell_path must run exactly once, in the single-threaded startup window \
+         before any tokio runtime / thread spawn (set_var soundness)"
+    );
+
     match capture_login_shell_path() {
         Some(path) => {
             // SAFETY: called from the synchronous `main` dispatch at daemon
@@ -105,7 +148,9 @@ pub fn apply_login_shell_path() {
             // (`run_daemon_serve_cli` is `#[tokio::main]`, so it builds its
             // runtime only when *called*, after this returns). The process is
             // single-threaded here, so no concurrent `getenv` can race this
-            // `setenv` — the PRD's stated soundness condition for `set_var`.
+            // `setenv` — the PRD's stated soundness condition for `set_var`. The
+            // captured value is rejected if it carries a NUL/control byte (see
+            // `capture_path_via_shell`), so `set_var` cannot panic here.
             unsafe {
                 std::env::set_var("PATH", &path);
             }
@@ -198,5 +243,34 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("does-not-exist-shell");
         assert_eq!(capture_path_via_shell(&missing.to_string_lossy()), None);
+    }
+
+    #[test]
+    fn none_on_nul_byte_in_output() {
+        // PRD #170 round 2 (auditor finding 1): a pathological `$SHELL` printing
+        // a PATH with an embedded NUL must be rejected — `set_var` panics on a
+        // NUL, so the capture path returns None and the daemon keeps its
+        // inherited PATH instead of crashing at startup. `\000` is octal NUL in
+        // POSIX `printf`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shell = write_shell(
+            dir.path(),
+            "nul-shell.sh",
+            "#!/bin/sh\nprintf '/opt/bin'\nprintf '\\000'\nprintf ':/usr/bin'\n",
+        );
+        assert_eq!(capture_path_via_shell(&shell.to_string_lossy()), None);
+    }
+
+    #[test]
+    fn none_on_control_byte_in_output() {
+        // Any other embedded control byte (here a raw ESC, `\033`) is rejected
+        // the same way — a real PATH never contains one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shell = write_shell(
+            dir.path(),
+            "ctrl-shell.sh",
+            "#!/bin/sh\nprintf '/opt/bin\\033/usr/bin'\n",
+        );
+        assert_eq!(capture_path_via_shell(&shell.to_string_lossy()), None);
     }
 }
