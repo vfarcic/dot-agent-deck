@@ -552,6 +552,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the exact layout used to keep the chip visible (wrap vs. window/scroll); the visibility of the non-selected chips when the row overflows; the authoring hint text (covered by `prompt/new-pane/007`).
 - **Platform coverage:** mac+linux.
 
+##### prompt/new-pane/010 — The new-pane form surfaces an agent-command picker (visible by default) offering `claude` / `opencode` presets alongside the `default_command`-prefilled Command field (PRD #170 M2.2).
+- **Layer:** L1 (ratatui `TestBackend` via the public `render_new_pane_form_to_buffer` seam).
+- **Agent:** none.
+- **Asserts:** the rendered form carries an agent-command picker — the `claude` and `opencode` agent presets both render — AND the existing Command field still shows its pre-filled command value (the seam's command, which production fills from `default_command`), proving the picker is additive to (not a replacement for) the free-text/path/custom command. Visible by default (no experimental flag). RED today: the form renders only the free-text Command field; no `claude`/`opencode` agent presets appear.
+- **Does not assert:** the picker's exact widget shape (chips vs. cycler vs. list); keyboard/mouse selection behavior; the schedule-authoring flow's copy of the picker (the seam is shared); insta byte-snapshot identity (plain substring assertions, matching `mouse/form/001`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Focus / navigation
 
 #### focus/dashboard
@@ -993,6 +1000,22 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Agent:** none (uses `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` to simulate skew).
 - **Asserts:** for each abort keystroke (`Q`, `q`, `Ctrl+C`, `Ctrl+D`, `Esc`): the TUI exits non-zero; the daemon socket is still answering after the exit; no fresh daemon was spawned.
 - **Does not assert:** any rendered error message after abort (the prompt itself is the user-visible artifact).
+- **Platform coverage:** mac+linux.
+
+#### lifecycle/login-path
+
+##### lifecycle/login-path/001 — A dashboard new-pane whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).
+- **Layer:** L2 (real `dot-agent-deck` binary in a PTY; the deck lazy-spawns its daemon, which inherits the deck's env).
+- **Agent:** none (a synthetic stub binary placed only in a temp dir that is NOT on the inherited PATH; the deck's `$SHELL` is a fake login shell whose `-lc` output adds that dir to PATH, mirroring how `~/.profile` adds `~/.local/bin`). `default_command` is set to the bare stub so the new-pane form pre-fills it.
+- **Asserts:** opening the new-pane form (Ctrl+n → confirm dir → Submit) with the bare stub as the command spawns it successfully — the stub writes an on-disk marker that appears within the wait window. RED today: nothing captures the login-shell PATH, so the daemon's PATH lacks the stub dir, the bare command is not found, the spawn fails, and the marker never appears.
+- **Does not assert:** the exact spawn-failure error text in the pane; the agent-command picker layout (covered by `prompt/new-pane/010`); the non-PATH login environment (out of scope per PRD #170).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/login-path/002 — A scheduled-task fire whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).
+- **Layer:** L2 (headless `dot-agent-deck daemon serve` driven via the `RunNow` control message — no PTY/grid, same shape as `scheduler/spawn/*`).
+- **Agent:** none (a synthetic stub binary placed only in a temp dir absent from the daemon's PATH; the daemon's `$SHELL` is a fake login shell whose `-lc` output adds that dir to PATH). The scheduled task's `command` is the bare stub.
+- **Asserts:** firing the task via `RunNow` spawns the bare stub successfully — the stub writes an on-disk marker that appears within the wait window. RED today: with no login-shell PATH capture the daemon's PATH lacks the stub dir, the bare command is not found, and the marker never appears.
+- **Does not assert:** prompt delivery to the spawned agent (covered by `scheduler/spawn/004`); the orchestration-vs-card branch (covered by `scheduler/spawn/002`).
 - **Platform coverage:** mac+linux.
 
 ### Resize
@@ -1846,11 +1869,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the exact next-fire timestamp formatting for enabled tasks; live-status rendering when a reused tab exists; the action buttons' click behavior (covered by `mouse/modal/001`).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/manager/002 — `a` (add) / `Enter`/`e` (edit) spawn the seeded authoring agent; edit pre-fills the row's current values (PRD #127 M3.3).
-- **Layer:** L2 (same no-L1-seam reason). `claude` is shimmed to a recorder agent that posts SessionStart and records its delivered seed.
+##### scheduler/manager/002 — `a` (add) / `Enter`/`e` (edit) spawn the seeded authoring agent running the CONFIGURED command (`default_command`, not a hardcoded `claude`); edit pre-fills the row's current values (PRD #127 M3.3; PRD #170 M2.1).
+- **Layer:** L2 (same no-L1-seam reason). Two shims are on PATH: a distinctive `default_command` (e.g. `stub-authoring`) shimmed to a recorder that posts SessionStart and records its delivered seed, and `claude` shimmed to a separate neutralizing recorder (so the host's real `claude` is never invoked and so the hardcoded-`claude` regression is observable).
 - **Agent:** the shimmed authoring agent (records the gated-delivered seed, mirroring how `tabs/mode/005` observes seed delivery).
-- **Asserts:** pressing `e` on a row spawns the seeded authoring agent and the edit context is pre-filled — the agent receives the authoring seed carrying the row's current prompt value.
-- **Does not assert:** the full authoring seed-prompt text; that the agent ultimately calls `schedule update` (covered by the CLI + seed-delivery mechanism); the add (blank) path beyond reuse of the same seam.
+- **Asserts:** with `default_command` set to the distinctive stub, pressing `e` on a row spawns the seeded authoring agent running THAT configured command — its recorder receives the authoring seed carrying the row's current prompt value (pre-fill), AND the `claude` recorder receives nothing (the authoring command is no longer the hardcoded `claude`). RED today: the authoring spawn is hardcoded to `SCHEDULE_AUTHORING_AGENT = "claude"`, so the configured stub's recorder is never written.
+- **Does not assert:** the full authoring seed-prompt text; that the agent ultimately calls `schedule update` (covered by the CLI + seed-delivery mechanism); the add (blank) path beyond reuse of the same seam; the agent-command picker UI (covered by `prompt/new-pane/010`).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/manager/003 — `d` + confirm removes the schedule definition but does NOT close an already-open tab for it (PRD #127 M3.3).

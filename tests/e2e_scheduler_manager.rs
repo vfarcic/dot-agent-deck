@@ -119,11 +119,17 @@ fn manager_001_lists_schedules_with_status_and_next_fire() {
 }
 
 /// Scenario: With a fixture `schedules.toml` containing one task (`digest`) and
-/// `claude` shimmed (on PATH) to a recorder agent that posts SessionStart and
-/// records its delivered prompt, open the manager and press `e` on the row to
-/// edit. Assert the seeded authoring agent is spawned and that the edit context
-/// is PRE-FILLED with the row's current values — the recorder receives the
-/// authoring seed carrying `digest`'s distinctive prompt text.
+/// `default_command` configured to a DISTINCTIVE stub command (`stub-authoring`,
+/// not `claude`) shimmed (on PATH) to a recorder agent that posts SessionStart
+/// and records its delivered prompt, open the manager and press `e` on the row to
+/// edit. Assert the seeded authoring agent that gets spawned is the CONFIGURED
+/// command — the `stub-authoring` recorder receives the authoring seed carrying
+/// `digest`'s distinctive prompt text (proving both edit pre-fill AND that the
+/// command came from `default_command`) — while a separate `claude` neutralizer
+/// shim (kept on PATH so the host's real `claude` is never invoked) records
+/// nothing. RED today: the authoring spawn is hardcoded to
+/// `SCHEDULE_AUTHORING_AGENT = "claude"`, so the configured stub's recorder is
+/// never written.
 #[spec("scheduler/manager/002")]
 #[test]
 fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
@@ -137,31 +143,51 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
          enabled = true\n",
     );
 
-    // Shim `claude` (the authoring agent command) to a recorder that opens the
+    // Write a recorder shim named `name` into `shim_dir`: it opens the
     // gated-delivery readiness gate (posts SessionStart via the real hook path)
-    // then records every delivered line — so the authoring seed is observable.
+    // then records every delivered line to `record`, so the authoring seed is
+    // observable. Used for BOTH the configured stub command and a `claude`
+    // neutralizer (the latter so the host's real `claude` never runs and so the
+    // hardcoded-`claude` regression is observable).
     let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let record = scratch.path().join("authoring-record.log");
     let shim_dir = scratch.path().join("shim");
     std::fs::create_dir_all(&shim_dir).expect("create shim dir");
-    let claude = shim_dir.join("claude");
-    std::fs::write(
-        &claude,
-        format!(
-            "#!/bin/sh\n\
-             printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"authoring\"}}' \
-             | \"{bin}\" hook claude-code >/dev/null 2>&1\n\
-             while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; done\n",
-            rec = record.to_string_lossy()
-        ),
-    )
-    .expect("write claude shim");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod claude shim");
-    }
+    let write_recorder = |name: &str, record: &std::path::Path| {
+        let path = shim_dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"authoring\"}}' \
+                 | \"{bin}\" hook claude-code >/dev/null 2>&1\n\
+                 while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; done\n",
+                rec = record.to_string_lossy()
+            ),
+        )
+        .unwrap_or_else(|e| panic!("write {name} shim: {e}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|e| panic!("chmod {name} shim: {e}"));
+        }
+    };
+
+    // The CONFIGURED authoring command is a distinctive stub — its recorder is
+    // the GREEN signal. A `claude` neutralizer recorder catches the pre-fix
+    // hardcoded-`claude` path (and shields the test from the host's real claude).
+    let authoring_record = scratch.path().join("authoring-record.log");
+    let claude_record = scratch.path().join("claude-record.log");
+    write_recorder("stub-authoring", &authoring_record);
+    write_recorder("claude", &claude_record);
+
+    // `default_command` = the distinctive stub, supplied via a config file the
+    // deck reads (DOT_AGENT_DECK_CONFIG). Once PRD #170 M2.1 lands, the authoring
+    // helper resolves its command from this instead of the hardcoded `claude`.
+    let config_path = scratch.path().join("config.toml");
+    std::fs::write(&config_path, "default_command = \"stub-authoring\"\n")
+        .expect("write config.toml");
+
     let path_env = format!(
         "{}:{}",
         shim_dir.to_string_lossy(),
@@ -170,6 +196,7 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
 
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_env("PATH", path_env)
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
@@ -178,17 +205,29 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
     deck.wait_for_string("Scheduled Tasks");
     deck.send_keys(b"e"); // edit the auto-selected `digest` row
 
-    // The edit pre-fill must reach the authoring agent: the recorder receives
-    // the seed carrying digest's current prompt value.
+    // The edit must spawn the CONFIGURED authoring command (not hardcoded
+    // `claude`) and pre-fill it: the stub's recorder receives the seed carrying
+    // digest's current prompt value.
     assert!(
         common::wait_for_file_substr_count(
-            &record,
+            &authoring_record,
             "DIGESTPROMPTMARKER",
             1,
             Duration::from_secs(15),
         ),
-        "editing a schedule must spawn the seeded authoring agent pre-filled with the \
-         row's current values (the agent never received digest's prompt)"
+        "editing a schedule must spawn the seeded authoring agent running the CONFIGURED \
+         `default_command` (`stub-authoring`), pre-filled with the row's current values — \
+         the configured command's recorder never received digest's prompt (the spawn is \
+         still hardcoded to `claude`)"
+    );
+    // The authoring command must NOT be the hardcoded `claude`: its neutralizer
+    // recorder must be empty (checked only after the positive assert passes, so
+    // this is a clean point-in-time read, not a race).
+    assert_eq!(
+        common::count_file_substr(&claude_record, "DIGESTPROMPTMARKER"),
+        0,
+        "the authoring command must come from `default_command`, not the hardcoded \
+         `claude` — but the `claude` shim received the authoring seed"
     );
     drop(scratch);
 }
