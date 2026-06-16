@@ -822,9 +822,9 @@ fn manager_011_esc_returns_to_manager_dialog() {
 /// Scheduled-Tasks MANAGER dialog (mirroring the Esc behavior), not the bare
 /// dashboard, with no authoring agent spawned. RED today: `q` drops to the
 /// dashboard.
-#[spec("scheduler/manager/011")]
+#[spec("scheduler/manager/013")]
 #[test]
-fn manager_011_q_returns_to_manager_dialog() {
+fn manager_013_q_returns_to_manager_dialog() {
     assert_pick_modal_close_returns_to_manager(b"q");
 }
 
@@ -992,6 +992,96 @@ fn manager_012_click_cancel_closes_to_manager_no_spawn() {
         common::count_file_substr(&claude_record, "DIGESTPROMPTMARKER"),
         0,
         "clicking [Cancel] must not spawn anything — the `claude` recorder must stay empty"
+    );
+    drop(scratch);
+}
+
+/// Scenario: With `default_command` configured to a CUSTOM command that is NOT a
+/// preset (`stub-authoring`, a recorder shim) plus a `claude` neutralizer on
+/// PATH, open the manager and press `e` to raise the pick-agent modal. The modal
+/// opens with the custom command as the chosen default and the preset highlight
+/// at the LEFTMOST position (`selected_preset == 0`, since the custom command
+/// matches no preset). Press `h` (move-prev) AT that leftmost position — it must
+/// be a no-op that does NOT clobber the custom chosen command — then confirm with
+/// Enter. Assert the seeded authoring agent spawns running the CUSTOM
+/// `stub-authoring` command (its recorder receives digest's authoring seed), NOT
+/// `claude` (`AGENT_COMMAND_PRESETS[0]`). RED today: at `selected_preset == 0`,
+/// `h` still reassigns `chosen = AGENT_COMMAND_PRESETS[0]` (claude), so `claude`
+/// spawns and the custom recorder never fires.
+#[spec("scheduler/manager/014")]
+#[test]
+fn manager_014_h_at_leftmost_preserves_custom_command() {
+    let (scratch, sched_path) = scratch_with_schedules(
+        "[[scheduled_tasks]]\n\
+         name = \"digest\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"DIGESTPROMPTMARKER\"\n\
+         enabled = true\n",
+    );
+
+    let shim_dir = scratch.path().join("shim");
+    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+    // The CUSTOM (non-preset) authoring command is the GREEN signal; a `claude`
+    // neutralizer recorder both shields the host's real `claude` and catches the
+    // clobber regression where `h` reassigns the chosen command to `claude`.
+    let authoring_record = scratch.path().join("authoring-record.log");
+    let claude_record = scratch.path().join("claude-record.log");
+    write_recorder_shim(&shim_dir, "stub-authoring", &authoring_record);
+    write_recorder_shim(&shim_dir, "claude", &claude_record);
+
+    // `default_command` = the custom (non-preset) command, so the modal opens
+    // with `chosen = "stub-authoring"` and `selected_preset = 0` (no preset
+    // matches the custom command, so the highlight starts at the leftmost preset).
+    let config_path = scratch.path().join("config.toml");
+    std::fs::write(&config_path, "default_command = \"stub-authoring\"\n")
+        .expect("write config.toml");
+
+    let path_env = format!(
+        "{}:{}",
+        shim_dir.to_string_lossy(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
+        .with_env("PATH", path_env)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    deck.send_keys(MANAGER_KEY);
+    deck.wait_for_string("NEXT FIRE"); // manager dialog up
+    deck.send_keys(b"e"); // edit → opens the pick-agent modal
+    deck.wait_for_string("opencode"); // modal up
+
+    // Press `h` (move-prev) at the leftmost preset. With `selected_preset == 0`
+    // this must NOT clobber the CUSTOM chosen command — it stays `stub-authoring`.
+    deck.send_keys(b"h");
+    deck.send_keys(b"\r"); // confirm the chosen command → spawn the authoring agent
+
+    // GREEN: pressing `h` at the leftmost preset preserved the custom command, so
+    // confirming spawns `stub-authoring` and its recorder receives digest's seed.
+    assert!(
+        common::wait_for_file_substr_count(
+            &authoring_record,
+            "DIGESTPROMPTMARKER",
+            1,
+            Duration::from_secs(15),
+        ),
+        "pressing `h` at the leftmost preset (selected_preset == 0) must NOT clobber the \
+         CUSTOM chosen command — confirming must spawn `stub-authoring` (the configured \
+         `default_command`), whose recorder receives digest's authoring seed — but it never did"
+    );
+    // The clobber regression target: `claude` (presets[0]) must NOT have spawned
+    // (checked only after the positive assert passes, so it is a clean
+    // point-in-time read, not a race).
+    assert_eq!(
+        common::count_file_substr(&claude_record, "DIGESTPROMPTMARKER"),
+        0,
+        "pressing `h` at the leftmost preset must not reassign the chosen command to `claude` \
+         (`AGENT_COMMAND_PRESETS[0]`) — but the `claude` shim received the authoring seed"
     );
     drop(scratch);
 }
