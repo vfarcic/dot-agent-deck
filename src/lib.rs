@@ -21,6 +21,7 @@ pub mod hyperlink;
 pub mod init;
 pub mod keybindings;
 pub mod llm;
+pub mod login_shell;
 pub mod mode_manager;
 pub mod opencode_manage;
 pub mod palette;

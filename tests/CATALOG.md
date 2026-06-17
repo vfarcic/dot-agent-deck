@@ -552,6 +552,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the exact layout used to keep the chip visible (wrap vs. window/scroll); the visibility of the non-selected chips when the row overflows; the authoring hint text (covered by `prompt/new-pane/007`).
 - **Platform coverage:** mac+linux.
 
+##### prompt/new-pane/010 — The new-pane form surfaces an agent-command picker (visible by default) offering `claude` / `opencode` presets alongside the `default_command`-prefilled Command field (PRD #170 M2.2).
+- **Layer:** L1 (ratatui `TestBackend` via the public `render_new_pane_form_to_buffer` seam).
+- **Agent:** none.
+- **Asserts:** the rendered form carries an agent-command picker — the `claude` and `opencode` agent presets both render — AND the existing Command field still shows its pre-filled command value (the seam's command, which production fills from `default_command`), proving the picker is additive to (not a replacement for) the free-text/path/custom command. Visible by default (no experimental flag). RED today: the form renders only the free-text Command field; no `claude`/`opencode` agent presets appear.
+- **Does not assert:** the picker's exact widget shape (chips vs. cycler vs. list); keyboard/mouse selection behavior; the schedule-authoring flow's copy of the picker (the seam is shared); insta byte-snapshot identity (plain substring assertions, matching `mouse/form/001`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Focus / navigation
 
 #### focus/dashboard
@@ -993,6 +1000,22 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Agent:** none (uses `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` to simulate skew).
 - **Asserts:** for each abort keystroke (`Q`, `q`, `Ctrl+C`, `Ctrl+D`, `Esc`): the TUI exits non-zero; the daemon socket is still answering after the exit; no fresh daemon was spawned.
 - **Does not assert:** any rendered error message after abort (the prompt itself is the user-visible artifact).
+- **Platform coverage:** mac+linux.
+
+#### lifecycle/login-path
+
+##### lifecycle/login-path/001 — A dashboard new-pane whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).
+- **Layer:** L2 (real `dot-agent-deck` binary in a PTY; the deck lazy-spawns its daemon, which inherits the deck's env).
+- **Agent:** none (a synthetic stub binary placed only in a temp dir that is NOT on the inherited PATH; the deck's `$SHELL` is a fake login shell whose `-lc` output adds that dir to PATH, mirroring how `~/.profile` adds `~/.local/bin`). `default_command` is set to the bare stub so the new-pane form pre-fills it.
+- **Asserts:** opening the new-pane form (Ctrl+n → confirm dir → Submit) with the bare stub as the command spawns it successfully — the stub writes an on-disk marker that appears within the wait window. RED today: nothing captures the login-shell PATH, so the daemon's PATH lacks the stub dir, the bare command is not found, the spawn fails, and the marker never appears.
+- **Does not assert:** the exact spawn-failure error text in the pane; the agent-command picker layout (covered by `prompt/new-pane/010`); the non-PATH login environment (out of scope per PRD #170).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/login-path/002 — A scheduled-task fire whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).
+- **Layer:** L2 (headless `dot-agent-deck daemon serve` driven via the `RunNow` control message — no PTY/grid, same shape as `scheduler/spawn/*`).
+- **Agent:** none (a synthetic stub binary placed only in a temp dir absent from the daemon's PATH; the daemon's `$SHELL` is a fake login shell whose `-lc` output adds that dir to PATH). The scheduled task's `command` is the bare stub.
+- **Asserts:** firing the task via `RunNow` spawns the bare stub successfully — the stub writes an on-disk marker that appears within the wait window. RED today: with no login-shell PATH capture the daemon's PATH lacks the stub dir, the bare command is not found, and the marker never appears.
+- **Does not assert:** prompt delivery to the spawned agent (covered by `scheduler/spawn/004`); the orchestration-vs-card branch (covered by `scheduler/spawn/002`).
 - **Platform coverage:** mac+linux.
 
 ### Resize
@@ -1846,11 +1869,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the exact next-fire timestamp formatting for enabled tasks; live-status rendering when a reused tab exists; the action buttons' click behavior (covered by `mouse/modal/001`).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/manager/002 — `a` (add) / `Enter`/`e` (edit) spawn the seeded authoring agent; edit pre-fills the row's current values (PRD #127 M3.3).
-- **Layer:** L2 (same no-L1-seam reason). `claude` is shimmed to a recorder agent that posts SessionStart and records its delivered seed.
+##### scheduler/manager/002 — Editing a schedule opens the pick-agent modal; confirming the default selection spawns the seeded authoring agent running the CONFIGURED command (`default_command`), pre-filled with the row's current values (PRD #127 M3.3; PRD #170 M2.1 + round 2 Option B).
+- **Layer:** L2 (same no-L1-seam reason for the manager dialog; the modal's render is covered at L1 by `scheduler/manager/008`). Two shims are on PATH: a distinctive `default_command` (e.g. `stub-authoring`) shimmed to a recorder that posts SessionStart and records its delivered seed, and `claude` shimmed to a separate neutralizing recorder (so the host's real `claude` is never invoked and so a fall-back-to-`claude` regression is observable).
 - **Agent:** the shimmed authoring agent (records the gated-delivered seed, mirroring how `tabs/mode/005` observes seed delivery).
-- **Asserts:** pressing `e` on a row spawns the seeded authoring agent and the edit context is pre-filled — the agent receives the authoring seed carrying the row's current prompt value.
-- **Does not assert:** the full authoring seed-prompt text; that the agent ultimately calls `schedule update` (covered by the CLI + seed-delivery mechanism); the add (blank) path beyond reuse of the same seam.
+- **Asserts:** with `default_command` set to the distinctive stub, pressing `e` on a row FIRST opens the pick-agent modal (its `opencode` preset chip renders); confirming the default selection with Enter then spawns the seeded authoring agent running THAT configured command — its recorder receives the authoring seed carrying the row's current prompt value (pre-fill), AND the `claude` recorder receives nothing (the confirmed command came from `default_command`). RED until the pick-agent modal exists: today `e` spawns the authoring agent immediately with no modal, so the `opencode` preset chip never renders and the modal wait times out.
+- **Does not assert:** the full authoring seed-prompt text; that the agent ultimately calls `schedule update` (covered by the CLI + seed-delivery mechanism); the add (blank) path beyond reuse of the same seam; the modal's render layout (covered by `scheduler/manager/008`); non-default preset selection (covered by `scheduler/manager/009`).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/manager/003 — `d` + confirm removes the schedule definition but does NOT close an already-open tab for it (PRD #127 M3.3).
@@ -1885,6 +1908,62 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`, one enabled task whose name is longer than the legacy fixed-width name cell).
 - **Asserts:** opening the manager at a roomy (200-col) terminal AND at a windowed (80-col) terminal renders the task's FULL name un-clipped on the grid at both widths — proving the dialog auto-sizes to its content (PRD #144 shared modal sizing helper, clamped within the windowed terminal) instead of truncating the field to the fixed 72-col modal. RED today: the modal is hard-capped at 72 cols and the name is truncated to 21 chars (`truncate_cell`), so the full name never appears.
 - **Does not assert:** the exact modal width / clamp fraction at each terminal size; the `[min, max]` bounds of the shared helper (covered by the coder's pure-data unit test); the delete-confirmation containment (covered by `scheduler/manager/005`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/008 — The schedule pick-agent modal renders the agent-command presets (`claude` / `opencode`, visible by default) and defaults to the resolved authoring command (PRD #170 round 2, Option B).
+- **Layer:** L1 (ratatui `TestBackend` via a new public `render_schedule_agent_pick_to_buffer` seam, mirroring `render_new_pane_form_to_buffer`). RED is a COMPILE error until the coder adds the seam + the modal it renders.
+- **Agent:** none.
+- **Asserts:** the rendered pick-agent modal carries an agent-command picker — the `claude` and `opencode` presets both render, visible by default — AND shows the resolved authoring command (the seam's `mycmd`, which production fills from `default_command`) as the default selection, proving the modal defaults to the configured command while offering the presets as alternatives. PRD #170 round 3 also pins the modal chrome: the instruction/hint line renders un-clipped (the `h/l select` / `Enter confirm` / `Esc cancel` phrases are all visible — reviewer F1) and the modal offers clickable `[Confirm]` / `[Cancel]` buttons (reviewer F4 mouse parity, the exact bracketed labels `scheduler/manager/012`/`015` click).
+- **Does not assert:** the modal's exact widget shape (chips vs. list); keyboard/mouse selection behavior (covered by `scheduler/manager/009`); the spawn on confirm (covered by `scheduler/manager/002`); the click-to-confirm/cancel behavior (covered by `scheduler/manager/012`/`015`); insta byte-snapshot identity (plain substring assertions, matching `prompt/new-pane/010`).
+- **Platform coverage:** mac+linux+windows.
+
+##### scheduler/manager/009 — Selecting a NON-default agent preset in the pick-agent modal is honored: the chosen command spawns the authoring agent, not the default (PRD #170 round 2, Option B).
+- **Layer:** L2 (drives the real manager + modal via PTY keystrokes; observed via distinct-name recorder shims on disk). Two shims on PATH: `claude` (the `default_command`) and `opencode` (the non-default pick), each shimmed to a separate recorder so the test can tell WHICH spawned.
+- **Agent:** the shimmed authoring agent (records the gated-delivered seed).
+- **Asserts:** with `default_command = "claude"`, pressing `e` opens the pick-agent modal; moving the preset highlight to the non-default `opencode` (`l`) and confirming with Enter spawns the authoring agent running `opencode` (its recorder receives the authoring seed) while the default `claude` recorder stays empty. RED until the modal + selection wiring exist: today `e` spawns `claude` immediately with no modal.
+- **Does not assert:** the exact key/click that moves the highlight (the contract — `h`/`l` or Left/Right or a preset click — is the coder's; the observable is which command spawned); the modal render (covered by `scheduler/manager/008`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/010 — A blank/unset `default_command` falls back to `claude` (`AGENT_COMMAND_PRESETS[0]`) for the authoring agent, NOT a bare `$SHELL` (PRD #170 round 2, R1 fallback).
+- **Layer:** L2 (drives the real manager + modal via PTY; observed via a `claude` recorder shim on disk).
+- **Agent:** the shimmed `claude` authoring agent (records the gated-delivered seed).
+- **Asserts:** with `default_command = ""` (the unconfigured-user case), pressing `e` opens the pick-agent modal and confirming the default with Enter spawns `claude` — its recorder receives the authoring seed — proving the blank command resolves to the first preset instead of spawning a bare login shell that cannot act on the seed. RED today: a blank `default_command` spawns a bare `$SHELL` (no modal, no fallback), so the `claude` recorder is never written.
+- **Does not assert:** the whitespace-only variant of the fallback (the same code path); the new-pane form's copy of the default (covered by `prompt/new-pane/010`); the modal render (covered by `scheduler/manager/008`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/011 — Closing the pick-agent modal with Esc returns to the Scheduled-Tasks MANAGER dialog you came from, not the bare dashboard (PRD #170 round 3, reviewer F3).
+- **Layer:** L2 (drives the real manager + modal via PTY; observed on the rendered vt100 grid plus the attach-socket registry). Shares one body with `scheduler/manager/013` (the `q`-key variant), parameterized on the close key — this entry pins the `Esc` close.
+- **Agent:** none (the close path must not spawn one — asserted via the attach socket).
+- **Asserts:** with a benign `default_command = "cat"`, pressing `e` opens the pick-agent modal (so the manager's `NEXT FIRE` header goes off-screen); sending `Esc` brings the manager dialog BACK — its `NEXT FIRE` header re-renders and the `Pick authoring agent` title is gone — and no authoring agent (display name `schedule`) is spawned. RED today: Esc drops to `UiMode::Normal` (the bare dashboard), so the manager never reappears and the post-close `NEXT FIRE` wait times out.
+- **Does not assert:** the `q`-key close (covered by `scheduler/manager/013`); the modal render (covered by `scheduler/manager/008`); the confirm/spawn path (covered by `scheduler/manager/002`/`012`); the dashboard's own contents.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/012 — The pick-agent modal's `[Confirm]` button is clickable: a `[Confirm]` click spawns the authoring agent, exactly like pressing Enter (PRD #170 round 3, reviewer F4 — mouse parity).
+- **Layer:** L2 (drives the real manager + modal via PTY mouse reports; `[Confirm]` located with `find_in_grid` then left-clicked, observed via distinct-name recorder shims on disk plus the vt100 grid). `default_command = "stub-authoring"` (a recorder shim) with a `claude` neutralizer on PATH.
+- **Agent:** the shimmed `stub-authoring` authoring agent (records the gated-delivered seed).
+- **Asserts:** clicking `[Confirm]` behaves like Enter — the seeded authoring agent spawns running the configured `stub-authoring` (its recorder receives `digest`'s prompt) and `claude` does not. RED today: the modal renders no `[Confirm]` button, so `find_in_grid` finds no click target and the test cannot locate it.
+- **Does not assert:** the `[Cancel]` click (covered by `scheduler/manager/015`); the keyboard Enter/Esc behavior (covered by `scheduler/manager/002`/`009`/`011`); preset-chip clicks (covered by `scheduler/manager/009`'s selection contract); the modal render layout (covered by `scheduler/manager/008`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/013 — Closing the pick-agent modal with `q` returns to the Scheduled-Tasks MANAGER dialog you came from, not the bare dashboard — mirroring the Esc close (PRD #170 round 3, reviewer F3).
+- **Layer:** L2 (drives the real manager + modal via PTY; observed on the rendered vt100 grid plus the attach-socket registry). Shares one body with `scheduler/manager/011` (the `Esc` variant), parameterized on the close key — this entry pins the `q` close.
+- **Agent:** none (the close path must not spawn one — asserted via the attach socket).
+- **Asserts:** with a benign `default_command = "cat"`, pressing `e` opens the pick-agent modal (so the manager's `NEXT FIRE` header goes off-screen); pressing `q` brings the manager dialog BACK — its `NEXT FIRE` header re-renders and the `Pick authoring agent` title is gone — and no authoring agent (display name `schedule`) is spawned. RED today: `q` drops to `UiMode::Normal` (the bare dashboard), so the manager never reappears and the post-close `NEXT FIRE` wait times out.
+- **Does not assert:** the `Esc` close (covered by `scheduler/manager/011`); the modal render (covered by `scheduler/manager/008`); the confirm/spawn path (covered by `scheduler/manager/002`/`012`); the dashboard's own contents.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/014 — Pressing `h` (move-prev) at the leftmost preset in the pick-agent modal must NOT clobber a CUSTOM chosen command to `claude` (PRD #170 round 3, Greptile finding on PR #171).
+- **Layer:** L2 (drives the real manager + modal via PTY; observed via distinct-name recorder shims on disk). Two shims on PATH: a CUSTOM non-preset `default_command` (`stub-authoring`) shimmed to a recorder, and `claude` shimmed to a neutralizing recorder (so the host's real `claude` is never invoked and so the clobber-to-`claude` regression is observable).
+- **Agent:** the shimmed authoring agent (records the gated-delivered seed).
+- **Asserts:** with `default_command = "stub-authoring"` (a custom command matching no preset), pressing `e` opens the pick-agent modal with the custom command chosen and the preset highlight at the leftmost position (`selected_preset == 0`); pressing `h` there is a no-op that does NOT overwrite the chosen command, so confirming with Enter spawns `stub-authoring` (its recorder receives `digest`'s authoring seed) and `claude` (`AGENT_COMMAND_PRESETS[0]`) does not. RED today: at `selected_preset == 0`, `h` still reassigns `chosen = AGENT_COMMAND_PRESETS[0]`, so `claude` spawns and the custom recorder never fires.
+- **Does not assert:** the `l`/Right preset-stepping behavior (covered by `scheduler/manager/009`); the modal render (covered by `scheduler/manager/008`); the cancel path (covered by `scheduler/manager/011`/`013`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/015 — The pick-agent modal's `[Cancel]` button is clickable: a `[Cancel]` click closes back to the manager with no spawn, exactly like pressing Esc (PRD #170 round 3, reviewer F4 — mouse parity).
+- **Layer:** L2 (drives the real manager + modal via PTY mouse reports; `[Cancel]` located with `find_in_grid` then left-clicked, observed via distinct-name recorder shims on disk plus the vt100 grid). `default_command = "stub-authoring"` (a recorder shim) with a `claude` neutralizer on PATH.
+- **Agent:** none (the cancel path must not spawn one — asserted via the attach socket and both recorder shims).
+- **Asserts:** clicking `[Cancel]` behaves like Esc — the modal closes back to the manager (`NEXT FIRE` re-renders, `Pick authoring agent` gone) with NO authoring agent (display name `schedule`) spawned and neither the `stub-authoring` nor the `claude` recorder written. RED today: the modal renders no `[Cancel]` button, so `find_in_grid` finds no click target and the test cannot locate it.
+- **Does not assert:** the `[Confirm]` click (covered by `scheduler/manager/012`); the keyboard Esc behavior (covered by `scheduler/manager/011`/`013`); preset-chip clicks (covered by `scheduler/manager/009`'s selection contract); the modal render layout (covered by `scheduler/manager/008`).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live
