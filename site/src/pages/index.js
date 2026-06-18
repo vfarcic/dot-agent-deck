@@ -86,8 +86,8 @@ function HomepageScreenshot() {
     <section className={styles.screenshot}>
       <div className="container">
         <img
-          src="/img/home-hero-dashboard.jpg"
-          alt="Agent Deck dashboard with multiple agent sessions running in parallel"
+          src="/img/orchestration-coder.png"
+          alt="Agent Deck orchestrating multiple agents in parallel — orchestrator and coder both working"
           className={styles.screenshotImage}
         />
       </div>
