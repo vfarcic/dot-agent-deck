@@ -7,15 +7,17 @@ title: Orchestration
 
 Orchestrations are multi-agent pipelines where a designated **orchestrator** agent coordinates work across one or more **worker** agents. Each worker runs in its own pane, gets tasks injected into it, and signals completion back to the orchestrator — all automatically, through the daemon.
 
-> **Run one orchestration at a time**
->
-> Run only **one orchestration at a time per user/machine**. Separate directories do **not** isolate concurrent orchestrations: they all share a single per-user daemon, so a worker's `work-done` report or notification can be delivered to the wrong orchestrator's stream. This is tracked for a fix in [issue #140](https://github.com/vfarcic/dot-agent-deck/issues/140).
+> **Prefer video?** This page is a written companion to the walkthrough below — a full development pipeline (coder → reviewer + auditor → release) running end-to-end on a real project.
+
+<a href="https://youtu.be/ZIWWDDu02Ik"><img src="https://img.youtube.com/vi/ZIWWDDu02Ik/maxresdefault.jpg" width="480" alt="Watch the multi-agent orchestration walkthrough on YouTube" /></a>
 
 ## Why orchestrations work
 
 An agent reviewing its own code is like a developer reviewing their own PR: the same assumptions, the same blind spots, the same conviction that what they wrote is correct. Running the reviewer as a separate agent — in a fresh session, pointed at a different model if you like — removes that bias.
 
-Beyond review quality, orchestrations address context decay. As an agent accumulates a long conversation, implementation details, error traces, and tool output pile up and dilute focus. Worker agents receive only the context the orchestrator explicitly hands them, keeping each one sharp on its task.
+Specialization compounds the effect. An agent forced to juggle several concerns at once does each one less well than an agent with a single focused brief. Giving each role its own agent — and, where you can, its own model family — keeps every pass sharp: a fresh, specialized context with no unrelated baggage, and independent judgment that does not inherit another agent's blind spots.
+
+Orchestrations also address context decay. As an agent accumulates a long conversation, implementation details, error traces, and tool output pile up and dilute focus. Worker agents receive only the context the orchestrator explicitly hands them, keeping each one sharp on its task.
 
 The tradeoff is wall-clock time: chaining agents is slower than a single run. But since you are not sitting there watching, the duration rarely matters. You hand off a task, do something else, and come back when the pipeline is done.
 
@@ -367,7 +369,7 @@ The daemon re-reads `.dot-agent-deck.toml` on every delegation, so edits take ef
 
 ### Two orchestrations with the same project name conflict
 
-If you run two orchestration tabs from different directories that happen to have the same basename (e.g. `~/a/myproject` and `~/b/myproject`), the daemon disambiguates delegation routing by their full path. Note that this scoping is best-effort and does not cover notification delivery — concurrent orchestrations are not yet safe to run side by side. Run one at a time (see the warning at the top of this page and [issue #140](https://github.com/vfarcic/dot-agent-deck/issues/140)).
+If you run two orchestration tabs from different directories that happen to have the same basename (e.g. `~/a/myproject` and `~/b/myproject`), the daemon disambiguates delegation routing by their full path.
 
 ## See also
 
