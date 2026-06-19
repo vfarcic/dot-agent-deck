@@ -10281,9 +10281,11 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize) -> Vec<(Action, 
 
 /// PRD #170 round 2: width (cols) the agent-command picker row needs — the
 /// `  Agent: ` label plus one `[preset]` chip per [`AGENT_COMMAND_PRESETS`]
-/// entry plus a one-cell separator between chips. Shared by the new-pane form
-/// and the pick-agent modal so a longer future preset can't be truncated by
-/// `render_modal_button_row`'s overflow break (reviewer finding 7).
+/// entry plus a one-cell separator between chips. Now used exclusively by
+/// [`render_schedule_agent_pick`] (the Scheduled-Tasks pick-agent modal) — the
+/// new-pane form picker was removed in this branch — so a longer future preset
+/// can't be truncated by `render_modal_button_row`'s overflow break (reviewer
+/// finding 7).
 fn agent_picker_row_width() -> u16 {
     const SEP: u16 = 1;
     let label_w = "  Agent: ".chars().count() as u16;
