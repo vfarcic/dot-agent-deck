@@ -1928,7 +1928,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Layer:** L2 (drives the real manager + modal via PTY; observed via a `claude` recorder shim on disk).
 - **Agent:** the shimmed `claude` authoring agent (records the gated-delivered seed).
 - **Asserts:** with `default_command = ""` (the unconfigured-user case), pressing `e` opens the pick-agent modal and confirming the default with Enter spawns `claude` — its recorder receives the authoring seed — proving the blank command resolves to the first preset instead of spawning a bare login shell that cannot act on the seed. RED today: a blank `default_command` spawns a bare `$SHELL` (no modal, no fallback), so the `claude` recorder is never written.
-- **Does not assert:** the whitespace-only variant of the fallback (the same code path); the new-pane form's copy of the default (covered by `prompt/new-pane/001`); the modal render (covered by `scheduler/manager/008`).
+- **Does not assert:** the whitespace-only variant of the fallback (the same code path); the modal render (covered by `scheduler/manager/008`).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/manager/011 — Closing the pick-agent modal with Esc returns to the Scheduled-Tasks MANAGER dialog you came from, not the bare dashboard (PRD #170 round 3, reviewer F3).
