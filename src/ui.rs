@@ -570,9 +570,8 @@ fn send_daemon_request_blocking(
     use std::io::{Read, Write};
 
     let path = config::attach_socket_path();
-    let mut stream = std::os::unix::net::UnixStream::connect(&path)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut stream = crate::platform::ipc::IpcClient::connect(&path)?;
+    stream.set_timeouts(std::time::Duration::from_secs(5))?;
 
     let payload = serde_json::to_vec(req).map_err(std::io::Error::other)?;
     let mut header = [0u8; 5];

@@ -27,6 +27,7 @@ pub mod opencode_manage;
 pub mod palette;
 pub mod pane;
 pub mod pane_input;
+pub mod platform;
 pub mod project_config;
 pub mod remote;
 pub mod schedule_cli;

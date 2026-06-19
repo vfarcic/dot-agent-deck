@@ -1,3 +1,10 @@
+// PRD #42 M8: the mock attach servers here bind Unix-domain sockets
+// (tokio::net::UnixListener/UnixStream) and set 0o600 socket perms via
+// PermissionsExt, so this suite is Unix-only at the source level.
+// `#![cfg(unix)]` makes the crate empty on Windows so the cross-platform test
+// build compiles; on Unix every test still runs exactly as before. A named-pipe
+// port of this harness for Windows is tracked by #164 (M10).
+#![cfg(unix)]
 //! PRD #76 M2.x — TUI session-list rehydration on bootstrap.
 //!
 //! The bug: in external-daemon mode the TUI never queried the daemon for

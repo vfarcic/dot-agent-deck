@@ -75,16 +75,16 @@
 //! "daemon is the single source of truth" model.
 
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
+
+use crate::platform::ipc::{IpcListener, IpcStream};
 
 pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
@@ -496,17 +496,14 @@ impl AttachResponse {
 /// to accept connections before spawning the async serve loop — this removes
 /// the bind/accept readiness race that the old probe-and-retry pattern was
 /// papering over.
-pub fn bind_attach_listener(path: &Path) -> io::Result<UnixListener> {
+pub fn bind_attach_listener(path: &Path) -> io::Result<IpcListener> {
     if path.exists() {
         std::fs::remove_file(path)?;
     }
-    let listener = crate::daemon::bind_socket(path)?;
-    // Defense in depth — the umask-before-bind in `bind_socket` already
-    // creates the inode at 0o600; restating the mode here means any future
-    // code path that bypasses `bind_socket` still ends up with the right
-    // permissions.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
+    // PRD #42 M2: `IpcListener::bind` does the umask-before-bind dance and the
+    // defense-in-depth 0o600 restate that used to live here as a separate
+    // `set_permissions` call, so the bound endpoint is owner-only unchanged.
+    IpcListener::bind(path)
 }
 
 /// Accept-loop half of the attach server. Runs until the listener errors out
@@ -519,7 +516,7 @@ pub fn bind_attach_listener(path: &Path) -> io::Result<UnixListener> {
 /// cost of holding a `Sender` with zero subscribers is negligible —
 /// `send` only succeeds when at least one `Receiver` exists.
 pub async fn serve_attach(
-    listener: UnixListener,
+    listener: IpcListener,
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> io::Result<()> {
@@ -559,7 +556,7 @@ pub async fn serve_attach(
 /// `tokio::spawn` future is wrapped so the decrement always runs).
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_attach_with_counter(
-    listener: UnixListener,
+    listener: IpcListener,
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
     client_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -580,7 +577,7 @@ pub async fn serve_attach_with_counter(
     let change_notify: Arc<Notify> = registry.change_notify();
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok(stream) => {
                 let registry = registry.clone();
                 let event_tx = event_tx.clone();
                 let counter = client_count.clone();
@@ -682,7 +679,7 @@ pub async fn run_attach_server_with_counter(
 }
 
 async fn handle_connection(
-    mut stream: UnixStream,
+    mut stream: IpcStream,
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
     state: SharedState,
@@ -1130,7 +1127,7 @@ pub async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse)
 /// [`AppState::handle_work_done`]) and the surviving PTY scrollback
 /// makes a separate replay path unnecessary.
 async fn handle_subscribe_events(
-    stream: UnixStream,
+    stream: IpcStream,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> io::Result<()> {
     let mut rx = event_tx.subscribe();
@@ -1184,7 +1181,7 @@ async fn handle_subscribe_events(
 }
 
 async fn handle_attach_stream(
-    stream: UnixStream,
+    stream: IpcStream,
     registry: Arc<AgentPtyRegistry>,
     id: String,
 ) -> io::Result<()> {
