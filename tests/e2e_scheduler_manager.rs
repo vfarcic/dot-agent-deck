@@ -104,9 +104,9 @@ fn manager_001_lists_schedules_with_status_and_next_fire() {
     // PRD #127: each action button must advertise its keyboard shortcut next to
     // the label — `[Add a]`, `[Edit e]`, `[Delete d]`, `[Run now r]` — mirroring
     // the `[Scheduled Tasks s]` button-bar button, so a keyboard user can tell
-    // which key drives each action. RED today: the buttons render `[Add]` /
+    // which key drives each action. Before the fix the buttons rendered `[Add]` /
     // `[Edit]` / `[Delete]` / `[Run now]` with the shortcut field empty
-    // (src/ui.rs Button::new(.., "", ..)), so no `<label> <key>` pair appears.
+    // (src/ui.rs Button::new(.., "", ..)), so no `<label> <key>` pair appeared.
     for (label, key) in [
         ("Add", "a"),
         ("Edit", "e"),
@@ -134,10 +134,10 @@ fn manager_001_lists_schedules_with_status_and_next_fire() {
 /// recorder receives the authoring seed carrying `digest`'s distinctive prompt
 /// text (proving both edit pre-fill AND that the confirmed command came from
 /// `default_command`) — while a separate `claude` neutralizer shim (kept on PATH
-/// so the host's real `claude` is never invoked) records nothing. RED until the
-/// pick-agent modal exists: today `e` spawns the authoring agent immediately with
-/// no modal, so the `opencode` preset chip never renders and the modal wait times
-/// out.
+/// so the host's real `claude` is never invoked) records nothing. Before the
+/// pick-agent modal existed, `e` spawned the authoring agent immediately with no
+/// modal, so the `opencode` preset chip never rendered and the modal wait timed
+/// out — the regression this test now guards.
 #[spec("scheduler/manager/002")]
 #[test]
 fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
@@ -191,8 +191,8 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
     write_recorder("claude", &claude_record);
 
     // `default_command` = the distinctive stub, supplied via a config file the
-    // deck reads (DOT_AGENT_DECK_CONFIG). Once PRD #170 M2.1 lands, the authoring
-    // helper resolves its command from this instead of the hardcoded `claude`.
+    // deck reads (DOT_AGENT_DECK_CONFIG). PRD #170 M2.1 (merged) makes the authoring
+    // helper resolve its command from this instead of the hardcoded `claude`.
     let config_path = scratch.path().join("config.toml");
     std::fs::write(&config_path, "default_command = \"stub-authoring\"\n")
         .expect("write config.toml");
@@ -218,9 +218,9 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
     // modal BEFORE spawning. The modal surfaces the agent-command presets
     // (`claude` / `opencode`); wait for the `opencode` preset chip to confirm the
     // modal is up, then confirm the DEFAULT selection (the resolved
-    // `default_command`) with Enter. RED until the modal exists: today `e` spawns
-    // the authoring agent immediately, so `opencode` never renders and this wait
-    // times out.
+    // `default_command`) with Enter. Before the modal existed, `e` spawned the
+    // authoring agent immediately, so `opencode` never rendered and this wait
+    // timed out.
     deck.wait_for_string("opencode");
     deck.send_keys(b"\r"); // confirm the default selection → spawn the authoring agent
 
@@ -423,9 +423,9 @@ fn manager_004_run_now_fires_selected_task() {
 /// row) is auto-selected, so the `▶` selection marker sits on it. Left-click
 /// the `bravo` row — which is NOT currently selected — and assert the selection
 /// marker moves to `bravo` (the rendered `▶ bravo` indicator appears and
-/// `▶ alpha` is gone), proving a row click hit-tests and re-selects. RED today:
-/// clicking a row is a no-op (selection only moves via the keyboard j/k), so the
-/// marker stays on `alpha`.
+/// `▶ alpha` is gone), proving a row click hit-tests and re-selects. Before the
+/// fix, clicking a row was a no-op (selection only moved via the keyboard j/k),
+/// so the marker stayed on `alpha`.
 #[spec("scheduler/manager/006")]
 #[test]
 fn manager_006_click_row_moves_selection() {
@@ -475,8 +475,8 @@ fn manager_006_click_row_moves_selection() {
     deck.click(col, row);
 
     // The selection marker must move to the clicked row: `▶ bravo` now renders.
-    // RED today — clicking a row is a no-op, so this never appears and the wait
-    // times out with the marker still on `alpha`.
+    // Before the fix, clicking a row was a no-op, so this never appeared and the
+    // wait timed out with the marker still on `alpha`.
     deck.wait_for_string("\u{25b6} bravo");
 
     // And the selection has left `alpha` (exactly one row is selected at a time).
@@ -494,9 +494,9 @@ fn manager_006_click_row_moves_selection() {
 /// terminal. Assert the task's FULL name renders un-clipped on the grid at BOTH
 /// widths — proving the dialog auto-sizes to its content (PRD #144 shared modal
 /// sizing helper, clamped within the windowed terminal) instead of truncating
-/// the field to a fixed 72-col modal. RED today: the modal is hard-capped at 72
-/// columns and the name is truncated to 21 chars (`truncate_cell`), so the full
-/// name never appears at either width.
+/// the field to a fixed 72-col modal. Before the fix the modal was hard-capped at
+/// 72 columns and the name was truncated to 21 chars (`truncate_cell`), so the
+/// full name never appeared at either width.
 #[spec("scheduler/manager/007")]
 #[test]
 fn manager_007_dialog_content_sized_unclipped_at_both_widths() {
@@ -587,9 +587,9 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
 /// and confirm with Enter. Assert the seeded authoring agent that spawns is the
 /// CHOSEN `opencode` (its recorder receives digest's authoring seed) and that the
 /// default `claude` is NOT spawned (its recorder stays empty) — proving a
-/// non-default preset selection is honored. RED until the modal + selection
-/// wiring exist: today `e` spawns `claude` (the default) immediately with no
-/// modal, so `opencode` never renders and the modal wait times out.
+/// non-default preset selection is honored. Before the modal + selection wiring
+/// existed, `e` spawned `claude` (the default) immediately with no modal, so
+/// `opencode` never rendered and the modal wait timed out.
 #[spec("scheduler/manager/009")]
 #[test]
 fn manager_009_pick_non_default_preset_is_honored() {
@@ -670,9 +670,9 @@ fn manager_009_pick_non_default_preset_is_honored() {
 /// DEFAULT selection with Enter. Assert the authoring agent that spawns runs
 /// `claude` (`AGENT_COMMAND_PRESETS[0]`, caught by the `claude` recorder) — the
 /// R1 fallback: a blank `default_command` must resolve to `claude`, NOT spawn a
-/// bare `$SHELL` that cannot act on the seed. RED today: a blank `default_command`
-/// spawns a bare login shell (no modal, no fallback), so the `claude` recorder is
-/// never written and the modal wait times out.
+/// bare `$SHELL` that cannot act on the seed. Before the fix a blank
+/// `default_command` spawned a bare login shell (no modal, no fallback), so the
+/// `claude` recorder was never written and the modal wait timed out.
 #[spec("scheduler/manager/010")]
 #[test]
 fn manager_010_blank_default_command_falls_back_to_claude() {
@@ -780,8 +780,8 @@ fn assert_pick_modal_close_returns_to_manager(close_key: &[u8]) {
 
     // F3: closing the pick-agent modal returns to the Scheduled-Tasks MANAGER
     // dialog (its `NEXT FIRE` header re-renders) you came from — NOT the bare
-    // dashboard. RED today: Esc/q drop to `UiMode::Normal` (dashboard), so the
-    // manager never reappears and this wait times out.
+    // dashboard. Before the fix, Esc/q dropped to `UiMode::Normal` (dashboard),
+    // so the manager never reappeared and this wait timed out.
     deck.wait_for_string("NEXT FIRE");
 
     let grid = deck.snapshot_grid();
@@ -809,8 +809,8 @@ fn assert_pick_modal_close_returns_to_manager(close_key: &[u8]) {
 /// row to raise the pick-agent modal, then press `Esc`. Assert the modal closes
 /// back to the MANAGER dialog (its `NEXT FIRE` header re-renders) — not the bare
 /// dashboard — with the `Pick authoring agent` title gone and no authoring agent
-/// spawned. RED today: Esc drops to the dashboard (`UiMode::Normal`), so the
-/// manager never reappears.
+/// spawned. Before the fix, Esc dropped to the dashboard (`UiMode::Normal`), so
+/// the manager never reappeared.
 #[spec("scheduler/manager/011")]
 #[test]
 fn manager_011_esc_returns_to_manager_dialog() {
@@ -820,8 +820,8 @@ fn manager_011_esc_returns_to_manager_dialog() {
 /// Scenario: Like `manager_011_esc_returns_to_manager_dialog`, but closes the
 /// pick-agent modal with `q` instead of Esc — `q` must also return to the
 /// Scheduled-Tasks MANAGER dialog (mirroring the Esc behavior), not the bare
-/// dashboard, with no authoring agent spawned. RED today: `q` drops to the
-/// dashboard.
+/// dashboard, with no authoring agent spawned. Before the fix, `q` dropped to
+/// the dashboard.
 #[spec("scheduler/manager/013")]
 #[test]
 fn manager_013_q_returns_to_manager_dialog() {
@@ -833,9 +833,9 @@ fn manager_013_q_returns_to_manager_dialog() {
 /// `e` to raise the pick-agent modal, then LEFT-CLICK the `[Confirm]` button.
 /// Clicking `[Confirm]` must behave exactly like pressing Enter: the seeded
 /// authoring agent spawns running the chosen/default command (`stub-authoring`,
-/// whose recorder receives `digest`'s authoring seed) and NOT `claude`. RED
-/// today: the modal renders no `[Confirm]` button, so `find_in_grid` finds no
-/// click target and the test fails to locate it.
+/// whose recorder receives `digest`'s authoring seed) and NOT `claude`. Before
+/// the fix the modal rendered no `[Confirm]` button, so `find_in_grid` found no
+/// click target and the test failed to locate it.
 #[spec("scheduler/manager/012")]
 #[test]
 fn manager_012_click_confirm_spawns_authoring_agent() {
@@ -878,8 +878,8 @@ fn manager_012_click_confirm_spawns_authoring_agent() {
     deck.send_keys(b"e"); // edit → opens the pick-agent modal
     deck.wait_for_string("opencode"); // modal up
 
-    // F4 mouse parity: click `[Confirm]` (== Enter). RED today: no `[Confirm]`
-    // button renders, so `find_in_grid` returns None and this `expect` panics.
+    // F4 mouse parity: click `[Confirm]` (== Enter). Before the fix no `[Confirm]`
+    // button rendered, so `find_in_grid` returned None and this `expect` panicked.
     let (col, row) = deck
         .find_in_grid("[Confirm]")
         .expect("the pick-agent modal must render a clickable [Confirm] button (F4)");
@@ -912,8 +912,8 @@ fn manager_012_click_confirm_spawns_authoring_agent() {
 /// raise the pick-agent modal, then LEFT-CLICK the `[Cancel]` button. Clicking
 /// `[Cancel]` must behave exactly like pressing Esc: the modal closes back to the
 /// MANAGER dialog (its `NEXT FIRE` header re-renders) with NO authoring agent
-/// spawned (neither recorder is written). RED today: the modal renders no
-/// `[Cancel]` button, so `find_in_grid` finds no click target.
+/// spawned (neither recorder is written). Before the fix the modal rendered no
+/// `[Cancel]` button, so `find_in_grid` found no click target.
 #[spec("scheduler/manager/015")]
 #[test]
 fn manager_015_click_cancel_closes_to_manager_no_spawn() {
@@ -956,8 +956,8 @@ fn manager_015_click_cancel_closes_to_manager_no_spawn() {
     deck.send_keys(b"e"); // edit → opens the pick-agent modal
     deck.wait_for_string("opencode"); // modal up
 
-    // F4 mouse parity: click `[Cancel]` (== Esc). RED today: no `[Cancel]` button
-    // renders, so `find_in_grid` returns None and this `expect` panics.
+    // F4 mouse parity: click `[Cancel]` (== Esc). Before the fix no `[Cancel]`
+    // button rendered, so `find_in_grid` returned None and this `expect` panicked.
     let (col, row) = deck
         .find_in_grid("[Cancel]")
         .expect("the pick-agent modal must render a clickable [Cancel] button (F4)");
@@ -1005,9 +1005,9 @@ fn manager_015_click_cancel_closes_to_manager_no_spawn() {
 /// be a no-op that does NOT clobber the custom chosen command — then confirm with
 /// Enter. Assert the seeded authoring agent spawns running the CUSTOM
 /// `stub-authoring` command (its recorder receives digest's authoring seed), NOT
-/// `claude` (`AGENT_COMMAND_PRESETS[0]`). RED today: at `selected_preset == 0`,
-/// `h` still reassigns `chosen = AGENT_COMMAND_PRESETS[0]` (claude), so `claude`
-/// spawns and the custom recorder never fires.
+/// `claude` (`AGENT_COMMAND_PRESETS[0]`). Before the fix, at `selected_preset == 0`,
+/// `h` still reassigned `chosen = AGENT_COMMAND_PRESETS[0]` (claude), so `claude`
+/// spawned and the custom recorder never fired.
 #[spec("scheduler/manager/014")]
 #[test]
 fn manager_014_h_at_leftmost_preserves_custom_command() {
