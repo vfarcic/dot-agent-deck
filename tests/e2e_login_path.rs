@@ -216,3 +216,73 @@ fn login_path_002_scheduled_fire_resolves_login_shell_command() {
          \"$PATH\"'`) at startup so the bare command resolves"
     );
 }
+
+/// Scenario: Launch the deck with `default_command` set to a bare authoring
+/// command that lives ONLY in a dir absent from the inherited PATH, and `$SHELL`
+/// pointed at a fake login shell whose `-lc` output adds that dir to PATH, plus a
+/// fixture `schedules.toml` holding one task. Open the Scheduled-Tasks manager
+/// (`S`), press `e` to edit the auto-selected row — which opens the pick-agent
+/// modal (PRD #170) defaulting to the resolved authoring command (the bare
+/// `default_command`) — and confirm the default selection with Enter. Assert the
+/// bare authoring command resolves and spawns under the daemon's login-shell-
+/// enriched PATH: the stub writes its on-disk marker. This pins PRD #170's THIRD
+/// spawn path (the schedule-authoring helper), the originally-motivating bug —
+/// GREEN now that both the login-shell PATH capture (M1.3) and the configurable
+/// authoring command (M2.1) are merged.
+#[spec("lifecycle/login-path/003")]
+#[test]
+fn login_path_003_schedule_authoring_resolves_login_shell_command() {
+    let fx = login_path_fixture("stub-authoring-agent");
+
+    // One fixture schedule so the manager has a row to edit. The task's OWN run
+    // command (`cat`, on the normal PATH) is irrelevant here — the authoring
+    // helper's command comes from `default_command` (the bare stub), not the task.
+    let sched_dir = tempfile::tempdir().expect("schedules tempdir");
+    let sched_path = sched_dir.path().join("schedules.toml");
+    std::fs::write(
+        &sched_path,
+        format!(
+            "[[scheduled_tasks]]\n\
+             name = \"digest\"\n\
+             cron = \"0 9 * * *\"\n\
+             working_dir = \"{work}\"\n\
+             command = \"cat\"\n\
+             prompt = \"digest prompt\"\n\
+             enabled = true\n",
+            work = fx.work.to_string_lossy(),
+        ),
+    )
+    .expect("write fixture schedules.toml");
+
+    let deck = TuiDeck::builder()
+        .with_env("SHELL", fx.fake_shell.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", fx.config.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    // Open the Scheduled-Tasks manager and edit the auto-selected `digest` row,
+    // which opens the pick-agent modal. `NEXT FIRE` is the "dialog is up" signal;
+    // `opencode` (a preset chip) is the "modal is up" signal.
+    deck.send_keys(b"S");
+    deck.wait_for_string("NEXT FIRE");
+    deck.send_keys(b"e"); // edit → opens the pick-agent modal
+    deck.wait_for_string("opencode");
+
+    // The modal's chosen default is the resolved authoring command — the bare
+    // `default_command` (a custom, non-preset command), so Enter confirms it
+    // without moving the preset highlight. Confirming spawns the seeded authoring
+    // agent running the bare stub through the daemon spawn primitive.
+    deck.send_keys(b"\r"); // confirm the default selection → spawn the authoring agent
+
+    assert!(
+        common::wait_for_path(&fx.marker, Duration::from_secs(15)),
+        "the schedule-authoring helper's bare command (a binary living only in the \
+         login-shell PATH) must resolve and spawn under the daemon's login-shell-\
+         enriched PATH, but its marker never appeared — PRD #170's third spawn path \
+         must benefit from the same `$SHELL -lc 'printf %s \"$PATH\"'` capture so the \
+         bare `default_command` resolves"
+    );
+
+    drop(sched_dir);
+}

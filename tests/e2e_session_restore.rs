@@ -475,7 +475,7 @@ fn restore_009_orchestration_config_drift_warns_and_falls_back_to_plain_pane() {
     // The restored pane auto-focuses (PaneInput), where Ctrl+C is forwarded to
     // the pane; detach to Normal mode first so Ctrl+C reaches the global quit.
     deck.send_keys(b"\x04"); // Ctrl+D → detach to Normal mode
-    deck.wait_for_absence("[Detach Ctrl+D]"); // pane no longer focused
+    deck.wait_for_absence("[Command Mode Ctrl+D]"); // pane no longer focused
     deck.send_keys(b"\x03"); // Ctrl+C → quit-confirm modal
     deck.wait_for_string("Quit dot-agent-deck?");
     deck.send_keys(b"\r"); // Enter → Detach (default) → clean teardown + flush
@@ -552,7 +552,7 @@ fn restore_010_zero_role_reresolved_orchestration_falls_back_without_panic() {
     // The restored pane auto-focuses (PaneInput); detach to Normal mode first so
     // Ctrl+C reaches the global quit (mirrors session/restore/009).
     deck.send_keys(b"\x04"); // Ctrl+D → detach to Normal mode
-    deck.wait_for_absence("[Detach Ctrl+D]"); // pane no longer focused
+    deck.wait_for_absence("[Command Mode Ctrl+D]"); // pane no longer focused
     deck.send_keys(b"\x03"); // Ctrl+C → quit-confirm modal
     deck.wait_for_string("Quit dot-agent-deck?");
     deck.send_keys(b"\r"); // Enter → Detach (default) → clean teardown + flush
