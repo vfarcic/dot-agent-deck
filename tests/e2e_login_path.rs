@@ -15,11 +15,12 @@
 //! daemon's PATH, and the daemon's `$SHELL` is a fake login shell whose
 //! `-lc` output adds that dir to PATH (mirroring how `~/.profile` adds
 //! `~/.local/bin`). A bare reference to the stub therefore resolves ONLY if the
-//! daemon captured the login-shell PATH. Two of PRD #170's three spawn paths are
-//! pinned here — the dashboard new-pane (`001`, real TUI) and a scheduled-task
-//! fire (`002`, headless daemon). The third path (the schedule-authoring helper)
-//! routes through the same daemon spawn primitive and additionally depends on the
-//! configurable-command change pinned by `scheduler/manager/002`.
+//! daemon captured the login-shell PATH. All three of PRD #170's spawn paths are
+//! pinned here — the dashboard new-pane (`001`, real TUI), a scheduled-task fire
+//! (`002`, headless daemon), and the schedule-authoring helper (`003`, the
+//! originally-motivating bug). The authoring-helper path routes through the same
+//! daemon spawn primitive and additionally depends on the configurable-command
+//! change pinned by `scheduler/manager/002`.
 //!
 //! RED today: nothing captures the login-shell PATH, so the daemon's PATH lacks
 //! the stub dir, the bare command is not found, the spawn fails, and the stub's
