@@ -13048,7 +13048,7 @@ mod tests {
         for frame_height in 2u16..=9 {
             let rows = bottom_bar_rows(&ui, 8, frame_height, &tab_view);
             assert!(
-                rows <= frame_height - 1,
+                rows < frame_height,
                 "bottom_bar_rows at frame_height={frame_height} reserved {rows} \
                  rows, leaving no content row (must be <= frame_height - 1)"
             );
