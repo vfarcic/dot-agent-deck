@@ -1018,6 +1018,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** prompt delivery to the spawned agent (covered by `scheduler/spawn/004`); the orchestration-vs-card branch (covered by `scheduler/spawn/002`).
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/login-path/003 — The schedule-authoring helper's bare authoring command (living only in the user's login-shell PATH) resolves and spawns when the daemon was launched without that dir on PATH (PRD #170 M1.3 + M2.1, the originally-motivating bug path).
+- **Layer:** L2 (real `dot-agent-deck` binary in a PTY; the deck lazy-spawns its daemon, which inherits the deck's env). Reuses the `login_path_fixture` mechanics (stripped PATH + fake login shell) from `lifecycle/login-path/001`/`002` and the pick-agent modal interaction from `scheduler/manager/002`.
+- **Agent:** none (a synthetic stub binary placed only in a temp dir absent from the inherited PATH; the deck's `$SHELL` is a fake login shell whose `-lc` output adds that dir to PATH). `default_command` is the bare stub, so the pick-agent modal's resolved authoring command defaults to it. A fixture `schedules.toml` supplies one task to edit (its own `cat` run command is irrelevant — the authoring command comes from `default_command`).
+- **Asserts:** opening the Scheduled-Tasks manager (`S`), pressing `e` to edit the auto-selected row opens the pick-agent modal (PRD #170) defaulting to the bare authoring command; confirming with Enter spawns it through the daemon spawn primitive, and the bare command resolves under the daemon's login-shell-enriched PATH — the stub writes an on-disk marker that appears within the wait window. GREEN on write (both M1.3 and M2.1 merged): pins PRD #170's third spawn path (the schedule-authoring helper), which routes through the same daemon spawn primitive as `001`/`002` plus the configurable-command change of `scheduler/manager/002`.
+- **Does not assert:** the authoring seed/prompt delivery to the spawned agent (covered by `scheduler/manager/002`); the modal's preset-selection wiring or Cancel/Esc behavior (covered by `scheduler/manager/009`–`015`); the non-PATH login environment (out of scope per PRD #170).
+- **Platform coverage:** mac+linux.
+
 ### Resize
 
 #### resize/sigwinch
