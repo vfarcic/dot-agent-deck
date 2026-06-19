@@ -227,14 +227,16 @@ fn login_path_002_scheduled_fire_resolves_login_shell_command() {
 /// command that lives ONLY in a dir absent from the inherited PATH, and `$SHELL`
 /// pointed at a fake login shell whose `-lc` output adds that dir to PATH, plus a
 /// fixture `schedules.toml` holding one task. Open the Scheduled-Tasks manager
-/// (`S`), press `e` to edit the auto-selected row — which opens the pick-agent
-/// modal (PRD #170) defaulting to the resolved authoring command (the bare
-/// `default_command`) — and confirm the default selection with Enter. Assert the
-/// bare authoring command resolves and spawns under the daemon's login-shell-
-/// enriched PATH: the stub writes its on-disk marker. This pins PRD #170's THIRD
-/// spawn path (the schedule-authoring helper), the originally-motivating bug —
-/// GREEN now that both the login-shell PATH capture (M1.3) and the configurable
-/// authoring command (M2.1) are merged.
+/// (`S`), press `e` to edit the auto-selected row — which now reuses the `Ctrl+n`
+/// flow (PRD #170 unify): a directory picker (` Select Directory `) → the
+/// mode-locked ` Edit Schedule ` form whose Command is pre-filled with the bare
+/// `default_command`. Confirm the dir with Space and submit via `[Submit]`.
+/// Assert the bare authoring command resolves and spawns under the daemon's
+/// login-shell-enriched PATH: the stub writes its on-disk marker. This pins PRD
+/// #170's THIRD spawn path (the schedule-authoring helper), the originally-
+/// motivating bug — GREEN once the login-shell PATH capture (M1.3), the
+/// configurable authoring command (M2.1), and the unified Add/Edit flow are
+/// merged.
 #[spec("lifecycle/login-path/003")]
 #[test]
 fn login_path_003_schedule_authoring_resolves_login_shell_command() {
@@ -268,18 +270,23 @@ fn login_path_003_schedule_authoring_resolves_login_shell_command() {
     deck.wait_for_string("No active sessions");
 
     // Open the Scheduled-Tasks manager and edit the auto-selected `digest` row,
-    // which opens the pick-agent modal. `NEXT FIRE` is the "dialog is up" signal;
-    // `opencode` (a preset chip) is the "modal is up" signal.
+    // which reuses the Ctrl+n flow. `NEXT FIRE` is the "dialog is up" signal;
+    // ` Select Directory ` is the "dir picker is up" signal; ` Edit Schedule ` is
+    // the "mode-locked form is up" signal.
     deck.send_keys(b"S");
     deck.wait_for_string("NEXT FIRE");
-    deck.send_keys(b"e"); // edit → opens the pick-agent modal
-    deck.wait_for_string("opencode");
+    deck.send_keys(b"e"); // edit → opens the dir picker (starting at the row's working_dir)
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" "); // Space → confirm the dir → mode-locked Edit Schedule form
+    deck.wait_for_string("Edit Schedule");
 
-    // The modal's chosen default is the resolved authoring command — the bare
-    // `default_command` (a custom, non-preset command), so Enter confirms it
-    // without moving the preset highlight. Confirming spawns the seeded authoring
+    // The form's Command is pre-filled with the resolved authoring command — the
+    // bare `default_command`. Submit via `[Submit]` to spawn the seeded authoring
     // agent running the bare stub through the daemon spawn primitive.
-    deck.send_keys(b"\r"); // confirm the default selection → spawn the authoring agent
+    let (scol, srow) = deck
+        .find_in_grid("[Submit]")
+        .expect("the mode-locked schedule form must render a [Submit] button");
+    deck.click(scol, srow); // submit → spawn the authoring agent
 
     assert!(
         common::wait_for_path(&fx.marker, Duration::from_secs(15)),
