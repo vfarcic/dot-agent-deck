@@ -15,7 +15,7 @@ dot-agent-deck config set default_command "claude"
 dot-agent-deck config get default_command
 ```
 
-`default_command` is the agent command pre-filled in the **new-pane form** and the value that seeds the **schedule-authoring** agent. In the new-pane form and in the Scheduled Tasks **Add/Edit** flow you can also pick the command from quick presets (`claude`, `opencode`) or type your own. If `default_command` is unset, these flows fall back to `claude`.
+`default_command` is the agent command pre-filled in the **new-pane form**'s Command field and the value that seeds the **schedule-authoring** agent. In the new-pane form you type the command directly (it accepts `claude`, `opencode`, a path, or any command). In the Scheduled Tasks **Add/Edit** flow a small picker lets you choose the authoring command from quick presets (`claude`, `opencode`) before the session starts. If `default_command` is unset, the schedule-authoring agent falls back to `claude`.
 
 ## Command Resolution and the Login-Shell PATH
 

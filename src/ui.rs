@@ -2293,10 +2293,6 @@ pub enum Action {
     FormSubmit,
     /// PRD #80 M8: form `[Cancel]` — close the form without spawning (== Esc).
     FormCancel,
-    /// PRD #170 M2.2: click an agent-command preset chip in the new-pane form —
-    /// fill the Command field with that preset (e.g. `claude` / `opencode`) and
-    /// focus the field so it can be tweaked. Additive to free-text typing.
-    FormSetCommand(String),
     /// PRD #170 round 2: click an agent-command preset chip in the pick-agent
     /// modal ([`UiMode::ScheduleAgentPick`]) — set the chosen authoring command
     /// to that preset (mouse parity for `h`/`l`). Confirming the modal then
@@ -5489,15 +5485,6 @@ fn dispatch_action(
             {
                 form.selection_index = idx;
                 form.focused = FormField::Mode;
-            }
-        }
-        // PRD #170 M2.2: click an agent-command preset → fill the Command field
-        // with it (== typing the command), then focus the field so the user can
-        // tweak it. The field stays free-text for paths / custom commands.
-        Action::FormSetCommand(cmd) => {
-            if let Some(form) = ui.new_pane_form.as_mut() {
-                form.command = cmd;
-                form.focused = FormField::Command;
             }
         }
         // [Submit] → spawn the pane from the form values (== Enter on the final
@@ -11303,27 +11290,15 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // form is two rows shorter — Command's label row plus its spacing row.
     let cmd_visible = form.command_visible();
     let cmd_rows: u16 = if cmd_visible { 2 } else { 0 };
-    // PRD #170 M2.2: the agent-command picker row (a spacer + the picker line)
-    // shows whenever the Command field shows — it fills that same field.
-    let picker_rows: u16 = if cmd_visible { 2 } else { 0 };
     // PRD #127 M3.2: the "schedule" authoring option adds one separator/label
     // row marking it as a throwaway authoring session.
     let schedule_rows: u16 = if form.is_schedule_selected() { 1 } else { 0 };
-    // PRD #144: content-size & center. Width grows to fit the wider of the mode
-    // chip row and (when the Command field shows) the agent-command picker row
+    // PRD #144: content-size & center. Width grows to fit the mode chip row
     // (plus borders + a little margin) but never below the comfortable 56-col
     // base; height is the reserved field rows. `modal_rect` clamps to 90% of
     // terminal.
-    // PRD #170 round 2 (reviewer finding 7): factor the picker row width so a
-    // longer future preset can't be truncated by `render_modal_button_row`'s
-    // overflow break.
-    let picker_row_w = if cmd_visible {
-        agent_picker_row_width()
-    } else {
-        0
-    };
-    let desired_w = chip_row_w.max(picker_row_w).saturating_add(4).max(56);
-    let desired_h = 10 + mode_extra + cmd_rows + picker_rows + schedule_rows;
+    let desired_w = chip_row_w.saturating_add(4).max(56);
+    let desired_h = 10 + mode_extra + cmd_rows + schedule_rows;
     let popup_area = modal_rect(desired_w, desired_h, area, 56, 10);
     let popup_width = popup_area.width;
 
@@ -11425,15 +11400,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
                 },
             ),
         ]));
-    }
-    // PRD #170 M2.2: reserve the agent-command picker row (label + preset chips,
-    // overlaid below). A spacer first, then the picker line itself. Only when the
-    // Command field is shown — the picker fills that field.
-    let mut picker_line_idx: Option<usize> = None;
-    if cmd_visible {
-        lines.push(Line::from(""));
-        picker_line_idx = Some(lines.len());
-        lines.push(Line::from(""));
     }
     lines.push(Line::from(""));
     // PRD #80 M8: reserve a row for the [Submit]/[Cancel] buttons (overlaid).
@@ -11556,40 +11522,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         }
     }
 
-    // PRD #170 M2.2: the agent-command preset picker — a `  Agent: ` label then
-    // one clickable `[preset]` chip per known agent (`claude` / `opencode`),
-    // visible by default and ADDITIVE to the free-text Command field above.
-    // Clicking a chip fills the Command field via `Action::FormSetCommand`. The
-    // row is skipped when it falls outside the clamped popup (PRD #144 A1).
-    let mut picker_button_rects: Vec<(Action, Rect)> = Vec::new();
-    if let Some(pi) = picker_line_idx
-        && line_y(pi) < popup_bottom
-    {
-        let picker_y = line_y(pi);
-        let label = "  Agent: ";
-        let label_w = label.chars().count() as u16;
-        {
-            let buf = frame.buffer_mut();
-            let _ = buf.set_span(
-                row_x,
-                picker_y,
-                &Span::styled(label, unfocused_label),
-                row_width,
-            );
-        }
-        let presets: Vec<Button> = AGENT_COMMAND_PRESETS
-            .iter()
-            .map(|p| Button::new(*p, "", Action::FormSetCommand((*p).to_string()), true))
-            .collect();
-        let presets_row = Rect {
-            x: row_x.saturating_add(label_w),
-            y: picker_y,
-            width: row_width.saturating_sub(label_w),
-            height: 1,
-        };
-        picker_button_rects = render_modal_button_row(frame, &presets, presets_row, 0);
-    }
-
     // [Submit] / [Cancel] buttons on the reserved row.
     let buttons = [
         Button::new("Submit", "", Action::FormSubmit, true),
@@ -11604,15 +11536,11 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // PRD #144 A1: skip the button row entirely when it falls outside the
     // clamped popup (degenerate short terminal) rather than writing past the
     // buffer bottom.
-    let mut button_rects = if btn_row.y < popup_bottom {
+    let button_rects = if btn_row.y < popup_bottom {
         render_modal_button_row(frame, &buttons, btn_row, 1)
     } else {
         Vec::new()
     };
-    // PRD #170 M2.2: the agent-command preset chips are also clickable form
-    // buttons (they fill the Command field). They don't overlap the
-    // Submit/Cancel row, so appending keeps hit-testing unambiguous.
-    button_rects.append(&mut picker_button_rects);
 
     // Cursor in the active text field (Mode uses chips, so no cursor there).
     // PRD #144 A1: only place the cursor when its row fits inside the popup.
