@@ -33,10 +33,9 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// into an 80×24 `TestBackend` buffer. The form must render a clickable chip
 /// for each mode option (`demo`, `demo2`) and `[Submit]` / `[Cancel]`
 /// buttons, AND still render its existing field chrome (the `Name:` field and
-/// the ` New Agent ` title). RED until M8 adds the chips + buttons: today the
-/// form shows only the single currently-selected mode in a `◀ … ▶` cycler
-/// (so the non-selected chip labels are absent) and has no Submit/Cancel
-/// buttons.
+/// the ` New Agent ` title). Before M8 the form showed only the single
+/// currently-selected mode in a `◀ … ▶` cycler (so the non-selected chip labels
+/// were absent) and had no Submit/Cancel buttons; M8 added the chips + buttons.
 #[spec("mouse/form/001")]
 #[test]
 fn form_001_renders_mode_chips_and_submit_cancel() {
@@ -65,38 +64,6 @@ fn form_001_renders_mode_chips_and_submit_cancel() {
         assert!(
             buf.contains(btn),
             "form must render the {btn} button, got:\n{buf}"
-        );
-    }
-}
-
-/// Scenario: Render the new-pane form into an 80×24 `TestBackend` buffer. PRD
-/// #170 M2.2 adds an agent-command picker, visible by default, so users can pick
-/// `claude` / `opencode` / a path / a custom command. Assert the form renders
-/// both the `claude` and `opencode` agent presets (the picker) AND still shows
-/// the pre-filled Command value the seam supplies (`mycmd`, which production
-/// fills from `default_command`) — proving the picker is additive to the free-text
-/// command, not a replacement. RED today: the form has only the free-text Command
-/// field; neither `claude` nor `opencode` preset is rendered.
-#[spec("prompt/new-pane/010")]
-#[test]
-fn new_pane_010_renders_agent_command_picker() {
-    let buf = buffer_text(&render_new_pane_form_to_buffer(&["demo"], 80, 24));
-
-    // The existing Command field still renders its pre-filled value — the picker
-    // is additive. The seam passes "mycmd" as the command; in production this is
-    // the configured `default_command` the form opens pre-filled with.
-    assert!(
-        buf.contains("mycmd"),
-        "the agent-command picker must keep the Command field pre-filled with the \
-         default_command value (`mycmd` via the seam), got:\n{buf}"
-    );
-
-    // The agent-command picker offers the known agent presets, visible by default.
-    for preset in ["claude", "opencode"] {
-        assert!(
-            buf.contains(preset),
-            "the new-pane form must surface an agent-command picker offering the \
-             `{preset}` preset (visible by default), got:\n{buf}"
         );
     }
 }

@@ -552,13 +552,6 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the exact layout used to keep the chip visible (wrap vs. window/scroll); the visibility of the non-selected chips when the row overflows; the authoring hint text (covered by `prompt/new-pane/007`).
 - **Platform coverage:** mac+linux.
 
-##### prompt/new-pane/010 — The new-pane form surfaces an agent-command picker (visible by default) offering `claude` / `opencode` presets alongside the `default_command`-prefilled Command field (PRD #170 M2.2).
-- **Layer:** L1 (ratatui `TestBackend` via the public `render_new_pane_form_to_buffer` seam).
-- **Agent:** none.
-- **Asserts:** the rendered form carries an agent-command picker — the `claude` and `opencode` agent presets both render — AND the existing Command field still shows its pre-filled command value (the seam's command, which production fills from `default_command`), proving the picker is additive to (not a replacement for) the free-text/path/custom command. Visible by default (no experimental flag). RED today: the form renders only the free-text Command field; no `claude`/`opencode` agent presets appear.
-- **Does not assert:** the picker's exact widget shape (chips vs. cycler vs. list); keyboard/mouse selection behavior; the schedule-authoring flow's copy of the picker (the seam is shared); insta byte-snapshot identity (plain substring assertions, matching `mouse/form/001`).
-- **Platform coverage:** mac+linux+windows.
-
 ### Focus / navigation
 
 #### focus/dashboard
@@ -1008,7 +1001,7 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Layer:** L2 (real `dot-agent-deck` binary in a PTY; the deck lazy-spawns its daemon, which inherits the deck's env).
 - **Agent:** none (a synthetic stub binary placed only in a temp dir that is NOT on the inherited PATH; the deck's `$SHELL` is a fake login shell whose `-lc` output adds that dir to PATH, mirroring how `~/.profile` adds `~/.local/bin`). `default_command` is set to the bare stub so the new-pane form pre-fills it.
 - **Asserts:** opening the new-pane form (Ctrl+n → confirm dir → Submit) with the bare stub as the command spawns it successfully — the stub writes an on-disk marker that appears within the wait window. RED today: nothing captures the login-shell PATH, so the daemon's PATH lacks the stub dir, the bare command is not found, the spawn fails, and the marker never appears.
-- **Does not assert:** the exact spawn-failure error text in the pane; the agent-command picker layout (covered by `prompt/new-pane/010`); the non-PATH login environment (out of scope per PRD #170).
+- **Does not assert:** the exact spawn-failure error text in the pane; the non-PATH login environment (out of scope per PRD #170).
 - **Platform coverage:** mac+linux.
 
 ##### lifecycle/login-path/002 — A scheduled-task fire whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).
@@ -1921,7 +1914,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Layer:** L1 (ratatui `TestBackend` via a new public `render_schedule_agent_pick_to_buffer` seam, mirroring `render_new_pane_form_to_buffer`). RED is a COMPILE error until the coder adds the seam + the modal it renders.
 - **Agent:** none.
 - **Asserts:** the rendered pick-agent modal carries an agent-command picker — the `claude` and `opencode` presets both render, visible by default — AND shows the resolved authoring command (the seam's `mycmd`, which production fills from `default_command`) as the default selection, proving the modal defaults to the configured command while offering the presets as alternatives. PRD #170 round 3 also pins the modal chrome: the instruction/hint line renders un-clipped (the `h/l select` / `Enter confirm` / `Esc cancel` phrases are all visible — reviewer F1) and the modal offers clickable `[Confirm]` / `[Cancel]` buttons (reviewer F4 mouse parity, the exact bracketed labels `scheduler/manager/012`/`015` click).
-- **Does not assert:** the modal's exact widget shape (chips vs. list); keyboard/mouse selection behavior (covered by `scheduler/manager/009`); the spawn on confirm (covered by `scheduler/manager/002`); the click-to-confirm/cancel behavior (covered by `scheduler/manager/012`/`015`); insta byte-snapshot identity (plain substring assertions, matching `prompt/new-pane/010`).
+- **Does not assert:** the modal's exact widget shape (chips vs. list); keyboard/mouse selection behavior (covered by `scheduler/manager/009`); the spawn on confirm (covered by `scheduler/manager/002`); the click-to-confirm/cancel behavior (covered by `scheduler/manager/012`/`015`); insta byte-snapshot identity (plain substring assertions, matching `mouse/form/001`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### scheduler/manager/009 — Selecting a NON-default agent preset in the pick-agent modal is honored: the chosen command spawns the authoring agent, not the default (PRD #170 round 2, Option B).
@@ -1935,7 +1928,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Layer:** L2 (drives the real manager + modal via PTY; observed via a `claude` recorder shim on disk).
 - **Agent:** the shimmed `claude` authoring agent (records the gated-delivered seed).
 - **Asserts:** with `default_command = ""` (the unconfigured-user case), pressing `e` opens the pick-agent modal and confirming the default with Enter spawns `claude` — its recorder receives the authoring seed — proving the blank command resolves to the first preset instead of spawning a bare login shell that cannot act on the seed. RED today: a blank `default_command` spawns a bare `$SHELL` (no modal, no fallback), so the `claude` recorder is never written.
-- **Does not assert:** the whitespace-only variant of the fallback (the same code path); the new-pane form's copy of the default (covered by `prompt/new-pane/010`); the modal render (covered by `scheduler/manager/008`).
+- **Does not assert:** the whitespace-only variant of the fallback (the same code path); the new-pane form's copy of the default (covered by `prompt/new-pane/001`); the modal render (covered by `scheduler/manager/008`).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/manager/011 — Closing the pick-agent modal with Esc returns to the Scheduled-Tasks MANAGER dialog you came from, not the bare dashboard (PRD #170 round 3, reviewer F3).

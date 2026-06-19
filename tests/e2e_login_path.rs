@@ -22,9 +22,11 @@
 //! daemon spawn primitive and additionally depends on the configurable-command
 //! change pinned by `scheduler/manager/002`.
 //!
-//! RED today: nothing captures the login-shell PATH, so the daemon's PATH lacks
-//! the stub dir, the bare command is not found, the spawn fails, and the stub's
-//! marker never appears.
+//! GREEN now (PRD #170 merged): the daemon captures the login-shell PATH at
+//! startup, so its PATH includes the stub dir, the bare command resolves, the
+//! spawn succeeds, and the stub's marker appears. These tests guard against the
+//! pre-fix regression where nothing captured the login-shell PATH, so the bare
+//! command was not found and the marker never appeared.
 
 mod common;
 
@@ -142,9 +144,10 @@ fn login_path_fixture(stub_name: &str) -> LoginFixture {
 /// new-pane form (Ctrl+n → Space confirms the dir) — the Command field is
 /// pre-filled with the bare stub — and submit via the `[Submit]` button. Assert
 /// the bare command resolves and spawns: the stub writes its on-disk marker.
-/// RED today: nothing captures the login-shell PATH, so the daemon's PATH lacks
-/// the stub dir, the bare command is not found, the spawn fails, and the marker
-/// never appears.
+/// GREEN now (PRD #170 merged): the daemon captures the login-shell PATH at
+/// startup, so the bare command resolves and the marker appears; the guarded
+/// regression is the pre-fix state where no capture happened and the marker
+/// never appeared.
 #[spec("lifecycle/login-path/001")]
 #[test]
 fn login_path_001_new_pane_resolves_login_shell_command() {
@@ -183,9 +186,11 @@ fn login_path_001_new_pane_resolves_login_shell_command() {
 /// whose `-lc` output adds a stub dir (absent from the daemon's PATH) to PATH,
 /// and register a scheduled task whose `command` is a bare stub living only in
 /// that dir. Fire the task via the `RunNow` control message and assert the bare
-/// command resolves and spawns: the stub writes its on-disk marker. RED today:
-/// with no login-shell PATH capture the daemon's PATH lacks the stub dir, the
-/// bare command is not found, and the marker never appears.
+/// command resolves and spawns: the stub writes its on-disk marker. GREEN now
+/// (PRD #170 merged): the daemon captures the login-shell PATH, so the bare
+/// command resolves and the marker appears; the guarded regression is the
+/// pre-fix state where, with no capture, the bare command was not found and the
+/// marker never appeared.
 #[spec("lifecycle/login-path/002")]
 #[test]
 fn login_path_002_scheduled_fire_resolves_login_shell_command() {
