@@ -596,7 +596,7 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
 /// the `Ctrl+n` flow: `a` opens the directory picker (` Select Directory `);
 /// confirming the dir with Space opens the mode-locked ` New Schedule ` form
 /// whose Command is PRE-FILLED from the resolved authoring command — and with a
-/// blank `default_command` that resolves to `claude` (`AGENT_COMMAND_PRESETS[0]`).
+/// blank `default_command` that resolves to `claude` (`DEFAULT_AUTHORING_COMMAND`).
 /// Submit via `[Submit]` and assert the spawned authoring agent runs `claude`
 /// (its recorder receives the base authoring seed — `throwaway authoring
 /// session`) — the R1 fallback: a blank `default_command` must resolve to
@@ -657,7 +657,7 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
     deck.click(scol, srow); // submit → spawn the seeded authoring agent
 
     // R1 fallback: a blank `default_command` must resolve to `claude`
-    // (`AGENT_COMMAND_PRESETS[0]`) so a real conversational agent runs — NOT a
+    // (`DEFAULT_AUTHORING_COMMAND`) so a real conversational agent runs — NOT a
     // bare `$SHELL`. The `claude` recorder receiving the base authoring seed
     // (`throwaway authoring session`) proves the fallback. (Add has no row, so the
     // seed carries no row marker — the base-seed substring is the green signal.)
