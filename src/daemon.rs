@@ -881,6 +881,19 @@ async fn run_hook_loop(
                             // `send` returns Err only when there are no
                             // subscribers — that's expected and ignored.
                             let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
+                            // Persist the agent type this hook revealed into
+                            // the PTY registry (keyed by pane id), so a later
+                            // `list_agents` — e.g. a fresh `dot-agent-deck
+                            // connect` after a detach — reports the real agent
+                            // instead of "No agent". The spawn-time
+                            // `from_command` guess is `None` for shell-launched
+                            // agents, so the hook stream is the only place the
+                            // daemon ever learns the true type. Upgrade-only
+                            // inside the registry; a no-op when the type is
+                            // `None` or the pane id is unknown/absent.
+                            if let Some(ref pane_id) = event.pane_id {
+                                pty_registry.set_agent_type(pane_id, &event.agent_type);
+                            }
                             state.write().await.apply_event(event);
                         } else {
                             warn!("Malformed event: {line}");
@@ -942,5 +955,90 @@ mod orphan_watchdog_tests {
         // which is WHY the watchdog must be left OFF for detached production /
         // TuiDeck daemons — only the harness's non-detached daemons enable it.
         assert!(should_exit_orphaned(1, 1));
+    }
+}
+
+#[cfg(test)]
+mod hook_ingestion_tests {
+    use super::*;
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::event::AgentType;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+
+    /// Scenario: the "No agent on reconnect" fix at the daemon layer. Spawn a
+    /// shell agent (so the spawn-time `from_command` guess is `None` — the
+    /// "No agent" state), run the real `run_hook_loop` against a temp hook
+    /// socket, then write a synthetic Claude Code `SessionStart` line tagged
+    /// with that pane's id. The loop must persist the event's `agent_type`
+    /// into the PTY registry, so a subsequent `list_agents` / `agent_records`
+    /// (what a fresh `dot-agent-deck connect` reads) reports `ClaudeCode`
+    /// instead of "No agent". No real LLM tokens — the event is injected
+    /// directly onto the ingestion socket.
+    #[tokio::test]
+    async fn run_hook_loop_persists_agent_type_into_registry() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-it".to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+        // Spawn-time guess is None — the bug's starting state.
+        assert_eq!(registry.agent_records()[0].agent_type, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hook.sock");
+        let listener = bind_socket(&sock).expect("bind hook socket");
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let shutdown = Arc::new(Notify::new());
+
+        let handle = tokio::spawn({
+            let registry = registry.clone();
+            async move { run_hook_loop(listener, state, event_tx, registry, shutdown).await }
+        });
+
+        // Synthetic SessionStart for the shell pane, carrying the real type.
+        let event = serde_json::json!({
+            "session_id": "it-sess",
+            "agent_type": "claude_code",
+            "event_type": "session_start",
+            "timestamp": "2026-06-20T12:00:00Z",
+            "pane_id": "pane-it",
+        });
+        let mut stream = UnixStream::connect(&sock)
+            .await
+            .expect("connect hook socket");
+        stream
+            .write_all(format!("{event}\n").as_bytes())
+            .await
+            .expect("write hook line");
+        stream.flush().await.unwrap();
+
+        // Ingestion is async — poll the registry until the type lands,
+        // bounded so a regression (type never persisted) fails fast.
+        let mut learned = None;
+        for _ in 0..40 {
+            if let Some(rec) = registry.agent_records().into_iter().next()
+                && rec.agent_type.is_some()
+            {
+                learned = rec.agent_type;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            learned,
+            Some(AgentType::ClaudeCode),
+            "hook-ingested agent_type must be persisted into the registry so \
+             a fresh connect reports the real agent instead of \"No agent\""
+        );
+
+        handle.abort();
+        registry.shutdown_all();
     }
 }

@@ -2239,6 +2239,41 @@ impl AgentPtyRegistry {
         Ok(())
     }
 
+    /// Persist the agent type the daemon *learned from a hook event* into the
+    /// registry, keyed by `pane_id_env` (hook events carry the originating
+    /// pane via `DOT_AGENT_DECK_PANE_ID`, which is exactly what
+    /// [`RunningAgent::pane_id_env`] holds).
+    ///
+    /// The spawn-time [`AgentType::from_command`] guess (stored at
+    /// [`AgentPtyRegistry::spawn_agent`]) is `None` for the common
+    /// interactive flow — the daemon spawns a shell and the user launches
+    /// `claude` / `opencode` *inside* it, so the command the daemon saw was
+    /// the shell. Without this write-back the registry — and therefore
+    /// [`AgentPtyRegistry::agent_records`] / the `list_agents` reply — keeps
+    /// reporting `AgentType::None` ("No agent") on a fresh `dot-agent-deck
+    /// connect`, until the agent happens to emit its next hook. The daemon's
+    /// hook-ingestion loop calls this so the real type, once observed, lands
+    /// in the source of truth and survives a TUI reconnect.
+    ///
+    /// Upgrade-only: ignores `AgentType::None` and never overwrites an
+    /// already-known type, mirroring the strict `None` → `Some` upgrade in
+    /// [`crate::state::AppState::apply_event`]. A no-op when no live agent
+    /// matches `pane_id_env` (unmanaged / external pane id, or empty id).
+    pub fn set_agent_type(&self, pane_id_env: &str, agent_type: &AgentType) {
+        if *agent_type == AgentType::None || pane_id_env.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(agent) = inner
+            .agents
+            .values_mut()
+            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))
+            && agent.agent_type.is_none()
+        {
+            agent.agent_type = Some(agent_type.clone());
+        }
+    }
+
     /// Number of agents currently owned by the registry.
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().agents.len()
@@ -2843,6 +2878,51 @@ mod tests {
         // can't have leaked the spawned child.
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.agent_ids(), vec![id1]);
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn set_agent_type_learns_from_event_and_is_upgrade_only() {
+        // The "No agent on reconnect" fix: the common interactive flow spawns
+        // a shell (so `from_command` → `None`), and the real type only ever
+        // arrives via a hook event. `set_agent_type` must land that type in
+        // the registry so `agent_records` / `list_agents` reports it on a
+        // fresh `connect` — but it must never overwrite a known type or
+        // downgrade to `None`, matching `apply_event`'s strict upgrade.
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-x".to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        // Spawn-time guess is None — this is the "No agent" state.
+        let type_of = |r: &AgentPtyRegistry| r.agent_records()[0].agent_type.clone();
+        assert_eq!(type_of(&registry), None, "shell spawn starts as None");
+
+        // A hook reveals the real type → registry upgrades None → Some.
+        registry.set_agent_type("pane-x", &AgentType::ClaudeCode);
+        assert_eq!(type_of(&registry), Some(AgentType::ClaudeCode));
+
+        // None never downgrades a known type.
+        registry.set_agent_type("pane-x", &AgentType::None);
+        assert_eq!(type_of(&registry), Some(AgentType::ClaudeCode));
+
+        // A different concrete type never overwrites an already-known one.
+        registry.set_agent_type("pane-x", &AgentType::OpenCode);
+        assert_eq!(type_of(&registry), Some(AgentType::ClaudeCode));
+
+        // Unknown / absent pane id is a harmless no-op (events from
+        // unmanaged panes must not panic or touch another agent).
+        registry.set_agent_type("pane-unknown", &AgentType::OpenCode);
+        registry.set_agent_type("", &AgentType::OpenCode);
+        assert_eq!(type_of(&registry), Some(AgentType::ClaudeCode));
+        assert_eq!(registry.len(), 1);
+
+        let _ = id;
         registry.shutdown_all();
     }
 
