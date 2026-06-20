@@ -963,8 +963,9 @@ mod hook_ingestion_tests {
     use super::*;
     use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
     use crate::event::AgentType;
+    use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
-    use tokio::net::UnixStream;
+    use tokio::net::{UnixListener, UnixStream};
 
     /// Scenario: the "No agent on reconnect" fix at the daemon layer. Spawn a
     /// shell agent (so the spawn-time `from_command` guess is `None` — the
@@ -990,8 +991,19 @@ mod hook_ingestion_tests {
         assert_eq!(registry.agent_records()[0].agent_type, None);
 
         let dir = tempfile::tempdir().unwrap();
+        // Deliberately bind WITHOUT `bind_socket`: that helper flips the
+        // process-global umask to 0o177 around `bind`, and under CI's
+        // `cargo test` (all lib tests share one process) that window races
+        // concurrent tempdir creation in other tests, leaving a dir without
+        // its search bit → `PermissionDenied` on bind. `cargo test-fast`
+        // (nextest, process-per-test) hides this. A plain bind keeps this
+        // test from perturbing the shared umask; the `set_permissions` below
+        // immunizes our own tempdir against another test's flip. Socket perms
+        // are irrelevant to what this test asserts.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod tempdir");
         let sock = dir.path().join("hook.sock");
-        let listener = bind_socket(&sock).expect("bind hook socket");
+        let listener = UnixListener::bind(&sock).expect("bind hook socket");
         let state: SharedState =
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
