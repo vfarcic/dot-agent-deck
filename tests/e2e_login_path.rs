@@ -7,7 +7,7 @@
 //! process PATH. When the daemon is launched without the user's login profile,
 //! its PATH lacks the dir where `claude`/`opencode` live (`~/.local/bin`), so a
 //! bare command fails to spawn. PRD #170's fix captures the login-shell PATH
-//! once at daemon startup (`$SHELL -lc 'printf %s "$PATH"'`) and applies it to
+//! once at daemon startup (`$SHELL -ilc 'printf %s "$PATH"'`) and applies it to
 //! the daemon's own environment, so every subsequently-spawned pane inherits it.
 //!
 //! These tests reproduce the failure without depending on the host's real
@@ -59,7 +59,7 @@ struct LoginFixture {
 ///     marker file then stays alive (so the spawned pane is "running");
 ///   - a fake login shell that emulates a profile prepending `stubbin/` to PATH
 ///     and, invoked as `-lc '<script>'`, runs the script with that enriched
-///     PATH — exactly what PRD #170's `$SHELL -lc 'printf %s "$PATH"'` capture
+///     PATH — exactly what PRD #170's `$SHELL -ilc 'printf %s "$PATH"'` capture
 ///     reads;
 ///   - a `config.toml` whose `default_command` is the bare stub.
 ///
@@ -177,7 +177,7 @@ fn login_path_001_new_pane_resolves_login_shell_command() {
         common::wait_for_path(&fx.marker, Duration::from_secs(15)),
         "a dashboard new-pane whose command is a bare binary living only in the \
          login-shell PATH must spawn successfully, but its marker never appeared — \
-         the daemon should capture the login-shell PATH (`$SHELL -lc 'printf %s \
+         the daemon should capture the login-shell PATH (`$SHELL -ilc 'printf %s \
          \"$PATH\"'`) at startup so the bare command resolves"
     );
 }
@@ -218,7 +218,7 @@ fn login_path_002_scheduled_fire_resolves_login_shell_command() {
         common::wait_for_path(&fx.marker, Duration::from_secs(15)),
         "a scheduled-task fire whose command is a bare binary living only in the \
          login-shell PATH must spawn successfully, but its marker never appeared — \
-         the daemon should capture the login-shell PATH (`$SHELL -lc 'printf %s \
+         the daemon should capture the login-shell PATH (`$SHELL -ilc 'printf %s \
          \"$PATH\"'`) at startup so the bare command resolves"
     );
 }
@@ -293,7 +293,7 @@ fn login_path_003_schedule_authoring_resolves_login_shell_command() {
         "the schedule-authoring helper's bare command (a binary living only in the \
          login-shell PATH) must resolve and spawn under the daemon's login-shell-\
          enriched PATH, but its marker never appeared — PRD #170's third spawn path \
-         must benefit from the same `$SHELL -lc 'printf %s \"$PATH\"'` capture so the \
+         must benefit from the same `$SHELL -ilc 'printf %s \"$PATH\"'` capture so the \
          bare `default_command` resolves"
     );
 
