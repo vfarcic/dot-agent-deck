@@ -1051,6 +1051,10 @@ mod hook_ingestion_tests {
         );
 
         handle.abort();
+        // Await the aborted task so it drops its `registry` Arc clone before
+        // we tear the registry down — strictly sequences cleanup instead of
+        // racing `shutdown_all` against the still-live loop task.
+        let _ = handle.await;
         registry.shutdown_all();
     }
 }

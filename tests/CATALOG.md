@@ -846,6 +846,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the absolute env-scrub call sites (covered by `agent_pty` pure-data tests `spawn_scrubs_via_daemon_env_from_child`, `spawn_scrubs_pane_id_env_from_child`, `spawn_opts_env_overrides_pane_id_scrub` — moved to `tmp/legacy-tests/`; this catalog entry replaces that lost end-to-end signal).
 - **Platform coverage:** mac+linux.
 
+##### hooks/delivery/007 — A hook event teaches the daemon an agent's type, so `list_agents` reports it on a fresh reconnect instead of "No agent".
+- **Layer:** L2.
+- **Agent:** none (synthetic — `StartAgent` over the daemon protocol with a shell command whose `from_command` type is `None`, then a JSON `SessionStart` written directly to the per-test hook socket).
+- **Asserts:** an agent started with no inferable type registers with `agent_type == None`; after a `SessionStart` hook carrying `agent_type = claude_code` for that pane's id, a subsequent `ListAgents` (the same call `hydrate_from_daemon` issues on reconnect) reports `agent_type == ClaudeCode`.
+- **Does not assert:** the rendered card label (the `AgentRecord`→placeholder→render mapping is covered by `rehydration` + L1 dashboard tests); the live-stream upgrade path while a TUI is already attached.
+- **Platform coverage:** mac+linux.
+
 #### hooks/install
 
 ##### hooks/install/001 — Launching the deck with `~/.claude/` present writes hook entries into `~/.claude/settings.json` idempotently.
