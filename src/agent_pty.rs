@@ -3527,19 +3527,27 @@ mod tests {
             .await
             .expect("close must signal change_notify");
 
-        // Agent dies on its own (no explicit close) → must notify via
-        // pump_reader on EOF.
+        // Agent dies on its own after a short delay (no explicit close) →
+        // must notify via pump_reader on EOF. The brief `sleep` (shell-wrapped
+        // because it's multi-word) keeps the child alive long enough to drain
+        // the spawn signal *first*, so the exit signal can't coalesce with it.
+        // The old `/usr/bin/true` exited instantly, so under load its
+        // exit-notify could merge with the spawn-notify — `Notify` collapses
+        // multiple pending `notify_one` calls into a single permit — and the
+        // drain then ate the only permit, making the exit wait time out.
         let _id2 = registry
             .spawn_agent(SpawnOptions {
-                command: Some("/usr/bin/true"),
+                command: Some("sleep 0.5"),
                 ..SpawnOptions::default()
             })
             .expect("spawn should succeed");
-        // Drain the spawn signal first so we test the exit signal in
-        // isolation. The spawn notify might already have a permit stored.
-        let _ = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
-        // Now wait for the exit signal.
-        tokio::time::timeout(Duration::from_secs(3), notify.notified())
+        // Drain the spawn signal while the child is still sleeping — no exit
+        // notify has fired yet, so this consumes only the spawn permit.
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("spawn must signal change_notify");
+        // Now the child exits on its own → pump_reader must signal on EOF.
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
             .await
             .expect("agent exit must signal change_notify");
     }
