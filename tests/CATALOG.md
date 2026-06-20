@@ -1940,6 +1940,27 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the Add (blank-context) path (covered by `scheduler/form/002`); the configured-command vs `claude` resolution beyond the neutralizer check (covered by `scheduler/manager/002`); the mode-locked form's render (covered by `scheduler/form/001`).
 - **Platform coverage:** mac+linux.
 
+##### scheduler/form/004 — Cancelling a MANAGER-originated schedule flow at the DIRECTORY PICKER (Esc / `q`) returns to the Scheduled-Tasks manager dialog, not the bare dashboard (PRD #170 round 4, reviewer F5).
+- **Layer:** L2 (drives the real manager → dir picker via PTY; asserted on the rendered vt100 grid plus the daemon registry). A benign `default_command = "cat"` so any erroneous spawn never invokes the host's real `claude`.
+- **Agent:** none (the flow is cancelled before any authoring agent spawns).
+- **Asserts:** opening the manager (`S`), pressing `a` (Add) or `e` (Edit) opens the directory picker (` Select Directory `); pressing Esc (Add + Edit) or `q` (Add) from the picker returns to the MANAGER dialog — its `NEXT FIRE` header re-renders — with the picker chrome (` Select Directory `) gone and NO `schedule` authoring agent spawned. RED until cancel is intent-aware: today the picker's Esc/`q` handlers unconditionally set `UiMode::Normal` (dashboard), so `NEXT FIRE` never reappears and the wait times out. Restores the intent the removed `scheduler/manager/011` (Esc) / `013` (`q`) pinned, re-targeted at the unified flow.
+- **Does not assert:** the form cancel point (covered by `scheduler/form/005`); a `Ctrl+n`-origin cancel still dropping to the dashboard (unchanged, out of scope); the spawn/seed on submit (covered by `scheduler/form/002`/`003`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/form/005 — Cancelling a MANAGER-originated schedule flow at the mode-locked FORM (Esc / click `[Cancel]`) returns to the Scheduled-Tasks manager dialog, not the bare dashboard (PRD #170 round 4, reviewer F5).
+- **Layer:** L2 (drives the real manager → dir picker → mode-locked form via PTY; asserted on the rendered vt100 grid plus the daemon registry). A benign `default_command = "cat"` so any erroneous spawn never invokes the host's real `claude`.
+- **Agent:** none (the flow is cancelled before any authoring agent spawns).
+- **Asserts:** opening the manager (`S`), pressing `a` (Add) or `e` (Edit) → confirming a dir with Space opens the mode-locked schedule form (` New Schedule ` / ` Edit Schedule `, with `[Submit]`); pressing Esc (Add + Edit) or clicking `[Cancel]` (Add) from the form returns to the MANAGER dialog — its `NEXT FIRE` header re-renders — with the form chrome (`[Submit]`) gone and NO `schedule` authoring agent spawned. RED until cancel is intent-aware: today the form's Esc/`[Cancel]` handlers unconditionally set `UiMode::Normal` (dashboard), so `NEXT FIRE` never reappears and the wait times out. Restores the intent the removed `scheduler/manager/015` (click `[Cancel]`) pinned, re-targeted at the unified flow.
+- **Does not assert:** the picker cancel point (covered by `scheduler/form/004`); a `Ctrl+n`-origin cancel still dropping to the dashboard (unchanged, out of scope); the spawn/seed on submit (covered by `scheduler/form/002`/`003`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/form/006 — On Edit, re-picking a DIFFERENT working_dir makes that picked dir WIN in the authoring seed — no conflicting old-vs-new working_dir (PRD #170 round 4, reviewer F3).
+- **Layer:** L2 (drives the real manager → dir picker → mode-locked form via PTY; observed via a distinct-name recorder shim on disk that records its spawn `pwd` then the delivered seed). `default_command = "stub-repick-authoring"` (a recorder shim) with a `claude` neutralizer on PATH; the fixture row's `working_dir` is a distinctively-named existing dir (`.../ROWDIRALPHA`) with a sibling re-pick target (`.../PICKDIRBRAVO`) and the row's prompt is `EDITPROMPTF3`.
+- **Agent:** the shimmed `stub-repick-authoring` authoring agent (records spawn cwd + the gated-delivered seed).
+- **Asserts:** pressing `e` (Edit) opens the dir picker started at the row's `working_dir` (`ROWDIRALPHA`); going UP one level (`h`) and descending into the DIFFERENT sibling `PICKDIRBRAVO` (double-click, confirmed via its `INNERMARK` child) then confirming with Space, and submitting via `[Submit]`, spawns the seeded authoring agent whose recorded seed — once delivered through its `EDITPROMPTF3` prompt line (which follows the `working_dir:` line) — carries `PICKDIRBRAVO` but ZERO occurrences of the row's stale `ROWDIRALPHA`. RED today: the edit seed appends the row's `working_dir: .../ROWDIRALPHA` as a conflicting current value alongside the picked `working_dir DEFAULT: .../PICKDIRBRAVO`.
+- **Does not assert:** the unchanged-pick / pre-fill path (covered by `scheduler/form/003`); the in-`src` `build_schedule_authoring_mode` seed unit tests (the coder's); the Add path (covered by `scheduler/form/002`).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/live
 
 ##### scheduler/live/001 — A scheduled fire surfaces its card LIVE to an already-attached TUI, without a disconnect/reconnect (PRD #127 finding #2).

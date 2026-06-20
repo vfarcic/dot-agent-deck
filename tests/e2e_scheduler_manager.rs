@@ -887,3 +887,334 @@ fn form_003_edit_prefills_seed_and_spawns_in_row_working_dir() {
     drop(scratch);
     drop(row_work_parent);
 }
+
+// ---------------------------------------------------------------------------
+// scheduler/form 004/005 — cancelling a MANAGER-originated schedule flow must
+// return to the Scheduled-Tasks MANAGER dialog, not the bare dashboard (PRD
+// #170 round 4, reviewer F5). Restores the intent the removed
+// scheduler/manager/011 (Esc) / 013 (`q`) / 015 (click [Cancel]) used to pin,
+// re-targeted at the unified dir-picker + mode-locked form flow.
+// ---------------------------------------------------------------------------
+
+/// Where in the unified schedule-authoring flow the user cancels.
+enum CancelAt {
+    /// While the directory picker (` Select Directory `) is up — before a dir is
+    /// confirmed.
+    Picker,
+    /// While the mode-locked schedule form (` New Schedule ` / ` Edit Schedule `)
+    /// is up — after a dir is confirmed.
+    Form,
+}
+
+/// How the user cancels.
+enum CancelBy {
+    /// Press `Esc`.
+    Esc,
+    /// Press `q` (the picker's quit key; the form has no `q` cancel).
+    Q,
+    /// Left-click the `[Cancel]` button.
+    ClickCancel,
+}
+
+/// F5 shared body: open the manager, enter the unified schedule-authoring flow
+/// via `entry_key` (`a` Add / `e` Edit), advance to the `at` cancel point, cancel
+/// via `by`, and assert the flow returns to the Scheduled-Tasks MANAGER dialog
+/// (its `NEXT FIRE` header re-renders) — NOT the bare dashboard — with the
+/// picker/form chrome gone and NO authoring agent spawned. The manager-originated
+/// cancel must be intent-aware (`DirPickerIntent::ScheduleAdd`/`ScheduleEdit`) and
+/// route back to the manager; a `Ctrl+n`-origin cancel still drops to the
+/// dashboard (unchanged). RED today: the picker/form Esc/`q`/[Cancel] handlers
+/// unconditionally set `UiMode::Normal`, so the manager never reappears.
+fn assert_schedule_flow_cancel_returns_to_manager(entry_key: &[u8], at: CancelAt, by: CancelBy) {
+    let (scratch, sched_path) = scratch_with_schedules(
+        "[[scheduled_tasks]]\n\
+         name = \"digest\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"digest prompt\"\n\
+         enabled = true\n",
+    );
+
+    // A benign `default_command` so any (erroneous) submit-spawn would run `cat`,
+    // never the host's real `claude`. Written explicitly so the deck never reads
+    // the host's config.
+    let config_path = scratch.path().join("config.toml");
+    std::fs::write(&config_path, "default_command = \"cat\"\n").expect("write config.toml");
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    deck.send_keys(MANAGER_KEY);
+    // `NEXT FIRE` renders only when the manager dialog is open with its rows
+    // loaded — the bare `Scheduled Tasks` substring is already on the dashboard
+    // button bar, so it can't tell the dialog apart from the dashboard.
+    deck.wait_for_string("NEXT FIRE");
+
+    deck.send_keys(entry_key); // `a` (Add) / `e` (Edit) → opens the dir picker
+    deck.wait_for_string("Select Directory"); // the dir picker is up
+
+    if let CancelAt::Form = at {
+        // Confirm the current/row dir → the mode-locked schedule form. `[Submit]`
+        // (only the form has it) is the unambiguous "form is up" signal.
+        deck.send_keys(b" ");
+        deck.wait_for_string("[Submit]");
+    }
+
+    // The manager dialog is replaced while the picker/form is up, so `NEXT FIRE`
+    // is off-screen; cancelling must bring it BACK.
+    match by {
+        CancelBy::Esc => deck.send_keys(b"\x1b"),
+        CancelBy::Q => deck.send_keys(b"q"),
+        CancelBy::ClickCancel => {
+            let (col, row) = deck
+                .find_in_grid("[Cancel]")
+                .expect("the picker/form must render a clickable [Cancel] button");
+            deck.click(col, row);
+        }
+    }
+
+    // F5: cancelling a MANAGER-originated schedule flow must return to the
+    // Scheduled-Tasks MANAGER dialog (its `NEXT FIRE` header re-renders) — NOT the
+    // bare dashboard. Before the fix, the picker/form Esc/`q`/[Cancel] handlers
+    // unconditionally set `UiMode::Normal` (dashboard), ignoring the
+    // `ScheduleAdd`/`ScheduleEdit` intent, so the manager never reappeared and this
+    // wait times out (RED).
+    deck.wait_for_string("NEXT FIRE");
+
+    // The picker/form chrome must be gone (we're back on the manager, not still on
+    // an overlay): neither the picker's ` Select Directory ` nor the form's
+    // `[Submit]` may remain on the grid.
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("Select Directory") && !grid.contains("[Submit]"),
+        "cancelling must dismiss the picker/form chrome — neither `Select Directory` \
+         nor `[Submit]` may remain once back on the manager.\nGrid:\n{grid}"
+    );
+
+    // No authoring agent spawned: cancelling must NOT fire the seeded `schedule`
+    // authoring pane (the spawn's display name is `SCHEDULE_MODE_NAME` = "schedule").
+    assert!(
+        !common::wait_for_agent_display_name(
+            deck.attach_socket_path(),
+            "schedule",
+            true,
+            Duration::from_millis(500),
+        ),
+        "cancelling the schedule flow must NOT spawn the authoring agent"
+    );
+    drop(scratch);
+}
+
+/// Scenario: Open the "Scheduled Tasks" manager, press `a` (Add) to open the
+/// directory picker, then press `Esc`. Assert the flow returns to the MANAGER
+/// dialog (its `NEXT FIRE` header re-renders) — not the bare dashboard — with the
+/// picker chrome gone and no authoring agent spawned. RED today: the picker's Esc
+/// handler unconditionally drops to `UiMode::Normal` (dashboard), so the manager
+/// never reappears.
+#[spec("scheduler/form/004")]
+#[test]
+fn form_004_add_dir_picker_esc_returns_to_manager() {
+    assert_schedule_flow_cancel_returns_to_manager(b"a", CancelAt::Picker, CancelBy::Esc);
+}
+
+/// Scenario: Like `form_004_add_dir_picker_esc_returns_to_manager`, but closes the
+/// directory picker with `q` instead of Esc — `q` must also return to the
+/// Scheduled-Tasks MANAGER dialog (mirroring Esc), not the bare dashboard, with no
+/// authoring agent spawned. RED today: the picker's `q` handler drops to the
+/// dashboard. (Restores the removed `scheduler/manager/013` `q` intent.)
+#[spec("scheduler/form/004")]
+#[test]
+fn form_004_add_dir_picker_q_returns_to_manager() {
+    assert_schedule_flow_cancel_returns_to_manager(b"a", CancelAt::Picker, CancelBy::Q);
+}
+
+/// Scenario: Open the manager, press `e` (Edit) on the auto-selected row to open
+/// the directory picker (started at the row's `working_dir`), then press `Esc`.
+/// Assert the flow returns to the MANAGER dialog (its `NEXT FIRE` header
+/// re-renders) — not the dashboard — with the picker chrome gone and no authoring
+/// agent spawned. Covers the Edit entry at the picker cancel point. RED today: the
+/// picker's Esc handler drops to the dashboard.
+#[spec("scheduler/form/004")]
+#[test]
+fn form_004_edit_dir_picker_esc_returns_to_manager() {
+    assert_schedule_flow_cancel_returns_to_manager(b"e", CancelAt::Picker, CancelBy::Esc);
+}
+
+/// Scenario: Open the manager, press `a` (Add) → confirm the dir with Space to
+/// reach the mode-locked ` New Schedule ` form, then press `Esc`. Assert the flow
+/// returns to the MANAGER dialog (its `NEXT FIRE` header re-renders) — not the
+/// bare dashboard — with the form chrome (`[Submit]`) gone and no authoring agent
+/// spawned. RED today: the form's Esc handler unconditionally drops to
+/// `UiMode::Normal` (dashboard), so the manager never reappears.
+#[spec("scheduler/form/005")]
+#[test]
+fn form_005_add_form_esc_returns_to_manager() {
+    assert_schedule_flow_cancel_returns_to_manager(b"a", CancelAt::Form, CancelBy::Esc);
+}
+
+/// Scenario: Like `form_005_add_form_esc_returns_to_manager`, but cancels the
+/// mode-locked ` New Schedule ` form by LEFT-CLICKING its `[Cancel]` button
+/// instead of pressing Esc — clicking `[Cancel]` must also return to the
+/// Scheduled-Tasks MANAGER dialog, not the bare dashboard, with no authoring agent
+/// spawned. RED today: the click-cancel path drops to the dashboard. (Restores the
+/// removed `scheduler/manager/015` click-[Cancel] intent.)
+#[spec("scheduler/form/005")]
+#[test]
+fn form_005_add_form_click_cancel_returns_to_manager() {
+    assert_schedule_flow_cancel_returns_to_manager(b"a", CancelAt::Form, CancelBy::ClickCancel);
+}
+
+/// Scenario: Open the manager, press `e` (Edit) → confirm the row dir with Space
+/// to reach the mode-locked ` Edit Schedule ` form, then press `Esc`. Assert the
+/// flow returns to the MANAGER dialog (its `NEXT FIRE` header re-renders) — not the
+/// dashboard — with the form chrome gone and no authoring agent spawned. Covers the
+/// Edit entry at the form cancel point. RED today: the form's Esc handler drops to
+/// the dashboard.
+#[spec("scheduler/form/005")]
+#[test]
+fn form_005_edit_form_esc_returns_to_manager() {
+    assert_schedule_flow_cancel_returns_to_manager(b"e", CancelAt::Form, CancelBy::Esc);
+}
+
+/// Scenario: With `default_command` configured to a distinctive `stub-repick-authoring`
+/// recorder shim (records its spawn `pwd` then the delivered seed) plus a `claude`
+/// neutralizer on PATH, and a fixture task (`digest`) whose `working_dir` is a
+/// distinctively-named existing dir (`.../ROWDIRALPHA`, a sibling of `.../PICKDIRBRAVO`)
+/// and whose prompt is `EDITPROMPTF3`, open the manager and press `e` to EDIT. The
+/// dir picker STARTS at the row's `working_dir` (`ROWDIRALPHA`); navigate UP one
+/// level (`h`) and descend into the DIFFERENT sibling `PICKDIRBRAVO`
+/// (double-click), then confirm it with Space. Submitting via `[Submit]` spawns the
+/// seeded authoring agent. Assert the re-picked dir B (`PICKDIRBRAVO`) WINS in the
+/// authoring seed and the row's stale dir A (`ROWDIRALPHA`) does NOT survive as a
+/// conflicting "current value": once the existing-schedule block is delivered
+/// (through its `EDITPROMPTF3` prompt line, which follows the `working_dir:` line),
+/// the recorder must carry `PICKDIRBRAVO` but ZERO occurrences of `ROWDIRALPHA`. RED
+/// today: the edit seed carries the picked dir as the `working_dir DEFAULT` AND the
+/// row's stale `working_dir: .../ROWDIRALPHA` as a conflicting current value.
+#[spec("scheduler/form/006")]
+#[test]
+fn form_006_edit_repick_different_dir_wins_in_seed() {
+    // Two distinctively-named SIBLING dirs under a common parent: the row's
+    // working_dir (A = `ROWDIRALPHA`) and the dir we re-pick (B = `PICKDIRBRAVO`).
+    // Siblings (not parent/child) so neither basename is a substring of the
+    // other's full path — the spawn cwd (B) and the seed `working_dir DEFAULT` (B)
+    // carry `PICKDIRBRAVO` only, while `ROWDIRALPHA` can appear ONLY via the stale
+    // existing-values `working_dir:` line. B holds a marker child (`INNERMARK`) so
+    // the descent into B is observable. Held alive for the whole test.
+    let parent = tempfile::tempdir().expect("repick parent");
+    let row_work = parent.path().join("ROWDIRALPHA");
+    let pick_work = parent.path().join("PICKDIRBRAVO");
+    std::fs::create_dir(&row_work).expect("create row working_dir (A)");
+    std::fs::create_dir(&pick_work).expect("create re-pick dir (B)");
+    std::fs::create_dir(pick_work.join("INNERMARK")).expect("create B marker child");
+
+    let (scratch, sched_path) = scratch_with_schedules(&format!(
+        "[[scheduled_tasks]]\n\
+         name = \"digest\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"{work}\"\n\
+         command = \"cat\"\n\
+         prompt = \"EDITPROMPTF3\"\n\
+         enabled = true\n",
+        work = row_work.to_string_lossy(),
+    ));
+
+    let shim_dir = scratch.path().join("shim");
+    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+    let authoring_record = scratch.path().join("authoring-record.log");
+    let claude_record = scratch.path().join("claude-record.log");
+    write_recorder_shim(&shim_dir, "stub-repick-authoring", &authoring_record);
+    write_recorder_shim(&shim_dir, "claude", &claude_record);
+
+    let config_path = scratch.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "default_command = \"stub-repick-authoring\"\n",
+    )
+    .expect("write config.toml");
+
+    let path_env = format!(
+        "{}:{}",
+        shim_dir.to_string_lossy(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
+        .with_env("PATH", path_env)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    deck.send_keys(MANAGER_KEY);
+    deck.wait_for_string("Scheduled Tasks");
+    deck.send_keys(b"e"); // EDIT the auto-selected `digest` row → opens the dir picker
+
+    // The Edit picker STARTS at the row's working_dir (A = ROWDIRALPHA). Re-pick a
+    // DIFFERENT dir: go up one level to the parent (`h`), where the sibling
+    // `PICKDIRBRAVO` is listed, then descend into it (double-click) — its marker
+    // child `INNERMARK` confirms we are now inside B — and confirm B with Space.
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b"h"); // go up: row dir (A) → parent (lists A + B siblings)
+    deck.wait_for_string("PICKDIRBRAVO"); // the sibling re-pick target is listed
+    let (col, row) = deck
+        .find_in_grid("PICKDIRBRAVO")
+        .expect("the parent listing must render the `PICKDIRBRAVO` row");
+    deck.click(col, row);
+    deck.click(col, row); // double-click → descend into B
+    deck.wait_for_string("INNERMARK"); // B's marker child → we are inside B
+    deck.send_keys(b" "); // Space → confirm B (the picked dir) → locked Edit form
+    deck.wait_for_string("Edit Schedule");
+    let (scol, srow) = deck
+        .find_in_grid("[Submit]")
+        .expect("the mode-locked schedule form must render a [Submit] button");
+    deck.click(scol, srow); // submit → spawn the seeded authoring agent
+
+    // Wait until the existing-schedule block is delivered THROUGH its prompt line
+    // (`EDITPROMPTF3`), which the seed prints AFTER its `working_dir:` line — so by
+    // the time the prompt marker lands, the (stale) working_dir line, if present,
+    // is already recorded. This makes the `ROWDIRALPHA`-count read below race-free.
+    assert!(
+        common::wait_for_file_substr_count(
+            &authoring_record,
+            "EDITPROMPTF3",
+            1,
+            Duration::from_secs(15),
+        ),
+        "editing must spawn the seeded authoring agent pre-filled from the row — the recorder \
+         never received the row's `EDITPROMPTF3` prompt"
+    );
+
+    // F3: the re-picked dir B must WIN in the authoring seed. The row's stale
+    // working_dir A (`ROWDIRALPHA`) must NOT survive as a conflicting "current
+    // value": the seed must carry a SINGLE consistent working_dir (B). RED today —
+    // the edit seed appends the row's `working_dir: .../ROWDIRALPHA` as a current
+    // value alongside the picked `working_dir DEFAULT: .../PICKDIRBRAVO`.
+    assert_eq!(
+        common::count_file_substr(&authoring_record, "ROWDIRALPHA"),
+        0,
+        "re-picking a different dir on Edit must make the PICKED dir win — the row's stale \
+         working_dir `ROWDIRALPHA` must not appear in the authoring seed as a conflicting \
+         current value, but it did"
+    );
+    // And the picked dir B is reflected (sanity: the flow ran, the picked dir is
+    // the working_dir the seed carries and the spawn cwd).
+    assert!(
+        common::count_file_substr(&authoring_record, "PICKDIRBRAVO") >= 1,
+        "the re-picked dir `PICKDIRBRAVO` must be reflected in the authoring seed as the \
+         working_dir, but it was not"
+    );
+    // The `claude` neutralizer must stay empty (the configured command spawned).
+    assert_eq!(
+        common::count_file_substr(&claude_record, "EDITPROMPTF3"),
+        0,
+        "the form's configured command must spawn, not `claude` — but the `claude` shim \
+         received the authoring seed"
+    );
+    drop(scratch);
+    drop(parent);
+}
