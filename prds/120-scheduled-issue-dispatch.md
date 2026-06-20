@@ -1,6 +1,6 @@
 # PRD #120: Scheduled agent dispatch on open GitHub issues
 
-**Status**: Planning (unblocked — #127 shipped 2026-06-07; Phases 2–4 remain)
+**Status**: Planning (unblocked — #127 shipped 2026-06-07; Phases 2–4 remain). Design decisions locked 2026-06-20 — see [Design decisions](#design-decisions-2026-06-20).
 **Priority**: Medium
 **Created**: 2026-05-25
 **GitHub Issue**: [#120](https://github.com/vfarcic/dot-agent-deck/issues/120)
@@ -11,7 +11,19 @@
 
 ## Validation refresh (2026-06-14)
 
-Re-validated against current code — verdict: **unblocked, mostly accurate**. The #127 dependency **shipped** (archived in `prds/done/`), so the primitives this PRD composes now exist: `Scheduler::{register,run_now,tick_at,reload_apply}` (`src/scheduler.rs`), `spawn(SpawnRequest{task_name,working_dir,command,prompt})` → `SpawnHandle` with the `on_tab_closed` cleanup seam (`src/spawn.rs`), and the **global** schedules config at `~/.config/dot-agent-deck/schedules.toml` (`src/config.rs`). The remaining work is genuinely the GitHub layer (Phases 2–4: `gh` issue enumeration, per-issue worktrees, idempotency, cleanup) — none of which exists yet. Open Question 6 (tab-close → worktree cleanup hook) is resolved: `SpawnHandle.on_tab_closed` exists. Corrected below: scheduled-task entries live in the global `schedules.toml`, **not** the per-project `.dot-agent-deck.toml` (which is only the spawn-target config).
+Re-validated against current code — verdict: **unblocked, mostly accurate**. The #127 dependency **shipped** (archived in `prds/done/`), so the primitives this PRD composes now exist: `Scheduler::{register,run_now,tick_at,reload_apply}` (`src/scheduler.rs`), `spawn(SpawnRequest{task_name,working_dir,command,prompt})` → `SpawnHandle` with the `on_tab_closed` cleanup seam (`src/spawn.rs`), and the **global** schedules config at `~/.config/dot-agent-deck/schedules.toml` (`src/config.rs`). The remaining work is genuinely the GitHub layer (Phases 2–4: `gh` issue enumeration, per-issue worktrees, idempotency, cleanup) — none of which exists yet. Open Question 6 (tab-close → worktree cleanup hook) is **not** resolved: `SpawnHandle.on_tab_closed` is only an *unwired* seam — it is defined but never invoked, and the spawn handle is currently dropped, so nothing fires on close. Cleanup needs new daemon-side plumbing (see [Design decisions](#design-decisions-2026-06-20)). Corrected below: scheduled-task entries live in the global `schedules.toml`, **not** the per-project `.dot-agent-deck.toml` (which is only the spawn-target config).
+
+## Design decisions (2026-06-20)
+
+These supersede the earlier scope where they conflict. No implementation yet — recorded so the intent is fixed before work starts.
+
+- **One repo per task (not a list).** An `issue_dispatch` task targets a **single** `repo` (`owner/name`), not an array. Users who want several repos create several schedules. This keeps the scheduler's "one task = one spawn target" model, makes failure isolation trivial, and removes the cross-repo fan-out (and the old "one failing repo must not abort the rest" requirement) — per-issue resilience within the one repo still holds.
+- **The prompt is user-owned, not deck-dictated.** This replaces the hard-coded initial-prompt template (Open Question 5 / M2.3). The task carries a free-text `prompt` **template** with a single placeholder, `{{issue_number}}`, substituted per issue at fire time. It is **default-seeded** to `Work on issue {{issue_number}}`, which the user can change to anything — e.g. `/prd-full {{issue_number}}` to drive their own skill. The agent deduces the repo/URL from the worktree it runs in, so the issue number alone is enough; the deck adds no auto-appended context block.
+- **Name default-seeded to `Issues {{repo}}`,** resolved once at creation time (the repo is known then). Editable; uniqueness is already enforced (the name is the reuse key and renames are forbidden).
+- **Workspace root = the task's `working_dir`** (resolves Open Question 3). The directory the user picks in the dir-picker is the clone parent: the repo clones to `<working_dir>/<name>` and per-issue worktrees live under `<clone>/.worktrees/issue-<n>`. Reusing the user-supplied `working_dir` avoids defaulting to the daemon's long-lived, arbitrary launch cwd.
+- **Idempotency keys on the deterministic branch.** Primary signal: the per-issue worktree exists. Secondary: an open PR whose **head branch is `agent/issue-<n>`** — more reliable than parsing `Closes #n` from PR bodies.
+- **Tab-close → worktree cleanup needs new plumbing (corrects Open Question 6).** `SpawnHandle.on_tab_closed` is only a seam — defined but never invoked, and the spawn handle is dropped, so nothing fires on close. Cleanup will be implemented daemon-side (a worktree registry plus a close-detection watcher), removing the worktree while preserving the clone.
+- **Ships visible by default.** No `experimental` feature-flag gate for this surface.
 
 ## Problem Statement
 
@@ -36,7 +48,7 @@ The result is a tool that is excellent for running agents *once you've set them 
 
 Add a **scheduler** subsystem to dot-agent-deck that, on a configured cron, runs an **issue-dispatch task**. The dispatch task:
 
-1. Enumerates open issues across a configured list of repos (with filters: max issues per run, optional label gate, optional `gh` query).
+1. Enumerates open issues for the task's single configured repo (with filters: max issues per run, optional label gate, optional `gh` query).
 2. For each candidate issue, ensures the target repo is cloned under a configured workspace root (clone if missing, fetch+pull if present).
 3. Creates a per-issue worktree on a branch like `agent/issue-<n>` inside that repo.
 4. Reads the repo's `.dot-agent-deck.toml`:
@@ -61,7 +73,7 @@ The dispatch flow runs **in-process inside the deck**, not as a remote `/schedul
   - Tasks fire on schedule when the deck is running; missed fires while the deck was closed are *not* replayed (documented behavior).
   - Manual "run now" command so a scheduled task can be triggered on demand without waiting for the next tick.
 - **`issue_dispatch` task type**, configurable with:
-  - List of target repos (e.g. `["vfarcic/dot-ai", "vfarcic/dot-agent-deck"]`).
+  - A single target repo (e.g. `vfarcic/dot-ai`). Multiple repos → multiple schedules.
   - Max issues to dispatch per run.
   - Optional label filter (e.g. `agent-eligible`).
   - Optional `gh` query override for advanced users.
@@ -70,8 +82,8 @@ The dispatch flow runs **in-process inside the deck**, not as a remote `/schedul
 - **Tab spawn branching** based on the target repo's `.dot-agent-deck.toml`:
   - Has `[[orchestrations]]` → orchestration tab; initial prompt delivered to the `orchestrator` role.
   - Does not → single agent card in the dashboard; initial prompt delivered to that agent.
-- **Initial prompt** for the spawned agent/orchestrator: includes the issue URL, title, body, repo name, and worktree path. Phrased as a task (e.g. "Investigate and implement what is described in this issue …").
-- **Idempotency check**: before dispatching, skip if `<repo-clone>/.worktrees/issue-<n>` exists *or* `gh pr list --search "linked:issue-<n>"` (or equivalent) returns an open PR.
+- **Initial prompt** — a **user-owned template** (not deck-dictated), default-seeded to `Work on issue {{issue_number}}` with the `{{issue_number}}` placeholder substituted per issue. The user may set any prompt, e.g. `/prd-full {{issue_number}}` to drive their own skill. The agent deduces repo/URL from its worktree, so the issue number alone suffices; no auto-appended context block. (See [Design decisions](#design-decisions-2026-06-20).)
+- **Idempotency check**: before dispatching, skip if `<repo-clone>/.worktrees/issue-<n>` exists (primary) *or* an open PR has head branch `agent/issue-<n>` (secondary — deterministic, avoids fuzzy `Closes #n` body parsing).
 - **Tab persistence**: dispatched tabs live until the user closes them. The user is in control of review / additional iteration / discard.
 - **Worktree cleanup**: when the user closes the tab/card associated with an issue, the worktree is removed (`git worktree remove`). The clone is *not* removed.
 - **Failure visibility**: if any step in the dispatch fails (clone error, no orchestration role despite block existing, GitHub API rate limit), the failure is surfaced to the user as a deck-level notification or a dedicated "scheduler log" view — not swallowed silently.
@@ -89,7 +101,7 @@ The dispatch flow runs **in-process inside the deck**, not as a remote `/schedul
 
 ## Success Criteria
 
-- A user can add a `[[scheduled_tasks]]` block to the global `~/.config/dot-agent-deck/schedules.toml` declaring an `issue_dispatch` task with a cron expression, a list of repos, and a per-run cap; the daemon loads it on startup without further configuration. (The per-project `.dot-agent-deck.toml` only describes the spawn target — modes/orchestrations — not the schedule.)
+- A user can add a `[[scheduled_tasks]]` block to the global `~/.config/dot-agent-deck/schedules.toml` declaring an `issue_dispatch` task with a cron expression, a single repo, and a per-run cap; the daemon loads it on startup without further configuration. (The per-project `.dot-agent-deck.toml` only describes the spawn target — modes/orchestrations — not the schedule.)
 - When the cron fires (or the user invokes "run now"), the dispatch executes end-to-end against at least one configured repo: clone/pull, worktree, tab spawn, initial prompt delivered.
 - An issue with an existing worktree under `.worktrees/issue-<n>` *or* an open linked PR is skipped on subsequent runs — verified by running the dispatch twice with no intervening close.
 - For a repo with an `[[orchestrations]]` block, the dispatch opens an orchestration tab and the `orchestrator` role receives the initial prompt.
@@ -103,10 +115,10 @@ The dispatch flow runs **in-process inside the deck**, not as a remote `/schedul
 
 1. **Config schema location and shape.** Does the scheduler config live in the same `.dot-agent-deck.toml` that the deck is launched from (new `[[scheduled_tasks]]` block alongside `[[modes]]` / `[[orchestrations]]`), or in a separate file (`~/.config/dot-agent-deck/scheduler.toml`)? Working assumption: same file, project-scoped — keeps "this deck instance's configuration" in one place.
 2. **Cron parser.** Use a Rust cron crate (e.g. `cron`, `tokio-cron-scheduler`) or hand-roll a simpler "every N minutes / daily at HH:MM" syntax? Working assumption: pick a maintained crate to avoid scope creep; only reach for hand-rolled if dependency footprint is bad.
-3. **Workspace root resolution.** Default to "the directory `dot-agent-deck` was launched from" — but is that the *cwd* at launch time, or the directory containing the active `.dot-agent-deck.toml`? Working assumption: directory containing the config. Explicit override via config (`workspace_root = "..."`).
-4. **PR-linked check.** What is the most reliable way to detect "there's already an open PR for this issue" via `gh`? Options: search `gh pr list --search "linked:#<n>"`, parse PR bodies for `Closes #<n>` / `Fixes #<n>`, or rely on GitHub's "linked PRs" API. M1 picks one and documents the limitation if any.
-5. **Initial prompt format.** What exactly do we send to a single agent vs. an orchestrator? Working assumption: a short template ("Work on issue <url>. Title: <…>. Body: <…>. Worktree: <…>.") that, for orchestrators, is suffixed with "Coordinate the team per the project's orchestration template." Template content finalized in M2.
-6. **Tab close → worktree cleanup hook.** Is there already a "tab closed" event we can attach to, or does this require new plumbing? Working assumption: tab-close hooks likely already exist for agent shutdown; reuse them.
+3. **Workspace root resolution.** **[Resolved 2026-06-20]** Reuse the task's `working_dir` (the dir picked in the dir-picker) as the clone parent. This avoids defaulting to the daemon's long-lived, arbitrary launch cwd and needs no new config field.
+4. **PR-linked check.** **[Resolved 2026-06-20]** Key on the deterministic head branch: an open PR whose head is `agent/issue-<n>` means the issue is in flight. This is more reliable than parsing `Closes #<n>` from PR bodies, and the worktree-presence check remains the primary signal.
+5. **Initial prompt format.** **[Resolved 2026-06-20]** The prompt is a **user-owned** template with the `{{issue_number}}` placeholder, default-seeded to `Work on issue {{issue_number}}`. The deck no longer dictates wording (see [Design decisions](#design-decisions-2026-06-20)).
+6. **Tab close → worktree cleanup hook.** **[Corrected 2026-06-20]** This requires new plumbing — `SpawnHandle.on_tab_closed` is an unwired seam (never invoked; the handle is dropped). Implement cleanup daemon-side via a worktree registry plus a close-detection watcher (see [Design decisions](#design-decisions-2026-06-20)).
 7. **Concurrency safety.** If two scheduled task runs overlap (e.g. a slow run still in progress when the next tick fires), do we serialize, skip, or run them in parallel? Working assumption: skip-if-prior-run-still-active, with a log entry.
 
 ## Milestones
@@ -138,7 +150,7 @@ The dispatch flow runs **in-process inside the deck**, not as a remote `/schedul
 ### Phase 3: Filters, robustness, polish
 
 - [ ] **M3.1** — Implement the optional label filter and the optional `gh` query override. Defaults to "all open issues, up to `max_per_run`."
-- [ ] **M3.2** — Failure handling: auth/network/GitHub API errors are caught at task boundaries, logged, and surfaced to the user; one failing repo does not abort the rest of the run.
+- [ ] **M3.2** — Failure handling: auth/network/GitHub API errors are caught at issue boundaries, logged, and surfaced to the user; one failing **issue** does not abort the rest of the run. (Single repo per task — no cross-repo fan-out.)
 - [ ] **M3.3** — Tests: unit tests for the scheduler engine, integration tests for the dispatch end-to-end (using a fixture repo or a real test repo per the established testing approach with `dot-ai-infra`).
 
 ### Phase 4: Docs and ship
