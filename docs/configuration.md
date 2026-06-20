@@ -17,16 +17,6 @@ dot-agent-deck config get default_command
 
 `default_command` is the agent command pre-filled in the **new-pane form**'s Command field and the value that seeds the **schedule-authoring** agent. Both the new-pane form and the Scheduled Tasks **Add/Edit** flow use the same form — you type the command directly into the **Command** field (it accepts `claude`, `opencode`, a path, or any command), pre-filled from `default_command`. If `default_command` is unset, the schedule-authoring agent falls back to `claude`.
 
-## Command Resolution and the Login-Shell PATH
-
-The daemon spawns every pane's command — dashboard panes, scheduled-task fires, and the schedule-authoring agent alike — and resolves a bare command such as `claude` or `opencode` against its own `PATH`. To make *"a command that resolves for the logged-in user resolves in a dot-agent-deck pane"* reliably true, the daemon captures your **login-shell PATH** once at startup: it runs your `$SHELL` as an **interactive login shell** (`$SHELL -ilc …`, bounded by a short timeout) and adopts the printed `PATH` as its own, which every pane it spawns then inherits. The capture is *interactive* on purpose — an SSH session is an interactive login shell, so this sources the exact same startup files, including `~/.bashrc`. That matters because some installers add their `PATH` line to `~/.bashrc` *after* its non-interactive guard (`case $- in *i*) ;; *) return;; esac`); a login-only capture would skip them. As a result, an agent installed under `~/.local/bin` *or* under a directory added by `~/.bashrc` (for example `~/.opencode/bin`) resolves in a deck pane even when the daemon was launched from a context that never loaded your login profile — a non-interactive SSH session, a system service, or a bare launcher. The rule of thumb: **if the command resolves when you SSH in, it resolves in a deck pane.**
-
-> **A profile PATH change needs a daemon restart**
->
-> The login-shell PATH is captured **once, when the daemon starts**. If you change your shell profile's `PATH` — or install an agent into a directory that wasn't on it before — restart the daemon so it re-captures: `dot-agent-deck daemon restart`. Until then the daemon keeps using the `PATH` it captured at its last start.
-
-If the capture fails for any reason — `$SHELL` is unset, the probe times out, or it returns nothing usable — the daemon keeps the `PATH` it inherited, so this never makes spawning *worse* than before. Only the `PATH` is taken from the login shell; other login-only variables (for example `KUBECONFIG` or cloud credentials) are not captured here — once an agent like Claude Code is running it sources your profile itself for its own shell-outs.
-
 ## Environment Variables
 
 | Variable | Default | Description |

@@ -79,15 +79,15 @@ If a pane comes up with an error such as *"Unable to spawn `claude` because it d
 
 ### Why This Happens
 
-The daemon resolves a bare command against its own process `PATH`. At startup it captures your **login-shell PATH** (see [Configuration › Command Resolution and the Login-Shell PATH](configuration.md#command-resolution-and-the-login-shell-path)) so commands installed under, for example, `~/.local/bin` normally resolve. You can still hit this if the command isn't on your login shell's PATH at all, or if it was added — or the agent was installed — **after** the daemon last started, because the PATH is captured only once per daemon start.
+The daemon resolves a bare command against its own process `PATH`. At startup it captures your **login-shell PATH** — the PATH you get in an interactive login shell, the same as when you SSH in — so commands installed under, for example, `~/.local/bin` or a directory added by `~/.bashrc` (such as `~/.opencode/bin`) normally resolve. You can still hit this if the command isn't on your login shell's PATH at all, or if it was added — or the agent was installed — **after** the daemon last started, because the PATH is captured only once per daemon start.
 
 ### Fix
 
 1. Confirm the command resolves in a fresh login shell of your own:
    ```bash
-   $SHELL -lc 'command -v claude'
+   $SHELL -ilc 'command -v claude'
    ```
-   If that prints nothing, fix your shell profile (for example, add the install directory to `PATH` in `~/.profile`) until it does.
+   If that prints nothing, fix your shell startup files (for example, add the install directory to `PATH` in `~/.profile` or `~/.bashrc`) until it does.
 
 2. Restart the daemon so it re-captures the login-shell PATH:
    ```bash
