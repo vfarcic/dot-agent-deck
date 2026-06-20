@@ -386,24 +386,25 @@ impl DirPickerState {
 /// authoring agent pre-seeded with [`SCHEDULE_AUTHORING_SEED_PROMPT`].
 const SCHEDULE_MODE_NAME: &str = "schedule";
 
-/// PRD #170 M2.2: the agent-command picker presets surfaced in the new-pane
-/// form (and the schedule authoring flow, which reuses the same form). Clicking
-/// a preset fills the Command field; the field stays free-text so a path or a
-/// custom command still works. Visible by default — no experimental flag.
-const AGENT_COMMAND_PRESETS: &[&str] = &["claude", "opencode"];
+/// PRD #170 round 2 (reviewer finding 1): the fallback agent command for a
+/// scheduled-task authoring session when no `default_command` is configured. The
+/// Command field is free-text (the clickable preset picker is gone), so only this
+/// blank-case default remains — `claude`, the simple default that launches a real
+/// conversational agent.
+const DEFAULT_AUTHORING_COMMAND: &str = "claude";
 
 /// PRD #170 round 2 (reviewer findings 1 & 3): resolve the authoring command
 /// for a scheduled-task authoring session. The authoring agent MUST be a real
 /// conversational agent that can act on the seed prompt and call the `schedule
 /// add` CLI — never a bare `$SHELL`. So a blank/whitespace `default_command`
 /// (the unconfigured-user case: `config.rs` defaults it to `String::new`) falls
-/// back to the first known preset (`claude`); a configured value is used as-is
-/// (trimmed). Shared by the pick-agent modal seed AND both authoring spawn
-/// sites so the fallback is applied uniformly.
+/// back to [`DEFAULT_AUTHORING_COMMAND`] (`claude`); a configured value is used
+/// as-is (trimmed). Shared by both authoring spawn sites so the fallback is
+/// applied uniformly.
 fn resolve_authoring_command(default_command: &str) -> String {
     let trimmed = default_command.trim();
     if trimmed.is_empty() {
-        AGENT_COMMAND_PRESETS[0].to_string()
+        DEFAULT_AUTHORING_COMMAND.to_string()
     } else {
         trimmed.to_string()
     }
@@ -479,9 +480,13 @@ fn schedule_next_fire_display(task: &crate::config::ScheduledTask) -> String {
 /// PRD #170 (unify): `working_dir` is the directory picked in the dir-picker
 /// (the cwd the authoring session is launched in). It is appended as the
 /// schedule's `working_dir` DEFAULT so the agent's `schedule add/update`
-/// naturally targets the picked dir unless the user names another. On **edit**
-/// the existing values block still injects the row's stored `working_dir` (and
-/// the picker starts there, so an unchanged pick reproduces it).
+/// naturally targets the picked dir unless the user names another.
+///
+/// PRD #170 round 2 (reviewer finding 3): on **edit** the existing-values block
+/// lists the PICKED `working_dir` (not the row's stale stored one) so it can
+/// never conflict with the `working_dir DEFAULT:` line — re-picking a different
+/// directory wins, and an unchanged pick (the picker opens at the row's dir)
+/// reproduces the stored value.
 fn build_schedule_authoring_mode(
     existing: Option<&crate::config::ScheduledTask>,
     working_dir: &std::path::Path,
@@ -514,7 +519,9 @@ fn build_schedule_authoring_mode(
                 base = base,
                 name = t.name,
                 cron = t.cron,
-                working_dir = t.working_dir,
+                // PRD #170 finding 3: the PICKED dir (not the row's stale stored
+                // one) so this current-value line agrees with `working_dir DEFAULT`.
+                working_dir = working_dir.display(),
                 command = command,
                 prompt = t.prompt,
                 ntpf = t.new_tab_per_fire,
@@ -692,10 +699,14 @@ impl NewPaneFormState {
         // available, so the Mode field always shows (at minimum "No mode" and
         // "schedule") and the form opens focused on it.
         let has_mode_field = true;
+        // PRD #170 round 2 (reviewer finding 7): the synthetic mode only supplies
+        // the cycler's display `name` — the authoring seed is derived at submit
+        // time by `build_schedule_authoring_mode` (threaded with the picked dir),
+        // so `seed_prompt` here is dead data; leave it `None`.
         let schedule_authoring = ModeConfig {
             name: SCHEDULE_MODE_NAME.to_string(),
             init_command: None,
-            seed_prompt: Some(SCHEDULE_AUTHORING_SEED_PROMPT.to_string()),
+            seed_prompt: None,
             panes: Vec::new(),
             rules: Vec::new(),
             reactive_panes: 0,
@@ -732,10 +743,12 @@ impl NewPaneFormState {
         command: String,
         existing: Option<config::ScheduledTask>,
     ) -> Self {
+        // PRD #170 round 2 (reviewer finding 7): seed is derived at submit time by
+        // `build_schedule_authoring_mode`; the synthetic mode only carries `name`.
         let schedule_authoring = ModeConfig {
             name: SCHEDULE_MODE_NAME.to_string(),
             init_command: None,
-            seed_prompt: Some(SCHEDULE_AUTHORING_SEED_PROMPT.to_string()),
+            seed_prompt: None,
             panes: Vec::new(),
             rules: Vec::new(),
             reactive_panes: 0,
@@ -3495,6 +3508,53 @@ fn open_schedule_dir_picker(ui: &mut UiState, existing: Option<config::Scheduled
     ui.mode = UiMode::DirPicker;
 }
 
+/// PRD #170 round 2 (reviewer finding 5): re-render the Scheduled-Tasks manager
+/// after cancelling a manager-originated schedule flow. The `scheduled_tasks`
+/// list is still loaded from the original `OpenScheduledTasks`, so this only
+/// clamps the selection back into range (defensive — nothing removed a row) and
+/// switches mode so the dialog (its `NEXT FIRE` header) re-renders.
+fn return_to_scheduled_tasks_manager(ui: &mut UiState) {
+    if ui.scheduled_selected >= ui.scheduled_tasks.len() {
+        ui.scheduled_selected = ui.scheduled_tasks.len().saturating_sub(1);
+    }
+    ui.scheduled_delete_confirm = false;
+    ui.mode = UiMode::ScheduledTasks;
+}
+
+/// PRD #170 round 2 (reviewer findings 4 & 5): cancel the directory picker.
+/// Routes by the picker's `dir_picker_intent`: a manager-originated pick
+/// (`ScheduleAdd`/`ScheduleEdit`) returns to the Scheduled-Tasks manager, while
+/// an ordinary `Ctrl+n` pick (`NewPane`) drops to the dashboard (unchanged).
+/// Either way the intent is CONSUMED (reset to `NewPane`) so a later `Ctrl+n` is
+/// never poisoned by a stale schedule intent. Shared by the picker's Esc/`q`
+/// keys and the `[Cancel]` button so all cancel doors behave identically.
+fn cancel_dir_picker(ui: &mut UiState) {
+    ui.dir_picker = None;
+    let intent = std::mem::replace(&mut ui.dir_picker_intent, DirPickerIntent::NewPane);
+    match intent {
+        DirPickerIntent::ScheduleAdd | DirPickerIntent::ScheduleEdit(_) => {
+            return_to_scheduled_tasks_manager(ui);
+        }
+        DirPickerIntent::NewPane => ui.mode = UiMode::Normal,
+    }
+}
+
+/// PRD #170 round 2 (reviewer finding 5): cancel the new-pane form. By the time
+/// the form is up, [`transition_after_dir_pick`] has already consumed the
+/// `dir_picker_intent`, so route on the form's own `schedule_locked` flag: a
+/// mode-locked schedule form (manager Add/Edit) returns to the Scheduled-Tasks
+/// manager, while the ordinary `Ctrl+n` form drops to the dashboard (unchanged).
+/// Shared by the form's Esc key and the `[Cancel]` button.
+fn cancel_new_pane_form(ui: &mut UiState) {
+    let locked = ui.new_pane_form.as_ref().is_some_and(|f| f.schedule_locked);
+    ui.new_pane_form = None;
+    if locked {
+        return_to_scheduled_tasks_manager(ui);
+    } else {
+        ui.mode = UiMode::Normal;
+    }
+}
+
 /// Decide what value to push to the daemon on a Rename-mode keypress.
 /// Returns `Some(text)` only on Enter; the caller then forwards `text` to
 /// `PaneController::rename_pane`. An empty/whitespace-only `text` means
@@ -3629,8 +3689,7 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> Action {
             }
             KeyCode::Char(c) => match c {
                 'q' | 'Q' => {
-                    ui.dir_picker = None;
-                    ui.mode = UiMode::Normal;
+                    cancel_dir_picker(ui);
                 }
                 _ => {
                     picker.filter_text.push(c);
@@ -3647,13 +3706,11 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> Action {
             if !picker.filter_text.is_empty() {
                 picker.clear_filter();
             } else {
-                ui.dir_picker = None;
-                ui.mode = UiMode::Normal;
+                cancel_dir_picker(ui);
             }
         }
         KeyCode::Char('q') => {
-            ui.dir_picker = None;
-            ui.mode = UiMode::Normal;
+            cancel_dir_picker(ui);
         }
         KeyCode::Char('j') | KeyCode::Down => {
             picker.select_next();
@@ -3811,9 +3868,10 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
         }
     };
     match key.code {
+        // PRD #170 finding 5: a locked schedule form returns to the manager; the
+        // ordinary `Ctrl+n` form drops to the dashboard (unchanged).
         KeyCode::Esc => {
-            ui.new_pane_form = None;
-            ui.mode = UiMode::Normal;
+            cancel_new_pane_form(ui);
         }
         KeyCode::Tab => {
             form.focused = form.next_field();
@@ -5467,10 +5525,10 @@ fn dispatch_action(
         Action::PickerConfirm => {
             transition_after_dir_pick(ui);
         }
-        // [Cancel] → close the picker (== q / Esc).
+        // [Cancel] → close the picker (== q / Esc). PRD #170 finding 5: routes
+        // intent-aware — a manager-originated pick returns to the manager.
         Action::PickerCancel => {
-            ui.dir_picker = None;
-            ui.mode = UiMode::Normal;
+            cancel_dir_picker(ui);
         }
         // [Filter] → open the picker's filter input (== `/`).
         Action::PickerFilter => {
@@ -5513,10 +5571,11 @@ fn dispatch_action(
                 );
             }
         }
-        // [Cancel] → close the form without spawning (== Esc).
+        // [Cancel] → close the form without spawning (== Esc). PRD #170 finding 5:
+        // a locked schedule form returns to the manager (intent-aware via
+        // `schedule_locked`); the ordinary form drops to the dashboard.
         Action::FormCancel => {
-            ui.new_pane_form = None;
-            ui.mode = UiMode::Normal;
+            cancel_new_pane_form(ui);
         }
         Action::ForwardToPane(bytes) => {
             if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
@@ -10679,7 +10738,19 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) -> PickerCl
 /// focus-dependent wording can be unit-tested without driving a TestBackend.
 /// `name_submits` is true when focus is on Name and the Command field is
 /// hidden (orchestration selected) — i.e. Enter on Name submits the form.
-fn new_pane_form_footer_hint(has_mode_field: bool, name_submits: bool) -> &'static str {
+///
+/// PRD #170 round 2 (reviewer finding 6): the mode-locked schedule form has a
+/// single navigable field (Command), so the generic "Tab: switch field" hint is
+/// misleading — `schedule_locked` shows a Command-only `Enter: confirm  Esc:
+/// cancel` instead.
+fn new_pane_form_footer_hint(
+    has_mode_field: bool,
+    name_submits: bool,
+    schedule_locked: bool,
+) -> &'static str {
+    if schedule_locked {
+        return "  Enter: confirm  Esc: cancel";
+    }
     if has_mode_field {
         if name_submits {
             "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: submit  Esc: cancel"
@@ -11203,8 +11274,9 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // the generic "Enter: next" wording, which is misleading in that state.
     let name_submits = form.focused == FormField::Name && !cmd_visible;
     // PRD #170: pass `show_mode` (false when locked) so the locked footer drops
-    // the `◀▶: mode` hint; unlocked it equals the old `has_mode_field`.
-    let footer = new_pane_form_footer_hint(show_mode, name_submits);
+    // the `◀▶: mode` hint; unlocked it equals the old `has_mode_field`. Finding 6:
+    // `schedule_locked` selects the Command-only `Enter: confirm  Esc: cancel`.
+    let footer = new_pane_form_footer_hint(show_mode, name_submits, form.schedule_locked);
     lines.push(Line::styled(footer, text_primary()));
 
     // PRD #170: the locked schedule form retitles the modal by action; otherwise
@@ -17996,15 +18068,25 @@ mod tests {
 
     #[test]
     fn manager_edit_authoring_mode_prefills_and_forbids_rename() {
-        let existing = make_scheduled_task("digest", true);
+        // PRD #170 finding 3: the row's stored dir (A) and the re-picked dir (B)
+        // are distinct, non-overlapping paths so the assertions below can tell the
+        // stale current-value from the picked default.
+        let mut existing = make_scheduled_task("digest", true);
+        existing.working_dir = "/row/dir/alpha".to_string();
         let mode =
-            build_schedule_authoring_mode(Some(&existing), std::path::Path::new("/tmp/picked"));
+            build_schedule_authoring_mode(Some(&existing), std::path::Path::new("/pick/dir/bravo"));
         assert_eq!(mode.name, SCHEDULE_MODE_NAME);
         let seed = mode.seed_prompt.as_deref().unwrap();
         // PRD #170: the picked dir is threaded in as the working_dir DEFAULT.
         assert!(
-            seed.contains("working_dir DEFAULT: /tmp/picked"),
+            seed.contains("working_dir DEFAULT: /pick/dir/bravo"),
             "edit seed must carry the picked dir as the working_dir default, got:\n{seed}"
+        );
+        // PRD #170 finding 3: the re-picked dir wins — the row's stale stored
+        // working_dir must NOT survive as a conflicting current value.
+        assert!(
+            !seed.contains("/row/dir/alpha"),
+            "the re-picked working_dir must win; the row's stale dir must not appear, got:\n{seed}"
         );
         // Pre-fill: the existing entry's distinctive prompt + name reach the seed.
         assert!(
@@ -18083,9 +18165,11 @@ mod tests {
 
     // PRD #127 M3.2: the new-deck dialog's Mode cycler always ends with a
     // built-in "schedule" authoring option (after the project modes and
-    // orchestrations). Selecting it yields a synthetic ModeConfig carrying the
-    // authoring seed prompt, so the gated seed-delivery path (Phase 3A) spawns
-    // a pre-seeded agent.
+    // orchestrations). PRD #170 finding 7: the seed no longer rides on the
+    // synthetic mode (that field is dead data, left `None`) — it is derived at
+    // submit time by `build_schedule_authoring_mode`, so the SPAWN REQUEST is what
+    // carries it. This test pins both: the option is last/selectable, and
+    // submitting it produces a seeded request.
     #[test]
     fn unified_form_builtin_schedule_option_is_last_and_seeded() {
         let mut f = NewPaneFormState::new(
@@ -18105,20 +18189,27 @@ mod tests {
         }
         assert!(f.is_schedule_selected());
 
-        // It is a real (synthetic) mode carrying the authoring seed prompt, and
-        // it is NOT misread as an orchestration.
+        // It is a real (synthetic) mode named `schedule`, NOT misread as an
+        // orchestration. Finding 7: the synthetic mode no longer carries the seed.
         let seeded = f.selected_mode().expect("schedule yields a mode");
         assert_eq!(seeded.name, "schedule");
-        let seed = seeded
+        assert!(
+            seeded.seed_prompt.is_none(),
+            "finding 7: the synthetic mode's seed_prompt is dead data — left None"
+        );
+        assert!(f.selected_orchestration().is_none());
+
+        // The seed is delivered through the spawn request derived at submit time.
+        let req = build_new_pane_request(&f, "claude");
+        let seed = req
             .seed_prompt
             .as_deref()
-            .expect("carries a seed prompt");
+            .expect("submitting the schedule option carries the authoring seed");
         assert!(seed.contains("schedule add"), "seed must invoke the CLI");
         assert!(
             seed.to_lowercase().contains("confirm"),
             "seed must require confirm-before-write"
         );
-        assert!(f.selected_orchestration().is_none());
     }
 
     // PRD #170 M2.1 (was PRD #127 Part 4) — a blank Command on the "schedule"
@@ -18657,7 +18748,7 @@ mod tests {
     fn footer_hint_switches_to_submit_when_name_focused_with_orchestration() {
         // PRD #106 follow-up: when the Command field is hidden and focus is
         // on Name, Enter submits — the footer must say so.
-        let submit_hint = new_pane_form_footer_hint(true, true);
+        let submit_hint = new_pane_form_footer_hint(true, true, false);
         assert!(
             submit_hint.contains("Enter: submit"),
             "expected submit hint, got {submit_hint:?}"
@@ -18665,15 +18756,26 @@ mod tests {
 
         // Sanity checks: every other focus/visibility combination keeps the
         // legacy 'Enter: next' wording.
-        let next_hint = new_pane_form_footer_hint(true, false);
+        let next_hint = new_pane_form_footer_hint(true, false, false);
         assert!(
             next_hint.contains("Enter: next") && !next_hint.contains("submit"),
             "expected next hint, got {next_hint:?}"
         );
-        let no_mode_hint = new_pane_form_footer_hint(false, false);
+        let no_mode_hint = new_pane_form_footer_hint(false, false, false);
         assert!(
             no_mode_hint.contains("Enter: next/confirm"),
             "expected next/confirm hint when there's no mode field, got {no_mode_hint:?}"
+        );
+
+        // PRD #170 finding 6: the mode-locked schedule form has a single
+        // navigable field (Command), so it drops the misleading "Tab: switch
+        // field" wording for a Command-only confirm/cancel hint.
+        let locked_hint = new_pane_form_footer_hint(false, false, true);
+        assert!(
+            locked_hint.contains("Enter: confirm")
+                && locked_hint.contains("Esc: cancel")
+                && !locked_hint.contains("Tab"),
+            "expected a Command-only locked hint with no Tab wording, got {locked_hint:?}"
         );
     }
 
