@@ -89,33 +89,54 @@ fn capture_path_via_shell(shell: &str) -> Option<String> {
         .spawn()
         .ok()?;
 
+    // Drain stdout on a separate thread *while* we poll for exit. An interactive
+    // rc may print a banner / MOTD to stdout before our `printf` runs; if that
+    // exceeds the OS pipe buffer (~64 KB on Linux) the child would block on its
+    // write and `try_wait` would never complete — a deadlock that hangs until
+    // CAPTURE_TIMEOUT and then falls back, defeating the capture for exactly the
+    // verbose-profile users this targets. Concurrent draining keeps the pipe
+    // empty; the reader returns when the child's stdout closes.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        buf
+    });
+
     // Poll for completion so we can enforce the timeout AND kill a hung shell.
-    // The captured output (PATH) is far smaller than the pipe buffer, so it is
-    // safe to read it only after exit; a shell that floods stdout instead would
-    // block on write and simply hit the timeout below.
     let deadline = Instant::now() + CAPTURE_TIMEOUT;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    break None;
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
-            Err(_) => return None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
         }
     };
 
-    if !status.success() {
-        return None;
+    // On a clean exit the child's stdout is closed, so the drainer has finished
+    // (or will momentarily) — join it to collect the output. On timeout/error we
+    // already killed the child; drop the handle instead of joining so we never
+    // block on a drainer an exotic backgrounded grandchild could keep open. On
+    // the clean path the join completes before this returns, so the process is
+    // single-threaded again before `apply_login_shell_path` calls `set_var`.
+    match status {
+        Some(status) if status.success() => {
+            let out = reader.join().ok()?;
+            extract_marked_path(&out)
+        }
+        _ => None,
     }
-
-    let mut out = String::new();
-    child.stdout.as_mut()?.read_to_string(&mut out).ok()?;
-    extract_marked_path(&out)
 }
 
 /// Pull the PATH out from between [`PATH_MARK_BEGIN`] and [`PATH_MARK_END`] and
@@ -300,6 +321,33 @@ mod tests {
     fn captures_path_from_interactive_login_shell() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shell = write_probe_shell(dir.path(), "ok-shell.sh", "/opt/login/bin:/usr/bin", 0);
+        assert_eq!(
+            capture_path_via_shell(&shell.to_string_lossy()),
+            Some("/opt/login/bin:/usr/bin".to_string()),
+        );
+    }
+
+    #[test]
+    fn captures_path_despite_large_stdout_banner() {
+        // Regression guard: an interactive rc that prints a banner bigger than
+        // the OS pipe buffer (~64 KB) to stdout BEFORE our probe must not
+        // deadlock the capture. stdout is drained on a thread concurrently with
+        // the poll loop, so the child never blocks on its write and the marked
+        // PATH (printed last) still parses out. Without concurrent draining this
+        // would hang until CAPTURE_TIMEOUT and then return None.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shell = write_shell(
+            dir.path(),
+            "verbose-shell.sh",
+            "#!/bin/sh\n\
+             export PATH=\"/opt/login/bin:/usr/bin\"\n\
+             i=0\n\
+             while [ \"$i\" -lt 2000 ]; do \
+             printf 'banner line %s padding padding padding padding padding\\n' \"$i\"; \
+             i=$((i + 1)); done\n\
+             while [ \"$#\" -gt 0 ]; do case \"$1\" in -*) shift ;; *) break ;; esac; done\n\
+             if [ \"$#\" -gt 0 ]; then /bin/sh -c \"$1\"; fi\n",
+        );
         assert_eq!(
             capture_path_via_shell(&shell.to_string_lossy()),
             Some("/opt/login/bin:/usr/bin".to_string()),
