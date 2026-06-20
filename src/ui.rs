@@ -193,13 +193,6 @@ enum UiMode {
     /// next-fire) with add/edit (seeded authoring agent), delete-with-confirm
     /// (definition only), and run-now actions.
     ScheduledTasks,
-    /// PRD #170 round 2: the pick-agent modal shown BEFORE the Scheduled-Tasks
-    /// manager Add/Edit spawns the seeded authoring agent (Option B). It reuses
-    /// the agent-command picker (`AGENT_COMMAND_PRESETS` + `render_modal_button_row`)
-    /// so the user picks which agent runs the authoring session, defaulting to
-    /// the resolved authoring command. Confirming spawns; cancel returns to
-    /// Normal. State lives in [`UiState::schedule_agent_pick`].
-    ScheduleAgentPick,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,42 +409,6 @@ fn resolve_authoring_command(default_command: &str) -> String {
     }
 }
 
-/// PRD #170 round 2: state for the [`UiMode::ScheduleAgentPick`] modal — the
-/// small picker the Scheduled-Tasks manager Add/Edit opens BEFORE spawning the
-/// seeded authoring agent (Option B). Holds the chosen authoring command
-/// (initialized to the resolved `default_command`, or `claude` when blank), the
-/// highlighted preset index, and the existing task for edit pre-fill (`None` =
-/// add). On confirm the modal spawns `schedule_authoring_request(existing,
-/// &chosen)`.
-struct ScheduleAgentPickState {
-    /// The authoring command that spawns on confirm. Seeded to the resolved
-    /// `default_command`; `h`/`l` (or a chip click) overwrite it with a preset.
-    chosen: String,
-    /// Index into [`AGENT_COMMAND_PRESETS`] of the highlighted preset.
-    selected_preset: usize,
-    /// The existing schedule for an Edit pre-fill, or `None` for Add.
-    existing: Option<config::ScheduledTask>,
-}
-
-impl ScheduleAgentPickState {
-    /// Build the modal state from an already-resolved `chosen` command and the
-    /// edit-target (`None` = add). Highlights the preset matching `chosen` when
-    /// it is one; otherwise the first preset (a configured custom command is
-    /// still shown as the default and spawns on confirm unless the user steers
-    /// the selection to a preset).
-    fn new(chosen: String, existing: Option<config::ScheduledTask>) -> Self {
-        let selected_preset = AGENT_COMMAND_PRESETS
-            .iter()
-            .position(|p| *p == chosen)
-            .unwrap_or(0);
-        Self {
-            chosen,
-            selected_preset,
-            existing,
-        }
-    }
-}
-
 /// PRD #127 M3.2: the crisp seed prompt delivered (gated, like orchestrations)
 /// to the "schedule" authoring agent. It instructs the agent to converse with
 /// the user, then call the validated `dot-agent-deck schedule add` CLI — it
@@ -518,9 +475,26 @@ fn schedule_next_fire_display(task: &crate::config::ScheduledTask) -> String {
 /// **edit**, the existing entry's current values are injected so the agent
 /// starts from them and calls `schedule update` (NOT `add`); renaming is
 /// forbidden (the `name` is the reuse-registry key — to rename, remove + add).
-fn build_schedule_authoring_mode(existing: Option<&crate::config::ScheduledTask>) -> ModeConfig {
+///
+/// PRD #170 (unify): `working_dir` is the directory picked in the dir-picker
+/// (the cwd the authoring session is launched in). It is appended as the
+/// schedule's `working_dir` DEFAULT so the agent's `schedule add/update`
+/// naturally targets the picked dir unless the user names another. On **edit**
+/// the existing values block still injects the row's stored `working_dir` (and
+/// the picker starts there, so an unchanged pick reproduces it).
+fn build_schedule_authoring_mode(
+    existing: Option<&crate::config::ScheduledTask>,
+    working_dir: &std::path::Path,
+) -> ModeConfig {
+    let base = format!(
+        "{seed}\n\n\
+         working_dir DEFAULT: {dir} (the directory this authoring session was launched in) \
+         — use it as the schedule's working_dir unless the user names another.",
+        seed = SCHEDULE_AUTHORING_SEED_PROMPT,
+        dir = working_dir.display(),
+    );
     let seed = match existing {
-        None => SCHEDULE_AUTHORING_SEED_PROMPT.to_string(),
+        None => base,
         Some(t) => {
             let command = t.command.clone().unwrap_or_default();
             format!(
@@ -537,7 +511,7 @@ fn build_schedule_authoring_mode(existing: Option<&crate::config::ScheduledTask>
                  `dot-agent-deck schedule update --name {name} ...` (NOT `add`). \
                  RENAME IS FORBIDDEN — the name {name:?} is fixed (it is the reuse-tab key); \
                  to rename, remove this schedule and add a new one.",
-                base = SCHEDULE_AUTHORING_SEED_PROMPT,
+                base = base,
                 name = t.name,
                 cron = t.cron,
                 working_dir = t.working_dir,
@@ -637,6 +611,22 @@ pub enum FormField {
     Command,
 }
 
+/// PRD #170 (unify): why the directory picker is open — which form to build
+/// once a directory is confirmed (in [`transition_after_dir_pick`]). `Ctrl+n`
+/// opens it for an ordinary new pane; the Scheduled-Tasks manager's Add/Edit
+/// reuse the SAME picker, then build the schedule-locked form (carrying the
+/// edit row for `ScheduleEdit`). Always set at every picker-open site and reset
+/// to `NewPane` once consumed, so a later `Ctrl+n` is never poisoned.
+enum DirPickerIntent {
+    /// `Ctrl+n` — build the ordinary new-pane form ([`NewPaneFormState::new`]).
+    NewPane,
+    /// Manager Add — build the schedule-locked form with no edit row.
+    ScheduleAdd,
+    /// Manager Edit — build the schedule-locked form pre-filled from this row
+    /// (boxed: the variant is far larger than the others).
+    ScheduleEdit(Box<config::ScheduledTask>),
+}
+
 struct NewPaneFormState {
     dir: PathBuf,
     name: String,
@@ -653,6 +643,18 @@ struct NewPaneFormState {
     selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations, last = "schedule"
     has_mode_field: bool,
     focused: FormField,
+    /// PRD #170 (unify): when `true` the form is MODE-LOCKED to schedule
+    /// authoring — the manager's Add/Edit reuses this same form but hides the
+    /// Mode cycler and the Name field and retitles the modal ` New Schedule ` /
+    /// ` Edit Schedule `. `false` is the ordinary `Ctrl+n` new-pane form (Mode +
+    /// Name visible), left byte-for-byte unchanged. Built via
+    /// [`NewPaneFormState::new_schedule_locked`]; `new` always sets it `false`.
+    schedule_locked: bool,
+    /// PRD #170 (unify): the existing schedule on a manager **Edit** (`None` on
+    /// **Add**). Drives the authoring-seed pre-fill (the agent starts from the
+    /// row's values and calls `schedule update`) and the ` Edit Schedule ` title.
+    /// Only ever `Some` when `schedule_locked` is `true`.
+    schedule_existing: Option<config::ScheduledTask>,
 }
 
 // ---------------------------------------------------------------------------
@@ -708,7 +710,53 @@ impl NewPaneFormState {
             selection_index: 0,
             has_mode_field,
             focused: FormField::Mode,
+            // PRD #170: the ordinary `Ctrl+n` form is never locked.
+            schedule_locked: false,
+            schedule_existing: None,
         }
+    }
+
+    /// PRD #170 (unify): build the new-pane form MODE-LOCKED to schedule
+    /// authoring — the shape the Scheduled-Tasks manager's Add/Edit opens after
+    /// the directory picker (reusing the `Ctrl+n` form instead of a bespoke
+    /// modal). `modes`/`orchestrations` are left empty so `schedule_index()` is
+    /// `1` and the selection is fixed there (`is_schedule_selected()` is already
+    /// true), the card name is fixed to `SCHEDULE_MODE_NAME` (the schedule's own
+    /// name is authored conversationally), focus opens on the free-text Command
+    /// field (pre-filled by the caller from the resolved `default_command`), and
+    /// `schedule_locked` drives the render branches that hide the Mode cycler +
+    /// Name field and retitle the modal. `existing` is `Some(row)` on Edit (for
+    /// the authoring-seed pre-fill), `None` on Add.
+    fn new_schedule_locked(
+        dir: PathBuf,
+        command: String,
+        existing: Option<config::ScheduledTask>,
+    ) -> Self {
+        let schedule_authoring = ModeConfig {
+            name: SCHEDULE_MODE_NAME.to_string(),
+            init_command: None,
+            seed_prompt: Some(SCHEDULE_AUTHORING_SEED_PROMPT.to_string()),
+            panes: Vec::new(),
+            rules: Vec::new(),
+            reactive_panes: 0,
+        };
+        let mut form = Self {
+            dir,
+            name: SCHEDULE_MODE_NAME.to_string(),
+            command,
+            modes: Vec::new(),
+            orchestrations: Vec::new(),
+            schedule_authoring,
+            selection_index: 0,
+            has_mode_field: true,
+            focused: FormField::Command,
+            schedule_locked: true,
+            schedule_existing: existing,
+        };
+        // Lock the selection onto the built-in schedule option (index 1 with no
+        // modes/orchestrations) so the existing schedule spawn branch fires.
+        form.selection_index = form.schedule_index();
+        form
     }
 
     /// Cycler index of the built-in "schedule" authoring option — the last one,
@@ -792,6 +840,11 @@ impl NewPaneFormState {
     }
 
     fn next_field(&self) -> FormField {
+        // PRD #170: the locked schedule form has a single navigable field
+        // (Command) — Mode + Name are hidden, so Tab is a no-op.
+        if self.schedule_locked {
+            return FormField::Command;
+        }
         let cmd_visible = self.command_visible();
         match self.focused {
             FormField::Mode => FormField::Name,
@@ -815,6 +868,11 @@ impl NewPaneFormState {
     }
 
     fn prev_field(&self) -> FormField {
+        // PRD #170: symmetric to `next_field` — the locked schedule form's only
+        // navigable field is Command.
+        if self.schedule_locked {
+            return FormField::Command;
+        }
         let cmd_visible = self.command_visible();
         match self.focused {
             FormField::Mode => {
@@ -987,6 +1045,10 @@ struct UiState {
     scroll_offset: usize,
     status_message: Option<(String, std::time::Instant)>,
     dir_picker: Option<DirPickerState>,
+    /// PRD #170 (unify): why `dir_picker` is open — selects which form
+    /// [`transition_after_dir_pick`] builds when the directory is confirmed.
+    /// Set at every picker-open site; reset to `NewPane` once consumed.
+    dir_picker_intent: DirPickerIntent,
     new_pane_form: Option<NewPaneFormState>,
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
@@ -1133,11 +1195,6 @@ struct UiState {
     /// Schedule names with a live tab/agent, snapshotted when the dialog opens
     /// (drives the live/idle status indicator).
     scheduled_live_names: HashSet<String>,
-    /// PRD #170 round 2: state for the pick-agent modal ([`UiMode::ScheduleAgentPick`]).
-    /// `Some` while the modal is up (set when the manager Add/Edit opens it),
-    /// `None` otherwise. Confirming spawns the seeded authoring agent running
-    /// the chosen command; cancel clears this and returns to Normal.
-    schedule_agent_pick: Option<ScheduleAgentPickState>,
     /// PRD #76 M2.20: timestamp of the most recent keystroke forwarded to a
     /// pane via `ForwardToPane`. Drives the submit-debounce in `PaneInput` mode
     /// so an Enter keystroke arriving fused to preceding typed bytes is
@@ -1246,6 +1303,7 @@ impl UiState {
             scroll_offset: 0,
             status_message: None,
             dir_picker: None,
+            dir_picker_intent: DirPickerIntent::NewPane,
             new_pane_form: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
@@ -1279,7 +1337,6 @@ impl UiState {
             scheduled_selected: 0,
             scheduled_delete_confirm: false,
             scheduled_live_names: HashSet::new(),
-            schedule_agent_pick: None,
             last_pane_keystroke_at: None,
             session_coalescer: config::SnapshotCoalescer::new(SNAPSHOT_COALESCE_INTERVAL),
             session_epoch: std::time::Instant::now(),
@@ -2293,20 +2350,6 @@ pub enum Action {
     FormSubmit,
     /// PRD #80 M8: form `[Cancel]` — close the form without spawning (== Esc).
     FormCancel,
-    /// PRD #170 round 2: click an agent-command preset chip in the pick-agent
-    /// modal ([`UiMode::ScheduleAgentPick`]) — set the chosen authoring command
-    /// to that preset (mouse parity for `h`/`l`). Confirming the modal then
-    /// spawns it; this click alone does not confirm.
-    ScheduleAgentSetCommand(String),
-    /// PRD #170 round 3 (F4): the pick-agent modal's `[Confirm]` button — mouse
-    /// parity for `Enter`. Spawns the seeded authoring agent running the
-    /// chosen/default command. Shared by the Enter key and the button click.
-    ScheduleAgentConfirm,
-    /// PRD #170 round 3 (F3/F4): the pick-agent modal's `[Cancel]` button —
-    /// mouse parity for `Esc`/`q`. Closes the modal WITHOUT spawning and returns
-    /// to the Scheduled-Tasks manager dialog (not the dashboard). Shared by the
-    /// Esc/q keys and the button click.
-    ScheduleAgentCancel,
     /// PRD #80: Normal-mode digit `1`-`9` — jump to card N and focus its pane.
     FocusCard(usize),
     /// PRD #80: on a mode tab, move the in-tab side-pane focus down (j/Down).
@@ -3392,19 +3435,21 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
             }
             Action::Continue
         }
-        // Add: PRD #170 round 2 — open the pick-agent modal (Option B) instead
-        // of spawning directly. The modal defaults to the resolved authoring
-        // command and spawns the seeded agent on confirm (blank context).
+        // Add: PRD #170 (unify) — reuse the `Ctrl+n` flow. Open the directory
+        // picker (at the cwd) marked `ScheduleAdd`; confirming a dir builds the
+        // mode-locked ` New Schedule ` form, which spawns the seeded authoring
+        // agent on submit (blank context).
         KeyCode::Char('a') => {
-            open_schedule_agent_pick(ui, None);
+            open_schedule_dir_picker(ui, None);
             Action::Continue
         }
-        // Edit the selected row: PRD #170 round 2 — open the pick-agent modal
-        // pre-loaded with the row for the authoring pre-fill (it calls `schedule
-        // update`). With no rows, behaves like add (`existing = None`).
+        // Edit the selected row: PRD #170 (unify) — open the directory picker
+        // STARTING at the row's `working_dir`, marked `ScheduleEdit(row)` so the
+        // mode-locked ` Edit Schedule ` form pre-fills the authoring seed from
+        // the row (it calls `schedule update`). With no rows, behaves like add.
         KeyCode::Enter | KeyCode::Char('e') => {
             let existing = ui.scheduled_tasks.get(ui.scheduled_selected).cloned();
-            open_schedule_agent_pick(ui, existing);
+            open_schedule_dir_picker(ui, existing);
             Action::Continue
         }
         // Delete (definition only) — ask to confirm first.
@@ -3426,96 +3471,28 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
     }
 }
 
-/// PRD #170 round 2: open the pick-agent modal for a manager Add (`existing =
-/// None`) or Edit (`existing = Some(row)`). Seeds the chosen command from the
-/// resolved `default_command` (so an unconfigured user gets `claude`, never a
-/// bare `$SHELL`) and switches into [`UiMode::ScheduleAgentPick`]. Shared by the
-/// `a`/`e`/Enter keys and the `[Add]`/`[Edit]` button actions so all four open
-/// the identical modal.
-fn open_schedule_agent_pick(ui: &mut UiState, existing: Option<config::ScheduledTask>) {
-    let chosen = resolve_authoring_command(&ui.config.default_command);
-    ui.schedule_agent_pick = Some(ScheduleAgentPickState::new(chosen, existing));
-    ui.mode = UiMode::ScheduleAgentPick;
-}
-
-/// PRD #170 round 2: key handling for the pick-agent modal. `h`/`Left` move the
-/// preset highlight to the previous preset, `l`/`Right` to the NEXT preset
-/// (claude → opencode) — each sets the chosen command to that preset. `Enter`
-/// confirms the chosen command and spawns the seeded authoring agent;
-/// `Esc`/`q` close the modal without spawning.
-///
-/// PRD #170 round 3: confirm/cancel route through the shared
-/// [`Action::ScheduleAgentConfirm`] / [`Action::ScheduleAgentCancel`] arms so
-/// the keys and the clickable `[Confirm]`/`[Cancel]` buttons (F4) follow one
-/// path — and cancel returns to the manager dialog, not the dashboard (F3).
-fn handle_schedule_agent_pick_key(key: KeyEvent, ui: &mut UiState) -> Action {
-    match key.code {
-        // F3: Esc/q close back to the Scheduled-Tasks manager dialog (not the
-        // dashboard), via the shared Cancel path the `[Cancel]` button uses too.
-        KeyCode::Esc | KeyCode::Char('q') => Action::ScheduleAgentCancel,
-        KeyCode::Char('h') | KeyCode::Left => {
-            if let Some(pick) = ui.schedule_agent_pick.as_mut() {
-                // PRD #170 (Greptile P1): only reassign `chosen` when the
-                // highlight actually moves. At the leftmost preset
-                // (`selected_preset == 0`) `h` is a true no-op — reassigning
-                // here would clobber a CUSTOM chosen command to presets[0]
-                // (`claude`) even though nothing moved.
-                if pick.selected_preset > 0 {
-                    pick.selected_preset -= 1;
-                    pick.chosen = AGENT_COMMAND_PRESETS[pick.selected_preset].to_string();
-                }
-            }
-            Action::Continue
+/// PRD #170 (unify): open the directory picker for a manager Add (`existing =
+/// None`) or Edit (`existing = Some(row)`), reusing the `Ctrl+n` flow instead
+/// of a bespoke pick-agent modal. Add starts the picker at the cwd; Edit starts
+/// it at the row's `working_dir` and carries the row so the mode-locked form
+/// pre-fills the authoring seed. The picked directory then drives
+/// [`transition_after_dir_pick`] (branching on the `dir_picker_intent` set
+/// here) to build the schedule-locked form. Shared by the `a`/`e`/Enter keys
+/// and the `[Add]`/`[Edit]` button actions so all four follow one path.
+fn open_schedule_dir_picker(ui: &mut UiState, existing: Option<config::ScheduledTask>) {
+    let (intent, start) = match existing {
+        Some(row) => {
+            let start = PathBuf::from(&row.working_dir);
+            (DirPickerIntent::ScheduleEdit(Box::new(row)), start)
         }
-        KeyCode::Char('l') | KeyCode::Right => {
-            if let Some(pick) = ui.schedule_agent_pick.as_mut() {
-                // Symmetric to `h`: only reassign `chosen` when the highlight
-                // actually advances, so the rightmost preset is a no-op too.
-                if pick.selected_preset + 1 < AGENT_COMMAND_PRESETS.len() {
-                    pick.selected_preset += 1;
-                    pick.chosen = AGENT_COMMAND_PRESETS[pick.selected_preset].to_string();
-                }
-            }
-            Action::Continue
-        }
-        // F4: Enter confirms via the shared Confirm path the `[Confirm]` button
-        // uses too — spawn the seeded authoring agent running the chosen command.
-        KeyCode::Enter => Action::ScheduleAgentConfirm,
-        _ => Action::Continue,
-    }
-}
-
-/// Build the [`NewPaneRequest`] that spawns the seeded "schedule" authoring
-/// agent for the manager's add (`existing = None`) or edit (`existing =
-/// Some(..)`) action. Reuses the 3B-i authoring mode + 3A gated seed delivery.
-///
-/// PRD #170 M2.1: the authoring command is no longer the hardcoded `claude` —
-/// it resolves from the configured `default_command` (the same value the
-/// new-pane form opens pre-filled with), so a user who runs `opencode` (or a
-/// path / custom command) gets their agent here too.
-fn schedule_authoring_request(
-    existing: Option<&config::ScheduledTask>,
-    default_command: &str,
-) -> NewPaneRequest {
-    let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    // PRD #127: the "schedule" authoring session is a throwaway single-agent
-    // CARD, not a workload mode tab. Carry the authoring seed on `seed_prompt`
-    // (delivered via the gated path) and leave `mode_config` None so the spawn
-    // routes to the dashboard like any single-agent card instead of opening a
-    // 50/50 mode tab.
-    NewPaneRequest {
-        dir,
-        name: SCHEDULE_MODE_NAME.to_string(),
-        // PRD #170 round 2 (reviewer findings 1 & 3): resolve the authoring
-        // command so a blank/whitespace `default_command` (the unconfigured
-        // user) falls back to `claude` instead of spawning a bare `$SHELL` that
-        // can't act on the seed. Idempotent on an already-resolved value (the
-        // pick-agent modal passes its resolved `chosen` here).
-        command: resolve_authoring_command(default_command),
-        mode_config: None,
-        orchestration_config: None,
-        seed_prompt: build_schedule_authoring_mode(existing).seed_prompt,
-    }
+        None => (
+            DirPickerIntent::ScheduleAdd,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+        ),
+    };
+    ui.dir_picker_intent = intent;
+    ui.dir_picker = Some(DirPickerState::new(start));
+    ui.mode = UiMode::DirPicker;
 }
 
 /// Decide what value to push to the daemon on a Rename-mode keypress.
@@ -3710,8 +3687,15 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> Action {
     Action::Continue
 }
 
-/// Check for `.dot-agent-deck.toml` in the selected directory.
-/// Open the unified new-pane form, with mode field when modes are available.
+/// Build the form that follows a confirmed directory pick. For an ordinary
+/// `Ctrl+n` pick (`DirPickerIntent::NewPane`): check for `.dot-agent-deck.toml`
+/// in the selected directory and open the unified new-pane form, with the Mode
+/// field when modes are available. For a manager Add/Edit pick
+/// (`ScheduleAdd`/`ScheduleEdit`, PRD #170 unify): open the SAME form
+/// MODE-LOCKED to schedule authoring, with the Command pre-filled from the
+/// resolved `default_command` and (on Edit) the row carried for the seed
+/// pre-fill. The intent is consumed (reset to `NewPane`) so a later `Ctrl+n`
+/// isn't poisoned.
 fn transition_after_dir_pick(ui: &mut UiState) {
     let dir = ui
         .dir_picker
@@ -3719,25 +3703,38 @@ fn transition_after_dir_pick(ui: &mut UiState) {
         .map(|p| p.current_dir.clone())
         .unwrap_or_default();
 
-    let name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let command = ui.config.default_command.clone();
+    ui.dir_picker = None;
+    // Consume the intent so a later `Ctrl+n` (which only sets `NewPane`) is
+    // never poisoned by a stale schedule intent.
+    let intent = std::mem::replace(&mut ui.dir_picker_intent, DirPickerIntent::NewPane);
 
-    let (modes, orchestrations) = match load_project_config(&dir) {
-        Ok(Some(config)) => (config.modes, config.orchestrations),
-        _ => (vec![], vec![]),
+    let form = match intent {
+        DirPickerIntent::NewPane => {
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let command = ui.config.default_command.clone();
+            let (modes, orchestrations) = match load_project_config(&dir) {
+                Ok(Some(config)) => (config.modes, config.orchestrations),
+                _ => (vec![], vec![]),
+            };
+            NewPaneFormState::new(dir, name, command, modes, orchestrations)
+        }
+        // PRD #170: the picked dir is pre-seeded as the schedule's working_dir;
+        // the Command field pre-fills from the resolved authoring command so a
+        // blank `default_command` shows the `claude` fallback rather than blank.
+        DirPickerIntent::ScheduleAdd => {
+            let command = resolve_authoring_command(&ui.config.default_command);
+            NewPaneFormState::new_schedule_locked(dir, command, None)
+        }
+        DirPickerIntent::ScheduleEdit(existing) => {
+            let command = resolve_authoring_command(&ui.config.default_command);
+            NewPaneFormState::new_schedule_locked(dir, command, Some(*existing))
+        }
     };
 
-    ui.dir_picker = None;
-    ui.new_pane_form = Some(NewPaneFormState::new(
-        dir,
-        name,
-        command,
-        modes,
-        orchestrations,
-    ));
+    ui.new_pane_form = Some(form);
     ui.mode = UiMode::NewPaneForm;
 }
 
@@ -3771,13 +3768,20 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
         } else {
             form.command.clone()
         };
+        // PRD #170 (unify): derive the seed from `build_schedule_authoring_mode`
+        // threaded with the picked dir (and, on a manager Edit, the existing
+        // row) so the seed carries the working_dir DEFAULT and — for Edit — the
+        // row's current values pre-fill. For an unlocked `Ctrl+n` schedule
+        // selection `schedule_existing` is `None`, so this is the base seed plus
+        // the working_dir line.
         return NewPaneRequest {
             dir: form.dir.clone(),
             name: form.name.clone(),
             command,
             mode_config: None,
             orchestration_config: None,
-            seed_prompt: form.schedule_authoring.seed_prompt.clone(),
+            seed_prompt: build_schedule_authoring_mode(form.schedule_existing.as_ref(), &form.dir)
+                .seed_prompt,
         };
     }
     NewPaneRequest {
@@ -4328,6 +4332,9 @@ fn dispatch_action(
         // ===== PRD #80 global command actions (formerly inline in run_tui) =====
         // Ctrl+n: new pane (open directory picker).
         Action::NewPane => {
+            // PRD #170: mark this pick as an ordinary new-pane open (not a
+            // schedule Add/Edit) so a prior schedule intent can't leak.
+            ui.dir_picker_intent = DirPickerIntent::NewPane;
             ui.mode = UiMode::DirPicker;
             ui.dir_picker = Some(DirPickerState::new(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
@@ -5548,63 +5555,19 @@ fn dispatch_action(
             ui.mode = UiMode::ScheduledTasks;
         }
         // PRD #127 finding #4: `[Add]` button parity for the `a` key. PRD #170
-        // round 2: open the pick-agent modal (Option B) instead of spawning
-        // directly — confirming the modal spawns the seeded authoring agent.
+        // (unify): open the directory picker marked `ScheduleAdd` (reusing the
+        // `Ctrl+n` flow) instead of a bespoke modal — confirming a dir builds
+        // the mode-locked ` New Schedule ` form, which spawns on submit.
         Action::ScheduleAdd => {
-            open_schedule_agent_pick(ui, None);
+            open_schedule_dir_picker(ui, None);
         }
         // PRD #127 finding #4: `[Edit]` button parity for the `e`/Enter key.
-        // PRD #170 round 2: open the pick-agent modal pre-loaded with the
-        // selected row for the authoring pre-fill (blank context when empty).
+        // PRD #170 (unify): open the directory picker (at the row's working_dir)
+        // marked `ScheduleEdit(row)` so the mode-locked ` Edit Schedule ` form
+        // pre-fills the authoring seed from the row (blank context when empty).
         Action::ScheduleEdit => {
             let existing = ui.scheduled_tasks.get(ui.scheduled_selected).cloned();
-            open_schedule_agent_pick(ui, existing);
-        }
-        // PRD #170 round 2: a chip click in the pick-agent modal sets the chosen
-        // authoring command to that preset (mouse parity for `h`/`l`). Does not
-        // confirm — Enter / the `[Confirm]` button still spawns.
-        // PRD #170 round 3 (Auditor-1): defense-in-depth — trust only the preset
-        // membership, not the Action payload. Set `chosen` ONLY when `cmd` is a
-        // known `AGENT_COMMAND_PRESETS` member (the sole producer already emits
-        // presets); a stray non-preset payload is ignored rather than overwriting
-        // the resolved default with an arbitrary string.
-        Action::ScheduleAgentSetCommand(cmd) => {
-            if let Some(pick) = ui.schedule_agent_pick.as_mut()
-                && let Some(idx) = AGENT_COMMAND_PRESETS.iter().position(|p| *p == cmd)
-            {
-                pick.selected_preset = idx;
-                pick.chosen = cmd;
-            }
-        }
-        // PRD #170 round 3 (F4): the pick-agent modal's `[Confirm]` button (and
-        // the Enter key, which returns this action) — spawn the seeded authoring
-        // agent running the chosen/default command, the identical take()+spawn
-        // path the old inline Enter arm used. Reuses the `SpawnPane` arm so the
-        // click and the key spawn an identical pane.
-        Action::ScheduleAgentConfirm => {
-            if let Some(pick) = ui.schedule_agent_pick.take() {
-                ui.mode = UiMode::Normal;
-                let req = schedule_authoring_request(pick.existing.as_ref(), &pick.chosen);
-                return dispatch_action(
-                    Action::SpawnPane(Box::new(req)),
-                    ui,
-                    pane,
-                    state,
-                    tab_manager,
-                    snapshot,
-                    filtered,
-                    selected_id,
-                    frame_area,
-                );
-            }
-        }
-        // PRD #170 round 3 (F3/F4): the pick-agent modal's `[Cancel]` button (and
-        // the Esc/q keys, which return this action) — close the modal WITHOUT
-        // spawning and return to the Scheduled-Tasks MANAGER dialog you came from
-        // (re-open `ScheduledTasks`), NOT the bare dashboard (`Normal`).
-        Action::ScheduleAgentCancel => {
-            ui.schedule_agent_pick = None;
-            ui.mode = UiMode::ScheduledTasks;
+            open_schedule_dir_picker(ui, existing);
         }
         // PRD #127 finding #4: `[Delete]` button parity for the `d` key — arm
         // the definition-only delete confirmation for the selected row (the
@@ -7303,7 +7266,6 @@ pub fn run_tui(
                         | UiMode::Help
                         | UiMode::DirPicker
                         | UiMode::NewPaneForm
-                        | UiMode::ScheduleAgentPick
                 );
                 let is_scroll = matches!(
                     mouse.kind,
@@ -7463,10 +7425,6 @@ pub fn run_tui(
                         // buttons live in `modal_button_rects` and any miss is
                         // consumed here rather than reaching the pane behind it.
                         | UiMode::ScheduledTasks
-                        // PRD #170 round 2: the pick-agent modal is topmost too —
-                        // its preset chips live in `modal_button_rects` and a
-                        // miss is consumed rather than reaching the pane behind.
-                        | UiMode::ScheduleAgentPick
                 );
                 // PRD #80 M6: in the inline-edit modes the bottom row IS the
                 // input; its [Apply]/[Cancel] / [Save]/[Cancel] buttons live in
@@ -8171,7 +8129,6 @@ pub fn run_tui(
                     }
                     UiMode::StopConfirm => handle_stop_confirm_key(key, &mut ui),
                     UiMode::ScheduledTasks => handle_scheduled_tasks_key(key, &mut ui),
-                    UiMode::ScheduleAgentPick => handle_schedule_agent_pick_key(key, &mut ui),
                 });
             }
 
@@ -9130,20 +9087,6 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
         let (button_rects, row_rects) = render_scheduled_tasks(frame, ui);
         ui.modal_button_rects = button_rects;
         ui.scheduled_row_rects = row_rects;
-    }
-    if ui.mode == UiMode::ScheduleAgentPick {
-        // PRD #170 round 2/3: the pick-agent modal's preset chips AND its
-        // `[Confirm]`/`[Cancel]` buttons (F4) are clickable — record their rects
-        // in `modal_button_rects` so the shared modal hit-test routes a chip
-        // click to `Action::ScheduleAgentSetCommand` and a button click to
-        // `Action::ScheduleAgentConfirm` / `Action::ScheduleAgentCancel`.
-        let captured = ui
-            .schedule_agent_pick
-            .as_ref()
-            .map(|pick| render_schedule_agent_pick(frame, pick));
-        if let Some(button_rects) = captured {
-            ui.modal_button_rects = button_rects;
-        }
     }
     if ui.mode == UiMode::StarPrompt {
         ui.modal_button_rects = render_star_prompt(frame);
@@ -10279,189 +10222,6 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize) -> Vec<(Action, 
     render_modal_button_row(frame, &buttons, btn_row, 1)
 }
 
-/// PRD #170 round 2: width (cols) the agent-command picker row needs — the
-/// `  Agent: ` label plus one `[preset]` chip per [`AGENT_COMMAND_PRESETS`]
-/// entry plus a one-cell separator between chips. Now used exclusively by
-/// [`render_schedule_agent_pick`] (the Scheduled-Tasks pick-agent modal) — the
-/// new-pane form picker was removed in this branch — so a longer future preset
-/// can't be truncated by `render_modal_button_row`'s overflow break (reviewer
-/// finding 7).
-fn agent_picker_row_width() -> u16 {
-    const SEP: u16 = 1;
-    let label_w = "  Agent: ".chars().count() as u16;
-    let chips_w: u16 = AGENT_COMMAND_PRESETS
-        .iter()
-        .map(|p| p.chars().count() as u16 + 2) // [preset]
-        .sum();
-    let seps = SEP * (AGENT_COMMAND_PRESETS.len().saturating_sub(1) as u16);
-    label_w + chips_w + seps
-}
-
-/// PRD #170 round 2: render the pick-agent modal — the small picker the
-/// Scheduled-Tasks manager Add/Edit opens before spawning the seeded authoring
-/// agent (Option B). Shows the chosen/default authoring command plus the
-/// agent-command preset chips (`[claude]` / `[opencode]`) via
-/// [`render_modal_button_row`], both visible by default (no experimental flag).
-///
-/// PRD #170 round 3: also renders clickable `[Confirm]`/`[Cancel]` buttons
-/// (F4, mouse parity for Enter/Esc) and grows the modal so the bottom hint line
-/// renders un-clipped (F1). Returns the chips' AND the Confirm/Cancel buttons'
-/// `(Action, Rect)` pairs to record in `UiState::modal_button_rects` so the
-/// shared `hit_test_button` routes a chip click to
-/// [`Action::ScheduleAgentSetCommand`] and a button click to
-/// [`Action::ScheduleAgentConfirm`] / [`Action::ScheduleAgentCancel`].
-fn render_schedule_agent_pick(
-    frame: &mut Frame,
-    state: &ScheduleAgentPickState,
-) -> Vec<(Action, Rect)> {
-    let area = frame.area();
-
-    // The chip row's label, padded so the `[claude]`/`[opencode]` chips line up
-    // under the chosen-command VALUE on the row above (F5 label tidy):
-    // `  Agent:   ` (11 cols) matches `  Command: ` (11 cols) so both labels'
-    // colons and both value columns align.
-    let agent_label = "  Agent:   ";
-    let agent_label_w = agent_label.chars().count() as u16;
-
-    // Content-size the modal: wide enough to contain the picker row (label +
-    // chips, reviewer finding 7), the chosen-command line, and the title;
-    // `modal_rect` clamps to [min, 90% of terminal].
-    let chosen_line = format!("  Command: {}", state.chosen);
-    // `agent_picker_row_width()` counts the chips in full and a 9-col `  Agent: `
-    // label; the actual chip row uses the 2-col-wider padded label, comfortably
-    // covered by the `+4` margin and the 48-col floor below (reviewer finding 7:
-    // the chips never truncate).
-    let desired_w = agent_picker_row_width()
-        .max(chosen_line.chars().count() as u16)
-        .max(" Pick authoring agent ".chars().count() as u16)
-        .saturating_add(4)
-        .max(48);
-    // PRD #170 round 3 (F1): tall enough for EVERY row — title + the
-    // chosen-command line + the chips row + the new `[Confirm]`/`[Cancel]` row
-    // (F4) + the bottom hint line — so none is clipped by the clamped popup.
-    let desired_h = 11u16;
-    let popup_area = modal_rect(desired_w, desired_h, area, 48, 11);
-
-    frame.render_widget(Clear, popup_area);
-
-    let inner_width = popup_area.width.saturating_sub(2) as usize;
-
-    // Reserved lines; the `  Agent: ` row (idx 5) is overlaid with the chips and
-    // the `[Confirm]`/`[Cancel]` row (idx 7) with the buttons, both below.
-    let lines = vec![
-        Line::from(""),
-        Line::styled("  Which agent runs this authoring session?", text_primary()),
-        Line::from(""),
-        Line::styled(
-            format!("{chosen_line:<inner_width$}"),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::from(""),
-        Line::from(""), // idx 5: reserved for the `  Agent: ` + chips overlay
-        Line::from(""),
-        Line::from(""), // idx 7: reserved for the `[Confirm]`/`[Cancel]` buttons
-        Line::styled("  h/l select   Enter confirm   Esc cancel", text_primary()),
-    ];
-    // Indices of the reserved overlay rows within `lines` (0-based from the
-    // inner top).
-    let picker_line_idx = 5usize;
-    let button_line_idx = 7usize;
-
-    let block = Block::default()
-        .title(" Pick authoring agent ")
-        .title_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let paragraph = Paragraph::new(lines).block(block);
-    frame.render_widget(paragraph, popup_area);
-
-    let row_x = popup_area.x + 1;
-    let row_width = popup_area.width.saturating_sub(2);
-    let mut rects: Vec<(Action, Rect)> = Vec::new();
-
-    // Overlay the `  Agent: ` label + the preset chips on the reserved row.
-    // PRD #144 A1: skip the row if it falls outside the clamped popup (a
-    // degenerate short terminal) rather than writing past the buffer bottom.
-    let picker_y = popup_area.y + 1 + picker_line_idx as u16;
-    if picker_y < popup_area.bottom() {
-        {
-            let buf = frame.buffer_mut();
-            let _ = buf.set_span(
-                row_x,
-                picker_y,
-                &Span::styled(agent_label, text_dim()),
-                row_width,
-            );
-        }
-        let presets: Vec<Button> = AGENT_COMMAND_PRESETS
-            .iter()
-            .map(|p| {
-                Button::new(
-                    *p,
-                    "",
-                    Action::ScheduleAgentSetCommand((*p).to_string()),
-                    true,
-                )
-            })
-            .collect();
-        let presets_row = Rect {
-            x: row_x.saturating_add(agent_label_w),
-            y: picker_y,
-            width: row_width.saturating_sub(agent_label_w),
-            height: 1,
-        };
-        let mut chip_rects = render_modal_button_row(frame, &presets, presets_row, 0);
-        // PRD #170 round 2/3 (F2): highlight the selected chip REVERSED so the
-        // keyboard `h`/`l` movement (and a chip click) is visible — overlaid on
-        // top of the shared button-row render, since `render_modal_button_row`
-        // paints every chip with the terminal foreground. The chosen-command
-        // line above still shows the resolved value for non-preset defaults.
-        if let Some((_, rect)) = chip_rects.get(state.selected_preset)
-            && let Some(sel) = AGENT_COMMAND_PRESETS.get(state.selected_preset)
-        {
-            let rect = *rect;
-            let buf = frame.buffer_mut();
-            let _ = buf.set_span(
-                rect.x,
-                rect.y,
-                &Span::styled(
-                    format!("[{sel}]"),
-                    Style::default().add_modifier(Modifier::REVERSED),
-                ),
-                rect.width,
-            );
-        }
-        rects.append(&mut chip_rects);
-    }
-
-    // PRD #170 round 3 (F4): the `[Confirm]`/`[Cancel]` buttons on the reserved
-    // row — empty shortcuts so they render as plain `[Confirm]`/`[Cancel]`.
-    // Their rects join `modal_button_rects` so a click routes through the shared
-    // `hit_test_button`. Same A1 short-terminal guard as the chips row above.
-    let button_y = popup_area.y + 1 + button_line_idx as u16;
-    if button_y < popup_area.bottom() {
-        let buttons = [
-            Button::new("Confirm", "", Action::ScheduleAgentConfirm, true),
-            Button::new("Cancel", "", Action::ScheduleAgentCancel, true),
-        ];
-        let btn_row = Rect {
-            x: row_x,
-            y: button_y,
-            width: row_width,
-            height: 1,
-        };
-        rects.append(&mut render_modal_button_row(frame, &buttons, btn_row, 1));
-    }
-
-    rects
-}
-
 /// Format one help row: a key column (left-padded to a fixed width so the
 /// description column lines up) followed by the description. PRD #40 — the
 /// key column is sourced from the active [`KeybindingConfig`] so the overlay
@@ -11253,13 +11013,21 @@ type FormClickTargets = (
 
 fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClickTargets {
     let area = frame.area();
+    // PRD #170 (unify): the Scheduled-Tasks manager's Add/Edit reuse this form
+    // MODE-LOCKED to schedule authoring — hide the Mode cycler + the Name field
+    // and retitle the modal. The unlocked `Ctrl+n` form (the common case) is
+    // unaffected: with `schedule_locked == false`, `show_mode == has_mode_field`
+    // and `show_name == true`, so every branch below reduces to the prior
+    // behavior and the render stays byte-identical.
+    let show_mode = form.has_mode_field && !form.schedule_locked;
+    let show_name = !form.schedule_locked;
     // PRD #144: the Mode chips render on a SINGLE row (no `layout_mode_chips`
     // wrap band-aid) and the modal is content-sized via `modal_rect` to be wide
     // enough to contain the whole row — so the trailing `[schedule]` chip is
     // never clipped. `  Mode: ` is 8 cols; chips start one space after it.
     let chip_label_w: u16 = 8; // "  Mode: "
     let first_chip_x: u16 = chip_label_w + 1;
-    let chip_widths: Vec<u16> = if form.has_mode_field {
+    let chip_widths: Vec<u16> = if show_mode {
         (0..form.mode_option_count())
             .map(|i| form.mode_option_name(i).chars().count() as u16 + 2) // [name]
             .collect()
@@ -11286,21 +11054,34 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         .unwrap_or(first_chip_x);
     let mode_lines: u16 = 1;
     // The mode field (when modes exist) or the tip line (when they don't) needs
-    // its content line plus one spacing row before the next field.
-    let mode_extra: u16 = mode_lines + 1;
+    // its content line plus one spacing row before the next field. PRD #170: the
+    // locked schedule form drops the whole mode block.
+    let mode_extra: u16 = if form.schedule_locked {
+        0
+    } else {
+        mode_lines + 1
+    };
+    // PRD #170: the locked schedule form also drops the Name row.
+    let name_rows: u16 = if show_name { 1 } else { 0 };
     // PRD #106: when the Command field is hidden (orchestration selected) the
     // form is two rows shorter — Command's label row plus its spacing row.
     let cmd_visible = form.command_visible();
     let cmd_rows: u16 = if cmd_visible { 2 } else { 0 };
     // PRD #127 M3.2: the "schedule" authoring option adds one separator/label
-    // row marking it as a throwaway authoring session.
-    let schedule_rows: u16 = if form.is_schedule_selected() { 1 } else { 0 };
+    // row marking it as a throwaway authoring session (only in the unlocked
+    // Mode cycler — the locked schedule form has no mode block).
+    let schedule_rows: u16 = if show_mode && form.is_schedule_selected() {
+        1
+    } else {
+        0
+    };
     // PRD #144: content-size & center. Width grows to fit the mode chip row
     // (plus borders + a little margin) but never below the comfortable 56-col
     // base; height is the reserved field rows. `modal_rect` clamps to 90% of
-    // terminal.
+    // terminal. The `9 + name_rows` base reproduces the prior `10` when the Name
+    // row is shown (unlocked) and trims a row when it is hidden (locked).
     let desired_w = chip_row_w.saturating_add(4).max(56);
-    let desired_h = 10 + mode_extra + cmd_rows + schedule_rows;
+    let desired_h = 9 + name_rows + mode_extra + cmd_rows + schedule_rows;
     let popup_area = modal_rect(desired_w, desired_h, area, 56, 10);
     let popup_width = popup_area.width;
 
@@ -11336,8 +11117,11 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // PRD #80 M8: the Mode field is now a row of clickable chips (one per
     // option, including "No mode"), overlaid after the Paragraph render so each
     // chip gets its own rect. Reserve its blank line here.
+    // PRD #170: the locked schedule form omits the whole mode block (chips/tip
+    // + schedule hint). The unlocked branch is unchanged (`show_mode` equals the
+    // old `has_mode_field` there).
     let mut mode_line_idx: Option<usize> = None;
-    if form.has_mode_field {
+    if show_mode {
         mode_line_idx = Some(lines.len());
         // Reserve one blank line per (possibly wrapped) chip row, plus a spacing
         // line before the next field — matching the height reserved above.
@@ -11345,7 +11129,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
             lines.push(Line::from(""));
         }
         lines.push(Line::from(""));
-    } else {
+    } else if !form.schedule_locked {
         // No .dot-agent-deck.toml or no modes — show a contextual hint.
         lines.push(Line::styled(
             "  Tip: press g on dashboard to create modes",
@@ -11358,7 +11142,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // PRD #127 M3.2: subtle visual separation — when the "schedule" authoring
     // option is selected, the second reserved line shows a throwaway-session
     // hint (the first holds the chips, the second is spare).
-    if form.has_mode_field && form.is_schedule_selected() {
+    if show_mode && form.is_schedule_selected() {
         lines.push(Line::styled(
             "           \u{21b3} authoring (one-off)",
             Style::default()
@@ -11367,22 +11151,28 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         ));
     }
 
-    let name_line_idx = lines.len();
-    lines.push(Line::from(vec![
-        Span::styled("  Name:    ", name_style),
-        Span::styled(
-            format!(
-                "{:<width$}",
-                form.name,
-                width = inner_width.saturating_sub(11)
+    // PRD #170: the locked schedule form hides the Name field — the card's name
+    // is fixed to `SCHEDULE_MODE_NAME` and the schedule's own name is authored
+    // conversationally.
+    let mut name_line_idx: Option<usize> = None;
+    if show_name {
+        name_line_idx = Some(lines.len());
+        lines.push(Line::from(vec![
+            Span::styled("  Name:    ", name_style),
+            Span::styled(
+                format!(
+                    "{:<width$}",
+                    form.name,
+                    width = inner_width.saturating_sub(11)
+                ),
+                if form.focused == FormField::Name {
+                    text_primary()
+                } else {
+                    unfocused_label
+                },
             ),
-            if form.focused == FormField::Name {
-                text_primary()
-            } else {
-                unfocused_label
-            },
-        ),
-    ]));
+        ]));
+    }
     let mut cmd_line_idx: Option<usize> = None;
     if cmd_visible {
         lines.push(Line::from(""));
@@ -11412,12 +11202,24 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // selected) and focus is on Name, Enter submits — surface that instead of
     // the generic "Enter: next" wording, which is misleading in that state.
     let name_submits = form.focused == FormField::Name && !cmd_visible;
-    let footer = new_pane_form_footer_hint(form.has_mode_field, name_submits);
+    // PRD #170: pass `show_mode` (false when locked) so the locked footer drops
+    // the `◀▶: mode` hint; unlocked it equals the old `has_mode_field`.
+    let footer = new_pane_form_footer_hint(show_mode, name_submits);
     lines.push(Line::styled(footer, text_primary()));
 
-    let title = match form.selected_mode() {
-        Some(cfg) => format!(" New Agent \u{2014} {} mode ", cfg.name),
-        None => " New Agent ".to_string(),
+    // PRD #170: the locked schedule form retitles the modal by action; otherwise
+    // the title reflects the selected mode (unchanged).
+    let title = if form.schedule_locked {
+        if form.schedule_existing.is_some() {
+            " Edit Schedule ".to_string()
+        } else {
+            " New Schedule ".to_string()
+        }
+    } else {
+        match form.selected_mode() {
+            Some(cfg) => format!(" New Agent \u{2014} {} mode ", cfg.name),
+            None => " New Agent ".to_string(),
+        }
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -11442,15 +11244,17 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     let inner_end = row_x + row_width;
 
     let mut field_rects: Vec<(FormField, Rect)> = Vec::new();
-    field_rects.push((
-        FormField::Name,
-        Rect {
-            x: row_x,
-            y: line_y(name_line_idx),
-            width: row_width,
-            height: 1,
-        },
-    ));
+    if let Some(ni) = name_line_idx {
+        field_rects.push((
+            FormField::Name,
+            Rect {
+                x: row_x,
+                y: line_y(ni),
+                width: row_width,
+                height: 1,
+            },
+        ));
+    }
     if let Some(ci) = cmd_line_idx {
         field_rects.push((
             FormField::Command,
@@ -11546,9 +11350,12 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
 
     // Cursor in the active text field (Mode uses chips, so no cursor there).
     // PRD #144 A1: only place the cursor when its row fits inside the popup.
-    if form.focused == FormField::Name && line_y(name_line_idx) < popup_bottom {
+    if form.focused == FormField::Name
+        && let Some(ni) = name_line_idx
+        && line_y(ni) < popup_bottom
+    {
         let cursor_x = popup_area.x + 12 + form.name.len() as u16;
-        frame.set_cursor_position(Position::new(cursor_x, line_y(name_line_idx)));
+        frame.set_cursor_position(Position::new(cursor_x, line_y(ni)));
     } else if form.focused == FormField::Command
         && let Some(ci) = cmd_line_idx
         && line_y(ci) < popup_bottom
@@ -12555,20 +12362,34 @@ pub fn render_new_pane_form_to_buffer(
     })
 }
 
-/// PRD #170 round 2 L1 seam: render the pick-agent modal into a `Buffer`.
-/// `default_command` is the resolved authoring command (production fills it from
-/// the configured `default_command`); the modal seeds `chosen` from
-/// [`resolve_authoring_command`] so a blank value renders the `claude` fallback.
-/// Drives the production `render_schedule_agent_pick` through a `TestBackend` —
-/// mirrors [`render_new_pane_form_to_buffer`] / [`render_dir_picker_to_buffer`].
-pub fn render_schedule_agent_pick_to_buffer(
-    default_command: &str,
+/// PRD #170 (unify) L1 seam: render the new-pane form MODE-LOCKED to schedule
+/// authoring into a `Buffer`. `edit` picks the variant — `false` builds the Add
+/// form (` New Schedule `, no edit row), `true` builds the Edit form
+/// (` Edit Schedule `, a dummy existing row). The locked form shows only Dir +
+/// Command (no Mode cycler, no Name field). Drives the production
+/// `render_new_pane_form` through a `TestBackend` — mirrors
+/// [`render_new_pane_form_to_buffer`].
+pub fn render_new_pane_form_schedule_to_buffer(
+    edit: bool,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
-    let state = ScheduleAgentPickState::new(resolve_authoring_command(default_command), None);
+    let existing = edit.then(|| config::ScheduledTask {
+        name: "digest".to_string(),
+        cron: "0 9 * * *".to_string(),
+        working_dir: "/tmp/project".to_string(),
+        command: Some("cat".to_string()),
+        prompt: "digest prompt".to_string(),
+        new_tab_per_fire: false,
+        enabled: true,
+    });
+    let form = NewPaneFormState::new_schedule_locked(
+        std::path::PathBuf::from("/tmp/project"),
+        "claude".to_string(),
+        existing,
+    );
     render_overlay_to_buffer(width, height, |frame| {
-        render_schedule_agent_pick(frame, &state);
+        render_new_pane_form(frame, &form);
     })
 }
 
@@ -18156,20 +17977,35 @@ mod tests {
 
     #[test]
     fn manager_add_authoring_mode_is_blank_base_seed() {
-        let mode = build_schedule_authoring_mode(None);
+        let mode = build_schedule_authoring_mode(None, std::path::Path::new("/tmp/picked"));
         assert_eq!(mode.name, SCHEDULE_MODE_NAME);
         let seed = mode.seed_prompt.as_deref().unwrap();
-        // Add uses the base seed verbatim (invokes `schedule add`, no edit block).
-        assert_eq!(seed, SCHEDULE_AUTHORING_SEED_PROMPT);
+        // Add starts from the base seed (invokes `schedule add`, no edit block) —
+        // PRD #170 appends the picked-dir working_dir DEFAULT line.
+        assert!(
+            seed.starts_with(SCHEDULE_AUTHORING_SEED_PROMPT),
+            "add seed must begin with the base authoring seed"
+        );
         assert!(seed.contains("schedule add"));
+        // PRD #170: the picked dir is threaded in as the working_dir DEFAULT.
+        assert!(
+            seed.contains("working_dir DEFAULT: /tmp/picked"),
+            "add seed must carry the picked dir as the working_dir default, got:\n{seed}"
+        );
     }
 
     #[test]
     fn manager_edit_authoring_mode_prefills_and_forbids_rename() {
         let existing = make_scheduled_task("digest", true);
-        let mode = build_schedule_authoring_mode(Some(&existing));
+        let mode =
+            build_schedule_authoring_mode(Some(&existing), std::path::Path::new("/tmp/picked"));
         assert_eq!(mode.name, SCHEDULE_MODE_NAME);
         let seed = mode.seed_prompt.as_deref().unwrap();
+        // PRD #170: the picked dir is threaded in as the working_dir DEFAULT.
+        assert!(
+            seed.contains("working_dir DEFAULT: /tmp/picked"),
+            "edit seed must carry the picked dir as the working_dir default, got:\n{seed}"
+        );
         // Pre-fill: the existing entry's distinctive prompt + name reach the seed.
         assert!(
             seed.contains("digest-prompt-marker"),
