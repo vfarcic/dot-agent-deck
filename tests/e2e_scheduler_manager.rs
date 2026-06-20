@@ -16,13 +16,17 @@
 //! (per the PRD): `a` add, `Enter`/`e` edit, `d` delete (then a confirmation,
 //! confirmed with `y`), `r` run-now; the first row is auto-selected.
 //!
-//! ## Authoring flow (PRD #170)
-//! `a`/`e` no longer spawn the authoring agent immediately: they first open the
-//! pick-agent modal (`UiMode::ScheduleAgentPick`), which surfaces the
-//! agent-command presets (`claude` / `opencode`), defaulting to the resolved
+//! ## Authoring flow (PRD #170 — unified entry points)
+//! `a`/`e` no longer open a bespoke pick-agent modal: they reuse the SAME
+//! `Ctrl+n` flow — a **directory picker** (` Select Directory `) → the new-pane
+//! form MODE-LOCKED to schedule authoring (` New Schedule ` for Add /
+//! ` Edit Schedule ` for Edit), which shows only **Dir** + **Command** (no Mode
+//! cycler, no Name field). The Command field is pre-filled from the resolved
 //! authoring command (the configured `default_command`, or `claude` when that is
-//! blank). Confirming the modal spawns the seeded authoring agent running the
-//! chosen command; the scheduled task's own run command is unaffected.
+//! blank). Confirming (`[Submit]`) spawns the seeded authoring agent running that
+//! command IN the picked directory; the scheduled task's own run command is
+//! unaffected. Edit additionally starts the picker at the row's `working_dir` and
+//! pre-fills the authoring seed with the existing schedule's values.
 
 mod common;
 
@@ -127,17 +131,18 @@ fn manager_001_lists_schedules_with_status_and_next_fire() {
 /// `default_command` configured to a DISTINCTIVE stub command (`stub-authoring`,
 /// not `claude`) shimmed (on PATH) to a recorder agent that posts SessionStart
 /// and records its delivered prompt, open the manager and press `e` on the row to
-/// edit. Editing now FIRST opens the pick-agent modal (PRD #170 round 2, Option
-/// B): assert the modal surfaces the agent-command presets (the `opencode` chip),
-/// then confirm the DEFAULT selection with Enter. The seeded authoring agent that
-/// then gets spawned must be the CONFIGURED command — the `stub-authoring`
-/// recorder receives the authoring seed carrying `digest`'s distinctive prompt
-/// text (proving both edit pre-fill AND that the confirmed command came from
-/// `default_command`) — while a separate `claude` neutralizer shim (kept on PATH
-/// so the host's real `claude` is never invoked) records nothing. Before the
-/// pick-agent modal existed, `e` spawned the authoring agent immediately with no
-/// modal, so the `opencode` preset chip never rendered and the modal wait timed
-/// out — the regression this test now guards.
+/// edit. Editing now reuses the `Ctrl+n` flow (PRD #170 unify): `e` opens the
+/// directory picker (` Select Directory `); confirming the dir with Space opens
+/// the new-pane form MODE-LOCKED to schedule (` Edit Schedule `), whose Command
+/// is pre-filled from `default_command`; submitting via `[Submit]` spawns the
+/// seeded authoring agent. The agent that spawns must be the CONFIGURED command —
+/// the `stub-authoring` recorder receives the authoring seed carrying `digest`'s
+/// distinctive prompt text (proving both edit pre-fill AND that the confirmed
+/// command came from `default_command`) — while a separate `claude` neutralizer
+/// shim (kept on PATH so the host's real `claude` is never invoked) records
+/// nothing. RED until the new flow exists: today `e` opens the deleted pick-agent
+/// modal, so the dir picker never appears and the ` Select Directory ` wait times
+/// out.
 #[spec("scheduler/manager/002")]
 #[test]
 fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
@@ -212,21 +217,24 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
 
     deck.send_keys(MANAGER_KEY);
     deck.wait_for_string("Scheduled Tasks");
-    deck.send_keys(b"e"); // edit the auto-selected `digest` row → opens the pick-agent modal
+    deck.send_keys(b"e"); // edit the auto-selected `digest` row → opens the dir picker
 
-    // PRD #170 round 2 (Option B): Edit now routes through the ScheduleAgentPick
-    // modal BEFORE spawning. The modal surfaces the agent-command presets
-    // (`claude` / `opencode`); wait for the `opencode` preset chip to confirm the
-    // modal is up, then confirm the DEFAULT selection (the resolved
-    // `default_command`) with Enter. Before the modal existed, `e` spawned the
-    // authoring agent immediately, so `opencode` never rendered and this wait
-    // timed out.
-    deck.wait_for_string("opencode");
-    deck.send_keys(b"\r"); // confirm the default selection → spawn the authoring agent
+    // PRD #170 unify: Edit now reuses the Ctrl+n flow. `e` opens the directory
+    // picker (starting at the row's working_dir); confirm the dir with Space to
+    // reach the mode-locked ` Edit Schedule ` form, then submit via `[Submit]`.
+    // RED today: `e` opens the deleted pick-agent modal, so the dir picker's
+    // ` Select Directory ` chrome never renders and this wait times out.
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" "); // Space → confirm the (row) dir → locked schedule form
+    deck.wait_for_string("Edit Schedule"); // the mode-locked Edit form is up
+    let (scol, srow) = deck
+        .find_in_grid("[Submit]")
+        .expect("the mode-locked schedule form must render a [Submit] button");
+    deck.click(scol, srow); // submit → spawn the seeded authoring agent
 
-    // Confirming the modal must spawn the CONFIGURED authoring command (not
-    // `claude`) and pre-fill it: the stub's recorder receives the seed carrying
-    // digest's current prompt value.
+    // Submitting must spawn the CONFIGURED authoring command (not `claude`) and
+    // pre-fill it: the stub's recorder receives the seed carrying digest's current
+    // prompt value.
     assert!(
         common::wait_for_file_substr_count(
             &authoring_record,
@@ -234,10 +242,10 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
             1,
             Duration::from_secs(15),
         ),
-        "editing a schedule must open the pick-agent modal, then on confirm spawn the seeded \
-         authoring agent running the CONFIGURED `default_command` (`stub-authoring`), pre-filled \
-         with the row's current values — the configured command's recorder never received \
-         digest's prompt"
+        "editing a schedule must open the dir picker → mode-locked Edit Schedule form, then on \
+         submit spawn the seeded authoring agent running the CONFIGURED `default_command` \
+         (`stub-authoring`), pre-filled with the row's current values — the configured command's \
+         recorder never received digest's prompt"
     );
     // The confirmed authoring command must NOT be `claude`: its neutralizer
     // recorder must be empty (checked only after the positive assert passes, so
@@ -551,12 +559,14 @@ fn manager_007_dialog_content_sized_unclipped_at_both_widths() {
     drop(scratch);
 }
 
-/// Write a recorder shim named `name` into `shim_dir`: it opens the
-/// gated-delivery readiness gate (posts SessionStart via the real hook path)
-/// then appends every delivered line to `record`, so the authoring seed a
-/// spawned agent receives is observable on disk. Distinct-name shims let a test
-/// tell WHICH agent command actually spawned. Mirrors the inline recorder in
-/// `manager_002`.
+/// Write a recorder shim named `name` into `shim_dir`: it records its working
+/// directory (`pwd`) — the dir the agent was SPAWNED in — then opens the
+/// gated-delivery readiness gate (posts SessionStart via the real hook path) and
+/// appends every delivered line to `record`, so BOTH the spawn cwd AND the
+/// authoring seed a spawned agent receives are observable on disk. Distinct-name
+/// shims let a test tell WHICH agent command actually spawned; the recorded
+/// `pwd` lets a test assert the agent spawned in the PICKED directory. Mirrors
+/// the inline recorder in `manager_002`.
 fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::path::Path) {
     let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
     let path = shim_dir.join(name);
@@ -564,6 +574,7 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
         &path,
         format!(
             "#!/bin/sh\n\
+             pwd >> \"{rec}\"\n\
              printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"authoring\"}}' \
              | \"{bin}\" hook claude-code >/dev/null 2>&1\n\
              while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; done\n",
@@ -579,110 +590,29 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
     }
 }
 
-/// Scenario: With a fixture task (`digest`) and `default_command = "claude"`
-/// (so the pick-agent modal opens with `claude` as the default selection), put
-/// distinct-name recorder shims for BOTH `claude` and `opencode` on PATH, open
-/// the manager and press `e` to edit. When the pick-agent modal appears, select
-/// the NON-default `opencode` preset (`l` moves the highlight to the next preset)
-/// and confirm with Enter. Assert the seeded authoring agent that spawns is the
-/// CHOSEN `opencode` (its recorder receives digest's authoring seed) and that the
-/// default `claude` is NOT spawned (its recorder stays empty) — proving a
-/// non-default preset selection is honored. Before the modal + selection wiring
-/// existed, `e` spawned `claude` (the default) immediately with no modal, so
-/// `opencode` never rendered and the modal wait timed out.
-#[spec("scheduler/manager/009")]
-#[test]
-fn manager_009_pick_non_default_preset_is_honored() {
-    let (scratch, sched_path) = scratch_with_schedules(
-        "[[scheduled_tasks]]\n\
-         name = \"digest\"\n\
-         cron = \"0 9 * * *\"\n\
-         working_dir = \"/tmp\"\n\
-         command = \"cat\"\n\
-         prompt = \"DIGESTPROMPTMARKER\"\n\
-         enabled = true\n",
-    );
-
-    let shim_dir = scratch.path().join("shim");
-    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
-    let claude_record = scratch.path().join("claude-record.log");
-    let opencode_record = scratch.path().join("opencode-record.log");
-    write_recorder_shim(&shim_dir, "claude", &claude_record);
-    write_recorder_shim(&shim_dir, "opencode", &opencode_record);
-
-    // `default_command = "claude"` → the modal opens defaulting to `claude`; the
-    // test then steers it to the non-default `opencode`.
-    let config_path = scratch.path().join("config.toml");
-    std::fs::write(&config_path, "default_command = \"claude\"\n").expect("write config.toml");
-
-    let path_env = format!(
-        "{}:{}",
-        shim_dir.to_string_lossy(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
-    let deck = TuiDeck::builder()
-        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
-        .with_env("PATH", path_env)
-        .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
-
-    deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Scheduled Tasks");
-    deck.send_keys(b"e"); // edit the auto-selected `digest` row → opens the pick-agent modal
-
-    // The pick-agent modal must appear with the presets; `opencode` (the
-    // non-default preset chip) is the unambiguous "modal is up" signal.
-    deck.wait_for_string("opencode");
-    // Steer the selection to the NON-default preset, then confirm: `l` moves the
-    // preset highlight right (claude → opencode), Enter confirms the chosen
-    // command and spawns the authoring agent.
-    deck.send_keys(b"l"); // claude → opencode
-    deck.send_keys(b"\r"); // confirm the chosen `opencode`
-
-    // GREEN signal: the CHOSEN `opencode` spawned — its recorder receives the
-    // authoring seed carrying digest's prompt value.
-    assert!(
-        common::wait_for_file_substr_count(
-            &opencode_record,
-            "DIGESTPROMPTMARKER",
-            1,
-            Duration::from_secs(15),
-        ),
-        "selecting the non-default `opencode` preset and confirming must spawn the authoring \
-         agent running `opencode` — its recorder never received digest's authoring seed"
-    );
-    // The default `claude` must NOT have spawned (checked only after the positive
-    // assert passes, so it is a clean point-in-time read, not a race).
-    assert_eq!(
-        common::count_file_substr(&claude_record, "DIGESTPROMPTMARKER"),
-        0,
-        "picking `opencode` must override the `claude` default — but the `claude` shim \
-         received the authoring seed"
-    );
-    drop(scratch);
-}
-
-/// Scenario: With a fixture task (`digest`) and `default_command` EMPTY/unset
-/// (the unconfigured-user case), put a `claude` recorder shim on PATH, open the
-/// manager and press `e` to edit. When the pick-agent modal appears, confirm the
-/// DEFAULT selection with Enter. Assert the authoring agent that spawns runs
-/// `claude` (`AGENT_COMMAND_PRESETS[0]`, caught by the `claude` recorder) — the
-/// R1 fallback: a blank `default_command` must resolve to `claude`, NOT spawn a
-/// bare `$SHELL` that cannot act on the seed. Before the fix a blank
-/// `default_command` spawned a bare login shell (no modal, no fallback), so the
-/// `claude` recorder was never written and the modal wait timed out.
+/// Scenario: With a fixture task (`placeholder`, so the manager opens) and
+/// `default_command` EMPTY/unset (the unconfigured-user case), put a `claude`
+/// recorder shim on PATH, open the manager and press `a` to ADD. Adding reuses
+/// the `Ctrl+n` flow: `a` opens the directory picker (` Select Directory `);
+/// confirming the dir with Space opens the mode-locked ` New Schedule ` form
+/// whose Command is PRE-FILLED from the resolved authoring command — and with a
+/// blank `default_command` that resolves to `claude` (`DEFAULT_AUTHORING_COMMAND`).
+/// Submit via `[Submit]` and assert the spawned authoring agent runs `claude`
+/// (its recorder receives the base authoring seed — `throwaway authoring
+/// session`) — the R1 fallback: a blank `default_command` must resolve to
+/// `claude`, NOT spawn a bare `$SHELL` that cannot act on the seed. RED until the
+/// new flow exists: today `a` opens the deleted pick-agent modal, so the dir
+/// picker never appears and the ` Select Directory ` wait times out.
 #[spec("scheduler/manager/010")]
 #[test]
 fn manager_010_blank_default_command_falls_back_to_claude() {
     let (scratch, sched_path) = scratch_with_schedules(
         "[[scheduled_tasks]]\n\
-         name = \"digest\"\n\
+         name = \"placeholder\"\n\
          cron = \"0 9 * * *\"\n\
          working_dir = \"/tmp\"\n\
          command = \"cat\"\n\
-         prompt = \"DIGESTPROMPTMARKER\"\n\
+         prompt = \"placeholder prompt\"\n\
          enabled = true\n",
     );
 
@@ -713,37 +643,289 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
 
     deck.send_keys(MANAGER_KEY);
     deck.wait_for_string("Scheduled Tasks");
-    deck.send_keys(b"e"); // edit the auto-selected `digest` row → opens the pick-agent modal
+    deck.send_keys(b"a"); // ADD → opens the dir picker (blank-context add)
 
-    // With a blank `default_command` the modal still renders the presets (its
-    // default selection is the `claude` fallback); `opencode` is the "modal is up"
-    // signal. Confirm the default with Enter.
-    deck.wait_for_string("opencode");
-    deck.send_keys(b"\r"); // confirm the default selection → spawn the authoring agent
+    // PRD #170 unify: `a` opens the dir picker; confirm the dir with Space to
+    // reach the mode-locked ` New Schedule ` form (Command pre-filled with the
+    // resolved authoring command), then submit via `[Submit]`.
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" "); // Space → confirm the dir → locked schedule form
+    deck.wait_for_string("New Schedule"); // the mode-locked Add form is up
+    let (scol, srow) = deck
+        .find_in_grid("[Submit]")
+        .expect("the mode-locked schedule form must render a [Submit] button");
+    deck.click(scol, srow); // submit → spawn the seeded authoring agent
 
     // R1 fallback: a blank `default_command` must resolve to `claude`
-    // (`AGENT_COMMAND_PRESETS[0]`) so a real conversational agent runs — NOT a
-    // bare `$SHELL`. The `claude` recorder receiving the seed proves the fallback.
+    // (`DEFAULT_AUTHORING_COMMAND`) so a real conversational agent runs — NOT a
+    // bare `$SHELL`. The `claude` recorder receiving the base authoring seed
+    // (`throwaway authoring session`) proves the fallback. (Add has no row, so the
+    // seed carries no row marker — the base-seed substring is the green signal.)
     assert!(
         common::wait_for_file_substr_count(
             &claude_record,
-            "DIGESTPROMPTMARKER",
+            "throwaway authoring session",
             1,
             Duration::from_secs(15),
         ),
         "an unset/blank `default_command` must fall back to `claude` (not spawn a bare \
-         `$SHELL`): the authoring agent must run `claude` and deliver digest's seed — \
-         the `claude` recorder never received it"
+         `$SHELL`): the authoring agent must run `claude` and deliver the base authoring \
+         seed — the `claude` recorder never received it"
     );
     drop(scratch);
 }
 
-/// Open the manager, press `e` to raise the pick-agent modal, send `close_key`
-/// (Esc or `q`), and assert the modal closes BACK to the Scheduled-Tasks manager
-/// dialog (its `NEXT FIRE` column header re-renders) — NOT the bare dashboard —
-/// with no authoring agent spawned. Shared body for the Esc and `q` variants of
-/// `scheduler/manager/011` (PRD #170 round 3, reviewer F3).
-fn assert_pick_modal_close_returns_to_manager(close_key: &[u8]) {
+// ---------------------------------------------------------------------------
+// scheduler/form — the manager Add/Edit now reuse the Ctrl+n dir-picker +
+// new-pane form mode-locked to schedule (PRD #170 unify).
+// ---------------------------------------------------------------------------
+
+/// Scenario: With `default_command` configured to a distinctive `stub-add-authoring`
+/// recorder shim (which records its spawn `pwd` then the delivered seed) and a
+/// `claude` neutralizer on PATH, open the manager and press `a` to ADD. Adding
+/// reuses the `Ctrl+n` flow: `a` opens the directory picker (` Select Directory `);
+/// confirming the current dir with Space opens the mode-locked ` New Schedule `
+/// form whose Command is pre-filled from `default_command`; submitting via
+/// `[Submit]` spawns the seeded authoring agent. Assert the agent spawns (its
+/// recorder receives the base authoring seed — `throwaway authoring session`) and
+/// that it spawns IN the picked directory: its recorded `pwd` carries the deck's
+/// working-dir basename (the dir the picker confirmed). The `claude` neutralizer
+/// stays empty (the form's configured command spawned, not `claude`). RED until
+/// the new flow exists: today `a` opens the deleted pick-agent modal, so the dir
+/// picker never appears and the ` Select Directory ` wait times out.
+#[spec("scheduler/form/002")]
+#[test]
+fn form_002_add_spawns_authoring_agent_in_picked_dir() {
+    // One benign row so the manager opens (Add itself uses no row).
+    let (scratch, sched_path) = scratch_with_schedules(
+        "[[scheduled_tasks]]\n\
+         name = \"placeholder\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"placeholder prompt\"\n\
+         enabled = true\n",
+    );
+
+    let shim_dir = scratch.path().join("shim");
+    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+    let authoring_record = scratch.path().join("authoring-record.log");
+    let claude_record = scratch.path().join("claude-record.log");
+    write_recorder_shim(&shim_dir, "stub-add-authoring", &authoring_record);
+    write_recorder_shim(&shim_dir, "claude", &claude_record);
+
+    let config_path = scratch.path().join("config.toml");
+    std::fs::write(&config_path, "default_command = \"stub-add-authoring\"\n")
+        .expect("write config.toml");
+
+    let path_env = format!(
+        "{}:{}",
+        shim_dir.to_string_lossy(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
+        .with_env("PATH", path_env)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    // The picker for Add opens at the deck's cwd; confirming it with Space makes
+    // the picked dir = the deck's working dir. Its basename is the spawn-cwd marker.
+    let picked_basename = deck
+        .workdir()
+        .file_name()
+        .expect("deck workdir has a basename")
+        .to_string_lossy()
+        .into_owned();
+
+    deck.send_keys(MANAGER_KEY);
+    deck.wait_for_string("Scheduled Tasks");
+    deck.send_keys(b"a"); // ADD → opens the dir picker
+
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" "); // Space → confirm the current dir → locked schedule form
+    deck.wait_for_string("New Schedule"); // the mode-locked Add form is up
+    let (scol, srow) = deck
+        .find_in_grid("[Submit]")
+        .expect("the mode-locked schedule form must render a [Submit] button");
+    deck.click(scol, srow); // submit → spawn the seeded authoring agent
+
+    // The configured command spawned the authoring agent (base seed delivered).
+    assert!(
+        common::wait_for_file_substr_count(
+            &authoring_record,
+            "throwaway authoring session",
+            1,
+            Duration::from_secs(15),
+        ),
+        "adding a schedule must open the dir picker → mode-locked New Schedule form, then on \
+         submit spawn the seeded authoring agent running the configured `default_command` \
+         (`stub-add-authoring`) — its recorder never received the base authoring seed"
+    );
+    // And it spawned IN the picked directory: the recorded spawn `pwd` carries the
+    // picked dir's basename (the dir the picker confirmed = the deck's cwd).
+    assert!(
+        common::count_file_substr(&authoring_record, &picked_basename) >= 1,
+        "the authoring agent must spawn IN the picked directory — its recorded `pwd` must \
+         carry the picked dir's basename `{picked_basename}`, but it did not"
+    );
+    // The `claude` neutralizer must stay empty (the form's configured command won).
+    assert_eq!(
+        common::count_file_substr(&claude_record, "throwaway authoring session"),
+        0,
+        "the form's configured command must spawn, not `claude` — but the `claude` shim \
+         received the authoring seed"
+    );
+    drop(scratch);
+}
+
+/// Scenario: With `default_command` configured to a distinctive `stub-edit-authoring`
+/// recorder shim (records its spawn `pwd` then the delivered seed) plus a `claude`
+/// neutralizer on PATH, and a fixture task (`digest`) whose `working_dir` is a
+/// distinctively-named existing directory (`.../EDITWORKDIR`) and whose prompt is
+/// `EDITPROMPTMARKER`, open the manager and press `e` to EDIT. Editing reuses the
+/// `Ctrl+n` flow but the dir picker STARTS at the row's `working_dir`: confirming
+/// it with Space (without navigating) opens the mode-locked ` Edit Schedule `
+/// form; submitting via `[Submit]` spawns the seeded authoring agent. Assert the
+/// authoring seed is PRE-FILLED with the existing schedule's values (the recorder
+/// receives `EDITPROMPTMARKER`) AND that the agent spawns IN the row's
+/// `working_dir` (its recorded `pwd` carries `EDITWORKDIR`) — proving both the
+/// edit pre-fill and that the picker started at, and pre-seeded, the row's dir.
+/// The `claude` neutralizer stays empty. RED until the new flow exists: today `e`
+/// opens the deleted pick-agent modal, so the dir picker never appears and the
+/// ` Select Directory ` wait times out.
+#[spec("scheduler/form/003")]
+#[test]
+fn form_003_edit_prefills_seed_and_spawns_in_row_working_dir() {
+    // A distinctively-named existing directory for the row's working_dir, so the
+    // spawn-cwd marker (`EDITWORKDIR`) is a known literal regardless of the
+    // tempdir prefix. Held alive for the whole test.
+    let row_work_parent = tempfile::tempdir().expect("row working_dir parent");
+    let row_work = row_work_parent.path().join("EDITWORKDIR");
+    std::fs::create_dir(&row_work).expect("create row working_dir");
+
+    let (scratch, sched_path) = scratch_with_schedules(&format!(
+        "[[scheduled_tasks]]\n\
+         name = \"digest\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"{work}\"\n\
+         command = \"cat\"\n\
+         prompt = \"EDITPROMPTMARKER\"\n\
+         enabled = true\n",
+        work = row_work.to_string_lossy(),
+    ));
+
+    let shim_dir = scratch.path().join("shim");
+    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+    let authoring_record = scratch.path().join("authoring-record.log");
+    let claude_record = scratch.path().join("claude-record.log");
+    write_recorder_shim(&shim_dir, "stub-edit-authoring", &authoring_record);
+    write_recorder_shim(&shim_dir, "claude", &claude_record);
+
+    let config_path = scratch.path().join("config.toml");
+    std::fs::write(&config_path, "default_command = \"stub-edit-authoring\"\n")
+        .expect("write config.toml");
+
+    let path_env = format!(
+        "{}:{}",
+        shim_dir.to_string_lossy(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
+        .with_env("PATH", path_env)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    deck.send_keys(MANAGER_KEY);
+    deck.wait_for_string("Scheduled Tasks");
+    deck.send_keys(b"e"); // EDIT the auto-selected `digest` row → opens the dir picker
+
+    // The picker for Edit STARTS at the row's working_dir; confirm it with Space
+    // (no navigation) so the picked dir = the row's working_dir.
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" "); // Space → confirm the (row) dir → locked schedule form
+    deck.wait_for_string("Edit Schedule"); // the mode-locked Edit form is up
+    let (scol, srow) = deck
+        .find_in_grid("[Submit]")
+        .expect("the mode-locked schedule form must render a [Submit] button");
+    deck.click(scol, srow); // submit → spawn the seeded authoring agent
+
+    // The authoring seed is pre-filled with the existing schedule's values: the
+    // recorder receives the row's distinctive prompt text.
+    assert!(
+        common::wait_for_file_substr_count(
+            &authoring_record,
+            "EDITPROMPTMARKER",
+            1,
+            Duration::from_secs(15),
+        ),
+        "editing a schedule must pre-fill the authoring seed with the existing schedule's \
+         values — the recorder never received the row's `EDITPROMPTMARKER` prompt"
+    );
+    // And the agent spawns IN the row's working_dir (the picker started there and
+    // that dir is pre-seeded as the spawn cwd): the recorded `pwd` carries the
+    // distinctive `EDITWORKDIR` basename. Had the picker opened at the deck's cwd
+    // instead, the spawn cwd would not contain `EDITWORKDIR`.
+    assert!(
+        common::count_file_substr(&authoring_record, "EDITWORKDIR") >= 1,
+        "the Edit dir picker must start at the row's working_dir and pre-seed it as the \
+         spawn cwd — the authoring agent's recorded `pwd` must carry `EDITWORKDIR`, but it \
+         did not"
+    );
+    // The `claude` neutralizer must stay empty (the form's configured command won).
+    assert_eq!(
+        common::count_file_substr(&claude_record, "EDITPROMPTMARKER"),
+        0,
+        "the form's configured command must spawn, not `claude` — but the `claude` shim \
+         received the authoring seed"
+    );
+    drop(scratch);
+    drop(row_work_parent);
+}
+
+// ---------------------------------------------------------------------------
+// scheduler/form 004/005 — cancelling a MANAGER-originated schedule flow must
+// return to the Scheduled-Tasks MANAGER dialog, not the bare dashboard (PRD
+// #170 round 4, reviewer F5). Restores the intent the removed
+// scheduler/manager/011 (Esc) / 013 (`q`) / 015 (click [Cancel]) used to pin,
+// re-targeted at the unified dir-picker + mode-locked form flow.
+// ---------------------------------------------------------------------------
+
+/// Where in the unified schedule-authoring flow the user cancels.
+enum CancelAt {
+    /// While the directory picker (` Select Directory `) is up — before a dir is
+    /// confirmed.
+    Picker,
+    /// While the mode-locked schedule form (` New Schedule ` / ` Edit Schedule `)
+    /// is up — after a dir is confirmed.
+    Form,
+}
+
+/// How the user cancels.
+enum CancelBy {
+    /// Press `Esc`.
+    Esc,
+    /// Press `q` (the picker's quit key; the form has no `q` cancel).
+    Q,
+    /// Left-click the `[Cancel]` button.
+    ClickCancel,
+}
+
+/// F5 shared body: open the manager, enter the unified schedule-authoring flow
+/// via `entry_key` (`a` Add / `e` Edit), advance to the `at` cancel point, cancel
+/// via `by`, and assert the flow returns to the Scheduled-Tasks MANAGER dialog
+/// (its `NEXT FIRE` header re-renders) — NOT the bare dashboard — with the
+/// picker/form chrome gone and NO authoring agent spawned. The manager-originated
+/// cancel must be intent-aware (`DirPickerIntent::ScheduleAdd`/`ScheduleEdit`) and
+/// route back to the manager; a `Ctrl+n`-origin cancel still drops to the
+/// dashboard (unchanged). RED today: the picker/form Esc/`q`/[Cancel] handlers
+/// unconditionally set `UiMode::Normal`, so the manager never reappears.
+fn assert_schedule_flow_cancel_returns_to_manager(entry_key: &[u8], at: CancelAt, by: CancelBy) {
     let (scratch, sched_path) = scratch_with_schedules(
         "[[scheduled_tasks]]\n\
          name = \"digest\"\n\
@@ -754,8 +936,9 @@ fn assert_pick_modal_close_returns_to_manager(close_key: &[u8]) {
          enabled = true\n",
     );
 
-    // A benign `default_command` so the modal opens deterministically and any
-    // (erroneous) confirm-spawn would run `cat`, never the host's real `claude`.
+    // A benign `default_command` so any (erroneous) submit-spawn would run `cat`,
+    // never the host's real `claude`. Written explicitly so the deck never reads
+    // the host's config.
     let config_path = scratch.path().join("config.toml");
     std::fs::write(&config_path, "default_command = \"cat\"\n").expect("write config.toml");
 
@@ -767,31 +950,52 @@ fn assert_pick_modal_close_returns_to_manager(close_key: &[u8]) {
 
     deck.send_keys(MANAGER_KEY);
     // `NEXT FIRE` renders only when the manager dialog is open with its rows
-    // loaded — an unambiguous "dialog is up" signal (the bare `Scheduled Tasks`
-    // substring is already on the dashboard button bar before the dialog opens).
+    // loaded — the bare `Scheduled Tasks` substring is already on the dashboard
+    // button bar, so it can't tell the dialog apart from the dashboard.
     deck.wait_for_string("NEXT FIRE");
 
-    deck.send_keys(b"e"); // edit the auto-selected `digest` row → opens the pick-agent modal
-    deck.wait_for_string("opencode"); // the preset chip is the "modal is up" signal
+    deck.send_keys(entry_key); // `a` (Add) / `e` (Edit) → opens the dir picker
+    deck.wait_for_string("Select Directory"); // the dir picker is up
 
-    // While the modal is up the manager dialog is not rendered, so `NEXT FIRE` is
-    // off-screen; closing the modal must bring it BACK.
-    deck.send_keys(close_key); // Esc / q → must return to the MANAGER, not the dashboard
+    if let CancelAt::Form = at {
+        // Confirm the current/row dir → the mode-locked schedule form. `[Submit]`
+        // (only the form has it) is the unambiguous "form is up" signal.
+        deck.send_keys(b" ");
+        deck.wait_for_string("[Submit]");
+    }
 
-    // F3: closing the pick-agent modal returns to the Scheduled-Tasks MANAGER
-    // dialog (its `NEXT FIRE` header re-renders) you came from — NOT the bare
-    // dashboard. Before the fix, Esc/q dropped to `UiMode::Normal` (dashboard),
-    // so the manager never reappeared and this wait timed out.
+    // The manager dialog is replaced while the picker/form is up, so `NEXT FIRE`
+    // is off-screen; cancelling must bring it BACK.
+    match by {
+        CancelBy::Esc => deck.send_keys(b"\x1b"),
+        CancelBy::Q => deck.send_keys(b"q"),
+        CancelBy::ClickCancel => {
+            let (col, row) = deck
+                .find_in_grid("[Cancel]")
+                .expect("the picker/form must render a clickable [Cancel] button");
+            deck.click(col, row);
+        }
+    }
+
+    // F5: cancelling a MANAGER-originated schedule flow must return to the
+    // Scheduled-Tasks MANAGER dialog (its `NEXT FIRE` header re-renders) — NOT the
+    // bare dashboard. Before the fix, the picker/form Esc/`q`/[Cancel] handlers
+    // unconditionally set `UiMode::Normal` (dashboard), ignoring the
+    // `ScheduleAdd`/`ScheduleEdit` intent, so the manager never reappeared and this
+    // wait times out (RED).
     deck.wait_for_string("NEXT FIRE");
 
+    // The picker/form chrome must be gone (we're back on the manager, not still on
+    // an overlay): neither the picker's ` Select Directory ` nor the form's
+    // `[Submit]` may remain on the grid.
     let grid = deck.snapshot_grid();
     assert!(
-        !grid.contains("Pick authoring agent"),
-        "closing the pick-agent modal must dismiss it — its `Pick authoring agent` title \
-         must be gone.\nGrid:\n{grid}"
+        !grid.contains("Select Directory") && !grid.contains("[Submit]"),
+        "cancelling must dismiss the picker/form chrome — neither `Select Directory` \
+         nor `[Submit]` may remain once back on the manager.\nGrid:\n{grid}"
     );
 
-    // No authoring agent spawned: closing must NOT fire the seeded `schedule`
+    // No authoring agent spawned: cancelling must NOT fire the seeded `schedule`
     // authoring pane (the spawn's display name is `SCHEDULE_MODE_NAME` = "schedule").
     assert!(
         !common::wait_for_agent_display_name(
@@ -800,65 +1004,138 @@ fn assert_pick_modal_close_returns_to_manager(close_key: &[u8]) {
             true,
             Duration::from_millis(500),
         ),
-        "closing the pick-agent modal must NOT spawn the authoring agent"
+        "cancelling the schedule flow must NOT spawn the authoring agent"
     );
     drop(scratch);
 }
 
-/// Scenario: Open the "Scheduled Tasks" manager, press `e` on the auto-selected
-/// row to raise the pick-agent modal, then press `Esc`. Assert the modal closes
-/// back to the MANAGER dialog (its `NEXT FIRE` header re-renders) — not the bare
-/// dashboard — with the `Pick authoring agent` title gone and no authoring agent
-/// spawned. Before the fix, Esc dropped to the dashboard (`UiMode::Normal`), so
-/// the manager never reappeared.
-#[spec("scheduler/manager/011")]
+/// Scenario: Open the "Scheduled Tasks" manager, press `a` (Add) to open the
+/// directory picker, then press `Esc`. Assert the flow returns to the MANAGER
+/// dialog (its `NEXT FIRE` header re-renders) — not the bare dashboard — with the
+/// picker chrome gone and no authoring agent spawned. RED today: the picker's Esc
+/// handler unconditionally drops to `UiMode::Normal` (dashboard), so the manager
+/// never reappears.
+#[spec("scheduler/form/004")]
 #[test]
-fn manager_011_esc_returns_to_manager_dialog() {
-    assert_pick_modal_close_returns_to_manager(b"\x1b"); // Esc
+fn form_004_add_dir_picker_esc_returns_to_manager() {
+    assert_schedule_flow_cancel_returns_to_manager(b"a", CancelAt::Picker, CancelBy::Esc);
 }
 
-/// Scenario: Like `manager_011_esc_returns_to_manager_dialog`, but closes the
-/// pick-agent modal with `q` instead of Esc — `q` must also return to the
-/// Scheduled-Tasks MANAGER dialog (mirroring the Esc behavior), not the bare
-/// dashboard, with no authoring agent spawned. Before the fix, `q` dropped to
+/// Scenario: Like `form_004_add_dir_picker_esc_returns_to_manager`, but closes the
+/// directory picker with `q` instead of Esc — `q` must also return to the
+/// Scheduled-Tasks MANAGER dialog (mirroring Esc), not the bare dashboard, with no
+/// authoring agent spawned. RED today: the picker's `q` handler drops to the
+/// dashboard. (Restores the removed `scheduler/manager/013` `q` intent.)
+#[spec("scheduler/form/004")]
+#[test]
+fn form_004_add_dir_picker_q_returns_to_manager() {
+    assert_schedule_flow_cancel_returns_to_manager(b"a", CancelAt::Picker, CancelBy::Q);
+}
+
+/// Scenario: Open the manager, press `e` (Edit) on the auto-selected row to open
+/// the directory picker (started at the row's `working_dir`), then press `Esc`.
+/// Assert the flow returns to the MANAGER dialog (its `NEXT FIRE` header
+/// re-renders) — not the dashboard — with the picker chrome gone and no authoring
+/// agent spawned. Covers the Edit entry at the picker cancel point. RED today: the
+/// picker's Esc handler drops to the dashboard.
+#[spec("scheduler/form/004")]
+#[test]
+fn form_004_edit_dir_picker_esc_returns_to_manager() {
+    assert_schedule_flow_cancel_returns_to_manager(b"e", CancelAt::Picker, CancelBy::Esc);
+}
+
+/// Scenario: Open the manager, press `a` (Add) → confirm the dir with Space to
+/// reach the mode-locked ` New Schedule ` form, then press `Esc`. Assert the flow
+/// returns to the MANAGER dialog (its `NEXT FIRE` header re-renders) — not the
+/// bare dashboard — with the form chrome (`[Submit]`) gone and no authoring agent
+/// spawned. RED today: the form's Esc handler unconditionally drops to
+/// `UiMode::Normal` (dashboard), so the manager never reappears.
+#[spec("scheduler/form/005")]
+#[test]
+fn form_005_add_form_esc_returns_to_manager() {
+    assert_schedule_flow_cancel_returns_to_manager(b"a", CancelAt::Form, CancelBy::Esc);
+}
+
+/// Scenario: Like `form_005_add_form_esc_returns_to_manager`, but cancels the
+/// mode-locked ` New Schedule ` form by LEFT-CLICKING its `[Cancel]` button
+/// instead of pressing Esc — clicking `[Cancel]` must also return to the
+/// Scheduled-Tasks MANAGER dialog, not the bare dashboard, with no authoring agent
+/// spawned. RED today: the click-cancel path drops to the dashboard. (Restores the
+/// removed `scheduler/manager/015` click-[Cancel] intent.)
+#[spec("scheduler/form/005")]
+#[test]
+fn form_005_add_form_click_cancel_returns_to_manager() {
+    assert_schedule_flow_cancel_returns_to_manager(b"a", CancelAt::Form, CancelBy::ClickCancel);
+}
+
+/// Scenario: Open the manager, press `e` (Edit) → confirm the row dir with Space
+/// to reach the mode-locked ` Edit Schedule ` form, then press `Esc`. Assert the
+/// flow returns to the MANAGER dialog (its `NEXT FIRE` header re-renders) — not the
+/// dashboard — with the form chrome gone and no authoring agent spawned. Covers the
+/// Edit entry at the form cancel point. RED today: the form's Esc handler drops to
 /// the dashboard.
-#[spec("scheduler/manager/013")]
+#[spec("scheduler/form/005")]
 #[test]
-fn manager_013_q_returns_to_manager_dialog() {
-    assert_pick_modal_close_returns_to_manager(b"q");
+fn form_005_edit_form_esc_returns_to_manager() {
+    assert_schedule_flow_cancel_returns_to_manager(b"e", CancelAt::Form, CancelBy::Esc);
 }
 
-/// Scenario: With `default_command` configured to a distinctive `stub-authoring`
-/// recorder shim (and a `claude` neutralizer on PATH), open the manager, press
-/// `e` to raise the pick-agent modal, then LEFT-CLICK the `[Confirm]` button.
-/// Clicking `[Confirm]` must behave exactly like pressing Enter: the seeded
-/// authoring agent spawns running the chosen/default command (`stub-authoring`,
-/// whose recorder receives `digest`'s authoring seed) and NOT `claude`. Before
-/// the fix the modal rendered no `[Confirm]` button, so `find_in_grid` found no
-/// click target and the test failed to locate it.
-#[spec("scheduler/manager/012")]
+/// Scenario: With `default_command` configured to a distinctive `stub-repick-authoring`
+/// recorder shim (records its spawn `pwd` then the delivered seed) plus a `claude`
+/// neutralizer on PATH, and a fixture task (`digest`) whose `working_dir` is a
+/// distinctively-named existing dir (`.../ROWDIRALPHA`, a sibling of `.../PICKDIRBRAVO`)
+/// and whose prompt is `EDITPROMPTF3`, open the manager and press `e` to EDIT. The
+/// dir picker STARTS at the row's `working_dir` (`ROWDIRALPHA`); navigate UP one
+/// level (`h`) and descend into the DIFFERENT sibling `PICKDIRBRAVO`
+/// (double-click), then confirm it with Space. Submitting via `[Submit]` spawns the
+/// seeded authoring agent. Assert the re-picked dir B (`PICKDIRBRAVO`) WINS in the
+/// authoring seed and the row's stale dir A (`ROWDIRALPHA`) does NOT survive as a
+/// conflicting "current value": once the existing-schedule block is delivered
+/// (through its `EDITPROMPTF3` prompt line, which follows the `working_dir:` line),
+/// the recorder must carry `PICKDIRBRAVO` but ZERO occurrences of `ROWDIRALPHA`. RED
+/// today: the edit seed carries the picked dir as the `working_dir DEFAULT` AND the
+/// row's stale `working_dir: .../ROWDIRALPHA` as a conflicting current value.
+#[spec("scheduler/form/006")]
 #[test]
-fn manager_012_click_confirm_spawns_authoring_agent() {
-    let (scratch, sched_path) = scratch_with_schedules(
+fn form_006_edit_repick_different_dir_wins_in_seed() {
+    // Two distinctively-named SIBLING dirs under a common parent: the row's
+    // working_dir (A = `ROWDIRALPHA`) and the dir we re-pick (B = `PICKDIRBRAVO`).
+    // Siblings (not parent/child) so neither basename is a substring of the
+    // other's full path — the spawn cwd (B) and the seed `working_dir DEFAULT` (B)
+    // carry `PICKDIRBRAVO` only, while `ROWDIRALPHA` can appear ONLY via the stale
+    // existing-values `working_dir:` line. B holds a marker child (`INNERMARK`) so
+    // the descent into B is observable. Held alive for the whole test.
+    let parent = tempfile::tempdir().expect("repick parent");
+    let row_work = parent.path().join("ROWDIRALPHA");
+    let pick_work = parent.path().join("PICKDIRBRAVO");
+    std::fs::create_dir(&row_work).expect("create row working_dir (A)");
+    std::fs::create_dir(&pick_work).expect("create re-pick dir (B)");
+    std::fs::create_dir(pick_work.join("INNERMARK")).expect("create B marker child");
+
+    let (scratch, sched_path) = scratch_with_schedules(&format!(
         "[[scheduled_tasks]]\n\
          name = \"digest\"\n\
          cron = \"0 9 * * *\"\n\
-         working_dir = \"/tmp\"\n\
+         working_dir = \"{work}\"\n\
          command = \"cat\"\n\
-         prompt = \"DIGESTPROMPTMARKER\"\n\
+         prompt = \"EDITPROMPTF3\"\n\
          enabled = true\n",
-    );
+        work = row_work.to_string_lossy(),
+    ));
 
     let shim_dir = scratch.path().join("shim");
     std::fs::create_dir_all(&shim_dir).expect("create shim dir");
     let authoring_record = scratch.path().join("authoring-record.log");
     let claude_record = scratch.path().join("claude-record.log");
-    write_recorder_shim(&shim_dir, "stub-authoring", &authoring_record);
+    write_recorder_shim(&shim_dir, "stub-repick-authoring", &authoring_record);
     write_recorder_shim(&shim_dir, "claude", &claude_record);
 
     let config_path = scratch.path().join("config.toml");
-    std::fs::write(&config_path, "default_command = \"stub-authoring\"\n")
-        .expect("write config.toml");
+    std::fs::write(
+        &config_path,
+        "default_command = \"stub-repick-authoring\"\n",
+    )
+    .expect("write config.toml");
 
     let path_env = format!(
         "{}:{}",
@@ -874,214 +1151,70 @@ fn manager_012_click_confirm_spawns_authoring_agent() {
     deck.wait_for_string("No active sessions");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("NEXT FIRE"); // manager dialog up
-    deck.send_keys(b"e"); // edit → opens the pick-agent modal
-    deck.wait_for_string("opencode"); // modal up
+    deck.wait_for_string("Scheduled Tasks");
+    deck.send_keys(b"e"); // EDIT the auto-selected `digest` row → opens the dir picker
 
-    // F4 mouse parity: click `[Confirm]` (== Enter). Before the fix no `[Confirm]`
-    // button rendered, so `find_in_grid` returned None and this `expect` panicked.
+    // The Edit picker STARTS at the row's working_dir (A = ROWDIRALPHA). Re-pick a
+    // DIFFERENT dir: go up one level to the parent (`h`), where the sibling
+    // `PICKDIRBRAVO` is listed, then descend into it (double-click) — its marker
+    // child `INNERMARK` confirms we are now inside B — and confirm B with Space.
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b"h"); // go up: row dir (A) → parent (lists A + B siblings)
+    deck.wait_for_string("PICKDIRBRAVO"); // the sibling re-pick target is listed
     let (col, row) = deck
-        .find_in_grid("[Confirm]")
-        .expect("the pick-agent modal must render a clickable [Confirm] button (F4)");
+        .find_in_grid("PICKDIRBRAVO")
+        .expect("the parent listing must render the `PICKDIRBRAVO` row");
     deck.click(col, row);
+    deck.click(col, row); // double-click → descend into B
+    deck.wait_for_string("INNERMARK"); // B's marker child → we are inside B
+    deck.send_keys(b" "); // Space → confirm B (the picked dir) → locked Edit form
+    deck.wait_for_string("Edit Schedule");
+    let (scol, srow) = deck
+        .find_in_grid("[Submit]")
+        .expect("the mode-locked schedule form must render a [Submit] button");
+    deck.click(scol, srow); // submit → spawn the seeded authoring agent
 
-    // Confirming via click must spawn the CONFIGURED authoring command (not
-    // `claude`), pre-filled: the `stub-authoring` recorder receives digest's seed.
+    // Wait until the existing-schedule block is delivered THROUGH its prompt line
+    // (`EDITPROMPTF3`), which the seed prints AFTER its `working_dir:` line — so by
+    // the time the prompt marker lands, the (stale) working_dir line, if present,
+    // is already recorded. This makes the `ROWDIRALPHA`-count read below race-free.
     assert!(
         common::wait_for_file_substr_count(
             &authoring_record,
-            "DIGESTPROMPTMARKER",
+            "EDITPROMPTF3",
             1,
             Duration::from_secs(15),
         ),
-        "clicking [Confirm] must spawn the seeded authoring agent running the configured \
-         `default_command` (`stub-authoring`), pre-filled with the row's prompt — the \
-         recorder never received digest's authoring seed"
+        "editing must spawn the seeded authoring agent pre-filled from the row — the recorder \
+         never received the row's `EDITPROMPTF3` prompt"
     );
+
+    // F3: the re-picked dir B must WIN in the authoring seed. The row's stale
+    // working_dir A (`ROWDIRALPHA`) must NOT survive as a conflicting "current
+    // value": the seed must carry a SINGLE consistent working_dir (B). RED today —
+    // the edit seed appends the row's `working_dir: .../ROWDIRALPHA` as a current
+    // value alongside the picked `working_dir DEFAULT: .../PICKDIRBRAVO`.
     assert_eq!(
-        common::count_file_substr(&claude_record, "DIGESTPROMPTMARKER"),
+        common::count_file_substr(&authoring_record, "ROWDIRALPHA"),
         0,
-        "clicking [Confirm] must spawn the configured command, not `claude` — but the \
-         `claude` shim received the authoring seed"
+        "re-picking a different dir on Edit must make the PICKED dir win — the row's stale \
+         working_dir `ROWDIRALPHA` must not appear in the authoring seed as a conflicting \
+         current value, but it did"
+    );
+    // And the picked dir B is reflected (sanity: the flow ran, the picked dir is
+    // the working_dir the seed carries and the spawn cwd).
+    assert!(
+        common::count_file_substr(&authoring_record, "PICKDIRBRAVO") >= 1,
+        "the re-picked dir `PICKDIRBRAVO` must be reflected in the authoring seed as the \
+         working_dir, but it was not"
+    );
+    // The `claude` neutralizer must stay empty (the configured command spawned).
+    assert_eq!(
+        common::count_file_substr(&claude_record, "EDITPROMPTF3"),
+        0,
+        "the form's configured command must spawn, not `claude` — but the `claude` shim \
+         received the authoring seed"
     );
     drop(scratch);
-}
-
-/// Scenario: With `default_command` configured to a `stub-authoring` recorder
-/// shim (and a `claude` neutralizer on PATH), open the manager, press `e` to
-/// raise the pick-agent modal, then LEFT-CLICK the `[Cancel]` button. Clicking
-/// `[Cancel]` must behave exactly like pressing Esc: the modal closes back to the
-/// MANAGER dialog (its `NEXT FIRE` header re-renders) with NO authoring agent
-/// spawned (neither recorder is written). Before the fix the modal rendered no
-/// `[Cancel]` button, so `find_in_grid` found no click target.
-#[spec("scheduler/manager/015")]
-#[test]
-fn manager_015_click_cancel_closes_to_manager_no_spawn() {
-    let (scratch, sched_path) = scratch_with_schedules(
-        "[[scheduled_tasks]]\n\
-         name = \"digest\"\n\
-         cron = \"0 9 * * *\"\n\
-         working_dir = \"/tmp\"\n\
-         command = \"cat\"\n\
-         prompt = \"DIGESTPROMPTMARKER\"\n\
-         enabled = true\n",
-    );
-
-    let shim_dir = scratch.path().join("shim");
-    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
-    let authoring_record = scratch.path().join("authoring-record.log");
-    let claude_record = scratch.path().join("claude-record.log");
-    write_recorder_shim(&shim_dir, "stub-authoring", &authoring_record);
-    write_recorder_shim(&shim_dir, "claude", &claude_record);
-
-    let config_path = scratch.path().join("config.toml");
-    std::fs::write(&config_path, "default_command = \"stub-authoring\"\n")
-        .expect("write config.toml");
-
-    let path_env = format!(
-        "{}:{}",
-        shim_dir.to_string_lossy(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
-    let deck = TuiDeck::builder()
-        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
-        .with_env("PATH", path_env)
-        .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
-
-    deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("NEXT FIRE"); // manager dialog up
-    deck.send_keys(b"e"); // edit → opens the pick-agent modal
-    deck.wait_for_string("opencode"); // modal up
-
-    // F4 mouse parity: click `[Cancel]` (== Esc). Before the fix no `[Cancel]`
-    // button rendered, so `find_in_grid` returned None and this `expect` panicked.
-    let (col, row) = deck
-        .find_in_grid("[Cancel]")
-        .expect("the pick-agent modal must render a clickable [Cancel] button (F4)");
-    deck.click(col, row);
-
-    // Cancelling via click closes back to the MANAGER dialog (F3): `NEXT FIRE`
-    // re-renders and the modal title is gone.
-    deck.wait_for_string("NEXT FIRE");
-    let grid = deck.snapshot_grid();
-    assert!(
-        !grid.contains("Pick authoring agent"),
-        "clicking [Cancel] must dismiss the pick-agent modal — its `Pick authoring agent` \
-         title must be gone.\nGrid:\n{grid}"
-    );
-
-    // And NO authoring agent spawned: neither recorder received digest's seed.
-    assert!(
-        !common::wait_for_agent_display_name(
-            deck.attach_socket_path(),
-            "schedule",
-            true,
-            Duration::from_millis(500),
-        ),
-        "clicking [Cancel] must NOT spawn the authoring agent"
-    );
-    assert_eq!(
-        common::count_file_substr(&authoring_record, "DIGESTPROMPTMARKER"),
-        0,
-        "clicking [Cancel] must not spawn anything — the `stub-authoring` recorder must stay empty"
-    );
-    assert_eq!(
-        common::count_file_substr(&claude_record, "DIGESTPROMPTMARKER"),
-        0,
-        "clicking [Cancel] must not spawn anything — the `claude` recorder must stay empty"
-    );
-    drop(scratch);
-}
-
-/// Scenario: With `default_command` configured to a CUSTOM command that is NOT a
-/// preset (`stub-authoring`, a recorder shim) plus a `claude` neutralizer on
-/// PATH, open the manager and press `e` to raise the pick-agent modal. The modal
-/// opens with the custom command as the chosen default and the preset highlight
-/// at the LEFTMOST position (`selected_preset == 0`, since the custom command
-/// matches no preset). Press `h` (move-prev) AT that leftmost position — it must
-/// be a no-op that does NOT clobber the custom chosen command — then confirm with
-/// Enter. Assert the seeded authoring agent spawns running the CUSTOM
-/// `stub-authoring` command (its recorder receives digest's authoring seed), NOT
-/// `claude` (`AGENT_COMMAND_PRESETS[0]`). Before the fix, at `selected_preset == 0`,
-/// `h` still reassigned `chosen = AGENT_COMMAND_PRESETS[0]` (claude), so `claude`
-/// spawned and the custom recorder never fired.
-#[spec("scheduler/manager/014")]
-#[test]
-fn manager_014_h_at_leftmost_preserves_custom_command() {
-    let (scratch, sched_path) = scratch_with_schedules(
-        "[[scheduled_tasks]]\n\
-         name = \"digest\"\n\
-         cron = \"0 9 * * *\"\n\
-         working_dir = \"/tmp\"\n\
-         command = \"cat\"\n\
-         prompt = \"DIGESTPROMPTMARKER\"\n\
-         enabled = true\n",
-    );
-
-    let shim_dir = scratch.path().join("shim");
-    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
-    // The CUSTOM (non-preset) authoring command is the GREEN signal; a `claude`
-    // neutralizer recorder both shields the host's real `claude` and catches the
-    // clobber regression where `h` reassigns the chosen command to `claude`.
-    let authoring_record = scratch.path().join("authoring-record.log");
-    let claude_record = scratch.path().join("claude-record.log");
-    write_recorder_shim(&shim_dir, "stub-authoring", &authoring_record);
-    write_recorder_shim(&shim_dir, "claude", &claude_record);
-
-    // `default_command` = the custom (non-preset) command, so the modal opens
-    // with `chosen = "stub-authoring"` and `selected_preset = 0` (no preset
-    // matches the custom command, so the highlight starts at the leftmost preset).
-    let config_path = scratch.path().join("config.toml");
-    std::fs::write(&config_path, "default_command = \"stub-authoring\"\n")
-        .expect("write config.toml");
-
-    let path_env = format!(
-        "{}:{}",
-        shim_dir.to_string_lossy(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
-    let deck = TuiDeck::builder()
-        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
-        .with_env("PATH", path_env)
-        .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
-
-    deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("NEXT FIRE"); // manager dialog up
-    deck.send_keys(b"e"); // edit → opens the pick-agent modal
-    deck.wait_for_string("opencode"); // modal up
-
-    // Press `h` (move-prev) at the leftmost preset. With `selected_preset == 0`
-    // this must NOT clobber the CUSTOM chosen command — it stays `stub-authoring`.
-    deck.send_keys(b"h");
-    deck.send_keys(b"\r"); // confirm the chosen command → spawn the authoring agent
-
-    // GREEN: pressing `h` at the leftmost preset preserved the custom command, so
-    // confirming spawns `stub-authoring` and its recorder receives digest's seed.
-    assert!(
-        common::wait_for_file_substr_count(
-            &authoring_record,
-            "DIGESTPROMPTMARKER",
-            1,
-            Duration::from_secs(15),
-        ),
-        "pressing `h` at the leftmost preset (selected_preset == 0) must NOT clobber the \
-         CUSTOM chosen command — confirming must spawn `stub-authoring` (the configured \
-         `default_command`), whose recorder receives digest's authoring seed — but it never did"
-    );
-    // The clobber regression target: `claude` (presets[0]) must NOT have spawned
-    // (checked only after the positive assert passes, so it is a clean
-    // point-in-time read, not a race).
-    assert_eq!(
-        common::count_file_substr(&claude_record, "DIGESTPROMPTMARKER"),
-        0,
-        "pressing `h` at the leftmost preset must not reassign the chosen command to `claude` \
-         (`AGENT_COMMAND_PRESETS[0]`) — but the `claude` shim received the authoring seed"
-    );
-    drop(scratch);
+    drop(parent);
 }
