@@ -13,7 +13,11 @@
     "cargo@1.94.1",
     "clippy@1.94.1",
     "rustfmt@1.94.1",
-    "path:gcloud#google-cloud-sdk"
+    "path:gcloud#google-cloud-sdk",
+    "asciinema-agg@1.9.0",
+    "ffmpeg@8.1",
+    "jq@1.8.1",
+    "curl@8.17.0"
   ],
   "shell": {
     "init_hook": [

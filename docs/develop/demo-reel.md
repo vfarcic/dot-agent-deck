@@ -1,0 +1,161 @@
+# Demo Reel
+
+> **Developer / maintainer reference.** This page documents an internal release-workflow tool and is intentionally excluded from the published documentation site. It renders as plain Markdown here on GitHub.
+
+When a PRD's e2e tests pass, the only way to confirm the implemented behavior is what was intended is to read the test code or replay each per-test asciinema cast one at a time. The **demo reel** turns those casts into one watchable artifact: for each e2e test a PRD adds or changes, it shows a title/description card (the test's `## Scenario`), then plays that test's recording, then moves to the next — concatenated in catalog order — and uploads the result **unlisted to YouTube** so it can ride along with the PR. See PRD #180 for the full rationale.
+
+The tooling splits cleanly into two skills:
+
+- **Engine** — [`.claude/skills/demo-reel/`](../../.claude/skills/demo-reel/SKILL.md) (`reel.sh`). Repo-agnostic: its only input is a `manifest.json`. It renders the cards, stitches the MP4, and optionally uploads it. It knows nothing about Rust, tests, PRDs, `tests/CATALOG.md`, or `.dot-agent-deck/recordings/`.
+- **Adapter** — [`.claude/skills/demo-reel-adapter/`](../../.claude/skills/demo-reel-adapter/SKILL.md) (`build.sh`). dot-agent-deck-specific: it discovers which e2e tests this branch changed, lifts their title/description from the generated `test.md`, builds the manifest, and invokes the engine.
+
+The **only contract** between the two is the manifest.
+
+## Manifest contract
+
+`manifest.json` is a non-empty JSON **array** of objects, in the order the segments should appear. Each object has three non-empty string fields:
+
+```json
+[
+  {
+    "title": "mouse/button/001 — inline-shortcut label",
+    "description": "Start the app, focus the dashboard, and confirm the Button widget renders its inline-shortcut label.",
+    "clip": "recordings/mouse-button-001/full-stream.cast"
+  },
+  {
+    "title": "Second segment",
+    "description": "What this clip shows, in 1–3 plain-English sentences.",
+    "clip": "clips/second.mp4"
+  }
+]
+```
+
+| Field | Meaning |
+| --- | --- |
+| `title` | The card's bold headline. In the repo flow this is the `test.md` H1 (catalog id + headline). |
+| `description` | The card's dim, word-wrapped body. In the repo flow this is the test's `## Scenario` paragraph. |
+| `clip` | Path to the recording shown after the card: an existing `.cast` (asciinema v2), `.gif`, or `.mp4`. Resolved relative to the engine's current working directory. |
+
+The `clip` format is intentionally open — a cast renderer (`agg`) is just one optional front-end, so an already-rendered `gif`/`mp4` can be fed straight in. The engine rejects a manifest that breaks any of these rules (not a non-empty array, an entry that is not an object, an empty/missing field, a `clip` whose extension is not `.cast`/`.gif`/`.mp4`, or a `clip` file that does not exist) with a specific message and a non-zero exit.
+
+## Prerequisites
+
+The engine **checks these before doing any work** and fails fast with a message naming exactly what is missing; it never self-installs anything. Install them however you like; in this repo they are pinned in [`devbox.json`](../../devbox.json) and already on `PATH` inside `devbox shell`:
+
+| CLI | Used for | devbox package |
+| --- | --- | --- |
+| `agg` | render an asciinema cast to frames | `asciinema-agg` |
+| `ffmpeg` | stitch and encode the final MP4 | `ffmpeg` |
+| `jq` | parse and validate the manifest | `jq` |
+| `curl` | upload to YouTube (`--publish`) | `curl` |
+
+A missing CLI is a **hard** failure (the reel cannot be built). YouTube credentials are different: they are needed **only with `--publish`**, and a stitch-only run never touches them.
+
+### YouTube OAuth credentials
+
+Publishing reads three values **from the environment** — that is the only contract. The engine never hardcodes them and has no knowledge of how they get there:
+
+| Env var | Meaning |
+| --- | --- |
+| `YOUTUBE_CLIENT_ID` | OAuth client id |
+| `YOUTUBE_CLIENT_SECRET` | OAuth client secret |
+| `YOUTUBE_REFRESH_TOKEN` | OAuth refresh token (minted once via human consent) |
+
+Populate them however your environment manages secrets — a direct `export`, a `.env` file, your CI's secret store, or any secret manager. The engine just reads the three variables.
+
+> **Maintainer's setup (one example, not required).** In this repo they are sourced via [`vals`](../../.env.vals.yaml) from GCP Secret Manager: `.env.vals.yaml` maps each var to a `ref+gcpsecrets://vfarcic/youtube-dot-releases-*` reference that `vals env -export -f .env.vals.yaml` resolves into the environment (which `devbox shell` does automatically when `USE_VALS` is set). Substitute your own mechanism freely.
+
+> **One-time human provisioning.** The refresh token requires Google OAuth user consent, which a service account cannot grant cleanly for a personal channel, so the agent cannot self-provision it. Mint it once with the recipe below, then make the three values available as the env vars above. After that, every reel run reuses the stored refresh token.
+
+## Minting the YouTube refresh token (one-time)
+
+Do this once per channel that will host reels. All of it happens in the [Google Cloud Console](https://console.cloud.google.com/) plus a couple of `curl` calls.
+
+1. **Pick (or create) a Google Cloud project** for the channel's owner account.
+2. **Enable the API.** APIs & Services → Library → enable **YouTube Data API v3** for that project.
+3. **Configure the OAuth consent screen.** APIs & Services → OAuth consent screen → User type **External**. Add the channel owner's Google account as a **Test user** (a test app does not need verification for your own use), and add the scope `https://www.googleapis.com/auth/youtube.upload`.
+4. **Create the OAuth client.** APIs & Services → Credentials → Create credentials → **OAuth client ID** → Application type **Desktop app** (the "TV and Limited Input devices" type also works). This yields the **client id** and **client secret**.
+5. **Run the consent flow with offline access** to mint a refresh token. In a browser, signed in as the channel owner, open (substituting your client id):
+
+   ```text
+   https://accounts.google.com/o/oauth2/v2/auth?client_id=YOUR_CLIENT_ID&redirect_uri=http://localhost&response_type=code&scope=https://www.googleapis.com/auth/youtube.upload&access_type=offline&prompt=consent
+   ```
+
+   `access_type=offline` plus `prompt=consent` are what force Google to return a **refresh** token (without them you only get a short-lived access token). Approve the consent screen; the browser redirects to a `http://localhost/?code=…` URL that fails to load — that is expected. Copy the `code` value out of the address bar.
+6. **Exchange the authorization code for tokens:**
+
+   ```sh
+   curl --silent --request POST https://oauth2.googleapis.com/token \
+     --data-urlencode "client_id=YOUR_CLIENT_ID" \
+     --data-urlencode "client_secret=YOUR_CLIENT_SECRET" \
+     --data-urlencode "code=THE_CODE_FROM_STEP_5" \
+     --data-urlencode "redirect_uri=http://localhost" \
+     --data-urlencode "grant_type=authorization_code" | jq .
+   ```
+
+   The response JSON contains `refresh_token`. That value is the `YOUTUBE_REFRESH_TOKEN`.
+7. **Make the three values available as the `YOUTUBE_*` env vars** however your environment sources secrets. The maintainer's setup stores them in GCP Secret Manager (project `vfarcic`) so the `.env.vals.yaml` `ref+gcpsecrets://…` references resolve:
+
+   ```sh
+   printf '%s' 'YOUR_CLIENT_ID'     | gcloud secrets create youtube-dot-releases-client-id     --data-file=- --project vfarcic
+   printf '%s' 'YOUR_CLIENT_SECRET' | gcloud secrets create youtube-dot-releases-client-secret --data-file=- --project vfarcic
+   printf '%s' 'THE_REFRESH_TOKEN'  | gcloud secrets create youtube-dot-releases-refresh-token --data-file=- --project vfarcic
+   ```
+
+   (Use `gcloud secrets versions add <name> --data-file=-` instead of `create` if a secret already exists.) If you don't use `vals`, skip this step and export the three variables however you prefer.
+
+However you source them, the goal is the three `YOUTUBE_*` vars present in the environment when `reel.sh … --publish` runs.
+
+> **The refresh token is long-lived but not eternal.** Google may revoke it (password change, scope/consent revocation, a test app left idle for months, or exceeding the per-client refresh-token limit). When that happens the upload fails at runtime with the API's own error passed through; re-run steps 5–7 to mint and store a fresh token.
+
+## Building a reel locally
+
+### Engine, direct invocation
+
+Run from a directory where the manifest's `clip` paths resolve:
+
+```sh
+.claude/skills/demo-reel/reel.sh manifest.json --out reel.mp4             # stitch only, no upload
+.claude/skills/demo-reel/reel.sh manifest.json --out reel.mp4 --publish   # stitch + upload unlisted, prints the YouTube URL
+```
+
+`--out` defaults to `reel.mp4`. With `--publish` the engine uploads the stitched MP4 unlisted and prints the `https://youtu.be/<id>` watch URL on stdout (all other output goes to stderr, so the URL is cleanly capturable).
+
+### Adapter, the repo flow
+
+The adapter builds the manifest from this repo's conventions, then forwards `--out`/`--publish` to the engine. Run it from the repo root so the default relative paths (`.dot-agent-deck/recordings`, `tests/CATALOG.md`) resolve:
+
+```sh
+.claude/skills/demo-reel-adapter/build.sh --out reel.mp4              # select → assemble → stitch only
+.claude/skills/demo-reel-adapter/build.sh --out reel.mp4 --publish    # select → assemble → stitch + upload
+```
+
+It selects the e2e `#[spec]` tests this branch added/changed (diff vs `main`), reads each one's title (`test.md` H1) and `## Scenario` description, orders by catalog id, points each entry at its `full-stream.cast`, and invokes the engine. The `build.sh select` and `build.sh assemble` subcommands expose the two halves (the git-diff selection and the pure manifest assembly) for inspection — see the [adapter SKILL.md](../../.claude/skills/demo-reel-adapter/SKILL.md).
+
+> **Casts only exist for recorded runs.** Per-test casts are written only on test **failure** or when `DOT_AGENT_DECK_RECORD=1` is set (PRD #77), and they are local-only — never produced in CI. To build a reel for *passing* tests, run the e2e suite with `DOT_AGENT_DECK_RECORD=1` first so the casts under `.dot-agent-deck/recordings/<test>/full-stream.cast` are populated. Without casts, the adapter finds nothing in scope and clean-skips.
+
+### Smoke tests
+
+Two re-runnable checks guard the tooling locally:
+
+```sh
+task reel-smoke           # engine: stitch a tiny fixture and assert the MP4 with ffprobe (needs agg+ffmpeg; no network)
+task reel-adapter-test    # adapter: assert manifest order + L1 exclusion + clean-skip (pure shell; CI-safe)
+```
+
+The live YouTube upload cannot be a routine automated test; it is verified by code review of `upload.sh` plus a one-time manual `--publish` run (see the engine SKILL.md).
+
+## How the orchestrator step behaves
+
+The demo reel is **not** built during the pre-PR gate. The casts are *recorded* there (the e2e gate runs with `DOT_AGENT_DECK_RECORD=1`), but the reel itself is built, published, and linked only **after** the PR is open and its CI + Greptile review are green, and **before** merge — in the pre-merge window. Building it then means the link is posted once, against a PR that has already validated, and the changelog/PR-body update it adds gets one final quick CI + review pass before merge.
+
+1. **Record during the e2e gate.** The pre-PR e2e suite runs with `DOT_AGENT_DECK_RECORD=1`, so the passing tests' casts are populated under `.dot-agent-deck/recordings/` — one e2e run, recording turned on, not a second run. The casts sit on disk until the reel is built.
+2. **Open the PR and let it validate.** `/prd-done` opens the PR; the orchestrator waits for CI and the Greptile review to settle **green**. No reel yet.
+3. **Build + upload (pre-merge).** Once the PR is green, the adapter (`build.sh --out reel.mp4 --publish`) composes a descriptive title (`<repo> · PRD #<prd> · PR #<pr> — <short desc>`, e.g. `dot-agent-deck · PRD #180 · PR #182 — PRD demo reel`), selects the branch's new/changed e2e tests, builds the manifest, and the engine stitches the reel and uploads it unlisted, returning the watch URL.
+4. **Post the link in three places.** So the reel rides along with both the PR and the release notes, the URL is posted to **(a)** a PR comment, **(b)** the PR description/body, and **(c)** the changelog fragment `changelog.d/<prd>.feature.md` (appended, so it flows into the release notes). Committing the changelog/PR-body change triggers one final quick CI + Greptile pass, which the orchestrator waits on before the merge gate.
+5. **Surface to the human pre-merge.** The orchestrator presents the link at the merge gate: `Demo reel for PRD #NNN: <unlisted YouTube link>. Watch before merging.`
+6. **Clean skip.** If the branch changed **no** e2e tests, the adapter writes no manifest, builds no reel, uploads nothing, and prints `skipped: no e2e tests changed on this branch`. The orchestrator records that there is no reel and why — no URL, no comment, no PR-body edit, no changelog link.
+
+> **The unlisted link is public-by-reach in the release notes.** An unlisted YouTube video is not listed or searchable, but anyone who has the link can watch it — and putting it in the changelog fragment publishes the link into the release notes, so anyone reading those notes can reach the reel. This is intended: the release notes are exactly where a reader wants a "show me what this PRD did" link.
+
+> **Graceful degrade on a publish failure.** A stitch-only run always succeeds without credentials. If `--publish` is requested but the `YOUTUBE_*` credentials are missing, the engine still produces the local `reel.mp4` and skips only the upload, reporting `reel is at <path>; could not publish (missing …)`. Runtime upload errors (expired/revoked token, exhausted quota, API disabled) are only knowable at upload time and are passed through from the API rather than swallowed — re-mint the refresh token (above) if it was revoked.

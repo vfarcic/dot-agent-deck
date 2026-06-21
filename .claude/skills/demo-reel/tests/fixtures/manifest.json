@@ -1,0 +1,12 @@
+[
+  {
+    "title": "First segment",
+    "description": "Echoes a line in the first clip.",
+    "clip": "clip-a.cast"
+  },
+  {
+    "title": "Second segment",
+    "description": "Echoes a line in the second clip.",
+    "clip": "clip-b.cast"
+  }
+]
