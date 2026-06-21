@@ -1,22 +1,33 @@
-//! PRD #103 Phase 2 — local TUI build-version handshake against the
-//! external daemon.
+//! PRD #103 Phase 2 / PRD #161 Part A — local TUI build-version handshake
+//! against the external daemon.
 //!
 //! After [`crate::daemon_attach::ensure_external_daemon_or_die`] returns
 //! Ok, the TUI opens one short-lived attach connection and sends a
 //! [`crate::daemon_protocol::AttachRequest::Hello`] carrying its own
 //! `client_build_version`. The daemon replies with its compiled-in
-//! `build_version` (PRD #103 M1.1). If the two differ — or the daemon
-//! omits the field entirely (a pre-PRD-103 binary) — the handshake
-//! enters a recovery flow:
+//! `build_version` plus a `running_agents` summary (count + display
+//! names; PRD #161 M1.1). If the two build-ids differ — or the daemon
+//! omits the field entirely (a pre-PRD-103 binary) — PRD #161 D2's
+//! consent-based always-restart (option A) takes over. The decision is
+//! driven by whether agents are running and whether stdout is a TTY:
 //!
-//! - **TTY**: render an interactive prompt naming both build-ids and the
-//!   live agent IDs (from a `ListAgents` round-trip). The user can press
-//!   `S` to terminate the daemon and continue, or `Q`/`Ctrl+C`/`Ctrl+D`
-//!   to abort. When live agents are present, two consecutive `S` presses
-//!   are required (data-loss guard).
-//! - **Non-TTY** (CI, piped stdout): print the equivalent error to
-//!   stderr and exit non-zero. No prompt is rendered; the documented
-//!   recovery is `dot-agent-deck daemon stop`.
+//! - **No agents running** (regardless of TTY): nothing to lose, so the
+//!   old daemon is restarted SILENTLY — no prompt, no consent. The caller
+//!   re-runs `ensure_external_daemon_or_die`, which lazy-spawns a fresh
+//!   daemon at the current build ([`HandshakeOutcome::Recovered`]).
+//! - **Agents running + TTY**: render an interactive prompt that NAMES the
+//!   live agents (their display names, from the hello reply's
+//!   `running_agents`) and states that restarting stops them. A single
+//!   `s`/`S` consents to the restart ([`HandshakeOutcome::Recovered`]);
+//!   any dismiss key (`Esc`/`q`/`n`/`Enter`/`Ctrl+C`/`Ctrl+D`) DECLINES,
+//!   keeping the existing daemon and attaching to it unchanged
+//!   ([`HandshakeOutcome::ProceedOnExisting`]) so the user never loses
+//!   their running agents (D4 never-strand).
+//! - **Agents running + Non-TTY** (CI, piped stdout): the restart is
+//!   mandatory but can't get consent on a pipe, so print a daemon-recovery
+//!   hint to stderr and exit non-zero. No prompt is rendered; the
+//!   documented recovery is `dot-agent-deck daemon stop`. This is the only
+//!   non-zero-exit path.
 //!
 //! The handshake runs unconditionally — even when
 //! [`ensure_external_daemon_or_die`] just lazy-spawned the daemon and
@@ -39,7 +50,7 @@ use tokio::net::UnixStream;
 
 use crate::build_id::local_build_id;
 use crate::daemon_attach::peer_pid;
-use crate::daemon_client::{DaemonClient, issue_command};
+use crate::daemon_client::issue_command;
 use crate::daemon_protocol::{AttachRequest, AttachResponse, PROTOCOL_VERSION};
 
 /// How long to wait for the daemon's attach socket to disappear after a
@@ -54,12 +65,20 @@ pub enum HandshakeOutcome {
     /// Daemon's `build_version` matched the TUI's compiled-in
     /// `DAD_BUILD_ID`. No user interaction occurred.
     Match,
-    /// Build-ids differed; the user pressed `S`, the old daemon was
-    /// terminated, and the socket disappeared within the timeout. The
-    /// caller should re-run [`crate::daemon_attach::ensure_external_daemon_or_die`]
-    /// before attaching — the next TUI startup lazy-spawns a fresh daemon
-    /// at the current build.
+    /// Build-ids differed and the old daemon was terminated — either
+    /// silently because no agents were running, or after the user pressed
+    /// `s` on the TTY consent prompt. The socket disappeared within the
+    /// timeout. The caller should re-run
+    /// [`crate::daemon_attach::ensure_external_daemon_or_die`] before
+    /// attaching — the next TUI startup lazy-spawns a fresh daemon at the
+    /// current build.
     Recovered,
+    /// Build-ids differed and agents were running, but the user DECLINED
+    /// the restart on a TTY (any dismiss key). The existing (older) daemon
+    /// is kept and the caller proceeds to attach to it UNCHANGED — the user
+    /// keeps their running agents (PRD #161 D4 never-strand). The caller
+    /// must NOT re-spawn the daemon.
+    ProceedOnExisting,
 }
 
 /// Errors that abort startup. The non-TTY fallback prints to stderr
@@ -113,9 +132,15 @@ impl std::fmt::Display for HandshakeError {
 
 impl std::error::Error for HandshakeError {}
 
-/// Public entry point used by `run_tui_session`. Performs the handshake,
-/// runs the recovery flow on mismatch, and returns once the laptop can
-/// safely attach (or `Err` if the user aborted / something failed).
+/// Public entry point used by `run_tui_session`. Performs the handshake
+/// and runs PRD #161 Part A's consent-based recovery on a build-id
+/// mismatch, returning once the laptop can safely attach — either to a
+/// freshly-restarted daemon ([`HandshakeOutcome::Recovered`]) or to the
+/// existing one when the user declined the restart
+/// ([`HandshakeOutcome::ProceedOnExisting`]). The only `Err` return is the
+/// agents-running non-TTY mandatory-restart path
+/// ([`HandshakeError::MismatchAborted`], after a stderr hint) and genuine
+/// pre-flight failures (probe / peer-pid / SIGTERM).
 ///
 /// PRD M2.3 — runs unconditionally, even when
 /// [`crate::daemon_attach::ensure_external_daemon_or_die`] just lazy-spawned
@@ -146,26 +171,18 @@ pub async fn ensure_compatible_daemon_or_die(
         return Ok(HandshakeOutcome::Match);
     }
 
-    // Mismatch path. Pull the live-agent list so the prompt can name
-    // them; treat a list_agents error as "no agents listed" — the
-    // mismatch itself is the important user signal, and a failing
-    // list_agents on top would just confuse the picture. (If the
-    // daemon is too broken to list agents it almost certainly can't
-    // host live ones either.)
-    let agents = match DaemonClient::new(attach_path.to_path_buf())
-        .list_agents()
-        .await
-    {
-        Ok(rs) => rs.into_iter().map(|r| r.id).collect::<Vec<_>>(),
-        Err(e) => {
-            tracing::debug!(
-                target: "build_version_handshake",
-                error = %e,
-                "list_agents failed during mismatch flow; treating as no live agents"
-            );
-            Vec::new()
-        }
-    };
+    // Mismatch path (PRD #161 D2, option A — consent-based always-restart).
+    // Read the running-agent summary straight from the hello reply
+    // (`running_agents`, PRD #161 M1.1) so the prompt can name the live
+    // agents by their DISPLAY names — not a `list_agents()` round-trip,
+    // which yields generated ids. A pre-PRD-161 daemon omits the field, in
+    // which case we have no agents to enumerate and treat it as "no agents".
+    let agents: Vec<String> = probe
+        .response
+        .running_agents
+        .as_ref()
+        .map(|s| s.names.clone())
+        .unwrap_or_default();
     tracing::debug!(
         target: "build_version_handshake",
         local_build,
@@ -174,13 +191,24 @@ pub async fn ensure_compatible_daemon_or_die(
         "local daemon build_version handshake: mismatch"
     );
 
+    // (a) No agents running: nothing to lose, so restart SILENTLY —
+    // regardless of TTY. No prompt, no consent. The caller re-runs
+    // `ensure_external_daemon_or_die` after `Recovered`, lazy-spawning a
+    // fresh daemon at the current build.
+    if agents.is_empty() {
+        return terminate_and_recover(&probe, attach_path).await;
+    }
+
+    // (c) Agents running + non-TTY: the restart is mandatory but can't get
+    // consent on a pipe, so print the daemon-recovery hint to stderr and
+    // exit non-zero. This is the only non-zero-exit path.
     if !std::io::stdout().is_terminal() {
         let msg = render_non_tty_error(daemon_build.as_deref(), &local_build);
         eprint!("{msg}");
         return Err(HandshakeError::MismatchAborted);
     }
 
-    // TTY recovery flow: ask the user whether to terminate. The prompt
+    // (b) Agents running + TTY: ask the user whether to restart. The prompt
     // is rendered in raw mode on a blocking thread (crossterm's
     // event::read is synchronous; doing it directly would block the
     // tokio worker).
@@ -198,38 +226,48 @@ pub async fn ensure_compatible_daemon_or_die(
     .map_err(|e| HandshakeError::Probe(io::Error::other(format!("prompt task join: {e}"))))?;
 
     match decision {
-        InteractiveDecision::Quit => Err(HandshakeError::MismatchAborted),
-        InteractiveDecision::Stop => {
-            // PRD #103 PID-reuse mitigation: re-resolve `peer_pid()` on
-            // the SAME `UnixStream` we kept open across the interactive
-            // prompt. Holding the stream open prevents the kernel from
-            // tearing down the socket pairing in the window where the
-            // user was deciding S/Q. If `peer_pid()` now fails the
-            // daemon has already exited on its own — there's nothing to
-            // terminate, so short-circuit to success rather than
-            // signalling an arbitrary same-UID PID.
-            let resolved_pid = match peer_pid(&probe.stream) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::debug!(
-                        target: "build_version_handshake",
-                        error = %e,
-                        original_pid = probe.peer_pid,
-                        "re-resolved peer_pid failed after prompt; treating daemon as already gone"
-                    );
-                    return Ok(HandshakeOutcome::Recovered);
-                }
-            };
-            // Phase 2 doesn't escalate to SIGKILL — the user can re-run
-            // `dot-agent-deck daemon stop --force` for that. The
-            // graceful-SIGTERM outcome is the only success variant we
-            // care about here; treat both Stopped and Killed (the
-            // latter is unreachable with `None`) as Recovered.
-            terminate_daemon_graceful(resolved_pid, attach_path, TERMINATE_POLL_TIMEOUT, None)
-                .await?;
-            Ok(HandshakeOutcome::Recovered)
-        }
+        // Decline keeps the existing (older) daemon: proceed to attach to
+        // it unchanged so the user's running agents stay reachable (PRD
+        // #161 D4 never-strand). The caller must NOT re-spawn.
+        InteractiveDecision::Decline => Ok(HandshakeOutcome::ProceedOnExisting),
+        InteractiveDecision::Restart => terminate_and_recover(&probe, attach_path).await,
     }
+}
+
+/// SIGTERM the probed daemon and report [`HandshakeOutcome::Recovered`] so
+/// the caller re-runs `ensure_external_daemon_or_die` to lazy-spawn a fresh
+/// daemon at the current build. Shared by the silent no-agents restart (a)
+/// and the consented restart (b).
+async fn terminate_and_recover(
+    probe: &ProbeOutcome,
+    attach_path: &Path,
+) -> Result<HandshakeOutcome, HandshakeError> {
+    // PRD #103 PID-reuse mitigation: re-resolve `peer_pid()` on the SAME
+    // `UnixStream` we kept open across the (possible) interactive prompt.
+    // Holding the stream open prevents the kernel from tearing down the
+    // socket pairing in the window where the user was deciding. If
+    // `peer_pid()` now fails the daemon has already exited on its own —
+    // there's nothing to terminate, so short-circuit to success rather
+    // than signalling an arbitrary same-UID PID.
+    let resolved_pid = match peer_pid(&probe.stream) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(
+                target: "build_version_handshake",
+                error = %e,
+                original_pid = probe.peer_pid,
+                "re-resolved peer_pid failed before restart; treating daemon as already gone"
+            );
+            return Ok(HandshakeOutcome::Recovered);
+        }
+    };
+    // Part A doesn't escalate to SIGKILL — the user can re-run
+    // `dot-agent-deck daemon stop --force` for that. The graceful-SIGTERM
+    // outcome is the only success variant we care about here; treat both
+    // Stopped and Killed (the latter is unreachable with `None`) as
+    // Recovered.
+    terminate_daemon_graceful(resolved_pid, attach_path, TERMINATE_POLL_TIMEOUT, None).await?;
+    Ok(HandshakeOutcome::Recovered)
 }
 
 struct ProbeOutcome {
@@ -445,57 +483,52 @@ fn render_non_tty_error(daemon_build: Option<&str>, local_build: &str) -> String
 /// Render the interactive mismatch prompt as plain newline-separated
 /// text. Raw-mode display converts `\n` to `\r\n` at write time so
 /// tests can assert on the canonical form. Trailing newline omitted so
-/// the cursor sits one line below the prompt body — the next keystroke
-/// then echoes (well, would echo if raw mode left echo on) under the
-/// "[S] / [Q]" line.
+/// the cursor sits one line below the prompt body.
+///
+/// PRD #161 Part A: this prompt is only ever shown when agents are
+/// running (the no-agents path restarts silently with no prompt), so it
+/// always names the live agents (their display names, from the hello
+/// reply's `running_agents`) and offers a single-key consent: `s` to
+/// restart (stopping the agents), any other key to keep the existing
+/// daemon and continue.
 fn render_mismatch_prompt(
     daemon_build: Option<&str>,
     local_build: &str,
     agents: &[String],
 ) -> String {
     let daemon_display = daemon_build.unwrap_or("<unknown>");
-    if agents.is_empty() {
-        format!(
-            "⚠  Daemon version mismatch\n\
-             \x20  running daemon:  {daemon_display}\n\
-             \x20  this binary:     {local_build}\n\
-             \n\
-             \x20  [S] stop daemon and continue   [Q] quit\n"
-        )
-    } else {
-        let mut out = String::new();
-        out.push_str(&format!(
-            "⚠  Daemon version mismatch  ({n} managed agent(s) running)\n",
-            n = agents.len()
-        ));
-        // Surface both build-ids in the live-agent variant too — the
-        // no-agent branch shows them and the user loses crucial context
-        // (which side is "newer") if they're only visible in one of the
-        // two prompts. PRD #103 M4.2 / CodeRabbit finding #3.
-        out.push_str(&format!("   running daemon:  {daemon_display}\n"));
-        out.push_str(&format!("   this binary:     {local_build}\n"));
-        out.push('\n');
-        for id in agents {
-            out.push_str(&format!("   {id}\n"));
-        }
-        out.push('\n');
-        out.push_str("   Stopping the daemon will end these agents.\n");
-        out.push('\n');
-        out.push_str("   [S] stop daemon and continue   [Q] quit\n");
-        out
+    let mut out = String::new();
+    out.push_str(&format!(
+        "⚠  Daemon version mismatch  ({n} agent(s) running)\n",
+        n = agents.len()
+    ));
+    out.push_str(&format!("   running daemon:  {daemon_display}\n"));
+    out.push_str(&format!("   this binary:     {local_build}\n"));
+    out.push('\n');
+    out.push_str("   Restarting to upgrade will stop these agents:\n");
+    for name in agents {
+        out.push_str(&format!("   {name}\n"));
     }
+    out.push('\n');
+    out.push_str("   [S] restart daemon and continue   [any other key] keep current daemon\n");
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InteractiveDecision {
-    Stop,
-    Quit,
+    /// Restart the daemon (stopping its agents) and continue on a fresh one.
+    Restart,
+    /// Keep the existing daemon and continue attached to it (agents intact).
+    Decline,
 }
 
 /// Render the prompt in raw mode and block on `crossterm::event::read`
-/// until the user picks `S` or `Q` (or sends `Ctrl+C`/`Ctrl+D`). When
-/// `agents` is non-empty, two `S` presses are required — the live-agent
-/// data-loss guard (PRD #103 M2.1 / worker-task line 41).
+/// until the user makes a choice. PRD #161 Part A: a single `s`/`S`
+/// consents to the restart; every dismiss key
+/// (`Esc`/`q`/`n`/`Enter`/`Ctrl+C`/`Ctrl+D`) DECLINES, which keeps the
+/// existing daemon (D4 never-strand). The old two-`S` double-confirm is
+/// gone — there is no longer an exit path on a TTY, so a second
+/// confirmation buys nothing.
 ///
 /// Runs on a blocking thread because `crossterm::event::read` is
 /// synchronous; the caller spawn_blocking()s this function.
@@ -529,16 +562,14 @@ fn interactive_prompt(
     };
     render(&prompt);
 
-    let needs_two_s = !agents.is_empty();
-    let mut s_count = 0usize;
-
     loop {
         let ev = match event::read() {
             Ok(ev) => ev,
-            // A read error in raw mode (terminal yanked, TTY closed)
-            // is functionally equivalent to the user giving up. Quit
-            // safely rather than looping on a broken fd.
-            Err(_) => return InteractiveDecision::Quit,
+            // A read error in raw mode (terminal yanked, TTY closed) is
+            // functionally equivalent to the user dismissing. Decline
+            // safely (keeping the existing daemon) rather than looping on
+            // a broken fd.
+            Err(_) => return InteractiveDecision::Decline,
         };
         let Event::Key(KeyEvent {
             code, modifiers, ..
@@ -547,24 +578,18 @@ fn interactive_prompt(
             continue;
         };
         match (code, modifiers) {
+            // The ONLY affirmative key: a single `s`/`S` restarts.
             (KeyCode::Char('s' | 'S'), m) if !m.contains(KeyModifiers::CONTROL) => {
-                s_count += 1;
-                if !needs_two_s || s_count >= 2 {
-                    return InteractiveDecision::Stop;
-                }
-                // First S with live agents: re-render the prompt so
-                // the user sees that the keystroke was received but
-                // a second confirmation is still required. The text
-                // is unchanged (PRD pins it character-for-character).
-                render(&prompt);
+                return InteractiveDecision::Restart;
             }
-            (KeyCode::Char('q' | 'Q'), m) if !m.contains(KeyModifiers::CONTROL) => {
-                return InteractiveDecision::Quit;
+            // Explicit dismiss keys all decline → keep the existing daemon.
+            (KeyCode::Char('q' | 'Q' | 'n' | 'N'), m) if !m.contains(KeyModifiers::CONTROL) => {
+                return InteractiveDecision::Decline;
             }
             (KeyCode::Char('c' | 'd'), m) if m.contains(KeyModifiers::CONTROL) => {
-                return InteractiveDecision::Quit;
+                return InteractiveDecision::Decline;
             }
-            (KeyCode::Esc, _) => return InteractiveDecision::Quit,
+            (KeyCode::Esc, _) | (KeyCode::Enter, _) => return InteractiveDecision::Decline,
             _ => continue,
         }
     }
@@ -601,51 +626,74 @@ mod tests {
     }
 
     #[test]
-    fn mismatch_prompt_no_agents_matches_prd_form() {
-        // PRD #103 M2.1 pins this text character-for-character; the
-        // Phase 4 integration tests (M4.2) will assert against the
-        // same form, so any drift here fails the future test too.
-        let out = render_mismatch_prompt(Some("0.25.0-gabc1234"), "0.25.0-gdeadbee", &[]);
-        assert_eq!(
-            out,
-            "⚠  Daemon version mismatch\n\
-             \x20  running daemon:  0.25.0-gabc1234\n\
-             \x20  this binary:     0.25.0-gdeadbee\n\
-             \n\
-             \x20  [S] stop daemon and continue   [Q] quit\n"
-        );
-    }
-
-    #[test]
-    fn mismatch_prompt_with_agents_lists_them_under_header_and_warns_about_data_loss() {
+    fn mismatch_prompt_names_agents_and_offers_single_consent() {
+        // PRD #161 Part A: the prompt is only shown when agents are
+        // running (the no-agents path restarts silently with no prompt),
+        // so it always names each live agent by its display name, states
+        // that restarting stops them, and offers a single-key consent —
+        // `s` to restart, any other key to keep the existing daemon. There
+        // is no longer a "[Q] quit"/abort path or a two-`S` double-confirm.
         let out = render_mismatch_prompt(
-            Some("0.25.0-gabc1234"),
-            "0.25.0-gdeadbee",
-            &["agent-1".into(), "agent-2".into()],
+            Some("0.31.0-g0000old"),
+            "0.31.1-g1111new",
+            &["zeta-live-77".into(), "alpha-2".into()],
         );
-        let expected = "⚠  Daemon version mismatch  (2 managed agent(s) running)\n\
-             \x20  running daemon:  0.25.0-gabc1234\n\
-             \x20  this binary:     0.25.0-gdeadbee\n\
+        let expected = "⚠  Daemon version mismatch  (2 agent(s) running)\n\
+             \x20  running daemon:  0.31.0-g0000old\n\
+             \x20  this binary:     0.31.1-g1111new\n\
              \n\
-             \x20  agent-1\n\
-             \x20  agent-2\n\
+             \x20  Restarting to upgrade will stop these agents:\n\
+             \x20  zeta-live-77\n\
+             \x20  alpha-2\n\
              \n\
-             \x20  Stopping the daemon will end these agents.\n\
-             \n\
-             \x20  [S] stop daemon and continue   [Q] quit\n";
+             \x20  [S] restart daemon and continue   [any other key] keep current daemon\n";
         assert_eq!(out, expected);
     }
 
     #[test]
-    fn mismatch_prompt_pluralization_pinned_at_n_managed_agents() {
-        // The PRD-pinned form is "(N managed agent(s) running)" with a
-        // literal "(s)" — no clever singular/plural switching. Pin it
-        // so a future "be helpful" cleanup doesn't drift the string
-        // out from under the M4.2 assertions.
+    fn mismatch_prompt_conveys_restart_vs_keep_choice() {
+        // The new single-consent model: `s` restarts (stopping agents); any
+        // other key keeps the current daemon (decline = proceed-on-existing,
+        // D4 never-strand). No abort/quit wording survives.
+        let out = render_mismatch_prompt(Some("old"), "new", &["only".into()]);
+        assert!(
+            out.contains("[S] restart daemon and continue"),
+            "must offer the single `s` restart consent, got: {out:?}"
+        );
+        assert!(
+            out.contains("keep current daemon"),
+            "must offer keeping the existing daemon as the decline path, got: {out:?}"
+        );
+        assert!(
+            out.to_lowercase().contains("stop"),
+            "must state that restarting stops the agents, got: {out:?}"
+        );
+        assert!(
+            !out.to_lowercase().contains("quit"),
+            "the abort/quit path is gone under Part A, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn mismatch_prompt_single_agent_pluralization() {
+        // The header form is "(N agent(s) running)" with a literal "(s)" —
+        // no clever singular/plural switching. Pin it so a future "be
+        // helpful" cleanup doesn't drift the string.
         let single = render_mismatch_prompt(Some("a"), "b", &["only".into()]);
         assert!(
-            single.contains("(1 managed agent(s) running)"),
+            single.contains("(1 agent(s) running)"),
             "single-agent header must keep the literal '(s)', got: {single:?}"
+        );
+    }
+
+    #[test]
+    fn mismatch_prompt_renders_unknown_daemon_build() {
+        // A pre-PRD-103 daemon omits `build_version`; the prompt surfaces
+        // the `<unknown>` placeholder rather than an empty span.
+        let out = render_mismatch_prompt(None, "0.31.1-g1111new", &["only".into()]);
+        assert!(
+            out.contains("running daemon:  <unknown>"),
+            "missing daemon build_version must surface <unknown>, got: {out:?}"
         );
     }
 }
