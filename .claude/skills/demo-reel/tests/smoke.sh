@@ -64,11 +64,11 @@ IFS=',' read -r W H PIXFMT FR < <(
 [[ "$FR" == "30/1" ]]        || fail "avg_frame_rate '$FR' != 30/1"
 
 # Duration must be at least the sum of the per-card holds. Recompute the holds
-# from the manifest with the SAME rule the engine uses: max(3, ceil(words/3))
-# over each entry's title + description words.
+# from the manifest with the SAME rule the engine uses:
+# clamp(ceil(words/3), 3, 8) over each entry's title + description words.
 sum_holds="$(
   jq -r '.[] | .title + " " + .description' "$MANIFEST" \
-    | awk '{ h = int((NF + 2) / 3); if (h < 3) h = 3; s += h } END { print s }'
+    | awk '{ h = int((NF + 2) / 3); if (h < 3) h = 3; if (h > 8) h = 8; s += h } END { print s }'
 )"
 DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT")"
 awk -v d="$DUR" -v m="$sum_holds" 'BEGIN { exit !(d + 0 >= m + 0) }' \

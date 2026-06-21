@@ -47,6 +47,15 @@ FONT_SIZE=16
 FPS=30
 # Cap idle gaps inside a real clip so e2e waits don't make the reel drag.
 CLIP_IDLE=2
+# A card is one static frame. agg only needs a brief span to paint it, so the
+# synthetic card cast holds for CARD_RENDER_SPAN seconds and is rendered with a
+# small idle limit (CARD_IDLE); agg collapses that static span to a single
+# painted frame, which we then freeze. The card's ON-SCREEN hold is applied
+# AFTERWARD at the ffmpeg level (loop that still to an exact duration) — NOT via
+# agg's timeline — so a long card actually holds its full time instead of agg
+# collapsing the static tail.
+CARD_IDLE=2
+CARD_RENDER_SPAN="0.6"
 # Geometry for a gif/mp4 entry's card: those clips carry no terminal grid, so
 # the card is painted at this sensible default and every segment is normalized
 # to a common resolution afterwards (the ffmpeg scale+pad safety net).
@@ -270,16 +279,18 @@ read_cast_geom() {
   echo "$w $h"
 }
 
-# Synthesize a card .cast at WxH for the given title/description: paint at t=0,
-# then a no-op at t=HOLD so the static frame is held that long. agg's
-# --idle-time-limit is set above HOLD so the hold is not truncated.
+# Synthesize a one-frame card .cast at WxH for the given title/description:
+# paint at t=0, then a no-op a beat later (CARD_RENDER_SPAN) so agg has a span
+# to render the painted frame. The card's on-screen HOLD is deliberately NOT
+# encoded here — it is enforced later at the ffmpeg level (a single still
+# looped to an exact duration), so it is immune to agg collapsing a static tail.
 make_card_cast() {
-  local w="$1" h="$2" title="$3" desc="$4" hold="$5" out="$6" payload
+  local w="$1" h="$2" title="$3" desc="$4" out="$5" payload
   payload="$(CARD_W="$w" CARD_H="$h" CARD_TITLE="$title" CARD_DESC="$desc" awk -f "$CARD_AWK")"
   {
     printf '{"version": 2, "width": %d, "height": %d, "env": {"TERM": "xterm-256color"}}\n' "$w" "$h"
     printf '[0.0, "o", %s]\n' "$(printf '%s' "$payload" | jq -Rs .)"
-    printf '[%d.0, "o", %s]\n' "$hold" "$(printf '\033[H' | jq -Rs .)"
+    printf '[%s, "o", %s]\n' "$CARD_RENDER_SPAN" "$(printf '\033[H' | jq -Rs .)"
   } > "$out"
 }
 
@@ -309,6 +320,15 @@ probe_wh() {
     -of csv=s=x:p=0 "$1"
 }
 
+# Freeze the single painted still (PNG) from a rendered card gif. agg collapses
+# the card's static span to one frame, so grab exactly that frame. This still is
+# what the card segment is built from, so the card never flickers and its
+# duration is decoupled from agg's timeline.
+freeze_still() {
+  local gif="$1" png="$2"
+  ffmpeg -y -hide_banner -loglevel error -i "$gif" -frames:v 1 -update 1 "$png"
+}
+
 n="$(jq 'length' "$MANIFEST")"
 note "building reel from $n manifest entr$([[ "$n" -eq 1 ]] && echo y || echo ies)…"
 
@@ -316,7 +336,7 @@ note "building reel from $n manifest entr$([[ "$n" -eq 1 ]] && echo y || echo ie
 # via agg, gif/mp4 used as-is), preserving manifest order. The common target
 # resolution is then the max across all of them, so nothing is upscaled.
 natives=()
-hold_total=0
+holds=()          # parallel to natives: hold seconds for a card, empty for a clip
 for ((i = 0; i < n; i++)); do
   title="$(jq -r ".[$i].title"       "$MANIFEST")"
   desc="$(jq -r  ".[$i].description" "$MANIFEST")"
@@ -331,23 +351,34 @@ for ((i = 0; i < n; i++)); do
     cols="$DEFAULT_COLS"; rows="$DEFAULT_ROWS"
   fi
 
-  # Hold scales to text length: max(3s, ceil(words/3)) so longer cards stay
-  # readable. (words+2)/3 is integer-ceil of words/3.
+  # Hold scales to text length but is CLAMPED to [3, 8]: clamp(ceil(words/3),
+  # 3, 8). The lower bound keeps a short card on screen long enough to read; the
+  # upper cap stops a long description from parking the reel on a static frame
+  # for 50–60s — the viewer pauses to read more, but the card never holds beyond
+  # 8s. (words+2)/3 is integer-ceil of words/3.
   words="$(printf '%s %s' "$title" "$desc" | wc -w | tr -d '[:space:]')"
   hold=$(( (words + 2) / 3 ))
   (( hold < 3 )) && hold=3
-  hold_total=$(( hold_total + hold ))
+  (( hold > 8 )) && hold=8
 
-  make_card_cast "$cols" "$rows" "$title" "$desc" "$hold" "$WORKDIR/card_$i.cast"
-  render_cast "$WORKDIR/card_$i.cast" "$WORKDIR/card_$i.gif" "$((hold + 1))"
-  natives+=("$WORKDIR/card_$i.gif")
+  # Paint the card and render it through the SAME agg invocation as the clips
+  # (pixel-identical by construction), then freeze a single painted still. The
+  # on-screen hold is applied later (looping this still to exactly $hold
+  # seconds), decoupled from agg's idle handling.
+  make_card_cast "$cols" "$rows" "$title" "$desc" "$WORKDIR/card_$i.cast"
+  render_cast "$WORKDIR/card_$i.cast" "$WORKDIR/card_$i.gif" "$CARD_IDLE"
+  freeze_still "$WORKDIR/card_$i.gif" "$WORKDIR/card_$i.png"
+  natives+=("$WORKDIR/card_$i.png")
+  holds+=("$hold")
 
   case "$ext" in
     cast)
       render_cast "$clip" "$WORKDIR/clip_$i.gif" "$CLIP_IDLE"
-      natives+=("$WORKDIR/clip_$i.gif") ;;
+      natives+=("$WORKDIR/clip_$i.gif")
+      holds+=("") ;;
     gif|mp4)
-      natives+=("$clip") ;;   # pre-rendered: fed straight to ffmpeg
+      natives+=("$clip")       # pre-rendered: fed straight to ffmpeg
+      holds+=("") ;;
   esac
 done
 
@@ -374,11 +405,21 @@ done
 # so the agg-style `--` hardening doesn't apply here.
 list="$WORKDIR/concat.txt"
 : > "$list"
+norm_vf="fps=$FPS,scale=$TW:$TH:force_original_aspect_ratio=decrease,pad=$TW:$TH:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p"
 for idx in "${!natives[@]}"; do
   seg="$WORKDIR/seg_$idx.mp4"
-  ffmpeg -y -hide_banner -loglevel error -i "${natives[$idx]}" \
-    -vf "fps=$FPS,scale=$TW:$TH:force_original_aspect_ratio=decrease,pad=$TW:$TH:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p" \
-    -an -c:v libx264 -pix_fmt yuv420p -r "$FPS" "$seg"
+  hold="${holds[$idx]}"
+  if [[ -n "$hold" ]]; then
+    # Card segment: loop the single painted still to EXACTLY $hold seconds. The
+    # duration is enforced HERE (-loop 1 -t), decoupled from agg — so a long
+    # card holds its full (capped) time instead of agg collapsing the tail.
+    ffmpeg -y -hide_banner -loglevel error -loop 1 -t "$hold" -i "${natives[$idx]}" \
+      -vf "$norm_vf" -an -c:v libx264 -pix_fmt yuv420p -r "$FPS" "$seg"
+  else
+    # Clip segment: normalize the rendered/pre-rendered clip as-is.
+    ffmpeg -y -hide_banner -loglevel error -i "${natives[$idx]}" \
+      -vf "$norm_vf" -an -c:v libx264 -pix_fmt yuv420p -r "$FPS" "$seg"
+  fi
   printf "file '%s'\n" "$seg" >> "$list"
 done
 

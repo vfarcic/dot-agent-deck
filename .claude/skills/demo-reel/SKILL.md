@@ -94,8 +94,13 @@ For each manifest entry, in order:
    sensible default for a `gif`/`mp4`). It is rendered through the **same `agg`
    invocation** (theme, font, size, fps) as the clips, so the card is
    pixel-identical to a `.cast` clip by construction. The card's **hold**
-   duration scales to text length (`max(3s, ceil(words / 3))`) and
-   `agg --idle-time-limit` is set above the hold so it is not truncated.
+   duration scales to text length, clamped to a sane band
+   (`clamp(ceil(words / 3), 3s, 8s)`): a short card stays up long enough to
+   read, a long one pauses the viewer without ever parking the reel on a static
+   frame. The hold is enforced at the **ffmpeg** level — a single painted still
+   is frozen from the rendered card and looped to *exactly* the hold duration —
+   so it is decoupled from `agg`'s idle handling (which would otherwise collapse
+   the static tail to a couple of seconds).
 2. **Clip.** A `.cast` is rendered with that same `agg` invocation; a
    pre-rendered `gif`/`mp4` is used as-is.
 

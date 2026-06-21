@@ -44,14 +44,17 @@ MAN="$TMP/manifest.json"
 len="$(jq 'length' "$MAN")"
 [[ "$len" -eq 2 ]] || fail "(i) expected 2 entries, got $len (L1 gamma must be excluded)"
 
+# Beta's fixture title/description carry HTML entities (&#91;label&#93;, &amp;) —
+# the adapter must HTML-decode them to literal characters on the card while
+# leaving the catalog id (the part before " — ", used for ordering) untouched.
 t0="$(jq -r '.[0].title' "$MAN")"
 t1="$(jq -r '.[1].title' "$MAN")"
-[[ "$t0" == "mouse/button/001 — Beta renders its label." ]]  || fail "(i) entry 0 title: '$t0'"
-[[ "$t1" == "mouse/button/002 — Alpha renders its label." ]] || fail "(i) entry 1 title: '$t1'"
+[[ "$t0" == "mouse/button/001 — Beta renders its [label]." ]]  || fail "(i) entry 0 title (entities must decode): '$t0'"
+[[ "$t1" == "mouse/button/002 — Alpha renders its label." ]]   || fail "(i) entry 1 title: '$t1'"
 
 d0="$(jq -r '.[0].description' "$MAN")"
 d1="$(jq -r '.[1].description' "$MAN")"
-[[ "$d0" == "Beta scenario: start the app and confirm the beta widget renders its label." ]]   || fail "(i) entry 0 desc: '$d0'"
+[[ "$d0" == "Beta scenario: start the app & confirm the beta widget renders its [label]." ]] || fail "(i) entry 0 desc (entities must decode): '$d0'"
 [[ "$d1" == "Alpha scenario: start the app and confirm the alpha widget renders its label." ]] || fail "(i) entry 1 desc: '$d1'"
 
 c0="$(jq -r '.[0].clip' "$MAN")"

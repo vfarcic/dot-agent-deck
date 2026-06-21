@@ -102,6 +102,24 @@ extract_description() {
   ' "$md" | awk 'NF' | tr '\n' ' ' | sed -E 's/  +/ /g; s/^ //; s/ $//'
 }
 
+# Decode the small set of HTML entities this repo's test.md generator emits, so
+# card text shows literal characters ([ ] & < > ' "). This is repo-specific (the
+# generator HTML-escapes), so decoding lives in the ADAPTER — the engine keeps
+# painting its manifest text verbatim. Both named and numeric (decimal, with
+# optional leading zeros) forms are handled. `&amp;` / `&#38;` are decoded LAST
+# so an escaped entity is not re-decoded into something else.
+html_decode() {
+  sed -E '
+    s/&#0*91;/[/g
+    s/&#0*93;/]/g
+    s/&lt;/</g;       s/&#0*60;/</g
+    s/&gt;/>/g;       s/&#0*62;/>/g
+    s/&#0*39;/'\''/g; s/&apos;/'\''/g
+    s/&quot;/"/g;     s/&#0*34;/"/g
+    s/&amp;/\&/g;     s/&#0*38;/\&/g
+  '
+}
+
 # Source-file basename from the test.md "**Source:**" line
 # (`<dir>/<file>::<fn>` inside backticks) — used by selection only.
 extract_source_basename() {
@@ -130,7 +148,7 @@ catalog_ord() {
 # --------------------------------------------------------------------------
 assemble() {
   local manifest="$1"; shift
-  local rows id md cast title catid desc ord obj
+  local rows id md cast title catid desc ord obj title_dec desc_dec
   rows="$(mktemp)"
   # The rows scratch file is removed on the normal exit paths below, but a
   # validation `die` can abort mid-loop — so also clean it up on any exit
@@ -154,10 +172,14 @@ assemble() {
     [[ -f "$md" ]] || die "missing test.md for '$id': $md"
     title="$(extract_title "$md")"
     [[ -n "$title" ]] || die "no H1 title in $md"
+    # catid is matched against CATALOG.md ids, so derive it from the RAW title
+    # (ids are plain ASCII — no entities); only the card-bound text is decoded.
     catid="$(extract_catalog_id "$title")"
     desc="$(extract_description "$md")"
     ord="$(catalog_ord "$catid")"
-    obj="$(jq -nc --arg t "$title" --arg d "$desc" --arg c "$cast" \
+    title_dec="$(printf '%s' "$title" | html_decode)"
+    desc_dec="$(printf '%s' "$desc" | html_decode)"
+    obj="$(jq -nc --arg t "$title_dec" --arg d "$desc_dec" --arg c "$cast" \
       '{title:$t, description:$d, clip:$c}')"
     printf '%010d\t%s\t%s\n' "$ord" "$id" "$obj" >> "$rows"
   done

@@ -1,4 +1,4 @@
-# mouse/button/001 — Beta renders its label.
+# mouse/button/001 — Beta renders its &#91;label&#93;.
 
 **Source:** `tests/e2e_mouse_button.rs::beta`
 **Catalog:** tests/CATALOG.md
@@ -6,7 +6,7 @@
 
 ## Scenario
 
-Beta scenario: start the app and confirm the beta widget renders its label.
+Beta scenario: start the app &amp; confirm the beta widget renders its &#91;label&#93;.
 
 ## Steps
 
