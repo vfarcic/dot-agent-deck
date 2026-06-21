@@ -7,13 +7,13 @@
 //! process PATH. When the daemon is launched without the user's login profile,
 //! its PATH lacks the dir where `claude`/`opencode` live (`~/.local/bin`), so a
 //! bare command fails to spawn. PRD #170's fix captures the login-shell PATH
-//! once at daemon startup (`$SHELL -lc 'printf %s "$PATH"'`) and applies it to
+//! once at daemon startup (`$SHELL -ilc 'printf %s "$PATH"'`) and applies it to
 //! the daemon's own environment, so every subsequently-spawned pane inherits it.
 //!
 //! These tests reproduce the failure without depending on the host's real
 //! `~/.local/bin`: a stub binary is placed in a temp dir that is NOT on the
 //! daemon's PATH, and the daemon's `$SHELL` is a fake login shell whose
-//! `-lc` output adds that dir to PATH (mirroring how `~/.profile` adds
+//! `-ilc` output adds that dir to PATH (mirroring how `~/.profile` adds
 //! `~/.local/bin`). A bare reference to the stub therefore resolves ONLY if the
 //! daemon captured the login-shell PATH. All three of PRD #170's spawn paths are
 //! pinned here — the dashboard new-pane (`001`, real TUI), a scheduled-task fire
@@ -46,7 +46,7 @@ struct LoginFixture {
     stub_name: String,
     /// Absolute path of the marker the stub writes when it runs.
     marker: std::path::PathBuf,
-    /// A fake login shell whose `-lc` output adds the stub dir to PATH.
+    /// A fake login shell whose `-ilc` output adds the stub dir to PATH.
     fake_shell: std::path::PathBuf,
     /// Working dir for the spawned pane / task.
     work: std::path::PathBuf,
@@ -58,8 +58,8 @@ struct LoginFixture {
 ///   - a stub command (named `stub_name`) in a `stubbin/` dir that writes a
 ///     marker file then stays alive (so the spawned pane is "running");
 ///   - a fake login shell that emulates a profile prepending `stubbin/` to PATH
-///     and, invoked as `-lc '<script>'`, runs the script with that enriched
-///     PATH — exactly what PRD #170's `$SHELL -lc 'printf %s "$PATH"'` capture
+///     and, invoked as `-ilc '<script>'`, runs the script with that enriched
+///     PATH — exactly what PRD #170's `$SHELL -ilc 'printf %s "$PATH"'` capture
 ///     reads;
 ///   - a `config.toml` whose `default_command` is the bare stub.
 ///
@@ -90,7 +90,7 @@ fn login_path_fixture(stub_name: &str) -> LoginFixture {
 
     // The fake login shell: prepend the stub dir to PATH (the one profile effect
     // we emulate), then exec whatever command was requested. Drops any leading
-    // flag bundle (`-l`, `-c`, `-lc`, `-lic`, …) so `$SHELL -lc '<script>'`
+    // flag bundle (`-l`, `-c`, `-lc`, `-ilc`, `-lic`, …) so `$SHELL -ilc '<script>'`
     // works; the capture's `printf` then prints the enriched PATH.
     let fake_shell = base.join("login-shell.sh");
     std::fs::write(
@@ -140,7 +140,7 @@ fn login_path_fixture(stub_name: &str) -> LoginFixture {
 
 /// Scenario: Launch the deck with `default_command` set to a bare stub command
 /// that lives ONLY in a dir absent from the inherited PATH, and `$SHELL` pointed
-/// at a fake login shell whose `-lc` output adds that dir to PATH. Open the
+/// at a fake login shell whose `-ilc` output adds that dir to PATH. Open the
 /// new-pane form (Ctrl+n → Space confirms the dir) — the Command field is
 /// pre-filled with the bare stub — and submit via the `[Submit]` button. Assert
 /// the bare command resolves and spawns: the stub writes its on-disk marker.
@@ -177,13 +177,13 @@ fn login_path_001_new_pane_resolves_login_shell_command() {
         common::wait_for_path(&fx.marker, Duration::from_secs(15)),
         "a dashboard new-pane whose command is a bare binary living only in the \
          login-shell PATH must spawn successfully, but its marker never appeared — \
-         the daemon should capture the login-shell PATH (`$SHELL -lc 'printf %s \
+         the daemon should capture the login-shell PATH (`$SHELL -ilc 'printf %s \
          \"$PATH\"'`) at startup so the bare command resolves"
     );
 }
 
 /// Scenario: Spawn a headless daemon with `$SHELL` pointed at a fake login shell
-/// whose `-lc` output adds a stub dir (absent from the daemon's PATH) to PATH,
+/// whose `-ilc` output adds a stub dir (absent from the daemon's PATH) to PATH,
 /// and register a scheduled task whose `command` is a bare stub living only in
 /// that dir. Fire the task via the `RunNow` control message and assert the bare
 /// command resolves and spawns: the stub writes its on-disk marker. GREEN now
@@ -218,14 +218,14 @@ fn login_path_002_scheduled_fire_resolves_login_shell_command() {
         common::wait_for_path(&fx.marker, Duration::from_secs(15)),
         "a scheduled-task fire whose command is a bare binary living only in the \
          login-shell PATH must spawn successfully, but its marker never appeared — \
-         the daemon should capture the login-shell PATH (`$SHELL -lc 'printf %s \
+         the daemon should capture the login-shell PATH (`$SHELL -ilc 'printf %s \
          \"$PATH\"'`) at startup so the bare command resolves"
     );
 }
 
 /// Scenario: Launch the deck with `default_command` set to a bare authoring
 /// command that lives ONLY in a dir absent from the inherited PATH, and `$SHELL`
-/// pointed at a fake login shell whose `-lc` output adds that dir to PATH, plus a
+/// pointed at a fake login shell whose `-ilc` output adds that dir to PATH, plus a
 /// fixture `schedules.toml` holding one task. Open the Scheduled-Tasks manager
 /// (`S`), press `e` to edit the auto-selected row — which now reuses the `Ctrl+n`
 /// flow (PRD #170 unify): a directory picker (` Select Directory `) → the
@@ -293,7 +293,7 @@ fn login_path_003_schedule_authoring_resolves_login_shell_command() {
         "the schedule-authoring helper's bare command (a binary living only in the \
          login-shell PATH) must resolve and spawn under the daemon's login-shell-\
          enriched PATH, but its marker never appeared — PRD #170's third spawn path \
-         must benefit from the same `$SHELL -lc 'printf %s \"$PATH\"'` capture so the \
+         must benefit from the same `$SHELL -ilc 'printf %s \"$PATH\"'` capture so the \
          bare `default_command` resolves"
     );
 

@@ -8,97 +8,159 @@
 //! to spawn.
 //!
 //! The fix is a single daemon-startup block: capture the user's login-shell
-//! PATH once (`$SHELL -lc 'printf %s "$PATH"'`, bounded by a timeout) and set it
-//! into the daemon's own environment. Every pane the daemon subsequently spawns
-//! inherits that PATH automatically, with NO change to the hot spawn path. On
-//! capture failure (no `$SHELL`, non-zero exit, timeout, or empty output) the
-//! daemon keeps its inherited PATH, so behavior never regresses.
+//! PATH once and set it into the daemon's own environment. The capture runs the
+//! user's `$SHELL` as an *interactive login* shell (`-ilc`) — the same kind of
+//! shell an SSH session gets — so it sources `~/.bashrc` exactly as an
+//! interactive login does. That matters: many CLI installers (e.g. `opencode`)
+//! append their `PATH` line to `~/.bashrc`, *after* the standard
+//! `case $- in *i*) ;; *) return;; esac` guard that bails out of a
+//! non-interactive shell, so a login-*only* (`-lc`) capture never sees them.
+//! Every pane the daemon subsequently spawns inherits the captured PATH
+//! automatically, with NO change to the hot spawn path. On capture failure (no
+//! `$SHELL`, non-zero exit, timeout, or unusable output) the daemon keeps its
+//! inherited PATH, so behavior never regresses.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Upper bound on the login-shell capture. A login shell sourcing the user's
-/// profile is normally sub-second; on timeout we fall back to the inherited
-/// PATH (no regression).
-const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on the login-shell capture. An interactive login shell sourcing
+/// the user's profile *and* `~/.bashrc` is normally well under a second, but a
+/// heavy interactive setup (nvm / conda / rbenv init, version-manager hooks)
+/// can take longer, so we allow generous headroom. The bound only ever bites a
+/// hung shell — a healthy one exits in milliseconds — and on timeout we fall
+/// back to the inherited PATH (no regression).
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the capture polls the child for completion while waiting.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Capture the login-shell PATH by running `$SHELL -lc 'printf %s "$PATH"'`.
+/// Marker tokens that wrap the PATH in the probe's stdout. We extract the PATH
+/// from *between* them rather than reading raw stdout, because an **interactive**
+/// startup file (`~/.bashrc` & friends) may print a banner, MOTD, version line,
+/// or other noise to stdout before our `printf` ever runs. A real PATH never
+/// contains these literal tokens, so the slice between them is exactly the PATH.
+const PATH_MARK_BEGIN: &str = "__DOT_AGENT_DECK_PATH_BEGIN__";
+const PATH_MARK_END: &str = "__DOT_AGENT_DECK_PATH_END__";
+
+/// Capture the login-shell PATH by running the user's `$SHELL` as an
+/// **interactive login** shell and printing `$PATH`.
 ///
 /// Returns `Some(path)` only on a clean, non-empty result. Returns `None` when
 /// `$SHELL` is unset/empty, the shell fails to spawn, exits non-zero, times out,
-/// or prints nothing but whitespace.
+/// or prints no usable PATH.
 pub fn capture_login_shell_path() -> Option<String> {
     let shell = std::env::var("SHELL").ok()?;
     capture_path_via_shell(&shell)
 }
 
-/// Run `<shell> -lc 'printf %s "$PATH"'` with a timeout and return the trimmed
-/// stdout. Split out from [`capture_login_shell_path`] so the parse/fallback
-/// branches are unit-testable with a fake `$SHELL` (a temp script) without
-/// mutating the process environment.
+/// Run `<shell> -ilc '<probe>'` with a timeout and return the captured PATH.
+///
+/// The shell is invoked **interactive** (`-i`) **and** login (`-l`) — the same
+/// combination an SSH session gets — so it sources the identical startup files,
+/// including `~/.bashrc`. That is the crux of the fix: most CLI installers (e.g.
+/// `opencode`) append their `PATH` line to `~/.bashrc`, *after* the standard
+/// `case $- in *i*) ;; *) return;; esac` guard that bails out of a
+/// non-interactive shell. A login-only (`-lc`) capture hits that guard and never
+/// sees those dirs, so a bare `opencode` fails to resolve even though it works
+/// over SSH. Going interactive makes the captured PATH match "what works when you
+/// SSH in" — the invariant users expect.
+///
+/// Split out from [`capture_login_shell_path`] so the parse branches are
+/// unit-testable with a fake `$SHELL` (a temp script) without mutating the
+/// process environment.
 fn capture_path_via_shell(shell: &str) -> Option<String> {
     if shell.trim().is_empty() {
         return None;
     }
 
-    // `-lc <command>`: a login shell (`-l`) running a single command string
-    // (`-c`), exactly as the PRD specifies. `printf %s` emits the PATH with no
-    // trailing newline; we trim anyway to be robust to shells that add one.
+    // `-ilc <probe>`: interactive (`-i`) login (`-l`) shell running a single
+    // command string (`-c`). The probe prints `$PATH` wrapped in unique markers
+    // so we can recover it even when an interactive rc writes a banner to stdout
+    // first (see `PATH_MARK_BEGIN`). `-c` makes the shell run the probe and exit,
+    // so `-i` does not leave it waiting on (null) stdin.
+    let probe = format!(r#"printf '{PATH_MARK_BEGIN}%s{PATH_MARK_END}' "$PATH""#);
     let mut child = Command::new(shell)
-        .arg("-lc")
-        .arg(r#"printf %s "$PATH""#)
+        .arg("-ilc")
+        .arg(&probe)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
 
+    // Drain stdout on a separate thread *while* we poll for exit. An interactive
+    // rc may print a banner / MOTD to stdout before our `printf` runs; if that
+    // exceeds the OS pipe buffer (~64 KB on Linux) the child would block on its
+    // write and `try_wait` would never complete — a deadlock that hangs until
+    // CAPTURE_TIMEOUT and then falls back, defeating the capture for exactly the
+    // verbose-profile users this targets. Concurrent draining keeps the pipe
+    // empty; the reader returns when the child's stdout closes.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        buf
+    });
+
     // Poll for completion so we can enforce the timeout AND kill a hung shell.
-    // The captured output (PATH) is far smaller than the pipe buffer, so it is
-    // safe to read it only after exit; a shell that floods stdout instead would
-    // block on write and simply hit the timeout below.
     let deadline = Instant::now() + CAPTURE_TIMEOUT;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    break None;
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
-            Err(_) => return None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
         }
     };
 
-    if !status.success() {
-        return None;
+    // On a clean exit the child's stdout is closed, so the drainer has finished
+    // (or will momentarily) — join it to collect the output. On timeout/error we
+    // already killed the child; drop the handle instead of joining so we never
+    // block on a drainer an exotic backgrounded grandchild could keep open. On
+    // the clean path the join completes before this returns, so the process is
+    // single-threaded again before `apply_login_shell_path` calls `set_var`.
+    match status {
+        Some(status) if status.success() => {
+            let out = reader.join().ok()?;
+            extract_marked_path(&out)
+        }
+        _ => None,
     }
+}
 
-    let mut out = String::new();
-    child.stdout.as_mut()?.read_to_string(&mut out).ok()?;
-    let trimmed = out.trim();
-    if trimmed.is_empty() {
+/// Pull the PATH out from between [`PATH_MARK_BEGIN`] and [`PATH_MARK_END`] and
+/// validate it. Returns `None` when the markers are absent (the probe never ran
+/// — e.g. an rc that hard-exits — or produced nothing), the captured value is
+/// empty, or it carries a NUL / other control byte.
+fn extract_marked_path(out: &str) -> Option<String> {
+    let start = out.find(PATH_MARK_BEGIN)? + PATH_MARK_BEGIN.len();
+    let end_rel = out[start..].find(PATH_MARK_END)?;
+    let path = out[start..start + end_rel].trim();
+    if path.is_empty() {
         return None;
     }
     // PRD #170 round 2 (auditor finding 1): reject a value carrying a NUL or any
-    // other control byte BEFORE it can reach `std::env::set_var`. `str::trim`
-    // strips surrounding whitespace but NOT an embedded NUL (U+0000 is valid
-    // UTF-8 and not whitespace), and `set_var` PANICS on a NUL — so a
+    // other control byte BEFORE it can reach `std::env::set_var`. `set_var`
+    // PANICS on a NUL (U+0000 is valid UTF-8 and survives `trim`), so a
     // pathological / malicious `$SHELL` that printed one would crash daemon
     // startup. A real shell printing a real PATH never contains a control byte,
-    // so a clean capture is unaffected; a tainted one falls back to the
-    // inherited PATH (no regression).
-    if trimmed.chars().any(|c| c.is_control()) {
+    // so a clean capture is unaffected; a tainted one falls back to the inherited
+    // PATH (no regression).
+    if path.chars().any(|c| c.is_control()) {
         return None;
     }
-    Some(trimmed.to_string())
+    Some(path.to_string())
 }
 
 /// PRD #170 round 2 (auditor finding 2): debug-only run-once latch. The
@@ -172,6 +234,13 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Wrap `path` in the probe markers exactly as the real `printf` probe does,
+    /// so [`extract_marked_path`] sees the same framing it must parse in
+    /// production.
+    fn marked(path: &str) -> String {
+        format!("{PATH_MARK_BEGIN}{path}{PATH_MARK_END}")
+    }
+
     /// Write `body` to a fresh executable script under `dir` and return its path.
     fn write_shell(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let path = dir.join(name);
@@ -181,14 +250,103 @@ mod tests {
         path
     }
 
+    /// A fake `$SHELL` that exports `path_value` as PATH, drops the leading flag
+    /// bundle (`-ilc`, `-lc`, …), then runs the requested `-c` command (our
+    /// probe) so the real probe string + marker framing are exercised end to end.
+    /// Exits with `exit_code` so the status-rejection branch is testable.
+    fn write_probe_shell(
+        dir: &std::path::Path,
+        name: &str,
+        path_value: &str,
+        exit_code: i32,
+    ) -> std::path::PathBuf {
+        let body = format!(
+            "#!/bin/sh\n\
+             export PATH=\"{path_value}\"\n\
+             while [ \"$#\" -gt 0 ]; do case \"$1\" in -*) shift ;; *) break ;; esac; done\n\
+             if [ \"$#\" -gt 0 ]; then /bin/sh -c \"$1\"; fi\n\
+             exit {exit_code}\n"
+        );
+        write_shell(dir, name, &body)
+    }
+
     #[test]
-    fn captures_path_from_login_shell_stdout() {
+    fn extract_marked_path_returns_inner_value() {
+        assert_eq!(
+            extract_marked_path(&marked("/opt/login/bin:/usr/bin")),
+            Some("/opt/login/bin:/usr/bin".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_marked_path_ignores_surrounding_noise() {
+        // An interactive rc printed a banner before, and a newline after, the
+        // markers — the inner PATH must still come out clean. This is why we
+        // delimit instead of reading raw stdout.
+        let out = format!("Welcome to the machine!\n{}\n", marked("/opt/login/bin"));
+        assert_eq!(
+            extract_marked_path(&out),
+            Some("/opt/login/bin".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_marked_path_none_when_markers_absent() {
+        // No probe output at all (rc hard-exited before printf) → no markers.
+        assert_eq!(extract_marked_path("just a banner, no markers"), None);
+        // Begin marker but no end marker → still None.
+        assert_eq!(
+            extract_marked_path(&format!("{PATH_MARK_BEGIN}/opt/bin")),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_marked_path_none_when_inner_empty() {
+        assert_eq!(extract_marked_path(&marked("")), None);
+        assert_eq!(extract_marked_path(&marked("   ")), None);
+    }
+
+    #[test]
+    fn extract_marked_path_none_on_control_byte() {
+        // PRD #170 round 2 (auditor finding 1): a NUL inside the markers would
+        // make `set_var` panic, and any other control byte is equally bogus — a
+        // real PATH never contains one, so both are rejected and the daemon keeps
+        // its inherited PATH instead of crashing.
+        assert_eq!(extract_marked_path(&marked("/opt/bin\u{0}/usr/bin")), None);
+        assert_eq!(extract_marked_path(&marked("/opt/bin\u{1b}/usr/bin")), None);
+    }
+
+    #[test]
+    fn captures_path_from_interactive_login_shell() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // A fake `$SHELL` that, invoked with `-lc <cmd>`, prints a known PATH.
+        let shell = write_probe_shell(dir.path(), "ok-shell.sh", "/opt/login/bin:/usr/bin", 0);
+        assert_eq!(
+            capture_path_via_shell(&shell.to_string_lossy()),
+            Some("/opt/login/bin:/usr/bin".to_string()),
+        );
+    }
+
+    #[test]
+    fn captures_path_despite_large_stdout_banner() {
+        // Regression guard: an interactive rc that prints a banner bigger than
+        // the OS pipe buffer (~64 KB) to stdout BEFORE our probe must not
+        // deadlock the capture. stdout is drained on a thread concurrently with
+        // the poll loop, so the child never blocks on its write and the marked
+        // PATH (printed last) still parses out. Without concurrent draining this
+        // would hang until CAPTURE_TIMEOUT and then return None.
+        let dir = tempfile::tempdir().expect("tempdir");
         let shell = write_shell(
             dir.path(),
-            "ok-shell.sh",
-            "#!/bin/sh\nprintf %s \"/opt/login/bin:/usr/bin\"\n",
+            "verbose-shell.sh",
+            "#!/bin/sh\n\
+             export PATH=\"/opt/login/bin:/usr/bin\"\n\
+             i=0\n\
+             while [ \"$i\" -lt 2000 ]; do \
+             printf 'banner line %s padding padding padding padding padding\\n' \"$i\"; \
+             i=$((i + 1)); done\n\
+             while [ \"$#\" -gt 0 ]; do case \"$1\" in -*) shift ;; *) break ;; esac; done\n\
+             if [ \"$#\" -gt 0 ]; then /bin/sh -c \"$1\"; fi\n",
         );
         assert_eq!(
             capture_path_via_shell(&shell.to_string_lossy()),
@@ -197,36 +355,37 @@ mod tests {
     }
 
     #[test]
-    fn trims_trailing_whitespace_from_output() {
+    fn capture_requests_an_interactive_shell() {
+        // The crux of the fix: the capture MUST invoke an *interactive* shell
+        // (`-i`), or dirs added behind `~/.bashrc`'s `case $- in *i*` guard
+        // (where installers like opencode put their PATH line) are missed. This
+        // fake `$SHELL` exports the extra dir ONLY when it sees an `-i`-bearing
+        // flag, so a login-only capture would yield the bare `/usr/bin` and this
+        // assertion would fail.
         let dir = tempfile::tempdir().expect("tempdir");
         let shell = write_shell(
             dir.path(),
-            "trailing-shell.sh",
-            "#!/bin/sh\nprintf '%s\\n' \"/opt/login/bin\"\n",
+            "interactive-aware-shell.sh",
+            "#!/bin/sh\n\
+             interactive=0\n\
+             for a in \"$@\"; do case \"$a\" in -*i*) interactive=1 ;; esac; done\n\
+             if [ \"$interactive\" = 1 ]; then export PATH=\"/opt/interactive/bin:/usr/bin\"; \
+             else export PATH=\"/usr/bin\"; fi\n\
+             while [ \"$#\" -gt 0 ]; do case \"$1\" in -*) shift ;; *) break ;; esac; done\n\
+             if [ \"$#\" -gt 0 ]; then /bin/sh -c \"$1\"; fi\n",
         );
         assert_eq!(
             capture_path_via_shell(&shell.to_string_lossy()),
-            Some("/opt/login/bin".to_string()),
+            Some("/opt/interactive/bin:/usr/bin".to_string()),
+            "capture must run the shell interactively (`-i`) so ~/.bashrc-added dirs are seen"
         );
     }
 
     #[test]
     fn none_on_non_zero_exit() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // Prints a plausible PATH but exits non-zero — must be rejected.
-        let shell = write_shell(
-            dir.path(),
-            "fail-shell.sh",
-            "#!/bin/sh\nprintf %s \"/opt/login/bin\"\nexit 1\n",
-        );
-        assert_eq!(capture_path_via_shell(&shell.to_string_lossy()), None);
-    }
-
-    #[test]
-    fn none_on_empty_output() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // Exits cleanly but prints only whitespace — must fall back to None.
-        let shell = write_shell(dir.path(), "blank-shell.sh", "#!/bin/sh\nprintf '   \\n'\n");
+        // Prints a valid marked PATH but exits non-zero — must be rejected.
+        let shell = write_probe_shell(dir.path(), "fail-shell.sh", "/opt/login/bin", 1);
         assert_eq!(capture_path_via_shell(&shell.to_string_lossy()), None);
     }
 
@@ -243,34 +402,5 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("does-not-exist-shell");
         assert_eq!(capture_path_via_shell(&missing.to_string_lossy()), None);
-    }
-
-    #[test]
-    fn none_on_nul_byte_in_output() {
-        // PRD #170 round 2 (auditor finding 1): a pathological `$SHELL` printing
-        // a PATH with an embedded NUL must be rejected — `set_var` panics on a
-        // NUL, so the capture path returns None and the daemon keeps its
-        // inherited PATH instead of crashing at startup. `\000` is octal NUL in
-        // POSIX `printf`.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let shell = write_shell(
-            dir.path(),
-            "nul-shell.sh",
-            "#!/bin/sh\nprintf '/opt/bin'\nprintf '\\000'\nprintf ':/usr/bin'\n",
-        );
-        assert_eq!(capture_path_via_shell(&shell.to_string_lossy()), None);
-    }
-
-    #[test]
-    fn none_on_control_byte_in_output() {
-        // Any other embedded control byte (here a raw ESC, `\033`) is rejected
-        // the same way — a real PATH never contains one.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let shell = write_shell(
-            dir.path(),
-            "ctrl-shell.sh",
-            "#!/bin/sh\nprintf '/opt/bin\\033/usr/bin'\n",
-        );
-        assert_eq!(capture_path_via_shell(&shell.to_string_lossy()), None);
     }
 }
