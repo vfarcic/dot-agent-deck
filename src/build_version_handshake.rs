@@ -50,8 +50,10 @@ use tokio::net::UnixStream;
 
 use crate::build_id::local_build_id;
 use crate::daemon_attach::peer_pid;
-use crate::daemon_client::issue_command;
-use crate::daemon_protocol::{AttachRequest, AttachResponse, PROTOCOL_VERSION};
+use crate::daemon_client::{DaemonClient, issue_command};
+use crate::daemon_protocol::{
+    AttachRequest, AttachResponse, PROTOCOL_VERSION, RunningAgentsSummary,
+};
 
 /// How long to wait for the daemon's attach socket to disappear after a
 /// `SIGTERM` before reporting failure. The daemon's own teardown runs a
@@ -172,34 +174,70 @@ pub async fn ensure_compatible_daemon_or_die(
     }
 
     // Mismatch path (PRD #161 D2, option A — consent-based always-restart).
-    // Read the running-agent summary straight from the hello reply
-    // (`running_agents`, PRD #161 M1.1) so the prompt can name the live
-    // agents by their DISPLAY names — not a `list_agents()` round-trip,
-    // which yields generated ids. A pre-PRD-161 daemon omits the field, in
-    // which case we have no agents to enumerate and treat it as "no agents".
-    let agents: Vec<String> = probe
-        .response
-        .running_agents
-        .as_ref()
-        .map(|s| s.names.clone())
-        .unwrap_or_default();
+    // Decide whether to restart SILENTLY or take the consent path based on
+    // whether agents are running. Prefer the hello reply's `running_agents`
+    // summary (PRD #161 M1.1) so the prompt can name the live agents by their
+    // DISPLAY names. A pre-#161 daemon omits that field entirely (`None`) — it
+    // predates M1.1, but `PROTOCOL_VERSION` is unchanged so the handshake still
+    // proceeds. We must NOT treat that absence as "no agents" (FIX 1): doing so
+    // would SILENTLY SIGTERM live agents the new TUI can't see, regressing vs
+    // #103 (which used `list_agents`) and violating D2/D4. Instead fall back to
+    // `list_agents()`, and silent-restart ONLY on a POSITIVE zero-agents
+    // confirmation (`Some(0)`, or `None` + an empty list). When the field is
+    // absent and `list_agents` errors (cannot determine), be conservative and
+    // take the consent path — never silently kill when uncertain (never-strand).
+    let action = match probe.response.running_agents.as_ref() {
+        Some(summary) => decide_mismatch_action(Some(summary), FallbackAgents::Unknown),
+        None => {
+            let fallback = match DaemonClient::new(attach_path.to_path_buf())
+                .list_agents()
+                .await
+            {
+                Ok(records) if records.is_empty() => FallbackAgents::Empty,
+                Ok(records) => FallbackAgents::Present(
+                    records
+                        .into_iter()
+                        .map(|r| r.display_name.unwrap_or(r.id))
+                        .collect(),
+                ),
+                Err(e) => {
+                    tracing::debug!(
+                        target: "build_version_handshake",
+                        error = %e,
+                        "running_agents omitted and list_agents failed; taking consent path conservatively"
+                    );
+                    FallbackAgents::Unknown
+                }
+            };
+            decide_mismatch_action(None, fallback)
+        }
+    };
+
+    let agents: Vec<String> = match action {
+        // (a) Positive zero-agents confirmation: nothing to lose, so restart
+        // SILENTLY — regardless of TTY. No prompt, no consent. The caller
+        // re-runs `ensure_external_daemon_or_die` after `Recovered`,
+        // lazy-spawning a fresh daemon at the current build.
+        MismatchAction::SilentRestart => {
+            tracing::debug!(
+                target: "build_version_handshake",
+                local_build,
+                daemon_build = ?daemon_build,
+                "local daemon build_version handshake: mismatch, no agents — silent restart"
+            );
+            return terminate_and_recover(&probe, attach_path).await;
+        }
+        MismatchAction::AgentsPresent { names } => names,
+    };
     tracing::debug!(
         target: "build_version_handshake",
         local_build,
         daemon_build = ?daemon_build,
         live_agents = agents.len(),
-        "local daemon build_version handshake: mismatch"
+        "local daemon build_version handshake: mismatch, agents present — consent path"
     );
 
-    // (a) No agents running: nothing to lose, so restart SILENTLY —
-    // regardless of TTY. No prompt, no consent. The caller re-runs
-    // `ensure_external_daemon_or_die` after `Recovered`, lazy-spawning a
-    // fresh daemon at the current build.
-    if agents.is_empty() {
-        return terminate_and_recover(&probe, attach_path).await;
-    }
-
-    // (c) Agents running + non-TTY: the restart is mandatory but can't get
+    // (c) Agents present + non-TTY: the restart is mandatory but can't get
     // consent on a pipe, so print the daemon-recovery hint to stderr and
     // exit non-zero. This is the only non-zero-exit path.
     if !std::io::stdout().is_terminal() {
@@ -208,7 +246,7 @@ pub async fn ensure_compatible_daemon_or_die(
         return Err(HandshakeError::MismatchAborted);
     }
 
-    // (b) Agents running + TTY: ask the user whether to restart. The prompt
+    // (b) Agents present + TTY: ask the user whether to restart. The prompt
     // is rendered in raw mode on a blocking thread (crossterm's
     // event::read is synchronous; doing it directly would block the
     // tokio worker).
@@ -231,6 +269,65 @@ pub async fn ensure_compatible_daemon_or_die(
         // #161 D4 never-strand). The caller must NOT re-spawn.
         InteractiveDecision::Decline => Ok(HandshakeOutcome::ProceedOnExisting),
         InteractiveDecision::Restart => terminate_and_recover(&probe, attach_path).await,
+    }
+}
+
+/// PRD #161 FIX 1 — the outcome of consulting the fallback `list_agents` when
+/// the hello reply omits `running_agents` (a pre-#161 daemon that predates the
+/// M1.1 field). Three states so the decision can distinguish "positively zero
+/// agents" (safe to silent-restart) from "couldn't tell" (must take the consent
+/// path — never-strand, D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FallbackAgents {
+    /// `list_agents` returned a non-empty set — agents are present. Carries
+    /// their labels (display name, falling back to id) for the prompt.
+    Present(Vec<String>),
+    /// `list_agents` positively returned zero agents — nothing to lose.
+    Empty,
+    /// The fallback was not consulted (the summary was present), or
+    /// `list_agents` errored (indeterminate). Either way: do not silent-restart.
+    Unknown,
+}
+
+/// PRD #161 FIX 1 — what the mismatch path should do. `AgentsPresent` carries
+/// the names to show on the consent prompt (empty when indeterminate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MismatchAction {
+    /// Positive zero-agents confirmation — restart silently (regardless of TTY).
+    SilentRestart,
+    /// Agents present or indeterminate — take the consent path (TTY prompt /
+    /// non-TTY mandatory exit). `names` is what to show (may be empty).
+    AgentsPresent { names: Vec<String> },
+}
+
+/// PRD #161 FIX 1 — pure, testable mismatch decision. Silent-restart happens
+/// ONLY on a positive zero-agents confirmation: either the hello reply's
+/// `running_agents` summary reports `count == 0`, or it was absent (`None`)
+/// AND the fallback `list_agents` positively returned zero agents. When the
+/// summary is absent and the fallback could not be determined
+/// ([`FallbackAgents::Unknown`]), conservatively take the consent path so a
+/// pre-#161 daemon's live agents are never silently SIGTERM'd (D2/D4).
+///
+/// `fallback` is consulted only when `running_agents` is `None`; callers may
+/// pass [`FallbackAgents::Unknown`] when the summary is present (it is ignored).
+fn decide_mismatch_action(
+    running_agents: Option<&RunningAgentsSummary>,
+    fallback: FallbackAgents,
+) -> MismatchAction {
+    match running_agents {
+        // M1.1 summary present: authoritative. `count == 0` is a positive
+        // zero — silent restart; otherwise name the agents on the prompt.
+        Some(summary) if summary.count == 0 => MismatchAction::SilentRestart,
+        Some(summary) => MismatchAction::AgentsPresent {
+            names: summary.names.clone(),
+        },
+        // Pre-#161 daemon (field omitted): defer to the list_agents fallback.
+        None => match fallback {
+            FallbackAgents::Empty => MismatchAction::SilentRestart,
+            FallbackAgents::Present(names) => MismatchAction::AgentsPresent { names },
+            // Indeterminate: never silently kill when uncertain.
+            FallbackAgents::Unknown => MismatchAction::AgentsPresent { names: Vec::new() },
+        },
     }
 }
 
@@ -470,6 +567,48 @@ async fn poll_daemon_gone(attach_path: &Path, budget: Duration) -> bool {
 // Rendering / interactive prompt
 // ---------------------------------------------------------------------------
 
+/// PRD #161 FIX 4 — render-seam backstop. Strip characters from a
+/// daemon-supplied string that could perturb or spoof the live terminal when
+/// echoed into the mismatch prompt. On a build-mismatch the daemon's own
+/// `is_valid_display_name` gate cannot be assumed to have run, and it permits
+/// Unicode bidi overrides (U+202E etc.) and U+0085 anyway, so we re-validate
+/// CLIENT-SIDE at the render seam — without touching the global
+/// `is_valid_display_name` semantics. Strips:
+///   - C0 control bytes (`< 0x20`) and `0x7F` (DEL),
+///   - C1 controls (`0x80..=0x9F`, including U+0085 NEL) — covered by
+///     [`char::is_control`],
+///   - Unicode bidirectional format / override codepoints (U+202A..=U+202E,
+///     U+2066..=U+2069, U+200E/U+200F, U+061C) that can visually reorder or
+///     spoof the rendered text.
+///
+/// `keep_newlines` retains `\n` for the whole-prompt backstop pass (the
+/// prompt's own line structure is ours and trusted); the per-name pass passes
+/// `false` so an embedded newline in a name can't inject extra prompt lines.
+fn sanitize_for_prompt(s: &str, keep_newlines: bool) -> String {
+    s.chars()
+        .filter(|&c| {
+            if keep_newlines && c == '\n' {
+                return true;
+            }
+            !(c.is_control() || is_bidi_format_char(c))
+        })
+        .collect()
+}
+
+/// PRD #161 FIX 4 — Unicode bidirectional formatting / override codepoints that
+/// [`char::is_control`] does NOT catch (they are category `Cf`, not `Cc`) but
+/// which can visually reorder a rendered string to spoof an agent name.
+fn is_bidi_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202A}'..='\u{202E}'   // LRE, RLE, PDF, LRO, RLO
+            | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+            | '\u{200E}'              // LRM
+            | '\u{200F}'              // RLM
+            | '\u{061C}'              // ALM
+    )
+}
+
 /// Render the non-TTY (CI / piped-stdout) error message. Trailing
 /// newline included so the caller can write it directly.
 fn render_non_tty_error(daemon_build: Option<&str>, local_build: &str) -> String {
@@ -507,7 +646,9 @@ fn render_mismatch_prompt(
     out.push('\n');
     out.push_str("   Restarting to upgrade will stop these agents:\n");
     for name in agents {
-        out.push_str(&format!("   {name}\n"));
+        // FIX 4: sanitize each daemon-supplied name at the render seam so a
+        // control / bidi codepoint can't perturb or spoof this line.
+        out.push_str(&format!("   {}\n", sanitize_for_prompt(name, false)));
     }
     out.push('\n');
     out.push_str("   [S] restart daemon and continue   [any other key] keep current daemon\n");
@@ -523,12 +664,12 @@ enum InteractiveDecision {
 }
 
 /// Render the prompt in raw mode and block on `crossterm::event::read`
-/// until the user makes a choice. PRD #161 Part A: a single `s`/`S`
-/// consents to the restart; every dismiss key
-/// (`Esc`/`q`/`n`/`Enter`/`Ctrl+C`/`Ctrl+D`) DECLINES, which keeps the
-/// existing daemon (D4 never-strand). The old two-`S` double-confirm is
-/// gone — there is no longer an exit path on a TTY, so a second
-/// confirmation buys nothing.
+/// until the user makes a choice. PRD #161 Part A: a single `s`/`S` (without
+/// Ctrl) is the ONLY affirmative key and consents to the restart; **any other
+/// key** DECLINES, which keeps the existing daemon (D4 never-strand) and
+/// matches the prompt's advertised "[any other key] keep current daemon" (FIX
+/// 2). The old two-`S` double-confirm is gone — there is no longer an exit path
+/// on a TTY, so a second confirmation buys nothing.
 ///
 /// Runs on a blocking thread because `crossterm::event::read` is
 /// synchronous; the caller spawn_blocking()s this function.
@@ -553,10 +694,17 @@ fn interactive_prompt(
 
     let render = |body: &str| {
         let mut out = std::io::stdout().lock();
-        // Raw mode disables cooked LF→CRLF translation, so each `\n`
-        // must become `\r\n` for the prompt to land on consecutive
-        // left-aligned lines.
-        let with_cr = body.replace('\n', "\r\n");
+        // FIX 4 (render-seam backstop): strip control / bidi codepoints from
+        // the whole body just before it reaches the live terminal — a
+        // defense-in-depth pass over and above the per-name sanitize in
+        // `render_mismatch_prompt`, so nothing daemon-supplied (the agent
+        // names AND the echoed daemon build string) can perturb or spoof the
+        // terminal. `\n` is preserved (it is the prompt's own line structure)
+        // and then expanded to `\r\n` below: raw mode disables cooked LF→CRLF
+        // translation, so each `\n` must become `\r\n` for the prompt to land
+        // on consecutive left-aligned lines.
+        let safe = sanitize_for_prompt(body, true);
+        let with_cr = safe.replace('\n', "\r\n");
         let _ = out.write_all(with_cr.as_bytes());
         let _ = out.flush();
     };
@@ -578,19 +726,17 @@ fn interactive_prompt(
             continue;
         };
         match (code, modifiers) {
-            // The ONLY affirmative key: a single `s`/`S` restarts.
+            // The ONLY affirmative key: a single `s`/`S` (without Ctrl) restarts.
             (KeyCode::Char('s' | 'S'), m) if !m.contains(KeyModifiers::CONTROL) => {
                 return InteractiveDecision::Restart;
             }
-            // Explicit dismiss keys all decline → keep the existing daemon.
-            (KeyCode::Char('q' | 'Q' | 'n' | 'N'), m) if !m.contains(KeyModifiers::CONTROL) => {
-                return InteractiveDecision::Decline;
-            }
-            (KeyCode::Char('c' | 'd'), m) if m.contains(KeyModifiers::CONTROL) => {
-                return InteractiveDecision::Decline;
-            }
-            (KeyCode::Esc, _) | (KeyCode::Enter, _) => return InteractiveDecision::Decline,
-            _ => continue,
+            // FIX 2: every other key declines → keep the existing daemon,
+            // matching the prompt's advertised "[any other key] keep current
+            // daemon" (D4 never-strand). This includes the explicit dismiss
+            // keys (`Esc`/`q`/`n`/`Enter`/`Ctrl+C`/`Ctrl+D`) and any
+            // unrecognized key, which previously fell through to a no-op
+            // `continue` that contradicted the rendered text.
+            _ => return InteractiveDecision::Decline,
         }
     }
 }
@@ -695,5 +841,109 @@ mod tests {
             out.contains("running daemon:  <unknown>"),
             "missing daemon build_version must surface <unknown>, got: {out:?}"
         );
+    }
+
+    fn summary(count: usize, names: &[&str]) -> RunningAgentsSummary {
+        RunningAgentsSummary {
+            count,
+            names: names.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn decide_summary_present_with_agents_is_consent_path() {
+        // PRD #161 FIX 1: the M1.1 summary is authoritative — a non-zero count
+        // takes the consent path and surfaces the summary's display names.
+        let s = summary(2, &["alpha", "beta"]);
+        assert_eq!(
+            decide_mismatch_action(Some(&s), FallbackAgents::Unknown),
+            MismatchAction::AgentsPresent {
+                names: vec!["alpha".into(), "beta".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn decide_summary_present_zero_agents_is_silent_restart() {
+        // `Some(0)` is a POSITIVE zero — silent restart, nothing to lose. The
+        // `fallback` argument is ignored when the summary is present.
+        let s = summary(0, &[]);
+        assert_eq!(
+            decide_mismatch_action(Some(&s), FallbackAgents::Present(vec!["ignored".into()])),
+            MismatchAction::SilentRestart
+        );
+    }
+
+    #[test]
+    fn decide_summary_absent_list_agents_nonempty_is_consent_path() {
+        // PRD #161 FIX 1 BLOCKER: a pre-#161 daemon omits `running_agents`
+        // (`None`). Falling back to a NON-EMPTY `list_agents` must treat the
+        // agents as PRESENT (consent path, named) — NOT silent-restart, which
+        // would SIGTERM live agents the new TUI can't see.
+        assert_eq!(
+            decide_mismatch_action(
+                None,
+                FallbackAgents::Present(vec!["live-1".into(), "live-2".into()])
+            ),
+            MismatchAction::AgentsPresent {
+                names: vec!["live-1".into(), "live-2".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn decide_summary_absent_list_agents_empty_is_silent_restart() {
+        // `None` + a POSITIVE empty list = positively zero agents → silent
+        // restart is correct (nothing to lose).
+        assert_eq!(
+            decide_mismatch_action(None, FallbackAgents::Empty),
+            MismatchAction::SilentRestart
+        );
+    }
+
+    #[test]
+    fn decide_summary_absent_list_agents_error_is_consent_path() {
+        // `None` + an INDETERMINATE `list_agents` (it errored) must be
+        // conservative: take the consent path, never silently kill when
+        // uncertain (never-strand, D4). No names to show.
+        assert_eq!(
+            decide_mismatch_action(None, FallbackAgents::Unknown),
+            MismatchAction::AgentsPresent { names: Vec::new() }
+        );
+    }
+
+    #[test]
+    fn sanitize_for_prompt_strips_control_del_and_bidi() {
+        // PRD #161 FIX 4: the render-seam backstop strips an embedded ESC
+        // (0x1b), other C0 control bytes, 0x7F DEL, U+0085 (NEL, a C1
+        // control), and the U+202E RIGHT-TO-LEFT OVERRIDE bidi codepoint,
+        // leaving the printable characters intact.
+        let dirty = "ze\x1bta\x07-\x7f\u{202e}live\u{0085}-77";
+        assert_eq!(sanitize_for_prompt(dirty, false), "zeta-live-77");
+        // A name containing a newline cannot inject extra prompt lines when
+        // `keep_newlines` is false (the per-name pass).
+        assert_eq!(sanitize_for_prompt("a\nb", false), "ab");
+        // The whole-prompt backstop pass keeps `\n` (the prompt's own line
+        // structure) while still stripping control / bidi.
+        assert_eq!(sanitize_for_prompt("a\n\u{202e}b\x1b", true), "a\nb");
+    }
+
+    #[test]
+    fn sanitize_for_prompt_covers_all_bidi_overrides() {
+        // Every bidirectional format / override codepoint the backstop knows
+        // about must be stripped (these are category Cf, which
+        // `char::is_control` does NOT catch).
+        for c in [
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{061C}',
+        ] {
+            let input = format!("x{c}y");
+            assert_eq!(
+                sanitize_for_prompt(&input, false),
+                "xy",
+                "bidi codepoint U+{:04X} must be stripped",
+                c as u32
+            );
+        }
     }
 }

@@ -734,11 +734,23 @@ pub trait RemoteUpgrader {
     fn upgrade(&self, name: &str, version: &str) -> Result<(), String>;
 }
 
+/// PRD #161 FIX 3: ssh keepalive parameters for the remote-UPGRADE executor.
+/// Tuned to DETECT a dead/stalled connection within roughly
+/// `UPGRADE_SSH_ALIVE_INTERVAL * UPGRADE_SSH_ALIVE_COUNT_MAX` seconds (~2 min)
+/// of a truly dead link, WITHOUT a hard wallclock cap that would wrongly kill a
+/// slow-but-alive release download (which keeps answering keepalive probes at
+/// the ssh transport layer).
+const UPGRADE_SSH_CONNECT_TIMEOUT: u64 = 30;
+const UPGRADE_SSH_ALIVE_INTERVAL: u64 = 15;
+const UPGRADE_SSH_ALIVE_COUNT_MAX: u32 = 8;
+
 /// Production upgrader: runs the binary-swap-only [`crate::remote::upgrade`]
-/// flow against the registry at `remotes_path`. Uses a fresh, *uncapped*
-/// [`crate::remote::SystemSshExecutor`] (NOT the wallclock-capped probe
-/// executor) because a release download + install can legitimately run longer
-/// than the short version-probe timeout.
+/// flow against the registry at `remotes_path`. Uses a
+/// [`crate::remote::SystemSshExecutor::with_keepalive`] executor (NOT the
+/// wallclock-capped probe executor): a release download + install can
+/// legitimately run longer than the short version-probe timeout, so instead of
+/// a hard wallclock cap it relies on ssh keepalives to DETECT a dead/stalled
+/// connection while leaving a slow-but-alive download running (PRD #161 FIX 3).
 pub struct SystemRemoteUpgrader {
     remotes_path: PathBuf,
 }
@@ -757,7 +769,15 @@ impl RemoteUpgrader for SystemRemoteUpgrader {
             no_install: false,
             release_base: crate::remote::RELEASE_BASE.to_string(),
         };
-        let executor = crate::remote::SystemSshExecutor::new();
+        // PRD #161 FIX 3: keepalive-bearing executor (not the uncapped
+        // `new()`), so a dropped/stalled ssh connection during the upgrade is
+        // detected instead of hanging connect indefinitely — without a hard
+        // wallclock cap that would kill a slow-but-alive download.
+        let executor = crate::remote::SystemSshExecutor::with_keepalive(
+            UPGRADE_SSH_CONNECT_TIMEOUT,
+            UPGRADE_SSH_ALIVE_INTERVAL,
+            UPGRADE_SSH_ALIVE_COUNT_MAX,
+        );
         crate::remote::upgrade(&opts, &executor, &self.remotes_path)
             .map(|_| ())
             .map_err(|e| e.to_string())

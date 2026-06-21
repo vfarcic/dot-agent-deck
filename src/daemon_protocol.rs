@@ -1126,12 +1126,26 @@ async fn handle_connection(
             // "N running agents: …" before recycling the daemon. Additive and
             // optional — an older daemon omits it and the client tolerates
             // its absence.
-            let summary = RunningAgentsSummary::from_records(&registry.agent_records());
-            write_resp(
-                &mut stream,
-                &AttachResponse::hello(PROTOCOL_VERSION).with_running_agents(summary),
-            )
-            .await?;
+            //
+            // PRD #161 FIX 1 test knob: `DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS`
+            // makes the reply OMIT `running_agents` (leave it `None`),
+            // simulating a pre-#161 daemon so the cross-version None-agents
+            // fallback (handshake FIX 1) can be exercised at L2. Gated behind
+            // the same `cfg(any(test, debug_assertions))` as
+            // `DOT_AGENT_DECK_BUILD_ID_OVERRIDE`, so a shipped release binary
+            // compiles the hook out and can never be tricked into hiding its
+            // live agents.
+            #[cfg(any(test, debug_assertions))]
+            let omit_running_agents =
+                std::env::var_os("DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS").is_some();
+            #[cfg(not(any(test, debug_assertions)))]
+            let omit_running_agents = false;
+            let mut resp = AttachResponse::hello(PROTOCOL_VERSION);
+            if !omit_running_agents {
+                let summary = RunningAgentsSummary::from_records(&registry.agent_records());
+                resp = resp.with_running_agents(summary);
+            }
+            write_resp(&mut stream, &resp).await?;
         }
         AttachRequest::ReloadSchedules => {
             // PRD #127 M1.3: re-read the global config and diff/replace the
