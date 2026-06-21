@@ -52,7 +52,7 @@ Running `dot-agent-deck` opens a two-column layout with native embedded terminal
 
 The deck is a TUI on top of a small background daemon. The first `dot-agent-deck` invocation auto-spawns the daemon and connects to it over a per-user Unix socket — you don't have to start anything manually, and you don't have to clean anything up. The same daemon backs both local runs and `dot-agent-deck connect` (remote) sessions; there is no separate "local mode".
 
-The daemon owns the agent processes, which has one user-facing consequence: closing the TUI is a *detach*, not a kill. Your agents keep running. Reattach with `dot-agent-deck` later and the dashboard rehydrates with the agents still in their previous state.
+The daemon owns the agent processes, which has one user-facing consequence: closing the TUI is a *detach*, not a kill. Your agents keep running. Reattach with `dot-agent-deck` later and the dashboard rehydrates with the agents still in their previous state. Detach, sleep, a network drop, or switching machines — none of them stop your agents, because the daemon outlives the TUI in every case. The only thing that stops a running agent is *you* choosing to upgrade-and-restart the daemon onto a new binary version, and even then you are asked first (see [Upgrading](installation.md#upgrading)).
 
 About 30 seconds after both the TUI and every managed agent are gone, the daemon exits on its own and the socket is cleaned up. Override the window with `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` (in seconds; set `0` to disable idle shutdown and keep the daemon up indefinitely).
 

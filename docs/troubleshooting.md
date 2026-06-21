@@ -96,27 +96,27 @@ The daemon resolves a bare command against its own process `PATH`. At startup it
 
 If `command -v` finds the command in your login shell but a pane still can't spawn it after a daemon restart, capture debug logs with `DOT_AGENT_DECK_LOG=1` and file an issue — the daemon logs the PATH it captured at startup.
 
-## Delegate prompts silently no-op after an upgrade
+## Delegate prompts silently no-op after staying on an older daemon
 
-After upgrading the `dot-agent-deck` binary, the new TUI may attach to a daemon that was spawned by the *previous* version. The wire format stays compatible, but newer features (delegate role maps, orchestration tab fields, and similar internal refactors) silently no-op because the stale daemon doesn't know about the newer shape.
+After upgrading the `dot-agent-deck` binary, the new TUI can keep talking to a daemon that was spawned by the *previous* version. The wire format stays compatible, but newer features (delegate role maps, orchestration tab fields, and similar internal refactors) silently no-op because the older daemon doesn't know about the newer shape.
+
+This only happens when you are **deliberately** still on the older daemon. The common cause: you upgraded while agents were running, the launch prompt warned that restarting would stop them, and you **declined the restart to keep your agents** — which leaves the new TUI attached to the older daemon on purpose. (It can also happen with a very old, pre-handshake binary that attached without any version check.) With no agents running, the handshake restarts the daemon silently, so a fresh daemon at the new version is the normal outcome.
 
 ### Symptom
 
-You upgrade `dot-agent-deck`, relaunch it, and delegate prompts arrive in the TUI as if they were queued — but the orchestration pipeline never moves. Other recently-added features may also fail to take effect without an obvious error.
-
-If you see this, you connected to the stale daemon without going through the version-mismatch prompt — either because an earlier `dot-agent-deck` version (pre-handshake) attached silently, or because the relaunch happened in a non-interactive context. Newer builds prompt you at launch (see *Why this happens* below).
+You upgrade `dot-agent-deck`, keep your running agents on the existing daemon, and delegate prompts arrive in the TUI as if they were queued — but the orchestration pipeline never moves. Other recently-added features may also fail to take effect without an obvious error.
 
 ### Fix
 
-Relaunch `dot-agent-deck` from an interactive terminal:
+When you are ready to move to the new version, let the daemon restart. The simplest path is to finish or detach your running agents and relaunch — with no agents left, the handshake restarts the daemon silently:
 
 ```bash
 dot-agent-deck
 ```
 
-You'll see the mismatch prompt — press **S** to stop the stale daemon and continue. The TUI lazy-spawns a fresh daemon at the new binary's version on its way into the dashboard.
+If agents are still running and you want to upgrade now, relaunch and press **S** at the prompt (it names the live agents first) to restart the daemon onto the new version — this stops those agents. The TUI then lazy-spawns a fresh daemon at the new binary's version on its way into the dashboard.
 
-If the relaunch is happening from a script, CI job, or piped context (no TTY), the TUI cannot prompt. Run `daemon stop` explicitly first:
+If the relaunch is happening from a script, CI job, or piped context (no TTY) while agents are running, the TUI cannot prompt. Run `daemon stop` explicitly first:
 
 ```bash
 dot-agent-deck daemon stop
@@ -133,7 +133,7 @@ See [Installation › Recycling the local daemon](installation.md#recycling-the-
 
 ### Why this happens
 
-On every launch, the TUI performs a build-version handshake with the daemon. When it detects a mismatch *and* your terminal is interactive, it prompts you with both build IDs and a single-keystroke choice — press **S** to recycle the daemon and continue, or **Q** to abort. (If managed agents are running, the prompt itself lists them and warns before you confirm.) When the TUI is not attached to a terminal (CI, pipes), it prints the recovery hint to stderr and exits non-zero instead of prompting.
+On every launch, the TUI performs a build-version handshake with the daemon. When the binary versions differ, the resolution depends only on whether managed agents are running. With **no agents running**, the older daemon is restarted **silently** — there is nothing to lose. With **agents running** and an interactive terminal, the TUI prompts you: the prompt **names the live agents** and warns that restarting stops them, then offers a single-keystroke choice — press **S** to restart onto the new version, or any other key to **keep the current daemon** and stay attached to it with your agents intact. Keeping the current daemon is what leaves you on the older shape. When the TUI is not attached to a terminal (CI, pipes) and agents are running, it prints the recovery hint to stderr and exits non-zero instead of prompting.
 
 ## Enabling Debug Logs
 

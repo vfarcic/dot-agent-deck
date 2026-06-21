@@ -69,7 +69,7 @@ laptop                       remote host
 
 Three properties follow from this shape:
 
-1. **Agents survive your laptop.** Close the lid, lose Wi-Fi, kill the ssh session — the remote TUI process dies with its terminal, but the daemon and agents are separate processes and keep running. Reconnect later from the same laptop or a different one. A sleep or network drop reconnects on its own without closing the tab (see [Surviving sleep/wake](#surviving-sleepwake)); an explicit `connect` is only needed after you deliberately quit or move to another machine.
+1. **Agents survive your laptop.** Close the lid, lose Wi-Fi, kill the ssh session — the remote TUI process dies with its terminal, but the daemon and agents are separate processes and keep running. Reconnect later from the same laptop or a different one. A sleep or network drop reconnects on its own without closing the tab (see [Surviving sleep/wake](#surviving-sleepwake)); an explicit `connect` is only needed after you deliberately quit or move to another machine. The one and only thing that stops your remote agents is **you choosing to upgrade-and-restart** the remote daemon — never a detach, sleep, network drop, or machine switch. Upgrading the remote binary swaps the file on disk but leaves the running daemon (and its agents) alone; the daemon is recycled only when you consent to it on the next attach (see [Version skew and the upgrade nudge](#version-skew-and-the-upgrade-nudge)).
 2. **Hooks never cross the network.** Agents run on the remote and so does the daemon; hook events travel over a Unix socket on the remote. Network drops do not lose hook events.
 3. **One environment per project.** A remote is registered to a single project's working tree on the host. Running multiple projects on one host is supported (one directory per project under `~/projects/`), but each project should still be one registered remote.
 
@@ -113,9 +113,38 @@ Only a **dropped transport** triggers a reconnect. A clean quit or detach (exit 
 
 The keepalive interval/count and retry budget are sensible fixed defaults today; exposing them as configuration is a future improvement.
 
+## Version skew and the upgrade nudge
+
+A difference between the remote's `dot-agent-deck` version and your laptop's never blocks a connect. Your laptop is only ssh plus a terminal — the remote runs both its own TUI and its own daemon and they share one binary on the host — so the laptop's version has no bearing on whether the remote session is correct. A remote you simply haven't upgraded connects exactly as before, with its matched TUI and daemon and all its agents intact.
+
+The one case where `connect` offers to do something is when your **laptop is strictly newer** than the remote. Then, just before handing over to ssh, it shows a single optional prompt:
+
+```
+Remote 'my-vm' runs 0.31.0; you have 0.31.1 (2 running agents). Upgrade and connect? [y/N]
+```
+
+Its behavior:
+
+- **Newer-only.** The offer appears only when the laptop is ahead of the remote; it never suggests a downgrade or a same-version no-op.
+- **Default No.** Pressing **Enter**, `n`, or anything that isn't an explicit `y`/`yes` connects to the remote **as-is**, at its existing version.
+- **`y` upgrades, then connects.** It runs `dot-agent-deck remote upgrade my-vm` (a binary swap on the host — see below), then connects.
+- **Non-TTY skip.** When stdin is not a terminal (a script, a piped invocation), the prompt is skipped entirely and `connect` proceeds against the existing version, so automation never hangs on it.
+- **Upgrade failure falls back.** If the `remote upgrade` step fails, `connect` prints a clear message and connects to the **existing** remote version anyway — you are never left unable to reach your session.
+
+The `(N running agents)` note appears when the count is known, so you can see the restart cost before you say yes.
+
+### What `y` actually does to the remote daemon
+
+`remote upgrade` swaps the binary on disk **only** — it does not touch the running daemon or its agents. The daemon is recycled, if at all, by the same TUI↔daemon handshake that runs locally, on the remote's own machine, when the freshly-installed TUI attaches:
+
+- **No agents running on the remote** — the daemon restarts **silently** onto the new version. You land in the dashboard with nothing lost.
+- **Agents running on the remote** — you get the restart prompt (rendered over your ssh session). It **names the live remote agents** and warns that restarting stops them. Press **S** to restart onto the new version (those agents stop), or any other key to **keep the current daemon** and stay attached with your agents intact.
+
+This is the same shared handshake described under [Installation › Upgrading](installation.md#upgrading); the remote case differs only in that the binary swap happened over ssh first. Either way, declining always lands you on a working session — upgrading a remote can never strand you from your running agents.
+
 ## Failure modes
 
-Before exec'ing `ssh -t`, `connect` runs a short version probe (`<install_path> --version` over ssh) so it can classify three failure classes up front and give you an actionable message instead of dropping a half-broken TUI on you. A version mismatch between the remote binary and the laptop client is reported as a warning and the session still proceeds.
+Before exec'ing `ssh -t`, `connect` runs a short version probe (`<install_path> --version` over ssh) so it can classify reachability failures up front and give you an actionable message instead of dropping a half-broken TUI on you. A version *difference* between the remote binary and the laptop client is **not** a failure — it never blocks the connect. An un-upgraded older remote connects normally, and when your laptop happens to be newer you get an optional one-step upgrade offer (see [Version skew and the upgrade nudge](#version-skew-and-the-upgrade-nudge)).
 
 ### Host unreachable
 
@@ -144,16 +173,6 @@ What to do:
 
 - Run `dot-agent-deck remote upgrade my-vm` to reinstall the binary at your local client's version. This re-runs the install flow that `remote add` did originally.
 - If the upgrade fails, the install path itself is broken — check that the remote user has write access to `~/.local/bin/`.
-
-### Version mismatch (warning, not an error)
-
-If the remote binary reports a different version than the laptop, `connect` prints a warning and proceeds. The remote TUI runs against its own daemon over a Unix socket, so a version skew doesn't break the session — it just means future protocol changes might land on one side before the other.
-
-```
-warning: remote 'my-vm' runs dot-agent-deck 0.30.0; laptop runs 0.24.5. Run `dot-agent-deck remote upgrade my-vm` to align.
-```
-
-Run `remote upgrade` at your convenience to bring the remote binary in line with the laptop client.
 
 ### Empty dashboard on first connect
 

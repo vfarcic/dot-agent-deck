@@ -758,20 +758,27 @@ async fn run_tui_session() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    // PRD #103 Phase 2: build-version handshake against the running daemon.
-    // Runs unconditionally — including the freshly-spawned case where the
-    // build-ids are necessarily equal (PRD M2.3). The cost is one extra
-    // Unix-socket round-trip on cold start; the upside is a smoke test of
-    // the handshake on every launch, which catches regressions in
-    // `ensure_external_daemon_or_die` itself (wrong socket / wrong binary)
-    // or in the wire encoding of the `build_version` field.
+    // PRD #103 Phase 2 / PRD #161 Part A: build-version handshake against
+    // the running daemon. Runs unconditionally — including the
+    // freshly-spawned case where the build-ids are necessarily equal (PRD
+    // M2.3). The cost is one extra Unix-socket round-trip on cold start;
+    // the upside is a smoke test of the handshake on every launch, which
+    // catches regressions in `ensure_external_daemon_or_die` itself (wrong
+    // socket / wrong binary) or in the wire encoding of the `build_version`
+    // field.
     //
-    // On mismatch + TTY: presents an interactive prompt; on S the daemon
-    // is SIGTERM'd and we fall through (the next attach lazy-spawns a
-    // fresh daemon at the current build). On mismatch + non-TTY: prints
-    // the recovery hint to stderr and exits non-zero. Errors are already
-    // user-visible inside the helper, so we render no further message
-    // here.
+    // PRD #161 D2 (option A — consent-based always-restart) decides the
+    // mismatch path by agents-present + TTY:
+    //   - No agents: the daemon is SIGTERM'd silently (`Recovered`); we
+    //     fall through and re-spawn a fresh daemon at the current build.
+    //   - Agents + TTY: an interactive prompt names the live agents; a
+    //     single `s` restarts (`Recovered`, re-spawn), any dismiss key
+    //     declines (`ProceedOnExisting`, keep the existing daemon — D4
+    //     never-strand).
+    //   - Agents + non-TTY: prints the recovery hint to stderr and exits
+    //     non-zero (the only non-zero-exit path).
+    // Errors are already user-visible inside the helper, so we render no
+    // further message here.
     let handshake_outcome =
         match build_version_handshake::ensure_compatible_daemon_or_die(&attach_path).await {
             Ok(outcome) => outcome,
@@ -787,8 +794,9 @@ async fn run_tui_session() -> ExitCode {
     // next attach lazy-spawns a fresh one. Re-run the bootstrap so the
     // socket is back before any client (DaemonClient::list_agents,
     // spawn_event_subscriber, the embedded-pane controller) touches it.
-    // On `Match` the daemon is already running and compatible — re-running
-    // the bootstrap would just be wasted I/O.
+    // On `Match` (compatible) or `ProceedOnExisting` (user declined the
+    // restart, keeping the existing daemon) the daemon is already running —
+    // re-running the bootstrap would just be wasted I/O.
     if matches!(
         handshake_outcome,
         build_version_handshake::HandshakeOutcome::Recovered

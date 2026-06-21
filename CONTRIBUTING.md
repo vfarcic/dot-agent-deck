@@ -41,3 +41,4 @@ Maintainer-facing references that are intentionally **not** published to the doc
 
 - [Experimental flag](docs/develop/experimental-flag.md) — gate in-flight, work-in-progress surfaces behind the `experimental` flag during development, so unfinished UI can merge to `main` without showing up in normal use.
 - [Rendering contract](docs/develop/rendering-contract.md) — the four render-path invariants (single layout pass, layout-driven PTY size, 1:1 widget render, fixed resize sequencing) and the call sites that enforce them.
+- [Versioning and the "breaking" definition](docs/develop/versioning.md) — what "breaking" means here (the TUI↔daemon contract, including semantic breaks behind a stable wire), the `PROTOCOL_VERSION` floor and `.breaking.md` fragment, the `0.x` bump policy (breaking→minor, feature/bugfix→patch), and the cross-version manual-test discipline.

@@ -211,12 +211,33 @@ pub trait SshExecutor {
 /// ceiling would be too tight.
 pub struct SystemSshExecutor {
     wallclock_timeout: Option<u64>,
+    /// PRD #161 FIX 3: ssh keepalive + ConnectTimeout for the remote-UPGRADE
+    /// path. Unlike `wallclock_timeout` (which imposes a hard laptop-side
+    /// wallclock kill — fine for short probes), upgrade must tolerate a
+    /// legitimately long release download. Keepalives DETECT a dead/stalled
+    /// connection (the server stops answering `ServerAlive` probes) without
+    /// capping a slow-but-alive transfer. `None` keeps the original behavior.
+    /// Mutually exclusive with `wallclock_timeout` by construction.
+    keepalive: Option<SshKeepalive>,
+}
+
+/// PRD #161 FIX 3: ssh keepalive parameters for the remote-upgrade executor.
+#[derive(Clone, Copy)]
+struct SshKeepalive {
+    /// `-o ConnectTimeout=` — caps the pre-handshake phase (DNS, TCP, ssh).
+    connect_timeout: u64,
+    /// `-o ServerAliveInterval=` — seconds of silence before a keepalive probe.
+    interval: u64,
+    /// `-o ServerAliveCountMax=` — unanswered probes tolerated before ssh
+    /// declares the connection dead and disconnects.
+    count_max: u32,
 }
 
 impl SystemSshExecutor {
     pub fn new() -> Self {
         Self {
             wallclock_timeout: None,
+            keepalive: None,
         }
     }
 
@@ -227,6 +248,26 @@ impl SystemSshExecutor {
     pub fn with_wallclock_timeout(secs: u64) -> Self {
         Self {
             wallclock_timeout: Some(secs),
+            keepalive: None,
+        }
+    }
+
+    /// PRD #161 FIX 3: construct an executor for the remote-UPGRADE path with
+    /// ssh keepalives (and a ConnectTimeout) but NO laptop-side wallclock kill.
+    /// A dropped / stalled connection is DETECTED — ssh disconnects after the
+    /// server fails to answer `count_max` consecutive keepalive probes (~
+    /// `interval * count_max` seconds of a truly dead link) — while a
+    /// legitimately long-but-alive release download keeps answering probes at
+    /// the transport layer and is NOT killed (which a hard wallclock cap would
+    /// wrongly do).
+    pub fn with_keepalive(connect_timeout: u64, interval: u64, count_max: u32) -> Self {
+        Self {
+            wallclock_timeout: None,
+            keepalive: Some(SshKeepalive {
+                connect_timeout,
+                interval,
+                count_max,
+            }),
         }
     }
 
@@ -249,6 +290,22 @@ impl SystemSshExecutor {
             cmd.arg("-o").arg(format!("ConnectTimeout={secs}"));
             cmd.arg("-o").arg(format!("ServerAliveInterval={secs}"));
             cmd.arg("-o").arg("ServerAliveCountMax=1");
+        }
+        if let Some(ka) = self.keepalive {
+            // PRD #161 FIX 3 (remote upgrade): detect a dead/stalled connection
+            // without a hard wallclock cap. ServerAliveInterval +
+            // ServerAliveCountMax disconnect only after the server fails to
+            // answer `count_max` consecutive keepalive probes (~
+            // interval*count_max seconds of a truly dead link) — a
+            // slow-but-alive download keeps answering at the transport layer
+            // and is NOT killed. ConnectTimeout still caps the pre-handshake
+            // phase. Mutually exclusive with `wallclock_timeout` above.
+            cmd.arg("-o")
+                .arg(format!("ConnectTimeout={}", ka.connect_timeout));
+            cmd.arg("-o")
+                .arg(format!("ServerAliveInterval={}", ka.interval));
+            cmd.arg("-o")
+                .arg(format!("ServerAliveCountMax={}", ka.count_max));
         }
         cmd.arg("-p").arg(target.port.to_string());
         if let Some(key) = &target.key {
@@ -1406,6 +1463,40 @@ mod tests {
         assert!(
             args.iter().any(|a| a == "ServerAliveCountMax=1"),
             "with_wallclock_timeout must force a single missed-keepalive abort: {args:?}"
+        );
+    }
+
+    #[test]
+    fn system_ssh_executor_with_keepalive_sets_alive_options_without_count_max_1() {
+        // PRD #161 FIX 3: the remote-UPGRADE executor sets ConnectTimeout +
+        // ServerAliveInterval + ServerAliveCountMax so a dead connection is
+        // DETECTED — but with a count-max > 1 (and no laptop-side wallclock
+        // kill), so a slow-but-alive download isn't aborted on the first
+        // missed keepalive the way the probe path's CountMax=1 would.
+        let target = SshTarget {
+            host: "h".to_string(),
+            user: None,
+            port: 22,
+            key: None,
+        };
+        let cmd = SystemSshExecutor::with_keepalive(30, 15, 8).build_command(&target, "echo hi");
+        let args = args_of(&cmd);
+        assert!(
+            args.iter().any(|a| a == "ConnectTimeout=30"),
+            "with_keepalive must set ConnectTimeout: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "ServerAliveInterval=15"),
+            "with_keepalive must set ServerAliveInterval: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "ServerAliveCountMax=8"),
+            "with_keepalive must set a count-max > 1 so a slow download survives \
+             a transiently missed keepalive: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "ServerAliveCountMax=1"),
+            "with_keepalive must NOT use the probe path's single-miss abort: {args:?}"
         );
     }
 
