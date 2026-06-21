@@ -40,7 +40,7 @@ The `clip` format is intentionally open — a cast renderer (`agg`) is just one 
 
 ## Prerequisites
 
-The engine **checks these before doing any work** and fails fast with a message naming exactly what is missing; it never self-installs anything. Inside `devbox shell` all four CLIs are already on `PATH` — they are pinned in [`devbox.json`](../../devbox.json):
+The engine **checks these before doing any work** and fails fast with a message naming exactly what is missing; it never self-installs anything. Install them however you like; in this repo they are pinned in [`devbox.json`](../../devbox.json) and already on `PATH` inside `devbox shell`:
 
 | CLI | Used for | devbox package |
 | --- | --- | --- |
@@ -53,15 +53,19 @@ A missing CLI is a **hard** failure (the reel cannot be built). YouTube credenti
 
 ### YouTube OAuth credentials
 
-Publishing reads three values from the environment (never hardcoded). In this repo they are sourced from [`vals`](../../.env.vals.yaml) — `vals env -export -f .env.vals.yaml` resolves the `ref+gcpsecrets://…` references into the process environment, which `devbox shell` does for you when `USE_VALS` is set:
+Publishing reads three values **from the environment** — that is the only contract. The engine never hardcodes them and has no knowledge of how they get there:
 
-| Env var | Meaning | vals reference |
-| --- | --- | --- |
-| `YOUTUBE_CLIENT_ID` | OAuth client id | `ref+gcpsecrets://vfarcic/youtube-client-id` |
-| `YOUTUBE_CLIENT_SECRET` | OAuth client secret | `ref+gcpsecrets://vfarcic/youtube-client-secret` |
-| `YOUTUBE_REFRESH_TOKEN` | OAuth refresh token (minted once via human consent) | `ref+gcpsecrets://vfarcic/youtube-refresh-token` |
+| Env var | Meaning |
+| --- | --- |
+| `YOUTUBE_CLIENT_ID` | OAuth client id |
+| `YOUTUBE_CLIENT_SECRET` | OAuth client secret |
+| `YOUTUBE_REFRESH_TOKEN` | OAuth refresh token (minted once via human consent) |
 
-> **One-time human provisioning.** The refresh token requires Google OAuth user consent, which a service account cannot grant cleanly for a personal channel, so the agent cannot self-provision it. Mint it once with the recipe below and store the three values in the secrets backend so the `vals` references resolve. After that, every reel run reuses the stored refresh token.
+Populate them however your environment manages secrets — a direct `export`, a `.env` file, your CI's secret store, or any secret manager. The engine just reads the three variables.
+
+> **Maintainer's setup (one example, not required).** In this repo they are sourced via [`vals`](../../.env.vals.yaml) from GCP Secret Manager: `.env.vals.yaml` maps each var to a `ref+gcpsecrets://vfarcic/youtube-dot-releases-*` reference that `vals env -export -f .env.vals.yaml` resolves into the environment (which `devbox shell` does automatically when `USE_VALS` is set). Substitute your own mechanism freely.
+
+> **One-time human provisioning.** The refresh token requires Google OAuth user consent, which a service account cannot grant cleanly for a personal channel, so the agent cannot self-provision it. Mint it once with the recipe below, then make the three values available as the env vars above. After that, every reel run reuses the stored refresh token.
 
 ## Minting the YouTube refresh token (one-time)
 
@@ -90,17 +94,17 @@ Do this once per channel that will host reels. All of it happens in the [Google 
    ```
 
    The response JSON contains `refresh_token`. That value is the `YOUTUBE_REFRESH_TOKEN`.
-7. **Store the three secrets** in the backend the repo's `.env.vals.yaml` references (GCP Secret Manager, under the `vfarcic` project), so the `ref+gcpsecrets://…` references resolve:
+7. **Make the three values available as the `YOUTUBE_*` env vars** however your environment sources secrets. The maintainer's setup stores them in GCP Secret Manager (project `vfarcic`) so the `.env.vals.yaml` `ref+gcpsecrets://…` references resolve:
 
    ```sh
-   printf '%s' 'YOUR_CLIENT_ID'     | gcloud secrets create youtube-client-id     --data-file=- --project vfarcic
-   printf '%s' 'YOUR_CLIENT_SECRET' | gcloud secrets create youtube-client-secret --data-file=- --project vfarcic
-   printf '%s' 'THE_REFRESH_TOKEN'  | gcloud secrets create youtube-refresh-token --data-file=- --project vfarcic
+   printf '%s' 'YOUR_CLIENT_ID'     | gcloud secrets create youtube-dot-releases-client-id     --data-file=- --project vfarcic
+   printf '%s' 'YOUR_CLIENT_SECRET' | gcloud secrets create youtube-dot-releases-client-secret --data-file=- --project vfarcic
+   printf '%s' 'THE_REFRESH_TOKEN'  | gcloud secrets create youtube-dot-releases-refresh-token --data-file=- --project vfarcic
    ```
 
-   (Use `gcloud secrets versions add <name> --data-file=-` instead of `create` if a secret already exists.)
+   (Use `gcloud secrets versions add <name> --data-file=-` instead of `create` if a secret already exists.) If you don't use `vals`, skip this step and export the three variables however you prefer.
 
-After this, `vals env -export -f .env.vals.yaml` (or `USE_VALS=1 devbox shell`) puts the three `YOUTUBE_*` vars in the environment, and `reel.sh … --publish` can upload.
+However you source them, the goal is the three `YOUTUBE_*` vars present in the environment when `reel.sh … --publish` runs.
 
 > **The refresh token is long-lived but not eternal.** Google may revoke it (password change, scope/consent revocation, a test app left idle for months, or exceeding the per-client refresh-token limit). When that happens the upload fails at runtime with the API's own error passed through; re-run steps 5–7 to mint and store a fresh token.
 
