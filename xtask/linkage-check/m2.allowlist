@@ -63,7 +63,7 @@ hooks/install/002
 hooks/install/003
 lifecycle/daemon-idle/001
 lifecycle/daemon-idle/002
-# lifecycle/handshake/001-006 — covered by tests/e2e_handshake.rs
+# lifecycle/handshake/001-007 — covered by tests/e2e_handshake.rs
 # (PRD #161 Part A shared TUI<->daemon handshake; M4.1).
 lifecycle/restart/001
 lifecycle/start/001

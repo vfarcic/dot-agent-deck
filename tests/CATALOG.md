@@ -1009,6 +1009,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the other decline keystrokes individually (`q` / `Ctrl+C` / `Ctrl+D` — covered by the same decline path); exact prompt wording.
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/handshake/007 — Build-version mismatch with a live agent where the daemon OMITS `running_agents` (a pre-#161 daemon predating M1.1): the handshake falls back to `list_agents()` and shows the consent prompt instead of silently restarting over the unseen agent (PRD #161 FIX 1 / D2 / D4 never-strand).
+- **Layer:** L2.
+- **Agent:** one synthetic `sleep`-style agent, started over the daemon's attach socket; the daemon runs with `DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS` so its `Hello` reply leaves `running_agents = None`, simulating a daemon that predates the M1.1 summary field.
+- **Asserts:** the agents-PRESENT consent prompt appears (the TUI did NOT silently restart into the dashboard) — proving the handshake fell back to `list_agents()` rather than treating the absent field as "no agents" and SIGTERM'ing the live agent unseen; then pressing `Esc` declines and a working dashboard appears against the still-running old daemon with the agent still reachable (never-strand).
+- **Does not assert:** that the prompt names the agent by its *display* name specifically (loose match — with `running_agents` omitted the label comes from `list_agents()`, so the display name OR a non-zero "(N agent(s) running)" header is accepted); exact prompt wording.
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/login-path
 
 ##### lifecycle/login-path/001 — A dashboard new-pane whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).

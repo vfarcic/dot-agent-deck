@@ -25,6 +25,12 @@
 //!     daemon — you land in a working dashboard against it with the agents
 //!     still reachable (D4 never-strand; the key change from #103, where
 //!     declining EXITED).
+//!   - 007 — MISMATCH + agents + TTY, but the daemon OMITS `running_agents`
+//!     (a pre-#161 daemon predating M1.1): the handshake must NOT read the
+//!     absent field as "no agents" and silently restart (which would SIGTERM
+//!     the live agent unseen); it falls back to `list_agents()`, sees the
+//!     agent, and shows the consent prompt. Declining then keeps the existing
+//!     daemon with the agent reachable (FIX 1; D2/D4 never-strand).
 //!
 //! Skew is simulated without rebuilding the binary via
 //! `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` (honoured by both the daemon's `hello`
@@ -60,6 +66,23 @@ const LIVE_AGENT_NAME: &str = "zeta-live-77";
 /// stays put while the TUI attaches.
 fn spawn_daemon_at_build(build_id: &str) -> DaemonProc {
     spawn_daemon_serve_with_env(None, "0", &[("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", build_id)])
+}
+
+/// Like [`spawn_daemon_at_build`] but ALSO sets the test-only
+/// `DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS` on the daemon, so its `Hello`
+/// reply leaves `running_agents = None` — exactly how a pre-#161 daemon that
+/// predates the M1.1 summary field replies. The newer TUI must then fall back
+/// to `list_agents()` (PRD #161 FIX 1) rather than mistaking the absent field
+/// for "no agents" and silently restarting over live agents it can't see.
+fn spawn_daemon_at_build_omitting_running_agents(build_id: &str) -> DaemonProc {
+    spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", build_id),
+            ("DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS", "1"),
+        ],
+    )
 }
 
 /// Register one long-lived synthetic agent (`sleep`-style stub) on `daemon`
@@ -293,5 +316,64 @@ fn handshake_006_decline_keeps_existing_daemon() {
         ),
         "the live agent must remain reachable on the existing daemon after \
          declining the restart (never-strand, D4)"
+    );
+}
+
+/// Scenario: Start an older daemon with one live agent, but force its `Hello`
+/// reply to OMIT `running_agents` (`DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS`) —
+/// exactly how a pre-#161 daemon that predates the M1.1 summary replies. Attach
+/// a newer TUI in a TTY: the handshake must NOT read the absent field as "no
+/// agents" and silently restart (which would SIGTERM the live agent unseen), but
+/// fall back to `list_agents()`, see the agent, and surface the consent prompt.
+/// Pressing `Esc` then declines and lands in a working dashboard against the
+/// still-running old daemon with the agent reachable (PRD #161 FIX 1; D2/D4
+/// never-strand).
+#[spec("lifecycle/handshake/007")]
+#[test]
+fn handshake_007_omitted_running_agents_falls_back_no_silent_kill() {
+    let mut daemon = spawn_daemon_at_build_omitting_running_agents(OLD_BUILD);
+    start_live_agent(&daemon);
+    let deck = launch_tui_against(&daemon, NEW_BUILD);
+
+    // CORE GUARD: the agents-PRESENT consent prompt must appear. Pre-fix, the
+    // omitted `running_agents` was read as "no agents" → SILENT restart (NO
+    // prompt) → the live agent was killed unseen and we'd land straight in the
+    // empty dashboard. The fix falls back to `list_agents()`, which still sees
+    // the agent, so the prompt surfaces instead. LOOSE match on the agent
+    // reference: when `running_agents` is omitted the name comes from
+    // `list_agents()` (display name, falling back to id), so accept either the
+    // display name OR a non-zero "(N agent(s) running)" header — anything but
+    // the silent no-prompt restart proves the fallback ran.
+    deck.wait_until_grid(
+        "agents-present restart prompt via list_agents fallback",
+        |g| {
+            let low = g.to_lowercase();
+            let prompt_present = low.contains("stop") || low.contains("restart");
+            let names_agent = g.contains(LIVE_AGENT_NAME);
+            let nonzero_header =
+                low.contains("agent(s) running") && !low.contains("(0 agent(s) running)");
+            prompt_present && (names_agent || nonzero_header)
+        },
+    );
+
+    // Decline with Esc → keep the EXISTING daemon (D4 never-strand), mirroring
+    // handshake_006: a working dashboard appears against the still-running old
+    // daemon and the live agent stays reachable on it.
+    deck.send_keys(b"\x1b");
+    deck.wait_for_string("session(s)");
+    assert!(
+        daemon.is_alive_public(),
+        "declining must keep the existing daemon alive (never-strand, D4)"
+    );
+    assert!(
+        wait_for_agent_display_name(
+            &daemon.attach_socket,
+            LIVE_AGENT_NAME,
+            true,
+            Duration::from_secs(5),
+        ),
+        "the live agent must remain reachable on the existing daemon after \
+         declining the restart, even though its summary was omitted from the \
+         handshake (never-strand, D4)"
     );
 }
