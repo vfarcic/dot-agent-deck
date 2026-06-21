@@ -1,6 +1,6 @@
 # PRD #161: Compatibility-based version-mismatch handling
 
-**Status**: Planning (design substantially revised 2026-06-21; shared-handshake behavior resolved to A — see Design Decisions)
+**Status**: Implementation complete — runtime (M1.1–M1.3), release machinery (M2.1/M2.2), detection (M3.1), tests (M4.1–M4.3), and docs (M5.1) landed; review + audit resolved; full e2e gate green (1441/1441). Remaining: changelog fragment + PR/cross-version-manual-test/merge/close (M5.2/M5.3, via `/prd-done`). M3.2 deferred. (Design resolved to A — see Design Decisions.)
 **Priority**: Medium
 **Created**: 2026-06-14
 **Last updated**: 2026-06-21
@@ -135,6 +135,8 @@ While in 0.x, feature-only releases become patch releases (e.g. `0.31.1 → 0.31
 
 **Generic vs local boundary**: the `analyze.sh` 0.x recalibration is generically correct and belongs in the shared skill source. The dot-agent-deck-specific bits (the breaking definition, protocol-surface specifics) stay local.
 
+Applied so far in this PRD's work: the `prompts` source and the vendored copy of `dot-ai-changelog-fragment` both received the **generic** Step-3 "ask the breaking question first" prompt (identical body in both, pushed to both `vfarcic/prompts` and this repo). The project-specific definition stays out of the shared skill — the skill defers to each project's `pyproject.toml` `breaking` comment, which is where the dot-agent-deck definition (M2.2) lives.
+
 ## Scope
 
 ### In Scope
@@ -172,31 +174,31 @@ While in 0.x, feature-only releases become patch releases (e.g. `0.31.1 → 0.31
 ### Phase 1: Runtime (the user-facing payoff)
 
 - [x] **M1.0 — Resolve A vs B (D2).** ✅ **A (always-restart, consent-based)**; B deferred (revisit if users lose agents to compatible upgrades). Keep M1.1 fields additive so B stays a non-breaking future add.
-- [ ] **M1.1 — Probe/handshake additive fields.** A running-agent count/names field in `Hello`/`AttachResponse` (required for the restart prompt + the nudge), additive + optional; serde round-trip + older-shape-deserializes-to-None tests. No `PROTOCOL_VERSION` bump. Optionally also add `DAD_VERSION` now (additive) so a future option B is non-breaking.
-- [ ] **M1.2 — Part B: remote `connect`.** Delete the version/build comparison; keep the floor; add the one-step nudge (newer-only, default N, non-TTY skip, agent count); `y` → `remote upgrade` + connect, upgrade-failure → connect existing version.
-- [ ] **M1.3 — Part A: shared handshake (`build_version_handshake.rs`).** Implement **A**: demote #103's exact-match refusal to a consent-based restart — name live agents and prompt when agents are running, restart silently when idle, preserve non-TTY mandatory behavior. Applies to local and remote alike. (Option B's `semver`/`build.rs`/dev-dirty machinery is deferred.)
+- [x] **M1.1 — Probe/handshake additive fields.** ✅ `26a4a55` — `AttachResponse` gained `running_agents: Option<RunningAgentsSummary { count, names }>` + `daemon_version: Option<String>` (both `serde(default, skip_serializing_if=Option::is_none)`); `DAD_VERSION` added now (additive); no `PROTOCOL_VERSION` bump. Serde round-trip + legacy-shape-→-None tests in `tests/daemon_protocol.rs`.
+- [x] **M1.2 — Part B: remote `connect`.** ✅ `2775306` — deleted the `VersionMismatch`/`BuildVersionMismatch` comparison + `ProbeOutcome`/warn-gate; kept the floor; added `maybe_nudge_upgrade` (newer-only via semver, default N, non-TTY skip; `y` → `remote upgrade` + connect, upgrade-failure → connect existing version). `remote.rs` stays binary-swap-only. Agent count wired but `None` today (static ssh probe has no registry — documented known limitation, forward-compatible).
+- [x] **M1.3 — Part A: shared handshake (`build_version_handshake.rs`).** ✅ `0a2cae4` (+ `a830e19` review fix) — consent-based restart: silent when idle; agents-running TTY prompt names live agents (single-`s` consent), decline keeps the existing daemon (never-strand), agents-running non-TTY exits non-zero. **Cross-version fix (`a830e19`):** when an older daemon omits `running_agents`, fall back to `list_agents()`; silent-restart only on positive zero agents.
 
 ### Phase 2: Release machinery
 
-- [x] **M2.1 — `analyze.sh` 0.x recalibration** (vendored copy) — done in `8efcd76` (D5). Remaining: sync the `prompts` source repo.
-- [ ] **M2.2 — Sharpen breaking-definition guidance** in `pyproject.toml` comment + docs (local); keep shared `changelog-fragment` wording generic.
+- [x] **M2.1 — `analyze.sh` 0.x recalibration** (vendored copy) — done in `8efcd76` (D5). ✅ `prompts` source repo confirmed already carrying the 0.x policy (`prompts@ed63895`).
+- [x] **M2.2 — Sharpen breaking-definition guidance** in `pyproject.toml` comment + docs (local); keep shared `changelog-fragment` wording generic. The dot-agent-deck-specific breaking definition lives in the `pyproject.toml` `breaking` comment (read by the fragment skill at type-selection time) and `docs/develop/versioning.md`; the shared `changelog-fragment` skill gained only a **generic** "ask the breaking question first, then prefer the `breaking` type when unsure" prompt in Step 3, applied **identically to both** the `prompts` source (`changelog-fragment.md`) and the vendored copy (`.claude/skills/dot-ai-changelog-fragment/SKILL.md`) and pushed to both repos in this PRD's work (no dot-agent-deck specifics in the shared skill — generic-vs-local boundary preserved).
 
 ### Phase 3: Detection / discipline
 
-- [ ] **M3.1 — `prd-done`** cross-version manual-test step + "did this change the TUI↔daemon contract?" prompt (source in `dot-ai`, sync copy here).
-- [ ] **M3.2 — (Optional) non-blocking CI nudge** on changes to `src/daemon_protocol.rs` / event schema / role-map files.
+- [x] **M3.1 — cross-version contract check.** ✅ `162aedb` — the "did this change the TUI↔daemon contract?" prompt + the new-TUI-vs-previous-release-daemon manual-test step. **Divergence:** editing the vendored `.claude/skills/dot-ai-prd-done/SKILL.md` was blocked by the permission classifier (self-modification of agent config), so the check was placed in **`CLAUDE.md` permanent instruction 12** instead, which every orchestration role (including `release`/`/prd-done`) loads and follows; rationale also in `docs/develop/versioning.md`. **Follow-up:** fold the same check into the vendored `prd-done` skill + its canonical `dot-ai` upstream.
+- [ ] **M3.2 — (Optional) non-blocking CI nudge** on changes to `src/daemon_protocol.rs` / event schema / role-map files. **DEFERRED** (decision this session) — out of scope for this PR; tracked as a follow-up.
 
 ### Phase 4: Tests
 
-- [ ] **M4.1 — Shared handshake tests** (local + remote): no-agents silent restart; agents-running names + prompt; declining keeps the existing daemon; never-strand. (The compatible/incompatible/dev-dirty matrix is deferred with option B.)
-- [ ] **M4.2 — Probe/handshake field tests** for the additive agent-count field (M1.1).
-- [ ] **M4.3 — Remote connect tests** (fake-ssh executor): un-upgraded connects; nudge `y`/`n`; upgrade-failure fallback; non-TTY skip; newer-only.
+- [x] **M4.1 — Shared handshake tests.** ✅ `eebcfdc` + `f9c4be1` — L2 PTY `lifecycle/handshake/001–007` in `tests/e2e_handshake.rs`: match-silent; no-agents silent restart; agents-running prompt names live agents; non-TTY mandatory exit; single-`s` consent; decline keeps the existing daemon (never-strand); **`007` cross-version guard** (older daemon omits `running_agents` → fall back, no silent kill). Plus lib pure-data decision-fn unit tests in `a830e19`.
+- [x] **M4.2 — Probe/handshake field tests** for the additive fields (M1.1). ✅ `26a4a55` — serde round-trip + legacy-shape-→-`None` tests in `tests/daemon_protocol.rs`.
+- [x] **M4.3 — Remote connect tests** (fake-ssh executor). ✅ `2775306` — un-upgraded connects; nudge `y`/`n`; upgrade-failure fallback; non-TTY skip; newer-only.
 
 ### Phase 5: Docs and release
 
-- [ ] **M5.1 — Docs**: handshake behavior, the connect nudge + agent cost, agent preservation across detach, the 0.x cadence.
-- [ ] **M5.2 — Changelog fragment** (the first real exercise of the breaking-vs-not decision).
-- [ ] **M5.3 — PR, review, audit, cross-version manual test, merge, close.**
+- [x] **M5.1 — Docs**. ✅ `162aedb` — `installation.md` (consent-based handshake + Versioning/0.x cadence), `troubleshooting.md` (reframed the stale forces-upgrade section), `remote-environments.md` (Part B nudge + remote handshake + agent-preservation invariant), `getting-started.md` (daemon-lifecycle invariant), `docs/develop/versioning.md`.
+- [ ] **M5.2 — Changelog fragment** (the first real exercise of the breaking-vs-not decision). — during `/prd-done`.
+- [ ] **M5.3 — PR, review, audit, cross-version manual test, merge, close.** — review + audit ✅ (all findings resolved, `a830e19`); full e2e gate ✅ green (1441/1441); PR/cross-version-manual-test/merge/close pending `/prd-done`.
 
 ## Key Files
 

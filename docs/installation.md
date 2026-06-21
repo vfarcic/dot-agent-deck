@@ -55,11 +55,25 @@ After upgrading the `dot-agent-deck` binary, just relaunch it:
 dot-agent-deck
 ```
 
-On every launch, the TUI performs a build-version handshake with the running daemon. If a daemon spawned by the previous version is still alive, the TUI detects the mismatch and prompts you in your terminal (the prompt itself names both build IDs and, when managed agents are running, lists them before you confirm). Press **S** to stop the stale daemon and continue — the TUI lazy-spawns a fresh one at the new version and continues into the dashboard. No separate command needed.
+On every launch, the TUI performs a build-version handshake with the running daemon. If a daemon spawned by the previous version is still alive, the binary versions differ and the TUI resolves it for you — what happens depends only on whether managed agents are running:
 
-If the TUI is not attached to a terminal (CI, scripts, piped stdout), it cannot prompt, so it prints a recovery hint to stderr and exits non-zero. In that case, run `dot-agent-deck daemon stop` explicitly before relaunching — see [Recycling the local daemon](#recycling-the-local-daemon) below.
+- **No agents running** — the stale daemon is restarted **silently**. There is nothing to lose, so you are not prompted; the TUI lazy-spawns a fresh daemon at the new version and continues into the dashboard. This is the common case after a quiet upgrade.
+- **Agents running** — the TUI prompts you in your terminal. The prompt **names the live agents** and warns that restarting the daemon stops them. Press **S** to restart and continue on a fresh daemon at the new version (your agents are stopped), or press any other key to **keep the current daemon** and stay attached to it with your agents intact. Declining never strands you — you always land on a working session.
 
-See [Troubleshooting › Delegate prompts silently no-op after an upgrade](troubleshooting.md#delegate-prompts-silently-no-op-after-an-upgrade) for the symptom you'll see if you ever connect to a stale daemon without seeing the prompt first.
+You are never forced to upgrade-and-restart just to keep working: declining the prompt keeps you on the existing daemon, and you can finish or detach your agents and relaunch later, at which point (with no agents running) the daemon restarts silently.
+
+If the TUI is not attached to a terminal (CI, scripts, piped stdout) **and** agents are running, it cannot prompt for the restart, so it prints a recovery hint to stderr and exits non-zero. In that case, run `dot-agent-deck daemon stop` explicitly before relaunching — see [Recycling the local daemon](#recycling-the-local-daemon) below. (With no agents running, the non-interactive case still restarts silently.)
+
+See [Troubleshooting › Delegate prompts silently no-op after staying on an older daemon](troubleshooting.md#delegate-prompts-silently-no-op-after-staying-on-an-older-daemon) for the symptom you'll see if you keep an older daemon and then expect newer features to work against it.
+
+## Versioning
+
+`dot-agent-deck` is still in its `0.x` series, and the version digits follow a compatibility-first cadence while the major version is `0`:
+
+- A **protocol-/compatibility-breaking** change — one where an older and a newer build can no longer safely interoperate — bumps the **minor** digit (for example `0.31.x → 0.32.0`).
+- **New features and bug fixes** are **patch** releases (for example `0.31.1 → 0.31.2`).
+
+So while in `0.x` the minor digit signals **"compatibility broke"**, not "has new features". A bump from `0.31.x` to `0.32.0` is the cue to align both sides (see [Recycling the local daemon](#recycling-the-local-daemon) locally, or `dot-agent-deck remote upgrade` for a [remote](remote-environments.md)); a patch bump is always safe to mix.
 
 ## Recycling the local daemon
 

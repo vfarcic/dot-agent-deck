@@ -974,32 +974,46 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** any tracing log line.
 - **Platform coverage:** mac+linux.
 
-##### lifecycle/handshake/002 — Build-version mismatch in a TTY context renders the interactive prompt; pressing `S` terminates the old daemon and lazy-spawns a fresh one.
+##### lifecycle/handshake/002 — Build-version mismatch with NO running agents restarts the daemon silently and proceeds into the dashboard (PRD #161 Part A).
 - **Layer:** L2.
-- **Agent:** none (uses `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` to simulate skew).
-- **Asserts:** the rendered prompt contains both build IDs; after pressing `S` the dashboard appears against a daemon at the laptop's build.
-- **Does not assert:** exact prompt-text character matching (already pinned in lib pure-data tests).
+- **Agent:** none (an older external daemon at `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` is reused by a newer TUI to simulate skew).
+- **Asserts:** with no agents running, no prompt is shown and no keypress is sent — the dashboard's empty state (`No active sessions`) appears, and the original (older) daemon process exits (the silent restart terminated it; a fresh daemon was lazy-spawned at the new build).
+- **Does not assert:** the new daemon's exact build id (covered by the protocol round-trip tests).
 - **Platform coverage:** mac+linux.
 
-##### lifecycle/handshake/003 — Build-version mismatch with live agents requires two consecutive `S` presses.
+##### lifecycle/handshake/003 — Build-version mismatch with live agents in a TTY renders a consent prompt that names the live agents and states restarting stops them (PRD #161 Part A / M1.1).
 - **Layer:** L2.
-- **Agent:** none.
-- **Asserts:** one `S` does not terminate; two consecutive `S` presses do.
-- **Does not assert:** the warning string wording (loose substring match).
+- **Agent:** one synthetic `sleep`-style agent with a distinctive display name, started over the daemon's attach socket before the TUI attaches.
+- **Asserts:** the rendered prompt surfaces the live agent's **display name** (from the handshake reply's `running_agents.names`) together with the stop/restart intent.
+- **Does not assert:** exact prompt wording (loose substring match on the agent name + stop/restart intent); the agent's generated id.
 - **Platform coverage:** mac+linux.
 
-##### lifecycle/handshake/004 — Build-version mismatch on a non-TTY exits non-zero with a stderr recovery hint and no prompt.
+##### lifecycle/handshake/004 — Build-version mismatch with live agents on a non-TTY (mandatory-restart path) exits non-zero with a stderr recovery hint and no prompt (PRD #161 Part A).
 - **Layer:** L2.
-- **Agent:** none (run with stdout redirected to a pipe).
-- **Asserts:** exit code is non-zero; stderr mentions `dot-agent-deck daemon stop`.
-- **Does not assert:** exact stderr wording (pinned in lib pure-data tests).
+- **Agent:** one synthetic `sleep`-style agent (the binary is run directly with stdout redirected to a pipe, so `is_terminal()` is false).
+- **Asserts:** exit code is non-zero; stderr carries a clear daemon recovery hint (mentions the daemon and stop/restart) and no prompt is rendered.
+- **Does not assert:** exact stderr wording (pinned in lib pure-data tests); the no-agents non-TTY path (which silently restarts).
 - **Platform coverage:** mac+linux.
 
-##### lifecycle/handshake/005 — Build-version mismatch prompt: pressing `Q` / `Ctrl+C` / `Ctrl+D` / `Esc` aborts startup with a non-zero exit and leaves the stale daemon running.
+##### lifecycle/handshake/005 — Build-version mismatch with live agents in a TTY: a single consent keystroke restarts the daemon (agents stopped) and the dashboard appears (PRD #161 Part A — replaces #103's two-`S` double-confirm).
 - **Layer:** L2.
-- **Agent:** none (uses `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` to simulate skew).
-- **Asserts:** for each abort keystroke (`Q`, `q`, `Ctrl+C`, `Ctrl+D`, `Esc`): the TUI exits non-zero; the daemon socket is still answering after the exit; no fresh daemon was spawned.
-- **Does not assert:** any rendered error message after abort (the prompt itself is the user-visible artifact).
+- **Agent:** one synthetic `sleep`-style agent.
+- **Asserts:** after the prompt appears, a single `s` consent restarts the daemon — the original daemon process exits and the fresh (now empty) dashboard's `No active sessions` appears.
+- **Does not assert:** exact prompt wording; the recovered daemon's build id.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/handshake/006 — Build-version mismatch with live agents in a TTY: declining keeps the EXISTING daemon and lands in a working dashboard with the agents still reachable (PRD #161 D4 never-strand).
+- **Layer:** L2.
+- **Agent:** one synthetic `sleep`-style agent with a distinctive display name.
+- **Asserts:** after the prompt appears, pressing `Esc` does NOT exit — a working dashboard appears against the still-running older daemon (the session is listed), the original daemon process is still alive, and the live agent remains reachable on it (never-strand). This is the key change from #103, where declining exited.
+- **Does not assert:** the other decline keystrokes individually (`q` / `Ctrl+C` / `Ctrl+D` — covered by the same decline path); exact prompt wording.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/handshake/007 — Build-version mismatch with a live agent where the daemon OMITS `running_agents` (a pre-#161 daemon predating M1.1): the handshake falls back to `list_agents()` and shows the consent prompt instead of silently restarting over the unseen agent (PRD #161 FIX 1 / D2 / D4 never-strand).
+- **Layer:** L2.
+- **Agent:** one synthetic `sleep`-style agent, started over the daemon's attach socket; the daemon runs with `DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS` so its `Hello` reply leaves `running_agents = None`, simulating a daemon that predates the M1.1 summary field.
+- **Asserts:** the agents-PRESENT consent prompt appears (the TUI did NOT silently restart into the dashboard) — proving the handshake fell back to `list_agents()` rather than treating the absent field as "no agents" and SIGTERM'ing the live agent unseen; then pressing `Esc` declines and a working dashboard appears against the still-running old daemon with the agent still reachable (never-strand).
+- **Does not assert:** that the prompt names the agent by its *display* name specifically (loose match — with `running_agents` omitted the label comes from `list_agents()`, so the display name OR a non-zero "(N agent(s) running)" header is accepted); exact prompt wording.
 - **Platform coverage:** mac+linux.
 
 #### lifecycle/login-path

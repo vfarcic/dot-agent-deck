@@ -380,6 +380,48 @@ fn default_cols() -> u16 {
     80
 }
 
+/// PRD #161 M1.1: a snapshot of the agents the daemon is currently managing,
+/// carried additively on the [`AttachResponse`] reply to an
+/// [`AttachRequest::Hello`]. The shared TUI↔daemon restart prompt (Part A)
+/// and the remote `connect` nudge (Part B) both need to state
+/// "N running agents: alpha, beta" *before* recycling the daemon, so the
+/// handshake reply carries both the `count` and the human-readable `names`.
+///
+/// Additive + optional on the wire: an older daemon omits the enclosing
+/// `running_agents` field entirely (it deserializes to `None` via
+/// `#[serde(default)]`), and an older client simply ignores it. This needs
+/// no `PROTOCOL_VERSION` bump. `count` and `names` are kept as separate
+/// fields (rather than relying on `names.len()`) so a future option B
+/// classification can advertise a count without enumerating names if it ever
+/// wants to — keeping the shape forward-compatible (PRD #161 D2).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningAgentsSummary {
+    /// Number of agents the daemon is currently managing.
+    pub count: usize,
+    /// Display names of those agents, in registry order. Each entry is the
+    /// agent's `display_name` when set, falling back to its id, so the prompt
+    /// always has a label to show. `#[serde(default)]` lets a payload that
+    /// carried only a count decode the names as an empty `Vec`.
+    #[serde(default)]
+    pub names: Vec<String>,
+}
+
+impl RunningAgentsSummary {
+    /// Build a summary from the daemon's live [`AgentRecord`]s. The label for
+    /// each agent is its `display_name` when present, otherwise its id, so the
+    /// restart prompt / connect nudge always has something to print.
+    pub fn from_records(records: &[AgentRecord]) -> Self {
+        let names = records
+            .iter()
+            .map(|r| r.display_name.clone().unwrap_or_else(|| r.id.clone()))
+            .collect::<Vec<_>>();
+        Self {
+            count: records.len(),
+            names,
+        }
+    }
+}
+
 /// Discriminated by the populated optional fields rather than a tag, since
 /// each request type has a fixed shape and clients can decide what to read
 /// based on which request they sent.
@@ -419,6 +461,25 @@ pub struct AttachResponse {
     /// "incompatible — recycle the daemon").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_version: Option<String>,
+    /// PRD #161 M1.1: snapshot of the agents the daemon is managing at
+    /// handshake time (count + display names). Additive + optional — a
+    /// pre-PRD-161 daemon omits it (deserializes to `None`), so the field is
+    /// forward-compatible and needs no `PROTOCOL_VERSION` bump. The Part-A
+    /// restart prompt and the Part-B `connect` nudge read it to say
+    /// "N running agents: …" before recycling the daemon. Populated on the
+    /// daemon side from the live registry in the `Hello` handler; `None` on
+    /// unrelated responses and on the static `daemon hello` CLI probe (which
+    /// has no registry to enumerate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_agents: Option<RunningAgentsSummary>,
+    /// PRD #161 M1.1: the daemon binary's `env!("DAD_VERSION")` (e.g.
+    /// `0.31.1`) — the semver tag *without* the `-g<sha>[-dirty]` build suffix
+    /// that `build_version` carries. Additive + optional so a future option B
+    /// version-compatibility classification (deferred — see PRD #161 D2)
+    /// becomes a non-breaking add: the field is already on the wire, an older
+    /// daemon omits it (`None`), and `PROTOCOL_VERSION` is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
 }
 
 impl AttachResponse {
@@ -481,8 +542,24 @@ impl AttachResponse {
             // simulate same-tag / different-commit skew without
             // rebuilding the binary.
             build_version: Some(crate::build_id::local_build_id()),
+            // PRD #161 M1.1: also advertise the daemon's compiled-in
+            // `DAD_VERSION` (the semver tag, e.g. `0.31.1`). Always known at
+            // compile time like `build_version`, so it rides every hello
+            // reply — including the static `daemon hello` CLI probe. Additive
+            // and optional; a future option B classifies on this field.
+            daemon_version: Some(env!("DAD_VERSION").to_string()),
             ..Default::default()
         }
+    }
+
+    /// PRD #161 M1.1: attach a running-agent summary to a handshake reply.
+    /// The daemon's `Hello` handler calls this with a snapshot of the live
+    /// registry so the client's restart prompt / connect nudge can name the
+    /// agents that recycling the daemon would stop. Static probes that have
+    /// no registry (the `daemon hello` CLI) leave `running_agents` as `None`.
+    pub fn with_running_agents(mut self, summary: RunningAgentsSummary) -> Self {
+        self.running_agents = Some(summary);
+        self
     }
 }
 
@@ -1043,7 +1120,32 @@ async fn handle_connection(
                     "Hello from client build_version=\"{cbv_safe}\" (daemon build_version=\"{daemon_build_safe}\")",
                 );
             }
-            write_resp(&mut stream, &AttachResponse::hello(PROTOCOL_VERSION)).await?;
+            // PRD #161 M1.1: enumerate the live registry so the reply carries
+            // the running-agent summary (count + display names). The Part-A
+            // restart prompt and Part-B connect nudge read it to say
+            // "N running agents: …" before recycling the daemon. Additive and
+            // optional — an older daemon omits it and the client tolerates
+            // its absence.
+            //
+            // PRD #161 FIX 1 test knob: `DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS`
+            // makes the reply OMIT `running_agents` (leave it `None`),
+            // simulating a pre-#161 daemon so the cross-version None-agents
+            // fallback (handshake FIX 1) can be exercised at L2. Gated behind
+            // the same `cfg(any(test, debug_assertions))` as
+            // `DOT_AGENT_DECK_BUILD_ID_OVERRIDE`, so a shipped release binary
+            // compiles the hook out and can never be tricked into hiding its
+            // live agents.
+            #[cfg(any(test, debug_assertions))]
+            let omit_running_agents =
+                std::env::var_os("DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS").is_some();
+            #[cfg(not(any(test, debug_assertions)))]
+            let omit_running_agents = false;
+            let mut resp = AttachResponse::hello(PROTOCOL_VERSION);
+            if !omit_running_agents {
+                let summary = RunningAgentsSummary::from_records(&registry.agent_records());
+                resp = resp.with_running_agents(summary);
+            }
+            write_resp(&mut stream, &resp).await?;
         }
         AttachRequest::ReloadSchedules => {
             // PRD #127 M1.3: re-read the global config and diff/replace the
