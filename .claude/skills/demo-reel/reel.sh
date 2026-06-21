@@ -9,7 +9,7 @@
 # manifest.json. See SKILL.md for the full contract.
 #
 # Usage:
-#   reel.sh MANIFEST [--out OUT.mp4] [--publish]
+#   reel.sh MANIFEST [--out OUT.mp4] [--title TITLE] [--publish]
 #
 set -euo pipefail
 
@@ -19,6 +19,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # All hosting lives in this one script (see Uploader decision); reel.sh never
 # names a host. Only invoked when --publish is requested with credentials set.
 UPLOAD_SCRIPT="$SCRIPT_DIR/upload.sh"
+
+# Re-times each .cast clip BEFORE agg renders it: rewrites event timestamps so
+# typing replays at a readable cadence, operation repaints are held, and dead idle
+# waits are clamped. This is what makes a machine-speed e2e cast watchable; it
+# replaces the old blunt global CLIP_SPEED slowdown (see retime.sh and CLIP_SPEED
+# below). Repo-agnostic — operates on any .cast.
+RETIME_SCRIPT="$SCRIPT_DIR/retime.sh"
 
 # Single source of truth for the dev doc that explains prerequisite and
 # credential setup (created by a later docs milestone). Referenced from
@@ -39,14 +46,29 @@ REQUIRED_CLIS=(agg ffmpeg ffprobe)
 CRED_VARS=(YOUTUBE_CLIENT_ID YOUTUBE_CLIENT_SECRET YOUTUBE_REFRESH_TOKEN)
 
 # ---- Render constants ---------------------------------------------------
-# The SAME agg font/theme/fps are used for every card and every .cast clip, so
-# cards are pixel-identical to clips by construction (ffmpeg concat needs a
-# uniform resolution/fps/pixfmt). Changing any of these changes both together.
+# Clips render through agg at their RECORDED terminal grid and FONT_SIZE, so a
+# clip looks exactly as captured. Cards are deliberately different: each is
+# painted on a SMALLER fixed grid (CARD_COLS x CARD_ROWS) at a larger
+# CARD_FONT_SIZE, so the title/description fill more of the frame and read BIGGER
+# than they would on the clip's wide grid. Cards are therefore NOT pixel-identical
+# to clips — instead the ffmpeg scale+pad NORMALIZE pass (step 4 below) fits every
+# segment to one common resolution/fps/pixfmt, which is what keeps the concat
+# seamless even though cards and clips render at different sizes.
 THEME="asciinema"
 FONT_SIZE=16
 FPS=30
 # Cap idle gaps inside a real clip so e2e waits don't make the reel drag.
 CLIP_IDLE=2
+# Watchable cadence now comes from the cast RE-TIMER (retime.sh), which rewrites
+# each .cast clip's event timestamps BEFORE agg renders it — spreading coincident
+# bursts (typing, repaints) and clamping dead idle waits, which a single global
+# agg --speed could never do. So clips render at CLIP_SPEED 1.0 (real time of the
+# RETIMED cast). CLIP_SPEED is kept as a tunable escape hatch: a global multiplier
+# layered ON TOP of the re-timer (< 1 = slower still, > 1 = faster) for the rare
+# clip that wants a uniform nudge. Cards are static stills and are NEVER slowed
+# (render_cast defaults speed to 1). Pre-rendered gif/mp4 clips bypass agg (and
+# the re-timer) entirely, so neither affects them.
+CLIP_SPEED="${CLIP_SPEED:-1.0}"
 # A card is one static frame. agg only needs a brief span to paint it, so the
 # synthetic card cast holds for CARD_RENDER_SPAN seconds and is rendered with a
 # small idle limit (CARD_IDLE); agg collapses that static span to a single
@@ -56,15 +78,35 @@ CLIP_IDLE=2
 # collapsing the static tail.
 CARD_IDLE=2
 CARD_RENDER_SPAN="0.6"
-# Geometry for a gif/mp4 entry's card: those clips carry no terminal grid, so
-# the card is painted at this sensible default and every segment is normalized
-# to a common resolution afterwards (the ffmpeg scale+pad safety net).
-DEFAULT_COLS=100
-DEFAULT_ROWS=30
+# Each card's ON-SCREEN hold is a FLAT CARD_HOLD seconds (env-overridable),
+# regardless of how much text it carries. A fixed, deliberately short hold keeps
+# the reel moving; a viewer who wants to read a long description pauses the video
+# rather than the reel parking on every long card. (This replaces the old hold
+# that scaled with the rendered content-line count and was capped at 16s — the
+# content-line count still drives the card GRID HEIGHT so long text doesn't clip,
+# only the hold stopped depending on it.)
+CARD_HOLD="${CARD_HOLD:-4}"
+# Card geometry: a SMALL fixed grid painted at a larger font so the text renders
+# big relative to the clip. CARD_WRAP (< CARD_COLS) word-wraps text to a
+# comfortable measure, leaving generous side margins. The TITLE is centered; the
+# DESCRIPTION is rendered as a LEFT-ALIGNED, vertically-centered multi-line block
+# (one line per sentence / source line / list item, with hanging indents on
+# bullets — see CARD_AWK) so it reads as prose instead of one wrapped wall of
+# text. CARD_ROWS is a MINIMUM: a description with more lines than fit grows the
+# grid taller (CARD_AWK reports the effective height) rather than clipping, and
+# the normalize pass letterboxes/scales the result. The grid/font are tuned so a
+# typical card's native canvas stays just UNDER a clip's native size — the card
+# is scaled UP to the clip's resolution by the normalize pass instead of driving
+# that resolution up (which would upscale the clip). The same fixed grid serves
+# cast AND gif/mp4 entries (a gif/mp4 carries no terminal grid of its own).
+CARD_COLS=84
+CARD_ROWS=28
+CARD_WRAP=58
+CARD_FONT_SIZE=22
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME MANIFEST [--out OUT.mp4] [--publish]
+Usage: $SCRIPT_NAME MANIFEST [--out OUT.mp4] [--title TITLE] [--publish]
 
 Stitch a manifest of {title, description, clip} entries into one narrated MP4
 (title/description card, then clip, repeated in order). With --publish, upload
@@ -77,6 +119,9 @@ Arguments:
 
 Options:
   --out OUT.mp4   Path to write the stitched MP4 (default: reel.mp4).
+  --title TITLE   Title for the uploaded video (only used with --publish).
+                  Default: the basename of --out without its extension
+                  (e.g. "reel" for reel.mp4).
   --publish       Upload the MP4 unlisted to YouTube and print the URL.
                   Requires ${CRED_VARS[*]} in the environment.
   -h, --help      Show this help and exit.
@@ -84,6 +129,7 @@ Options:
 Examples:
   $SCRIPT_NAME manifest.json --out reel.mp4
   $SCRIPT_NAME manifest.json --out reel.mp4 --publish
+  $SCRIPT_NAME manifest.json --out reel.mp4 --title "My demo reel" --publish
 EOF
 }
 
@@ -110,6 +156,9 @@ note() {
 # ---- 1. Parse arguments -------------------------------------------------
 MANIFEST=""
 OUT="reel.mp4"
+# Empty means "derive from --out at publish time" (basename without extension);
+# a caller (e.g. the adapter) may set an explicit, descriptive title via --title.
+TITLE=""
 PUBLISH=0
 
 while [[ $# -gt 0 ]]; do
@@ -119,6 +168,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || usage_error "--out requires a path argument"
       OUT="$2"; shift 2 ;;
     --out=*) OUT="${1#*=}"; shift ;;
+    --title)
+      [[ $# -ge 2 ]] || usage_error "--title requires a value argument"
+      TITLE="$2"; shift 2 ;;
+    --title=*) TITLE="${1#*=}"; shift ;;
     --publish) PUBLISH=1; shift ;;
     # --publish is a boolean flag and takes no value; reject the =VALUE form
     # explicitly (rather than letting it fall through to "unknown option") so
@@ -217,16 +270,28 @@ fi
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT INT TERM
 
-# Paint a card frame as styled terminal text: bold title, dim word-wrapped,
-# block-centered description. Reads geometry/strings from the environment so
-# arbitrary punctuation/quotes in the text pass through untouched. Emits the
-# raw escape sequence (no trailing newline) — cursor positioning only, so the
-# bottom row never scrolls.
+# Paint a card frame as styled terminal text: a BOLD bright-cyan CENTERED title
+# above a BRIGHT-WHITE, LEFT-ALIGNED, vertically-centered multi-line description
+# (high contrast — never dim). The description is broken into readable lines
+# instead of one wrapped paragraph: split on sentence boundaries (.?! + space),
+# on any source line breaks, and on leading list markers (-, *, "N."), with a
+# hanging indent for bullet continuations; each resulting line is then wrapped to
+# CARD_WRAP. The block is vertically centered, and if it has more lines than fit
+# the grid grows taller (the effective height is reported back via CARD_META) so
+# long text scales/letterboxes rather than clipping. Reads geometry/strings from
+# the environment so arbitrary punctuation/quotes in the text pass through
+# untouched. Emits the raw escape sequence (no trailing newline) — cursor
+# positioning only, so the bottom row never scrolls.
 CARD_AWK="$WORKDIR/card.awk"
 cat > "$CARD_AWK" <<'AWK'
-function wrap(s, width, arr,    n, i, words, line, cnt, word) {
-  cnt = 0; line = ""
+function sp(n,   s) { s = ""; while (n-- > 0) s = s " "; return s }
+
+# Word-wrap s into pieces of at most `width` chars, appended to arr starting at
+# index cnt+1 (hard-splitting any word longer than width). Returns the new count.
+function wrap_line(s, width, arr, cnt,    n, i, words, line, word) {
+  if (width < 1) width = 1
   n = split(s, words, /[ \t]+/)
+  line = ""
   for (i = 1; i <= n; i++) {
     word = words[i]
     if (word == "") continue
@@ -242,64 +307,120 @@ function wrap(s, width, arr,    n, i, words, line, cnt, word) {
   if (line != "") arr[++cnt] = line
   return cnt
 }
-function emit(row, text, sgr,    col, len) {
-  len = length(text)
-  col = int((W - len) / 2) + 1                # center horizontally
+
+# Append one logical description line to dl[], wrapped to the description column
+# (maxw). `prefix` precedes the first physical line (a list marker, or empty) and
+# `indent` spaces hang under it on every continuation line.
+function add_desc(text, prefix, indent,    pieces, m, j) {
+  m = wrap_line(text, maxw - indent, pieces, 0)
+  if (m == 0) { dl[++nd] = prefix; return }   # keep an intentionally blank line
+  for (j = 1; j <= m; j++) {
+    if (j == 1) dl[++nd] = prefix pieces[j]
+    else        dl[++nd] = sp(indent) pieces[j]
+  }
+}
+
+# Turn one source segment (already split on newlines) into one-or-more logical
+# description lines: a leading list marker (-, *, or "N.") becomes a hanging-
+# indented bullet kept on its own line; otherwise the segment is split on
+# sentence boundaries (.?! followed by whitespace) into one line per sentence.
+function add_segment(seg,    marker, rest, parts, k, np) {
+  if (match(seg, /^[ \t]*([-*]|[0-9]+\.)[ \t]+/)) {
+    marker = substr(seg, RSTART, RLENGTH)
+    rest   = substr(seg, RSTART + RLENGTH)
+    sub(/^[ \t]+/, "", marker); sub(/[ \t]+$/, "", marker)
+    marker = marker " "                       # normalize to "<sym> "
+    add_desc(rest, marker, length(marker))
+    return
+  }
+  # Mark every sentence end (.?! + whitespace) with a sentinel, then split on it.
+  gsub(/[.?!]+[ \t]+/, "&\001", seg)
+  np = split(seg, parts, /\001/)
+  for (k = 1; k <= np; k++) {
+    if (parts[k] ~ /[^ \t]/) add_desc(parts[k], "", 0)
+  }
+}
+
+function emit(row, col, text, sgr) {
   if (col < 1) col = 1
   out = out ESC "[" row ";" col "H" ESC "[" sgr "m" text ESC "[0m"
 }
+
 BEGIN {
   W = ENVIRON["CARD_W"] + 0
-  H = ENVIRON["CARD_H"] + 0
+  MINH = ENVIRON["CARD_H"] + 0                  # minimum rows; grown if text overflows
   ESC = "\033"
-  margin = 4
-  maxw = W - 2 * margin
-  if (maxw < 10) maxw = (W > 10 ? W : 10)
-  nt = wrap(ENVIRON["CARD_TITLE"], maxw, tl)
-  nd = wrap(ENVIRON["CARD_DESC"], maxw, dl)
+  # Wrap width is an explicit measure (CARD_WRAP), decoupled from the grid width
+  # so text sits in a comfortable column with wide side margins. Clamp to [10, W].
+  maxw = ENVIRON["CARD_WRAP"] + 0
+  if (maxw < 10) maxw = 10
+  if (maxw > W) maxw = W
+
+  nt = wrap_line(ENVIRON["CARD_TITLE"], maxw, tl, 0)
+
+  nd = 0
+  nseg = split(ENVIRON["CARD_DESC"], segs, /\n/)   # preserve source line breaks
+  for (s = 1; s <= nseg; s++) add_segment(segs[s])
+
   block = nt + 1 + nd                          # title + blank gap + description
-  start = int((H - block) / 2) + 1             # center the block vertically
+  H = MINH
+  if (block + 2 > H) H = block + 2             # grow rows (1 row top+bottom margin) so nothing clips
+  start = int((H - block) / 2) + 1             # vertically center the block
   if (start < 1) start = 1
+  dcol = int((W - maxw) / 2) + 1               # left edge of the centered description column
+  if (dcol < 1) dcol = 1
+
   out = ESC "[?25l" ESC "[2J"                  # hide cursor, clear screen
   row = start
-  for (i = 1; i <= nt; i++) { emit(row, tl[i], "1"); row++ }   # 1 = bold title
-  row++                                                         # blank gap
-  for (i = 1; i <= nd; i++) { emit(row, dl[i], "2"); row++ }   # 2 = dim body
+  for (i = 1; i <= nt; i++) {                  # bold bright-cyan title, each line centered
+    emit(row, int((W - length(tl[i])) / 2) + 1, tl[i], "1;96"); row++
+  }
+  row++                                                          # blank gap
+  for (i = 1; i <= nd; i++) { emit(row, dcol, dl[i], "97"); row++ }  # bright-white left-aligned body
   printf "%s", out
+
+  # Report the effective height and total content lines so the caller can size
+  # the cast header and recompute the on-screen hold from the rendered content.
+  if (ENVIRON["CARD_META"] != "")
+    printf "%d %d\n", H, nt + nd > ENVIRON["CARD_META"]
 }
 AWK
 
-# Read a .cast header's terminal geometry ("W H"), falling back to the default.
-read_cast_geom() {
-  local cast="$1" hdr w h
-  hdr="$(head -n1 "$cast")"
-  w="$(printf '%s' "$hdr" | jq -r '.width // empty' 2>/dev/null || true)"
-  h="$(printf '%s' "$hdr" | jq -r '.height // empty' 2>/dev/null || true)"
-  [[ "$w" =~ ^[0-9]+$ && "$h" =~ ^[0-9]+$ ]] || { w="$DEFAULT_COLS"; h="$DEFAULT_ROWS"; }
-  echo "$w $h"
-}
-
-# Synthesize a one-frame card .cast at WxH for the given title/description:
-# paint at t=0, then a no-op a beat later (CARD_RENDER_SPAN) so agg has a span
-# to render the painted frame. The card's on-screen HOLD is deliberately NOT
-# encoded here — it is enforced later at the ffmpeg level (a single still
-# looped to an exact duration), so it is immune to agg collapsing a static tail.
+# Synthesize a one-frame card .cast for the given title/description: paint at
+# t=0, then a no-op a beat later (CARD_RENDER_SPAN) so agg has a span to render
+# the painted frame. The passed `h` is a MINIMUM number of rows — CARD_AWK may
+# grow the grid taller to fit a long description and reports the EFFECTIVE height
+# (plus the content-line count) via CARD_META; the .cast header is written with
+# that effective height, and the function echoes "<eff_rows> <content_lines>" so
+# the caller can recompute the on-screen hold. The card's on-screen HOLD is
+# deliberately NOT encoded here — it is enforced later at the ffmpeg level (a
+# single still looped to an exact duration), immune to agg collapsing a static
+# tail.
 make_card_cast() {
-  local w="$1" h="$2" title="$3" desc="$4" out="$5" payload
-  payload="$(CARD_W="$w" CARD_H="$h" CARD_TITLE="$title" CARD_DESC="$desc" awk -f "$CARD_AWK")"
+  local w="$1" h="$2" title="$3" desc="$4" out="$5" payload eff_h content_lines
+  local meta="$WORKDIR/card_meta"
+  payload="$(CARD_W="$w" CARD_H="$h" CARD_WRAP="$CARD_WRAP" CARD_META="$meta" CARD_TITLE="$title" CARD_DESC="$desc" awk -f "$CARD_AWK")"
+  read -r eff_h content_lines < "$meta"
+  rm -f "$meta"
   {
-    printf '{"version": 2, "width": %d, "height": %d, "env": {"TERM": "xterm-256color"}}\n' "$w" "$h"
+    printf '{"version": 2, "width": %d, "height": %d, "env": {"TERM": "xterm-256color"}}\n' "$w" "$eff_h"
     printf '[0.0, "o", %s]\n' "$(printf '%s' "$payload" | jq -Rs .)"
     printf '[%s, "o", %s]\n' "$CARD_RENDER_SPAN" "$(printf '\033[H' | jq -Rs .)"
   } > "$out"
+  printf '%s %s\n' "$eff_h" "$content_lines"
 }
 
-# The SAME agg invocation for cards and clips — only timing knobs vary, never
-# font/theme/size/fps, so the rendered pixel grid stays identical. The `--`
-# terminates option parsing so an untrusted clip path like "-foo.cast" is taken
-# as the positional input, never mistaken for an agg option.
+# One agg invocation for both cards and clips; the caller varies the idle limit,
+# the font size (cards render larger via CARD_FONT_SIZE — see below) AND the
+# playback speed, so the card and clip canvases differ on purpose and the
+# normalize pass reconciles them into one uniform stream. `font` defaults to
+# FONT_SIZE so the clip path keeps rendering at its recorded size; `speed`
+# defaults to 1 so cards (static stills) are never slowed — only the clip path
+# passes CLIP_SPEED to slow the action. The `--` terminates option parsing so an
+# untrusted clip path like "-foo.cast" is taken as the positional input, never
+# mistaken for an agg option.
 render_cast() {
-  local cast="$1" gif="$2" idle="$3"
+  local cast="$1" gif="$2" idle="$3" font="${4:-$FONT_SIZE}" speed="${5:-1}"
   # Capture agg's stderr to a temp file (under WORKDIR, so the EXIT trap cleans
   # it up) instead of discarding it. stdout stays /dev/null and the success path
   # stays quiet, but on a NON-ZERO agg exit we surface agg's real error here —
@@ -307,8 +428,8 @@ render_cast() {
   # the missing/garbled gif. This covers both the card and the .cast clip render
   # (the clip path calls this same function).
   local err="$WORKDIR/agg.err"
-  if ! agg --theme "$THEME" --font-size "$FONT_SIZE" --fps-cap "$FPS" \
-    --idle-time-limit "$idle" -- "$cast" "$gif" >/dev/null 2>"$err"; then
+  if ! agg --theme "$THEME" --font-size "$font" --fps-cap "$FPS" \
+    --idle-time-limit "$idle" --speed "$speed" -- "$cast" "$gif" >/dev/null 2>"$err"; then
     cat "$err" >&2
     die "agg failed to render $cast (exit non-zero); see agg error above"
   fi
@@ -332,9 +453,11 @@ freeze_still() {
 n="$(jq 'length' "$MANIFEST")"
 note "building reel from $n manifest entr$([[ "$n" -eq 1 ]] && echo y || echo ies)…"
 
-# Render every segment to its NATIVE resolution first (card via agg, .cast clip
-# via agg, gif/mp4 used as-is), preserving manifest order. The common target
-# resolution is then the max across all of them, so nothing is upscaled.
+# Render every segment to its NATIVE resolution first (card via agg on its small
+# fixed grid, .cast clip via agg at its recorded grid, gif/mp4 used as-is),
+# preserving manifest order. The common target resolution is then the max across
+# all of them; clips render at full size and the smaller cards are scaled up to
+# match in the normalize pass.
 natives=()
 holds=()          # parallel to natives: hold seconds for a card, empty for a clip
 for ((i = 0; i < n; i++)); do
@@ -343,37 +466,34 @@ for ((i = 0; i < n; i++)); do
   clip="$(jq -r  ".[$i].clip"        "$MANIFEST")"
   ext="$(printf '%s' "${clip##*.}" | tr '[:upper:]' '[:lower:]')"
 
-  # Card geometry matches the clip's terminal grid for a .cast; gif/mp4 clips
-  # have none, so the card uses the default and the normalize pass aligns them.
-  if [[ "$ext" == "cast" ]]; then
-    read -r cols rows < <(read_cast_geom "$clip")
-  else
-    cols="$DEFAULT_COLS"; rows="$DEFAULT_ROWS"
-  fi
+  # Paint the card on its SMALL fixed grid (CARD_COLS x CARD_ROWS minimum) at the
+  # larger CARD_FONT_SIZE — independent of the clip's grid — so the text reads
+  # big; the normalize pass below scales it up to the clip's resolution. The grid
+  # may grow taller for a long description (make_card_cast echoes the effective
+  # row count and the rendered content-line count). Then freeze a single painted
+  # still; the on-screen hold is applied later (looping this still to exactly
+  # $hold seconds), decoupled from agg's idle handling.
+  read -r eff_rows content_lines < <(make_card_cast "$CARD_COLS" "$CARD_ROWS" "$title" "$desc" "$WORKDIR/card_$i.cast")
 
-  # Hold scales to text length but is CLAMPED to [3, 8]: clamp(ceil(words/3),
-  # 3, 8). The lower bound keeps a short card on screen long enough to read; the
-  # upper cap stops a long description from parking the reel on a static frame
-  # for 50–60s — the viewer pauses to read more, but the card never holds beyond
-  # 8s. (words+2)/3 is integer-ceil of words/3.
-  words="$(printf '%s %s' "$title" "$desc" | wc -w | tr -d '[:space:]')"
-  hold=$(( (words + 2) / 3 ))
-  (( hold < 3 )) && hold=3
-  (( hold > 8 )) && hold=8
+  # On-screen hold is a FLAT CARD_HOLD seconds — independent of how much text the
+  # card carries. A fixed short hold keeps the reel moving; a viewer who wants to
+  # read a long description pauses the video rather than the reel parking on every
+  # long card. (content_lines above still drives the card GRID HEIGHT so long text
+  # doesn't clip — only the hold stopped depending on it.)
+  hold="$CARD_HOLD"
 
-  # Paint the card and render it through the SAME agg invocation as the clips
-  # (pixel-identical by construction), then freeze a single painted still. The
-  # on-screen hold is applied later (looping this still to exactly $hold
-  # seconds), decoupled from agg's idle handling.
-  make_card_cast "$cols" "$rows" "$title" "$desc" "$WORKDIR/card_$i.cast"
-  render_cast "$WORKDIR/card_$i.cast" "$WORKDIR/card_$i.gif" "$CARD_IDLE"
+  render_cast "$WORKDIR/card_$i.cast" "$WORKDIR/card_$i.gif" "$CARD_IDLE" "$CARD_FONT_SIZE"
   freeze_still "$WORKDIR/card_$i.gif" "$WORKDIR/card_$i.png"
   natives+=("$WORKDIR/card_$i.png")
   holds+=("$hold")
 
   case "$ext" in
     cast)
-      render_cast "$clip" "$WORKDIR/clip_$i.gif" "$CLIP_IDLE"
+      # Re-time the cast (rewrite event timestamps for a watchable cadence — see
+      # retime.sh) BEFORE rendering, then render the RETIMED cast through agg at
+      # CLIP_SPEED (default 1.0; the re-timer now controls cadence).
+      "$RETIME_SCRIPT" "$clip" --out "$WORKDIR/clip_$i.retimed.cast"
+      render_cast "$WORKDIR/clip_$i.retimed.cast" "$WORKDIR/clip_$i.gif" "$CLIP_IDLE" "$FONT_SIZE" "$CLIP_SPEED"
       natives+=("$WORKDIR/clip_$i.gif")
       holds+=("") ;;
     gif|mp4)
@@ -438,10 +558,12 @@ if [[ "$PUBLISH" -eq 1 ]]; then
   if [[ ${#missing_creds[@]} -gt 0 ]]; then
     note "reel is at $OUT; could not publish (missing ${missing_creds[*]} — see $DEV_DOC, or ask the agent to set them up)"
   else
-    # Title/description for the upload are derived from the reel itself; the
-    # engine is repo-agnostic and has no notion of a PRD. Runtime upload errors
-    # pass through from upload.sh unswallowed.
-    reel_title="$(basename "$OUT" .mp4)"
+    # Title for the upload: the caller-supplied --title verbatim if given,
+    # otherwise derived from the reel filename. The engine is repo-agnostic and
+    # has no notion of a PRD, so a descriptive title is the caller's job (the
+    # adapter composes one); --title is how it reaches the upload. Runtime upload
+    # errors pass through from upload.sh unswallowed.
+    reel_title="${TITLE:-$(basename "$OUT" .mp4)}"
     reel_desc="$(jq -r 'map("• " + .title) | join("\n")' "$MANIFEST")"
     url="$("$UPLOAD_SCRIPT" "$OUT" "$reel_title" "$reel_desc")"
     echo "$url"

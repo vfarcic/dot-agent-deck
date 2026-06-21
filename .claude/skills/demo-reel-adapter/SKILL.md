@@ -23,11 +23,31 @@ Everything dot-agent-deck-specific (which tests, where their title/description l
 
 | Command | What it does |
 | --- | --- |
-| `build.sh [reel] [--out OUT.mp4] [--publish] [--manifest PATH]` | Full pipeline: **select** → **assemble** → invoke the engine, forwarding `--out`/`--publish`. Clean-skips (no manifest, no engine, exit 0) when no e2e tests changed. `--manifest` sets where `manifest.json` is written (default `manifest.json` in CWD). |
+| `build.sh [reel] [--out OUT.mp4] [--publish] [--manifest PATH] [--title TITLE]` | Full pipeline: **select** → **assemble** → invoke the engine, forwarding `--out`/`--publish` plus a composed `--title`. Clean-skips (no manifest, no engine, exit 0) when no e2e tests changed. `--manifest` sets where `manifest.json` is written (default `manifest.json` in CWD). `--title` overrides the composed title verbatim (see **Title composition**). |
+| `build.sh title [--title TITLE]` | Print the title the `reel` pipeline would pass to the engine on the current branch — the composed title, or `--title` verbatim. Dry-run: no selection, no manifest, no engine, no upload. |
 | `build.sh select` | Print the in-scope recording-dir IDs, one per line (the git-diff half — concern **a**). |
 | `build.sh assemble [ID...] [--manifest PATH]` | Build `manifest.json` from an explicit list of recording-dir IDs (the pure half — concern **b**; no git, no network). Excludes cast-less IDs, orders by catalog id, clean-skips an empty/all-L1 list. |
 
 Run the full `reel` pipeline from the repo root so the default relative paths (`.dot-agent-deck/recordings`, `tests/CATALOG.md`) resolve. The engine resolves `clip` paths relative to its own CWD, so it is invoked from the same directory.
+
+## Title composition
+
+The engine names the uploaded video after its `--out` basename unless given a `--title`; the engine is repo-agnostic and has no notion of a PRD, so the adapter composes a descriptive title and forwards it. The format is:
+
+```text
+<repo> · PRD #<prd> · PR #<pr> — <short desc>
+```
+
+for example `dot-agent-deck · PRD #180 · PR #182 — PRD demo reel`. Each piece is derived from the repo and the current branch:
+
+| Piece | Source |
+| --- | --- |
+| `<repo>` | basename of the `origin` remote URL, minus a trailing `.git`. |
+| `<prd>` | the digits after the leading `prd-` in the current branch name (e.g. `prd-180-…` → `180`). |
+| `<pr>` | the open PR number for the branch (`gh pr view --json number`). **Omitted** (the whole ` · PR #<pr>` segment) when there is no open PR yet — no error. |
+| `<short desc>` | the H1 of `prds/<prd>-*.md`, stripped of a leading `PRD #<n>:` prefix (e.g. `# PRD #180: PRD demo reel` → `PRD demo reel`). Falls back to `demo reel` if no PRD heading is found. |
+
+Composition degrades gracefully — a missing repo/PRD/PR drops only its own segment — so it never errors. Pass `--title "…"` to override the whole thing verbatim; this is needed for manual/dogfood runs where the branch/PRD don't match the clips being stitched. Inspect what would be used without publishing via `build.sh title`.
 
 ## Selection rule (concern a)
 

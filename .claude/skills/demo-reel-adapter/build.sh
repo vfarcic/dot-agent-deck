@@ -56,9 +56,16 @@ die() { echo "demo-reel-adapter: $*" >&2; exit 1; }
 usage() {
   cat <<EOF
 Usage:
-  build.sh [reel] [--out OUT.mp4] [--publish] [--manifest PATH]
+  build.sh [reel] [--out OUT.mp4] [--publish] [--manifest PATH] [--title TITLE]
       Select in-scope e2e tests, build a manifest, and invoke the engine.
       Clean-skips (no manifest, no engine, exit 0) when no e2e tests changed.
+      Composes a descriptive video title ('<repo> · PRD #<prd> · PR #<pr> —
+      <desc>') and forwards it to the engine; --title TITLE overrides that
+      composition verbatim (for manual/dogfood runs).
+  build.sh title [--title TITLE]
+      Print the title the reel pipeline would pass to the engine on the current
+      branch (the composed title, or --title verbatim). Dry-run: no manifest, no
+      engine, no upload.
   build.sh select
       Print the in-scope recording-dir IDs (one per line). Uses git.
   build.sh assemble [ID...] [--manifest PATH]
@@ -227,23 +234,69 @@ select_ids() {
 }
 
 # --------------------------------------------------------------------------
+# Compose a descriptive reel title for the engine's --title (repo-specific).
+# Format:  '<repo> · PRD #<prd> · PR #<pr> — <short desc>'
+#   repo      <- basename of the origin remote URL, minus a trailing '.git'.
+#   prd       <- digits after the leading 'prd-' in the current branch name.
+#   pr        <- open PR number for this branch (gh); OMITTED when there is none.
+#   short desc<- H1 of prds/<prd>-*.md, minus a leading 'PRD #<n>:' prefix.
+# Every piece degrades gracefully: a missing repo/prd/pr drops just its segment,
+# and a missing PRD heading falls back to a sane default — composition never
+# errors, so a manual/dogfood run on an off-pattern branch still yields a title
+# (or the caller overrides the whole thing with --title).
+compose_title() {
+  local repo prd pr desc branch prd_file head
+
+  repo="$(git remote get-url origin 2>/dev/null || true)"
+  repo="${repo%.git}"      # strip a trailing .git
+  repo="${repo##*/}"       # basename (works for https and scp-style remotes)
+
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  prd="$(printf '%s' "$branch" | sed -nE 's/^prd-([0-9]+).*/\1/p')"
+
+  # Open PR number for the current branch, if any. No PR -> gh exits non-zero
+  # and pr stays empty, so the ' · PR #<pr>' segment is simply omitted.
+  pr="$(gh pr view --json number --jq '.number' 2>/dev/null || true)"
+
+  desc=""
+  if [[ -n "$prd" ]]; then
+    prd_file="$(ls "prds/${prd}-"*.md 2>/dev/null | head -1 || true)"
+    if [[ -n "$prd_file" && -f "$prd_file" ]]; then
+      # H1, minus the leading '# ', then minus a leading 'PRD #<n>:' prefix.
+      desc="$(grep -m1 '^# ' "$prd_file" 2>/dev/null | sed -E 's/^# +//; s/^PRD #?[0-9]+:[[:space:]]*//')"
+    fi
+  fi
+  [[ -n "$desc" ]] || desc="demo reel"
+
+  head="${repo:-repo}"
+  [[ -n "$prd" ]] && head="$head · PRD #$prd"
+  [[ -n "$pr"  ]] && head="$head · PR #$pr"
+  printf '%s — %s' "$head" "$desc"
+}
+
+# --------------------------------------------------------------------------
 # Dispatch + arg parsing.
 # --------------------------------------------------------------------------
 cmd="reel"
 case "${1:-}" in
-  select|assemble|reel) cmd="$1"; shift ;;
+  select|assemble|reel|title) cmd="$1"; shift ;;
   -h|--help) usage; exit 0 ;;
 esac
 
 out=""
 publish=""
 manifest="manifest.json"
+# Empty means "compose a descriptive title from repo/branch/PR/PRD"; a caller may
+# pass --title VALUE to override that composition verbatim (for manual/dogfood
+# runs where the branch/PRD don't match the clips). Forwarded to the engine.
+title=""
 ids=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --out)      out="${2:?--out needs a value}"; shift 2 ;;
     --publish)  publish=1; shift ;;
     --manifest) manifest="${2:?--manifest needs a value}"; shift 2 ;;
+    --title)    title="${2:?--title needs a value}"; shift 2 ;;
     -h|--help)  usage; exit 0 ;;
     --*)        die "unknown option: $1" ;;
     *)          ids+=("$1"); shift ;;
@@ -259,6 +312,13 @@ case "$cmd" in
     assemble "$manifest" ${ids[@]+"${ids[@]}"}
     ;;
 
+  title)
+    # Dry-run inspection: print the title the reel pipeline would pass to the
+    # engine on the current branch (the --title override verbatim, otherwise the
+    # composed title). No selection, no manifest, no engine — safe to run anytime.
+    printf '%s\n' "${title:-$(compose_title)}"
+    ;;
+
   reel)
     mapfile -t scope < <(select_ids)
     if [[ ${#scope[@]} -eq 0 ]]; then
@@ -270,7 +330,11 @@ case "$cmd" in
     # assemble clean-skipped (every selected dir turned out to be cast-less).
     [[ -f "$manifest" ]] || exit 0
     [[ -x "$ENGINE" ]] || die "engine not found or not executable: $ENGINE"
-    engine_args=("$manifest")
+    # Compose a descriptive title unless the caller pinned one with --title, and
+    # always forward it to the engine so the uploaded video is named for the PRD
+    # rather than the default 'reel' basename.
+    reel_title="${title:-$(compose_title)}"
+    engine_args=("$manifest" --title "$reel_title")
     [[ -n "$out" ]] && engine_args+=(--out "$out")
     [[ -n "$publish" ]] && engine_args+=(--publish)
     echo "demo-reel-adapter: invoking engine: $ENGINE ${engine_args[*]}" >&2

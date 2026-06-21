@@ -147,12 +147,15 @@ The live YouTube upload cannot be a routine automated test; it is verified by co
 
 ## How the orchestrator step behaves
 
-At PRD completion the orchestrator runs the demo-reel step as part of the pre-PR gate (between the e2e gate and `/prd-done`):
+The demo reel is **not** built during the pre-PR gate. The casts are *recorded* there (the e2e gate runs with `DOT_AGENT_DECK_RECORD=1`), but the reel itself is built, published, and linked only **after** the PR is open and its CI + Greptile review are green, and **before** merge — in the pre-merge window. Building it then means the link is posted once, against a PR that has already validated, and the changelog/PR-body update it adds gets one final quick CI + review pass before merge.
 
-1. **Record while gating.** The pre-PR e2e suite runs with `DOT_AGENT_DECK_RECORD=1`, so the passing tests' casts are populated — one e2e run, recording turned on, not a second run.
-2. **Build + upload.** The adapter selects the branch's new/changed e2e tests, builds the manifest, and the engine stitches the reel and uploads it unlisted, returning the watch URL.
-3. **Surface to the human pre-merge.** The orchestrator presents the link at the merge gate: `Demo reel for PRD #NNN: <unlisted YouTube link>. Watch before merging.`
-4. **Post as a PR comment.** Once `/prd-done` has opened the PR, the link is posted as a PR comment so it rides along with the PR.
-5. **Clean skip.** If the branch changed **no** e2e tests, the adapter writes no manifest, builds no reel, uploads nothing, and prints `skipped: no e2e tests changed on this branch`. The orchestrator records that there is no reel and why — no URL, no comment.
+1. **Record during the e2e gate.** The pre-PR e2e suite runs with `DOT_AGENT_DECK_RECORD=1`, so the passing tests' casts are populated under `.dot-agent-deck/recordings/` — one e2e run, recording turned on, not a second run. The casts sit on disk until the reel is built.
+2. **Open the PR and let it validate.** `/prd-done` opens the PR; the orchestrator waits for CI and the Greptile review to settle **green**. No reel yet.
+3. **Build + upload (pre-merge).** Once the PR is green, the adapter (`build.sh --out reel.mp4 --publish`) composes a descriptive title (`<repo> · PRD #<prd> · PR #<pr> — <short desc>`, e.g. `dot-agent-deck · PRD #180 · PR #182 — PRD demo reel`), selects the branch's new/changed e2e tests, builds the manifest, and the engine stitches the reel and uploads it unlisted, returning the watch URL.
+4. **Post the link in three places.** So the reel rides along with both the PR and the release notes, the URL is posted to **(a)** a PR comment, **(b)** the PR description/body, and **(c)** the changelog fragment `changelog.d/<prd>.feature.md` (appended, so it flows into the release notes). Committing the changelog/PR-body change triggers one final quick CI + Greptile pass, which the orchestrator waits on before the merge gate.
+5. **Surface to the human pre-merge.** The orchestrator presents the link at the merge gate: `Demo reel for PRD #NNN: <unlisted YouTube link>. Watch before merging.`
+6. **Clean skip.** If the branch changed **no** e2e tests, the adapter writes no manifest, builds no reel, uploads nothing, and prints `skipped: no e2e tests changed on this branch`. The orchestrator records that there is no reel and why — no URL, no comment, no PR-body edit, no changelog link.
+
+> **The unlisted link is public-by-reach in the release notes.** An unlisted YouTube video is not listed or searchable, but anyone who has the link can watch it — and putting it in the changelog fragment publishes the link into the release notes, so anyone reading those notes can reach the reel. This is intended: the release notes are exactly where a reader wants a "show me what this PRD did" link.
 
 > **Graceful degrade on a publish failure.** A stitch-only run always succeeds without credentials. If `--publish` is requested but the `YOUTUBE_*` credentials are missing, the engine still produces the local `reel.mp4` and skips only the upload, reporting `reel is at <path>; could not publish (missing …)`. Runtime upload errors (expired/revoked token, exhausted quota, API disabled) are only knowable at upload time and are passed through from the API rather than swallowed — re-mint the refresh token (above) if it was revoked.

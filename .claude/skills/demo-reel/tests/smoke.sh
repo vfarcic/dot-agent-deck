@@ -27,11 +27,15 @@ REEL="$HERE/../reel.sh"
 FIXTURES="$HERE/fixtures"
 MANIFEST="$FIXTURES/manifest.json"
 
-# Expected agg-rendered canvas for the fixtures' 80x24 cast geometry with the
-# engine's pinned render constants (theme/font-size/fps in reel.sh) and the
-# devbox-pinned agg. Override via env if the toolchain legitimately changes.
-EXPECTED_W="${EXPECTED_W:-790}"
-EXPECTED_H="${EXPECTED_H:-560}"
+# Expected stitched-canvas resolution = the MAX native across all segments. With
+# the engine's card constants (CARD_COLS x CARD_ROWS at CARD_FONT_SIZE in reel.sh)
+# the card canvas (~1139x893, even-rounded to 1140x894) is LARGER than these tiny
+# 80x24 fixture clips (790x560), so the CARD drives the target and the clips are
+# scaled up to it. (For the real reel, clips are recorded much larger than a card,
+# so the clip drives the target instead.) Override via env if the toolchain or the
+# card constants legitimately change.
+EXPECTED_W="${EXPECTED_W:-1140}"
+EXPECTED_H="${EXPECTED_H:-894}"
 
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 
@@ -63,13 +67,12 @@ IFS=',' read -r W H PIXFMT FR < <(
 [[ "$PIXFMT" == "yuv420p" ]] || fail "pix_fmt '$PIXFMT' != yuv420p"
 [[ "$FR" == "30/1" ]]        || fail "avg_frame_rate '$FR' != 30/1"
 
-# Duration must be at least the sum of the per-card holds. Recompute the holds
-# from the manifest with the SAME rule the engine uses:
-# clamp(ceil(words/3), 3, 8) over each entry's title + description words.
-sum_holds="$(
-  jq -r '.[] | .title + " " + .description' "$MANIFEST" \
-    | awk '{ h = int((NF + 2) / 3); if (h < 3) h = 3; if (h > 8) h = 8; s += h } END { print s }'
-)"
+# Duration must be at least the sum of the per-card holds. The engine now holds
+# every card a FLAT CARD_HOLD seconds (default 4), independent of text length, so
+# the lower bound is simply the entry count times that hold. Mirror the engine's
+# CARD_HOLD env override so the two stay in lock-step.
+CARD_HOLD="${CARD_HOLD:-4}"
+sum_holds="$(jq --argjson h "$CARD_HOLD" 'length * $h' "$MANIFEST")"
 DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT")"
 awk -v d="$DUR" -v m="$sum_holds" 'BEGIN { exit !(d + 0 >= m + 0) }' \
   || fail "duration ${DUR}s < sum of card holds ${sum_holds}s"
