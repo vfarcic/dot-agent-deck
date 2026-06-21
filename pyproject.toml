@@ -16,7 +16,12 @@ directory = "bugfix"
 name = "Bug Fixes"
 showcontent = true
 
-# breaking: Breaking changes that require user action
+# breaking: A change to the TUI<->daemon protocol/handler contract such that an
+# older and a newer build can no longer safely interoperate — including SEMANTIC
+# breaks behind a stable wire (a field whose meaning shifts, a role-map value
+# type that changes). This is the cross-process compatibility axis, NOT generic
+# user-facing breakage; see docs/develop/versioning.md. While major is 0 a
+# `breaking` fragment bumps the MINOR digit (feature/bugfix bump patch).
 [[tool.towncrier.type]]
 directory = "breaking"
 name = "Breaking Changes"
