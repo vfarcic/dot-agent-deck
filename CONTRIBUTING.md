@@ -41,3 +41,4 @@ Maintainer-facing references that are intentionally **not** published to the doc
 
 - [Experimental flag](docs/develop/experimental-flag.md) — gate in-flight, work-in-progress surfaces behind the `experimental` flag during development, so unfinished UI can merge to `main` without showing up in normal use.
 - [Rendering contract](docs/develop/rendering-contract.md) — the four render-path invariants (single layout pass, layout-driven PTY size, 1:1 widget render, fixed resize sequencing) and the call sites that enforce them.
+- [Demo reel](docs/develop/demo-reel.md) — turn a PRD's e2e test recordings into one narrated MP4 (title/description card, then the test running, repeated) and upload it unlisted to YouTube; covers the manifest contract, the `agg`/`ffmpeg`/`jq`/`curl` prerequisites, the one-time YouTube OAuth credential setup, local usage, and the orchestrator step.

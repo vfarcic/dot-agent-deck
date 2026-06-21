@@ -25,6 +25,16 @@ tasks:
     cmds:
       - npm run serve
 
+  reel-smoke:
+    desc: Build a demo reel from a tiny fixture and assert the stitched MP4 with ffprobe (local-only; no network, no upload)
+    cmds:
+      - .claude/skills/demo-reel/tests/smoke.sh
+
+  reel-adapter-test:
+    desc: Assert the demo-reel adapter builds manifest.json in catalog order, excludes L1 (cast-less) tests, and clean-skips an empty list (pure shell; no agg/ffmpeg/git/network; CI-safe)
+    cmds:
+      - .claude/skills/demo-reel-adapter/tests/adapter_test.sh
+
   checksums:
     desc: Generate SHA256 checksums for release binaries
     dir: dist

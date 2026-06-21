@@ -1,6 +1,6 @@
 # PRD #180: PRD demo reel
 
-**Status**: Not Started
+**Status**: In Progress
 **Priority**: Low
 **Created**: 2026-06-21
 **GitHub Issue**: [#180](https://github.com/vfarcic/dot-agent-deck/issues/180)
@@ -119,18 +119,18 @@ As part of the pre-PR gate, the orchestrator runs the e2e suite with `DOT_AGENT_
 
 ### Phase 1 — Engine (reusable stitch + publish skill)
 
-- [ ] **M1.1** — Engine skill scaffold under `.claude/skills/` with standalone scripts and the manifest contract (`{title, description, clip}`, `clip` = `.cast` | `gif` | `mp4`); prerequisite checks (`agg`, `ffmpeg`, uploader, OAuth token) that fail with actionable messages.
-- [ ] **M1.2** — Card rendering: synthetic-cast generator (styled title + word-wrapped, vertically-centered description; hold scaled to text length) rendered via the same `agg` invocation as clips; `ffmpeg scale`+`pad` normalize pass. Verified cards concat seamlessly with real clips.
-- [ ] **M1.3** — Stitch + encode all cards and clips into one uniform MP4 (`ffmpeg`); unlisted YouTube upload returning the URL. End-to-end on a hand-written manifest.
+- [x] **M1.1** — Engine skill scaffold under `.claude/skills/` with standalone scripts and the manifest contract (`{title, description, clip}`, `clip` = `.cast` | `gif` | `mp4`); prerequisite checks (`agg`, `ffmpeg`, uploader, OAuth token) that fail with actionable messages.
+- [x] **M1.2** — Card rendering: synthetic-cast generator (styled title + word-wrapped, vertically-centered description; hold scaled to text length) rendered via the same `agg` invocation as clips; `ffmpeg scale`+`pad` normalize pass. Verified cards concat seamlessly with real clips.
+- [x] **M1.3** — Stitch + encode all cards and clips into one uniform MP4 (`ffmpeg`); unlisted YouTube upload returning the URL. End-to-end on a hand-written manifest.
 
 ### Phase 2 — Adapter (dot-agent-deck manifest builder)
 
-- [ ] **M2.1** — Select the e2e `#[spec]` tests added/changed on the branch (diff vs `main`); lift each test's title (`test.md` H1) and description (`## Scenario`); order by catalog ID; emit a manifest pointing at each `full-stream.cast`. Clean skip when there are no in-scope e2e changes.
-- [ ] **M2.2** — Toolchain + secrets: add `agg` and `ffmpeg` (and the uploader) to `devbox.json`; document and validate the one-time YouTube OAuth refresh-token provisioning via `vals`/`.env.vals.yaml`.
+- [x] **M2.1** — Select the e2e `#[spec]` tests added/changed on the branch (diff vs `main`); lift each test's title (`test.md` H1) and description (`## Scenario`); order by catalog ID; emit a manifest pointing at each `full-stream.cast`. Clean skip when there are no in-scope e2e changes.
+- [x] **M2.2** — Toolchain + secrets: add `agg` and `ffmpeg` (and the uploader) to `devbox.json`; document and validate the one-time YouTube OAuth refresh-token provisioning via `vals`/`.env.vals.yaml`.
 
 ### Phase 3 — Orchestrator integration
 
-- [ ] **M3.1** — Pre-PR step: run e2e with `DOT_AGENT_DECK_RECORD=1`, build the manifest (M2.1), invoke the engine (M1.3), surface the URL to the human pre-merge, and post it as a PR comment; report a clean skip when no e2e tests changed.
+- [x] **M3.1** — Pre-PR step: run e2e with `DOT_AGENT_DECK_RECORD=1`, build the manifest (M2.1), invoke the engine (M1.3), surface the URL to the human pre-merge, and post it as a PR comment; report a clean skip when no e2e tests changed.
 
 ### Phase 4 — Docs & release gate
 

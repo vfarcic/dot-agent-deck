@@ -1,0 +1,4 @@
+{"version": 2, "width": 80, "height": 24, "env": {"TERM": "xterm-256color"}}
+[0.0, "o", "$ echo second clip\r\n"]
+[0.4, "o", "second clip output\r\n"]
+[0.8, "o", "$ "]
