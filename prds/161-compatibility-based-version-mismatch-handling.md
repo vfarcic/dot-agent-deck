@@ -135,6 +135,8 @@ While in 0.x, feature-only releases become patch releases (e.g. `0.31.1 → 0.31
 
 **Generic vs local boundary**: the `analyze.sh` 0.x recalibration is generically correct and belongs in the shared skill source. The dot-agent-deck-specific bits (the breaking definition, protocol-surface specifics) stay local.
 
+Applied so far in this PRD's work: the `prompts` source and the vendored copy of `dot-ai-changelog-fragment` both received the **generic** Step-3 "ask the breaking question first" prompt (identical body in both, pushed to both `vfarcic/prompts` and this repo). The project-specific definition stays out of the shared skill — the skill defers to each project's `pyproject.toml` `breaking` comment, which is where the dot-agent-deck definition (M2.2) lives.
+
 ## Scope
 
 ### In Scope
@@ -179,7 +181,7 @@ While in 0.x, feature-only releases become patch releases (e.g. `0.31.1 → 0.31
 ### Phase 2: Release machinery
 
 - [x] **M2.1 — `analyze.sh` 0.x recalibration** (vendored copy) — done in `8efcd76` (D5). Remaining: sync the `prompts` source repo.
-- [ ] **M2.2 — Sharpen breaking-definition guidance** in `pyproject.toml` comment + docs (local); keep shared `changelog-fragment` wording generic.
+- [ ] **M2.2 — Sharpen breaking-definition guidance** in `pyproject.toml` comment + docs (local); keep shared `changelog-fragment` wording generic. The dot-agent-deck-specific breaking definition lives in the `pyproject.toml` `breaking` comment (read by the fragment skill at type-selection time) and `docs/develop/versioning.md`; the shared `changelog-fragment` skill gained only a **generic** "ask the breaking question first, then prefer the `breaking` type when unsure" prompt in Step 3, applied **identically to both** the `prompts` source (`changelog-fragment.md`) and the vendored copy (`.claude/skills/dot-ai-changelog-fragment/SKILL.md`) and pushed to both repos in this PRD's work (no dot-agent-deck specifics in the shared skill — generic-vs-local boundary preserved).
 
 ### Phase 3: Detection / discipline
 
