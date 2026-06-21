@@ -15,7 +15,8 @@ use tokio::task::JoinHandle;
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
-    KIND_STREAM_IN, KIND_STREAM_OUT, TabMembership, bind_attach_listener, serve_attach, write_resp,
+    KIND_STREAM_IN, KIND_STREAM_OUT, RunningAgentsSummary, TabMembership, bind_attach_listener,
+    serve_attach, write_resp,
 };
 use dot_agent_deck::event::AgentType;
 
@@ -552,6 +553,162 @@ fn agent_record_omits_agent_type_when_none() {
     assert!(
         back.agent_type.is_none(),
         "missing `agent_type` in older daemon record must default to None"
+    );
+}
+
+// PRD #161 M1.1: the handshake reply gains two additive, optional fields —
+// a `running_agents` summary (count + display names) and a `daemon_version`
+// string (the daemon's `DAD_VERSION` semver). Both must round-trip through the
+// same serde path the daemon uses, and an older-shape payload that lacks them
+// must still decode (with both as `None`) so the wire stays forward-compatible
+// and no `PROTOCOL_VERSION` bump is needed.
+#[test]
+fn attach_response_round_trips_running_agents_and_daemon_version() {
+    let mut resp = AttachResponse::ok();
+    resp.running_agents = Some(RunningAgentsSummary {
+        count: 2,
+        names: vec!["alpha".into(), "beta".into()],
+    });
+    resp.daemon_version = Some("0.31.1".into());
+
+    let json = serde_json::to_string(&resp).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    // Wire shape: the summary is a nested object, the version a bare string.
+    assert_eq!(v["running_agents"]["count"], 2);
+    assert_eq!(v["running_agents"]["names"][0], "alpha");
+    assert_eq!(v["running_agents"]["names"][1], "beta");
+    assert_eq!(v["daemon_version"], "0.31.1");
+
+    let back: AttachResponse = serde_json::from_str(&json).unwrap();
+    let summary = back
+        .running_agents
+        .expect("running_agents must survive the round-trip");
+    assert_eq!(summary.count, 2);
+    assert_eq!(summary.names, vec!["alpha".to_string(), "beta".to_string()]);
+    assert_eq!(back.daemon_version.as_deref(), Some("0.31.1"));
+}
+
+#[test]
+fn attach_response_omits_running_agents_and_daemon_version_when_none() {
+    // Forward compat (encode side): an unrelated response (e.g. list-agents)
+    // must NOT carry either new field on the wire, so a pre-PRD-161 client
+    // keeps decoding the payload untouched.
+    let resp = AttachResponse::ok();
+    let v: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+    let obj = v.as_object().unwrap();
+    assert!(
+        !obj.contains_key("running_agents"),
+        "running_agents=None should be omitted from the wire payload"
+    );
+    assert!(
+        !obj.contains_key("daemon_version"),
+        "daemon_version=None should be omitted from the wire payload"
+    );
+}
+
+#[test]
+fn attach_response_deserializes_legacy_shape_without_running_agents_or_daemon_version() {
+    // Forward compat (decode side): a pre-PRD-161 daemon emits a hello reply
+    // with only `server_version` / `build_version`. The newer client must
+    // accept that older shape and decode both new fields as `None`.
+    let json = r#"{"ok":true,"server_version":3,"build_version":"0.31.0-gdeadbee"}"#;
+    let resp: AttachResponse = serde_json::from_str(json).unwrap();
+    assert!(resp.ok);
+    assert_eq!(resp.server_version, Some(3));
+    assert_eq!(resp.build_version.as_deref(), Some("0.31.0-gdeadbee"));
+    assert!(
+        resp.running_agents.is_none(),
+        "missing `running_agents` in older daemon reply must default to None"
+    );
+    assert!(
+        resp.daemon_version.is_none(),
+        "missing `daemon_version` in older daemon reply must default to None"
+    );
+}
+
+#[test]
+fn running_agents_summary_count_only_payload_decodes_empty_names() {
+    // Forward compat for the summary's own shape: a payload that carried only
+    // a `count` (a future option B advertising a number without enumerating
+    // names) must decode `names` as an empty Vec via `#[serde(default)]`.
+    let json = r#"{"count":3}"#;
+    let summary: RunningAgentsSummary = serde_json::from_str(json).unwrap();
+    assert_eq!(summary.count, 3);
+    assert!(summary.names.is_empty());
+}
+
+#[test]
+fn running_agents_summary_from_records_uses_display_name_then_id() {
+    // The summary's label for each agent is its `display_name` when set,
+    // falling back to the id so the restart prompt always has something to
+    // print. Order follows the records as given.
+    let records = vec![
+        AgentRecord {
+            id: "7".into(),
+            pane_id_env: None,
+            display_name: Some("coder".into()),
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+        },
+        AgentRecord {
+            id: "9".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+        },
+    ];
+    let summary = RunningAgentsSummary::from_records(&records);
+    assert_eq!(summary.count, 2);
+    assert_eq!(summary.names, vec!["coder".to_string(), "9".to_string()]);
+
+    // An empty registry yields a zero-count, empty-names summary.
+    let empty = RunningAgentsSummary::from_records(&[]);
+    assert_eq!(empty.count, 0);
+    assert!(empty.names.is_empty());
+}
+
+// PRD #161 M1.1: the live daemon's `Hello` handler must populate the
+// running-agent summary from its registry, and `hello()` must advertise the
+// daemon's `DAD_VERSION`. Drive the in-process attach server with a real
+// agent running so the reply carries a non-empty summary.
+#[tokio::test]
+async fn hello_response_carries_running_agents_and_daemon_version() {
+    let server = start_server().await;
+    let id = start_agent(&server, "sleep 30").await;
+
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut s,
+        &AttachRequest::Hello {
+            client_version: 3,
+            client_build_version: None,
+        },
+    )
+    .await;
+    let resp = read_response(&mut s).await;
+
+    assert!(resp.ok);
+    assert_eq!(
+        resp.daemon_version.as_deref(),
+        Some(env!("DAD_VERSION")),
+        "hello reply must advertise the daemon's DAD_VERSION"
+    );
+    let summary = resp
+        .running_agents
+        .expect("hello reply must carry a running-agent summary");
+    assert_eq!(summary.count, 1, "exactly one agent is running");
+    assert_eq!(
+        summary.names,
+        vec![id],
+        "the summary names the running agent (id fallback — no display_name set)"
     );
 }
 
