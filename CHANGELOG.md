@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.31.1] - 2026-06-21
+
+### Fixed
+
+- **Bare commands installed via `~/.bashrc` (such as `opencode`) now resolve in panes**
+  The daemon's login-shell PATH capture now runs your `$SHELL` as an **interactive** login shell (`$SHELL -ilc`) instead of a login-only one (`$SHELL -lc`). An interactive login shell sources `~/.bashrc` exactly as an SSH session does, so directories added there — for example `~/.opencode/bin`, where the opencode installer appends its `PATH` line *after* the standard non-interactive guard (`case $- in *i*) ;; *) return;; esac`) — are now captured. Previously only directories exported from login profiles like `~/.profile` (such as `~/.local/bin`, where `claude` lives) were seen, so a bare `opencode` failed to spawn even though it worked over SSH. The rule of thumb now holds: if a command resolves when you SSH into the machine, it resolves in a dot-agent-deck pane. As before, the PATH is captured once at daemon startup, so a profile change or newly installed tool takes effect after a daemon restart.
+- **Real Agent Shown Immediately on Reconnect**
+  Reconnecting the TUI to a running daemon (for example `ctrl+c` → stop → `dot-agent-deck connect`) now shows each deck's real agent (`Claude Code` / `OpenCode`) right away, instead of displaying "No agent" until that agent next emitted a hook. The daemon now remembers the agent type it learns from hook events, so `list_agents` reports it on the next connect.
+
+
+
 ## [0.31.0] - 2026-06-20
 
 ### Added
