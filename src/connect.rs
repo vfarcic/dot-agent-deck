@@ -19,14 +19,13 @@
 //! No socket relay or laptop-side daemon ever runs in this flow — that's
 //! M2.7's deliberate simplification.
 
-use std::io::{BufRead, Write};
-use std::path::Path;
+use std::io::{BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::build_id::local_build_id;
 use crate::daemon_protocol::{AttachResponse, PROTOCOL_VERSION};
 use crate::remote::{
     RemoteConfigError, RemoteEntry, RemotesFile, SshError, SshExecutor, SshTarget,
@@ -141,17 +140,6 @@ pub enum RemoteConnectError {
         "Remote '{name}' is reachable but `dot-agent-deck` was not found at {install_path}. Run `dot-agent-deck remote upgrade {name}` to (re)install."
     )]
     RemoteBinaryMissing { name: String, install_path: String },
-    /// The remote binary reports a different version than the laptop. M2.9
-    /// surfaces this as a *warning* (the connect proceeds); the variant
-    /// exists so callers and tests can pattern-match on the outcome of the
-    /// probe without parsing log lines. Future PRDs may upgrade specific
-    /// breaking-version pairs into hard failures.
-    #[error("Remote '{name}' runs dot-agent-deck {remote}; laptop runs {local}.")]
-    VersionMismatch {
-        name: String,
-        remote: String,
-        local: String,
-    },
     /// Could not even spawn ssh (e.g. ssh binary not on PATH, fork failed).
     /// Distinct from `HostUnreachable` — that one means ssh ran and
     /// reported a transport error, this one means ssh itself never started.
@@ -162,9 +150,11 @@ pub enum RemoteConnectError {
         source: std::io::Error,
     },
     /// PRD #76 M2.21: the laptop and the remote speak incompatible
-    /// attach-protocol versions. Unlike `VersionMismatch` (which only warns),
-    /// a protocol-version mismatch is fatal: the wire format isn't
-    /// backward-compatible and live updates would silently fail. `remote`
+    /// attach-protocol versions. A protocol-version mismatch is fatal: the
+    /// wire format isn't backward-compatible and live updates would silently
+    /// fail. This is part of the connect *floor* (PRD #161 D3 — "remote too
+    /// old to handshake" stays) and is unaffected by the M1.2 removal of the
+    /// laptop↔remote version/build *comparison*. `remote`
     /// is `None` when the remote binary is too old to know about the
     /// handshake at all (pre-M2.21 — no `daemon hello` subcommand).
     #[error("Remote '{name}' speaks attach protocol v{remote_str}; laptop speaks v{local}. {upgrade_hint}",
@@ -185,25 +175,6 @@ pub enum RemoteConnectError {
         message_suffix = if message.is_empty() { String::new() } else { format!(": {message}") }
     )]
     RemoteHandshakeError { name: String, message: String },
-    /// PRD #103 M1.4: the laptop and the remote have compatible
-    /// `PROTOCOL_VERSION`s but different `DAD_BUILD_ID`s. Same-tag-different-commit
-    /// (or dirty-tree) skew is the exact case that PROTOCOL_VERSION alone
-    /// can't catch — semantically divergent handler code behind a stable
-    /// wire shape. `remote` is `None` when the remote omits `build_version`
-    /// entirely (pre-PRD-103 binary): treated identically to a real mismatch
-    /// so the user upgrades the remote and the laptop gains the precision
-    /// on the next probe.
-    ///
-    /// Recovery routes to `remote upgrade <name>` (NOT `daemon stop` — the
-    /// local-daemon-stop command is only meaningful for the laptop-side
-    /// stale-daemon case).
-    #[error("Remote '{name}' was built as {remote_str}; laptop was built as {local}. Run `dot-agent-deck remote upgrade {name}` to re-install the remote at the current build.",
-            remote_str = remote.as_deref().unwrap_or("<unknown>"))]
-    BuildVersionMismatch {
-        name: String,
-        remote: Option<String>,
-        local: String,
-    },
     #[error(transparent)]
     Registry(#[from] RemoteConfigError),
     #[error("I/O error: {0}")]
@@ -320,22 +291,6 @@ pub fn pick_remote<R: BufRead, W: Write>(
 // M2.9 — version probe + ssh -t exec wrapper.
 // ---------------------------------------------------------------------------
 
-/// Outcome of `probe_remote_version`. The orchestrator turns this into a
-/// stderr warning (`Mismatch`) or proceeds silently (`Match`); the explicit
-/// enum keeps the test surface small without leaking probe internals into
-/// the caller.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ProbeOutcome {
-    /// Remote version equals the laptop's (string equality after the same
-    /// `dot-agent-deck X.Y.Z` parse the install pipeline uses).
-    Match,
-    /// Remote version doesn't match the laptop's. Carry both strings so the
-    /// caller can render a single warning line; M2.9 does not block on a
-    /// mismatch (per task constraints — tighter version policy is a future
-    /// PRD).
-    Mismatch { remote: String, local: String },
-}
-
 /// Read the probe-timeout override, falling back to [`PROBE_TIMEOUT_SECS_DEFAULT`].
 /// Invalid values fall back silently — a malformed env var should not block
 /// `connect` outright.
@@ -391,9 +346,17 @@ fn parse_version_output(stdout: &str) -> Option<String> {
     Some(version.to_string())
 }
 
-/// Run a one-shot version probe over ssh and classify the outcome.
+/// Run a one-shot version probe over ssh and return the remote's version.
 ///
-/// Three failure modes are distinguished so the caller can give the user an
+/// PRD #161 M1.2 (D3): this probe is part of the connect **floor** — it
+/// detects an unreachable host or a missing/foreign binary so the user gets
+/// an actionable message before the terminal is handed over. It no longer
+/// *compares* the remote version against the laptop's: the laptop is only
+/// ssh + a terminal, so a laptop↔remote version difference guards nothing.
+/// The returned version string instead feeds the newer-only upgrade nudge
+/// ([`maybe_nudge_upgrade`]); an un-upgraded remote connects normally.
+///
+/// Two failure modes are distinguished so the caller can give the user an
 /// actionable message:
 ///
 /// - **Host-unreachable** — ssh itself failed to connect (transport error,
@@ -402,9 +365,8 @@ fn parse_version_output(stdout: &str) -> Option<String> {
 /// - **Binary-missing** — ssh succeeded but the remote shell reported
 ///   "command not found" (exit 127) or stdout doesn't look like a version
 ///   line. Wrapped into `RemoteBinaryMissing` with a `remote upgrade` hint.
-/// - **Version-mismatch** — both sides report a version, but they don't
-///   match. Returned as `ProbeOutcome::Mismatch` (NOT an error) so the
-///   orchestrator can warn-and-continue per the task constraints.
+///
+/// On success the parsed remote version string is returned (e.g. `0.31.0`).
 ///
 /// Auth failures and host-key issues are folded into `HostUnreachable` —
 /// the message tells the user to check their ssh config, which is the right
@@ -415,8 +377,7 @@ pub fn probe_remote_version(
     target: &SshTarget,
     name: &str,
     install_path: &str,
-    local_version: &str,
-) -> Result<ProbeOutcome, RemoteConnectError> {
+) -> Result<String, RemoteConnectError> {
     // The probe command runs through the remote shell; we use the absolute
     // install_path because non-interactive ssh shells typically don't have
     // ~/.local/bin on PATH (same fix as ea8c748).
@@ -455,11 +416,9 @@ pub fn probe_remote_version(
                 });
             }
             match parse_version_output(&output.stdout) {
-                Some(remote_version) if remote_version == local_version => Ok(ProbeOutcome::Match),
-                Some(remote_version) => Ok(ProbeOutcome::Mismatch {
-                    remote: remote_version,
-                    local: local_version.to_string(),
-                }),
+                // PRD #161 M1.2: no laptop↔remote comparison — just surface
+                // the remote version for the newer-only nudge decision.
+                Some(remote_version) => Ok(remote_version),
                 None => {
                     // Status was 0 but stdout doesn't look like a version
                     // line — e.g. `dot-agent-deck` was replaced with a stub
@@ -509,12 +468,16 @@ const PROBE_PROTOCOL_STDOUT_CAP: usize = 64 * 1024;
 ///   `daemon hello`) → `ProtocolMismatch { remote: None, .. }`.
 /// - Remote exits 0 but stdout doesn't parse as a JSON response with a
 ///   `server_version` field → same treatment as "remote too old".
-/// - PRD #103 M1.4: `server_version` matches but `build_version` differs (or
-///   is missing on the remote) → [`RemoteConnectError::BuildVersionMismatch`]
-///   whose user-facing message names both build_ids and points at
-///   `dot-agent-deck remote upgrade <name>`. The local-side `daemon stop`
-///   command is NOT suggested here — that recovery applies only to the
-///   laptop's own stale daemon, not to a remote.
+///
+/// PRD #161 M1.2 (D3): the `server_version == PROTOCOL_VERSION` arm no longer
+/// compares the finer-grained `build_version`. That laptop↔remote build-id
+/// comparison guarded nothing (the laptop is only ssh + a terminal), so a
+/// matched-protocol remote is accepted regardless of build id and an
+/// un-upgraded remote connects normally. The structural `PROTOCOL_VERSION`
+/// floor ("remote too old to handshake") stays. On success the probe returns
+/// the remote's `running_agents` count (when the reply carries one) so the
+/// upgrade nudge can state the restart cost; the static `daemon hello` CLI
+/// has no registry to enumerate, so that is `None` today.
 ///
 /// Transport failures (`SshError`) fold into `HostUnreachable` via the same
 /// `map_probe_ssh_error` the binary-version probe uses — the user's
@@ -527,7 +490,7 @@ pub fn probe_remote_protocol(
     target: &SshTarget,
     name: &str,
     install_path: &str,
-) -> Result<(), RemoteConnectError> {
+) -> Result<Option<usize>, RemoteConnectError> {
     // SAFETY (audit P3b): `install_path` is currently a module-level
     // constant (`REMOTE_INSTALL_PATH`) with no shell metacharacters. If it
     // ever becomes user- or registry-configurable, this interpolation needs
@@ -581,33 +544,12 @@ pub fn probe_remote_protocol(
             }
             match resp.server_version {
                 Some(v) if v == PROTOCOL_VERSION => {
-                    // PRD #103 M1.4: PROTOCOL_VERSION matches — now check
-                    // the finer-grained `build_version` (which catches
-                    // same-tag-different-commit skew the protocol version
-                    // can't). A `None` here means a pre-PRD-103 remote
-                    // binary that doesn't emit `build_version`; treat it
-                    // identically to a real mismatch so the user re-runs
-                    // `remote upgrade <name>` and the laptop gains the
-                    // precision on the next probe.
-                    // Route through `local_build_id()` rather than
-                    // `env!("DAD_BUILD_ID")` so the
-                    // `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` test hook (used by
-                    // the M4.2 integration tests) takes effect on the
-                    // remote-mismatch path too.
-                    let local_build = local_build_id();
-                    match resp.build_version.as_deref() {
-                        Some(remote_build) if remote_build == local_build.as_str() => Ok(()),
-                        Some(remote_build) => Err(RemoteConnectError::BuildVersionMismatch {
-                            name: name.to_string(),
-                            remote: Some(remote_build.to_string()),
-                            local: local_build,
-                        }),
-                        None => Err(RemoteConnectError::BuildVersionMismatch {
-                            name: name.to_string(),
-                            remote: None,
-                            local: local_build,
-                        }),
-                    }
+                    // PRD #161 M1.2: the wire format is compatible. No
+                    // build-id comparison (deleted with the laptop↔remote
+                    // probe). Surface the running-agent count when the reply
+                    // carries one so the upgrade nudge can state the restart
+                    // cost; the static `daemon hello` CLI omits it (`None`).
+                    Ok(resp.running_agents.map(|s| s.count))
                 }
                 Some(v) => {
                     let upgrade_hint = if v < PROTOCOL_VERSION {
@@ -770,6 +712,146 @@ impl Default for SleepBackoff {
 impl ReconnectBackoff for SleepBackoff {
     fn backoff(&self, _attempt: usize) {
         std::thread::sleep(RECONNECT_BACKOFF);
+    }
+}
+
+/// PRD #161 M1.2: abstraction over running `remote upgrade` (binary swap only)
+/// from the connect nudge's `y` path. Modeled on the [`ConnectSpawner`] /
+/// [`ReconnectBackoff`] seams: production swaps the remote binary via
+/// [`crate::remote::upgrade`]; unit tests inject a fake that records the call
+/// and returns a scripted success/failure so the nudge's upgrade-then-connect
+/// and upgrade-failure-fallback branches are exercisable without ssh.
+///
+/// **Binary-swap-only by contract (D3):** the upgrader MUST NOT restart the
+/// remote daemon or kill agents. Any daemon restart is the Part-A handshake's
+/// job on the remote's own machine — the connect `y`-path only orchestrates
+/// the binary swap, then connects.
+pub trait RemoteUpgrader {
+    /// Upgrade remote `name` to `version` (the laptop's version). `Ok(())` on
+    /// success; `Err(msg)` carries a user-facing failure reason so the nudge
+    /// can print a clear fallback line before connecting to the existing
+    /// version (D4: never strand).
+    fn upgrade(&self, name: &str, version: &str) -> Result<(), String>;
+}
+
+/// Production upgrader: runs the binary-swap-only [`crate::remote::upgrade`]
+/// flow against the registry at `remotes_path`. Uses a fresh, *uncapped*
+/// [`crate::remote::SystemSshExecutor`] (NOT the wallclock-capped probe
+/// executor) because a release download + install can legitimately run longer
+/// than the short version-probe timeout.
+pub struct SystemRemoteUpgrader {
+    remotes_path: PathBuf,
+}
+
+impl SystemRemoteUpgrader {
+    pub fn new(remotes_path: PathBuf) -> Self {
+        Self { remotes_path }
+    }
+}
+
+impl RemoteUpgrader for SystemRemoteUpgrader {
+    fn upgrade(&self, name: &str, version: &str) -> Result<(), String> {
+        let opts = crate::remote::UpgradeOptions {
+            name: name.to_string(),
+            version: version.to_string(),
+            no_install: false,
+            release_base: crate::remote::RELEASE_BASE.to_string(),
+        };
+        let executor = crate::remote::SystemSshExecutor::new();
+        crate::remote::upgrade(&opts, &executor, &self.remotes_path)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// PRD #161 M1.2 (D3): is the laptop strictly newer than the remote? The
+/// connect nudge is **newer-only** — it never suggests a downgrade or a no-op
+/// same-version upgrade — so an equal or older laptop returns `false` and no
+/// prompt is shown. Both sides are parsed as semver (stripping the optional
+/// `v` prefix the install pipeline may carry); if either fails to parse we
+/// conservatively return `false`, so a malformed version string can never
+/// trigger a spurious upgrade prompt.
+fn laptop_is_newer(local: &str, remote: &str) -> bool {
+    let parse = |s: &str| semver::Version::parse(s.strip_prefix('v').unwrap_or(s)).ok();
+    match (parse(local), parse(remote)) {
+        (Some(l), Some(r)) => l > r,
+        _ => false,
+    }
+}
+
+/// PRD #161 M1.2 (D3/D4): the one-step, laptop-side, pre-handover upgrade
+/// nudge that replaces the deleted laptop↔remote enforcement.
+///
+/// Shown **only** when the laptop is strictly newer than the remote
+/// ([`laptop_is_newer`]) *and* stdin is a TTY (`is_tty`); otherwise this is a
+/// no-op and `connect` proceeds against the existing remote. The prompt
+/// defaults to **No** — empty / `Enter` / EOF / anything that isn't an
+/// explicit `y`/`yes`:
+///
+/// - `y`/`yes` → run `remote upgrade` (binary swap only) via `upgrader`, then
+///   connect. If the upgrade fails, print a clear fallback line and connect to
+///   the **existing** version anyway (never strand — D4). The Part-A handshake
+///   then owns any daemon restart on attach.
+/// - `Enter` / `n` / EOF → connect as-is against the existing version.
+///
+/// `agent_count` (from the `daemon hello` probe's `running_agents`) is folded
+/// into the prompt as "(N running agents)" when known, so the user sees the
+/// restart cost the upgrade incurs on attach. It is `None` on the current
+/// static-probe path; the note is simply omitted in that case.
+///
+/// Generic over `BufRead` / `Write` so tests inject fake I/O (same seam as
+/// [`pick_remote`]).
+#[allow(clippy::too_many_arguments)]
+fn maybe_nudge_upgrade<R: BufRead, W: Write>(
+    upgrader: &dyn RemoteUpgrader,
+    name: &str,
+    remote_version: &str,
+    local_version: &str,
+    agent_count: Option<usize>,
+    is_tty: bool,
+    input: &mut R,
+    output: &mut W,
+) -> Result<(), RemoteConnectError> {
+    // Newer-only: never suggest a downgrade or a same-version no-op.
+    if !laptop_is_newer(local_version, remote_version) {
+        return Ok(());
+    }
+    // Non-TTY: no one to answer the prompt — connect as-is, no nudge.
+    if !is_tty {
+        return Ok(());
+    }
+
+    let agents_note = match agent_count {
+        Some(n) if n > 0 => format!(" ({n} running agents)"),
+        _ => String::new(),
+    };
+    write!(
+        output,
+        "Remote '{name}' runs {remote_version}; you have {local_version}{agents_note}. Upgrade and connect? [y/N] "
+    )?;
+    output.flush()?;
+
+    let mut line = String::new();
+    let n = input.read_line(&mut line)?;
+    let answer = line.trim();
+    // Default N: empty input / bare Enter / EOF / anything but an explicit yes.
+    let yes = n != 0 && (answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"));
+    if !yes {
+        return Ok(());
+    }
+
+    // `y` → binary-swap upgrade to the laptop's version, then connect. A
+    // failure falls back to connecting the existing version with a clear
+    // message; the failure semantics are owned by `remote upgrade` (D3/D4).
+    match upgrader.upgrade(name, local_version) {
+        Ok(()) => Ok(()),
+        Err(msg) => {
+            writeln!(
+                output,
+                "warning: upgrade of remote '{name}' failed: {msg}\nConnecting to the existing {remote_version} install instead."
+            )?;
+            Ok(())
+        }
     }
 }
 
@@ -955,7 +1037,7 @@ fn on_transport_failure(
 /// give-up path a dropped session uses — otherwise a still-down network would
 /// let the reconnect escape the loop without counting against the budget,
 /// backing off, or restoring the terminal. Genuine incompatibilities
-/// (protocol/build mismatch, missing binary) stay fatal even on a reconnect.
+/// (protocol mismatch, missing binary) stay fatal even on a reconnect.
 ///
 /// Reconnection is bounded by [`MAX_CONNECT_ATTEMPTS`]. When exhausted we
 /// restore a sane local terminal (the remote TUI never got to leave alt
@@ -970,14 +1052,19 @@ fn on_transport_failure(
 /// - User Ctrl-C's the ssh, daemon dies, network drops mid-session, or we
 ///   exhaust reconnects → no bookkeeping update; the registry only ever shows
 ///   sessions that actually ran to completion.
-pub fn run_connect(
+#[allow(clippy::too_many_arguments)]
+pub fn run_connect<R: BufRead, W: Write>(
     entry: &RemoteEntry,
     executor: &dyn SshExecutor,
     spawner: &dyn ConnectSpawner,
     backoff: &dyn ReconnectBackoff,
+    upgrader: &dyn RemoteUpgrader,
     remotes_path: &Path,
     local_version: &str,
     install_path: &str,
+    input: &mut R,
+    output: &mut W,
+    is_tty: bool,
 ) -> Result<i32, RemoteConnectError> {
     let target = entry.ssh_target();
 
@@ -989,45 +1076,44 @@ pub fn run_connect(
     loop {
         attempt += 1;
 
-        // Stage 1: binary-version probe. A version *mismatch* warns and
-        // proceeds. A probe *error* is fatal on the initial connect (returns
-        // the existing "Could not reach…" UX), but on a RECONNECT a
-        // reachability failure (the normal "wifi/DHCP not back yet" state after
-        // sleep/wake) folds into the same bounded-retry/backoff/give-up path a
-        // dropped session uses — see `on_transport_failure`. Genuine
-        // incompatibilities stay fatal even on a reconnect.
-        match probe_remote_version(executor, &target, &entry.name, install_path, local_version) {
-            Ok(ProbeOutcome::Match) => {}
-            Ok(ProbeOutcome::Mismatch { remote, local }) => {
-                eprintln!(
-                    "warning: remote '{}' runs dot-agent-deck {}; laptop runs {}. Run `dot-agent-deck remote upgrade {}` to align.",
-                    entry.name, remote, local, entry.name
-                );
-            }
-            Err(e) if attempt > 1 && is_reachability_error(&e) => {
-                match on_transport_failure(
-                    attempt,
-                    &entry.name,
-                    TransportFailureKind::StillUnreachable,
-                    backoff,
-                ) {
-                    Some(code) => return Ok(code),
-                    None => continue,
+        // Stage 1: binary-version probe. PRD #161 M1.2 (D3): this no longer
+        // compares laptop↔remote versions (the laptop is only ssh + a
+        // terminal, so the comparison guarded nothing). It still catches an
+        // unreachable host or a missing/foreign binary (the connect floor) and
+        // returns the remote version for the newer-only nudge below. A probe
+        // *error* is fatal on the initial connect (returns the existing "Could
+        // not reach…" UX), but on a RECONNECT a reachability failure (the
+        // normal "wifi/DHCP not back yet" state after sleep/wake) folds into
+        // the same bounded-retry/backoff/give-up path a dropped session uses —
+        // see `on_transport_failure`.
+        let remote_version =
+            match probe_remote_version(executor, &target, &entry.name, install_path) {
+                Ok(v) => v,
+                Err(e) if attempt > 1 && is_reachability_error(&e) => {
+                    match on_transport_failure(
+                        attempt,
+                        &entry.name,
+                        TransportFailureKind::StillUnreachable,
+                        backoff,
+                    ) {
+                        Some(code) => return Ok(code),
+                        None => continue,
+                    }
                 }
-            }
-            Err(e) => return Err(e),
-        }
+                Err(e) => return Err(e),
+            };
 
-        // Stage 1b: protocol-version handshake. A binary-version match doesn't
-        // guarantee wire-format compatibility (the protocol is bumped
-        // independently of the binary semver, see PRD #76 M2.21), and a
-        // binary-version mismatch can still be safe if the protocol versions
-        // agree. Same reachability-vs-fatal split as the version probe: a
-        // transient transport failure on a reconnect retries, but a
-        // protocol/build incompatibility (the downgrade/safety case) stays
-        // fatal so we never re-spawn into an incompatible remote.
-        match probe_remote_protocol(executor, &target, &entry.name, install_path) {
-            Ok(()) => {}
+        // Stage 1b: protocol-version handshake — the structural floor ("remote
+        // too old to handshake" stays; the build-id comparison was removed with
+        // the laptop probe, see PRD #161 M1.2). Returns the remote's
+        // running-agent count when the reply carries one, so the nudge can
+        // state the restart cost. Same reachability-vs-fatal split as the
+        // version probe: a transient transport failure on a reconnect retries,
+        // but a protocol incompatibility stays fatal so we never re-spawn into
+        // an incompatible remote.
+        let agent_count = match probe_remote_protocol(executor, &target, &entry.name, install_path)
+        {
+            Ok(count) => count,
             Err(e) if attempt > 1 && is_reachability_error(&e) => {
                 match on_transport_failure(
                     attempt,
@@ -1040,6 +1126,25 @@ pub fn run_connect(
                 }
             }
             Err(e) => return Err(e),
+        };
+
+        // Stage 1c: one-step, pre-handover upgrade nudge (PRD #161 M1.2). Only
+        // on the *initial* connect (attempt 1) — a reconnect after a transport
+        // drop must re-attach without re-prompting. Newer-only + non-TTY-skip +
+        // default-N are decided inside `maybe_nudge_upgrade`; on `y` it runs the
+        // binary-swap `remote upgrade` then returns so we connect to the
+        // upgraded remote (a failed upgrade falls back to the existing version).
+        if attempt == 1 {
+            maybe_nudge_upgrade(
+                upgrader,
+                &entry.name,
+                &remote_version,
+                local_version,
+                agent_count,
+                is_tty,
+                input,
+                output,
+            )?;
         }
 
         // Stage 2: hand the terminal over. This blocks until the user exits.
@@ -1097,14 +1202,28 @@ pub fn run_connect_default(
     let executor = SystemSshExecutor::with_wallclock_timeout(probe_timeout_secs());
     let spawner = SystemConnectSpawner::new();
     let backoff = SleepBackoff::new();
+    // The upgrader runs the binary-swap `remote upgrade` with its OWN uncapped
+    // executor (a release download can outlast the short probe timeout).
+    let upgrader = SystemRemoteUpgrader::new(remotes_path.to_path_buf());
+    // PRD #161 M1.2: the nudge reads from stdin / writes the prompt to stdout
+    // and is skipped entirely when stdin is not a TTY.
+    let stdin = std::io::stdin();
+    let is_tty = stdin.is_terminal();
+    let mut input = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
     run_connect(
         entry,
         &executor,
         &spawner,
         &backoff,
+        &upgrader,
         remotes_path,
         local_version,
         REMOTE_INSTALL_PATH,
+        &mut input,
+        &mut output,
+        is_tty,
     )
 }
 
@@ -1454,6 +1573,113 @@ mod tests {
         }
     }
 
+    /// Fake `RemoteUpgrader` that records each `upgrade` call (name + version)
+    /// and returns a scripted result. `fail` makes every call return `Err`, so
+    /// the nudge's upgrade-failure fallback can be exercised without ssh.
+    struct RecordingUpgrader {
+        calls: std::cell::RefCell<Vec<(String, String)>>,
+        fail: bool,
+    }
+
+    impl RecordingUpgrader {
+        fn new() -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+                fail: false,
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+                fail: true,
+            }
+        }
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl RemoteUpgrader for RecordingUpgrader {
+        fn upgrade(&self, name: &str, version: &str) -> Result<(), String> {
+            self.calls
+                .borrow_mut()
+                .push((name.to_string(), version.to_string()));
+            if self.fail {
+                Err("install failed: download 404".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Fake executor whose `--version` probe reports a *specific* remote
+    /// version (independent of the laptop's) and whose `daemon hello` is always
+    /// compatible. Lets a test drive the un-upgraded-remote case (remote older
+    /// than the laptop) end-to-end through `run_connect`.
+    struct VersionExecutor {
+        remote_version: String,
+    }
+
+    impl VersionExecutor {
+        fn new(remote_version: &str) -> Self {
+            Self {
+                remote_version: remote_version.to_string(),
+            }
+        }
+    }
+
+    impl SshExecutor for VersionExecutor {
+        fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+            if command.contains("daemon hello") {
+                let body = serde_json::to_string(&AttachResponse::hello(PROTOCOL_VERSION))
+                    .expect("serialize hello");
+                Ok(SshOutput {
+                    status: 0,
+                    stdout: body,
+                    stderr: String::new(),
+                })
+            } else if command.contains("--version") {
+                Ok(SshOutput {
+                    status: 0,
+                    stdout: format!("dot-agent-deck {}\n", self.remote_version),
+                    stderr: String::new(),
+                })
+            } else {
+                panic!("unexpected probe command: {command}");
+            }
+        }
+    }
+
+    /// Drive `run_connect` with the nudge disabled (non-TTY) and a no-op
+    /// upgrader, so the reconnect/exit-code tests below stay focused on the
+    /// PRD #148 state machine. PRD #161 M1.2 added the nudge seam; these tests
+    /// don't exercise it (the probe reports the same version as the laptop, so
+    /// `laptop_is_newer` is false regardless).
+    fn run_connect_no_nudge(
+        entry: &RemoteEntry,
+        executor: &dyn SshExecutor,
+        spawner: &dyn ConnectSpawner,
+        backoff: &dyn ReconnectBackoff,
+        path: &Path,
+    ) -> Result<i32, RemoteConnectError> {
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"";
+        let mut output: Vec<u8> = Vec::new();
+        run_connect(
+            entry,
+            executor,
+            spawner,
+            backoff,
+            &upgrader,
+            path,
+            TEST_LOCAL_VERSION,
+            REMOTE_INSTALL_PATH,
+            &mut input,
+            &mut output,
+            false,
+        )
+    }
+
     fn test_entry(name: &str) -> RemoteEntry {
         RemoteEntry {
             name: name.to_string(),
@@ -1493,16 +1719,8 @@ mod tests {
         let spawner = ScriptedSpawner::new(vec![255, 0]);
         let backoff = RecordingBackoff::new();
 
-        let code = run_connect(
-            &entry,
-            &executor,
-            &spawner,
-            &backoff,
-            &path,
-            TEST_LOCAL_VERSION,
-            REMOTE_INSTALL_PATH,
-        )
-        .expect("run_connect should succeed after one reconnect");
+        let code = run_connect_no_nudge(&entry, &executor, &spawner, &backoff, &path)
+            .expect("run_connect should succeed after one reconnect");
 
         assert_eq!(code, 0, "clean exit on the second attempt");
         assert_eq!(
@@ -1536,16 +1754,8 @@ mod tests {
         let spawner = ScriptedSpawner::new(vec![0]);
         let backoff = RecordingBackoff::new();
 
-        let code = run_connect(
-            &entry,
-            &executor,
-            &spawner,
-            &backoff,
-            &path,
-            TEST_LOCAL_VERSION,
-            REMOTE_INSTALL_PATH,
-        )
-        .expect("run_connect");
+        let code = run_connect_no_nudge(&entry, &executor, &spawner, &backoff, &path)
+            .expect("run_connect");
 
         assert_eq!(code, 0);
         assert_eq!(spawner.spawn_count(), 1, "single spawn, no reconnect");
@@ -1563,16 +1773,8 @@ mod tests {
         let spawner = ScriptedSpawner::new(vec![130]);
         let backoff = RecordingBackoff::new();
 
-        let code = run_connect(
-            &entry,
-            &executor,
-            &spawner,
-            &backoff,
-            &path,
-            TEST_LOCAL_VERSION,
-            REMOTE_INSTALL_PATH,
-        )
-        .expect("run_connect");
+        let code = run_connect_no_nudge(&entry, &executor, &spawner, &backoff, &path)
+            .expect("run_connect");
 
         assert_eq!(code, 130, "Ctrl-C exit returned verbatim");
         assert_eq!(spawner.spawn_count(), 1, "single spawn, no reconnect");
@@ -1596,16 +1798,8 @@ mod tests {
         let spawner = ScriptedSpawner::new(vec![255]);
         let backoff = RecordingBackoff::new();
 
-        let code = run_connect(
-            &entry,
-            &executor,
-            &spawner,
-            &backoff,
-            &path,
-            TEST_LOCAL_VERSION,
-            REMOTE_INSTALL_PATH,
-        )
-        .expect("run_connect returns Ok with the terminal-error code");
+        let code = run_connect_no_nudge(&entry, &executor, &spawner, &backoff, &path)
+            .expect("run_connect returns Ok with the terminal-error code");
 
         assert_eq!(
             code, SSH_TRANSPORT_FAILURE_EXIT_CODE,
@@ -1648,16 +1842,9 @@ mod tests {
         let spawner = ScriptedSpawner::new(vec![255]);
         let backoff = RecordingBackoff::new();
 
-        let code = run_connect(
-            &entry,
-            &executor,
-            &spawner,
-            &backoff,
-            &path,
-            TEST_LOCAL_VERSION,
-            REMOTE_INSTALL_PATH,
-        )
-        .expect("run_connect folds reconnect-time unreachable into bounded retry, returns Ok(255)");
+        let code = run_connect_no_nudge(&entry, &executor, &spawner, &backoff, &path).expect(
+            "run_connect folds reconnect-time unreachable into bounded retry, returns Ok(255)",
+        );
 
         assert_eq!(
             code, SSH_TRANSPORT_FAILURE_EXIT_CODE,
@@ -1715,6 +1902,250 @@ mod tests {
         assert!(
             !unreachable.contains("lost"),
             "the still-unreachable line must not say a connection was 'lost': {unreachable}"
+        );
+    }
+
+    // ----- PRD #161 M4.3: connect version-comparison removal + upgrade nudge --
+
+    #[test]
+    fn unupgraded_older_remote_connects_normally() {
+        // Success criterion (PRD #161): a laptop at 0.31.1 connecting to a
+        // remote at 0.31.0 connects normally — no block, no error, no forced
+        // upgrade. The deleted laptop↔remote comparison would have hard-failed
+        // here; with it gone the older remote's matched TUI+daemon just connect.
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor = VersionExecutor::new("0.31.0");
+        let spawner = ScriptedSpawner::new(vec![0]);
+        let backoff = RecordingBackoff::new();
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"";
+        let mut output: Vec<u8> = Vec::new();
+
+        let code = run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &backoff,
+            &upgrader,
+            &path,
+            "0.31.1", // laptop strictly newer than the 0.31.0 remote
+            REMOTE_INSTALL_PATH,
+            &mut input,
+            &mut output,
+            false, // non-TTY → nudge auto-skipped, connect as-is
+        )
+        .expect("un-upgraded older remote must connect without a block");
+
+        assert_eq!(code, 0, "connects and exits cleanly");
+        assert_eq!(spawner.spawn_count(), 1, "single spawn, no block before it");
+        assert!(
+            upgrader.calls().is_empty(),
+            "no upgrade forced on a non-TTY connect to an older remote"
+        );
+    }
+
+    #[test]
+    fn nudge_is_newer_only() {
+        // The nudge is offered only when the laptop is strictly newer than the
+        // remote; an equal or older laptop must NOT prompt (never suggest a
+        // downgrade).
+        assert!(laptop_is_newer("0.31.1", "0.31.0"), "newer laptop -> nudge");
+        assert!(!laptop_is_newer("0.31.0", "0.31.0"), "equal -> no nudge");
+        assert!(
+            !laptop_is_newer("0.31.0", "0.31.1"),
+            "older laptop -> no nudge (never downgrade)"
+        );
+        // `v` prefix tolerated on either side.
+        assert!(laptop_is_newer("v0.32.0", "0.31.9"));
+        // Unparseable version is conservative: no nudge.
+        assert!(!laptop_is_newer("garbage", "0.31.0"));
+
+        // End-to-end through the prompt: an equal-version laptop on a TTY with
+        // 'y' queued still writes NO prompt and runs no upgrade.
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"y\n";
+        let mut output: Vec<u8> = Vec::new();
+        maybe_nudge_upgrade(
+            &upgrader,
+            "prod",
+            "0.31.0",
+            "0.31.0",
+            None,
+            true,
+            &mut input,
+            &mut output,
+        )
+        .expect("nudge");
+        assert!(output.is_empty(), "equal version writes no prompt");
+        assert!(
+            upgrader.calls().is_empty(),
+            "equal version runs no upgrade even with 'y' on stdin"
+        );
+    }
+
+    #[test]
+    fn nudge_default_n_connects_without_upgrade() {
+        // Newer laptop on a TTY: bare Enter (empty answer) defaults to No, so
+        // no upgrade runs and connect proceeds against the existing version.
+        // The agent count from the probe is surfaced in the prompt.
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"\n";
+        let mut output: Vec<u8> = Vec::new();
+        maybe_nudge_upgrade(
+            &upgrader,
+            "prod",
+            "0.31.0",
+            "0.31.1",
+            Some(2),
+            true,
+            &mut input,
+            &mut output,
+        )
+        .expect("nudge");
+        let prompt = String::from_utf8(output).unwrap();
+        assert!(
+            prompt.contains("Upgrade and connect? [y/N]"),
+            "prompt shown: {prompt}"
+        );
+        assert!(
+            prompt.contains("2 running agents"),
+            "agent count surfaced in the prompt: {prompt}"
+        );
+        assert!(
+            upgrader.calls().is_empty(),
+            "Enter defaults to No -> no upgrade"
+        );
+
+        // An explicit 'n' behaves the same.
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"n\n";
+        let mut output: Vec<u8> = Vec::new();
+        maybe_nudge_upgrade(
+            &upgrader,
+            "prod",
+            "0.31.0",
+            "0.31.1",
+            None,
+            true,
+            &mut input,
+            &mut output,
+        )
+        .expect("nudge");
+        assert!(upgrader.calls().is_empty(), "'n' -> no upgrade");
+    }
+
+    #[test]
+    fn nudge_yes_runs_upgrade_then_connects() {
+        // 'y' on a newer-laptop TTY runs `remote upgrade` to the laptop's
+        // version, then returns Ok so connect proceeds against the upgraded
+        // remote.
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"y\n";
+        let mut output: Vec<u8> = Vec::new();
+        maybe_nudge_upgrade(
+            &upgrader,
+            "prod",
+            "0.31.0",
+            "0.31.1",
+            None,
+            true,
+            &mut input,
+            &mut output,
+        )
+        .expect("nudge");
+        assert_eq!(
+            upgrader.calls(),
+            vec![("prod".to_string(), "0.31.1".to_string())],
+            "y upgrades the remote to the laptop's version before connecting"
+        );
+    }
+
+    #[test]
+    fn nudge_upgrade_failure_falls_back_to_existing_version() {
+        // PRD #161 D4 (never strand): a failed `remote upgrade` must NOT
+        // propagate as an error — the nudge prints a clear fallback line and
+        // connect proceeds against the EXISTING version.
+        let upgrader = RecordingUpgrader::failing();
+        let mut input: &[u8] = b"y\n";
+        let mut output: Vec<u8> = Vec::new();
+        maybe_nudge_upgrade(
+            &upgrader,
+            "prod",
+            "0.31.0",
+            "0.31.1",
+            None,
+            true,
+            &mut input,
+            &mut output,
+        )
+        .expect("upgrade failure must fall back, not error out");
+        assert_eq!(upgrader.calls().len(), 1, "the upgrade was attempted");
+        let msg = String::from_utf8(output).unwrap();
+        assert!(msg.contains("failed"), "clear failure message: {msg}");
+        assert!(
+            msg.contains("existing 0.31.0 install"),
+            "falls back to the existing remote version: {msg}"
+        );
+    }
+
+    #[test]
+    fn nudge_non_tty_auto_skips() {
+        // Even with the laptop strictly newer and a 'y' queued on stdin, a
+        // non-TTY stdin skips the prompt entirely and connects as-is.
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"y\n";
+        let mut output: Vec<u8> = Vec::new();
+        maybe_nudge_upgrade(
+            &upgrader,
+            "prod",
+            "0.31.0",
+            "0.31.1",
+            Some(3),
+            false,
+            &mut input,
+            &mut output,
+        )
+        .expect("nudge");
+        assert!(output.is_empty(), "non-TTY writes no prompt");
+        assert!(upgrader.calls().is_empty(), "non-TTY runs no upgrade");
+    }
+
+    #[test]
+    fn run_connect_nudge_y_upgrades_then_connects_end_to_end() {
+        // Full path through run_connect: newer laptop, TTY, 'y' → the binary
+        // swap runs, then ssh -t spawns and the session exits cleanly. Proves
+        // the y-path orchestrates `remote upgrade` then connects.
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor = VersionExecutor::new("0.31.0");
+        let spawner = ScriptedSpawner::new(vec![0]);
+        let backoff = RecordingBackoff::new();
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"y\n";
+        let mut output: Vec<u8> = Vec::new();
+
+        let code = run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &backoff,
+            &upgrader,
+            &path,
+            "0.31.1",
+            REMOTE_INSTALL_PATH,
+            &mut input,
+            &mut output,
+            true,
+        )
+        .expect("connect after the y-upgrade");
+
+        assert_eq!(code, 0, "connected and exited cleanly after the upgrade");
+        assert_eq!(spawner.spawn_count(), 1, "connected once after the upgrade");
+        assert_eq!(
+            upgrader.calls(),
+            vec![("prod".to_string(), "0.31.1".to_string())],
+            "y ran `remote upgrade` to the laptop version before connecting"
         );
     }
 }
