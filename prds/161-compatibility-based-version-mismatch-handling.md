@@ -1,6 +1,6 @@
 # PRD #161: Compatibility-based version-mismatch handling
 
-**Status**: Planning (design substantially revised 2026-06-21 — see Design Decisions)
+**Status**: Planning (design substantially revised 2026-06-21; shared-handshake behavior resolved to A — see Design Decisions)
 **Priority**: Medium
 **Created**: 2026-06-14
 **Last updated**: 2026-06-21
@@ -26,23 +26,24 @@ Verified in code (not docs):
 
 **Consequence:** the new-TUI-meets-old-daemon skew is real and identical in both cases — locally (you `brew`/`cargo` upgrade the binary while a local daemon keeps running) and remotely (you `remote upgrade` the binary while the remote daemon keeps running). The "remote TUI and daemon can't differ" intuition holds only for an *un-upgraded* remote (binary on disk == running daemon); once the binary is upgraded in place, they differ exactly like local. The laptop↔remote comparison done by the `connect` probe, by contrast, guards nothing — the laptop is only ssh + a terminal, so its version has no bearing on the remote session's correctness.
 
-### D2 — Part A: the shared handshake decision (local == remote).
+### D2 — Part A: the shared handshake decision (local == remote). **Resolved: A.**
 
 When a newer TUI attaches to an older still-running daemon, the options are:
 
-- **(A) Always restart** the daemon on any version difference (lose its agents). Cheap; no version logic. This is essentially today's #103 behavior, made non-fatal.
+- **(A) Always restart** the daemon on any version difference (lose its agents). Cheap; no version logic. This is essentially today's #103 behavior, made consent-based instead of fatal.
 - **(B) Attach if compatible, restart only if incompatible** (keep agents when it is safe to). Needs a `semver`-crate caret helper, a `build.rs` exact-release-tag signal, the dev/dirty fallback to exact-build-id, and `DAD_VERSION` carried in the handshake.
 - **(C) Always attach regardless of version — rejected.** Attaching a newer TUI to a genuinely *incompatible* older daemon is exactly the #103 silent-corruption class (delegate signals no-op). Unsafe; off the table.
 
-**OPEN DECISION (resolve when work starts): A or B.** Current lean is **B**, with this reasoning:
+**RESOLVED 2026-06-21: A (always-restart, consent-based). B is deferred, not built.** Reasoning:
 
-- B preserves running agents across a *compatible* upgrade, which is the whole original point of this PRD.
-- B can only trust semver for **clean released builds at distinct tags**; dev/dirty builds fall back to exact-build-id (i.e. behave like A). Remote binaries and non-developer local installs are essentially always releases, so B's benefit *is* realizable there; it degrades to A only for local source/dev builds, which is safe.
-- It is one mechanism for both paths, not two.
+- The acute bug (forced upgrade just to connect) is fixed by Part B alone, independent of this choice. A vs B only decides the *secondary* question — whether a *compatible* upgrade preserves running agents — which is a nice-to-have, not the reported problem.
+- A matches the accepted workflow: nothing forces an upgrade anymore (Part B), so you upgrade when idle and accept the restart. The daemon's core value (agents surviving detach/sleep/network/machine-switch) is fully preserved under A; agents are lost only when *you* choose to upgrade-and-restart.
+- B's cost (semver caret helper + `build.rs` exact-tag signal + dev/dirty fallback + a 5-case test matrix) and *risk* (it re-opens the #103 silent-corruption door — a breaking change mis-marked compatible would attach and no-op delegates, safe only via ongoing `.breaking.md` discipline) are high relative to how rarely the benefit triggers (upgrade-while-agents-running *and* compatible *and* clean release builds).
+- The `PROTOCOL_VERSION`-only "B-lite" middle path is rejected: cheap, but it silently reintroduces the *semantic-break* corruption that build-id equality exists to catch.
 
-A stays the cheap fallback if the semver/`build.rs`/dev-dirty machinery is judged not worth it.
+**Forward-compatibility:** keep the M1.1 handshake fields additive and optional so adding B later is a non-breaking change. **Revisit B** only if real usage shows users repeatedly losing agents to *compatible* upgrades and asking for preservation.
 
-Either way, when a restart is required and **agents are running**, the prompt must **name the live agents** and state that restarting stops them; when **no agents** are running, restart silently (nothing to lose). Preserve the non-TTY/CI behavior (clear stderr + non-zero exit) only on a mandatory restart path.
+When a restart is required and **agents are running**, the prompt must **name the live agents** and state that restarting stops them; declining keeps you on the existing daemon (agents intact). When **no agents** are running, restart silently. Preserve the non-TTY/CI behavior (clear stderr + non-zero exit) only on the mandatory restart path.
 
 ### D3 — Part B: delete the laptop-side `connect` enforcement; optional one-step `remote upgrade` nudge.
 
@@ -53,10 +54,10 @@ Keep the connect **floor**: reachability / binary-missing / "remote too old to h
 Optionally, replace the deleted block with a **one-step**, laptop-side, pre-handover nudge — **newer-only** (never suggests a downgrade), default **N**, auto-skipped when stdin is not a TTY:
 
 - `Remote 'X' runs 0.31.0; you have 0.31.1. Upgrade and connect? [y/N]`
-- **`y`** → run `remote upgrade` (swap the remote binary), then connect. The shared Part-A handshake then does the right thing on attach: compatible (under B) → keep agents; incompatible → restart with the named-agents prompt.
+- **`y`** → run `remote upgrade` (swap the remote binary), then connect. The shared Part-A handshake then restarts the daemon on attach (agents stopped, named in the prompt if running).
 - **`Enter` / `n`** → connect as-is.
 
-`remote upgrade` stays **binary-swap-only** (it must not kill agents); any daemon restart is the Part-A handshake's job. A failing `remote upgrade` falls back to connecting the existing version with a clear error (failure semantics owned by `remote upgrade`; connect just reacts to the `Result`). To state "N running agents" in the nudge, the laptop needs the count from the `daemon hello` probe (see M1.2).
+`remote upgrade` stays **binary-swap-only** (it must not kill agents); any daemon restart is the Part-A handshake's job. A failing `remote upgrade` falls back to connecting the existing version with a clear error (failure semantics owned by `remote upgrade`; connect just reacts to the `Result`). To state "N running agents" in the nudge, the laptop needs the count from the `daemon hello` probe (see M1.1).
 
 ### D4 — Invariant: an upgrade must never leave you unable to reach your running agents.
 
@@ -75,7 +76,7 @@ A banner can't disambiguate "upgrade local vs remote vs both." The pre-handover 
 | ID | Decision | Rationale | Impact on PRD |
 |---|---|---|---|
 | D1 | Daemon handshake is one shared code path (local == remote); only the laptop `connect` probe is remote-specific | Verified in code | Splits work into Part A (shared) + Part B (remote-only); kills the duplicated local/remote framing |
-| D2 | Part A: shared handshake decision A (always-restart) vs B (attach-if-compatible); C rejected. **Lean B; final A/B open** | B preserves agents on compatible release upgrades; one mechanism | Original M1.1–M1.3 collapse into this single decision |
+| D2 | Part A: shared handshake = **A (always-restart, consent-based)**; B deferred (forward-compatible fields kept); C rejected | A fixes everything the reported bug needs; B's cost + corruption-risk outweigh a rare benefit | M1.3 builds A; the semver/`build.rs`/dev-dirty machinery is deferred |
 | D3 | Part B: delete laptop `connect` comparison; keep floor; optional one-step `remote upgrade` nudge (newer-only, default N, non-TTY skip) | Laptop is ssh+terminal; the block guards nothing | Replaces original M1.4; remote keeps no version logic of its own |
 | D4 | Invariant: never strand running agents | UX correctness | Decline = working session; restart only on consent / no-agents |
 | D5 | analyze.sh recalibration already landed (8efcd76) | Repo fact-check | Phase 2 M2.1 effectively done |
@@ -105,14 +106,14 @@ Remote 'dot-agent' was built as 0.31.0-g0458192; laptop was built as 0.31.1-g879
 
 For this project, **breaking = a change to the TUI↔daemon protocol/handler contract such that an older and a newer build cannot safely interoperate.** This is *not* the same axis as user-facing breaking; it is specifically the cross-process contract. The framing is natural here because the TUI and daemon are the same binary in two modes — the only cross-process contract is the attach protocol and the handler semantics behind it. The skew is a *runtime* condition (a persistent daemon outlives the TUI and survives a binary upgrade-in-place), not a build-time difference.
 
-A change is "breaking" in this sense when it would make an older peer mis-behave against a newer one — including **semantic** changes behind a stable wire (a field whose meaning changes, a role-map value type that shifts), which is the residual risk class that `PROTOCOL_VERSION` alone cannot see. This is the axis the Part-A handshake (D2) classifies on under option B.
+A change is "breaking" in this sense when it would make an older peer mis-behave against a newer one — including **semantic** changes behind a stable wire (a field whose meaning changes, a role-map value type that shifts), which is the residual risk class that `PROTOCOL_VERSION` alone cannot see. (This is the axis a future option B would classify on; under the resolved A model the handshake always restarts and does not classify.)
 
 ## Detection strategy (no mechanical CI gate)
 
 A mechanical schema/snapshot gate over the protocol surface was **considered and rejected**: structural wire breaks are already caught by `PROTOCOL_VERSION` discipline, while the actual residual risk — semantic breaks behind a stable wire — is invisible to a type snapshot. Detection is layered instead:
 
 1. **`PROTOCOL_VERSION` stays the structural fatal floor.** Wire-shape breaks must bump it and remain mandatory in the Part-A handshake.
-2. **Human-marked `.breaking.md` changelog fragment for semantic breaks.** The only feasible signal for a same-wire/different-meaning change, and (under B) the input that flips a handshake from suggest to mandatory.
+2. **Human-marked `.breaking.md` changelog fragment for semantic breaks.** The only feasible signal for a same-wire/different-meaning change (and the input a future option B would need).
 3. **A cross-version manual-test step** in `prd-done` for PRDs touching the daemon / protocol / orchestration / hooks: run the new TUI against a daemon spawned from the *previous* release and confirm delegate + hooks still flow.
 4. **(Optional) a non-blocking CI nudge** when a PR touches `src/daemon_protocol.rs`, the event schema, or the role-map types.
 
@@ -124,7 +125,7 @@ The 0.x bump policy is: **while major is 0**, `breaking → minor`, `feature →
 
 ### Versioning-cadence consequence
 
-While in 0.x, feature-only releases become patch releases (e.g. `0.31.1 → 0.31.2`); only a protocol-breaking change bumps the minor. The minor digit stops meaning "has new features" and starts meaning "broke compatibility." Already in effect on the release side (D5); document it (M5.1). Under option B this version tag *is* the compatibility signal the handshake reads.
+While in 0.x, feature-only releases become patch releases (e.g. `0.31.1 → 0.31.2`); only a protocol-breaking change bumps the minor. The minor digit stops meaning "has new features" and starts meaning "broke compatibility." Already in effect on the release side (D5); document it (M5.1).
 
 ## Three-repo coordination
 
@@ -138,16 +139,17 @@ While in 0.x, feature-only releases become patch releases (e.g. `0.31.1 → 0.31
 
 ### In Scope
 
-- **Part A — shared TUI↔daemon handshake** (`src/build_version_handshake.rs`): implement the chosen A/B behavior (D2). For B: a `semver` caret compatibility helper, a `build.rs` exact-release-tag (or commits-since-tag) signal, the dev/dirty exact-build-id fallback, and `DAD_VERSION` carried in the `Hello`/`AttachResponse` as an additive optional field (no `PROTOCOL_VERSION` bump). For A: demote #103's exact-match refusal to a no-agents-silent / agents-prompt restart. Either way: name live agents on a mandatory restart; restart silently when idle; preserve non-TTY mandatory behavior.
+- **Part A — shared TUI↔daemon handshake** (`src/build_version_handshake.rs`): implement **A** (D2) — demote #103's exact-match refusal to a consent-based restart: name live agents and prompt when agents are running, restart silently when idle, preserve non-TTY mandatory behavior. Applies to local and remote alike.
 - **Part B — remote `connect` (`src/connect.rs`)**: delete the laptop↔remote version/build comparison (`VersionMismatch` gate + `BuildVersionMismatch` fatal); keep the reachability/binary-missing/handshake floor; add the optional one-step nudge (newer-only, default N, non-TTY skip; `y` → `remote upgrade` + connect; upgrade-failure → connect existing version).
 - **Agent count in the probe**: extend `daemon hello` / `AttachResponse` with an additive optional running-agent count (and ideally names) so the nudge and the handshake prompt can state "N running agents."
 - **Release machinery**: `pyproject.toml`/docs wording (M2.2) and `prompts`-repo sync (M2.1 source); the vendored `analyze.sh` recalibration is already done (D5).
 - **Detection / discipline**: `prd-done` cross-version step + contract prompt (M3.1); optional CI nudge (M3.2).
-- **Docs** (M5.1): compatible-vs-incompatible upgrades, the connect nudge + agent cost, agent preservation across detach, and the 0.x cadence.
+- **Docs** (M5.1): the connect nudge + agent cost, agent preservation across detach, and the 0.x cadence.
 - **Tests** (Phase 4).
 
 ### Out of Scope
 
+- **Compatibility-based agent preservation (option B)** — **deferred** (D2): the `semver` caret helper, `build.rs` exact-tag signal, dev/dirty fallback, and version-tag compatibility classification. Keep the handshake fields additive so B stays a non-breaking future add; revisit only if users repeatedly lose agents to compatible upgrades. The `PROTOCOL_VERSION`-only "B-lite" variant is rejected outright (reintroduces semantic-break corruption).
 - **Separate local-path and remote-path compatibility logic** — there is one shared handshake (D1/D2); the remote path carries no version logic of its own beyond deleting its probe.
 - **(C) Always-attach regardless of compatibility** — rejected as the #103 corruption class (D2).
 - **A mechanical CI snapshot/schema gate** over the protocol surface — rejected.
@@ -158,8 +160,8 @@ While in 0.x, feature-only releases become patch releases (e.g. `0.31.1 → 0.31
 ## Success Criteria
 
 - **Remote, un-upgraded:** a laptop at `0.31.1` connecting to a remote at `0.31.0` **connects normally** (no block, no forced upgrade); the remote's matched TUI+daemon attach, agents intact. Verified by tests (fake-ssh executor).
-- **Shared handshake, no agents:** a newer TUI meeting an older daemon with no agents restarts/attaches silently (per A/B). Verified by tests (local + remote).
-- **Shared handshake, agents running:** the restart prompt **names the live agents** and states they will be stopped; under B a *compatible* pair attaches without restart and agents survive. Verified by tests.
+- **Shared handshake, no agents:** a newer TUI meeting an older daemon with no agents restarts/attaches silently. Verified by tests (local + remote).
+- **Shared handshake, agents running:** the restart prompt **names the live agents** and states they will be stopped; declining keeps you on the existing daemon (agents intact). Verified by tests.
 - **Never strand (D4):** no path leaves the user unable to reach running agents. Verified by tests.
 - **Remote nudge:** newer-only; default N; non-TTY skip; `y` upgrades then connects; a failing upgrade falls back to connecting the existing version with a clear error. Verified by tests.
 - **Release cadence:** `analyze.sh` on `0.31.x` proposes **minor** for `.breaking.md`, **patch** for feature/bugfix (already satisfied — D5).
@@ -169,10 +171,10 @@ While in 0.x, feature-only releases become patch releases (e.g. `0.31.1 → 0.31
 
 ### Phase 1: Runtime (the user-facing payoff)
 
-- [ ] **M1.0 — Resolve A vs B (D2).** Decide the shared-handshake behavior before building; scopes the rest of Phase 1.
-- [ ] **M1.1 — Probe/handshake additive fields.** `DAD_VERSION` (for B) and a running-agent count/names field in `Hello`/`AttachResponse`, additive + optional; serde round-trip + older-shape-deserializes-to-None tests. No `PROTOCOL_VERSION` bump.
+- [x] **M1.0 — Resolve A vs B (D2).** ✅ **A (always-restart, consent-based)**; B deferred (revisit if users lose agents to compatible upgrades). Keep M1.1 fields additive so B stays a non-breaking future add.
+- [ ] **M1.1 — Probe/handshake additive fields.** A running-agent count/names field in `Hello`/`AttachResponse` (required for the restart prompt + the nudge), additive + optional; serde round-trip + older-shape-deserializes-to-None tests. No `PROTOCOL_VERSION` bump. Optionally also add `DAD_VERSION` now (additive) so a future option B is non-breaking.
 - [ ] **M1.2 — Part B: remote `connect`.** Delete the version/build comparison; keep the floor; add the one-step nudge (newer-only, default N, non-TTY skip, agent count); `y` → `remote upgrade` + connect, upgrade-failure → connect existing version.
-- [ ] **M1.3 — Part A: shared handshake (`build_version_handshake.rs`).** Implement the chosen A/B model. For B: `semver` caret helper + `build.rs` exact-tag signal + dev/dirty fallback. Name live agents on mandatory restart; silent restart when idle; non-TTY mandatory behavior preserved. Applies to local and remote alike.
+- [ ] **M1.3 — Part A: shared handshake (`build_version_handshake.rs`).** Implement **A**: demote #103's exact-match refusal to a consent-based restart — name live agents and prompt when agents are running, restart silently when idle, preserve non-TTY mandatory behavior. Applies to local and remote alike. (Option B's `semver`/`build.rs`/dev-dirty machinery is deferred.)
 
 ### Phase 2: Release machinery
 
@@ -186,8 +188,8 @@ While in 0.x, feature-only releases become patch releases (e.g. `0.31.1 → 0.31
 
 ### Phase 4: Tests
 
-- [ ] **M4.1 — Shared handshake tests** (local + remote): no-agents silent; agents-running names + prompt; under B the compatible/incompatible/same-tag-different-sha/dirty/untagged matrix; never-strand.
-- [ ] **M4.2 — Probe/handshake field tests** for the additive `DAD_VERSION` + agent-count fields (M1.1).
+- [ ] **M4.1 — Shared handshake tests** (local + remote): no-agents silent restart; agents-running names + prompt; declining keeps the existing daemon; never-strand. (The compatible/incompatible/dev-dirty matrix is deferred with option B.)
+- [ ] **M4.2 — Probe/handshake field tests** for the additive agent-count field (M1.1).
 - [ ] **M4.3 — Remote connect tests** (fake-ssh executor): un-upgraded connects; nudge `y`/`n`; upgrade-failure fallback; non-TTY skip; newer-only.
 
 ### Phase 5: Docs and release
@@ -198,28 +200,27 @@ While in 0.x, feature-only releases become patch releases (e.g. `0.31.1 → 0.31
 
 ## Key Files
 
-- `src/build_version_handshake.rs` — **Part A**, the shared handshake; the locus of the A/B decision (M1.3). Runs for both local and ssh-launched remote via `run_tui_session`.
+- `src/build_version_handshake.rs` — **Part A**, the shared handshake (M1.3). Runs for both local and ssh-launched remote via `run_tui_session`.
 - `src/connect.rs` — **Part B**: remove the laptop↔remote comparison (`VersionMismatch` / `BuildVersionMismatch`); add the one-step nudge (M1.2). The error enum (`RemoteConnectError`) and `run_connect` staging.
 - `src/remote.rs` — `remote upgrade` stays binary-swap-only (must not kill agents); the connect `y`-path orchestrates it.
-- `src/daemon_protocol.rs` — `Hello` / `AttachResponse` gain additive optional `DAD_VERSION` + agent-count fields; `PROTOCOL_VERSION` unchanged (M1.1).
+- `src/daemon_protocol.rs` — `Hello` / `AttachResponse` gain additive optional agent-count (and optionally `DAD_VERSION`) fields; `PROTOCOL_VERSION` unchanged (M1.1).
 - `src/daemon_attach.rs` — `ensure_external_daemon_or_die` (reuses an existing daemon; relevant to restart sequencing).
 - `src/main.rs` — `run_tui_session` calls the handshake (`main.rs:775`); the shared entry for both modes.
-- `build.rs` — exact-release-tag signal, **only if** D2 resolves to B.
+- `build.rs` — exact-release-tag signal — **deferred** (only needed for option B).
 - `.claude/skills/dot-ai-tag-release/analyze.sh` — already recalibrated (D5); mirror to the `prompts` repo (M2.1).
 - `pyproject.toml` — `breaking` type comment, sharpened locally (M2.2).
 - `prds/103-local-daemon-build-version-handshake.md` — parent; this PRD revises its policy.
 
 ## Risks and Mitigations
 
-- **Risk: choosing B removes #103's blunt backstop.** A breaking change mis-marked as a patch would let two incompatible builds read as "compatible" and only suggest. *Mitigation:* `PROTOCOL_VERSION` still catches structural breaks (mandatory); the cross-version manual test targets semantic breaks; the dev/dirty fallback preserves exact-match during development. Residual risk is rare and recoverable (delegate no-ops → `daemon stop`).
+- **Risk (deferred B): attach-if-compatible would remove #103's blunt backstop.** A breaking change mis-marked as a patch would let two incompatible builds read as "compatible" and silently corrupt (delegate no-ops). This is a primary reason B is deferred (D2). *If B is ever built:* `PROTOCOL_VERSION` still catches structural breaks; the cross-version manual test targets semantic breaks; the dev/dirty fallback preserves exact-match during development.
 - **Risk: `connect` `y`-path double-prompt / stranding.** *Mitigation (D3/D4):* `remote upgrade` is binary-only; the Part-A handshake owns the restart and only prompts when agents exist; `n` always connects to the matched existing daemon.
 - **Risk: upgrade failure mid-`y`.** *Mitigation:* fall back to connecting the existing version with a clear error; failure semantics owned by `remote upgrade`.
-- **Risk: `0.0.x` edge** — under the caret rule every patch is incompatible. *Mitigation:* the `semver` crate caret encodes this; the helper inherits it; not our current state (0.31).
 - **Risk: three-repo drift** — shared skills are vendored copies. *Mitigation:* change source repos then sync; keep dot-agent-deck specifics out of shared skills.
 
 ## Open Questions / Decisions
 
-- **OPEN (D2): A or B for the shared handshake** — always-restart (cheap) vs attach-if-compatible (preserves agents on compatible release upgrades, adds the semver/`build.rs`/dev-dirty machinery). Lean B. Resolve at M1.0 before building.
+- **Resolved (D2): A** (always-restart, consent-based) for the shared handshake; B deferred with additive fields kept so it stays a non-breaking future add. Revisit B only if users repeatedly lose agents to compatible upgrades.
 - **Resolved (D1):** one shared handshake (local == remote); the laptop `connect` probe is the only remote-specific piece and is deleted.
 - **Resolved (D3):** remote suggest UX = a pre-handover one-step connect prompt (not an in-TUI banner — D6); newer-only; default N; non-TTY auto-skips; `remote upgrade` stays binary-only.
 - **Resolved (D4):** never strand running agents.
