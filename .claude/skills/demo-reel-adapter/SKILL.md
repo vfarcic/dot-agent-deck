@@ -5,19 +5,13 @@ description: dot-agent-deck-specific adapter that builds a demo-reel manifest.js
 
 # Demo Reel adapter (dot-agent-deck)
 
-The **adapter** is the repo-specific half of PRD #180. It discovers the
-work-list and builds a `manifest.json`, then hands it to the repo-agnostic
-**engine** ([`demo-reel`](../demo-reel/SKILL.md), `reel.sh`). The engine renders
-the cards, stitches the MP4, and (with `--publish`) uploads it — it knows nothing
-about Rust, `#[spec]`, `tests/CATALOG.md`, or `.dot-agent-deck/recordings/`. The
-**only** contract between the two is the manifest:
+The **adapter** is the repo-specific half of PRD #180. It discovers the work-list and builds a `manifest.json`, then hands it to the repo-agnostic **engine** ([`demo-reel`](../demo-reel/SKILL.md), `reel.sh`). The engine renders the cards, stitches the MP4, and (with `--publish`) uploads it — it knows nothing about Rust, `#[spec]`, `tests/CATALOG.md`, or `.dot-agent-deck/recordings/`. The **only** contract between the two is the manifest:
 
 ```json
 [{ "title": "...", "description": "...", "clip": "<path-to-.cast|.gif|.mp4>" }, ...]
 ```
 
-Everything dot-agent-deck-specific (which tests, where their title/description
-live, the catalog ordering) lives here; nothing of it leaks into the engine.
+Everything dot-agent-deck-specific (which tests, where their title/description live, the catalog ordering) lives here; nothing of it leaks into the engine.
 
 ## Usage
 
@@ -33,15 +27,11 @@ live, the catalog ordering) lives here; nothing of it leaks into the engine.
 | `build.sh select` | Print the in-scope recording-dir IDs, one per line (the git-diff half — concern **a**). |
 | `build.sh assemble [ID...] [--manifest PATH]` | Build `manifest.json` from an explicit list of recording-dir IDs (the pure half — concern **b**; no git, no network). Excludes cast-less IDs, orders by catalog id, clean-skips an empty/all-L1 list. |
 
-Run the full `reel` pipeline from the repo root so the default relative paths
-(`.dot-agent-deck/recordings`, `tests/CATALOG.md`) resolve. The engine resolves
-`clip` paths relative to its own CWD, so it is invoked from the same directory.
+Run the full `reel` pipeline from the repo root so the default relative paths (`.dot-agent-deck/recordings`, `tests/CATALOG.md`) resolve. The engine resolves `clip` paths relative to its own CWD, so it is invoked from the same directory.
 
 ## Selection rule (concern a)
 
-`select` lists the recording dirs under `.dot-agent-deck/recordings/<id>/` that
-are **in scope** for this branch's reel. File-level granularity; robustness over
-cleverness. A dir is in scope **iff both** hold:
+`select` lists the recording dirs under `.dot-agent-deck/recordings/<id>/` that are **in scope** for this branch's reel. File-level granularity; robustness over cleverness. A dir is in scope **iff both** hold:
 
 1. **It contains a `full-stream.cast`** — the e2e proxy. The `cargo xtask docs`
    generator writes a `test.md` for *every* `#[spec]` test but emits a cast only
@@ -56,16 +46,11 @@ cleverness. A dir is in scope **iff both** hold:
    sidesteps the `test.md` `<immediate-parent>/<file>` path quirk and is robust
    for the flat `tests/*.rs` (and `src/*.rs`) layout this repo uses.
 
-> The recording dir is named after the test **function** (e.g. `mytest`), while
-> the **catalog id** (e.g. `mouse/button/001`) lives in the test.md H1 — the two
-> are not the same string, which is why ids for ordering are read from the H1,
-> not the dir name.
+> The recording dir is named after the test **function** (e.g. `mytest`), while the **catalog id** (e.g. `mouse/button/001`) lives in the test.md H1 — the two are not the same string, which is why ids for ordering are read from the H1, not the dir name.
 
 ## Assembly rule (concern b)
 
-`assemble` is pure: given a list of recording-dir IDs it reads only `test.md`
-and `CATALOG.md` (no test-body parsing, no git, no network) and emits the
-manifest:
+`assemble` is pure: given a list of recording-dir IDs it reads only `test.md` and `CATALOG.md` (no test-body parsing, no git, no network) and emits the manifest:
 
 - **title** ← the `test.md` **H1** line, minus the leading `# ` (e.g.
   `mouse/button/001 — Beta renders its label.`).
@@ -82,14 +67,11 @@ manifest:
   `skipped: no e2e tests changed on this branch`, writes **no** manifest, and
   exits 0.
 
-Splitting selection (a) from assembly (b) is deliberate: (b) is fully
-deterministic and fixture-testable without git or the network, which is what the
-acceptance test below exercises.
+Splitting selection (a) from assembly (b) is deliberate: (b) is fully deterministic and fixture-testable without git or the network, which is what the acceptance test below exercises.
 
 ## Environment overrides
 
-All paths default to this repo's layout and are overridable (the test uses this
-to point at fixtures):
+All paths default to this repo's layout and are overridable (the test uses this to point at fixtures):
 
 | Var | Default |
 | --- | --- |
@@ -100,11 +82,7 @@ to point at fixtures):
 
 ## Acceptance test
 
-A **re-runnable, pure-shell** test (no `agg`/`ffmpeg`, no git, no network — so it
-**may** run in CI, unlike the engine smoke and the reel step itself) drives the
-deterministic `assemble` path against a tiny fixture
-(`tests/fixtures/recordings/` with two e2e dirs that have casts and one L1 dir
-that does not, plus a `CATALOG.md` fixture). It asserts:
+A **re-runnable, pure-shell** test (no `agg`/`ffmpeg`, no git, no network — so it **may** run in CI, unlike the engine smoke and the reel step itself) drives the deterministic `assemble` path against a tiny fixture (`tests/fixtures/recordings/` with two e2e dirs that have casts and one L1 dir that does not, plus a `CATALOG.md` fixture). It asserts:
 
 1. given `alpha beta gamma`, the manifest has the right titles/descriptions/clip
    paths **in catalog order** (`beta`=001 before `alpha`=002) and **excludes**

@@ -289,8 +289,18 @@ make_card_cast() {
 # as the positional input, never mistaken for an agg option.
 render_cast() {
   local cast="$1" gif="$2" idle="$3"
-  agg --theme "$THEME" --font-size "$FONT_SIZE" --fps-cap "$FPS" \
-    --idle-time-limit "$idle" -- "$cast" "$gif" >/dev/null 2>&1
+  # Capture agg's stderr to a temp file (under WORKDIR, so the EXIT trap cleans
+  # it up) instead of discarding it. stdout stays /dev/null and the success path
+  # stays quiet, but on a NON-ZERO agg exit we surface agg's real error here —
+  # otherwise an agg failure only manifests later as an opaque ffmpeg error on
+  # the missing/garbled gif. This covers both the card and the .cast clip render
+  # (the clip path calls this same function).
+  local err="$WORKDIR/agg.err"
+  if ! agg --theme "$THEME" --font-size "$FONT_SIZE" --fps-cap "$FPS" \
+    --idle-time-limit "$idle" -- "$cast" "$gif" >/dev/null 2>"$err"; then
+    cat "$err" >&2
+    die "agg failed to render $cast (exit non-zero); see agg error above"
+  fi
 }
 
 # Probe a media file's "WIDTHxHEIGHT".

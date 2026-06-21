@@ -5,23 +5,11 @@ description: Stitch a manifest of terminal recordings into one narrated MP4 (tit
 
 # Demo Reel engine
 
-A reusable, repo-agnostic engine that turns an ordered **manifest** of
-`{title, description, clip}` entries into a single narrated MP4: for each
-entry it renders a title/description **card**, plays that entry's **clip**,
-then moves to the next — concatenated in manifest order. With `--publish` it
-uploads the result **unlisted to YouTube** and prints the URL.
+A reusable, repo-agnostic engine that turns an ordered **manifest** of `{title, description, clip}` entries into a single narrated MP4: for each entry it renders a title/description **card**, plays that entry's **clip**, then moves to the next — concatenated in manifest order. With `--publish` it uploads the result **unlisted to YouTube** and prints the URL.
 
-The engine knows nothing about Rust, tests, PRDs, or any specific repo. Its
-only input is a `manifest.json`. It is invocable by an agent (via this skill)
-and directly by a human or CI (`reel.sh manifest.json --out reel.mp4`).
+The engine knows nothing about Rust, tests, PRDs, or any specific repo. Its only input is a `manifest.json`. It is invocable by an agent (via this skill) and directly by a human or CI (`reel.sh manifest.json --out reel.mp4`).
 
-> **Status:** the full engine pipeline is wired. A run validates the manifest
-> and prerequisites, renders a card per entry, stitches `[card, clip, …]` into
-> one uniform MP4 (`reel.sh` → `ffmpeg`), and — with `--publish` and credentials
-> present — uploads it unlisted to YouTube (`upload.sh`) and prints the URL. The
-> stitch path is covered by a re-runnable local smoke (`task reel-smoke`); the
-> live upload is verified by code review plus a documented one-line manual step
-> (see **Verifying the upload path**).
+> **Status:** the full engine pipeline is wired. A run validates the manifest and prerequisites, renders a card per entry, stitches `[card, clip, …]` into one uniform MP4 (`reel.sh` → `ffmpeg`), and — with `--publish` and credentials present — uploads it unlisted to YouTube (`upload.sh`) and prints the URL. The stitch path is covered by a re-runnable local smoke (`task reel-smoke`); the live upload is verified by code review plus a documented one-line manual step (see **Verifying the upload path**).
 
 ## Usage
 
@@ -45,9 +33,7 @@ reel.sh manifest.json --out reel.mp4 --publish   # stitch + upload unlisted
 
 ## Manifest contract
 
-`manifest.json` is the **only** contract between a caller and the engine. It
-is a JSON **array** of one or more objects, in the order the segments should
-appear:
+`manifest.json` is the **only** contract between a caller and the engine. It is a JSON **array** of one or more objects, in the order the segments should appear:
 
 ```json
 [
@@ -64,8 +50,7 @@ appear:
 ]
 ```
 
-The engine rejects a manifest that breaks any of these rules, with a specific
-message and a non-zero exit:
+The engine rejects a manifest that breaks any of these rules, with a specific message and a non-zero exit:
 
 - The top level is a **non-empty JSON array**.
 - Every entry is a JSON **object** with non-empty string `title`,
@@ -78,9 +63,7 @@ message and a non-zero exit:
 
 ## Prerequisites
 
-The engine checks these **before doing any work** and fails fast with an
-actionable message naming exactly what is missing; it never self-installs
-anything.
+The engine checks these **before doing any work** and fails fast with an actionable message naming exactly what is missing; it never self-installs anything.
 
 **Always required (CLIs on PATH):**
 
@@ -91,9 +74,7 @@ anything.
 | `jq` | parse and validate the manifest | nix `jq` |
 | `curl` | upload to YouTube (only with `--publish`) | nix `curl` |
 
-**Required only with `--publish`** — YouTube Data API v3 OAuth credentials,
-read from the environment (never hardcoded). In this repo they are sourced
-from `vals` / `.env.vals.yaml`:
+**Required only with `--publish`** — YouTube Data API v3 OAuth credentials, read from the environment (never hardcoded). In this repo they are sourced from `vals` / `.env.vals.yaml`:
 
 | Env var | Meaning |
 | --- | --- |
@@ -101,8 +82,7 @@ from `vals` / `.env.vals.yaml`:
 | `YOUTUBE_CLIENT_SECRET` | OAuth client secret |
 | `YOUTUBE_REFRESH_TOKEN` | OAuth refresh token (minted once via a human consent flow) |
 
-Stitch-only runs (no `--publish`) do **not** require any credentials. The
-one-time OAuth provisioning is documented in `docs/develop/demo-reel.md`.
+Stitch-only runs (no `--publish`) do **not** require any credentials. The one-time OAuth provisioning is documented in `docs/develop/demo-reel.md`.
 
 ## How a reel is built
 
@@ -119,22 +99,11 @@ For each manifest entry, in order:
 2. **Clip.** A `.cast` is rendered with that same `agg` invocation; a
    pre-rendered `gif`/`mp4` is used as-is.
 
-Every segment is then **normalized** (`ffmpeg scale` + `pad`) to one common
-resolution — the max across all segments — at a constant fps and `yuv420p`, so
-the segments share resolution/fps/pixfmt. This is the safety net for any clip
-recorded at a different terminal size. The normalized segments are concatenated
-into a single uniform video stream (`reel.mp4` by default).
+Every segment is then **normalized** (`ffmpeg scale` + `pad`) to one common resolution — the max across all segments — at a constant fps and `yuv420p`, so the segments share resolution/fps/pixfmt. This is the safety net for any clip recorded at a different terminal size. The normalized segments are concatenated into a single uniform video stream (`reel.mp4` by default).
 
 ## Local smoke test
 
-A re-runnable smoke builds a reel from a tiny self-contained fixture (two
-hand-written `.cast` clips + a manifest under
-`.claude/skills/demo-reel/tests/fixtures/`) in **stitch-only** mode (no network,
-no credentials) and asserts the result with `ffprobe`: non-empty file, exactly
-one video stream at the expected resolution (a single stream proves there is no
-resolution/fps/pixfmt seam between segments), `yuv420p`, constant `30/1` fps, and
-a duration at least the sum of the per-card holds. It is **local-only** (never
-CI):
+A re-runnable smoke builds a reel from a tiny self-contained fixture (two hand-written `.cast` clips + a manifest under `.claude/skills/demo-reel/tests/fixtures/`) in **stitch-only** mode (no network, no credentials) and asserts the result with `ffprobe`: non-empty file, exactly one video stream at the expected resolution (a single stream proves there is no resolution/fps/pixfmt seam between segments), `yuv420p`, constant `30/1` fps, and a duration at least the sum of the per-card holds. It is **local-only** (never CI):
 
 ```sh
 task reel-smoke
@@ -144,17 +113,13 @@ task reel-smoke
 
 ## Verifying the upload path
 
-The live YouTube upload cannot be a routine automated test, so it is verified by
-code review of `upload.sh` plus a **one-time manual** check: with the three
-`YOUTUBE_*` credentials exported, run
+The live YouTube upload cannot be a routine automated test, so it is verified by code review of `upload.sh` plus a **one-time manual** check: with the three `YOUTUBE_*` credentials exported, run
 
 ```sh
 .claude/skills/demo-reel/reel.sh some-manifest.json --out reel.mp4 --publish
 ```
 
-and confirm it prints an `https://youtu.be/<id>` URL that opens an **unlisted**
-video. All hosting lives in `upload.sh` alone, so swapping hosts later does not
-touch the rest of the engine.
+and confirm it prints an `https://youtu.be/<id>` URL that opens an **unlisted** video. All hosting lives in `upload.sh` alone, so swapping hosts later does not touch the rest of the engine.
 
 ## Failure behavior
 
