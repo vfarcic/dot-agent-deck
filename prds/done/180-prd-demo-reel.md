@@ -1,6 +1,6 @@
 # PRD #180: PRD demo reel
 
-**Status**: In Progress
+**Status**: Complete
 **Priority**: Low
 **Created**: 2026-06-21
 **GitHub Issue**: [#180](https://github.com/vfarcic/dot-agent-deck/issues/180)
@@ -143,8 +143,8 @@ The reel's casts are recorded during the pre-PR e2e gate (the suite runs with `D
 
 ### Phase 4 — Docs & release gate
 
-- [ ] **M4.1** — Developer docs under `docs/develop/` (manifest contract, prerequisite/credential setup, local usage, orchestrator behavior), linked from `CONTRIBUTING.md`, excluded from the published site; changelog fragment via `dot-ai-changelog-fragment`.
-- [ ] **M4.2** — Pre-PR gate: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test-fast`, and `cargo test-e2e` green; review (Greptile) settled per CLAUDE.md rule 8.
+- [x] **M4.1** — Developer docs under `docs/develop/` (manifest contract, prerequisite/credential setup, local usage, orchestrator behavior), linked from `CONTRIBUTING.md`, excluded from the published site; changelog fragment via `dot-ai-changelog-fragment`.
+- [x] **M4.2** — Pre-PR gate: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test-fast`, and `cargo test-e2e` green; review (Greptile) settled per CLAUDE.md rule 8.
 
 ## Risks & Mitigations
 
