@@ -1,6 +1,6 @@
 # PRD #82: Orchestrator role reinforcement against delegation drift
 
-**Status**: Problem-stated; solution TBD
+**Status**: M1 complete — solution decided; implementation (M2+) pending
 **Priority**: Medium
 **Created**: 2026-05-10
 **GitHub Issue**: [#82](https://github.com/vfarcic/dot-agent-deck/issues/82)
@@ -76,10 +76,54 @@ These are the questions the investigation milestone must answer before any solut
 - Visible UI for "the orchestrator was reminded" status. Reinforcement, if implemented, should be silent from the user's perspective — they should just see less drift.
 - Changing model selection / provider behaviour for the orchestrator (e.g. "use Opus for orchestrator because it's stickier on roles"). Out of scope; orthogonal lever.
 
+## Solution
+
+**Decided 2026-06-22 (M1 outcome).** Drift's root cause is **placement**, not model stickiness: the orchestrator role is delivered as a transcript `Read` result, never as a system prompt, so compaction summarizes it away — and it does so **symmetrically on both Claude Code and OpenCode** (both auto-compact by replacing detailed history with an LLM summary). The chosen fix is to **detect the post-compaction moment on both harnesses and re-assert the orchestrator role there, through deck-owned channels that touch no developer-owned file.**
+
+### Root cause (confirmed in code)
+
+`build_orchestrator_context` (`src/ui.rs:1625`) composes the role text and `prepare_orchestrator_prompt` (`src/ui.rs:1701`) writes it to `.dot-agent-deck/orchestrator-context.md`, then PTY-injects a one-liner telling the agent to `Read` that file. The role therefore enters the conversation as a `Read` tool result inside the transcript — exactly the content compaction summarizes/discards first. `spawn` (`src/agent_pty.rs:768`) carries no `--append-system-prompt`, so nothing pins the role into the system prompt. OpenCode uses the **identical** deck-side delivery path and also auto-compacts (summary replaces detailed history, last user message replayed), so the failure mode is symmetric across harnesses, not Claude-Code-only. This is the mechanical origin of trigger #1; trigger #2 (drift without compaction) remains unconfirmed.
+
+### Rejected alternatives
+
+- **Durable system-prompt placement** — rejected. The flag path (`--append-system-prompt[-file]`) is blocked because the deck spawns an opaque launcher (`command = "devbox run agent-*"`) it can't pass flags through. The managed-instructions-file path (`CLAUDE.md` / `AGENTS.md` / OpenCode's `instructions` array) is ruled out by a product boundary: **the deck must not write or manage developer-owned instruction files.** OpenCode's `experimental.chat.system.transform` is unusable — mutations to `output.system` are silently discarded before reaching the LLM (sst/opencode #17100, closed not-planned). So durable placement, the cleanest root-cause fix in principle, has no deck-owned, both-harness path available today.
+- **Pure reword of the `prompt_template`** — complement only, not the deliverable. It is compaction-mortal (it sits in the same transcript position the summarizer erases) and only affects newly generated configs. It raises the baseline floor but cannot by itself cure the structural loss.
+- **Per-handoff work-done one-liner re-assert** — deferred (see Refined Milestones). It carries the highest over-correction risk (a terse "always delegate" drilled on every handoff is exactly what makes the orchestrator refuse its legitimate carve-outs), and the trigger it targets (#2, drift without compaction) is still unconfirmed. Building it before #2 is measured risks shipping the riskiest mechanism for a problem that may not exist independently.
+
+### Chosen approach — detect + re-assert on both harnesses
+
+- **Detection — Claude Code:** `SessionStart` with `source: "compact"`, which fires *after* compaction. The hook is already auto-installed and the event already reaches the binary, but the `source` field is currently dropped into `_extra` in `src/hook.rs` — parse it. `PreCompact` is the wrong injection point because injecting before compaction lets the summarizer erase the reminder. Cleanup: `src/hook.rs:96` maps a dead `"PostCompact"` string Claude Code never emits — remove or repurpose it.
+- **Detection — OpenCode:** the observable `session.compacted` event. It already passes the deck plugin's `startsWith("session.")` forwarder unchanged and reaches the binary; it is dropped only because `map_opencode_event_type` (`src/hook.rs`) has no matching arm. Minimal fix is a single arm — e.g. mapping `session.compacted` to the existing `EventType::Compacting`. No plugin or protocol change.
+- **Injection — Claude Code:** the deck's own **PTY lever** — on detecting post-compaction for an orchestrator pane, the daemon PTY-writes the re-assert into that pane (the same mechanism the work-done one-liner uses, `src/state.rs:778`). This deliberately avoids Claude Code's post-compact `additionalContext` path, which is reportedly broken upstream (bug #15174).
+- **Injection — OpenCode:** either the same PTY lever, or the native `experimental.session.compacting` hook (`output.context.push(...)`) added to the deck-owned `plugin_template` (`src/opencode_manage.rs`), which folds the role text into the summary itself and is arguably more robust. The per-harness injection choice is settled in M2 after the live spike — not over-committed here.
+- **Re-assert content:** it re-uses the **same single-source-of-truth role pointer** as startup — "re-read `.dot-agent-deck/orchestrator-context.md`" (the file persists on disk through compaction) — so the full role and its carve-outs are restored from one source, never a hardcoded "always delegate." It differs from the startup prompt only in its trailing instruction: startup ends with "Acknowledge your role and wait for instructions"; the post-compaction re-assert instead says "resume coordinating the current work — delegate the next step; do not implement, review, or audit yourself." It must **not** tell the orchestrator to wait for instructions mid-session — that would stall it. (On the OpenCode native-hook path the content is the role text pushed into the summary rather than a re-read pointer.)
+- **Free complement:** tighten the generated orchestrator `prompt_template` wording in `assets/config_gen_prompt.md` so new configs start stricter and foreground the carve-outs.
+
+### Over-correction guard (the PRD's named risk)
+
+Because the re-assert points at the role's own file (single source of truth), the carve-outs (MAY run `/prd-next` / `/prd-update-progress` directly, read the PRD file, the two user gates) are preserved verbatim rather than compressed into "always delegate." Validation must include a scenario where, after the re-assert fires, the orchestrator still legitimately runs a carve-out command and honors the user gates.
+
+### Harness story
+
+Both harnesses are covered, so the asymmetry the PRD feared is eliminated. If anything it reverses: OpenCode's compaction-injection hook (`experimental.session.compacting`) is documented and purpose-built, while Claude Code's post-compact `additionalContext` is bugged — which is why Claude Code uses the PTY path.
+
 ## Milestones
 
-- [ ] **M1 — Investigation and decision.** Reproduce both failure modes (post-compaction and long-handoff drift) on Claude Code and OpenCode. Audit the actual injection mechanism and survival of `prompt_template` across compaction in each harness. Catalog candidate injection points (`PostCompact` hook, work-done system reminder, OpenCode equivalents, `prompt_template` placement changes, prompt rewording). For each candidate, list: blast radius, plumbing cost, harness coverage (Claude Code only vs both), token cost per fire, risk of over-correction (orchestrator refusing legitimate carve-outs). Decide the chosen approach, or decide explicitly that no fix is worth shipping at this time. Output: this PRD updated with a new `## Solution` section and a `## Refined Milestones` section that fills in M2+ with concrete implementation milestones based on the chosen path.
-- [ ] **M2+** — TBD, defined by M1.
+- [x] **M1 — Investigation and decision.** Reproduce both failure modes (post-compaction and long-handoff drift) on Claude Code and OpenCode. Audit the actual injection mechanism and survival of `prompt_template` across compaction in each harness. Catalog candidate injection points (`PostCompact` hook, work-done system reminder, OpenCode equivalents, `prompt_template` placement changes, prompt rewording). For each candidate, list: blast radius, plumbing cost, harness coverage (Claude Code only vs both), token cost per fire, risk of over-correction (orchestrator refusing legitimate carve-outs). Decide the chosen approach, or decide explicitly that no fix is worth shipping at this time. Output: this PRD updated with a new `## Solution` section and a `## Refined Milestones` section that fills in M2+ with concrete implementation milestones based on the chosen path. **Done** — see `## Solution` (root cause: compaction-mortal placement, symmetric across both harnesses; chosen fix: detect + re-assert on both) and `## Refined Milestones` below.
+- **M2+** — defined by M1; see `## Refined Milestones`.
+
+## Refined Milestones
+
+Concrete implementation milestones for the chosen detect-and-re-assert approach. They may be renumbered or organized as the work demands; the spike gates the rest.
+
+- [ ] **M2 — Live-verification spike (first, gating).** Instrument the raw hook payloads, force a compaction on each harness (Claude Code via `/compact`; OpenCode via overflow or the proactive path), and confirm: the signal fires (`SessionStart{source:"compact"}` / `session.compacted`), it is parseable, and a re-assert injection lands in the post-compaction context. Independent go/no-go per harness — one failing does not sink the other. This doubles as the deterministic *mechanism* repro M1 mandated: the behavioral drift itself is stochastic and not deterministically reproducible, but the mechanism is.
+- [ ] **M3 — Claude Code re-assert.** Parse `source` in `src/hook.rs`; on the `compact` case for an orchestrator pane, have the daemon PTY-write the resume-flavored re-assert. Remove the dead `"PostCompact"` arm.
+- [ ] **M4 — OpenCode re-assert.** Add the `session.compacted` map arm; implement the re-assert via the PTY lever and/or the native `experimental.session.compacting` hook (`output.context.push(...)`) in the deck-owned `plugin_template`.
+- [ ] **M5 — Wording complement.** Tighten the generated orchestrator `prompt_template` in `assets/config_gen_prompt.md` (foreground the carve-outs, tighten the boundary) so new configs start stricter.
+- [ ] **Validation.** The over-correction regression check (the orchestrator still runs its carve-outs and honors the user gates after the re-assert fires) plus a bounded manual drift observation. Per `feedback_validate_pre_pr.md`, the PRD owner does a single pre-PR sign-off, not per-milestone stops.
+- [ ] **Deferred follow-up (gated on confirming trigger #2 is real).** The per-handoff work-done one-liner re-assert. Split into a separate task; do not build it until drift without compaction is measured as a genuine, distinct failure mode.
+
+**Note for implementation milestones (CLAUDE.md rule 12).** M3/M4 touch hooks, the daemon, and orchestration, so the cross-version contract check applies: before the PR, answer "did this change the TUI↔daemon contract?" and run the cross-version manual test (older daemon + branch TUI; confirm a delegate still routes and hooks still arrive). Expectation: adding an event-type mapping arm plus a daemon-side PTY write is same-wire, so likely no `PROTOCOL_VERSION` bump and no `.breaking.md` — but the check must be made, not assumed.
 
 ## Validation Strategy
 
