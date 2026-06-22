@@ -1,6 +1,6 @@
 # PRD #120: Scheduled agent dispatch on open GitHub issues
 
-**Status**: Planning (unblocked — #127 shipped 2026-06-07; Phases 2–4 remain). Design decisions locked 2026-06-20 — see [Design decisions](#design-decisions-2026-06-20).
+**Status**: Implementation complete (2026-06-22) — Phases 1–4 landed on branch `prd-120-scheduled-agent-dispatch-on-open-github-issues` (commits `ee3c56b` → `2032eb3`); reviewer + auditor findings resolved and the full e2e gate is green. Remaining before close: open the PR, the user's manual end-to-end validation at the merge gate, and filing the M4.2 follow-up issues. Design decisions locked 2026-06-20 — see [Design decisions](#design-decisions-2026-06-20).
 **Priority**: Medium
 **Created**: 2026-05-25
 **GitHub Issue**: [#120](https://github.com/vfarcic/dot-agent-deck/issues/120)
@@ -138,25 +138,25 @@ The dispatch flow runs **in-process inside the deck**, not as a remote `/schedul
 
 - [x] ~~**M1.1** — Decide config schema.~~ *Subsumed by #127 (`config::ScheduledTask` + the global `schedules.toml`).*
 - [x] ~~**M1.2** — Implement the scheduler engine.~~ *Subsumed by #127 (`src/scheduler.rs`: cron loop, `run_now`, skip-if-running, `reload_apply`).*
-- [ ] **M1.3** — Surface scheduler state / failure notifications for issue-dispatch runs. Reuse #127's notification seam (PRD #126) rather than adding a parallel one; only the issue-dispatch-specific events (per-repo/per-issue success/skip/failure) are new here.
+- [x] **M1.3** — Surface scheduler state / failure notifications for issue-dispatch runs. Reuse #127's notification seam (PRD #126) rather than adding a parallel one; only the issue-dispatch-specific events (per-repo/per-issue success/skip/failure) are new here. *(Done — `ea0b889`: 4 additive `NotifyEvent` variants `IssueDispatched`/`IssueDispatchSkipped`/`IssueDispatchFailed`/`IssueDispatchRepoError` + `StderrNotifier` formatting, on #127's existing seam.)*
 
 ### Phase 2: Issue-dispatch task type
 
-- [ ] **M2.1** — Implement repo provisioning: clone-if-missing, fetch+pull-if-present, under the resolved workspace root. Exposed as a reusable internal API so future task types can call it.
-- [ ] **M2.2** — Implement per-issue worktree creation and the idempotency check (worktree presence + open linked-PR check via `gh`). Skip + log when an issue is already claimed.
-- [ ] **M2.3** — Implement the dispatch branching: read the target repo's `.dot-agent-deck.toml`, choose orchestration-tab vs. single-agent-card, spawn accordingly, deliver the initial prompt.
-- [ ] **M2.4** — Implement tab-close → worktree cleanup hook. Closing the dispatched tab/card removes the worktree; the clone is preserved.
+- [x] **M2.1** — Implement repo provisioning: clone-if-missing, fetch+pull-if-present, under the resolved workspace root. Exposed as a reusable internal API so future task types can call it. *(Done — `ea0b889`/`2032eb3`: `provision_repo` — `gh repo clone` if missing, `git fetch` + ff-only `pull` if present; refresh failure non-fatal (S3); existing-clone origin verified vs configured repo (L3).)*
+- [x] **M2.2** — Implement per-issue worktree creation and the idempotency check (worktree presence + open linked-PR check via `gh`). Skip + log when an issue is already claimed. *(Done — `ea0b889`: `git worktree add` on `agent/issue-<n>`; `dispatch_decision` keyed on worktree presence + open PR with head `agent/issue-<n>`; worktree-add tolerant of a pre-existing branch (B1, `2032eb3`).)*
+- [x] **M2.3** — Implement the dispatch branching: read the target repo's `.dot-agent-deck.toml`, choose orchestration-tab vs. single-agent-card, spawn accordingly, deliver the initial prompt. *(Done — `ea0b889`: reuses #127's `spawn` branch logic per issue; `{{issue_number}}` substituted into the user-owned prompt template.)*
+- [x] **M2.4** — Implement tab-close → worktree cleanup hook. Closing the dispatched tab/card removes the worktree; the clone is preserved. *(Done — `ea0b889`/`2032eb3`: daemon-side `WorktreeRegistry` + `StopAgent` close detection; refcounted so a multi-role orchestration worktree is removed only on the LAST role close (S1).)*
 
 ### Phase 3: Filters, robustness, polish
 
-- [ ] **M3.1** — Implement the optional label filter and the optional `gh` query override. Defaults to "all open issues, up to `max_per_run`."
-- [ ] **M3.2** — Failure handling: auth/network/GitHub API errors are caught at issue boundaries, logged, and surfaced to the user; one failing **issue** does not abort the rest of the run. (Single repo per task — no cross-repo fan-out.)
-- [ ] **M3.3** — Tests: unit tests for the scheduler engine, integration tests for the dispatch end-to-end (using a fixture repo or a real test repo per the established testing approach with `dot-ai-infra`).
+- [x] **M3.1** — Implement the optional label filter and the optional `gh` query override. Defaults to "all open issues, up to `max_per_run`." *(Done — `ea0b889`: `issue_list_argv` adds `--label`/`--search` when set; `max_per_run` caps issues considered per run; values validated + `--` end-of-options guard (M1).)*
+- [x] **M3.2** — Failure handling: auth/network/GitHub API errors are caught at issue boundaries, logged, and surfaced to the user; one failing **issue** does not abort the rest of the run. (Single repo per task — no cross-repo fan-out.) *(Done — `ea0b889`: per-issue error boundary; failure surfaced via the notifier; remaining issues continue.)*
+- [x] **M3.3** — Tests: unit tests for the scheduler engine, integration tests for the dispatch end-to-end (using a fixture repo or a real test repo per the established testing approach with `dot-ai-infra`). *(Done — pure-data unit tests + L2 `scheduler/dispatch/001–009` e2e flows (stub `gh` + fixture remote, headless daemon via `RunNow`); full e2e gate green, 1499/1500 + 1 unrelated real-LLM flake that passed on rerun.)*
 
 ### Phase 4: Docs and ship
 
-- [ ] **M4.1** — User docs under `site/` covering configuration, the idempotency / cleanup model, the deck-must-be-running caveat, and a complete example `.dot-agent-deck.toml` with a `[[scheduled_tasks]]` block.
-- [ ] **M4.2** — Final pass: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`. Open follow-up issues for known out-of-scope items (tab auto-restoration, additional task types, external notifications).
+- [x] **M4.1** — User docs under `site/` covering configuration, the idempotency / cleanup model, the deck-must-be-running caveat, and a complete example `.dot-agent-deck.toml` with a `[[scheduled_tasks]]` block. *(Done — `18141e1`: new "Dispatching agents onto open GitHub issues (`issue_dispatch`)" section in `docs/scheduled-tasks.md` — the `[scheduled_tasks.issue_dispatch]` config, the per-issue fire flow, where clones/worktrees/branches land, the worktree-is-the-ledger idempotency model, tab-close cleanup, and the `gh`/daemon caveats.)*
+- [ ] **M4.2** — Final pass: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`. Open follow-up issues for known out-of-scope items (tab auto-restoration, additional task types, external notifications). *(Gates PASS — fmt/clippy clean, `cargo test-fast` 870/870, full `cargo test-e2e` green. Follow-up issues still to be filed at the merge stage: tab auto-restoration, additional task types, external notifications, and the M3.1 `max_per_run` enumeration-cap-vs-dispatched-count refinement (review S2).)*
 
 ## Risks and Mitigations
 
