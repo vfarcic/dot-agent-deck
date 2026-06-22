@@ -86,6 +86,18 @@ pub fn show_experimental_footer() -> bool {
     experimental_enabled()
 }
 
+/// Production wrapper for scheduled GitHub issue-dispatch (PRD #120, LATE
+/// DECISION 2026-06-22). One wrapper per feature (CLAUDE.md #9) so
+/// `grep issue_dispatch_enabled` finds the single gate at graduation. Unlike
+/// the other wrappers this gates a daemon *activation* seam rather than a TUI
+/// render — issue-dispatch has no user-visible surface, so the documented
+/// behavior gate lives in `make_schedule_callback` (read at fire time, not
+/// captured at registration, so a live toggle takes effect). Config parsing
+/// stays flag-free; only the dispatch flow's activation is gated.
+pub fn issue_dispatch_enabled() -> bool {
+    experimental_enabled()
+}
+
 /// Guards [`init_and_watch`] so the periodic watcher thread is spawned at
 /// most once per process (reviewer #4 / audit INFO-3): a second call is a
 /// no-op rather than leaking a duplicate poll thread.
