@@ -17,6 +17,7 @@ mod common;
 use common::{DaemonProc, TuiDeck, spawn_daemon_serve, write_hook_line};
 use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::AgentType;
+use dot_agent_deck::state::SessionStatus;
 use spec::spec;
 use std::time::Duration;
 
@@ -157,6 +158,25 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
     // Drive the daemon's live session to `Working` with an active tool — the
     // exact state a user would see before disconnecting. No TUI is attached;
     // the daemon's `apply_event` builds the authoritative `SessionState`.
+    //
+    // The two hooks MUST be applied in order (`session_start` then
+    // `tool_start`), so we write the second only after the daemon has applied
+    // the first. The daemon handles each hook connection on its own
+    // `tokio::spawn`ed task (see `run_hook_loop`), so two back-to-back writes
+    // over separate connections have NO cross-connection ordering guarantee —
+    // and `apply_event`'s `SessionStart` arm resets the session to `Idle` /
+    // clears the active tool. If `session_start` raced in AFTER `tool_start`
+    // under parallel load it would clobber the `Working` state straight back
+    // to `Idle`, and the snapshot could never reach `Working` (the exact
+    // failure a single back-to-back-then-wait guard hit). A real agent always
+    // emits `session_start` at launch and its first tool hook well afterward,
+    // so serializing here models real usage and removes the load-induced race.
+
+    // Hook #1 — `session_start`: establishes the session and teaches the
+    // event-derived agent type. Wait until the daemon's registry reflects it
+    // (a live snapshot exists and carries the learned `ClaudeCode` type; the
+    // `SessionStart` arm leaves the status at `Idle`) before sending the tool
+    // hook, so the tool hook can only move the status forward.
     let session_start = serde_json::json!({
         "session_id": "recon-sess",
         "agent_type": "claude_code",
@@ -167,6 +187,25 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
     });
     write_hook_line(&daemon.hook_socket, &session_start.to_string())
         .expect("write SessionStart hook");
+    let started = daemon.wait_for_agent_where(
+        |r| {
+            r.agent_type == Some(AgentType::ClaudeCode)
+                && r.live
+                    .as_ref()
+                    .is_some_and(|s| s.status == SessionStatus::Idle)
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        started.is_some(),
+        "daemon must apply SessionStart (live snapshot present, type learned) \
+         before the tool hook is sent, got: {:?}",
+        daemon.agent_records()
+    );
+
+    // Hook #2 — `tool_start`: with the session already established, this can
+    // only drive the live snapshot to `Working` (no later `SessionStart`
+    // arrives to reset it).
     let tool_start = serde_json::json!({
         "session_id": "recon-sess",
         "agent_type": "claude_code",
@@ -180,17 +219,23 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
     write_hook_line(&daemon.hook_socket, &tool_start.to_string()).expect("write ToolStart hook");
 
     // The daemon now holds a `Working` session; a reconnecting TUI's
-    // `hydrate_from_daemon` → `ListAgents` must carry it. Wait until the
-    // daemon's own registry confirms the event-derived type landed, so the
-    // fresh TUI below is guaranteed to hydrate against a populated snapshot.
+    // `hydrate_from_daemon` → `ListAgents` must carry it. Gate on the
+    // snapshot's `Working` status — not just the learned type — so the tool
+    // hook is guaranteed applied to the snapshot before the fresh TUI
+    // reconnects.
     let learned = daemon.wait_for_agent_where(
-        |r| r.agent_type == Some(AgentType::ClaudeCode),
+        |r| {
+            r.agent_type == Some(AgentType::ClaudeCode)
+                && r.live
+                    .as_ref()
+                    .is_some_and(|s| s.status == SessionStatus::Working)
+        },
         Duration::from_secs(5),
     );
     assert!(
         learned.is_some(),
-        "daemon must have ingested the hooks before the fresh TUI reconnects, \
-         got: {:?}",
+        "daemon must have ingested both hooks (live snapshot == Working) before \
+         the fresh TUI reconnects, got: {:?}",
         daemon.agent_records()
     );
 
