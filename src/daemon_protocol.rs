@@ -841,7 +841,32 @@ async fn handle_connection(
 
     match req {
         AttachRequest::ListAgents => {
-            let records = registry.agent_records();
+            let mut records = registry.agent_records();
+            // PRD #162: enrich each registry record with the daemon's live,
+            // event-derived session state so a reconnecting TUI restores the
+            // real status / agent type / active tool / tool count / prompt
+            // context instead of minting a bare `Idle` / "No agent"
+            // placeholder. Match the live `SessionState` on BOTH the agent id
+            // (registry `record.id` == `SessionState.agent_id`) AND the pane
+            // id (`record.pane_id_env` == `SessionState.pane_id`); a `/clear`
+            // restart can leave a stale session on the same keys, so break ties
+            // by the most-recent `last_activity` (newest-wins). The dummy-state
+            // `serve_attach` path carries an empty `AppState`, so this loop
+            // attaches nothing and `live` stays `None` — today's behavior.
+            {
+                let guard = state.read().await;
+                for record in &mut records {
+                    record.live = guard
+                        .sessions
+                        .values()
+                        .filter(|s| {
+                            s.agent_id.as_deref() == Some(record.id.as_str())
+                                && s.pane_id == record.pane_id_env
+                        })
+                        .max_by_key(|s| s.last_activity)
+                        .map(|s| s.live_snapshot());
+                }
+            }
             write_resp(&mut stream, &AttachResponse::agent_records(records)).await?;
         }
         AttachRequest::StartAgent {
@@ -1684,6 +1709,7 @@ mod tests {
             agent_type: None,
             rows: 0,
             cols: 0,
+            live: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -1701,6 +1727,7 @@ mod tests {
             agent_type: None,
             rows: 0,
             cols: 0,
+            live: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();

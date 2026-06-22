@@ -33,7 +33,7 @@ const MAX_FIRST_PROMPTS: usize = 3;
 pub(crate) const SESSION_START_WAIT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionStatus {
     Thinking,
     Working,
@@ -55,10 +55,45 @@ pub struct DashboardStats {
     pub total_tools: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ActiveTool {
     pub name: String,
     pub detail: Option<String>,
+}
+
+/// PRD #162: a serializable snapshot of the daemon's live, event-derived
+/// session state, attached to each `AgentRecord` in the `ListAgents` response
+/// so a reconnecting TUI restores the real status / agent type / active tool /
+/// tool count / prompt context instead of minting a bare `Idle` / "No agent"
+/// placeholder.
+///
+/// Carried as an additive optional (`AgentRecord.live: Option<SessionSnapshot>`):
+/// an older daemon, the test/dummy-state attach path, or an agent that never
+/// emitted an event all yield `None`, and the TUI falls back to today's
+/// placeholder behavior. No `PROTOCOL_VERSION` bump — every field follows the
+/// M2.11–M2.13 `#[serde(default, skip_serializing_if = ...)]` reconnect-field
+/// convention.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionSnapshot {
+    /// The live `SessionStatus` (`Working` / `Thinking` / `WaitingForInput` /
+    /// `Idle` / `Compacting` / `Error`) as `apply_event` last computed it.
+    pub status: SessionStatus,
+    /// The event-derived agent type — this is the "No agent" fix: a spawn-time
+    /// `AgentRecord.agent_type = None` is overridden by the `Some(..)` carried
+    /// here once the session has emitted at least one event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<AgentType>,
+    /// The active tool (name + detail) if the session is mid-tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tool: Option<ActiveTool>,
+    /// Running tool tally so the card's tool count survives the reconnect.
+    pub tool_count: u32,
+    /// First-prompt context preserved across the reconnect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub first_prompts: Vec<String>,
+    /// The most recent user prompt, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_user_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +124,23 @@ pub struct SessionState {
     /// the live scheduler-spawn case, where the name would otherwise degrade
     /// to the truncated pane id. `None` for ordinary hook-driven sessions.
     pub display_name: Option<String>,
+}
+
+impl SessionState {
+    /// PRD #162: build the wire [`SessionSnapshot`] from this live session.
+    /// The snapshot's `agent_type` is the EVENT-DERIVED value (wrapped in
+    /// `Some`), so a reconnecting TUI can override a `None` spawn-time
+    /// `AgentRecord.agent_type` with what the agent actually is.
+    pub fn live_snapshot(&self) -> SessionSnapshot {
+        SessionSnapshot {
+            status: self.status.clone(),
+            agent_type: Some(self.agent_type.clone()),
+            active_tool: self.active_tool.clone(),
+            tool_count: self.tool_count,
+            first_prompts: self.first_prompts.clone(),
+            last_user_prompt: self.last_user_prompt.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]

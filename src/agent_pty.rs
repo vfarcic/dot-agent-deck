@@ -1144,6 +1144,16 @@ pub struct AgentRecord {
     /// Current PTY cols. See `rows` for the full rationale.
     #[serde(default, skip_serializing_if = "is_zero_u16")]
     pub cols: u16,
+    /// PRD #162: the daemon's live, event-derived session state for this
+    /// agent, joined in by the `ListAgents` handler from `AppState.sessions`
+    /// (on `agent_id` + `pane_id`, newest-`last_activity`-wins). `None` when
+    /// no live session matches — an older daemon, the test/dummy-state attach
+    /// path, or an agent that never emitted an event — and the TUI falls back
+    /// to today's bare-placeholder behavior. Additive optional, so the wire
+    /// shape stays backwards-compatible with daemons predating this field and
+    /// no `PROTOCOL_VERSION` bump is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<crate::state::SessionSnapshot>,
 }
 
 /// Skip-predicate for `AgentRecord::rows` / `AgentRecord::cols`
@@ -2190,6 +2200,10 @@ impl AgentPtyRegistry {
                 agent_type: agent.agent_type.clone(),
                 rows: agent.pty_rows,
                 cols: agent.pty_cols,
+                // PRD #162: the registry has no live session state; the
+                // `ListAgents` handler joins `AppState.sessions` in and
+                // overrides this when a matching live session exists.
+                live: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -3775,6 +3789,7 @@ mod tests {
             agent_type: None,
             rows: 120,
             cols: 40,
+            live: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4035,6 +4050,7 @@ mod tests {
             agent_type: None,
             rows: 0,
             cols: 0,
+            live: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
