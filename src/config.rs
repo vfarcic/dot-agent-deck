@@ -603,7 +603,11 @@ impl SnapshotCoalescer {
 pub struct IssueDispatchConfig {
     /// Target repo in `owner/name` form (e.g. `vfarcic/dot-ai`).
     pub repo: String,
-    /// Maximum number of issues dispatched per fire (the per-run cap).
+    /// Maximum number of issues dispatched per fire (the per-run cap). Omitting
+    /// it defaults to 3 — the value documented in the changelog — so a
+    /// hand-written `[scheduled_tasks.issue_dispatch]` table that leaves it out
+    /// still deserializes (and the task still fires) instead of being rejected.
+    #[serde(default = "default_max_per_run")]
     pub max_per_run: usize,
     /// Optional label filter (e.g. `agent-eligible`). `None` = no label gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -661,6 +665,12 @@ pub struct ScheduledTask {
 
 fn default_enabled() -> bool {
     true
+}
+
+/// Default `issue_dispatch.max_per_run` when the field is omitted: 3, matching
+/// the changelog's documented "enumeration cap, default 3".
+fn default_max_per_run() -> usize {
+    3
 }
 
 /// Internal mirror of the file shape so a well-formed file deserializes in one
@@ -2200,6 +2210,36 @@ prompt = "hi"
         let loaded = LoadedSchedules::parse(plain);
         assert!(loaded.errors.is_empty());
         assert!(loaded.tasks[0].issue_dispatch.is_none());
+    }
+
+    // PRD #120 — `max_per_run` is optional: a hand-written issue-dispatch table
+    // that omits it deserializes (and validates/loads) with the changelog's
+    // documented default of 3, rather than being rejected for a missing field.
+    #[test]
+    fn issue_dispatch_max_per_run_defaults_to_three_when_omitted() {
+        let toml_str = r#"
+[[scheduled_tasks]]
+name = "Issues vfarcic/dot-ai"
+cron = "0 9 * * *"
+working_dir = "/work/space"
+prompt = "Work on issue {{issue_number}}"
+
+[scheduled_tasks.issue_dispatch]
+repo = "vfarcic/dot-ai"
+"#;
+        let loaded = LoadedSchedules::parse(toml_str);
+        // The entry must validate and load (not land in `errors`).
+        assert!(loaded.errors.is_empty(), "errors: {:?}", loaded.errors);
+        assert_eq!(loaded.tasks.len(), 1);
+        let disp = loaded.tasks[0]
+            .issue_dispatch
+            .as_ref()
+            .expect("issue-dispatch task");
+        assert_eq!(disp.repo, "vfarcic/dot-ai");
+        assert_eq!(
+            disp.max_per_run, 3,
+            "omitted max_per_run must default to 3 (matches changelog)"
+        );
     }
 
     // PRD #120 (M1) — a hand-edited issue-dispatch task with a malformed `repo`

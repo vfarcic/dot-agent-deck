@@ -291,8 +291,22 @@ async fn dispatch_one_issue(
         return Ok(());
     }
 
-    // M2.2 — create the per-issue worktree on `agent/issue-<n>`.
-    create_worktree(clone_dir, &paths.worktree_dir, &paths.branch).await?;
+    // M2.2 — create the per-issue worktree on `agent/issue-<n>`. A concurrent
+    // fire can claim it in the TOCTOU window after the idempotency check above
+    // (see `create_worktree`); that benign race is a skip, not a failure —
+    // mirroring the `dispatch_decision` worktree-presence skip.
+    match create_worktree(clone_dir, &paths.worktree_dir, &paths.branch).await? {
+        WorktreeCreation::Created => {}
+        WorktreeCreation::AlreadyClaimed => {
+            notifier.notify(NotifyEvent::IssueDispatchSkipped {
+                task: task_name.to_string(),
+                repo: cfg.repo.clone(),
+                issue,
+                branch: paths.branch.clone(),
+            });
+            return Ok(());
+        }
+    }
 
     // M2.4 — record the worktree for tab-close cleanup NOW, before the spawn's
     // prompt-delivery wait. `spawn` registers the agent (visible to a `StopAgent`
@@ -483,6 +497,15 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
     Ok(!arr.is_empty())
 }
 
+/// Outcome of [`create_worktree`]: either we created the per-issue worktree, or
+/// a concurrent fire had already claimed it (the benign TOCTOU race below),
+/// which the caller surfaces as a skip rather than a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeCreation {
+    Created,
+    AlreadyClaimed,
+}
+
 /// M2.2: create the per-issue worktree on `agent/issue-<n>`. The `.worktrees`
 /// parent is created first so the add never trips on a missing dir.
 ///
@@ -493,11 +516,20 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
 /// the reuse-the-vacated-slot model. So probe for the branch first: attach the
 /// existing branch (no `-b`) when it is already there, and only create it (`-b`)
 /// when it is not.
+///
+/// TOCTOU: the caller only reaches here after [`dispatch_decision`] saw the
+/// worktree dir ABSENT, but a concurrent fire of the same task can create it in
+/// the window before this `worktree add` runs — the add then fails on the now-
+/// present path. Because we only arrive with the dir believed absent, its
+/// presence after a failed add means a concurrent claim, not our error: report
+/// [`WorktreeCreation::AlreadyClaimed`] (→ skip) instead of a hard failure. A
+/// genuine add failure (bad ref, permissions, …) leaves the dir absent and
+/// still propagates as `Err`.
 async fn create_worktree(
     clone_dir: &Path,
     worktree_dir: &Path,
     branch: &str,
-) -> Result<(), String> {
+) -> Result<WorktreeCreation, String> {
     if let Some(parent) = worktree_dir.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create worktree parent {}: {e}", parent.display()))?;
@@ -518,10 +550,23 @@ async fn create_worktree(
     )
     .await
     .is_ok();
-    if branch_exists {
+    let add = if branch_exists {
         run_status("git", &["-C", &clone, "worktree", "add", &wt, branch]).await
     } else {
         run_status("git", &["-C", &clone, "worktree", "add", &wt, "-b", branch]).await
+    };
+    match add {
+        Ok(()) => Ok(WorktreeCreation::Created),
+        // Concurrent claim (TOCTOU): the dir is present now though we arrived
+        // believing it absent — treat as already-claimed. A real failure leaves
+        // the dir absent and surfaces as the original error.
+        Err(e) => {
+            if worktree_dir.exists() {
+                Ok(WorktreeCreation::AlreadyClaimed)
+            } else {
+                Err(e)
+            }
+        }
     }
 }
 
@@ -770,6 +815,48 @@ mod tests {
         let other = vec![record(Some("/somewhere/else"), None)];
         assert!(!worktree_still_in_use(&other, wt));
         assert!(!worktree_still_in_use(&[], wt));
+    }
+
+    // --- TOCTOU: concurrent-claim worktree race ---
+
+    // PRD #120 — when the per-issue worktree dir is already present (a concurrent
+    // fire claimed it in the window after the idempotency check), `create_worktree`
+    // reports AlreadyClaimed so the caller skips the issue rather than failing it.
+    // Deterministic: the production code keys solely on `worktree_dir.exists()`
+    // after a failed `git worktree add`, so a non-git clone dir suffices to force
+    // the add to fail; the pre-created worktree dir drives the already-claimed verdict.
+    #[tokio::test]
+    async fn create_worktree_already_claimed_when_dir_present() {
+        let ws = tempfile::tempdir().unwrap();
+        let clone_dir = ws.path().join("clone"); // not a git repo → add fails
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        let worktree_dir = clone_dir.join(".worktrees").join("issue-7");
+        // Simulate the concurrent fire having already created the worktree dir.
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+
+        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-7").await;
+        assert_eq!(
+            outcome,
+            Ok(WorktreeCreation::AlreadyClaimed),
+            "an already-present worktree dir is a concurrent claim → skip, not failure"
+        );
+    }
+
+    // PRD #120 — a genuine `git worktree add` failure with NO worktree dir on disk
+    // stays a hard failure (Err), so real problems (bad ref, permissions, …) are
+    // still surfaced as IssueDispatchFailed rather than masked as a skip.
+    #[tokio::test]
+    async fn create_worktree_propagates_genuine_failure() {
+        let ws = tempfile::tempdir().unwrap();
+        let clone_dir = ws.path().join("clone"); // not a git repo → add fails
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        let worktree_dir = clone_dir.join(".worktrees").join("issue-9"); // absent
+
+        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-9").await;
+        assert!(
+            outcome.is_err(),
+            "a real add failure with no worktree on disk must propagate as Err, got {outcome:?}"
+        );
     }
 
     // --- S5: workspace absolutization ---
