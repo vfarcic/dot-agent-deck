@@ -1452,6 +1452,75 @@ without depending on the config struct API.
 - **Does not assert:** the live-path title plumbing (already covered by the new-pane orchestration flow); the serde round-trip of the new field in isolation (a unit test the coder adds with the field).
 - **Platform coverage:** mac+linux.
 
+### Live session status on reconnect (PRD #162)
+
+These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must attach the live, event-derived session state (a `SessionSnapshot` on each `AgentRecord`) so reconnected cards show real status instead of `Idle`/"No agent". The data already exists in `AppState.sessions` (built by `apply_event`, unchanged); this PRD only exposes it. The wire field `live: Option<SessionSnapshot>` is additive/optional — no `PROTOCOL_VERSION` bump.
+
+#### session/live
+
+##### session/live/001 — `SessionSnapshot` serde round-trips every `SessionStatus` and an older `AgentRecord` without the field decodes to `live == None` (PRD #162 M1.1).
+- **Layer:** pure-data (serde round-trip; no daemon/TUI harness; runs in the fast tier).
+- **Agent:** none.
+- **Asserts:** a `SessionSnapshot` carrying each `SessionStatus` variant (Idle/Working/Thinking/WaitingForInput/Compacting/Error) round-trips through JSON with the status (and agent_type/active_tool/tool_count/prompts) preserved; an `AgentRecord` carrying `live = Some(snapshot)` round-trips with the snapshot intact; and a hand-crafted older-daemon `AgentRecord` JSON with no `live` key decodes via `#[serde(default)]` to `live == None` (back-compat, no protocol bump).
+- **Does not assert:** the `ListAgents` join (session/live/002); newest-wins tie-break (session/live/003); the TUI-side seeding of the hydrated session (Phase 2).
+- **Platform coverage:** mac+linux+windows.
+
+##### session/live/002 — The `ListAgents` handler attaches the live event-derived snapshot; the dummy-state path yields `None` (PRD #162 M1.2).
+- **Layer:** in-crate integration (in-process attach daemon over a Unix socket; fast tier; spawns a `sleep` PTY only to populate the registry record, does not drive vt100).
+- **Agent:** none.
+- **Asserts:** with a registry agent whose spawn-time `agent_type` is `None` and a live `AppState` session (same `agent_id` + `pane_id`) driven via `apply_event` to `Working` with an active tool, `tool_count > 0`, an event-derived `agent_type` (ClaudeCode) and a first prompt, the `ListAgents` response carries `AgentRecord.live = Some` with that status, the event-derived `agent_type` (even though the registry record's spawn-time `agent_type` is `None`), the active tool name, the tool count, and the first/last prompt. The empty dummy-state `serve_attach` path returns the same record with `live == None` — no harness regression and the older-daemon fallback shape.
+- **Does not assert:** the pure serde shape (session/live/001); newest-wins (session/live/003); the TUI-side seeding (Phase 2).
+- **Platform coverage:** mac+linux.
+
+##### session/live/003 — When two sessions map to the same agent, the join attaches the newest-`last_activity` snapshot (PRD #162 M1.2 newest-wins).
+- **Layer:** in-crate integration (in-process attach daemon over a Unix socket; fast tier; spawns a `sleep` PTY only to populate the registry record, does not drive vt100).
+- **Agent:** none.
+- **Asserts:** with two hand-built `SessionState`s in `AppState.sessions` that both map to the same agent (same `agent_id` + `pane_id`, e.g. a `/clear` restart leaving a stale entry) but different `last_activity` and distinguishing status/prompt, the `ListAgents` join attaches the snapshot from the entry with the most-recent `last_activity` (the live session), not the dead predecessor.
+- **Does not assert:** the pure serde shape (session/live/001); the populated-vs-dummy contrast (session/live/002); the TUI-side seeding (Phase 2).
+- **Platform coverage:** mac+linux.
+
+##### session/live/004 — Hydrating a fresh controller seeds the reconnected card from the daemon's live snapshot (status/agent_type/active_tool/tool_count/prompts), and falls back to the bare placeholder when no snapshot is present (PRD #162 M2.1/M2.2).
+- **Layer:** in-process (real in-process attach daemon over a Unix socket; `EmbeddedPaneController::hydrate_from_daemon`; spawns two `sleep` PTYs only to populate the registry, does not drive vt100). Runs in the fast tier.
+- **Agent:** none.
+- **Asserts:** a warm daemon carries agent A (spawn-time `agent_type = None`, the "No agent" case) driven via `apply_event` to a live `Working` session with an active `Edit` tool, `tool_count > 0`, an event-derived `ClaudeCode` type and a first prompt, plus agent B (spawn-time `OpenCode`) with NO live session. Hydrating a fresh controller threads the live `SessionSnapshot` through `HydratedPane.live` (`Some` for A, `None` for B); seeding each hydrated session via `AppState::seed_hydrated_session` — exactly as the `ui.rs` hydration loop does — makes agent A's card carry the snapshot's `status` (Working, not Idle) / `agent_type` (ClaudeCode, overriding the `None` spawn-time value, not "No agent") / `active_tool` / `tool_count` / `first_prompts` / `last_user_prompt`, with the PRD #110 `agent_id` minted on the card; agent B's snapshot-absent card falls back to today's bare placeholder (Idle, spawn-time `OpenCode`, no active tool). Each pane seeds exactly one card (no duplicate).
+- **Does not assert:** the pure serde shape (session/live/001); the `ListAgents` join in isolation (session/live/002); newest-wins (session/live/003); the post-reconnect remap (session/live/005); the rendered-grid reconnect against a real daemon (session/live/006).
+- **Platform coverage:** mac+linux.
+
+##### session/live/005 — A post-reconnect `SessionStart` from the same agent remaps onto the snapshot-seeded card instead of spawning a duplicate (PRD #162 M2.2, PRD #110 property preserved).
+- **Layer:** pure-state (in-process `AppState`; `seed_hydrated_session` + `apply_event`; no daemon/TUI harness). Runs in the fast tier.
+- **Agent:** none.
+- **Asserts:** after `AppState::seed_hydrated_session` seeds a card from a live `SessionSnapshot` (Working/ClaudeCode/active tool/prompts) with the PRD #110 `agent_id` minted on it, a subsequent `SessionStart` event carrying the SAME `pane_id` + `agent_id` but a distinct `session_id` remaps onto the hydrated card — exactly one session/pane survives for that agent (no duplicate) and the minted `agent_id` is preserved through the remap.
+- **Does not assert:** the snapshot-seeding of the card's fields (session/live/004); the daemon-side join (session/live/002, session/live/003); the rendered-grid reconnect (session/live/006); the clear=true respawn (different `agent_id`) duplicate-retire path (PRD #110 tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### session/live/006 — A fresh TUI reconnecting to a real daemon renders the live `Working` status on the rebuilt card immediately, not the `Idle`/"No agent" placeholder (PRD #162 M2.1/M2.2 end-to-end).
+- **Layer:** L2 (real-binary PTY; a shared `dot-agent-deck daemon serve` driven over its hook + attach sockets, then a fresh real-binary TUI launched against the same daemon's sockets; `#[cfg(feature = "e2e")]`).
+- **Agent:** none (the agent is a `sh -c 'sleep 600'` stub; the live status is taught via synthetic Claude Code hooks — no LLM tokens).
+- **Asserts:** a daemon-owned agent (spawn-time `agent_type = None`, pane `pane-recon`, display name `recon-live-77`) is driven to a live `Working` session with an active `Read` tool by writing `session_start` + `tool_start` hooks (carrying the registry agent id so the `ListAgents` snapshot join matches) — with NO TUI attached. A FRESH TUI then launched against the same daemon, writing no further hook, rebuilds the dashboard card showing the live `Working` status and the agent's display name immediately on reconnect, and does not render the `No agent` placeholder for that live agent.
+- **Does not assert:** a literal first-TUI detach cycle (the daemon owns the live state regardless of whether a TUI was ever attached); the in-process seeding seam (session/live/004); the active-tool tally/label beyond the status badge; the daemon-side join/serde (session/live/001–003).
+- **Platform coverage:** mac+linux.
+
+##### session/live/007 — `DaemonClient::list_agents` scrubs and clamps a hostile `AgentRecord.live` at the wire boundary so a malformed daemon can't corrupt the rebuilt card (PRD #162 review-fix, parallels embed/attach/005).
+- **Layer:** in-crate integration (a hand-rolled mock attach daemon over a Unix socket advertises one hostile `AgentRecord`; the real `DaemonClient::list_agents` boundary sanitizer runs; fast tier; no PTY/vt100).
+- **Agent:** none (the mock daemon hand-crafts the hostile `AttachResponse`).
+- **Asserts:** a daemon advertises an `AgentRecord.live` whose `last_user_prompt`, every `first_prompts` entry, and `active_tool.name` / `.detail` carry ANSI escapes, NUL bytes, and other ASCII control chars AND are over-long (~100 KiB each), and whose `first_prompts` is oversized (6 entries — double the `MAX_FIRST_PROMPTS` cap of 3). `list_agents` returns the record with its live snapshot PRESERVED (the agent is real) but SCRUBBED — no byte `< 0x20` or `== 0x7f` survives in `last_user_prompt`, any `first_prompts` entry, or `active_tool.name` / `.detail` — and CLAMPED — every one of `last_user_prompt`, `active_tool.name`, `active_tool.detail`, and each `first_prompts` entry is length-bounded to <= 65536 bytes (not passed through verbatim), and `first_prompts` is cut to at most `MAX_FIRST_PROMPTS` (3) entries.
+- **Does not assert:** the daemon-side join/serde (session/live/001–003); the seeding of the card's fields (session/live/004); the `agent_type` precedence fallback (session/live/008); the `tab_membership` scrub itself (embed/attach/005); the exact sanitized output beyond "no raw control bytes survive and the list is clamped".
+- **Platform coverage:** mac+linux.
+
+##### session/live/008 — An event-derived `AgentType::None` snapshot falls back to the spawn-time agent type on reconnect instead of seeding the card as "No agent" (PRD #162 review-fix).
+- **Layer:** pure-state (in-process `AppState`; `SessionState::live_snapshot` + `AppState::seed_hydrated_session`; no daemon/TUI harness). Runs in the fast tier.
+- **Agent:** none.
+- **Asserts:** a live `SessionState` whose event-derived `agent_type` is `AgentType::None` (the agent emitted events but never identified itself) snapshots via `live_snapshot` to `agent_type == None` (Option::None, NOT `Some(AgentType::None)`), so when `seed_hydrated_session` seeds a reconnected card whose spawn-time `agent_type` is `Some(ClaudeCode)`, the snapshot does not shadow the spawn-time fallback and the card carries the REAL `ClaudeCode` type — not "No agent".
+- **Does not assert:** the wire-boundary scrub/clamp (session/live/007); the full snapshot field seeding (session/live/004); the daemon-side newest-wins join (session/live/003); the post-reconnect remap (session/live/005).
+- **Platform coverage:** mac+linux+windows.
+
+##### session/live/009 — An unknown `SessionStatus` string on `AgentRecord.live.status` degrades gracefully instead of failing the whole record parse (PRD #162 Greptile review-fix, forward-compat).
+- **Layer:** pure-data (serde decode of a hand-crafted wire JSON; no daemon/TUI harness; fast tier).
+- **Agent:** none.
+- **Asserts:** an `AgentRecord` wire JSON whose `live.status` is a string this build does not know (`"Hibernating"`) deserializes via `serde_json::from_str::<AgentRecord>` to `Ok` (NOT `Err`) and the record survives with its `id` / `pane_id_env` intact — a newer daemon's future status variant must not fail an older TUI's entire `AgentRecord` decode just because `live` is a present field. Mechanism-agnostic: does NOT pin whether the fix maps the unknown status to a catch-all variant (`live` stays `Some`) or drops `live` to `None`.
+- **Does not assert:** which degrade mechanism is chosen (`#[serde(other)]` vs lenient `live -> None`); the older-shape back-compat (`live` absent -> `None`, session/live/001); the wire-boundary scrub/clamp (session/live/007).
+- **Platform coverage:** mac+linux+windows.
+
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
 These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.

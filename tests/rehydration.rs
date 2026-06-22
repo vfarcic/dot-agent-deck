@@ -28,19 +28,26 @@ use tempfile::TempDir;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
-use dot_agent_deck::agent_pty::{AgentPtyRegistry, TabMembership};
+use chrono::Utc;
+use dot_agent_deck::agent_pty::{
+    AgentPtyRegistry, AgentRecord, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
+};
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_REQ, KIND_RESP, bind_attach_listener, read_frame,
-    serve_attach, write_frame,
+    serve_attach, serve_attach_with_counter, write_frame,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
-use dot_agent_deck::event::AgentType;
-use dot_agent_deck::state::AppState;
+use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+use dot_agent_deck::state::{
+    ActiveTool, AppState, SessionSnapshot, SessionState, SessionStatus, SharedState,
+};
 use dot_agent_deck::ui::{
     dead_slot_pane_id, fill_dead_slots_with_placeholders, is_dead_slot_pane_id,
 };
 use spec::spec;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::AtomicUsize;
 
 // `bind_attach_listener` flips the process-global umask while binding; share
 // the lock with the other M-series tests so concurrent tempdir creation
@@ -79,6 +86,142 @@ async fn start_real_server() -> Server {
         path,
         registry,
         handle,
+    }
+}
+
+/// PRD #162: variant of [`start_real_server`] that serves with the daemon's
+/// real, caller-supplied `state: SharedState` via `serve_attach_with_counter`
+/// instead of `serve_attach`'s empty dummy state. This is the production path
+/// the `ListAgents` handler reads to attach the live `SessionSnapshot`. The
+/// caller owns the `registry` (so it can pre-spawn agents into it) and the
+/// `state` (so it can populate `AppState.sessions` via `apply_event`). Returns
+/// the tempdir (keep it alive — drop removes the socket) and the join handle
+/// (abort it at teardown).
+async fn start_server_with_state(
+    registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
+) -> (TempDir, PathBuf, JoinHandle<()>) {
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = bind_attach_listener(&path).expect("bind attach listener");
+        (dir, path, listener)
+    };
+    let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+    let client_count = Arc::new(AtomicUsize::new(0));
+    let scheduler = Arc::new(dot_agent_deck::scheduler::Scheduler::with_stderr_notifier());
+    let reuse = dot_agent_deck::spawn::new_reuse_registry();
+    let registry_for_task = registry.clone();
+    let handle = tokio::spawn(async move {
+        let _ = serve_attach_with_counter(
+            listener,
+            registry_for_task,
+            event_tx,
+            client_count,
+            state,
+            None,
+            scheduler,
+            reuse,
+        )
+        .await;
+    });
+    (dir, path, handle)
+}
+
+/// PRD #162: drive an `AppState` session via the same `apply_event` path the
+/// daemon uses for hook events, until the session is `Working` with an active
+/// tool, `tool_count > 0`, an event-derived `agent_type` of ClaudeCode, and a
+/// recorded first/last prompt. Mirrors the status/transition apply_event flow:
+/// SessionStart → Thinking(prompt) → ToolStart(Read) → ToolEnd → ToolStart(Edit).
+fn drive_session_to_working(state: &mut AppState, session_id: &str, pane_id: &str, agent_id: &str) {
+    let mk = |event_type: EventType,
+              tool_name: Option<&str>,
+              tool_detail: Option<&str>,
+              user_prompt: Option<&str>| AgentEvent {
+        session_id: session_id.to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type,
+        tool_name: tool_name.map(str::to_string),
+        tool_detail: tool_detail.map(str::to_string),
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: user_prompt.map(str::to_string),
+        metadata: HashMap::new(),
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+    };
+    state.apply_event(mk(EventType::SessionStart, None, None, None));
+    state.apply_event(mk(
+        EventType::Thinking,
+        None,
+        None,
+        Some("build the feature"),
+    ));
+    state.apply_event(mk(
+        EventType::ToolStart,
+        Some("Read"),
+        Some("src/main.rs"),
+        None,
+    ));
+    state.apply_event(mk(EventType::ToolEnd, None, None, None));
+    state.apply_event(mk(
+        EventType::ToolStart,
+        Some("Edit"),
+        Some("src/lib.rs"),
+        None,
+    ));
+}
+
+/// PRD #162: serve the *empty dummy-state* `serve_attach` path on a
+/// caller-owned registry (so the same spawned agent can be queried over both
+/// the populated and the dummy path). This is the older-daemon / test-harness
+/// shape whose `ListAgents` must yield `live == None`.
+async fn start_dummy_server_on(
+    registry: Arc<AgentPtyRegistry>,
+) -> (TempDir, PathBuf, JoinHandle<()>) {
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = bind_attach_listener(&path).expect("bind attach listener");
+        (dir, path, listener)
+    };
+    let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+    let registry_for_task = registry.clone();
+    let handle = tokio::spawn(async move {
+        let _ = serve_attach(listener, registry_for_task, event_tx).await;
+    });
+    (dir, path, handle)
+}
+
+/// PRD #162: hand-build a `SessionState` for the newest-wins join test
+/// (session/live/003). Bypasses `apply_event` on purpose so two sessions can
+/// coexist on the same `agent_id` + `pane_id` (the `/clear`-restart stale-entry
+/// case `apply_event`'s reuse guard would otherwise collapse).
+fn make_session(
+    session_id: &str,
+    pane_id: &str,
+    agent_id: &str,
+    status: SessionStatus,
+    last_prompt: &str,
+    last_activity: chrono::DateTime<Utc>,
+) -> SessionState {
+    SessionState {
+        session_id: session_id.to_string(),
+        agent_type: AgentType::ClaudeCode,
+        cwd: None,
+        status,
+        active_tool: None,
+        started_at: last_activity,
+        last_activity,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: Some(last_prompt.to_string()),
+        first_prompts: vec![last_prompt.to_string()],
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        display_name: None,
     }
 }
 
@@ -1282,4 +1425,781 @@ async fn restore_007_warm_daemon_hydrates_orchestration_roles_in_order_inner() {
     for id in &spawned_ids {
         let _ = server.registry.close_agent(id);
     }
+}
+
+/// Scenario: Spawn a registry agent whose spawn-time `agent_type` is `None`
+/// (the "No agent" case) and drive a live `AppState` session on the same
+/// `agent_id` + `pane_id` to `Working` with an active tool, `tool_count > 0`,
+/// an event-derived ClaudeCode type and a first prompt; calling `ListAgents`
+/// over the real attach socket must return the record with `live = Some(...)`
+/// carrying that status, the event-derived agent_type (overriding the `None`
+/// spawn-time value), the active tool, the tool count and the prompts. The same
+/// registry served via the empty dummy-state `serve_attach` path must return
+/// the record with `live == None` — today's behavior, no harness regression.
+#[spec("session/live/002")]
+#[test]
+fn live_002_list_agents_attaches_live_snapshot() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(live_002_list_agents_attaches_live_snapshot_inner());
+}
+
+async fn live_002_list_agents_attaches_live_snapshot_inner() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let pane = "pane-live";
+
+    // Registry record: spawn-time agent_type is None — the legacy "No agent"
+    // case the PRD fixes. The event-derived type below must override it.
+    let agent_id = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("sleep 30"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+            agent_type: None,
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+
+    // Live, event-derived session state — the store the join must read.
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    {
+        let mut guard = state.write().await;
+        drive_session_to_working(&mut guard, "sess-live", pane, &agent_id);
+    }
+
+    // Populated-state path: ListAgents must attach the snapshot.
+    let (_dir, path, handle) = start_server_with_state(registry.clone(), state.clone()).await;
+    let client = DaemonClient::new(path);
+    let records = client
+        .list_agents()
+        .await
+        .expect("list_agents should succeed");
+    let rec = records
+        .iter()
+        .find(|r| r.id == agent_id)
+        .expect("spawned agent must appear in list_agents");
+
+    assert!(
+        rec.agent_type.is_none(),
+        "precondition: this record's spawn-time agent_type is None"
+    );
+    let live = rec
+        .live
+        .as_ref()
+        .expect("reconnect must attach the live SessionSnapshot");
+    assert_eq!(live.status, SessionStatus::Working, "live status restored");
+    assert_eq!(
+        live.agent_type,
+        Some(AgentType::ClaudeCode),
+        "event-derived agent_type must override the None spawn-time type"
+    );
+    assert_eq!(
+        live.active_tool.as_ref().map(|t| t.name.as_str()),
+        Some("Edit"),
+        "active tool name preserved across reconnect"
+    );
+    assert!(
+        live.tool_count > 0,
+        "tool_count must be > 0, got {}",
+        live.tool_count
+    );
+    assert!(
+        live.first_prompts
+            .iter()
+            .any(|p| p.as_str() == "build the feature"),
+        "first prompt context preserved, got {:?}",
+        live.first_prompts
+    );
+    assert_eq!(
+        live.last_user_prompt.as_deref(),
+        Some("build the feature"),
+        "last_user_prompt preserved"
+    );
+
+    // Dummy-state path: serve_attach uses an empty AppState → no snapshot,
+    // exactly today's behavior (older daemon / test harness). No regression.
+    let (_ddir, dpath, dhandle) = start_dummy_server_on(registry.clone()).await;
+    let dclient = DaemonClient::new(dpath);
+    let drecords = dclient
+        .list_agents()
+        .await
+        .expect("list_agents should succeed");
+    let drec = drecords
+        .iter()
+        .find(|r| r.id == agent_id)
+        .expect("spawned agent must appear in dummy-state list_agents");
+    assert!(
+        drec.live.is_none(),
+        "empty dummy-state serve_attach must yield live == None; got {:?}",
+        drec.live
+    );
+
+    handle.abort();
+    dhandle.abort();
+    let _ = registry.close_agent(&agent_id);
+}
+
+/// Scenario: With two `SessionState`s in `AppState.sessions` that both map to
+/// the same agent (same `agent_id` + `pane_id`, e.g. a `/clear` restart that
+/// left a stale entry) but different `last_activity` and distinguishing
+/// status/prompt, the `ListAgents` join must attach the snapshot from the entry
+/// with the most-recent `last_activity` (the live session), not the dead
+/// predecessor.
+#[spec("session/live/003")]
+#[test]
+fn live_003_join_picks_newest_last_activity() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(live_003_join_picks_newest_last_activity_inner());
+}
+
+async fn live_003_join_picks_newest_last_activity_inner() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let pane = "pane-dup";
+    let agent_id = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("sleep 30"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+            agent_type: None,
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+
+    let older = Utc::now() - chrono::Duration::seconds(120);
+    let newer = Utc::now();
+    let dead = make_session(
+        "dead-sess",
+        pane,
+        &agent_id,
+        SessionStatus::Idle,
+        "STALE PROMPT",
+        older,
+    );
+    let live = make_session(
+        "live-sess",
+        pane,
+        &agent_id,
+        SessionStatus::Working,
+        "FRESH PROMPT",
+        newer,
+    );
+
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    {
+        let mut guard = state.write().await;
+        // Insert the dead predecessor first; the live session is newer.
+        guard.sessions.insert("dead-sess".to_string(), dead);
+        guard.sessions.insert("live-sess".to_string(), live);
+    }
+
+    let (_dir, path, handle) = start_server_with_state(registry.clone(), state.clone()).await;
+    let client = DaemonClient::new(path);
+    let records = client
+        .list_agents()
+        .await
+        .expect("list_agents should succeed");
+    let rec = records
+        .iter()
+        .find(|r| r.id == agent_id)
+        .expect("spawned agent must appear in list_agents");
+    let snap = rec
+        .live
+        .as_ref()
+        .expect("a live snapshot must be attached for the duplicated agent");
+    assert_eq!(
+        snap.status,
+        SessionStatus::Working,
+        "newest-wins: must take the live (newer last_activity) session's status, not the dead Idle predecessor"
+    );
+    assert_eq!(
+        snap.last_user_prompt.as_deref(),
+        Some("FRESH PROMPT"),
+        "newest-wins: must take the newer session's prompt, not the stale predecessor"
+    );
+
+    handle.abort();
+    let _ = registry.close_agent(&agent_id);
+}
+
+/// Scenario: A warm in-process daemon carries two agents — agent A whose
+/// spawn-time `agent_type` is `None` (the "No agent" case) driven via
+/// `apply_event` to a live `Working` session with an active `Edit` tool,
+/// `tool_count > 0`, an event-derived `ClaudeCode` type and a first prompt; and
+/// agent B (spawn-time `OpenCode`) with NO live session. Hydrating a fresh
+/// controller from that daemon threads the live `SessionSnapshot` through
+/// `HydratedPane.live` (agent A `Some`, agent B `None`); seeding each hydrated
+/// session the way `ui.rs` does — `AppState::seed_hydrated_session` — makes
+/// agent A's card carry the snapshot's `status` / `agent_type` (overriding the
+/// `None` spawn-time value) / `active_tool` / `tool_count` / `first_prompts` /
+/// `last_user_prompt`, NOT a bare `Idle` / "No agent" placeholder, while agent
+/// B's snapshot-absent card falls back to today's bare placeholder (Idle,
+/// spawn-time `OpenCode`). Each pane seeds exactly one card — no duplicate.
+#[spec("session/live/004")]
+#[test]
+fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner());
+}
+
+async fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let (_dir, path, handle) = start_server_with_state(registry.clone(), state.clone()).await;
+    let client = DaemonClient::new(path.clone());
+
+    // Agent A: spawn-time agent_type None — the "No agent" case. It WILL get a
+    // live event-derived session below, which the snapshot must surface.
+    let pane_a = "pane-live-a";
+    let agent_a = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            agent_type: None,
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_a.to_string())],
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent A should succeed");
+
+    // Agent B: spawn-time agent_type OpenCode but NO live session → live None.
+    // The fallback must seed the bare placeholder from this spawn-time value.
+    let pane_b = "pane-bare-b";
+    let agent_b = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            agent_type: Some(AgentType::OpenCode),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_b.to_string())],
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent B should succeed");
+
+    // Drive ONLY agent A's session to Working (same apply_event flow the daemon
+    // uses for hook events).
+    {
+        let mut guard = state.write().await;
+        drive_session_to_working(&mut guard, "sess-a", pane_a, &agent_a);
+    }
+
+    // Hydrate a fresh controller from the warm daemon.
+    let ctrl = Arc::new(EmbeddedPaneController::new(
+        path,
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        hydrated.len(),
+        2,
+        "both agents should hydrate; got {hydrated:?}"
+    );
+
+    let h_a = hydrated
+        .iter()
+        .find(|h| h.agent_id == agent_a)
+        .expect("agent A must hydrate as a pane");
+    let h_b = hydrated
+        .iter()
+        .find(|h| h.agent_id == agent_b)
+        .expect("agent B must hydrate as a pane");
+
+    // M2.1: the live snapshot threads through HydratedPane.live.
+    let live_a = h_a
+        .live
+        .as_ref()
+        .expect("agent A's hydrated pane must carry the live SessionSnapshot");
+    assert_eq!(
+        live_a.status,
+        SessionStatus::Working,
+        "live status threaded"
+    );
+    assert_eq!(
+        live_a.agent_type,
+        Some(AgentType::ClaudeCode),
+        "event-derived agent_type must override the None spawn-time value"
+    );
+    assert_eq!(
+        live_a.active_tool.as_ref().map(|t| t.name.as_str()),
+        Some("Edit"),
+        "active tool threaded through HydratedPane.live"
+    );
+    assert!(live_a.tool_count > 0, "tool_count threaded");
+    assert!(
+        live_a
+            .first_prompts
+            .iter()
+            .any(|p| p.as_str() == "build the feature"),
+        "first prompt threaded, got {:?}",
+        live_a.first_prompts
+    );
+    assert!(
+        h_b.live.is_none(),
+        "agent B has no live session → HydratedPane.live must be None; got {:?}",
+        h_b.live
+    );
+
+    // M2.2: seed each hydrated session exactly the way the ui.rs hydration loop
+    // does — a snapshot-aware insert that seeds from `h.live` when present and
+    // falls back to today's bare placeholder when absent. PRD #110 agent_id
+    // minting is preserved on the seeded card.
+    let mut tui_state = AppState::default();
+    for h in &hydrated {
+        tui_state.register_pane(h.pane_id.clone());
+        tui_state.seed_hydrated_session(
+            h.pane_id.clone(),
+            h.cwd.clone(),
+            h.agent_type.clone(),
+            Some(h.agent_id.clone()),
+            h.live.as_ref(),
+        );
+    }
+
+    // Snapshot-seeded card (A): the real live state, NOT Idle / "No agent".
+    let a_sessions: Vec<&SessionState> = tui_state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref() == Some(pane_a))
+        .collect();
+    assert_eq!(
+        a_sessions.len(),
+        1,
+        "exactly one card for the live pane (no duplicate); got {a_sessions:?}"
+    );
+    let sess_a = a_sessions[0];
+    assert_eq!(
+        sess_a.status,
+        SessionStatus::Working,
+        "seeded card must show the live Working status, not Idle"
+    );
+    assert_eq!(
+        sess_a.agent_type,
+        AgentType::ClaudeCode,
+        "seeded card must show the event-derived agent_type, not None ('No agent')"
+    );
+    assert_eq!(
+        sess_a.active_tool.as_ref().map(|t| t.name.as_str()),
+        Some("Edit"),
+        "seeded card must keep its active tool across the reconnect"
+    );
+    assert!(
+        sess_a.tool_count > 0,
+        "seeded card must keep its tool count"
+    );
+    assert!(
+        sess_a
+            .first_prompts
+            .iter()
+            .any(|p| p.as_str() == "build the feature"),
+        "seeded card must keep its first-prompt context, got {:?}",
+        sess_a.first_prompts
+    );
+    assert_eq!(
+        sess_a.last_user_prompt.as_deref(),
+        Some("build the feature"),
+        "seeded card must keep its last_user_prompt"
+    );
+    assert_eq!(
+        sess_a.agent_id.as_deref(),
+        Some(agent_a.as_str()),
+        "PRD #110 agent_id minting must be preserved on the seeded card"
+    );
+
+    // Fallback card (B): no snapshot → today's bare placeholder.
+    let b_sessions: Vec<&SessionState> = tui_state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref() == Some(pane_b))
+        .collect();
+    assert_eq!(
+        b_sessions.len(),
+        1,
+        "exactly one card for the bare pane (no duplicate); got {b_sessions:?}"
+    );
+    let sess_b = b_sessions[0];
+    assert_eq!(
+        sess_b.status,
+        SessionStatus::Idle,
+        "no snapshot must fall back to today's bare Idle placeholder"
+    );
+    assert_eq!(
+        sess_b.agent_type,
+        AgentType::OpenCode,
+        "fallback must seed the spawn-time agent_type"
+    );
+    assert!(
+        sess_b.active_tool.is_none(),
+        "bare placeholder has no active tool"
+    );
+
+    drop(ctrl);
+    handle.abort();
+    let _ = registry.close_agent(&agent_a);
+    let _ = registry.close_agent(&agent_b);
+}
+
+/// Scenario: After hydration seeds a card from a live `SessionSnapshot` via
+/// `AppState::seed_hydrated_session` (PRD #110 `agent_id` minted on the seeded
+/// placeholder), a subsequent post-reconnect `SessionStart` event from the SAME
+/// agent — same `pane_id` + `agent_id`, a distinct `session_id` — must remap
+/// onto the hydrated card rather than spawning a second one. Asserts exactly one
+/// session/pane survives for that agent (no duplicate) and the minted `agent_id`
+/// is preserved through the remap.
+#[spec("session/live/005")]
+#[test]
+fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
+    let pane = "pane-remap";
+    let agent_id = "agent-remap-xyz";
+
+    // The live snapshot the daemon would have attached on reconnect.
+    let snap = SessionSnapshot {
+        status: SessionStatus::Working,
+        agent_type: Some(AgentType::ClaudeCode),
+        active_tool: Some(ActiveTool {
+            name: "Read".into(),
+            detail: Some("src/main.rs".into()),
+        }),
+        tool_count: 2,
+        first_prompts: vec!["build the feature".into()],
+        last_user_prompt: Some("build the feature".into()),
+    };
+
+    // Hydration seeds the card from the snapshot; agent_id is minted on it so
+    // the same-agent reuse guard in apply_event can remap a later SessionStart.
+    let mut state = AppState::default();
+    state.register_pane(pane.to_string());
+    state.seed_hydrated_session(
+        pane.to_string(),
+        None,
+        None, // spawn-time agent_type None — overridden by the snapshot
+        Some(agent_id.to_string()),
+        Some(&snap),
+    );
+    assert_eq!(
+        state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane))
+            .count(),
+        1,
+        "precondition: exactly one seeded card before the SessionStart"
+    );
+
+    // A post-reconnect SessionStart from the SAME agent (same pane + agent_id,
+    // distinct session_id) must collapse onto the seeded card.
+    state.apply_event(AgentEvent {
+        session_id: "real-sess".into(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some(pane.to_string()),
+        agent_id: Some(agent_id.to_string()),
+    });
+
+    let sessions: Vec<&SessionState> = state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref() == Some(pane))
+        .collect();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "post-reconnect SessionStart from the same agent must remap onto the \
+         hydrated card, not spawn a duplicate; got {sessions:?}"
+    );
+    assert_eq!(
+        sessions[0].agent_id.as_deref(),
+        Some(agent_id),
+        "PRD #110 agent_id must be preserved through the remap"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mock daemon for the wire-boundary hardening test (session/live/007).
+// ---------------------------------------------------------------------------
+
+/// Returns true if `s` carries any ASCII control byte (`< 0x20` or DEL
+/// `0x7f`) — the same "no raw control bytes survive into the rendered cell"
+/// policy `is_valid_cwd` / `is_valid_display_name` enforce elsewhere on the
+/// `list_agents` wire boundary.
+fn has_control_bytes(s: &str) -> bool {
+    s.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
+/// Mock that mimics a hostile / malformed daemon: replies to ListAgents with
+/// ONE `AgentRecord` whose live `SessionSnapshot` carries ANSI escapes, NUL
+/// bytes, and other control chars in `last_user_prompt`, in every
+/// `first_prompts` entry, and in `active_tool.name` / `.detail`, where
+/// `last_user_prompt`, `active_tool.name`, `active_tool.detail`, AND every
+/// `first_prompts` entry are ALSO over-long (~100 KiB each), and where
+/// `first_prompts` carries 6 entries (double `MAX_FIRST_PROMPTS`). The
+/// TUI-side `list_agents` boundary must scrub control bytes from AND
+/// length-clamp every one of these strings before they can corrupt a rebuilt
+/// card — not just the `first_prompts` entries.
+async fn run_hostile_live_list_server(listener: UnixListener) {
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        tokio::spawn(async move {
+            let req = match read_frame(&mut stream).await {
+                Ok(Some((KIND_REQ, payload))) => {
+                    match serde_json::from_slice::<AttachRequest>(&payload) {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    }
+                }
+                _ => return,
+            };
+            if let AttachRequest::ListAgents = req {
+                let over_long = "a".repeat(100_000);
+                let hostile = AgentRecord {
+                    id: "hostile-live-7".into(),
+                    pane_id_env: Some("pane-hostile".into()),
+                    display_name: None,
+                    cwd: None,
+                    tab_membership: None,
+                    agent_type: Some(AgentType::ClaudeCode),
+                    rows: 0,
+                    cols: 0,
+                    live: Some(SessionSnapshot {
+                        status: SessionStatus::Working,
+                        agent_type: Some(AgentType::ClaudeCode),
+                        active_tool: Some(ActiveTool {
+                            // Oversized in BOTH dimensions: control-laden AND
+                            // over-long (~100 KiB) so the length clamp must
+                            // apply here too, not only control-stripping.
+                            name: format!("Ed\x1bit\x00{over_long}"),
+                            detail: Some(format!("src/\x1b[2Jmain.rs\x07{over_long}")),
+                        }),
+                        tool_count: 3,
+                        // Oversized in BOTH dimensions: 6 entries (> the
+                        // MAX_FIRST_PROMPTS cap of 3), each control-laden and
+                        // each over-long.
+                        first_prompts: (0..6)
+                            .map(|i| format!("p{i} \x1b[31m\x00{over_long}"))
+                            .collect(),
+                        // Oversized in BOTH dimensions, like the active-tool
+                        // strings: control-laden AND over-long (~100 KiB).
+                        last_user_prompt: Some(format!(
+                            "run \x1b[31mhostile\x07 \x00prompt {over_long}"
+                        )),
+                    }),
+                };
+                let resp = AttachResponse {
+                    ok: true,
+                    agent_records: Some(vec![hostile]),
+                    ..Default::default()
+                };
+                let _ = write_resp(&mut stream, &resp).await;
+            } else {
+                let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
+            }
+        });
+    }
+}
+
+/// Scenario: A hostile / malformed daemon advertises via `list_agents` an
+/// `AgentRecord.live` whose prompt and active-tool strings carry ANSI escapes,
+/// NUL bytes, and other control chars AND are over-long (~100 KiB each), and
+/// whose `first_prompts` is oversized (6 entries, each also over-long).
+/// Calling `DaemonClient::list_agents` against that daemon must return the
+/// record with its live snapshot preserved (the agent is real) but SCRUBBED —
+/// no control bytes survive in `last_user_prompt`, any `first_prompts` entry,
+/// or `active_tool.name` / `.detail` — and CLAMPED — every one of
+/// `last_user_prompt`, `active_tool.name`, `active_tool.detail`, and each
+/// `first_prompts` entry is length-bounded to <= 65536 bytes, and
+/// `first_prompts` is cut to at most `MAX_FIRST_PROMPTS` (3) entries — so a
+/// malformed daemon can't corrupt the rebuilt card (parallels
+/// embed/attach/005's `tab_membership` scrub).
+// Written as a sync `#[test]` driving an explicit multi-thread runtime rather
+// than `#[tokio::test]`: the linkage-check (PRD #77 Decision 17) ties each
+// `#[spec(...)]` to the next plain `fn` definition and the function-name
+// prefix, and does not recognize a `#[tokio::test] async fn` — so the spec'd
+// entry point must be a sync `#[test]` that block_on's the async body.
+#[spec("session/live/007")]
+#[test]
+fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner());
+}
+
+async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner() {
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = UnixListener::bind(&path).expect("bind mock attach socket");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, path, listener)
+    };
+    let server_handle = tokio::spawn(async move {
+        run_hostile_live_list_server(listener).await;
+    });
+
+    let client = DaemonClient::new(path);
+    let records = client
+        .list_agents()
+        .await
+        .expect("list_agents must succeed");
+    assert_eq!(
+        records.len(),
+        1,
+        "one hostile record advertised; got {records:?}"
+    );
+    let live = records[0].live.as_ref().expect(
+        "the live snapshot must be preserved (the agent is real) — scrubbed/clamped, not dropped",
+    );
+
+    // No raw control bytes survive into any rendered string, AND each string
+    // is length-bounded — a 100 KiB prompt or tool string must be clamped, not
+    // passed through verbatim once the control bytes are stripped.
+    let last = live.last_user_prompt.as_deref().unwrap_or_default();
+    assert!(
+        !has_control_bytes(last),
+        "last_user_prompt must be scrubbed of control bytes; got {last:?}"
+    );
+    assert!(
+        last.len() <= 65536,
+        "last_user_prompt must be length-clamped, not passed through verbatim; got {} bytes",
+        last.len()
+    );
+    let tool = live
+        .active_tool
+        .as_ref()
+        .expect("active_tool must be preserved");
+    assert!(
+        !has_control_bytes(&tool.name),
+        "active_tool.name must be scrubbed of control bytes; got {:?}",
+        tool.name
+    );
+    assert!(
+        tool.name.len() <= 65536,
+        "active_tool.name must be length-clamped, not passed through verbatim; got {} bytes",
+        tool.name.len()
+    );
+    let detail = tool.detail.as_deref().unwrap_or_default();
+    assert!(
+        !has_control_bytes(detail),
+        "active_tool.detail must be scrubbed of control bytes; got {:?}",
+        tool.detail
+    );
+    assert!(
+        detail.len() <= 65536,
+        "active_tool.detail must be length-clamped, not passed through verbatim; got {} bytes",
+        detail.len()
+    );
+
+    // first_prompts clamped to <= MAX_FIRST_PROMPTS (3) entries, each scrubbed
+    // and length-bounded so an over-long prompt can't blow up the card.
+    assert!(
+        live.first_prompts.len() <= 3,
+        "first_prompts must be clamped to <= MAX_FIRST_PROMPTS (3); got {} entries",
+        live.first_prompts.len()
+    );
+    for (i, p) in live.first_prompts.iter().enumerate() {
+        assert!(
+            !has_control_bytes(p),
+            "first_prompts[{i}] must be scrubbed of control bytes; got {p:?}"
+        );
+        assert!(
+            p.len() <= 65536,
+            "first_prompts[{i}] must be length-clamped, not passed through verbatim; got {} bytes",
+            p.len()
+        );
+    }
+
+    server_handle.abort();
+    drop(dir);
+}
+
+/// Scenario: A live `SessionState` whose EVENT-DERIVED `agent_type` is
+/// `AgentType::None` (the agent has emitted events but never identified itself)
+/// is snapshotted via `SessionState::live_snapshot` and seeded onto a
+/// reconnected card whose SPAWN-TIME `agent_type` is `Some(ClaudeCode)`.
+/// `live_snapshot` must map `AgentType::None` to `Option::None` so the snapshot
+/// does NOT shadow the spawn-time fallback, and `seed_hydrated_session` must
+/// therefore surface the REAL `ClaudeCode` type on the card — not "No agent".
+#[spec("session/live/008")]
+#[test]
+fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
+    let pane = "pane-none-type";
+    let agent_id = "agent-none-type";
+
+    // A live session that has emitted events but never resolved its agent type.
+    let session = SessionState {
+        session_id: format!("pane-{pane}"),
+        agent_type: AgentType::None,
+        cwd: None,
+        status: SessionStatus::Working,
+        active_tool: None,
+        started_at: Utc::now(),
+        last_activity: Utc::now(),
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: None,
+        first_prompts: Vec::new(),
+        pane_id: Some(pane.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        display_name: None,
+    };
+
+    // The fix lands here: an event-derived AgentType::None must snapshot as
+    // Option::None so the spawn-time fallback in seed_hydrated_session wins.
+    let snap = session.live_snapshot();
+    assert_eq!(
+        snap.agent_type, None,
+        "live_snapshot must map event-derived AgentType::None to Option::None so it does \
+         not shadow the spawn-time agent_type; got {:?}",
+        snap.agent_type
+    );
+
+    // Seed a reconnected card: the spawn-time type is the REAL ClaudeCode.
+    let mut state = AppState::default();
+    state.register_pane(pane.to_string());
+    state.seed_hydrated_session(
+        pane.to_string(),
+        None,
+        Some(AgentType::ClaudeCode), // spawn-time agent_type — the real one
+        Some(agent_id.to_string()),
+        Some(&snap),
+    );
+
+    let sessions: Vec<&SessionState> = state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref() == Some(pane))
+        .collect();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "exactly one seeded card for the pane; got {sessions:?}"
+    );
+    assert_eq!(
+        sessions[0].agent_type,
+        AgentType::ClaudeCode,
+        "event-derived AgentType::None must fall back to the spawn-time ClaudeCode, not \
+         seed the card as 'No agent'"
+    );
 }

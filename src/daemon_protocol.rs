@@ -841,7 +841,42 @@ async fn handle_connection(
 
     match req {
         AttachRequest::ListAgents => {
-            let records = registry.agent_records();
+            let mut records = registry.agent_records();
+            // PRD #162: enrich each registry record with the daemon's live,
+            // event-derived session state so a reconnecting TUI restores the
+            // real status / agent type / active tool / tool count / prompt
+            // context instead of minting a bare `Idle` / "No agent"
+            // placeholder. Match the live `SessionState` on BOTH the agent id
+            // (registry `record.id` == `SessionState.agent_id`) AND the pane
+            // id (`record.pane_id_env` == `SessionState.pane_id`); a `/clear`
+            // restart can leave a stale session on the same keys, so break ties
+            // by the most-recent `last_activity` (newest-wins). The dummy-state
+            // `serve_attach` path carries an empty `AppState`, so this loop
+            // attaches nothing and `live` stays `None` — today's behavior.
+            //
+            // The pick must be total/deterministic: `HashMap::values()` yields
+            // sessions in an unspecified order, so two sessions tying on an
+            // identical `last_activity` would otherwise resolve by hash order.
+            // Break that tie on the (unique) `session_id` so the same input
+            // always selects the same snapshot.
+            {
+                let guard = state.read().await;
+                for record in &mut records {
+                    record.live = guard
+                        .sessions
+                        .values()
+                        .filter(|s| {
+                            s.agent_id.as_deref() == Some(record.id.as_str())
+                                && s.pane_id == record.pane_id_env
+                        })
+                        .max_by(|a, b| {
+                            a.last_activity
+                                .cmp(&b.last_activity)
+                                .then_with(|| a.session_id.cmp(&b.session_id))
+                        })
+                        .map(|s| s.live_snapshot());
+                }
+            }
             write_resp(&mut stream, &AttachResponse::agent_records(records)).await?;
         }
         AttachRequest::StartAgent {
@@ -1445,6 +1480,7 @@ async fn handle_attach_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     #[tokio::test]
     async fn frame_round_trip() {
@@ -1683,6 +1719,7 @@ mod tests {
             agent_type: None,
             rows: 0,
             cols: 0,
+            live: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -1700,6 +1737,7 @@ mod tests {
             agent_type: None,
             rows: 0,
             cols: 0,
+            live: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -1790,6 +1828,142 @@ mod tests {
             rec.tab_membership.is_none(),
             "old-daemon record without tab_membership must decode as None"
         );
+    }
+
+    /// Scenario: Build a `SessionSnapshot` for every `SessionStatus` variant
+    /// and round-trip it through JSON, asserting the status (and the agent
+    /// type / active tool / tool count / prompts) survive; attach one to an
+    /// `AgentRecord` and confirm `live` round-trips as `Some`; finally decode
+    /// an older-daemon `AgentRecord` JSON that predates the `live` field and
+    /// assert it deserializes with `live == None` (additive optional — no
+    /// `PROTOCOL_VERSION` bump).
+    #[spec("session/live/001")]
+    #[test]
+    fn live_001_session_snapshot_serde_and_agent_record_back_compat() {
+        use crate::event::AgentType;
+        use crate::state::{ActiveTool, SessionSnapshot, SessionStatus};
+
+        // (a) Every SessionStatus variant survives a SessionSnapshot round-trip.
+        for status in [
+            SessionStatus::Idle,
+            SessionStatus::Working,
+            SessionStatus::Thinking,
+            SessionStatus::WaitingForInput,
+            SessionStatus::Compacting,
+            SessionStatus::Error,
+        ] {
+            let snap = SessionSnapshot {
+                status: status.clone(),
+                agent_type: Some(AgentType::ClaudeCode),
+                active_tool: Some(ActiveTool {
+                    name: "Read".into(),
+                    detail: Some("src/main.rs".into()),
+                }),
+                tool_count: 3,
+                first_prompts: vec!["build the feature".into()],
+                last_user_prompt: Some("build the feature".into()),
+            };
+            let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
+            let back: SessionSnapshot =
+                serde_json::from_str(&json).expect("SessionSnapshot deserializes");
+            assert_eq!(back.status, status, "status must round-trip for {status:?}");
+            assert_eq!(back.agent_type, Some(AgentType::ClaudeCode));
+            assert_eq!(
+                back.active_tool.as_ref().map(|t| t.name.as_str()),
+                Some("Read"),
+                "active tool name must round-trip"
+            );
+            assert_eq!(back.tool_count, 3);
+            assert_eq!(back.first_prompts, vec!["build the feature".to_string()]);
+            assert_eq!(back.last_user_prompt.as_deref(), Some("build the feature"));
+        }
+
+        // (b) An AgentRecord carrying a live snapshot round-trips with live == Some.
+        let rec = AgentRecord {
+            id: "9".into(),
+            pane_id_env: Some("pane-9".into()),
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: Some(SessionSnapshot {
+                status: SessionStatus::Working,
+                agent_type: Some(AgentType::ClaudeCode),
+                active_tool: None,
+                tool_count: 0,
+                first_prompts: Vec::new(),
+                last_user_prompt: None,
+            }),
+        };
+        let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
+        let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");
+        let live = back
+            .live
+            .expect("live snapshot must survive the AgentRecord round-trip");
+        assert_eq!(live.status, SessionStatus::Working);
+        assert_eq!(live.agent_type, Some(AgentType::ClaudeCode));
+
+        // (c) Back-compat: an older daemon's AgentRecord JSON has no `live`
+        // field at all. It must decode via `#[serde(default)]` with
+        // live == None — additive optional, no PROTOCOL_VERSION bump.
+        let legacy = r#"{
+            "id": "42",
+            "pane_id_env": "pid-42",
+            "display_name": "auditor",
+            "cwd": "/work"
+        }"#;
+        let old: AgentRecord = serde_json::from_str(legacy)
+            .expect("older daemon shape must decode via #[serde(default)] on live");
+        assert!(
+            old.live.is_none(),
+            "older AgentRecord without a live field must decode as None"
+        );
+    }
+
+    /// Scenario: A newer daemon advertises an `AgentRecord` whose `live.status`
+    /// is a `SessionStatus` string this (older) build does not know
+    /// (`"Hibernating"`). Because `live` is a present field, an unknown status
+    /// must NOT fail the whole `AgentRecord` deserialization:
+    /// `serde_json::from_str::<AgentRecord>` must return `Ok` and the record
+    /// must survive with its `id` / `pane_id_env` intact and usable. Pairs with
+    /// session/live/001 (older-shape -> `live == None` back-compat); this pins
+    /// newer-shape forward-compat. Mechanism-agnostic: it does NOT pin whether
+    /// the fix maps the unknown status to a catch-all variant (so `live` stays
+    /// `Some`) or drops `live` to `None` — only that the parse succeeds and the
+    /// record is retained.
+    #[spec("session/live/009")]
+    #[test]
+    fn live_009_unknown_session_status_does_not_fail_agent_record_parse() {
+        // A newer daemon adds a future SessionStatus variant; this older TUI has
+        // no matching enum arm. `live` is a PRESENT field, so a strict enum
+        // decode would fail the ENTIRE AgentRecord parse rather than degrading.
+        let payload = r#"{
+            "id": "fwd-compat-9",
+            "pane_id_env": "pane-fwd-9",
+            "live": {
+                "status": "Hibernating",
+                "tool_count": 0
+            }
+        }"#;
+
+        let parsed = serde_json::from_str::<AgentRecord>(payload);
+        assert!(
+            parsed.is_ok(),
+            "an unknown SessionStatus string must degrade gracefully, not fail \
+             the whole AgentRecord parse (forward-compat); got {:?}",
+            parsed.as_ref().err()
+        );
+
+        // The agent record itself must survive and stay usable — regardless of
+        // whether the fix keeps `live = Some(<catch-all>)` or drops it to `None`.
+        let rec = parsed.expect("unknown SessionStatus must parse Ok");
+        assert_eq!(
+            rec.id, "fwd-compat-9",
+            "the AgentRecord must be retained through the unknown-status parse"
+        );
+        assert_eq!(rec.pane_id_env.as_deref(), Some("pane-fwd-9"));
     }
 
     #[test]

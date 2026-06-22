@@ -5961,32 +5961,38 @@ pub fn run_tui(
         for h in &hydrated {
             let mut st = state.blocking_write();
             st.register_pane(h.pane_id.clone());
-            // Carry the daemon-recorded cwd through to the placeholder session
-            // so the session card shows the right directory until the agent
-            // emits its first SessionStart event.
+            // Carry the daemon-recorded cwd through to the seeded session
+            // so the session card shows the right directory.
             //
-            // PRD #76 M2.13: also carry the daemon-recorded `agent_type`
-            // through so the dashboard card renders the real agent label
-            // (ClaudeCode / OpenCode) on reconnect instead of "No agent".
-            // The daemon captured the value at spawn time from
-            // `StartAgent.agent_type` (inferred from the command via
-            // `AgentType::from_command`); a `None` here means either the
-            // command wasn't recognized or an older daemon predated the
-            // field, in which case the placeholder shows "No agent" until
-            // the next `SessionStart` event — same legacy behavior.
-            // PRD #110 followup: hydration mints the placeholder with the
+            // PRD #162: seed the card from the daemon's live, event-derived
+            // `SessionSnapshot` (`h.live`) when one is attached, so the
+            // reconnected dashboard shows the agent's REAL status / active
+            // tool / tool count / prompt context immediately — not a bare
+            // `Idle` reset until the next event arrives. When `h.live` is
+            // `None` (older daemon, dummy-state attach path, or an agent that
+            // never emitted an event) `seed_hydrated_session` falls back to
+            // the bare `insert_placeholder_session` placeholder — today's
+            // behavior, so no reconnect regresses.
+            //
+            // PRD #76 M2.13: the daemon-recorded spawn-time `agent_type` is
+            // still passed through; the snapshot's event-derived value wins
+            // when present (the "No agent" fix — a snapshot overrides a
+            // `None` spawn-time type with the agent's real label), and the
+            // spawn-time value is the fallback when the snapshot is absent or
+            // carries no type.
+            // PRD #110 followup: seeding mints the card with the
             // daemon-recorded `agent_id` (carried via `HydratedPane.agent_id`)
             // so the strict-equality reuse guard in `apply_event` lets a
             // post-reconnect `SessionStart` from the same agent remap onto
-            // the placeholder. Without this, the placeholder would carry
-            // `agent_id=None` and a `SessionStart` with `Some(daemon-id)`
-            // would not match → a second card would appear beside the
-            // hydrated one.
-            st.insert_placeholder_session(
+            // the seeded card. Without this, it would carry `agent_id=None`
+            // and a `SessionStart` with `Some(daemon-id)` would not match → a
+            // second card would appear beside the hydrated one.
+            st.seed_hydrated_session(
                 h.pane_id.clone(),
                 h.cwd.clone(),
                 h.agent_type.clone(),
                 Some(h.agent_id.clone()),
+                h.live.as_ref(),
             );
             drop(st);
             let display_name = h.display_name.clone().unwrap_or_else(|| h.agent_id.clone());
@@ -11727,6 +11733,10 @@ fn status_style(status: &SessionStatus) -> (&str, Style) {
         SessionStatus::WaitingForInput => ("Needs Input", style.add_modifier(Modifier::BOLD)),
         SessionStatus::Idle => ("Idle", style),
         SessionStatus::Error => ("Error", style),
+        // PRD #162 forward-compat: an unknown wire status renders with the
+        // neutral idle label/color so a future daemon's status never shows as
+        // a misleading active state on an older TUI.
+        SessionStatus::Unknown => ("Idle", style),
     }
 }
 
@@ -12896,6 +12906,7 @@ mod tests {
             cwd: cwd.map(|s| s.to_string()),
             tab_membership: membership,
             agent_type: None,
+            live: None,
         }
     }
 

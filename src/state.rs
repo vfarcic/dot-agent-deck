@@ -14,7 +14,11 @@ use crate::event::{
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
 const MAX_RECENT_EVENTS: usize = 50;
-const MAX_FIRST_PROMPTS: usize = 3;
+/// Maximum number of first-prompt entries retained per session. The live-side
+/// cap in `apply_event` and the wire-boundary clamp in
+/// [`crate::daemon_client`] (which re-clamps a hostile/oversized daemon
+/// snapshot) share this single source of truth.
+pub(crate) const MAX_FIRST_PROMPTS: usize = 3;
 
 /// PRD #92 F9 followup-6: how long the post-respawn dispatch task
 /// waits for the freshly-spawned agent to emit a `SessionStart` hook
@@ -33,7 +37,7 @@ const MAX_FIRST_PROMPTS: usize = 3;
 pub(crate) const SESSION_START_WAIT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionStatus {
     Thinking,
     Working,
@@ -41,6 +45,15 @@ pub enum SessionStatus {
     WaitingForInput,
     Idle,
     Error,
+    /// PRD #162 forward-compat catch-all: a future/unknown `status` string on
+    /// the wire deserializes here instead of failing the whole `AgentRecord`
+    /// decode. Deserialize-only — `#[serde(other)]` variants are never
+    /// serialized, and the daemon's `live_snapshot()` only ever produces the
+    /// six real variants, so `Unknown` only ever originates from an
+    /// unrecognized wire value on a newer daemon. Rendered neutrally (like
+    /// `Idle`) so it never masquerades as an active state.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,10 +68,45 @@ pub struct DashboardStats {
     pub total_tools: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ActiveTool {
     pub name: String,
     pub detail: Option<String>,
+}
+
+/// PRD #162: a serializable snapshot of the daemon's live, event-derived
+/// session state, attached to each `AgentRecord` in the `ListAgents` response
+/// so a reconnecting TUI restores the real status / agent type / active tool /
+/// tool count / prompt context instead of minting a bare `Idle` / "No agent"
+/// placeholder.
+///
+/// Carried as an additive optional (`AgentRecord.live: Option<SessionSnapshot>`):
+/// an older daemon, the test/dummy-state attach path, or an agent that never
+/// emitted an event all yield `None`, and the TUI falls back to today's
+/// placeholder behavior. No `PROTOCOL_VERSION` bump — every field follows the
+/// M2.11–M2.13 `#[serde(default, skip_serializing_if = ...)]` reconnect-field
+/// convention.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionSnapshot {
+    /// The live `SessionStatus` (`Working` / `Thinking` / `WaitingForInput` /
+    /// `Idle` / `Compacting` / `Error`) as `apply_event` last computed it.
+    pub status: SessionStatus,
+    /// The event-derived agent type — this is the "No agent" fix: a spawn-time
+    /// `AgentRecord.agent_type = None` is overridden by the `Some(..)` carried
+    /// here once the session has emitted at least one event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<AgentType>,
+    /// The active tool (name + detail) if the session is mid-tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tool: Option<ActiveTool>,
+    /// Running tool tally so the card's tool count survives the reconnect.
+    pub tool_count: u32,
+    /// First-prompt context preserved across the reconnect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub first_prompts: Vec<String>,
+    /// The most recent user prompt, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_user_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +137,33 @@ pub struct SessionState {
     /// the live scheduler-spawn case, where the name would otherwise degrade
     /// to the truncated pane id. `None` for ordinary hook-driven sessions.
     pub display_name: Option<String>,
+}
+
+impl SessionState {
+    /// PRD #162: build the wire [`SessionSnapshot`] from this live session.
+    /// The snapshot's `agent_type` is the EVENT-DERIVED value, so a
+    /// reconnecting TUI can override a `None` spawn-time
+    /// `AgentRecord.agent_type` with what the agent actually is — but
+    /// `AgentType::None` (the agent has emitted events yet never identified
+    /// itself) maps to `Option::None`, NOT `Some(AgentType::None)`. A
+    /// `Some(None-the-type)` would shadow the spawn-time fallback in
+    /// [`AppState::seed_hydrated_session`] and regress a real, known
+    /// spawn-time type to "No agent"; emitting `None` here keeps that
+    /// fallback reachable.
+    pub fn live_snapshot(&self) -> SessionSnapshot {
+        let agent_type = match self.agent_type {
+            AgentType::None => None,
+            ref other => Some(other.clone()),
+        };
+        SessionSnapshot {
+            status: self.status.clone(),
+            agent_type,
+            active_tool: self.active_tool.clone(),
+            tool_count: self.tool_count,
+            first_prompts: self.first_prompts.clone(),
+            last_user_prompt: self.last_user_prompt.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -513,6 +588,9 @@ impl AppState {
                 SessionStatus::Error => stats.errors += 1,
                 SessionStatus::Idle => stats.idle += 1,
                 SessionStatus::Compacting => stats.compacting += 1,
+                // PRD #162 forward-compat: an unknown wire status is bucketed
+                // as idle so it never inflates an active-work tally.
+                SessionStatus::Unknown => stats.idle += 1,
             }
             stats.total_tools += session.tool_count as u64;
         }
@@ -577,6 +655,61 @@ impl AppState {
                 display_name: None,
             },
         );
+    }
+
+    /// PRD #162: seed a hydrated pane's session from the daemon's live
+    /// [`SessionSnapshot`] when one is attached, falling back to the bare
+    /// [`Self::insert_placeholder_session`] placeholder when it is absent.
+    ///
+    /// This is the reconnect-side counterpart to the `ListAgents` snapshot
+    /// join: on `dot-agent-deck connect`, each `HydratedPane` carries the
+    /// agent's live state (`status` / event-derived `agent_type` /
+    /// `active_tool` / `tool_count` / prompt context), and seeding from it
+    /// restores the pre-disconnect card instead of resetting to `Idle` /
+    /// "No agent" until the next event arrives.
+    ///
+    /// - `live = Some(snap)`: the card takes the snapshot's `status` /
+    ///   `active_tool` / `tool_count` / `first_prompts` / `last_user_prompt`,
+    ///   and its `agent_type` is the snapshot's **event-derived** value —
+    ///   falling back to the spawn-time `agent_type` argument **only** when
+    ///   the snapshot's is `None` (the "No agent" fix).
+    /// - `live = None`: behaves identically to
+    ///   [`Self::insert_placeholder_session`] (bare `Idle`, spawn-time
+    ///   `agent_type`). The fallback delegates to that method so it can't
+    ///   drift from the placeholder path.
+    ///
+    /// In BOTH branches the PRD #110 `agent_id` is minted on the seeded
+    /// session exactly as `insert_placeholder_session` does, so a
+    /// post-reconnect `SessionStart` from the same agent remaps onto this
+    /// card via `apply_event`'s reuse guard instead of spawning a duplicate.
+    pub fn seed_hydrated_session(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        live: Option<&SessionSnapshot>,
+    ) {
+        // The snapshot's event-derived agent_type wins; fall back to the
+        // spawn-time value only when the snapshot has none (or is absent).
+        let effective_agent_type = match live {
+            Some(snap) => snap.agent_type.clone().or(agent_type),
+            None => agent_type,
+        };
+        // Mint the placeholder exactly as today (PRD #110 agent_id,
+        // started_at reuse, session_id), then overlay the live snapshot
+        // fields when one is present.
+        self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
+        if let Some(snap) = live {
+            let session_id = format!("pane-{}", pane_id);
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                session.status = snap.status.clone();
+                session.active_tool = snap.active_tool.clone();
+                session.tool_count = snap.tool_count;
+                session.first_prompts = snap.first_prompts.clone();
+                session.last_user_prompt = snap.last_user_prompt.clone();
+            }
+        }
     }
 
     /// Unregister a pane ID (e.g., when closing a pane).
