@@ -66,6 +66,13 @@ fn opt(s: &Option<String>) -> String {
     }
 }
 
+fn opt_interval(v: Option<u64>) -> String {
+    match v {
+        Some(n) => n.to_string(),
+        None => "—".to_string(),
+    }
+}
+
 /// Pop the first element of `pool` whose name matches `name` (case-insensitive),
 /// returning its index-erased value. Used to greedily pair like-named items.
 /// `get` is a higher-ranked `fn` pointer so the borrow it returns is tied to its
@@ -186,8 +193,28 @@ fn diff_mode_pair(b: &ModeConfig, u: &ModeConfig, out: &mut String) {
         let pos = u_rules.iter().position(|r| r.pattern == br.pattern);
         match pos {
             Some(i) => {
-                u_rules.remove(i);
-                out.push_str(&format!("- **both**: `{}`\n", br.pattern));
+                let ur = u_rules.remove(i);
+                // Same pattern still leaves two comparable fields — `watch` and
+                // `interval`. A same-pattern/different-watch (or interval) delta
+                // is a real divergence (e.g. user flipped a rule to re-run on a
+                // timer): surface it instead of collapsing the pair to "both".
+                if br.watch == ur.watch && br.interval == ur.interval {
+                    out.push_str(&format!(
+                        "- **both**: `{}` (watch={})\n",
+                        br.pattern,
+                        yn(br.watch)
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "- **both, differ ✗**: `{}` — B (watch={}, interval={}) vs \
+                         U (watch={}, interval={})\n",
+                        br.pattern,
+                        yn(br.watch),
+                        opt_interval(br.interval),
+                        yn(ur.watch),
+                        opt_interval(ur.interval)
+                    ));
+                }
             }
             None => out.push_str(&format!(
                 "- **B-only**: `{}` (watch={})\n",

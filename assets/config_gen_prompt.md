@@ -205,7 +205,7 @@ description = "Audits code for security vulnerabilities and unsafe patterns"
 prompt_template = "Audit the change for security vulnerabilities. Report findings only."
 ```
 
-When proposing a `release` role, set `clear = false` on it so it can resume after a CI failure, and add a **mandatory** pre-release human gate to the orchestrator's `prompt_template`: "Before delegating to release, summarize what to validate end-to-end and STOP until the user explicitly confirms." Compose `release` itself as a two-phase worker: Phase 1 opens the PR via the project's release flow, then waits for CI and any automated PR review to settle, reports a findings summary (PR URL, per-check CI conclusions, review findings), and STOPS without merging; Phase 2 merges and closes the issue only when re-delegated with an explicit go-ahead. `release` never merges on its own initiative.
+When proposing a `release` role, set `clear = false` on it so it can resume after a CI failure. The orchestrator's **mandatory pre-release human gate is the one specified in step 4** (summarize what to validate end-to-end and STOP for explicit user confirmation before delegating to `release`) — put it in the orchestrator's `prompt_template` once; do not also restate it inside `release`. What `release` itself adds is its two-phase shape: Phase 1 opens the PR via the project's release flow, then waits for CI and any automated PR review to settle, reports a findings summary (PR URL, per-check CI conclusions, review findings), and STOPS without merging; Phase 2 merges and closes the issue only when re-delegated with an explicit go-ahead. `release` never merges on its own initiative.
 
 ## Role Library
 
