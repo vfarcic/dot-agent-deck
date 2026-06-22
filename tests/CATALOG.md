@@ -1910,6 +1910,20 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** cross-repo fan-out resilience (one repo per task — removed from scope); the exact failure-message wording (loose substring on the issue 11 key).
 - **Platform coverage:** mac+linux.
 
+##### scheduler/dispatch/008 — An issue dispatched, then closed without a PR (worktree removed, branch left behind), is re-dispatched on a later fire: the worktree is re-created and an agent spawns again, with no failure surfaced (PRD #120 B1 — `worktree add` must tolerate the leftover `agent/issue-<n>` branch).
+- **Layer:** L2 (as `scheduler/dispatch/001`; first run-now to dispatch, `StopAgent` to close, second run-now while the stub still reports the issue open with no PR).
+- **Agent:** none (run-now ×2 + `StopAgent`; observes the re-created worktree, a re-spawned orchestrator, and daemon stderr).
+- **Asserts:** after close the worktree is gone but branch `agent/issue-7` survives; the second fire re-creates the issue-7 worktree and spawns the orchestrator again; no per-issue failure (`failed:` / "already exists") is surfaced.
+- **Does not assert:** the exact branch-reattach git mechanics (probe vs. retry-without-`-b`) — only the observable re-dispatch; behavior when an open PR exists (covered by `scheduler/dispatch/003`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/009 — Closing ONE role of a multi-role orchestration dispatch leaves the shared issue worktree on disk; only closing the LAST role removes it, clone preserved (PRD #120 S1 — refcount the worktree, remove on last close).
+- **Layer:** L2 (as `scheduler/dispatch/001`; the fixture remote commits a two-role `[[orchestrations]]` config — `orchestrator` + `reviewer`, both `cat` — so a dispatch opens two role panes sharing one `orchestration_cwd`).
+- **Agent:** none (run-now to dispatch; `StopAgent` per role; observes on-disk worktree + `git worktree list` + clone dir).
+- **Asserts:** both role panes spawn into the same issue worktree; closing the reviewer leaves the worktree present (disk + `git worktree list`); closing the orchestrator (last role) removes the worktree while the clone directory remains.
+- **Does not assert:** the refcount/registry internals (counted at spawn, decremented per close) — only the observable last-close-removes contract; the single-role close path (covered by `scheduler/dispatch/006`).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/reuse
 
 ##### scheduler/reuse/001 — Two fires of a `new_tab_per_fire = false` task reuse one tab and re-deliver the prompt into the same pane (PRD #127 M2.2).

@@ -99,6 +99,14 @@ exit 1
 const ORCH_TOML: &str = "[[orchestrations]]\nname = \"dispatch-orch\"\n\n\
      [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n";
 
+/// A committed `.dot-agent-deck.toml` whose orchestration has TWO roles
+/// (`orchestrator` + `reviewer`, both `cat`). A dispatched worktree opens an
+/// orchestration tab with two role panes that share ONE `orchestration_cwd` (the
+/// issue worktree) — the fixture for `scheduler/dispatch/009`'s refcount check.
+const MULTIROLE_ORCH_TOML: &str = "[[orchestrations]]\nname = \"dispatch-orch\"\n\n\
+     [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+     [[orchestrations.roles]]\nname = \"reviewer\"\ncommand = \"cat\"\n";
+
 /// Holds the stub `gh` + the per-repo fixture data dir, both rooted in a scratch
 /// tempdir kept alive for the test's lifetime.
 struct GhStub {
@@ -148,6 +156,16 @@ impl GhStub {
         init_remote(&rd.join("remote"), with_orchestration);
     }
 
+    /// Like [`add_repo`] but the committed `.dot-agent-deck.toml` defines a
+    /// TWO-role orchestration (orchestrator + reviewer, both `cat`), so a
+    /// dispatched worktree opens an orchestration tab with two role panes that
+    /// share the SAME issue worktree as their `orchestration_cwd`.
+    fn add_repo_multirole(&self, repo: &str) {
+        let rd = self.repo_dir(repo);
+        std::fs::create_dir_all(&rd).expect("create repo fixture dir");
+        init_remote_with_orch_toml(&rd.join("remote"), Some(MULTIROLE_ORCH_TOML));
+    }
+
     /// Set the canned `gh issue list` output for `repo` (issue numbers, in
     /// returned order).
     fn set_issues(&self, repo: &str, numbers: &[u64]) {
@@ -195,14 +213,22 @@ impl GhStub {
 }
 
 /// Initialize a fixture remote: a real git repo with one commit (`README.md`,
-/// plus `.dot-agent-deck.toml` when `with_orchestration`). Commit identity is
-/// pinned inline so the repo does not depend on the host's global git config.
+/// plus the single-role [`ORCH_TOML`] `.dot-agent-deck.toml` when
+/// `with_orchestration`). Thin wrapper over [`init_remote_with_orch_toml`].
 fn init_remote(remote: &Path, with_orchestration: bool) {
+    init_remote_with_orch_toml(remote, with_orchestration.then_some(ORCH_TOML));
+}
+
+/// Initialize a fixture remote committing `README.md` plus, when `orch_toml` is
+/// `Some`, that exact `.dot-agent-deck.toml` content (so callers can choose a
+/// single- or multi-role orchestration config). Commit identity is pinned inline
+/// so the repo does not depend on the host's global git config.
+fn init_remote_with_orch_toml(remote: &Path, orch_toml: Option<&str>) {
     std::fs::create_dir_all(remote).expect("create remote dir");
     run_git(remote, &["-c", "init.defaultBranch=main", "init", "-q"]);
     std::fs::write(remote.join("README.md"), "issue-dispatch fixture\n").expect("write README");
-    if with_orchestration {
-        std::fs::write(remote.join(".dot-agent-deck.toml"), ORCH_TOML)
+    if let Some(toml) = orch_toml {
+        std::fs::write(remote.join(".dot-agent-deck.toml"), toml)
             .expect("write fixture .dot-agent-deck.toml");
     }
     run_git(remote, &["add", "-A"]);
@@ -274,6 +300,18 @@ fn orchestrator_in(r: &AgentRecord, worktree: &Path) -> bool {
         &r.tab_membership,
         Some(TabMembership::Orchestration { role_name, orchestration_cwd, .. })
             if role_name == "orchestrator" && orchestration_cwd.as_deref() == Some(want.as_ref())
+    )
+}
+
+/// Whether `r` is the role named `role` of an orchestration tab rooted at
+/// `worktree` (its `orchestration_cwd`). Generalises [`orchestrator_in`] so a
+/// multi-role dispatch can match a specific sibling role (e.g. `reviewer`).
+fn role_in(r: &AgentRecord, role: &str, worktree: &Path) -> bool {
+    let want = worktree.to_string_lossy();
+    matches!(
+        &r.tab_membership,
+        Some(TabMembership::Orchestration { role_name, orchestration_cwd, .. })
+            if role_name == role && orchestration_cwd.as_deref() == Some(want.as_ref())
     )
 }
 
@@ -826,5 +864,187 @@ fn dispatch_007_one_issue_fails_others_dispatch() {
     assert!(
         surfaced,
         "the per-issue failure for issue 11 must be surfaced through the notifier"
+    );
+}
+
+/// Scenario: Dispatch one open issue (no open PR) so its worktree and branch
+/// `agent/issue-7` are created, then CLOSE the dispatched agent via `StopAgent`
+/// (removing the worktree but LEAVING the branch), then fire the SAME task again
+/// while `gh` still reports the issue open with no PR. The reclaimed issue must
+/// re-dispatch — its worktree is re-created and an orchestrator spawns again —
+/// with no per-issue failure surfaced (B1: worktree-add must tolerate the
+/// pre-existing branch left behind by the close).
+#[spec("scheduler/dispatch/008")]
+#[test]
+fn dispatch_008_refire_after_close_redispatches() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    stub.add_repo(repo, true);
+    stub.set_issues(repo, &[7]);
+
+    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
+
+    // First fire: dispatch issue 7.
+    daemon.run_now("dispatch-task").expect("run-now (first)");
+    assert!(
+        common::wait_for_path(&paths.worktree_dir, W),
+        "the first fire must create the issue-7 worktree"
+    );
+    let agent = daemon
+        .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+        .expect("the first fire must spawn the orchestrator for issue 7");
+
+    // Close the dispatched tab. Cleanup removes the worktree but `git worktree
+    // remove --force` LEAVES the branch `agent/issue-7` behind.
+    daemon
+        .send_attach_request(&AttachRequest::StopAgent {
+            id: agent.id.clone(),
+        })
+        .expect("StopAgent over the attach socket");
+    assert!(
+        common::wait_until(W, || !paths.worktree_dir.exists()),
+        "closing the dispatched tab must remove the worktree (precondition for the re-fire)"
+    );
+    // Precondition for B1: the branch survives the close, so a naive
+    // `worktree add -b agent/issue-7` on the next fire would collide.
+    assert!(
+        common::wait_until(Duration::from_secs(5), || git_branch_exists(
+            &paths.clone_dir,
+            &paths.branch
+        )),
+        "the close preserves branch {} (the leftover that makes the re-fire trip)",
+        paths.branch
+    );
+
+    // Second fire: issue still open, no PR, worktree gone → must re-dispatch.
+    daemon.run_now("dispatch-task").expect("run-now (second)");
+
+    // RED today: `create_worktree` runs `worktree add <wt> -b agent/issue-7`,
+    // which fails because the branch already exists → the worktree is never
+    // re-created and an `IssueDispatchFailed` is surfaced.
+    assert!(
+        common::wait_for_path(&paths.worktree_dir, W),
+        "re-firing must re-create the issue-7 worktree (B1: worktree-add must tolerate the existing branch)"
+    );
+    assert!(
+        daemon
+            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+            .is_some(),
+        "re-firing must spawn the orchestrator again for the reclaimed issue 7"
+    );
+    // The re-dispatch must not surface a per-issue failure for issue 7.
+    let failed = common::wait_until(Duration::from_secs(3), || {
+        daemon.stderr_contains("failed:") || daemon.stderr_contains("already exists")
+    });
+    assert!(
+        !failed,
+        "re-dispatch must NOT surface an IssueDispatchFailed for issue 7"
+    );
+}
+
+/// Scenario: Dispatch one open issue whose cloned repo carries a TWO-role
+/// orchestration (orchestrator + reviewer), so the issue worktree hosts two role
+/// panes sharing one `orchestration_cwd`. Closing ONE role pane must leave the
+/// worktree on disk (a sibling role is still live in it); only closing the LAST
+/// role pane removes the worktree — and the clone is preserved (S1: refcount the
+/// worktree, removing it only when the last rooted agent closes).
+#[spec("scheduler/dispatch/009")]
+#[test]
+fn dispatch_009_multirole_orchestration_cleanup_refcount() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    stub.add_repo_multirole(repo);
+    stub.set_issues(repo, &[7]);
+
+    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    daemon
+        .run_now("dispatch-task")
+        .expect("run-now dispatch-task");
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
+    let wt = paths.worktree_dir.clone();
+    assert!(
+        common::wait_for_path(&wt, W),
+        "dispatch must create the issue worktree"
+    );
+
+    // Both role panes spawn into the SAME issue worktree.
+    let orchestrator = daemon
+        .wait_for_agent_where(|r| role_in(r, "orchestrator", &wt), W)
+        .expect("the orchestrator role must spawn into the issue worktree");
+    let reviewer = daemon
+        .wait_for_agent_where(|r| role_in(r, "reviewer", &wt), W)
+        .expect("the reviewer role must spawn into the same issue worktree");
+
+    // Close ONE role (the reviewer). The worktree must SURVIVE — the
+    // orchestrator role is still live in it.
+    daemon
+        .send_attach_request(&AttachRequest::StopAgent {
+            id: reviewer.id.clone(),
+        })
+        .expect("StopAgent reviewer over the attach socket");
+
+    // RED today: the first role-pane close runs `git worktree remove --force`,
+    // nuking the worktree out from under the still-live orchestrator. Give the
+    // async cleanup time to (wrongly) fire, then assert the worktree is still
+    // present on disk and in `git worktree list`.
+    let nuked_early = common::wait_until(Duration::from_secs(5), || {
+        !wt.exists() || !git_worktree_listed(&paths.clone_dir, &wt)
+    });
+    assert!(
+        !nuked_early,
+        "closing ONE role of a multi-role orchestration must NOT remove the shared worktree (S1: refcount — remove only on the LAST close)"
+    );
+
+    // Close the LAST role (the orchestrator). Now the worktree must be removed,
+    // while the clone is preserved.
+    daemon
+        .send_attach_request(&AttachRequest::StopAgent {
+            id: orchestrator.id.clone(),
+        })
+        .expect("StopAgent orchestrator over the attach socket");
+    let removed = common::wait_until(W, || {
+        !wt.exists() && !git_worktree_listed(&paths.clone_dir, &wt)
+    });
+    assert!(
+        removed,
+        "closing the LAST role must remove the shared worktree from disk and `git worktree list`"
+    );
+    assert!(
+        paths.clone_dir.is_dir(),
+        "the clone directory must be preserved after worktree cleanup"
     );
 }
