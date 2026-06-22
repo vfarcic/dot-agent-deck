@@ -408,11 +408,71 @@ async fn provision_repo(workspace: &Path, clone_dir: &Path, repo: &str) -> Resul
                 "issue-dispatch: clone refresh failed; continuing with current refs"
             );
         }
+        // Keep the per-issue `.worktrees/` dir out of the clone's `git status`
+        // (idempotent, best-effort — never fails the run).
+        ensure_worktrees_excluded(clone_dir);
         return Ok(());
     }
     std::fs::create_dir_all(workspace)
         .map_err(|e| format!("failed to create workspace {}: {e}", workspace.display()))?;
-    run_status("gh", &["repo", "clone", repo, &clone_dir.to_string_lossy()]).await
+    run_status("gh", &["repo", "clone", repo, &clone_dir.to_string_lossy()]).await?;
+    // Same hygiene on the fresh clone, so it holds across the first AND every
+    // later fire.
+    ensure_worktrees_excluded(clone_dir);
+    Ok(())
+}
+
+/// Keep the per-issue worktrees dir (`<clone>/.worktrees/`) out of the clone's
+/// `git status` WITHOUT touching the user's tracked files: append `.worktrees/`
+/// to the clone's LOCAL exclude file (`<clone>/.git/info/exclude`) — never a
+/// committed `.gitignore`, because the cloned repo belongs to the user and we
+/// must not modify their tracked/committed files. `.worktrees/` sits in the main
+/// clone's working tree and would otherwise show as untracked to anyone running
+/// `git status` in the clone (agents run INSIDE a worktree, above which it isn't
+/// visible — so this is hygiene for the main clone).
+///
+/// Idempotent: the line is appended only if not already present, so repeated
+/// fires never duplicate it; `.git/info/` is created if missing. Best-effort: any
+/// I/O failure is logged at WARN and swallowed — it must NEVER fail the dispatch
+/// run.
+fn ensure_worktrees_excluded(clone_dir: &Path) {
+    const WORKTREES_EXCLUDE_LINE: &str = ".worktrees/";
+    let info_dir = clone_dir.join(".git").join("info");
+    let exclude_path = info_dir.join("exclude");
+
+    // A missing exclude reads as empty — treat that as "line absent".
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    if existing
+        .lines()
+        .any(|line| line.trim() == WORKTREES_EXCLUDE_LINE)
+    {
+        return;
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&info_dir) {
+        tracing::warn!(
+            clone = %clone_dir.display(),
+            error = %e,
+            "issue-dispatch: could not create .git/info to exclude .worktrees/"
+        );
+        return;
+    }
+
+    // Append on its own line, inserting a separating newline only when the
+    // existing content lacks a trailing one.
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(WORKTREES_EXCLUDE_LINE);
+    content.push('\n');
+    if let Err(e) = std::fs::write(&exclude_path, content) {
+        tracing::warn!(
+            clone = %clone_dir.display(),
+            error = %e,
+            "issue-dispatch: could not write .git/info/exclude to exclude .worktrees/"
+        );
+    }
 }
 
 /// S3: refresh an existing clone in place — `git fetch` then `git pull --ff-only`.
@@ -856,6 +916,41 @@ mod tests {
         assert!(
             outcome.is_err(),
             "a real add failure with no worktree on disk must propagate as Err, got {outcome:?}"
+        );
+    }
+
+    // --- .worktrees/ git-status hygiene via .git/info/exclude ---
+
+    // PRD #120 — provisioning keeps `.worktrees/` out of the clone's `git status`
+    // by appending it to the clone-LOCAL `.git/info/exclude` (never a committed
+    // .gitignore — the clone is the user's). Idempotent: a second fire must not
+    // duplicate the line.
+    #[test]
+    fn ensure_worktrees_excluded_appends_once_idempotently() {
+        let clone = tempfile::tempdir().unwrap();
+        // Initialize the clone with a `.git/info/` structure.
+        let info_dir = clone.path().join(".git").join("info");
+        std::fs::create_dir_all(&info_dir).unwrap();
+        let exclude_path = info_dir.join("exclude");
+
+        // First fire writes the `.worktrees/` exclude line.
+        ensure_worktrees_excluded(clone.path());
+        let after_first = std::fs::read_to_string(&exclude_path).unwrap();
+        assert!(
+            after_first.lines().any(|l| l.trim() == ".worktrees/"),
+            ".git/info/exclude should contain the .worktrees/ line, got {after_first:?}"
+        );
+
+        // Second fire must NOT duplicate it.
+        ensure_worktrees_excluded(clone.path());
+        let after_second = std::fs::read_to_string(&exclude_path).unwrap();
+        let count = after_second
+            .lines()
+            .filter(|l| l.trim() == ".worktrees/")
+            .count();
+        assert_eq!(
+            count, 1,
+            "repeated fires must not duplicate the exclude line, got {after_second:?}"
         );
     }
 
