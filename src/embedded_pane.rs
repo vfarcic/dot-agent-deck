@@ -49,6 +49,15 @@ pub struct HydratedPane {
     /// is older / didn't persist the field, or the spawn command wasn't
     /// recognized as an agent by [`AgentType::from_command`].
     pub agent_type: Option<AgentType>,
+    /// PRD #162: the daemon's live, event-derived session snapshot for this
+    /// agent, joined onto the `AgentRecord` in the `ListAgents` handler (M1.2).
+    /// `Some(..)` carries the real `status` / event-derived `agent_type` /
+    /// `active_tool` / `tool_count` / prompt context so the hydrated card
+    /// restores the pre-disconnect view instead of a bare `Idle` / "No agent"
+    /// placeholder. `None` — older daemon, the dummy-state attach path, or an
+    /// agent that never emitted an event — falls back to today's placeholder
+    /// seeding via [`crate::state::AppState::seed_hydrated_session`].
+    pub live: Option<crate::state::SessionSnapshot>,
 }
 
 /// Commands the per-pane I/O task drains from `input_rx`. `Input` carries
@@ -881,6 +890,7 @@ impl EmbeddedPaneController {
                 cwd: cwd_record,
                 tab_membership: record.tab_membership.clone(),
                 agent_type: record.agent_type.clone(),
+                live: record.live.clone(),
             });
         }
         hydrated

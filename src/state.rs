@@ -630,6 +630,61 @@ impl AppState {
         );
     }
 
+    /// PRD #162: seed a hydrated pane's session from the daemon's live
+    /// [`SessionSnapshot`] when one is attached, falling back to the bare
+    /// [`Self::insert_placeholder_session`] placeholder when it is absent.
+    ///
+    /// This is the reconnect-side counterpart to the `ListAgents` snapshot
+    /// join: on `dot-agent-deck connect`, each `HydratedPane` carries the
+    /// agent's live state (`status` / event-derived `agent_type` /
+    /// `active_tool` / `tool_count` / prompt context), and seeding from it
+    /// restores the pre-disconnect card instead of resetting to `Idle` /
+    /// "No agent" until the next event arrives.
+    ///
+    /// - `live = Some(snap)`: the card takes the snapshot's `status` /
+    ///   `active_tool` / `tool_count` / `first_prompts` / `last_user_prompt`,
+    ///   and its `agent_type` is the snapshot's **event-derived** value —
+    ///   falling back to the spawn-time `agent_type` argument **only** when
+    ///   the snapshot's is `None` (the "No agent" fix).
+    /// - `live = None`: behaves identically to
+    ///   [`Self::insert_placeholder_session`] (bare `Idle`, spawn-time
+    ///   `agent_type`). The fallback delegates to that method so it can't
+    ///   drift from the placeholder path.
+    ///
+    /// In BOTH branches the PRD #110 `agent_id` is minted on the seeded
+    /// session exactly as `insert_placeholder_session` does, so a
+    /// post-reconnect `SessionStart` from the same agent remaps onto this
+    /// card via `apply_event`'s reuse guard instead of spawning a duplicate.
+    pub fn seed_hydrated_session(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        live: Option<&SessionSnapshot>,
+    ) {
+        // The snapshot's event-derived agent_type wins; fall back to the
+        // spawn-time value only when the snapshot has none (or is absent).
+        let effective_agent_type = match live {
+            Some(snap) => snap.agent_type.clone().or(agent_type),
+            None => agent_type,
+        };
+        // Mint the placeholder exactly as today (PRD #110 agent_id,
+        // started_at reuse, session_id), then overlay the live snapshot
+        // fields when one is present.
+        self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
+        if let Some(snap) = live {
+            let session_id = format!("pane-{}", pane_id);
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                session.status = snap.status.clone();
+                session.active_tool = snap.active_tool.clone();
+                session.tool_count = snap.tool_count;
+                session.first_prompts = snap.first_prompts.clone();
+                session.last_user_prompt = snap.last_user_prompt.clone();
+            }
+        }
+    }
+
     /// Unregister a pane ID (e.g., when closing a pane).
     pub fn unregister_pane(&mut self, pane_id: &str) {
         self.managed_pane_ids.remove(pane_id);
