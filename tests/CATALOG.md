@@ -1452,6 +1452,33 @@ without depending on the config struct API.
 - **Does not assert:** the live-path title plumbing (already covered by the new-pane orchestration flow); the serde round-trip of the new field in isolation (a unit test the coder adds with the field).
 - **Platform coverage:** mac+linux.
 
+### Live session status on reconnect (PRD #162)
+
+These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must attach the live, event-derived session state (a `SessionSnapshot` on each `AgentRecord`) so reconnected cards show real status instead of `Idle`/"No agent". The data already exists in `AppState.sessions` (built by `apply_event`, unchanged); this PRD only exposes it. The wire field `live: Option<SessionSnapshot>` is additive/optional — no `PROTOCOL_VERSION` bump.
+
+#### session/live
+
+##### session/live/001 — `SessionSnapshot` serde round-trips every `SessionStatus` and an older `AgentRecord` without the field decodes to `live == None` (PRD #162 M1.1).
+- **Layer:** pure-data (serde round-trip; no daemon/TUI harness; runs in the fast tier).
+- **Agent:** none.
+- **Asserts:** a `SessionSnapshot` carrying each `SessionStatus` variant (Idle/Working/Thinking/WaitingForInput/Compacting/Error) round-trips through JSON with the status (and agent_type/active_tool/tool_count/prompts) preserved; an `AgentRecord` carrying `live = Some(snapshot)` round-trips with the snapshot intact; and a hand-crafted older-daemon `AgentRecord` JSON with no `live` key decodes via `#[serde(default)]` to `live == None` (back-compat, no protocol bump).
+- **Does not assert:** the `ListAgents` join (session/live/002); newest-wins tie-break (session/live/003); the TUI-side seeding of the hydrated session (Phase 2).
+- **Platform coverage:** mac+linux+windows.
+
+##### session/live/002 — The `ListAgents` handler attaches the live event-derived snapshot; the dummy-state path yields `None` (PRD #162 M1.2).
+- **Layer:** in-crate integration (in-process attach daemon over a Unix socket; fast tier; spawns a `sleep` PTY only to populate the registry record, does not drive vt100).
+- **Agent:** none.
+- **Asserts:** with a registry agent whose spawn-time `agent_type` is `None` and a live `AppState` session (same `agent_id` + `pane_id`) driven via `apply_event` to `Working` with an active tool, `tool_count > 0`, an event-derived `agent_type` (ClaudeCode) and a first prompt, the `ListAgents` response carries `AgentRecord.live = Some` with that status, the event-derived `agent_type` (even though the registry record's spawn-time `agent_type` is `None`), the active tool name, the tool count, and the first/last prompt. The empty dummy-state `serve_attach` path returns the same record with `live == None` — no harness regression and the older-daemon fallback shape.
+- **Does not assert:** the pure serde shape (session/live/001); newest-wins (session/live/003); the TUI-side seeding (Phase 2).
+- **Platform coverage:** mac+linux.
+
+##### session/live/003 — When two sessions map to the same agent, the join attaches the newest-`last_activity` snapshot (PRD #162 M1.2 newest-wins).
+- **Layer:** in-crate integration (in-process attach daemon over a Unix socket; fast tier; spawns a `sleep` PTY only to populate the registry record, does not drive vt100).
+- **Agent:** none.
+- **Asserts:** with two hand-built `SessionState`s in `AppState.sessions` that both map to the same agent (same `agent_id` + `pane_id`, e.g. a `/clear` restart leaving a stale entry) but different `last_activity` and distinguishing status/prompt, the `ListAgents` join attaches the snapshot from the entry with the most-recent `last_activity` (the live session), not the dead predecessor.
+- **Does not assert:** the pure serde shape (session/live/001); the populated-vs-dummy contrast (session/live/002); the TUI-side seeding (Phase 2).
+- **Platform coverage:** mac+linux.
+
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
 These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.

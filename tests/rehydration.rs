@@ -28,19 +28,24 @@ use tempfile::TempDir;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
-use dot_agent_deck::agent_pty::{AgentPtyRegistry, TabMembership};
+use chrono::Utc;
+use dot_agent_deck::agent_pty::{
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
+};
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_REQ, KIND_RESP, bind_attach_listener, read_frame,
-    serve_attach, write_frame,
+    serve_attach, serve_attach_with_counter, write_frame,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
-use dot_agent_deck::event::AgentType;
-use dot_agent_deck::state::AppState;
+use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+use dot_agent_deck::state::{AppState, SessionState, SessionStatus, SharedState};
 use dot_agent_deck::ui::{
     dead_slot_pane_id, fill_dead_slots_with_placeholders, is_dead_slot_pane_id,
 };
 use spec::spec;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::AtomicUsize;
 
 // `bind_attach_listener` flips the process-global umask while binding; share
 // the lock with the other M-series tests so concurrent tempdir creation
@@ -79,6 +84,142 @@ async fn start_real_server() -> Server {
         path,
         registry,
         handle,
+    }
+}
+
+/// PRD #162: variant of [`start_real_server`] that serves with the daemon's
+/// real, caller-supplied `state: SharedState` via `serve_attach_with_counter`
+/// instead of `serve_attach`'s empty dummy state. This is the production path
+/// the `ListAgents` handler reads to attach the live `SessionSnapshot`. The
+/// caller owns the `registry` (so it can pre-spawn agents into it) and the
+/// `state` (so it can populate `AppState.sessions` via `apply_event`). Returns
+/// the tempdir (keep it alive — drop removes the socket) and the join handle
+/// (abort it at teardown).
+async fn start_server_with_state(
+    registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
+) -> (TempDir, PathBuf, JoinHandle<()>) {
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = bind_attach_listener(&path).expect("bind attach listener");
+        (dir, path, listener)
+    };
+    let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+    let client_count = Arc::new(AtomicUsize::new(0));
+    let scheduler = Arc::new(dot_agent_deck::scheduler::Scheduler::with_stderr_notifier());
+    let reuse = dot_agent_deck::spawn::new_reuse_registry();
+    let registry_for_task = registry.clone();
+    let handle = tokio::spawn(async move {
+        let _ = serve_attach_with_counter(
+            listener,
+            registry_for_task,
+            event_tx,
+            client_count,
+            state,
+            None,
+            scheduler,
+            reuse,
+        )
+        .await;
+    });
+    (dir, path, handle)
+}
+
+/// PRD #162: drive an `AppState` session via the same `apply_event` path the
+/// daemon uses for hook events, until the session is `Working` with an active
+/// tool, `tool_count > 0`, an event-derived `agent_type` of ClaudeCode, and a
+/// recorded first/last prompt. Mirrors the status/transition apply_event flow:
+/// SessionStart → Thinking(prompt) → ToolStart(Read) → ToolEnd → ToolStart(Edit).
+fn drive_session_to_working(state: &mut AppState, session_id: &str, pane_id: &str, agent_id: &str) {
+    let mk = |event_type: EventType,
+              tool_name: Option<&str>,
+              tool_detail: Option<&str>,
+              user_prompt: Option<&str>| AgentEvent {
+        session_id: session_id.to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type,
+        tool_name: tool_name.map(str::to_string),
+        tool_detail: tool_detail.map(str::to_string),
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: user_prompt.map(str::to_string),
+        metadata: HashMap::new(),
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+    };
+    state.apply_event(mk(EventType::SessionStart, None, None, None));
+    state.apply_event(mk(
+        EventType::Thinking,
+        None,
+        None,
+        Some("build the feature"),
+    ));
+    state.apply_event(mk(
+        EventType::ToolStart,
+        Some("Read"),
+        Some("src/main.rs"),
+        None,
+    ));
+    state.apply_event(mk(EventType::ToolEnd, None, None, None));
+    state.apply_event(mk(
+        EventType::ToolStart,
+        Some("Edit"),
+        Some("src/lib.rs"),
+        None,
+    ));
+}
+
+/// PRD #162: serve the *empty dummy-state* `serve_attach` path on a
+/// caller-owned registry (so the same spawned agent can be queried over both
+/// the populated and the dummy path). This is the older-daemon / test-harness
+/// shape whose `ListAgents` must yield `live == None`.
+async fn start_dummy_server_on(
+    registry: Arc<AgentPtyRegistry>,
+) -> (TempDir, PathBuf, JoinHandle<()>) {
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = bind_attach_listener(&path).expect("bind attach listener");
+        (dir, path, listener)
+    };
+    let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+    let registry_for_task = registry.clone();
+    let handle = tokio::spawn(async move {
+        let _ = serve_attach(listener, registry_for_task, event_tx).await;
+    });
+    (dir, path, handle)
+}
+
+/// PRD #162: hand-build a `SessionState` for the newest-wins join test
+/// (session/live/003). Bypasses `apply_event` on purpose so two sessions can
+/// coexist on the same `agent_id` + `pane_id` (the `/clear`-restart stale-entry
+/// case `apply_event`'s reuse guard would otherwise collapse).
+fn make_session(
+    session_id: &str,
+    pane_id: &str,
+    agent_id: &str,
+    status: SessionStatus,
+    last_prompt: &str,
+    last_activity: chrono::DateTime<Utc>,
+) -> SessionState {
+    SessionState {
+        session_id: session_id.to_string(),
+        agent_type: AgentType::ClaudeCode,
+        cwd: None,
+        status,
+        active_tool: None,
+        started_at: last_activity,
+        last_activity,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: Some(last_prompt.to_string()),
+        first_prompts: vec![last_prompt.to_string()],
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        display_name: None,
     }
 }
 
@@ -1282,4 +1423,203 @@ async fn restore_007_warm_daemon_hydrates_orchestration_roles_in_order_inner() {
     for id in &spawned_ids {
         let _ = server.registry.close_agent(id);
     }
+}
+
+/// Scenario: Spawn a registry agent whose spawn-time `agent_type` is `None`
+/// (the "No agent" case) and drive a live `AppState` session on the same
+/// `agent_id` + `pane_id` to `Working` with an active tool, `tool_count > 0`,
+/// an event-derived ClaudeCode type and a first prompt; calling `ListAgents`
+/// over the real attach socket must return the record with `live = Some(...)`
+/// carrying that status, the event-derived agent_type (overriding the `None`
+/// spawn-time value), the active tool, the tool count and the prompts. The same
+/// registry served via the empty dummy-state `serve_attach` path must return
+/// the record with `live == None` — today's behavior, no harness regression.
+#[spec("session/live/002")]
+#[test]
+fn live_002_list_agents_attaches_live_snapshot() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(live_002_list_agents_attaches_live_snapshot_inner());
+}
+
+async fn live_002_list_agents_attaches_live_snapshot_inner() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let pane = "pane-live";
+
+    // Registry record: spawn-time agent_type is None — the legacy "No agent"
+    // case the PRD fixes. The event-derived type below must override it.
+    let agent_id = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("sleep 30"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+            agent_type: None,
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+
+    // Live, event-derived session state — the store the join must read.
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    {
+        let mut guard = state.write().await;
+        drive_session_to_working(&mut guard, "sess-live", pane, &agent_id);
+    }
+
+    // Populated-state path: ListAgents must attach the snapshot.
+    let (_dir, path, handle) = start_server_with_state(registry.clone(), state.clone()).await;
+    let client = DaemonClient::new(path);
+    let records = client
+        .list_agents()
+        .await
+        .expect("list_agents should succeed");
+    let rec = records
+        .iter()
+        .find(|r| r.id == agent_id)
+        .expect("spawned agent must appear in list_agents");
+
+    assert!(
+        rec.agent_type.is_none(),
+        "precondition: this record's spawn-time agent_type is None"
+    );
+    let live = rec
+        .live
+        .as_ref()
+        .expect("reconnect must attach the live SessionSnapshot");
+    assert_eq!(live.status, SessionStatus::Working, "live status restored");
+    assert_eq!(
+        live.agent_type,
+        Some(AgentType::ClaudeCode),
+        "event-derived agent_type must override the None spawn-time type"
+    );
+    assert_eq!(
+        live.active_tool.as_ref().map(|t| t.name.as_str()),
+        Some("Edit"),
+        "active tool name preserved across reconnect"
+    );
+    assert!(
+        live.tool_count > 0,
+        "tool_count must be > 0, got {}",
+        live.tool_count
+    );
+    assert!(
+        live.first_prompts
+            .iter()
+            .any(|p| p.as_str() == "build the feature"),
+        "first prompt context preserved, got {:?}",
+        live.first_prompts
+    );
+    assert_eq!(
+        live.last_user_prompt.as_deref(),
+        Some("build the feature"),
+        "last_user_prompt preserved"
+    );
+
+    // Dummy-state path: serve_attach uses an empty AppState → no snapshot,
+    // exactly today's behavior (older daemon / test harness). No regression.
+    let (_ddir, dpath, dhandle) = start_dummy_server_on(registry.clone()).await;
+    let dclient = DaemonClient::new(dpath);
+    let drecords = dclient
+        .list_agents()
+        .await
+        .expect("list_agents should succeed");
+    let drec = drecords
+        .iter()
+        .find(|r| r.id == agent_id)
+        .expect("spawned agent must appear in dummy-state list_agents");
+    assert!(
+        drec.live.is_none(),
+        "empty dummy-state serve_attach must yield live == None; got {:?}",
+        drec.live
+    );
+
+    handle.abort();
+    dhandle.abort();
+    let _ = registry.close_agent(&agent_id);
+}
+
+/// Scenario: With two `SessionState`s in `AppState.sessions` that both map to
+/// the same agent (same `agent_id` + `pane_id`, e.g. a `/clear` restart that
+/// left a stale entry) but different `last_activity` and distinguishing
+/// status/prompt, the `ListAgents` join must attach the snapshot from the entry
+/// with the most-recent `last_activity` (the live session), not the dead
+/// predecessor.
+#[spec("session/live/003")]
+#[test]
+fn live_003_join_picks_newest_last_activity() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(live_003_join_picks_newest_last_activity_inner());
+}
+
+async fn live_003_join_picks_newest_last_activity_inner() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let pane = "pane-dup";
+    let agent_id = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("sleep 30"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+            agent_type: None,
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+
+    let older = Utc::now() - chrono::Duration::seconds(120);
+    let newer = Utc::now();
+    let dead = make_session(
+        "dead-sess",
+        pane,
+        &agent_id,
+        SessionStatus::Idle,
+        "STALE PROMPT",
+        older,
+    );
+    let live = make_session(
+        "live-sess",
+        pane,
+        &agent_id,
+        SessionStatus::Working,
+        "FRESH PROMPT",
+        newer,
+    );
+
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    {
+        let mut guard = state.write().await;
+        // Insert the dead predecessor first; the live session is newer.
+        guard.sessions.insert("dead-sess".to_string(), dead);
+        guard.sessions.insert("live-sess".to_string(), live);
+    }
+
+    let (_dir, path, handle) = start_server_with_state(registry.clone(), state.clone()).await;
+    let client = DaemonClient::new(path);
+    let records = client
+        .list_agents()
+        .await
+        .expect("list_agents should succeed");
+    let rec = records
+        .iter()
+        .find(|r| r.id == agent_id)
+        .expect("spawned agent must appear in list_agents");
+    let snap = rec
+        .live
+        .as_ref()
+        .expect("a live snapshot must be attached for the duplicated agent");
+    assert_eq!(
+        snap.status,
+        SessionStatus::Working,
+        "newest-wins: must take the live (newer last_activity) session's status, not the dead Idle predecessor"
+    );
+    assert_eq!(
+        snap.last_user_prompt.as_deref(),
+        Some("FRESH PROMPT"),
+        "newest-wins: must take the newer session's prompt, not the stale predecessor"
+    );
+
+    handle.abort();
+    let _ = registry.close_agent(&agent_id);
 }

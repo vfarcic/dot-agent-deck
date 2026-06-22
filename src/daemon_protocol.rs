@@ -1445,6 +1445,7 @@ async fn handle_attach_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     #[tokio::test]
     async fn frame_round_trip() {
@@ -1789,6 +1790,98 @@ mod tests {
         assert!(
             rec.tab_membership.is_none(),
             "old-daemon record without tab_membership must decode as None"
+        );
+    }
+
+    /// Scenario: Build a `SessionSnapshot` for every `SessionStatus` variant
+    /// and round-trip it through JSON, asserting the status (and the agent
+    /// type / active tool / tool count / prompts) survive; attach one to an
+    /// `AgentRecord` and confirm `live` round-trips as `Some`; finally decode
+    /// an older-daemon `AgentRecord` JSON that predates the `live` field and
+    /// assert it deserializes with `live == None` (additive optional — no
+    /// `PROTOCOL_VERSION` bump).
+    #[spec("session/live/001")]
+    #[test]
+    fn live_001_session_snapshot_serde_and_agent_record_back_compat() {
+        use crate::event::AgentType;
+        use crate::state::{ActiveTool, SessionSnapshot, SessionStatus};
+
+        // (a) Every SessionStatus variant survives a SessionSnapshot round-trip.
+        for status in [
+            SessionStatus::Idle,
+            SessionStatus::Working,
+            SessionStatus::Thinking,
+            SessionStatus::WaitingForInput,
+            SessionStatus::Compacting,
+            SessionStatus::Error,
+        ] {
+            let snap = SessionSnapshot {
+                status: status.clone(),
+                agent_type: Some(AgentType::ClaudeCode),
+                active_tool: Some(ActiveTool {
+                    name: "Read".into(),
+                    detail: Some("src/main.rs".into()),
+                }),
+                tool_count: 3,
+                first_prompts: vec!["build the feature".into()],
+                last_user_prompt: Some("build the feature".into()),
+            };
+            let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
+            let back: SessionSnapshot =
+                serde_json::from_str(&json).expect("SessionSnapshot deserializes");
+            assert_eq!(back.status, status, "status must round-trip for {status:?}");
+            assert_eq!(back.agent_type, Some(AgentType::ClaudeCode));
+            assert_eq!(
+                back.active_tool.as_ref().map(|t| t.name.as_str()),
+                Some("Read"),
+                "active tool name must round-trip"
+            );
+            assert_eq!(back.tool_count, 3);
+            assert_eq!(back.first_prompts, vec!["build the feature".to_string()]);
+            assert_eq!(back.last_user_prompt.as_deref(), Some("build the feature"));
+        }
+
+        // (b) An AgentRecord carrying a live snapshot round-trips with live == Some.
+        let rec = AgentRecord {
+            id: "9".into(),
+            pane_id_env: Some("pane-9".into()),
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: Some(SessionSnapshot {
+                status: SessionStatus::Working,
+                agent_type: Some(AgentType::ClaudeCode),
+                active_tool: None,
+                tool_count: 0,
+                first_prompts: Vec::new(),
+                last_user_prompt: None,
+            }),
+        };
+        let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
+        let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");
+        let live = back
+            .live
+            .expect("live snapshot must survive the AgentRecord round-trip");
+        assert_eq!(live.status, SessionStatus::Working);
+        assert_eq!(live.agent_type, Some(AgentType::ClaudeCode));
+
+        // (c) Back-compat: an older daemon's AgentRecord JSON has no `live`
+        // field at all. It must decode via `#[serde(default)]` with
+        // live == None — additive optional, no PROTOCOL_VERSION bump.
+        let legacy = r#"{
+            "id": "42",
+            "pane_id_env": "pid-42",
+            "display_name": "auditor",
+            "cwd": "/work"
+        }"#;
+        let old: AgentRecord = serde_json::from_str(legacy)
+            .expect("older daemon shape must decode via #[serde(default)] on live");
+        assert!(
+            old.live.is_none(),
+            "older AgentRecord without a live field must decode as None"
         );
     }
 
