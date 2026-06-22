@@ -1858,6 +1858,58 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the 10s fallback-on-timeout delivery path (a separate readiness facet); orchestration-tab delivery gating (covered structurally by spawn/002).
 - **Platform coverage:** mac+linux.
 
+#### scheduler/dispatch
+
+##### scheduler/dispatch/001 — Firing an `issue_dispatch` task clones the repo, creates a per-issue worktree on `agent/issue-<n>`, and spawns an agent into it with the substituted prompt (PRD #120 M2.1–M2.3).
+- **Layer:** L2 (headless `dot-agent-deck daemon serve` driven via the `RunNow` control message — no PTY/grid, same shape as `scheduler/spawn/*`). All GitHub access is isolated offline behind a stub `gh` on PATH (`issue list`/`pr list` → canned JSON; `repo clone` → `git clone` of a local one-commit fixture remote that carries a committed `.dot-agent-deck.toml`).
+- **Agent:** none (run-now; the fixture orchestration role runs `cat`, which echoes the delivered prompt).
+- **Asserts:** the repo is cloned to `<working_dir>/<name>`, the worktree appears at `<clone>/.worktrees/issue-7` with branch `agent/issue-7` (via `git`), and an `orchestrator`-role agent rooted at that worktree (`orchestration_cwd`) receives the substituted per-issue prompt (`ISSUEDISPATCH-7`, echoed by `cat`).
+- **Does not assert:** the single-agent-card branch (covered by `scheduler/dispatch/004`); fetch+pull refresh of an existing clone; the exact `gh` argv (covered by the pure-data `issue_dispatch` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/002 — A second fire with no intervening close skips an issue whose worktree already exists: no re-clone error, no duplicate spawn, and the skip is surfaced (PRD #120 M2.2 idempotency, primary signal).
+- **Layer:** L2 (as `scheduler/dispatch/001`).
+- **Agent:** none (run-now; observes the registry orchestrator count + on-disk worktree/clone + daemon stderr).
+- **Asserts:** the first fire creates the issue-7 worktree and one orchestrator agent; a second fire leaves the worktree and clone in place, does NOT grow the orchestrator count beyond one (no duplicate spawn), and surfaces a skip for the already-claimed issue.
+- **Does not assert:** the open-PR secondary signal (covered by `scheduler/dispatch/003`); the exact skip-message wording (loose substring on the issue key / "skip").
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/003 — An issue whose `gh pr list` reports an open PR on `agent/issue-<n>` is skipped while a sibling issue with no PR dispatches (PRD #120 M2.2 idempotency, secondary signal).
+- **Layer:** L2 (as `scheduler/dispatch/001`; the stub `gh pr list --head agent/issue-7` returns a non-empty array, while issue 8 returns `[]`).
+- **Agent:** none (run-now; observes per-issue worktrees + orchestrator count).
+- **Asserts:** issue 8 (no PR) dispatches — worktree present, orchestrator agent running — proving the flow ran; issue 7 (open PR) is skipped — no `issue-7` worktree, and the run's orchestrator count is one.
+- **Does not assert:** parsing `Closes #n` from PR bodies (the check keys on the deterministic head branch only); the worktree-exists primary signal (covered by `scheduler/dispatch/002`).
+- **Note:** a control issue (8, no PR) is included so "the flow ran AND issue 7 was skipped" is observable from end-state alone.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/004 — A clone with an `[[orchestrations]]` block opens an orchestration tab (prompt to the `orchestrator` role); a clone without one opens a single-agent card (prompt delivered) — reached through the dispatch path (PRD #120 M2.3).
+- **Layer:** L2 (as `scheduler/dispatch/001`; two `issue_dispatch` tasks, one fixture remote with a committed `.dot-agent-deck.toml`, one without; `default_command = cat` via `DOT_AGENT_DECK_CONFIG` so the single-agent card runs `cat`).
+- **Agent:** none (run-now; observes `ListAgents` tab_membership + spawn cwd + PTY prompt echo).
+- **Asserts:** the orchestration clone spawns an `orchestrator`-role agent in its worktree and the substituted prompt (`ORCHDISP-11`) reaches it; the plain clone spawns a non-orchestration single-agent card whose cwd is its worktree and the substituted prompt (`PLAINDISP-22`) reaches it.
+- **Does not assert:** the clone/worktree/branch derivation (covered by `scheduler/dispatch/001`); the orchestration-vs-card branch outside the dispatch path (covered by `scheduler/spawn/002`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/005 — When `gh` returns more open issues than `max_per_run`, only the first N (in returned order) get worktrees + spawns; the rest are left untouched (PRD #120 M3.1 cap).
+- **Layer:** L2 (as `scheduler/dispatch/001`; the stub returns five issues while `max_per_run = 2`, so the flow's own cap — not the stub — bounds the run).
+- **Agent:** none (run-now; observes per-issue worktrees + orchestrator count).
+- **Asserts:** issues 1 and 2 are dispatched (worktrees present), issues 3–5 are left untouched (no worktrees), and exactly two orchestrator agents exist.
+- **Does not assert:** issue ordering/scoring beyond "returned order" (out of scope per the PRD); the label/query filters (pure-data `issue_dispatch` argv tests cover those).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/006 — Closing a dispatched tab removes its worktree from disk and `git worktree list` while preserving the clone (PRD #120 M2.4 tab-close → cleanup plumbing).
+- **Layer:** L2 (as `scheduler/dispatch/001`; close is driven via the `StopAgent` control message on the dispatched orchestrator).
+- **Agent:** none (run-now to dispatch; `StopAgent` to close; observes on-disk worktree/clone + `git worktree list`).
+- **Asserts:** after dispatch the issue worktree exists; after closing the tab the worktree is gone from disk and from `git worktree list`, while the clone directory remains.
+- **Does not assert:** the in-deck close gesture (`Ctrl+w`) — the daemon-side close→cleanup contract is exercised over the protocol; auto-restoration of dispatched tabs (out of scope per the PRD).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/007 — One issue's dispatch failing (a simulated `gh` error for that issue) does not abort the others, and the failure is surfaced as a notification, not swallowed (PRD #120 M3.2 per-issue resilience).
+- **Layer:** L2 (as `scheduler/dispatch/001`; the stub `gh pr list --head agent/issue-11` exits non-zero while issue 10 is healthy).
+- **Agent:** none (run-now; observes survivor worktrees + orchestrator count + daemon stderr).
+- **Asserts:** issue 10 still dispatches (worktree + orchestrator agent) despite issue 11 failing; issue 11 produces no worktree; and a failure referencing issue 11 is surfaced through the notifier (daemon stderr).
+- **Does not assert:** cross-repo fan-out resilience (one repo per task — removed from scope); the exact failure-message wording (loose substring on the issue 11 key).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/reuse
 
 ##### scheduler/reuse/001 — Two fires of a `new_tab_per_fire = false` task reuse one tab and re-deliver the prompt into the same pane (PRD #127 M2.2).
