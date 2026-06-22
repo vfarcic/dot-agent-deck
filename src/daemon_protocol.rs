@@ -613,6 +613,7 @@ pub async fn serve_attach(
     // resolve against an empty registry rather than needing a real one.
     let dummy_scheduler = Arc::new(crate::scheduler::Scheduler::with_stderr_notifier());
     let dummy_reuse = crate::spawn::new_reuse_registry();
+    let dummy_worktrees = crate::issue_dispatch_run::new_worktree_registry();
     serve_attach_with_counter(
         listener,
         registry,
@@ -622,6 +623,7 @@ pub async fn serve_attach(
         None,
         dummy_scheduler,
         dummy_reuse,
+        dummy_worktrees,
     )
     .await
 }
@@ -644,6 +646,7 @@ pub async fn serve_attach_with_counter(
     shutdown: Option<Arc<tokio::sync::Notify>>,
     scheduler: Arc<crate::scheduler::Scheduler>,
     reuse_registry: crate::spawn::ReuseRegistry,
+    worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
 ) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
@@ -666,6 +669,7 @@ pub async fn serve_attach_with_counter(
                 let shutdown = shutdown.clone();
                 let scheduler = scheduler.clone();
                 let reuse_registry = reuse_registry.clone();
+                let worktree_registry = worktree_registry.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
                     // so a `handle_connection` task that panics or is dropped
@@ -703,6 +707,7 @@ pub async fn serve_attach_with_counter(
                         shutdown,
                         scheduler,
                         reuse_registry,
+                        worktree_registry,
                     )
                     .await
                     {
@@ -745,6 +750,7 @@ pub async fn run_attach_server_with_counter(
     info!("Attach protocol listening on {}", path.display());
     let dummy_scheduler = Arc::new(crate::scheduler::Scheduler::with_stderr_notifier());
     let dummy_reuse = crate::spawn::new_reuse_registry();
+    let dummy_worktrees = crate::issue_dispatch_run::new_worktree_registry();
     serve_attach_with_counter(
         listener,
         registry,
@@ -754,10 +760,12 @@ pub async fn run_attach_server_with_counter(
         None,
         dummy_scheduler,
         dummy_reuse,
+        dummy_worktrees,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: UnixStream,
     registry: Arc<AgentPtyRegistry>,
@@ -766,6 +774,7 @@ async fn handle_connection(
     shutdown: Option<Arc<tokio::sync::Notify>>,
     scheduler: Arc<crate::scheduler::Scheduler>,
     reuse_registry: crate::spawn::ReuseRegistry,
+    worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -996,11 +1005,15 @@ async fn handle_connection(
             // close. Without this, a closed pane's role/cwd would linger
             // in the maps and a subsequent `handle_delegate` aimed at
             // that role would still resolve the dead pane.
-            let pane_id_env = registry
-                .agent_records()
-                .into_iter()
-                .find(|r| r.id == id)
-                .and_then(|r| r.pane_id_env);
+            // Capture the agent's record once, BEFORE close_agent removes it.
+            // `pane_id_env` cleans up the daemon's per-pane role maps; the
+            // record's cwd/orchestration-cwd is how the PRD #120 M2.4 close
+            // watcher matches a dispatched issue agent to its worktree.
+            let stopping_record = registry.agent_records().into_iter().find(|r| r.id == id);
+            let pane_id_env = stopping_record.as_ref().and_then(|r| r.pane_id_env.clone());
+            let dispatched_worktree = stopping_record
+                .as_ref()
+                .and_then(crate::issue_dispatch_run::worktree_of_record);
             // PRD #92 F8 followup (auditor #1): `close_agent` runs the
             // synchronous SIGTERM-with-grace loop in
             // `terminate_child_with_grace_and_wait`, which calls
@@ -1034,6 +1047,18 @@ async fn handle_connection(
                 Ok(()) => {
                     if let Some(pane_id) = pane_id_env {
                         state.write().await.unregister_pane(&pane_id);
+                    }
+                    // PRD #120 M2.4: if this agent was dispatched into a per-issue
+                    // worktree, the tab close is its cleanup trigger — `git
+                    // worktree remove` the worktree (the clone is preserved) and
+                    // drop the registry entry. The child is already reaped (the
+                    // close above ran the SIGTERM-with-grace loop), so the
+                    // worktree is no longer a live cwd. No-op for ordinary agents.
+                    if let Some(worktree) = dispatched_worktree
+                        && let Some(clone) =
+                            crate::issue_dispatch_run::take_worktree(&worktree_registry, &worktree)
+                    {
+                        crate::issue_dispatch_run::remove_worktree(&worktree, &clone).await;
                     }
                     write_resp(&mut stream, &AttachResponse::ok()).await?
                 }
@@ -1161,6 +1186,7 @@ async fn handle_connection(
                 crate::daemon::schedule_callback_factory(
                     registry.clone(),
                     reuse_registry.clone(),
+                    worktree_registry.clone(),
                     event_tx.clone(),
                 ),
             );
