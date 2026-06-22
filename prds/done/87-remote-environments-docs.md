@@ -1,11 +1,16 @@
 # PRD #87: Remote Environments Documentation
 
-**Status**: Planning (re-scoped 2026-06-14 — most work already shipped; two cross-reference gaps remain)
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-05-16
-**Last Updated**: 2026-06-14
+**Last Updated**: 2026-06-22
+**Completed**: 2026-06-22
 **GitHub Issue**: [#87](https://github.com/vfarcic/dot-agent-deck/issues/87)
 **Depends on**: PRD #76 (Remote Agent Environments) — **shipped**.
+
+## Closure note (2026-06-22)
+
+Closed as **done**. The core deliverable shipped: all three pages — `docs/remote-environments.md`, `docs/remote-recipes.md`, `docs/remote-requirements.md` — exist and are published in `site/sidebars.js` under a "Remote Environments" category, so a docs-site reader can discover the remote workflow without leaving the sidebar (the primary Success Criterion). The two remaining cross-reference gaps the 2026-06-14 re-scope identified (a dedicated "Running on a remote host" callout in `getting-started.md`, and a remote-install note in `installation.md`) were judged unnecessary — the daemon "How it runs" section (PRD #93) and the existing inline remote links in `installation.md` already point readers at `remote-environments.md`. As the re-scope itself allowed, the PRD is closed as done rather than held open for those optional touches. Any future polish can be a small docs follow-up, not a reason to keep this PRD open.
 
 ## Validation refresh + re-scope (2026-06-14)
 

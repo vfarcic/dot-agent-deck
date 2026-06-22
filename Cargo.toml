@@ -61,3 +61,15 @@ e2e = []
 [[example]]
 name = "send_event"
 path = "examples/send_event.rs"
+
+# PRD #116: renders the exact config-gen prompt for a project directory so the
+# baseline-regeneration procedure can capture what the deck sends to the agent.
+[[example]]
+name = "render_config_gen_prompt"
+path = "examples/render_config_gen_prompt.rs"
+
+# PRD #116: region-based structured diff between a regenerated baseline and the
+# user-improved .dot-agent-deck.toml (M1.3 taxonomy).
+[[example]]
+name = "diff_config"
+path = "examples/diff_config.rs"

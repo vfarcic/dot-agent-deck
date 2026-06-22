@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.31.2] - 2026-06-21
+
+### Added
+
+- **Consent-based daemon restart and smarter connect behavior**
+  Version differences between the TUI and a running daemon no longer block you from connecting. Previously, any build-id difference — even a patch upgrade — triggered a hard failure that forced you to upgrade both sides immediately, stopping all running agents in the process.
+  The TUI-to-daemon attach handshake is now consent-based: when you run a newer TUI against an older daemon with **no running agents**, the daemon restarts silently and you connect normally. When **agents are running**, the prompt names each live agent and asks for confirmation before stopping them; declining keeps the existing daemon and all agents intact. Non-TTY and CI environments exit non-zero on a mandatory restart, preserving script behavior.
+  The blocking laptop-to-remote version comparison in `connect` is removed. An un-upgraded remote host now connects normally — no forced `remote upgrade` just because your laptop is one patch ahead. When your laptop is newer, an optional one-step nudge appears (`y` upgrades the remote and connects; `Enter`/`n` connects as-is); the nudge is skipped in non-TTY environments and never suggests a downgrade. The `AttachResponse` handshake now carries `running_agents` (count and names) and `daemon_version` as additive optional fields — forward-compatible with older daemons that omit them.
+  See [Installation](https://agent-deck.devopstoolkit.ai/docs/installation), [Remote Environments](https://agent-deck.devopstoolkit.ai/docs/remote-environments), and [Troubleshooting](https://agent-deck.devopstoolkit.ai/docs/troubleshooting) for updated behavior details.
+- **PRD Demo Reel**
+  At PRD completion, the pre-PR gate now automatically produces a single narrated MP4 that shows — for each e2e test the PRD added or changed — a readable title/description card followed immediately by that test's terminal recording, in catalog order. The reel is uploaded unlisted to YouTube and the URL is surfaced to the maintainer pre-merge and posted as a PR comment, making "watch the new behavior before approving" a one-click step instead of replaying individual asciinema casts.
+  The system is split into two components: a reusable **engine skill** (`.claude/skills/demo-reel/`) that accepts a format-agnostic manifest (`[{title, description, clip}]` where `clip` is a `.cast`, `.gif`, or `.mp4`) and produces a single stitched MP4 with per-entry title/description cards rendered as terminal frames through `agg`, and a **dot-agent-deck adapter** (`.claude/skills/demo-reel-adapter/`) that builds the manifest from the branch's new/changed `#[spec]` e2e tests by reading each test's `test.md` title and `## Scenario` paragraph. When the branch changed no e2e tests, both the reel step and the PR comment skip cleanly with a clear reason. The engine is also directly invocable by a human or CI via `reel.sh manifest.json [--publish]`.
+  Prerequisites — `agg`, `ffmpeg`, and a YouTube uploader — are added to `devbox.json`. A one-time YouTube OAuth refresh token must be provisioned by a human and stored via `vals` / `.env.vals.yaml`; the engine checks for all prerequisites and fails with an actionable message if any are missing.
+  See the [Demo Reel developer guide](https://github.com/vfarcic/dot-agent-deck/blob/main/docs/develop/demo-reel.md) for the manifest contract, credential setup, and local usage instructions.
+
+### Fixed
+
+- **Cross-version connect and agent-detection fixes**
+  Connecting a laptop one patch ahead of a remote no longer fails with a build-id mismatch error. The laptop-side `connect` version/build comparison that blocked this was removed; it compared the wrong pair (laptop binary vs remote binary rather than remote TUI vs remote daemon) and protected nothing.
+  When an older daemon omits the new `running_agents` field from the handshake response, the TUI now falls back to `list_agents()` to determine whether agents are running before deciding to restart. This prevents a silent agent kill when a newer TUI first attaches to an older daemon that does not yet send the field.
+
+
+
 ## [0.31.1] - 2026-06-21
 
 ### Fixed

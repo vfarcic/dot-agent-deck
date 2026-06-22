@@ -1,6 +1,6 @@
 # PRD #116: Analyze user-improved `.dot-agent-deck.toml` configs to refine the config-gen prompt
 
-**Status**: Planning
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-05-25
 **GitHub Issue**: [#116](https://github.com/vfarcic/dot-agent-deck/issues/116)
@@ -58,6 +58,8 @@ The deliverable is **not a new feature in the deck binary**. It is a repeatable 
 
 - A reviewer can open the pattern catalogue and see, per pattern, (a) which projects exhibit it, (b) what the AI generates, (c) what the user wrote instead, and (d) a proposed prompt or role-library change.
 - After the prompt/role-library edits land, regenerating the baseline for **at least 3 of the analyzed projects** produces a config that is qualitatively closer to the improved version than the pre-edit baseline (smaller diff in at least 2 of the structured regions). Documented in the validation section of the analysis output.
+
+  > **Outcome of this pass (2 of 3 — accepted, not silently relaxed).** This pass met the strict ≥2-region bar for **2 of the 3 required projects** (`dot-agent-deck`, `dot-ai`). The shortfall is structural, not a failed edit: all four landed patterns (P1–P4) concentrate in the single `[[orchestrations.roles]]` region, so a project gets at most two independent axes (roster + template-content) to improve, and two of the remaining candidates (`dot-ai-cli`, `youtube-automation`) already matched the user role roster before the edits — leaving them only the template-content axis (one region). The qualitative goal *was* met: P1–P4 all landed and reproduce reliably across every catalogued project. The original ≥3-project criterion above is **kept as written, not rewritten to "2"**, so the gap stays auditable per this PRD's honesty requirement. The author reviewed and **accepted** the 2-project result as the proven slice for this pass (matching the "ship after one full pass through Phase 3" risk guidance below); follow-up issue [#183](https://github.com/vfarcic/dot-agent-deck/issues/183) revisits the strict metric with a larger project set.
 - The re-run procedure is reproducible: a fresh checkout + the documented steps regenerates the baselines and diffs without manual fixup.
 - No regression in the existing `src/config_gen.rs` tests; if the prompt changes require updating assertion strings, those updates are intentional and called out in the commit message.
 - `cargo fmt --check` and `cargo clippy -- -D warnings` pass.
@@ -73,27 +75,27 @@ The deliverable is **not a new feature in the deck binary**. It is a repeatable 
 
 ### Phase 1: Tooling and pilot
 
-- [ ] **M1.1** — Inventory hand-improved configs. Walk the author's `~/code/` directory, list every `.dot-agent-deck.toml`, classify each as "AI-generated, untouched" / "lightly edited" / "substantially edited". Drop worktree duplicates of the same logical project. Output: a small table in the analysis dir.
-- [ ] **M1.2** — Define and implement the baseline regeneration procedure. Pin LLM provider, model, and any sampling parameters. Reproduce a baseline for one pilot project end-to-end. Capture the exact prompt sent (post-render) alongside the output for auditability.
-- [ ] **M1.3** — Define the structured diff. Choose region taxonomy (`init_command`, persistent panes, reactive rules, orchestration roles, role `prompt_template`s, etc.) and produce a readable diff for the pilot project.
-- [ ] **M1.4** — Pilot analysis: write up the pilot project's deltas with the proposed prompt changes they suggest. Use it to pressure-test the format before scaling.
+- [x] **M1.1** — Inventory hand-improved configs. Walk the author's `~/code/` directory, list every `.dot-agent-deck.toml`, classify each as "AI-generated, untouched" / "lightly edited" / "substantially edited". Drop worktree duplicates of the same logical project. Output: a small table in the analysis dir.
+- [x] **M1.2** — Define and implement the baseline regeneration procedure. Pin LLM provider, model, and any sampling parameters. Reproduce a baseline for one pilot project end-to-end. Capture the exact prompt sent (post-render) alongside the output for auditability.
+- [x] **M1.3** — Define the structured diff. Choose region taxonomy (`init_command`, persistent panes, reactive rules, orchestration roles, role `prompt_template`s, etc.) and produce a readable diff for the pilot project.
+- [x] **M1.4** — Pilot analysis: write up the pilot project's deltas with the proposed prompt changes they suggest. Use it to pressure-test the format before scaling.
 
 ### Phase 2: Fan out and catalogue
 
-- [ ] **M2.1** — Regenerate baselines for the remaining substantially-edited projects identified in M1.1.
-- [ ] **M2.2** — Produce per-project diff artifacts using the M1.3 format.
-- [ ] **M2.3** — Aggregate into the pattern catalogue: each pattern names the gap, lists the projects that exhibit it, shows representative before/after snippets, and proposes a prompt or role-library edit.
+- [x] **M2.1** — Regenerate baselines for the remaining substantially-edited projects identified in M1.1.
+- [x] **M2.2** — Produce per-project diff artifacts using the M1.3 format.
+- [x] **M2.3** — Aggregate into the pattern catalogue: each pattern names the gap, lists the projects that exhibit it, shows representative before/after snippets, and proposes a prompt or role-library edit.
 
 ### Phase 3: Apply prompt edits and validate
 
-- [ ] **M3.1** — Land the prompt and role-library edits derived from the catalogue. Keep them targeted — one edit per identified pattern, with the catalogue entry referenced in the commit body. Update `src/config_gen.rs` tests only if the assertions need to track the change.
-- [ ] **M3.2** — Regenerate baselines a second time using the updated prompt. Diff against the user-improved configs again. Document the residual gap per project.
-- [ ] **M3.3** — Document the re-run procedure (where the scripts live, how to invoke them, where outputs go) so this analysis can be repeated as more projects are added.
+- [x] **M3.1** — Land the prompt and role-library edits derived from the catalogue. Keep them targeted — one edit per identified pattern, with the catalogue entry referenced in the commit body. Update `src/config_gen.rs` tests only if the assertions need to track the change.
+- [x] **M3.2** — Regenerate baselines a second time using the updated prompt. Diff against the user-improved configs again. Document the residual gap per project.
+- [x] **M3.3** — Document the re-run procedure (where the scripts live, how to invoke them, where outputs go) so this analysis can be repeated as more projects are added.
 
 ### Phase 4: Wrap-up
 
-- [ ] **M4.1** — Cross-check: confirm `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` all pass.
-- [ ] **M4.2** — Open follow-up issues for any pattern that surfaces but cannot be solved by a prompt change alone (e.g. requires a deck-binary feature). Do not bundle those into this PRD.
+- [x] **M4.1** — Cross-check: confirm `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` all pass.
+- [x] **M4.2** — Open follow-up issues for any pattern that surfaces but cannot be solved by a prompt change alone (e.g. requires a deck-binary feature). Do not bundle those into this PRD.
 
 ## Risks and Mitigations
 
