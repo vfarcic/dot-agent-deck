@@ -1,6 +1,6 @@
 # PRD #176: Desktop GUI app — alternative front-end to the TUI
 
-**Status**: Not Started
+**Status**: In Progress
 **Priority**: Medium
 **Created**: 2026-06-20
 **GitHub Issue**: [#176](https://github.com/vfarcic/dot-agent-deck/issues/176)
@@ -99,6 +99,8 @@ It does not re-implement the TUI's rendering, does not hold orchestration logic,
 
 7. **Conceptual parity, not implementation parity.** Shared concepts (decks, tabs, panes, focus) must feel coherent across both front-ends, but their code is independent and the GUI is free to diverge where GUI-native affordances are better. Chasing literal parity is the named non-goal because it is what converts a complementary app into a permanent two-front-end maintenance burden.
 
+8. **GUI test suite (web e2e + throughput stress) deferred to a follow-up task; the build is validated by hand until then.** Per the maintainer's call (2026-06-22), the initial build prioritizes a launchable, visibly-working GUI over its automated test layer. The web component/e2e tests for the chrome (M2.1/M2.2), the M1.3 **throughput stress harness**, and the one terminal round-trip are deferred to a dedicated follow-up testing task (see M5.2). The Rust-side tests already in place remain authoritative and stay in `cargo test-fast`: the protocol crate's migrated round-trip tests (M1.1) and the GUI core's connect/`Hello`/bridge integration test (M1.2). The Tauri build toolchain (WebKitGTK and friends) is provisioned **cross-platform via `devbox.json` nix packages** — not OS-specific `apt` commands — because the maintainer develops on both macOS (system WebView, no extra libs) and Linux (webkitgtk).
+
 ## Success Criteria
 
 - The GUI connects to the running daemon over the existing socket, completes the `Hello` handshake, lists agents, and renders the same decks/tabs the TUI shows — driven entirely by existing protocol responses, with **zero** daemon changes for this path.
@@ -115,9 +117,9 @@ It does not re-implement the TUI's rendering, does not hold orchestration logic,
 
 ### Phase 1 — Foundations & the throughput risk
 
-- [ ] **M1.1** — Extract a `protocol` Cargo workspace crate from the current binary (wire types, frame codecs, `AgentRecord`, event structs). TUI/CLI/tests depend on it; migrated round-trip tests stay green; no behavior change.
-- [ ] **M1.2** — Tauri app skeleton as a workspace member: Rust core connects to the daemon socket via `protocol`, performs `Hello` version negotiation, and bridges frames to the webview. JS toolchain contained in the GUI subdirectory.
-- [ ] **M1.3** — Single embedded terminal pane: `AttachStream` → xterm.js round-trip, bidirectional, with single-slot resize coalescing **and a defined throughput stress test** (multiple busy panes; measure responsiveness/loss over Tauri IPC). This is the load-bearing feasibility check.
+- [x] **M1.1** — Extract a `protocol` Cargo workspace crate from the current binary (wire types, frame codecs, `AgentRecord`, event structs). TUI/CLI/tests depend on it; migrated round-trip tests stay green; no behavior change. **Done** — `crates/protocol`; wire byte-identical (`PROTOCOL_VERSION` unchanged at 3, no `.breaking.md`); 44 migrated round-trip tests green via re-export shims.
+- [x] **M1.2** — Tauri app skeleton as a workspace member: Rust core connects to the daemon socket via `protocol`, performs `Hello` version negotiation, and bridges frames to the webview. JS toolchain contained in the GUI subdirectory. **Done** — `gui/core` (`dad-gui-core`, testable connect/`Hello`/bridge lib, workspace member) + `gui/src-tauri` (`dad-gui`, thin Tauri v2 shell, workspace-excluded so missing webview libs can't break Rust gates) + `gui/dist` vanilla frontend; socket discovery centralized in `protocol::socket` (TUI delegates to it); connect/`Hello`/bridge integration test green in `test-fast`.
+- [ ] **M1.3** — Single embedded terminal pane: `AttachStream` → xterm.js round-trip, bidirectional, with single-slot resize coalescing **and a defined throughput stress test** (multiple busy panes; measure responsiveness/loss over Tauri IPC). This is the load-bearing feasibility check. _Pane functionality is built and validated by hand in this slice; the **throughput stress test is deferred** to the follow-up GUI test task (Design Decision #8)._
 
 ### Phase 2 — GUI-native chrome
 
@@ -136,7 +138,7 @@ It does not re-implement the TUI's rendering, does not hold orchestration logic,
 ### Phase 5 — Packaging, tests, docs & release gate
 
 - [ ] **M5.1** — Opt-in packaging: a separate build target/artifact, excluded from the default release, labeled preview/opt-in.
-- [ ] **M5.2** — Tests: `protocol`-crate and core bridge/handshake (Rust); lightweight web component/e2e for chrome + one terminal round-trip; daemon event-emission coverage.
+- [ ] **M5.2** — Tests: `protocol`-crate and core bridge/handshake (Rust); lightweight web component/e2e for chrome + one terminal round-trip; daemon event-emission coverage. **(The web component/e2e + terminal round-trip + M1.3 throughput stress are the deferred follow-up testing task — Design Decision #8; the Rust `protocol`/core tests already landed in M1.1/M1.2.)**
 - [ ] **M5.3** — Docs: developer build/run + toolchain doc under `docs/develop/` (linked from `CONTRIBUTING.md`); user doc once past spike quality; changelog fragment via `dot-ai-changelog-fragment`.
 - [ ] **M5.4** — Pre-PR gate: `cargo test-e2e` green; review (Greptile) settled per CLAUDE.md rule 8.
 

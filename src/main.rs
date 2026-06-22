@@ -996,9 +996,7 @@ fn run_connect(name: Option<String>) -> ExitCode {
 /// with `AttachResponse::hello` — any divergence silently breaks the
 /// handshake.
 fn run_daemon_hello_cli() -> ExitCode {
-    let resp = dot_agent_deck::daemon_protocol::AttachResponse::hello(
-        dot_agent_deck::daemon_protocol::PROTOCOL_VERSION,
-    );
+    let resp = dot_agent_deck::daemon_protocol::hello_response();
     let json = match serde_json::to_string(&resp) {
         Ok(j) => j,
         Err(e) => {

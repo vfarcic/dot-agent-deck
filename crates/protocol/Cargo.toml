@@ -1,0 +1,23 @@
+[package]
+name = "protocol"
+version = "0.1.0"
+edition = "2024"
+
+# PRD #176 M1.1: the shared daemon wire-protocol crate. Extracted from the
+# `dot-agent-deck` binary so the TUI, the CLI daemon commands, the tests, and
+# the future desktop GUI core all depend on ONE definition of the protocol.
+# Deliberately minimal deps — no TUI/daemon-only crates (ratatui, portable-pty,
+# clap, …) may leak in here, so a GUI/web client can link it cheaply.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+# PRD #176 M1.2: `socket::current_uid` namespaces the `/tmp` fallback socket
+# paths per user via `getuid(2)`. libc is tiny and not a TUI/daemon-only crate,
+# so it doesn't violate this crate's "minimal deps" rule.
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "rt"] }

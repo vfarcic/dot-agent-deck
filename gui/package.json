@@ -1,0 +1,16 @@
+{
+  "name": "dot-agent-deck-gui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PRD #176 desktop GUI (Tauri) — opt-in second front-end to the dot-agent-deck daemon. All JS build tooling is contained in this directory and never leaks into the Rust workspace gates.",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0"
+  }
+}

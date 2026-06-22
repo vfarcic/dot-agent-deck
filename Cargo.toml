@@ -1,10 +1,25 @@
 [workspace]
 members = [
     ".",
+    "crates/protocol",
+    "gui/core",
     "xtask/docs",
     "xtask/linkage-check",
     "xtask/spec",
 ]
+# PRD #176 M1.2: the GUI core is a plain-Rust lib (no webview deps), so it
+# joins the default set the Rust gates run over — `cargo fmt`/`clippy`/`test`
+# /`test-fast` exercise it with no extra flags. The root binary and the GUI
+# core are the default members; `crates/protocol` and the `xtask/*` helpers
+# stay members-but-not-default exactly as before (their tests run via `-p` or
+# `--workspace`).
+default-members = [".", "gui/core"]
+# PRD #176 M1.2 / Risks ("JS toolchain must not pollute the Rust gates"): the
+# Tauri shell depends on `tauri`, which needs the system WebKitGTK dev
+# libraries. Excluding it keeps it OUT of every workspace build/lock so a
+# missing webview lib can never break `cargo fmt`/`clippy`/`test-fast`. Build
+# it deliberately from `gui/` once the webview toolchain is provisioned.
+exclude = ["gui/src-tauri"]
 
 [package]
 name = "dot-agent-deck"
@@ -12,6 +27,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# PRD #176 M1.1: shared daemon wire types (frame codec, AttachRequest/Response,
+# AgentRecord, event structs). The binary re-exports these from
+# `daemon_protocol` / `event` / `agent_pty` so existing call sites are unchanged.
+protocol = { path = "crates/protocol" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

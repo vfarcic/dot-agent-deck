@@ -1,0 +1,32 @@
+[package]
+name = "dad-gui-core"
+version = "0.1.0"
+edition = "2024"
+description = """
+PRD #176 desktop GUI core: a plain-Rust daemon client (socket discovery, \
+connect, Hello version negotiation, frame bridge) shared by the Tauri shell. \
+Holds NO webview/JS/Tauri deps, so the Rust gates (fmt/clippy/test-fast) \
+compile and exercise it directly while the shell that needs WebKitGTK stays \
+workspace-excluded.
+"""
+
+# PRD #176 Design Decision #1: the GUI is a *fourth client* of the daemon — it
+# holds no business logic and depends on the shared `protocol` wire types by
+# path, never redefining them.
+[dependencies]
+protocol = { path = "../../crates/protocol" }
+tokio = { version = "1", features = [
+    "net",
+    "io-util",
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

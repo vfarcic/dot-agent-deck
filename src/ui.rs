@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -61,15 +60,10 @@ fn text_dim() -> Style {
         .add_modifier(Modifier::DIM)
 }
 
-impl fmt::Display for crate::event::AgentType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            crate::event::AgentType::ClaudeCode => write!(f, "ClaudeCode"),
-            crate::event::AgentType::OpenCode => write!(f, "OpenCode"),
-            crate::event::AgentType::None => write!(f, "No agent"),
-        }
-    }
-}
+// PRD #176 M1.1: the `Display for AgentType` impl moved to the `protocol`
+// crate alongside the type itself — the binary can't implement a std trait
+// for a type it no longer owns (orphan rule), and the rendering is shared by
+// every client.
 
 // ---------------------------------------------------------------------------
 // Platform-aware modifier key label

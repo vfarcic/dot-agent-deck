@@ -1,0 +1,213 @@
+/* M1.3 GUI preview: sidebar (connection + agent picker) and a live terminal
+   pane (xterm.js). Dark theme so the embedded terminal reads naturally. */
+
+:root {
+  --bg: #0d1017;
+  --panel: #141a2e;
+  --panel-2: #1b2238;
+  --border: #283250;
+  --text: #d7def0;
+  --muted: #8893b0;
+  --accent: #5b8cff;
+  --ok: #3fb950;
+  --err: #f85149;
+  --warn: #d29922;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+}
+
+.app {
+  display: flex;
+  height: 100vh;
+}
+
+/* ---- Sidebar ---- */
+.sidebar {
+  width: 250px;
+  min-width: 250px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 14px;
+  gap: 12px;
+  overflow-y: auto;
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 16px;
+  letter-spacing: 0.2px;
+}
+
+.brand .preview {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.conn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--warn);
+  flex: 0 0 auto;
+}
+
+.conn.ok .dot {
+  background: var(--ok);
+}
+.conn.err .dot {
+  background: var(--err);
+}
+
+.detail {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.detail dt {
+  white-space: nowrap;
+}
+.detail dd {
+  margin: 0;
+  word-break: break-all;
+  color: var(--text);
+}
+
+.btn {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.btn:hover {
+  border-color: var(--accent);
+}
+.btn.small {
+  padding: 3px 8px;
+}
+
+.agents {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-height: 0;
+}
+.agents-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.agents-head h2 {
+  margin: 0;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--muted);
+}
+
+.agent-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+}
+.agent-list li.empty {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 6px 2px;
+}
+.agent-list button {
+  width: 100%;
+  text-align: left;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 8px 10px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.agent-list button:hover {
+  border-color: var(--border);
+}
+.agent-list button.active {
+  border-color: var(--accent);
+  background: #21304f;
+}
+.agent-list .aid {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+/* ---- Terminal pane ---- */
+.pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  position: relative;
+}
+.pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  font-weight: 600;
+}
+.terminal {
+  flex: 1;
+  min-height: 0;
+  padding: 6px 8px;
+  background: #000;
+}
+.overlay {
+  position: absolute;
+  inset: 41px 0 0 0; /* below the head bar */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  color: var(--muted);
+  text-align: center;
+  padding: 24px;
+}
+.overlay[hidden] {
+  display: none;
+}

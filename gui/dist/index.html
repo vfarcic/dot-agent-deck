@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>dot-agent-deck</title>
+    <link rel="stylesheet" href="vendor/xterm/xterm.css" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <header class="brand">
+          <h1>dot-agent-deck</h1>
+          <span class="preview">GUI preview · M1.3</span>
+        </header>
+
+        <section class="conn">
+          <span id="status-dot" class="dot"></span>
+          <span id="status-label">Connecting…</span>
+        </section>
+        <dl id="status-detail" class="detail"></dl>
+        <button id="retry" class="btn" hidden>Retry connection</button>
+
+        <section class="agents">
+          <div class="agents-head">
+            <h2>Agents</h2>
+            <button id="refresh" class="btn small" title="Refresh agent list">↻</button>
+          </div>
+          <ul id="agent-list" class="agent-list">
+            <li class="empty">No agents yet.</li>
+          </ul>
+        </section>
+      </aside>
+
+      <main class="pane">
+        <header class="pane-head">
+          <span id="pane-title">No terminal attached</span>
+          <button id="detach" class="btn small" hidden>Detach</button>
+        </header>
+        <div id="terminal" class="terminal"></div>
+        <div id="overlay" class="overlay">
+          <p>Select an agent on the left to open its live terminal.</p>
+        </div>
+      </main>
+    </div>
+
+    <script src="vendor/xterm/xterm.js"></script>
+    <script src="vendor/xterm/addon-fit.js"></script>
+    <script src="main.js"></script>
+  </body>
+</html>

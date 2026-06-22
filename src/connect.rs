@@ -1457,7 +1457,7 @@ mod tests {
                 // build_version == local_build_id(), which is exactly what
                 // probe_remote_protocol compares against in-process — so the
                 // handshake matches without any env juggling.
-                let body = serde_json::to_string(&AttachResponse::hello(PROTOCOL_VERSION))
+                let body = serde_json::to_string(&crate::daemon_protocol::hello_response())
                     .expect("serialize hello");
                 Ok(SshOutput {
                     status: 0,
@@ -1504,7 +1504,7 @@ mod tests {
     impl SshExecutor for UnreachableAfterFirstConnectExecutor {
         fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
             if command.contains("daemon hello") {
-                let body = serde_json::to_string(&AttachResponse::hello(PROTOCOL_VERSION))
+                let body = serde_json::to_string(&crate::daemon_protocol::hello_response())
                     .expect("serialize hello");
                 return Ok(SshOutput {
                     status: 0,
@@ -1651,7 +1651,7 @@ mod tests {
     impl SshExecutor for VersionExecutor {
         fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
             if command.contains("daemon hello") {
-                let body = serde_json::to_string(&AttachResponse::hello(PROTOCOL_VERSION))
+                let body = serde_json::to_string(&crate::daemon_protocol::hello_response())
                     .expect("serialize hello");
                 Ok(SshOutput {
                     status: 0,

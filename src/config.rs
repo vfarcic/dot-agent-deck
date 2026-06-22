@@ -48,54 +48,26 @@ pub fn config_keys_help() -> String {
     help
 }
 
+/// Path of the daemon's hook-ingestion Unix socket (line-delimited JSON).
+///
+/// PRD #176 M1.2: the env/XDG/`/tmp`-per-uid resolution now lives in
+/// [`protocol::socket_path`] so the TUI, the CLI, and the desktop GUI core
+/// share ONE definition and can't drift. Kept as a thin re-export for the
+/// binary's existing call sites.
 pub fn socket_path() -> PathBuf {
-    if let Ok(path) = std::env::var("DOT_AGENT_DECK_SOCKET") {
-        return PathBuf::from(path);
-    }
-
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("dot-agent-deck.sock");
-    }
-
-    // PRD #93 reviewer REV-2: the `/tmp` fallback must include the uid so
-    // two users on the same host can't collide on the same socket path
-    // (the daemon is per-user; the 0o600 mode is on the socket inode, but
-    // the *path* still has to be unique, otherwise the loser's `bind(2)`
-    // sees `EADDRINUSE` against the winner's inode). Same rationale as
-    // `attach_socket_path` below.
-    PathBuf::from(format!("/tmp/dot-agent-deck-{}.sock", current_uid()))
+    protocol::socket_path()
 }
 
-/// Path of the M1.2 streaming-attach Unix socket. Separate from the existing
+/// Path of the M1.2 streaming-attach Unix socket. Separate from the
 /// hook-ingestion socket (PRD #76 line 219) so the two protocols have
 /// disjoint, clearly-typed wire formats: hook ingestion is line-delimited
-/// JSON, attach is a binary frame protocol (see `daemon_protocol`). Same
-/// XDG-aware resolution pattern as `socket_path`, with `DOT_AGENT_DECK_ATTACH_SOCKET`
-/// as the explicit override.
+/// JSON, attach is a binary frame protocol (see `daemon_protocol`).
+///
+/// PRD #176 M1.2: resolution delegated to [`protocol::attach_socket_path`] —
+/// the GUI core connects through that same function so a second front-end can
+/// never invent a divergent socket path.
 pub fn attach_socket_path() -> PathBuf {
-    if let Ok(path) = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET") {
-        return PathBuf::from(path);
-    }
-
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("dot-agent-deck-attach.sock");
-    }
-
-    // PRD #93 reviewer REV-2: include the uid in the `/tmp` fallback path so
-    // two users on the same host get disjoint sockets (each daemon's
-    // `bind(2)` would otherwise collide with the other user's inode), and
-    // so the path itself can't be observed by another user to figure out
-    // *which* deck process to target. The 0o600 mode on the inode is
-    // already enforced; the per-user path is the missing half.
-    PathBuf::from(format!("/tmp/dot-agent-deck-attach-{}.sock", current_uid()))
-}
-
-/// Current OS uid, used to namespace the `/tmp` fallback sockets per user.
-/// Wraps `libc::getuid` so the unsafe is centralized in one place.
-fn current_uid() -> u32 {
-    // SAFETY: `getuid(2)` is async-signal-safe and has no failure mode; it
-    // simply returns the calling process's real uid.
-    unsafe { libc::getuid() }
+    protocol::attach_socket_path()
 }
 
 /// Per-user state directory. Used by lazy-spawn (PRD #76 M4.3) for the
