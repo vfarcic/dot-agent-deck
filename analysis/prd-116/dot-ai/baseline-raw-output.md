@@ -1,0 +1,82 @@
+**Rationale:**
+This is a TypeScript/Node.js project (dot-ai MCP server) with mandatory Kubernetes integration testing. The devbox.json defines the reproducible environment and agent launchers (`agent-new` for full-power implementation, `agent-medium` for lighter review/release tasks). The project requires both fast unit tests (`npm run test:unit`) and heavy integration tests (`npm run test:integration`) before PR/merge, so the coder role must run both tiers. The prds/ directory contains 35 spec files, and the orchestrator has access to `/dot-ai-prd-next`, `/dot-ai-prd-done`, and related coordination skills. A 4-role orchestration (orchestrator, coder, reviewer, release) matches the clear release-flow signals (ci.yml gate, release.yml workflow, `/dot-ai-prd-done` skill). For persistent monitoring, `git status -s` shows in-flight changes; reactive rules capture fast checks (npm test/lint) and git inspection, totaling 3 side panes.
+
+```toml
+[[modes]]
+name = "dev"
+init_command = "devbox shell"
+reactive_panes = 2
+
+[[modes.panes]]
+name = "git status"
+command = "git status -s"
+watch = true
+
+[[modes.rules]]
+pattern = "npm run (test:unit|test:integration|lint)"
+watch = false
+
+[[modes.rules]]
+pattern = "git (log|diff|show|status)"
+watch = false
+
+[[orchestrations]]
+name = "dev-flow"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-new"
+start = true
+prompt_template = """
+You coordinate the dev team. You NEVER do implementation, review, or release work yourself — only delegate.
+
+Workflow:
+1. Use /dot-ai-prd-next to identify the next task from prds/.
+2. Delegate implementation to coder. Coder must run both npm run test:unit and npm run test:integration before finishing.
+3. Delegate review to reviewer for code quality.
+4. Summarize what to test end-to-end and STOP — wait for user approval before proceeding to release.
+5. Delegate to release to open a PR and merge via /dot-ai-prd-done.
+
+Context-handoff rule (CRITICAL): Every worker cold-starts with no memory of prior conversation or other workers' outputs. Whatever you write in --task is their entire context. Therefore:
+- Always include the spec file path from prds/ if referenced in the task.
+- Include file paths the worker should read.
+- When chaining workers (e.g., coder → reviewer), paste the changed files or a summary of what was implemented.
+- When retrying after failure, include the exact error message in --task.
+- If context is long, write it to .dot-agent-deck/<task-slug>.md and reference that path instead of pasting inline.
+"""
+
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-new"
+description = "Implements features, fixes bugs, refactors code"
+prompt_template = """
+Implement the requested change. If a spec is referenced, read it from prds/ first.
+Run npm run test:unit (fast unit tests) first to validate.
+Then run npm run test:integration with a scoped pattern to validate the full integration suite.
+If tests fail, investigate and fix the code until all tests pass.
+Report completion only when tests are green.
+"""
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run agent-medium"
+description = "Reviews code changes for correctness, style, and edge cases"
+prompt_template = """
+Review the code changes. Report findings only — do not modify code.
+Focus on correctness, consistency with the rest of the codebase, edge cases, and spec compliance.
+If a spec file is referenced, verify the implementation matches it.
+If critical context is missing from the task, surface it in your work-done summary rather than guessing.
+"""
+
+[[orchestrations.roles]]
+name = "release"
+command = "devbox run agent-medium"
+description = "Runs the project's release/PR/merge workflow"
+clear = false
+prompt_template = """
+Your job is to open a PR and merge it via /dot-ai-prd-done.
+Do NOT modify source code.
+If any step fails, report the exact error and stop — do not attempt to fix code yourself.
+If critical context is missing (e.g., PR title, release notes path), report that in your work-done summary.
+"""
+```
