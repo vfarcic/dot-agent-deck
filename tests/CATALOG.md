@@ -1924,6 +1924,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the refcount/registry internals (counted at spawn, decremented per close) — only the observable last-close-removes contract; the single-role close path (covered by `scheduler/dispatch/006`).
 - **Platform coverage:** mac+linux.
 
+##### scheduler/dispatch/010 — With the `experimental` flag OFF a valid `issue_dispatch` task stays inert (no clone/worktree/spawn) and surfaces a one-line "experimental / how to enable" notice (PRD #120 LATE DECISION 2026-06-22 — ships behind the experimental flag).
+- **Layer:** L2 (as `scheduler/dispatch/001`, but the daemon-spawn env OMITS `DOT_AGENT_DECK_EXPERIMENTAL`, so the activation gate in `make_schedule_callback` keeps the task inert; the stub `gh` still reports one open issue and the fixture remote is present).
+- **Agent:** none (run-now; observes the absence of the per-issue worktree/clone, a zero orchestrator count, and daemon stderr).
+- **Asserts:** after the fire the `derive_issue_paths` worktree dir does NOT exist, the clone dir does NOT exist, no orchestrator agent is spawned (count 0), and the notifier (daemon stderr) carries a notice referencing `experimental` plus how to `enable` it. The startup banner always logs "experimental flag: OFF", so the meaningful signal is the how-to-enable instruction, which baseline daemon stderr never emits.
+- **Does not assert:** the exact notice wording (loose substring on `experimental` + `enable`); config parsing of `[scheduled_tasks.issue_dispatch]` when the flag is off (still parses — unit-tested); the flag-ON dispatch flow (covered by `scheduler/dispatch/001-009`, which set `DOT_AGENT_DECK_EXPERIMENTAL=1`).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/reuse
 
 ##### scheduler/reuse/001 — Two fires of a `new_tab_per_fire = false` task reuse one tab and re-deliver the prompt into the same pane (PRD #127 M2.2).
