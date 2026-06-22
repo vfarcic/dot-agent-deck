@@ -112,6 +112,10 @@ async fn start_server_with_state(
     let client_count = Arc::new(AtomicUsize::new(0));
     let scheduler = Arc::new(dot_agent_deck::scheduler::Scheduler::with_stderr_notifier());
     let reuse = dot_agent_deck::spawn::new_reuse_registry();
+    // PRD #120 added a 9th `worktree_registry` arg to `serve_attach_with_counter`;
+    // this rehydration harness doesn't exercise issue dispatch, so it passes the
+    // same empty stand-in the non-orchestration callers use.
+    let worktrees = dot_agent_deck::issue_dispatch_run::new_worktree_registry();
     let registry_for_task = registry.clone();
     let handle = tokio::spawn(async move {
         let _ = serve_attach_with_counter(
@@ -123,6 +127,7 @@ async fn start_server_with_state(
             None,
             scheduler,
             reuse,
+            worktrees,
         )
         .await;
     });

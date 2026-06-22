@@ -750,6 +750,9 @@ mod tests {
             agent_type: None,
             rows: 24,
             cols: 80,
+            // PRD #162: no live session state in this cwd-derivation fixture;
+            // matches the registry's own `agent_records()` default (`None`).
+            live: None,
         }
     }
 
