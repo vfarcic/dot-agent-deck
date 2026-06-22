@@ -1,6 +1,6 @@
 # PRD #120: Scheduled agent dispatch on open GitHub issues
 
-**Status**: Implementation complete (2026-06-22) — Phases 1–4 landed on branch `prd-120-scheduled-agent-dispatch-on-open-github-issues` (commits `ee3c56b` → `2032eb3`); reviewer + auditor findings resolved and the full e2e gate is green. Remaining before close: open the PR, the user's manual end-to-end validation at the merge gate, and filing the M4.2 follow-up issues. Design decisions locked 2026-06-20 — see [Design decisions](#design-decisions-2026-06-20).
+**Status**: Complete (2026-06-22) — PR merged, issue #120 closed. Phases 1–4 landed; all e2e tests green. Follow-ups: M4.2 issues (graduate-experimental n/a — shipped visible; open PR dedup branch-name improvement).
 **Priority**: Medium
 **Created**: 2026-05-25
 **GitHub Issue**: [#120](https://github.com/vfarcic/dot-agent-deck/issues/120)
