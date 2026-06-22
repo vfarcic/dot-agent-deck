@@ -25,7 +25,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use dad_gui_core::{
     AgentRecord, ConnectionState, ResizeHandle, attach_socket_path, attach_stream,
-    connect_and_handshake, list_agents, resize_channel, run_resize_worker,
+    connect_or_autostart, list_agents, resize_channel, run_resize_worker,
 };
 use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
@@ -135,18 +135,21 @@ fn publish(app: &AppHandle, state: ConnectionState) {
     }
 }
 
-/// Connect + `Hello` version negotiation, then drop the probe connection (M1.3
-/// streams agent output over its own per-agent attach connections, so the Hello
-/// socket is only used to confirm reachability + version). Any failure
-/// publishes the matching [`ConnectionState`] so the frontend shows a
-/// connect/retry affordance.
+/// Auto-start the daemon if needed, connect + `Hello` version negotiation, then
+/// drop the probe connection (M1.3 streams agent output over its own per-agent
+/// attach connections, so the Hello socket is only used to confirm
+/// reachability + version). Launching the GUI with no daemon running brings the
+/// daemon up here — mirroring the TUI's always-external bootstrap (PRD #93) —
+/// rather than asking the user to start it. Any failure publishes the matching
+/// [`ConnectionState`] so the frontend shows a connect/retry affordance with a
+/// clear reason (binary not found, spawn failed, socket never appeared).
 async fn bootstrap_connection(app: AppHandle) {
     publish(&app, ConnectionState::Connecting);
     let socket = attach_socket_path();
-    match connect_and_handshake(&socket, Some(client_build_version())).await {
+    match connect_or_autostart(&socket, Some(client_build_version())).await {
         Ok(conn) => publish(&app, conn.state()),
         Err(err) => {
-            tracing::info!(error = %err, "daemon connect/handshake failed");
+            tracing::info!(error = %err, "daemon connect/auto-start failed");
             publish(&app, ConnectionState::from_connect_error(&err));
         }
     }

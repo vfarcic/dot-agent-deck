@@ -7,7 +7,11 @@
 //!    [`protocol::attach_socket_path`], the exact function the TUI uses);
 //! 2. connects and performs the [`protocol`] `Hello` version-negotiation
 //!    handshake (mirroring the binary's `build_version_handshake::probe_daemon`
-//!    flow — send our [`protocol::PROTOCOL_VERSION`], compare the daemon's);
+//!    flow — send our [`protocol::PROTOCOL_VERSION`], compare the daemon's),
+//!    **auto-starting the daemon** if none is reachable (see [`ensure_daemon`]
+//!    and [`connect_or_autostart`]) — exactly like the TUI's always-external
+//!    daemon bootstrap (PRD #93), so launching the GUI alone brings the daemon
+//!    up;
 //! 3. bridges length-prefixed daemon frames to/from a channel the Tauri shell
 //!    pumps into the webview.
 //!
@@ -24,6 +28,7 @@
 
 mod agent;
 mod client;
+mod daemon;
 
 pub use agent::{
     AgentStream, AgentStreamReader, AgentStreamWriter, ClientError, ResizeHandle, attach_stream,
@@ -31,8 +36,9 @@ pub use agent::{
 };
 pub use client::{
     BridgeFrame, BridgeReader, BridgeWriter, ConnectError, ConnectionState, DaemonConnection,
-    connect_and_handshake, run_bridge,
+    connect_and_handshake, connect_or_autostart, run_bridge,
 };
+pub use daemon::{DAEMON_BIN_ENV, EnsureDaemonError, ensure_daemon};
 
 /// The per-agent snapshot the daemon echoes over `list-agents`, re-exported so
 /// the Tauri shell names the same wire type the core returns from

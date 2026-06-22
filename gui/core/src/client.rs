@@ -21,6 +21,8 @@ use protocol::{
     AttachRequest, AttachResponse, KIND_REQ, KIND_RESP, PROTOCOL_VERSION, read_frame, write_frame,
 };
 
+use crate::daemon::{EnsureDaemonError, ensure_daemon};
+
 /// One length-prefixed daemon frame bridged toward the webview. For M1.2 this
 /// carries the raw `(kind, payload)` so the wiring is generic; the live
 /// terminal stream (`KIND_STREAM_OUT`) and its efficient transport land in
@@ -51,6 +53,28 @@ pub enum ConnectError {
          (recycle the daemon so both run the same build)"
     )]
     VersionMismatch { local: u32, remote: Option<u32> },
+    /// No daemon was reachable and the GUI's attempt to auto-start one failed
+    /// (binary not found, spawn failed, or the socket never appeared). Carries
+    /// the underlying [`EnsureDaemonError`] whose `Display` is the user-facing
+    /// reason shown in the connect/retry state.
+    #[error("could not auto-start the daemon: {0}")]
+    DaemonAutostart(#[source] EnsureDaemonError),
+}
+
+impl ConnectError {
+    /// Whether the failure means "no daemon is listening" — the only class that
+    /// warrants auto-starting one. A missing socket file ([`SocketMissing`]) or
+    /// a refused/failed connect ([`Connect`], e.g. a stale socket whose binder
+    /// died) qualify. A daemon that *answered* but rejected, replied
+    /// malformed, or negotiated an incompatible version does NOT — spawning a
+    /// second daemon can't fix a reachable-but-wrong one, so those surface
+    /// as-is.
+    fn is_daemon_unreachable(&self) -> bool {
+        matches!(
+            self,
+            ConnectError::SocketMissing(_) | ConnectError::Connect(_)
+        )
+    }
 }
 
 /// The connection state the webview renders. `Serialize` so the Tauri shell
@@ -214,6 +238,51 @@ pub async fn connect_and_handshake(
             remote: other,
         }),
     }
+}
+
+/// Connect to the daemon at `socket_path`, **auto-starting one** if none is
+/// reachable, then perform the `Hello` handshake — the GUI's launch path
+/// (PRD #176). This mirrors the TUI: the always-external daemon (PRD #93) is
+/// brought up on demand rather than asked-for, so launching the GUI alone is
+/// enough to get connected.
+///
+/// Flow:
+/// 1. Try [`connect_and_handshake`] against an already-running daemon.
+/// 2. If that fails *only because no daemon is listening*
+///    ([`ConnectError::is_daemon_unreachable`]), run [`ensure_daemon`] to
+///    fork-exec one (binary resolved per [`crate::daemon`], socket polled with
+///    the TUI's 50 ms / 5 s budget), then retry the handshake once.
+/// 3. Any other first-attempt error (a daemon that answered but rejected /
+///    replied malformed / negotiated an incompatible version) is returned
+///    as-is — auto-starting a second daemon can't fix a reachable-but-wrong one.
+///
+/// On a genuine start failure the [`ConnectError::DaemonAutostart`] reason
+/// (binary-not-found / spawn-failed / socket-never-appeared) flows into the
+/// connect/retry state.
+///
+/// Build-version compatibility (PRD #176 compat note): the retry handshake
+/// gates purely on `PROTOCOL_VERSION` (see [`connect_and_handshake`]) and only
+/// *records* the daemon's `build_version` for display — it never rejects on
+/// build skew. So the GUI happily attaches to a user's already-installed
+/// `dot-agent-deck` daemon at the same protocol version even when that daemon
+/// is a different build than this GUI.
+pub async fn connect_or_autostart(
+    socket_path: &Path,
+    client_build_version: Option<String>,
+) -> Result<DaemonConnection, ConnectError> {
+    match connect_and_handshake(socket_path, client_build_version.clone()).await {
+        Ok(conn) => return Ok(conn),
+        Err(e) if e.is_daemon_unreachable() => {
+            // Fall through to auto-start: no daemon is listening yet.
+        }
+        Err(e) => return Err(e),
+    }
+
+    ensure_daemon(socket_path)
+        .await
+        .map_err(ConnectError::DaemonAutostart)?;
+
+    connect_and_handshake(socket_path, client_build_version).await
 }
 
 /// Read one `RESP` frame and decode the [`AttachResponse`]. EOF, a wrong frame
