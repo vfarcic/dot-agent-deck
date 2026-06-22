@@ -1,6 +1,6 @@
 # PRD #126: Agent-driven notifications with minimal deck-side fallback
 
-**Status**: Planning
+**Status**: Planning — rescoped 2026-06-22 (see [Scope Decision](#scope-decision-2026-06-22))
 **Priority**: Medium
 **Created**: 2026-05-25
 **GitHub Issue**: [#126](https://github.com/vfarcic/dot-agent-deck/issues/126)
@@ -11,6 +11,18 @@
 ## Validation refresh (2026-06-14)
 
 Re-validated against current code — verdict: **current**. Nothing here has shipped yet (no `src/notifications.rs`, no `[notifications]` config block, no inactivity timer). The dependency relationships are real and live: PRD #99 is correctly closed/superseded by this PRD, and PRD #127 (cron scheduler) shipped consuming this PRD's notification seam via a temporary `StderrNotifier` stub. When implementing M2.2, fill the existing `Notifier`/`NotifyEvent`/`StderrNotifier` seam in `src/scheduler.rs` rather than inventing a new one.
+
+## Scope Decision (2026-06-22)
+
+Rescoped after review. The happy path of this PRD — **agents notify the user via their own tools** — requires *no deck code*: a notification MCP/CLI on the agent (Slack MCP, ntfy, `osascript`, …) plus a notify-on-done/blocked/needs-input instruction injected at spawn. For a single project that instruction can go straight into each role's `prompt_template` in `.dot-agent-deck.toml`; the optional `agent_notification_hint` config field (M1.3) only generalizes it to ad-hoc panes and scheduled tasks that have no `prompt_template`.
+
+**Near-term deliverable** — the agent-driven path only: documentation showing users how to wire an MCP/CLI and add the notify-on-done/blocked/needs-input instruction, plus (optionally) the `agent_notification_hint` field so the hint applies project-wide.
+
+**Deferred until proven needed** — the two deck-side *safety nets*. They are the only parts that genuinely cannot be done with MCP + config, and we defer them rather than build on speculation:
+- **Inactivity nudge** — Phase 1's timer (M1.1) + inactivity-fired prompt injection (M1.2). A stuck or quiet agent cannot self-notify, so the deck would have to watch PTY output and inject the prompt.
+- **No-agent fallback** — all of Phase 2 (M2.1 desktop channel, M2.2 scheduler-failure / agent-crash wiring, M2.3 dedup). There is no agent to delegate to for a pre-spawn scheduler failure or a silently-crashed process, so the deck must fire a local desktop notification itself.
+
+Revisit if real usage shows the happy path is unreliable — agents forgetting to notify, hanging without noticing, or dying before notifying. Until then the `Notifier`/`StderrNotifier` seam in `src/scheduler.rs` (shipped by #127) stays as-is.
 
 ## Problem Statement
 
@@ -100,17 +112,23 @@ The deck's notification responsibilities collapse to: one minimal local channel,
 
 ### Phase 1: Inactivity timer + prompt-injection plumbing
 
+> **Deferred (2026-06-22):** M1.1 and M1.2 (the inactivity nudge) are parked until proven needed — see [Scope Decision](#scope-decision-2026-06-22). M1.3 (the hint field) is the only near-term item in this phase, and is optional for single-project use (use `prompt_template` instead).
+
 - [ ] **M1.1** — Implement the inactivity timer: per-agent `last_pty_output` tracking, configurable threshold, fires on expiry. Resets on PTY output. Disabled when `notify_when_inactive_after` is unset.
 - [ ] **M1.2** — Wire the inactivity expiry to existing prompt-injection plumbing: on fire, inject the inactivity prompt into the target agent's session. Verify Claude Code's behavior at "waiting for user input" state; document per-agent caveats.
 - [ ] **M1.3** — Implement the `agent_notification_hint` config field. Append to spawn-time prompt for every agent / orchestrator role. Ship a sensible default.
 
 ### Phase 2: Deck-side desktop channel + dedup
 
+> **Deferred (2026-06-22):** entire phase parked until proven needed (the no-agent fallback) — see [Scope Decision](#scope-decision-2026-06-22).
+
 - [ ] **M2.1** — Implement the minimal desktop channel. Decide `notify-rust` vs. shell-out based on transitive dep weight. Single file, no trait, not exposed to agents.
 - [ ] **M2.2** — Wire scheduler-side pre-spawn failures and agent-crash detection to the desktop channel. (Scheduler failure wiring is a stub here; the actual scheduler PRD will hook into it.)
 - [ ] **M2.3** — Implement the suspension/dedup rule: deck-fired desktop notification for a target → suspend that target's inactivity timer until a user-initiated reset event.
 
 ### Phase 3: Tests
+
+> **Deferred (2026-06-22):** M3.1/M3.2 test the inactivity timer, dedup, and crash paths — they defer with the Phase 1/2 features they cover. Near-term, only the optional hint-append (M1.3) needs a test.
 
 - [ ] **M3.1** — Unit tests: inactivity timer reset/expiry/suspension behavior, prompt-injection content, dedup rule.
 - [ ] **M3.2** — Integration test: spawn a fixture agent with the hint, simulate quiet PTY for N seconds, assert injection fires with expected content. Trigger a simulated agent crash, assert desktop notification fires and inactivity timer is suspended.
