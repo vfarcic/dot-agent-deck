@@ -125,25 +125,25 @@ pub struct AppState {
 
 pub type SharedState = Arc<RwLock<AppState>>;
 
+const WORK_DONE_FOOTER: &str = "## When done\n\n\
+Signal completion by running this command via Bash:\n\
+```bash\n\
+dot-agent-deck work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
+```";
+
 /// Compose the prompt that the daemon writes into a worker pane on
-/// delegation: the caller-supplied `task_body` (typically a one-liner
-/// pointing at `.dot-agent-deck/worker-task-{role}.md`), a blank line,
-/// then the work-done footer that reminds the worker to signal
-/// completion via `dot-agent-deck work-done` once they finish.
+/// delegation. In the normal file-backed path this is intentionally only
+/// the one-line pointer to `.dot-agent-deck/worker-task-{role}.md`.
+/// Keeping every injected PTY prompt single-line avoids bracketed paste
+/// and lets the synthetic CR follow the same reliable path as ordinary
+/// typed prompts.
 ///
 /// The footer used to be appended per-role by the TUI's
 /// `OrchestrationConfig.roles[*].prompt_template` wrapping. PRD #93
-/// round-5 moved dispatch into the daemon but left
-/// `OrchestrationConfig` out of scope, so without this helper every
-/// delegated task lost the footer and workers stopped signaling back.
+/// round-5 moved dispatch into the daemon; the durable worker context now
+/// lives in the task file instead of the injected pane prompt.
 pub fn compose_delegate_prompt(task_body: &str) -> String {
-    format!(
-        "{task_body}\n\n## When done\n\n\
-         Signal completion by running this command via Bash:\n\
-         ```bash\n\
-         dot-agent-deck work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
-         ```"
-    )
+    task_body.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// CodeRabbit (PRD #93 round-9): build the file contents written to
@@ -152,14 +152,15 @@ pub fn compose_delegate_prompt(task_body: &str) -> String {
 /// `## Task` header beneath the template — mirrors the pre-Round-5 TUI
 /// dispatch path that Round 5 lost when it moved orchestration onto
 /// the daemon side without bringing the per-role template wrapping
-/// along. With no template the file content is the raw task; the
-/// PTY-injected one-liner still appends the work-done footer in both
-/// shapes via [`compose_delegate_prompt`].
+/// along. The work-done footer is appended to the file rather than the
+/// PTY-injected pointer so workers still get completion instructions
+/// without forcing a multi-line bracketed-paste write into the agent TUI.
 pub fn compose_worker_task_file(prompt_template: Option<&str>, task: &str) -> String {
-    match prompt_template {
+    let body = match prompt_template {
         Some(tpl) if !tpl.trim().is_empty() => format!("{tpl}\n\n## Task\n\n{task}"),
         _ => task.to_string(),
-    }
+    };
+    format!("{}\n\n{}", body.trim_end(), WORK_DONE_FOOTER)
 }
 
 /// Look up the role config for `role_name` inside the orchestration
@@ -1064,20 +1065,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compose_delegate_prompt_appends_work_done_footer() {
+    fn compose_delegate_prompt_is_single_line_file_pointer() {
         let prompt =
             compose_delegate_prompt("Read .dot-agent-deck/worker-task-coder.md for your task.");
-        assert!(
-            prompt.starts_with("Read .dot-agent-deck/worker-task-coder.md for your task.\n\n"),
-            "task body must lead, then a blank line before the footer"
+        assert_eq!(
+            prompt,
+            "Read .dot-agent-deck/worker-task-coder.md for your task."
         );
         assert!(
-            prompt.contains("## When done"),
-            "footer must include the ## When done heading"
+            !prompt.contains('\n'),
+            "pane-injected delegate prompt must stay single-line"
+        );
+    }
+
+    #[test]
+    fn compose_delegate_prompt_normalizes_multiline_input() {
+        let prompt = compose_delegate_prompt("line one\n\nline two\r\nline three");
+        assert_eq!(prompt, "line one line two line three");
+        assert!(
+            !prompt.contains('\n'),
+            "pane-injected delegate prompt must normalize newlines"
+        );
+    }
+
+    #[test]
+    fn compose_worker_task_file_appends_work_done_footer() {
+        let content = compose_worker_task_file(Some("You are coder."), "Implement the thing.");
+        assert!(content.starts_with("You are coder.\n\n## Task\n\nImplement the thing."));
+        assert!(
+            content.contains("## When done"),
+            "task file must include the completion heading"
         );
         assert!(
-            prompt.contains("dot-agent-deck work-done --task"),
-            "footer must instruct the worker to call dot-agent-deck work-done"
+            content.contains("dot-agent-deck work-done --task"),
+            "task file must instruct the worker to call dot-agent-deck work-done"
         );
+
+        let no_template = compose_worker_task_file(None, "Implement the fallback.");
+        assert!(no_template.starts_with("Implement the fallback.\n\n## When done"));
     }
 }
