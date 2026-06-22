@@ -1503,7 +1503,7 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 ##### session/live/007 — `DaemonClient::list_agents` scrubs and clamps a hostile `AgentRecord.live` at the wire boundary so a malformed daemon can't corrupt the rebuilt card (PRD #162 review-fix, parallels embed/attach/005).
 - **Layer:** in-crate integration (a hand-rolled mock attach daemon over a Unix socket advertises one hostile `AgentRecord`; the real `DaemonClient::list_agents` boundary sanitizer runs; fast tier; no PTY/vt100).
 - **Agent:** none (the mock daemon hand-crafts the hostile `AttachResponse`).
-- **Asserts:** a daemon advertises an `AgentRecord.live` whose `last_user_prompt`, every `first_prompts` entry, and `active_tool.name` / `.detail` carry ANSI escapes, NUL bytes, and other ASCII control chars, and whose `first_prompts` is oversized (6 entries — double the `MAX_FIRST_PROMPTS` cap of 3 — each also over-long at 100 KiB). `list_agents` returns the record with its live snapshot PRESERVED (the agent is real) but SCRUBBED — no byte `< 0x20` or `== 0x7f` survives in `last_user_prompt`, any `first_prompts` entry, or `active_tool.name` / `.detail` — and CLAMPED — `first_prompts` is cut to at most `MAX_FIRST_PROMPTS` (3) entries, each length-bounded rather than passed through verbatim.
+- **Asserts:** a daemon advertises an `AgentRecord.live` whose `last_user_prompt`, every `first_prompts` entry, and `active_tool.name` / `.detail` carry ANSI escapes, NUL bytes, and other ASCII control chars AND are over-long (~100 KiB each), and whose `first_prompts` is oversized (6 entries — double the `MAX_FIRST_PROMPTS` cap of 3). `list_agents` returns the record with its live snapshot PRESERVED (the agent is real) but SCRUBBED — no byte `< 0x20` or `== 0x7f` survives in `last_user_prompt`, any `first_prompts` entry, or `active_tool.name` / `.detail` — and CLAMPED — every one of `last_user_prompt`, `active_tool.name`, `active_tool.detail`, and each `first_prompts` entry is length-bounded to <= 65536 bytes (not passed through verbatim), and `first_prompts` is cut to at most `MAX_FIRST_PROMPTS` (3) entries.
 - **Does not assert:** the daemon-side join/serde (session/live/001–003); the seeding of the card's fields (session/live/004); the `agent_type` precedence fallback (session/live/008); the `tab_membership` scrub itself (embed/attach/005); the exact sanitized output beyond "no raw control bytes survive and the list is clamped".
 - **Platform coverage:** mac+linux.
 
@@ -1512,6 +1512,13 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Agent:** none.
 - **Asserts:** a live `SessionState` whose event-derived `agent_type` is `AgentType::None` (the agent emitted events but never identified itself) snapshots via `live_snapshot` to `agent_type == None` (Option::None, NOT `Some(AgentType::None)`), so when `seed_hydrated_session` seeds a reconnected card whose spawn-time `agent_type` is `Some(ClaudeCode)`, the snapshot does not shadow the spawn-time fallback and the card carries the REAL `ClaudeCode` type — not "No agent".
 - **Does not assert:** the wire-boundary scrub/clamp (session/live/007); the full snapshot field seeding (session/live/004); the daemon-side newest-wins join (session/live/003); the post-reconnect remap (session/live/005).
+- **Platform coverage:** mac+linux+windows.
+
+##### session/live/009 — An unknown `SessionStatus` string on `AgentRecord.live.status` degrades gracefully instead of failing the whole record parse (PRD #162 Greptile review-fix, forward-compat).
+- **Layer:** pure-data (serde decode of a hand-crafted wire JSON; no daemon/TUI harness; fast tier).
+- **Agent:** none.
+- **Asserts:** an `AgentRecord` wire JSON whose `live.status` is a string this build does not know (`"Hibernating"`) deserializes via `serde_json::from_str::<AgentRecord>` to `Ok` (NOT `Err`) and the record survives with its `id` / `pane_id_env` intact — a newer daemon's future status variant must not fail an older TUI's entire `AgentRecord` decode just because `live` is a present field. Mechanism-agnostic: does NOT pin whether the fix maps the unknown status to a catch-all variant (`live` stays `Some`) or drops `live` to `None`.
+- **Does not assert:** which degrade mechanism is chosen (`#[serde(other)]` vs lenient `live -> None`); the older-shape back-compat (`live` absent -> `None`, session/live/001); the wire-boundary scrub/clamp (session/live/007).
 - **Platform coverage:** mac+linux+windows.
 
 ### Session save (snapshot freshness, PRD #89 Phase 1)

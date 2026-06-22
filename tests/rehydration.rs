@@ -1945,10 +1945,13 @@ fn has_control_bytes(s: &str) -> bool {
 /// Mock that mimics a hostile / malformed daemon: replies to ListAgents with
 /// ONE `AgentRecord` whose live `SessionSnapshot` carries ANSI escapes, NUL
 /// bytes, and other control chars in `last_user_prompt`, in every
-/// `first_prompts` entry, and in `active_tool.name` / `.detail`, AND an
-/// oversized `first_prompts` (6 entries — double `MAX_FIRST_PROMPTS` — each
-/// also over-long at 100 KiB). The TUI-side `list_agents` boundary must scrub
-/// and clamp these before they can corrupt a rebuilt card.
+/// `first_prompts` entry, and in `active_tool.name` / `.detail`, where
+/// `last_user_prompt`, `active_tool.name`, `active_tool.detail`, AND every
+/// `first_prompts` entry are ALSO over-long (~100 KiB each), and where
+/// `first_prompts` carries 6 entries (double `MAX_FIRST_PROMPTS`). The
+/// TUI-side `list_agents` boundary must scrub control bytes from AND
+/// length-clamp every one of these strings before they can corrupt a rebuilt
+/// card — not just the `first_prompts` entries.
 async fn run_hostile_live_list_server(listener: UnixListener) {
     loop {
         let (mut stream, _) = match listener.accept().await {
@@ -1980,8 +1983,11 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         status: SessionStatus::Working,
                         agent_type: Some(AgentType::ClaudeCode),
                         active_tool: Some(ActiveTool {
-                            name: "Ed\x1bit\x00".into(),
-                            detail: Some("src/\x1b[2Jmain.rs\x07".into()),
+                            // Oversized in BOTH dimensions: control-laden AND
+                            // over-long (~100 KiB) so the length clamp must
+                            // apply here too, not only control-stripping.
+                            name: format!("Ed\x1bit\x00{over_long}"),
+                            detail: Some(format!("src/\x1b[2Jmain.rs\x07{over_long}")),
                         }),
                         tool_count: 3,
                         // Oversized in BOTH dimensions: 6 entries (> the
@@ -1990,7 +1996,11 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         first_prompts: (0..6)
                             .map(|i| format!("p{i} \x1b[31m\x00{over_long}"))
                             .collect(),
-                        last_user_prompt: Some("run \x1b[31mhostile\x07 \x00prompt".into()),
+                        // Oversized in BOTH dimensions, like the active-tool
+                        // strings: control-laden AND over-long (~100 KiB).
+                        last_user_prompt: Some(format!(
+                            "run \x1b[31mhostile\x07 \x00prompt {over_long}"
+                        )),
                     }),
                 };
                 let resp = AttachResponse {
@@ -2008,15 +2018,17 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
 
 /// Scenario: A hostile / malformed daemon advertises via `list_agents` an
 /// `AgentRecord.live` whose prompt and active-tool strings carry ANSI escapes,
-/// NUL bytes, and other control chars, and whose `first_prompts` is oversized
-/// (6 entries, each also over-long). Calling `DaemonClient::list_agents`
-/// against that daemon must return the record with its live snapshot preserved
-/// (the agent is real) but SCRUBBED — no control bytes survive in
-/// `last_user_prompt`, any `first_prompts` entry, or `active_tool.name` /
-/// `.detail` — and CLAMPED — `first_prompts` is cut to at most
-/// `MAX_FIRST_PROMPTS` (3) entries, each length-bounded — so a malformed
-/// daemon can't corrupt the rebuilt card (parallels embed/attach/005's
-/// `tab_membership` scrub).
+/// NUL bytes, and other control chars AND are over-long (~100 KiB each), and
+/// whose `first_prompts` is oversized (6 entries, each also over-long).
+/// Calling `DaemonClient::list_agents` against that daemon must return the
+/// record with its live snapshot preserved (the agent is real) but SCRUBBED —
+/// no control bytes survive in `last_user_prompt`, any `first_prompts` entry,
+/// or `active_tool.name` / `.detail` — and CLAMPED — every one of
+/// `last_user_prompt`, `active_tool.name`, `active_tool.detail`, and each
+/// `first_prompts` entry is length-bounded to <= 65536 bytes, and
+/// `first_prompts` is cut to at most `MAX_FIRST_PROMPTS` (3) entries — so a
+/// malformed daemon can't corrupt the rebuilt card (parallels
+/// embed/attach/005's `tab_membership` scrub).
 // Written as a sync `#[test]` driving an explicit multi-thread runtime rather
 // than `#[tokio::test]`: the linkage-check (PRD #77 Decision 17) ties each
 // `#[spec(...)]` to the next plain `fn` definition and the function-name
@@ -2060,11 +2072,18 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         "the live snapshot must be preserved (the agent is real) — scrubbed/clamped, not dropped",
     );
 
-    // No raw control bytes survive into any rendered string.
+    // No raw control bytes survive into any rendered string, AND each string
+    // is length-bounded — a 100 KiB prompt or tool string must be clamped, not
+    // passed through verbatim once the control bytes are stripped.
     let last = live.last_user_prompt.as_deref().unwrap_or_default();
     assert!(
         !has_control_bytes(last),
         "last_user_prompt must be scrubbed of control bytes; got {last:?}"
+    );
+    assert!(
+        last.len() <= 65536,
+        "last_user_prompt must be length-clamped, not passed through verbatim; got {} bytes",
+        last.len()
     );
     let tool = live
         .active_tool
@@ -2076,9 +2095,20 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         tool.name
     );
     assert!(
-        !has_control_bytes(tool.detail.as_deref().unwrap_or_default()),
+        tool.name.len() <= 65536,
+        "active_tool.name must be length-clamped, not passed through verbatim; got {} bytes",
+        tool.name.len()
+    );
+    let detail = tool.detail.as_deref().unwrap_or_default();
+    assert!(
+        !has_control_bytes(detail),
         "active_tool.detail must be scrubbed of control bytes; got {:?}",
         tool.detail
+    );
+    assert!(
+        detail.len() <= 65536,
+        "active_tool.detail must be length-clamped, not passed through verbatim; got {} bytes",
+        detail.len()
     );
 
     // first_prompts clamped to <= MAX_FIRST_PROMPTS (3) entries, each scrubbed

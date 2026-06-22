@@ -1922,6 +1922,50 @@ mod tests {
         );
     }
 
+    /// Scenario: A newer daemon advertises an `AgentRecord` whose `live.status`
+    /// is a `SessionStatus` string this (older) build does not know
+    /// (`"Hibernating"`). Because `live` is a present field, an unknown status
+    /// must NOT fail the whole `AgentRecord` deserialization:
+    /// `serde_json::from_str::<AgentRecord>` must return `Ok` and the record
+    /// must survive with its `id` / `pane_id_env` intact and usable. Pairs with
+    /// session/live/001 (older-shape -> `live == None` back-compat); this pins
+    /// newer-shape forward-compat. Mechanism-agnostic: it does NOT pin whether
+    /// the fix maps the unknown status to a catch-all variant (so `live` stays
+    /// `Some`) or drops `live` to `None` — only that the parse succeeds and the
+    /// record is retained.
+    #[spec("session/live/009")]
+    #[test]
+    fn live_009_unknown_session_status_does_not_fail_agent_record_parse() {
+        // A newer daemon adds a future SessionStatus variant; this older TUI has
+        // no matching enum arm. `live` is a PRESENT field, so a strict enum
+        // decode would fail the ENTIRE AgentRecord parse rather than degrading.
+        let payload = r#"{
+            "id": "fwd-compat-9",
+            "pane_id_env": "pane-fwd-9",
+            "live": {
+                "status": "Hibernating",
+                "tool_count": 0
+            }
+        }"#;
+
+        let parsed = serde_json::from_str::<AgentRecord>(payload);
+        assert!(
+            parsed.is_ok(),
+            "an unknown SessionStatus string must degrade gracefully, not fail \
+             the whole AgentRecord parse (forward-compat); got {:?}",
+            parsed.as_ref().err()
+        );
+
+        // The agent record itself must survive and stay usable — regardless of
+        // whether the fix keeps `live = Some(<catch-all>)` or drops it to `None`.
+        let rec = parsed.expect("unknown SessionStatus must parse Ok");
+        assert_eq!(
+            rec.id, "fwd-compat-9",
+            "the AgentRecord must be retained through the unknown-status parse"
+        );
+        assert_eq!(rec.pane_id_env.as_deref(), Some("pane-fwd-9"));
+    }
+
     #[test]
     fn set_agent_label_serde_round_trip() {
         let req = AttachRequest::SetAgentLabel {
