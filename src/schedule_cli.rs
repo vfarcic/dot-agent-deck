@@ -79,6 +79,9 @@ pub fn add(tasks: &mut Vec<ScheduledTask>, args: AddArgs) -> Result<(), String> 
         prompt: args.prompt,
         new_tab_per_fire: args.new_tab_per_fire,
         enabled: args.enabled,
+        // PRD #120 issue-dispatch tasks are authored by a separate door; the
+        // #127 `schedule add` CLI only writes single-spawn tasks.
+        issue_dispatch: None,
     });
     Ok(())
 }

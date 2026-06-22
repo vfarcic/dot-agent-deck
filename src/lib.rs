@@ -19,6 +19,7 @@ pub mod hook;
 pub mod hooks_manage;
 pub mod hyperlink;
 pub mod init;
+pub mod issue_dispatch;
 pub mod keybindings;
 pub mod llm;
 pub mod login_shell;

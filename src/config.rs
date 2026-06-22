@@ -588,6 +588,32 @@ impl SnapshotCoalescer {
 // Scheduled tasks — global, daemon-owned config (PRD #127, M1.2)
 // ---------------------------------------------------------------------------
 
+/// PRD #120 GitHub issue-dispatch configuration, carried by a
+/// `[[scheduled_tasks]]` entry whose `[scheduled_tasks.issue_dispatch]` table is
+/// present. The table's **presence is the task-type discriminator**: a
+/// [`ScheduledTask`] with `issue_dispatch == Some(_)` enumerates open issues for
+/// `repo` and dispatches one agent per issue on fire, instead of the single
+/// spawn behaviour of PRD #127. The shared scheduler fields — `name`, `cron`,
+/// `working_dir` (the workspace root the repo clones under), `prompt` (the
+/// per-issue template, see [`crate::issue_dispatch`]), and `enabled` — still come
+/// from the enclosing [`ScheduledTask`]; only the GitHub-specific knobs live
+/// here. One repo per task is a locked PRD decision (several repos → several
+/// schedules), which is why this is a single `repo`, not a list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueDispatchConfig {
+    /// Target repo in `owner/name` form (e.g. `vfarcic/dot-ai`).
+    pub repo: String,
+    /// Maximum number of issues dispatched per fire (the per-run cap).
+    pub max_per_run: usize,
+    /// Optional label filter (e.g. `agent-eligible`). `None` = no label gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Optional raw `gh` search-query override for advanced users. `None` = the
+    /// default "all open issues up to `max_per_run`" listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+}
+
 /// One `[[scheduled_tasks]]` entry from the global
 /// `~/.config/dot-agent-deck/schedules.toml`. The daemon's job list. See PRD
 /// #127 "Configuration: global, daemon-owned".
@@ -619,6 +645,18 @@ pub struct ScheduledTask {
     /// Whether the daemon registers and fires this task. Default true.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// PRD #120: when present, this is an `issue_dispatch` task — on fire it
+    /// enumerates open issues for `issue_dispatch.repo` and dispatches an agent
+    /// per issue, reusing `prompt` as the per-issue template (the
+    /// `{{issue_number}}` placeholder substituted at fire time) and
+    /// `working_dir` as the workspace root. Absent (`None`) → the original
+    /// single-spawn task. The table's presence is the task-type discriminator.
+    ///
+    /// MUST stay the LAST field: TOML serializes it as a
+    /// `[scheduled_tasks.issue_dispatch]` sub-table, which has to follow all the
+    /// scalar fields of the entry to round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_dispatch: Option<IssueDispatchConfig>,
 }
 
 fn default_enabled() -> bool {
@@ -762,6 +800,13 @@ impl LoadedSchedules {
 /// seam (PRD #126) and the entry is skipped, without blocking valid siblings or
 /// crashing the daemon.
 fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, ScheduleLoadError> {
+    // PRD #120: an issue-dispatch task has no top-level `command` — the per-issue
+    // spawn derives its command from each cloned repo's `.dot-agent-deck.toml`
+    // (orchestration roles, or the single-agent default). Only the #127
+    // single-spawn task type requires `command`.
+    if task.issue_dispatch.is_some() {
+        return Ok(expand_task(task));
+    }
     match &task.command {
         Some(cmd) if !cmd.trim().is_empty() => Ok(expand_task(task)),
         _ => Err(ScheduleLoadError {
@@ -2053,6 +2098,94 @@ enabled = false
         assert!(t.new_tab_per_fire);
         assert!(!t.enabled);
         assert_eq!(t.working_dir, "/abs/path");
+    }
+
+    // PRD #120 (U1) — a fully-specified `issue_dispatch` task round-trips every
+    // field from `schedules.toml`: the `[scheduled_tasks.issue_dispatch]` table
+    // is the task-type discriminator, and a command-less entry is accepted
+    // (unlike a #127 single-spawn task) because the per-issue command comes from
+    // the cloned repo's config.
+    #[test]
+    fn issue_dispatch_round_trips_all_fields() {
+        let toml_str = r#"
+[[scheduled_tasks]]
+name = "Issues vfarcic/dot-ai"
+cron = "0 9 * * MON-FRI"
+working_dir = "/work/space"
+prompt = "Work on issue {{issue_number}}"
+enabled = true
+
+[scheduled_tasks.issue_dispatch]
+repo = "vfarcic/dot-ai"
+max_per_run = 3
+label = "agent-eligible"
+query = "is:open sort:created-asc"
+"#;
+        let loaded = LoadedSchedules::parse(toml_str);
+        assert!(loaded.errors.is_empty(), "errors: {:?}", loaded.errors);
+        assert_eq!(loaded.tasks.len(), 1);
+        let t = &loaded.tasks[0];
+        // Shared scheduler fields still carry the task's identity / schedule.
+        assert_eq!(t.name, "Issues vfarcic/dot-ai");
+        assert_eq!(t.cron, "0 9 * * MON-FRI");
+        assert_eq!(t.working_dir, "/work/space");
+        assert_eq!(t.prompt, "Work on issue {{issue_number}}");
+        assert!(
+            t.command.is_none(),
+            "issue-dispatch needs no top-level command"
+        );
+        // The discriminator table carries every GitHub-specific field.
+        let disp = t
+            .issue_dispatch
+            .as_ref()
+            .expect("issue_dispatch table present → issue-dispatch task");
+        assert_eq!(disp.repo, "vfarcic/dot-ai");
+        assert_eq!(disp.max_per_run, 3);
+        assert_eq!(disp.label.as_deref(), Some("agent-eligible"));
+        assert_eq!(disp.query.as_deref(), Some("is:open sort:created-asc"));
+    }
+
+    // PRD #120 (U1) — the optional filters (`label`, `query`) default to `None`
+    // when omitted, and a plain `[[scheduled_tasks]]` entry with no
+    // `issue_dispatch` table is still a (command-required) single-spawn task.
+    #[test]
+    fn issue_dispatch_optional_filters_default_to_none() {
+        let toml_str = r#"
+[[scheduled_tasks]]
+name = "Issues vfarcic/dot-ai"
+cron = "0 9 * * *"
+working_dir = "/work/space"
+prompt = "Work on issue {{issue_number}}"
+
+[scheduled_tasks.issue_dispatch]
+repo = "vfarcic/dot-ai"
+max_per_run = 5
+"#;
+        let loaded = LoadedSchedules::parse(toml_str);
+        assert!(loaded.errors.is_empty(), "errors: {:?}", loaded.errors);
+        let disp = loaded.tasks[0]
+            .issue_dispatch
+            .as_ref()
+            .expect("issue-dispatch task");
+        assert_eq!(disp.repo, "vfarcic/dot-ai");
+        assert_eq!(disp.max_per_run, 5);
+        assert!(disp.label.is_none(), "omitted label defaults to None");
+        assert!(disp.query.is_none(), "omitted query defaults to None");
+        // `enabled` still defaults true via the shared machinery.
+        assert!(loaded.tasks[0].enabled);
+
+        // A non-issue-dispatch entry has no table and is the original task type.
+        let plain = r#"
+[[scheduled_tasks]]
+name = "plain"
+cron = "0 9 * * *"
+working_dir = "/tmp"
+command = "claude"
+prompt = "hi"
+"#;
+        let loaded = LoadedSchedules::parse(plain);
+        assert!(loaded.errors.is_empty());
+        assert!(loaded.tasks[0].issue_dispatch.is_none());
     }
 
     #[test]

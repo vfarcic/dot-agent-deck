@@ -12454,6 +12454,7 @@ pub fn render_new_pane_form_schedule_to_buffer(
         prompt: "digest prompt".to_string(),
         new_tab_per_fire: false,
         enabled: true,
+        issue_dispatch: None,
     });
     let form = NewPaneFormState::new_schedule_locked(
         std::path::PathBuf::from("/tmp/project"),
@@ -18021,6 +18022,7 @@ mod tests {
             prompt: format!("{name}-prompt-marker"),
             new_tab_per_fire: false,
             enabled,
+            issue_dispatch: None,
         }
     }
 

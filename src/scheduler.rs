@@ -195,6 +195,11 @@ struct FireFields {
     command: Option<String>,
     prompt: String,
     new_tab_per_fire: bool,
+    /// PRD #120: the issue-dispatch config (repo / cap / label / query). It is
+    /// fire-affecting too — an edit to e.g. the label filter must rebuild the
+    /// callback so the next fire enumerates the new set, exactly as a prompt
+    /// edit does. `None` for #127 single-spawn tasks.
+    issue_dispatch: Option<crate::config::IssueDispatchConfig>,
 }
 
 impl FireFields {
@@ -206,6 +211,7 @@ impl FireFields {
             command: task.command.clone(),
             prompt: task.prompt.clone(),
             new_tab_per_fire: task.new_tab_per_fire,
+            issue_dispatch: task.issue_dispatch.clone(),
         }
     }
 
@@ -220,6 +226,7 @@ impl FireFields {
             command: None,
             prompt: String::new(),
             new_tab_per_fire: false,
+            issue_dispatch: None,
         }
     }
 }
@@ -769,6 +776,7 @@ mod tests {
             prompt: "p".to_string(),
             new_tab_per_fire: false,
             enabled,
+            issue_dispatch: None,
         };
 
         // Initial load: two tasks.
@@ -862,6 +870,7 @@ mod tests {
             prompt: "p".to_string(),
             new_tab_per_fire: false,
             enabled: true,
+            issue_dispatch: None,
         };
         let noop: Callback = Arc::new(|| Box::pin(async {}));
         scheduler.reload_apply(&[desired], |_| noop.clone());
