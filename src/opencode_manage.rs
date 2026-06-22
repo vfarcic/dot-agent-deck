@@ -412,13 +412,15 @@ fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
 }
 
 /// Fan-out core for explicit install: write the plugin into every candidate root that
-/// exists; if none exist, fall back to `fallback_dir` (the XDG-default plugin dir),
-/// creating it — the first-time-install behavior. Each successful write emits one
-/// `Installed OpenCode plugin: <path>` line to `out`. Every target is attempted even if
-/// an earlier one fails; the first error (if any) is returned so the caller surfaces it.
+/// exists; if none exist, fall back to `fallback_dir()` (the XDG-default plugin dir),
+/// creating it — the first-time-install behavior. The fallback closure is evaluated
+/// lazily, only when no layout exists, so the common path avoids the extra filesystem
+/// probe. Each successful write emits one `Installed OpenCode plugin: <path>` line to
+/// `out`. Every target is attempted even if an earlier one fails; the first error (if
+/// any) is returned so the caller surfaces it.
 fn install_to_roots(
     roots: &[PathBuf],
-    fallback_dir: &Path,
+    fallback_dir: impl FnOnce() -> PathBuf,
     binary_path: &str,
     out: &mut impl std::io::Write,
 ) -> std::io::Result<()> {
@@ -429,7 +431,7 @@ fn install_to_roots(
         }
     }
     if targets.is_empty() {
-        targets.push(fallback_dir.to_path_buf());
+        targets.push(fallback_dir());
     }
 
     let mut first_err: Option<std::io::Error> = None;
@@ -473,7 +475,7 @@ pub fn install() -> std::io::Result<()> {
 
     install_to_roots(
         &candidate_roots(),
-        &plugin_dir_for_install(),
+        plugin_dir_for_install,
         &binary_path,
         &mut std::io::stdout(),
     )
@@ -492,12 +494,6 @@ pub fn uninstall() -> std::io::Result<()> {
 }
 
 // --- Testable versions that accept a custom path ---
-
-pub fn install_to(dir: &Path, binary_path: &str) -> std::io::Result<()> {
-    let path = write_plugin(dir, binary_path)?;
-    println!("Installed OpenCode plugin: {}", path.display());
-    Ok(())
-}
 
 pub fn uninstall_from(dir: &PathBuf) -> std::io::Result<()> {
     uninstall_impl(dir)
@@ -653,7 +649,7 @@ mod tests {
         let mut out = Vec::new();
         install_to_roots(
             &[xdg_root.clone(), legacy_root.clone()],
-            &fallback,
+            || fallback.clone(),
             "/bin/deck-install",
             &mut out,
         )
@@ -693,7 +689,7 @@ mod tests {
         let mut out = Vec::new();
         install_to_roots(
             &[xdg_root.clone(), legacy_root.clone()],
-            &fallback,
+            || fallback.clone(),
             "/bin/deck-fallback",
             &mut out,
         )
@@ -725,7 +721,7 @@ mod tests {
         let mut out = Vec::new();
         let result = install_to_roots(
             &[xdg_root.clone(), legacy_root.clone()],
-            &fallback,
+            || fallback.clone(),
             "/bin/deck-resil2",
             &mut out,
         );
