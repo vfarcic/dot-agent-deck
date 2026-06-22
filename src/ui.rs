@@ -11733,6 +11733,10 @@ fn status_style(status: &SessionStatus) -> (&str, Style) {
         SessionStatus::WaitingForInput => ("Needs Input", style.add_modifier(Modifier::BOLD)),
         SessionStatus::Idle => ("Idle", style),
         SessionStatus::Error => ("Error", style),
+        // PRD #162 forward-compat: an unknown wire status renders with the
+        // neutral idle label/color so a future daemon's status never shows as
+        // a misleading active state on an older TUI.
+        SessionStatus::Unknown => ("Idle", style),
     }
 }
 

@@ -45,6 +45,15 @@ pub enum SessionStatus {
     WaitingForInput,
     Idle,
     Error,
+    /// PRD #162 forward-compat catch-all: a future/unknown `status` string on
+    /// the wire deserializes here instead of failing the whole `AgentRecord`
+    /// decode. Deserialize-only — `#[serde(other)]` variants are never
+    /// serialized, and the daemon's `live_snapshot()` only ever produces the
+    /// six real variants, so `Unknown` only ever originates from an
+    /// unrecognized wire value on a newer daemon. Rendered neutrally (like
+    /// `Idle`) so it never masquerades as an active state.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -578,6 +587,9 @@ impl AppState {
                 SessionStatus::Error => stats.errors += 1,
                 SessionStatus::Idle => stats.idle += 1,
                 SessionStatus::Compacting => stats.compacting += 1,
+                // PRD #162 forward-compat: an unknown wire status is bucketed
+                // as idle so it never inflates an active-work tally.
+                SessionStatus::Unknown => stats.idle += 1,
             }
             stats.total_tools += session.tool_count as u64;
         }

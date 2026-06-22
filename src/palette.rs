@@ -71,5 +71,8 @@ pub fn status_color(status: &SessionStatus) -> Color {
         SessionStatus::WaitingForInput => STATUS_WAITING,
         SessionStatus::Error => STATUS_ERROR,
         SessionStatus::Idle => STATUS_IDLE,
+        // PRD #162 forward-compat: an unknown wire status renders with the
+        // neutral idle color so it never masquerades as an active state.
+        SessionStatus::Unknown => STATUS_IDLE,
     }
 }

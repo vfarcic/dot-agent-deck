@@ -193,10 +193,10 @@ fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
 ///   real, we just don't trust the bucketing hint).
 /// - `live` snapshot (PRD #162): control bytes are stripped from
 ///   `last_user_prompt`, every `first_prompts` entry, and `active_tool.name` /
-///   `.detail`; `first_prompts` is clamped to at most
-///   [`crate::state::MAX_FIRST_PROMPTS`] entries, each length-bounded to
-///   [`MAX_FIRST_PROMPT_BYTES`]. The snapshot is KEPT as `Some(..)` — the
-///   agent is real; only its strings are scrubbed.
+///   `.detail`, and each of those strings is length-bounded to
+///   [`MAX_FIRST_PROMPT_BYTES`]; `first_prompts` is additionally clamped to at
+///   most [`crate::state::MAX_FIRST_PROMPTS`] entries. The snapshot is KEPT as
+///   `Some(..)` — the agent is real; only its strings are scrubbed.
 fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
     if let Some(tm) = rec.tab_membership.take() {
         let name_len = tm.name().len();
@@ -214,12 +214,12 @@ fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
 
     if let Some(live) = rec.live.as_mut() {
         if let Some(prompt) = live.last_user_prompt.as_mut() {
-            *prompt = strip_control_chars(prompt);
+            *prompt = clamp_bytes(strip_control_chars(prompt), MAX_FIRST_PROMPT_BYTES);
         }
         if let Some(tool) = live.active_tool.as_mut() {
-            tool.name = strip_control_chars(&tool.name);
+            tool.name = clamp_bytes(strip_control_chars(&tool.name), MAX_FIRST_PROMPT_BYTES);
             if let Some(detail) = tool.detail.as_mut() {
-                *detail = strip_control_chars(detail);
+                *detail = clamp_bytes(strip_control_chars(detail), MAX_FIRST_PROMPT_BYTES);
             }
         }
         // Clamp the count first, then scrub + length-bound each survivor so we
