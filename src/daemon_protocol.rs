@@ -853,6 +853,12 @@ async fn handle_connection(
             // by the most-recent `last_activity` (newest-wins). The dummy-state
             // `serve_attach` path carries an empty `AppState`, so this loop
             // attaches nothing and `live` stays `None` — today's behavior.
+            //
+            // The pick must be total/deterministic: `HashMap::values()` yields
+            // sessions in an unspecified order, so two sessions tying on an
+            // identical `last_activity` would otherwise resolve by hash order.
+            // Break that tie on the (unique) `session_id` so the same input
+            // always selects the same snapshot.
             {
                 let guard = state.read().await;
                 for record in &mut records {
@@ -863,7 +869,11 @@ async fn handle_connection(
                             s.agent_id.as_deref() == Some(record.id.as_str())
                                 && s.pane_id == record.pane_id_env
                         })
-                        .max_by_key(|s| s.last_activity)
+                        .max_by(|a, b| {
+                            a.last_activity
+                                .cmp(&b.last_activity)
+                                .then_with(|| a.session_id.cmp(&b.session_id))
+                        })
                         .map(|s| s.live_snapshot());
                 }
             }

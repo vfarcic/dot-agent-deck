@@ -14,7 +14,11 @@ use crate::event::{
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
 const MAX_RECENT_EVENTS: usize = 50;
-const MAX_FIRST_PROMPTS: usize = 3;
+/// Maximum number of first-prompt entries retained per session. The live-side
+/// cap in `apply_event` and the wire-boundary clamp in
+/// [`crate::daemon_client`] (which re-clamps a hostile/oversized daemon
+/// snapshot) share this single source of truth.
+pub(crate) const MAX_FIRST_PROMPTS: usize = 3;
 
 /// PRD #92 F9 followup-6: how long the post-respawn dispatch task
 /// waits for the freshly-spawned agent to emit a `SessionStart` hook
@@ -128,13 +132,23 @@ pub struct SessionState {
 
 impl SessionState {
     /// PRD #162: build the wire [`SessionSnapshot`] from this live session.
-    /// The snapshot's `agent_type` is the EVENT-DERIVED value (wrapped in
-    /// `Some`), so a reconnecting TUI can override a `None` spawn-time
-    /// `AgentRecord.agent_type` with what the agent actually is.
+    /// The snapshot's `agent_type` is the EVENT-DERIVED value, so a
+    /// reconnecting TUI can override a `None` spawn-time
+    /// `AgentRecord.agent_type` with what the agent actually is — but
+    /// `AgentType::None` (the agent has emitted events yet never identified
+    /// itself) maps to `Option::None`, NOT `Some(AgentType::None)`. A
+    /// `Some(None-the-type)` would shadow the spawn-time fallback in
+    /// [`AppState::seed_hydrated_session`] and regress a real, known
+    /// spawn-time type to "No agent"; emitting `None` here keeps that
+    /// fallback reachable.
     pub fn live_snapshot(&self) -> SessionSnapshot {
+        let agent_type = match self.agent_type {
+            AgentType::None => None,
+            ref other => Some(other.clone()),
+        };
         SessionSnapshot {
             status: self.status.clone(),
-            agent_type: Some(self.agent_type.clone()),
+            agent_type,
             active_tool: self.active_tool.clone(),
             tool_count: self.tool_count,
             first_prompts: self.first_prompts.clone(),

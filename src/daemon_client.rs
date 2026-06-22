@@ -155,12 +155,48 @@ pub async fn issue_command<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     read_response(rd).await
 }
 
-/// Clamp `record.tab_membership` to `None` if the embedded `name` fails
-/// [`validate_tab_membership`]. Defense in depth at the wire boundary
-/// (M2.12 fixup auditor #1): the daemon validates on `StartAgent`, but
-/// a malformed or older daemon could still echo an invalid record. A
-/// rejected membership is logged via `tracing::warn!` (the agent is
-/// real — we just don't trust the bucketing hint).
+/// Per-entry byte ceiling the live-snapshot clamp enforces on each surviving
+/// `first_prompts` entry (PRD #162 finding #2). A hostile/malformed daemon
+/// could advertise a megabyte-long prompt that would bloat the rebuilt card;
+/// 64 KiB is far above any real first prompt yet bounds the worst case.
+const MAX_FIRST_PROMPT_BYTES: usize = 65536;
+
+/// Drop ASCII/Unicode control characters from a daemon-supplied string so no
+/// raw control byte (ANSI escape, NUL, DEL, C1) survives into a rendered cell.
+/// Mirrors the `char::is_control` policy `login_shell` / the build-handshake
+/// render seam apply elsewhere on untrusted wire input.
+fn strip_control_chars(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Truncate `s` to at most `max_bytes`, snapping back to the nearest char
+/// boundary so a multi-byte UTF-8 sequence is never split.
+fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s
+}
+
+/// Sanitize a single `AgentRecord` echoed by the daemon before it reaches the
+/// TUI. Defense in depth at the wire boundary (M2.12 fixup auditor #1, PRD
+/// #162 findings #1/#2): the daemon validates on `StartAgent`, but a malformed
+/// or older daemon could still echo an untrusted record. Two scrubs:
+///
+/// - `tab_membership`: clamped to `None` if the embedded `name` fails
+///   [`validate_tab_membership`] (logged via `tracing::warn!` — the agent is
+///   real, we just don't trust the bucketing hint).
+/// - `live` snapshot (PRD #162): control bytes are stripped from
+///   `last_user_prompt`, every `first_prompts` entry, and `active_tool.name` /
+///   `.detail`; `first_prompts` is clamped to at most
+///   [`crate::state::MAX_FIRST_PROMPTS`] entries, each length-bounded to
+///   [`MAX_FIRST_PROMPT_BYTES`]. The snapshot is KEPT as `Some(..)` — the
+///   agent is real; only its strings are scrubbed.
 fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
     if let Some(tm) = rec.tab_membership.take() {
         let name_len = tm.name().len();
@@ -173,6 +209,24 @@ fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
                     "list_agents: clamping invalid tab_membership.name from daemon record to None — pane lands on dashboard"
                 );
             }
+        }
+    }
+
+    if let Some(live) = rec.live.as_mut() {
+        if let Some(prompt) = live.last_user_prompt.as_mut() {
+            *prompt = strip_control_chars(prompt);
+        }
+        if let Some(tool) = live.active_tool.as_mut() {
+            tool.name = strip_control_chars(&tool.name);
+            if let Some(detail) = tool.detail.as_mut() {
+                *detail = strip_control_chars(detail);
+            }
+        }
+        // Clamp the count first, then scrub + length-bound each survivor so we
+        // never waste work scrubbing entries we're about to drop.
+        live.first_prompts.truncate(crate::state::MAX_FIRST_PROMPTS);
+        for prompt in live.first_prompts.iter_mut() {
+            *prompt = clamp_bytes(strip_control_chars(prompt), MAX_FIRST_PROMPT_BYTES);
         }
     }
 }
