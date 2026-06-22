@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 
 use chrono::Utc;
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
+    AgentPtyRegistry, AgentRecord, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::daemon_protocol::{
@@ -1927,5 +1927,249 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         sessions[0].agent_id.as_deref(),
         Some(agent_id),
         "PRD #110 agent_id must be preserved through the remap"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mock daemon for the wire-boundary hardening test (session/live/007).
+// ---------------------------------------------------------------------------
+
+/// Returns true if `s` carries any ASCII control byte (`< 0x20` or DEL
+/// `0x7f`) — the same "no raw control bytes survive into the rendered cell"
+/// policy `is_valid_cwd` / `is_valid_display_name` enforce elsewhere on the
+/// `list_agents` wire boundary.
+fn has_control_bytes(s: &str) -> bool {
+    s.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
+/// Mock that mimics a hostile / malformed daemon: replies to ListAgents with
+/// ONE `AgentRecord` whose live `SessionSnapshot` carries ANSI escapes, NUL
+/// bytes, and other control chars in `last_user_prompt`, in every
+/// `first_prompts` entry, and in `active_tool.name` / `.detail`, AND an
+/// oversized `first_prompts` (6 entries — double `MAX_FIRST_PROMPTS` — each
+/// also over-long at 100 KiB). The TUI-side `list_agents` boundary must scrub
+/// and clamp these before they can corrupt a rebuilt card.
+async fn run_hostile_live_list_server(listener: UnixListener) {
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        tokio::spawn(async move {
+            let req = match read_frame(&mut stream).await {
+                Ok(Some((KIND_REQ, payload))) => {
+                    match serde_json::from_slice::<AttachRequest>(&payload) {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    }
+                }
+                _ => return,
+            };
+            if let AttachRequest::ListAgents = req {
+                let over_long = "a".repeat(100_000);
+                let hostile = AgentRecord {
+                    id: "hostile-live-7".into(),
+                    pane_id_env: Some("pane-hostile".into()),
+                    display_name: None,
+                    cwd: None,
+                    tab_membership: None,
+                    agent_type: Some(AgentType::ClaudeCode),
+                    rows: 0,
+                    cols: 0,
+                    live: Some(SessionSnapshot {
+                        status: SessionStatus::Working,
+                        agent_type: Some(AgentType::ClaudeCode),
+                        active_tool: Some(ActiveTool {
+                            name: "Ed\x1bit\x00".into(),
+                            detail: Some("src/\x1b[2Jmain.rs\x07".into()),
+                        }),
+                        tool_count: 3,
+                        // Oversized in BOTH dimensions: 6 entries (> the
+                        // MAX_FIRST_PROMPTS cap of 3), each control-laden and
+                        // each over-long.
+                        first_prompts: (0..6)
+                            .map(|i| format!("p{i} \x1b[31m\x00{over_long}"))
+                            .collect(),
+                        last_user_prompt: Some("run \x1b[31mhostile\x07 \x00prompt".into()),
+                    }),
+                };
+                let resp = AttachResponse {
+                    ok: true,
+                    agent_records: Some(vec![hostile]),
+                    ..Default::default()
+                };
+                let _ = write_resp(&mut stream, &resp).await;
+            } else {
+                let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
+            }
+        });
+    }
+}
+
+/// Scenario: A hostile / malformed daemon advertises via `list_agents` an
+/// `AgentRecord.live` whose prompt and active-tool strings carry ANSI escapes,
+/// NUL bytes, and other control chars, and whose `first_prompts` is oversized
+/// (6 entries, each also over-long). Calling `DaemonClient::list_agents`
+/// against that daemon must return the record with its live snapshot preserved
+/// (the agent is real) but SCRUBBED — no control bytes survive in
+/// `last_user_prompt`, any `first_prompts` entry, or `active_tool.name` /
+/// `.detail` — and CLAMPED — `first_prompts` is cut to at most
+/// `MAX_FIRST_PROMPTS` (3) entries, each length-bounded — so a malformed
+/// daemon can't corrupt the rebuilt card (parallels embed/attach/005's
+/// `tab_membership` scrub).
+// Written as a sync `#[test]` driving an explicit multi-thread runtime rather
+// than `#[tokio::test]`: the linkage-check (PRD #77 Decision 17) ties each
+// `#[spec(...)]` to the next plain `fn` definition and the function-name
+// prefix, and does not recognize a `#[tokio::test] async fn` — so the spec'd
+// entry point must be a sync `#[test]` that block_on's the async body.
+#[spec("session/live/007")]
+#[test]
+fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner());
+}
+
+async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner() {
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = UnixListener::bind(&path).expect("bind mock attach socket");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, path, listener)
+    };
+    let server_handle = tokio::spawn(async move {
+        run_hostile_live_list_server(listener).await;
+    });
+
+    let client = DaemonClient::new(path);
+    let records = client
+        .list_agents()
+        .await
+        .expect("list_agents must succeed");
+    assert_eq!(
+        records.len(),
+        1,
+        "one hostile record advertised; got {records:?}"
+    );
+    let live = records[0].live.as_ref().expect(
+        "the live snapshot must be preserved (the agent is real) — scrubbed/clamped, not dropped",
+    );
+
+    // No raw control bytes survive into any rendered string.
+    let last = live.last_user_prompt.as_deref().unwrap_or_default();
+    assert!(
+        !has_control_bytes(last),
+        "last_user_prompt must be scrubbed of control bytes; got {last:?}"
+    );
+    let tool = live
+        .active_tool
+        .as_ref()
+        .expect("active_tool must be preserved");
+    assert!(
+        !has_control_bytes(&tool.name),
+        "active_tool.name must be scrubbed of control bytes; got {:?}",
+        tool.name
+    );
+    assert!(
+        !has_control_bytes(tool.detail.as_deref().unwrap_or_default()),
+        "active_tool.detail must be scrubbed of control bytes; got {:?}",
+        tool.detail
+    );
+
+    // first_prompts clamped to <= MAX_FIRST_PROMPTS (3) entries, each scrubbed
+    // and length-bounded so an over-long prompt can't blow up the card.
+    assert!(
+        live.first_prompts.len() <= 3,
+        "first_prompts must be clamped to <= MAX_FIRST_PROMPTS (3); got {} entries",
+        live.first_prompts.len()
+    );
+    for (i, p) in live.first_prompts.iter().enumerate() {
+        assert!(
+            !has_control_bytes(p),
+            "first_prompts[{i}] must be scrubbed of control bytes; got {p:?}"
+        );
+        assert!(
+            p.len() <= 65536,
+            "first_prompts[{i}] must be length-clamped, not passed through verbatim; got {} bytes",
+            p.len()
+        );
+    }
+
+    server_handle.abort();
+    drop(dir);
+}
+
+/// Scenario: A live `SessionState` whose EVENT-DERIVED `agent_type` is
+/// `AgentType::None` (the agent has emitted events but never identified itself)
+/// is snapshotted via `SessionState::live_snapshot` and seeded onto a
+/// reconnected card whose SPAWN-TIME `agent_type` is `Some(ClaudeCode)`.
+/// `live_snapshot` must map `AgentType::None` to `Option::None` so the snapshot
+/// does NOT shadow the spawn-time fallback, and `seed_hydrated_session` must
+/// therefore surface the REAL `ClaudeCode` type on the card — not "No agent".
+#[spec("session/live/008")]
+#[test]
+fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
+    let pane = "pane-none-type";
+    let agent_id = "agent-none-type";
+
+    // A live session that has emitted events but never resolved its agent type.
+    let session = SessionState {
+        session_id: format!("pane-{pane}"),
+        agent_type: AgentType::None,
+        cwd: None,
+        status: SessionStatus::Working,
+        active_tool: None,
+        started_at: Utc::now(),
+        last_activity: Utc::now(),
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: None,
+        first_prompts: Vec::new(),
+        pane_id: Some(pane.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        display_name: None,
+    };
+
+    // The fix lands here: an event-derived AgentType::None must snapshot as
+    // Option::None so the spawn-time fallback in seed_hydrated_session wins.
+    let snap = session.live_snapshot();
+    assert_eq!(
+        snap.agent_type, None,
+        "live_snapshot must map event-derived AgentType::None to Option::None so it does \
+         not shadow the spawn-time agent_type; got {:?}",
+        snap.agent_type
+    );
+
+    // Seed a reconnected card: the spawn-time type is the REAL ClaudeCode.
+    let mut state = AppState::default();
+    state.register_pane(pane.to_string());
+    state.seed_hydrated_session(
+        pane.to_string(),
+        None,
+        Some(AgentType::ClaudeCode), // spawn-time agent_type — the real one
+        Some(agent_id.to_string()),
+        Some(&snap),
+    );
+
+    let sessions: Vec<&SessionState> = state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref() == Some(pane))
+        .collect();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "exactly one seeded card for the pane; got {sessions:?}"
+    );
+    assert_eq!(
+        sessions[0].agent_type,
+        AgentType::ClaudeCode,
+        "event-derived AgentType::None must fall back to the spawn-time ClaudeCode, not \
+         seed the card as 'No agent'"
     );
 }
