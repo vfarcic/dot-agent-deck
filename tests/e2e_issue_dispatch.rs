@@ -16,12 +16,12 @@
 //! a real one-commit git repo (optionally carrying a committed
 //! `.dot-agent-deck.toml` so the dispatched worktree opens an orchestration tab).
 //!
-//! RED today: firing an `issue_dispatch` task does NOT run the GitHub-dispatch
-//! flow — nothing is cloned, no worktree is created, and no per-issue agent is
-//! spawned into a worktree (the current callback just attempts a single bogus
-//! spawn in the workspace root). Each test fails on its first observable —
-//! clone/worktree/per-issue-spawn absent — exactly the flow the later
-//! flow-implementer task wires up.
+//! Implemented now (dispatch/001-009 all GREEN): firing an `issue_dispatch` task
+//! runs the full GitHub-dispatch flow — the daemon clones the repo, derives a
+//! per-issue worktree on `agent/issue-<n>`, dedups issues that already carry an
+//! open PR or a live worktree, and spawns one agent per remaining issue into its
+//! worktree. Each test asserts that observable end-state — clone present,
+//! worktree created, per-issue agent(s) rooted in it — across the seam above.
 
 mod common;
 
@@ -936,9 +936,10 @@ fn dispatch_008_refire_after_close_redispatches() {
     // Second fire: issue still open, no PR, worktree gone → must re-dispatch.
     daemon.run_now("dispatch-task").expect("run-now (second)");
 
-    // RED today: `create_worktree` runs `worktree add <wt> -b agent/issue-7`,
-    // which fails because the branch already exists → the worktree is never
-    // re-created and an `IssueDispatchFailed` is surfaced.
+    // B1 fixed: `create_worktree` tolerates the pre-existing `agent/issue-7`
+    // branch (reusing it rather than `-b`-creating it), so the second fire
+    // re-creates the worktree and re-dispatches instead of surfacing an
+    // `IssueDispatchFailed`.
     assert!(
         common::wait_for_path(&paths.worktree_dir, W),
         "re-firing must re-create the issue-7 worktree (B1: worktree-add must tolerate the existing branch)"
@@ -1017,10 +1018,10 @@ fn dispatch_009_multirole_orchestration_cleanup_refcount() {
         })
         .expect("StopAgent reviewer over the attach socket");
 
-    // RED today: the first role-pane close runs `git worktree remove --force`,
-    // nuking the worktree out from under the still-live orchestrator. Give the
-    // async cleanup time to (wrongly) fire, then assert the worktree is still
-    // present on disk and in `git worktree list`.
+    // S1 fixed: the shared worktree is refcounted, so the first role-pane close
+    // does not run `git worktree remove --force` while the orchestrator role is
+    // still live in it. Give the async cleanup time to (wrongly) fire, then
+    // assert the worktree is still present on disk and in `git worktree list`.
     let nuked_early = common::wait_until(Duration::from_secs(5), || {
         !wt.exists() || !git_worktree_listed(&paths.clone_dir, &wt)
     });
