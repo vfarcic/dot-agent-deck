@@ -192,6 +192,10 @@ The daemon also auto-exits after a short idle window when there are no clients a
 
 ## Dispatching agents onto open GitHub issues (`issue_dispatch`)
 
+> **Experimental — off by default**
+>
+> This task type ships behind the `experimental` feature flag while it is being road-tested, so a normal install ignores it. To turn it on, set `experimental = true` under a `[features]` table in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the environment variable wins over the file). With the flag **off**, an `issue_dispatch` schedule still loads but stays **inert** — it never fires — and the deck surfaces a one-line notice telling you to enable the flag. Everything below applies once the flag is on.
+
 The examples so far run **one** prompt in **one** directory per fire. An **`issue_dispatch`** task is a specialized variant that, on each fire, looks at the **open GitHub issues of one repo** and spins up an agent **per issue** — so *"every weekday at 09:00, pull up to five open issues from `vfarcic/dot-ai` and start an agent on each"* becomes a single schedule instead of a morning of manual cloning, worktree-making, and prompt-pasting.
 
 You turn an ordinary scheduled task into an issue-dispatch task by adding a `[scheduled_tasks.issue_dispatch]` sub-table to it. The shared fields (`name`, `cron`, `working_dir`, `prompt`, `enabled`) keep their meaning; the sub-table adds the GitHub-specific knobs:

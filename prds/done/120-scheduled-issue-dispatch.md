@@ -23,7 +23,7 @@ These supersede the earlier scope where they conflict. No implementation yet —
 - **Workspace root = the task's `working_dir`** (resolves Open Question 3). The directory the user picks in the dir-picker is the clone parent: the repo clones to `<working_dir>/<name>` and per-issue worktrees live under `<clone>/.worktrees/issue-<n>`. Reusing the user-supplied `working_dir` avoids defaulting to the daemon's long-lived, arbitrary launch cwd.
 - **Idempotency keys on the deterministic branch.** Primary signal: the per-issue worktree exists. Secondary: an open PR whose **head branch is `agent/issue-<n>`** — more reliable than parsing `Closes #n` from PR bodies.
 - **Tab-close → worktree cleanup needs new plumbing (corrects Open Question 6).** `SpawnHandle.on_tab_closed` is only a seam — defined but never invoked, and the spawn handle is dropped, so nothing fires on close. Cleanup will be implemented daemon-side (a worktree registry plus a close-detection watcher), removing the worktree while preserving the clone.
-- **Ships visible by default.** No `experimental` feature-flag gate for this surface.
+- **~~Ships visible by default. No `experimental` feature-flag gate for this surface.~~** **Reversed 2026-06-22:** ships **behind the `experimental` flag** (off by default) so the author can dogfood it before GA. Since `issue_dispatch` has no TUI surface, the flag gates the single daemon **activation seam** in `make_schedule_callback` (a contained behaviour gate, documented in `docs/develop/experimental-flag.md`); config still parses when the flag is off, the task stays inert + surfaces an "enable the flag" notice. Graduation tracked by a `graduate-issue-dispatch` follow-up issue.
 
 ## Problem Statement
 

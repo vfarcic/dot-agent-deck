@@ -51,3 +51,12 @@ Both the TUI and the background daemon read the flag independently from the same
 ## Why surfaces are gated
 
 This lets work-in-progress code merge to `main` without exposing unfinished UI during normal use. Each gated surface is wired behind a small wrapper function so that, once the feature is finished ("graduates"), the gating is removed mechanically and the surface becomes visible to everyone. Until then, it stays behind `experimental`.
+
+## Currently gated
+
+| Wrapper (in `src/features.rs`) | Surface | PRD | Graduation |
+|---|---|---|---|
+| `show_experimental_footer()` | The experimental dashboard footer | #139 | — |
+| `issue_dispatch_enabled()` | The `issue_dispatch` scheduled-task type | #120 | `graduate-issue-dispatch` |
+
+> **Headless exception — `issue_dispatch` gates behaviour, not a render seam.** The flag's default model is presentation-only, but `issue_dispatch` (PRD #120) has **no UI surface** — it is a config-driven *daemon behaviour*. So its wrapper gates the single **activation seam** in the daemon's schedule-fire path (`make_schedule_callback`): with the flag off, a configured `issue_dispatch` task still parses and loads but never fires (it stays inert and surfaces a one-line "experimental — enable the flag" notice). This is the one place the flag intentionally switches behaviour rather than visibility, and it is contained to that single activation check — the dispatch flow internals are flag-free. The daemon already reads the flag (see "Default and precedence"), so no new plumbing is needed.
