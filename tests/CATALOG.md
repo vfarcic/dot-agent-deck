@@ -1479,6 +1479,27 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Does not assert:** the pure serde shape (session/live/001); the populated-vs-dummy contrast (session/live/002); the TUI-side seeding (Phase 2).
 - **Platform coverage:** mac+linux.
 
+##### session/live/004 — Hydrating a fresh controller seeds the reconnected card from the daemon's live snapshot (status/agent_type/active_tool/tool_count/prompts), and falls back to the bare placeholder when no snapshot is present (PRD #162 M2.1/M2.2).
+- **Layer:** in-process (real in-process attach daemon over a Unix socket; `EmbeddedPaneController::hydrate_from_daemon`; spawns two `sleep` PTYs only to populate the registry, does not drive vt100). Runs in the fast tier.
+- **Agent:** none.
+- **Asserts:** a warm daemon carries agent A (spawn-time `agent_type = None`, the "No agent" case) driven via `apply_event` to a live `Working` session with an active `Edit` tool, `tool_count > 0`, an event-derived `ClaudeCode` type and a first prompt, plus agent B (spawn-time `OpenCode`) with NO live session. Hydrating a fresh controller threads the live `SessionSnapshot` through `HydratedPane.live` (`Some` for A, `None` for B); seeding each hydrated session via `AppState::seed_hydrated_session` — exactly as the `ui.rs` hydration loop does — makes agent A's card carry the snapshot's `status` (Working, not Idle) / `agent_type` (ClaudeCode, overriding the `None` spawn-time value, not "No agent") / `active_tool` / `tool_count` / `first_prompts` / `last_user_prompt`, with the PRD #110 `agent_id` minted on the card; agent B's snapshot-absent card falls back to today's bare placeholder (Idle, spawn-time `OpenCode`, no active tool). Each pane seeds exactly one card (no duplicate).
+- **Does not assert:** the pure serde shape (session/live/001); the `ListAgents` join in isolation (session/live/002); newest-wins (session/live/003); the post-reconnect remap (session/live/005); the rendered-grid reconnect against a real daemon (session/live/006).
+- **Platform coverage:** mac+linux.
+
+##### session/live/005 — A post-reconnect `SessionStart` from the same agent remaps onto the snapshot-seeded card instead of spawning a duplicate (PRD #162 M2.2, PRD #110 property preserved).
+- **Layer:** pure-state (in-process `AppState`; `seed_hydrated_session` + `apply_event`; no daemon/TUI harness). Runs in the fast tier.
+- **Agent:** none.
+- **Asserts:** after `AppState::seed_hydrated_session` seeds a card from a live `SessionSnapshot` (Working/ClaudeCode/active tool/prompts) with the PRD #110 `agent_id` minted on it, a subsequent `SessionStart` event carrying the SAME `pane_id` + `agent_id` but a distinct `session_id` remaps onto the hydrated card — exactly one session/pane survives for that agent (no duplicate) and the minted `agent_id` is preserved through the remap.
+- **Does not assert:** the snapshot-seeding of the card's fields (session/live/004); the daemon-side join (session/live/002, session/live/003); the rendered-grid reconnect (session/live/006); the clear=true respawn (different `agent_id`) duplicate-retire path (PRD #110 tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### session/live/006 — A fresh TUI reconnecting to a real daemon renders the live `Working` status on the rebuilt card immediately, not the `Idle`/"No agent" placeholder (PRD #162 M2.1/M2.2 end-to-end).
+- **Layer:** L2 (real-binary PTY; a shared `dot-agent-deck daemon serve` driven over its hook + attach sockets, then a fresh real-binary TUI launched against the same daemon's sockets; `#[cfg(feature = "e2e")]`).
+- **Agent:** none (the agent is a `sh -c 'sleep 600'` stub; the live status is taught via synthetic Claude Code hooks — no LLM tokens).
+- **Asserts:** a daemon-owned agent (spawn-time `agent_type = None`, pane `pane-recon`, display name `recon-live-77`) is driven to a live `Working` session with an active `Read` tool by writing `session_start` + `tool_start` hooks (carrying the registry agent id so the `ListAgents` snapshot join matches) — with NO TUI attached. A FRESH TUI then launched against the same daemon, writing no further hook, rebuilds the dashboard card showing the live `Working` status and the agent's display name immediately on reconnect, and does not render the `No agent` placeholder for that live agent.
+- **Does not assert:** a literal first-TUI detach cycle (the daemon owns the live state regardless of whether a TUI was ever attached); the in-process seeding seam (session/live/004); the active-tool tally/label beyond the status badge; the daemon-side join/serde (session/live/001–003).
+- **Platform coverage:** mac+linux.
+
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
 These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.

@@ -39,7 +39,9 @@ use dot_agent_deck::daemon_protocol::{
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
-use dot_agent_deck::state::{AppState, SessionState, SessionStatus, SharedState};
+use dot_agent_deck::state::{
+    ActiveTool, AppState, SessionSnapshot, SessionState, SessionStatus, SharedState,
+};
 use dot_agent_deck::ui::{
     dead_slot_pane_id, fill_dead_slots_with_placeholders, is_dead_slot_pane_id,
 };
@@ -1622,4 +1624,308 @@ async fn live_003_join_picks_newest_last_activity_inner() {
 
     handle.abort();
     let _ = registry.close_agent(&agent_id);
+}
+
+/// Scenario: A warm in-process daemon carries two agents — agent A whose
+/// spawn-time `agent_type` is `None` (the "No agent" case) driven via
+/// `apply_event` to a live `Working` session with an active `Edit` tool,
+/// `tool_count > 0`, an event-derived `ClaudeCode` type and a first prompt; and
+/// agent B (spawn-time `OpenCode`) with NO live session. Hydrating a fresh
+/// controller from that daemon threads the live `SessionSnapshot` through
+/// `HydratedPane.live` (agent A `Some`, agent B `None`); seeding each hydrated
+/// session the way `ui.rs` does — `AppState::seed_hydrated_session` — makes
+/// agent A's card carry the snapshot's `status` / `agent_type` (overriding the
+/// `None` spawn-time value) / `active_tool` / `tool_count` / `first_prompts` /
+/// `last_user_prompt`, NOT a bare `Idle` / "No agent" placeholder, while agent
+/// B's snapshot-absent card falls back to today's bare placeholder (Idle,
+/// spawn-time `OpenCode`). Each pane seeds exactly one card — no duplicate.
+#[spec("session/live/004")]
+#[test]
+fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner());
+}
+
+async fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let (_dir, path, handle) = start_server_with_state(registry.clone(), state.clone()).await;
+    let client = DaemonClient::new(path.clone());
+
+    // Agent A: spawn-time agent_type None — the "No agent" case. It WILL get a
+    // live event-derived session below, which the snapshot must surface.
+    let pane_a = "pane-live-a";
+    let agent_a = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            agent_type: None,
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_a.to_string())],
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent A should succeed");
+
+    // Agent B: spawn-time agent_type OpenCode but NO live session → live None.
+    // The fallback must seed the bare placeholder from this spawn-time value.
+    let pane_b = "pane-bare-b";
+    let agent_b = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".into()),
+            agent_type: Some(AgentType::OpenCode),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_b.to_string())],
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent B should succeed");
+
+    // Drive ONLY agent A's session to Working (same apply_event flow the daemon
+    // uses for hook events).
+    {
+        let mut guard = state.write().await;
+        drive_session_to_working(&mut guard, "sess-a", pane_a, &agent_a);
+    }
+
+    // Hydrate a fresh controller from the warm daemon.
+    let ctrl = Arc::new(EmbeddedPaneController::new(
+        path,
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        hydrated.len(),
+        2,
+        "both agents should hydrate; got {hydrated:?}"
+    );
+
+    let h_a = hydrated
+        .iter()
+        .find(|h| h.agent_id == agent_a)
+        .expect("agent A must hydrate as a pane");
+    let h_b = hydrated
+        .iter()
+        .find(|h| h.agent_id == agent_b)
+        .expect("agent B must hydrate as a pane");
+
+    // M2.1: the live snapshot threads through HydratedPane.live.
+    let live_a = h_a
+        .live
+        .as_ref()
+        .expect("agent A's hydrated pane must carry the live SessionSnapshot");
+    assert_eq!(
+        live_a.status,
+        SessionStatus::Working,
+        "live status threaded"
+    );
+    assert_eq!(
+        live_a.agent_type,
+        Some(AgentType::ClaudeCode),
+        "event-derived agent_type must override the None spawn-time value"
+    );
+    assert_eq!(
+        live_a.active_tool.as_ref().map(|t| t.name.as_str()),
+        Some("Edit"),
+        "active tool threaded through HydratedPane.live"
+    );
+    assert!(live_a.tool_count > 0, "tool_count threaded");
+    assert!(
+        live_a
+            .first_prompts
+            .iter()
+            .any(|p| p.as_str() == "build the feature"),
+        "first prompt threaded, got {:?}",
+        live_a.first_prompts
+    );
+    assert!(
+        h_b.live.is_none(),
+        "agent B has no live session → HydratedPane.live must be None; got {:?}",
+        h_b.live
+    );
+
+    // M2.2: seed each hydrated session exactly the way the ui.rs hydration loop
+    // does — a snapshot-aware insert that seeds from `h.live` when present and
+    // falls back to today's bare placeholder when absent. PRD #110 agent_id
+    // minting is preserved on the seeded card.
+    let mut tui_state = AppState::default();
+    for h in &hydrated {
+        tui_state.register_pane(h.pane_id.clone());
+        tui_state.seed_hydrated_session(
+            h.pane_id.clone(),
+            h.cwd.clone(),
+            h.agent_type.clone(),
+            Some(h.agent_id.clone()),
+            h.live.as_ref(),
+        );
+    }
+
+    // Snapshot-seeded card (A): the real live state, NOT Idle / "No agent".
+    let a_sessions: Vec<&SessionState> = tui_state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref() == Some(pane_a))
+        .collect();
+    assert_eq!(
+        a_sessions.len(),
+        1,
+        "exactly one card for the live pane (no duplicate); got {a_sessions:?}"
+    );
+    let sess_a = a_sessions[0];
+    assert_eq!(
+        sess_a.status,
+        SessionStatus::Working,
+        "seeded card must show the live Working status, not Idle"
+    );
+    assert_eq!(
+        sess_a.agent_type,
+        AgentType::ClaudeCode,
+        "seeded card must show the event-derived agent_type, not None ('No agent')"
+    );
+    assert_eq!(
+        sess_a.active_tool.as_ref().map(|t| t.name.as_str()),
+        Some("Edit"),
+        "seeded card must keep its active tool across the reconnect"
+    );
+    assert!(
+        sess_a.tool_count > 0,
+        "seeded card must keep its tool count"
+    );
+    assert!(
+        sess_a
+            .first_prompts
+            .iter()
+            .any(|p| p.as_str() == "build the feature"),
+        "seeded card must keep its first-prompt context, got {:?}",
+        sess_a.first_prompts
+    );
+    assert_eq!(
+        sess_a.last_user_prompt.as_deref(),
+        Some("build the feature"),
+        "seeded card must keep its last_user_prompt"
+    );
+    assert_eq!(
+        sess_a.agent_id.as_deref(),
+        Some(agent_a.as_str()),
+        "PRD #110 agent_id minting must be preserved on the seeded card"
+    );
+
+    // Fallback card (B): no snapshot → today's bare placeholder.
+    let b_sessions: Vec<&SessionState> = tui_state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref() == Some(pane_b))
+        .collect();
+    assert_eq!(
+        b_sessions.len(),
+        1,
+        "exactly one card for the bare pane (no duplicate); got {b_sessions:?}"
+    );
+    let sess_b = b_sessions[0];
+    assert_eq!(
+        sess_b.status,
+        SessionStatus::Idle,
+        "no snapshot must fall back to today's bare Idle placeholder"
+    );
+    assert_eq!(
+        sess_b.agent_type,
+        AgentType::OpenCode,
+        "fallback must seed the spawn-time agent_type"
+    );
+    assert!(
+        sess_b.active_tool.is_none(),
+        "bare placeholder has no active tool"
+    );
+
+    drop(ctrl);
+    handle.abort();
+    let _ = registry.close_agent(&agent_a);
+    let _ = registry.close_agent(&agent_b);
+}
+
+/// Scenario: After hydration seeds a card from a live `SessionSnapshot` via
+/// `AppState::seed_hydrated_session` (PRD #110 `agent_id` minted on the seeded
+/// placeholder), a subsequent post-reconnect `SessionStart` event from the SAME
+/// agent — same `pane_id` + `agent_id`, a distinct `session_id` — must remap
+/// onto the hydrated card rather than spawning a second one. Asserts exactly one
+/// session/pane survives for that agent (no duplicate) and the minted `agent_id`
+/// is preserved through the remap.
+#[spec("session/live/005")]
+#[test]
+fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
+    let pane = "pane-remap";
+    let agent_id = "agent-remap-xyz";
+
+    // The live snapshot the daemon would have attached on reconnect.
+    let snap = SessionSnapshot {
+        status: SessionStatus::Working,
+        agent_type: Some(AgentType::ClaudeCode),
+        active_tool: Some(ActiveTool {
+            name: "Read".into(),
+            detail: Some("src/main.rs".into()),
+        }),
+        tool_count: 2,
+        first_prompts: vec!["build the feature".into()],
+        last_user_prompt: Some("build the feature".into()),
+    };
+
+    // Hydration seeds the card from the snapshot; agent_id is minted on it so
+    // the same-agent reuse guard in apply_event can remap a later SessionStart.
+    let mut state = AppState::default();
+    state.register_pane(pane.to_string());
+    state.seed_hydrated_session(
+        pane.to_string(),
+        None,
+        None, // spawn-time agent_type None — overridden by the snapshot
+        Some(agent_id.to_string()),
+        Some(&snap),
+    );
+    assert_eq!(
+        state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane))
+            .count(),
+        1,
+        "precondition: exactly one seeded card before the SessionStart"
+    );
+
+    // A post-reconnect SessionStart from the SAME agent (same pane + agent_id,
+    // distinct session_id) must collapse onto the seeded card.
+    state.apply_event(AgentEvent {
+        session_id: "real-sess".into(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some(pane.to_string()),
+        agent_id: Some(agent_id.to_string()),
+    });
+
+    let sessions: Vec<&SessionState> = state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref() == Some(pane))
+        .collect();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "post-reconnect SessionStart from the same agent must remap onto the \
+         hydrated card, not spawn a duplicate; got {sessions:?}"
+    );
+    assert_eq!(
+        sessions[0].agent_id.as_deref(),
+        Some(agent_id),
+        "PRD #110 agent_id must be preserved through the remap"
+    );
 }
