@@ -6,10 +6,13 @@
 //! running binary exactly. Ordering is normalized (modes/orchestrations/roles
 //! matched by name case-insensitively; panes by command; rules by pattern) so
 //! the diff reflects content, not declaration order. Output is Markdown on
-//! stdout, one section per region from decision #2:
-//! `init_command`, `reactive_panes`, `seed_prompt`, `[[modes]]`,
+//! stdout. The repeated regions from decision #2 — `[[modes]]`,
 //! `[[modes.panes]]`, `[[modes.rules]]`, `[[orchestrations]]`,
-//! `[[orchestrations.roles]]` (including `prompt_template`).
+//! `[[orchestrations.roles]]` — each get their own heading. The per-mode
+//! scalars (`init_command`, `reactive_panes`, `seed_prompt`) and per-role
+//! scalars (including `prompt_template`, whose full text expands in a
+//! `<details>` block when it differs) are compared as rows in a table under
+//! the matched mode/role, not as separate sections.
 //!
 //! Usage:
 //!   cargo run --quiet --example diff_config -- <baseline.toml> <improved.toml>
