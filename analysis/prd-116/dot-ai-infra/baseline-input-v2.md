@@ -69,7 +69,7 @@ Whitelist (safe to mirror): read-only inspection — `status`, `log`, `diff`, `s
 
 ## Your Task
 
-1. **Discover the project at `{dir}`.** Read its build/package files, task runners, scripts, and CI/CD configs to identify the real toolchain. Do NOT assume — derive everything from what's actually in the repo. Probe for:
+1. **Discover the project at `/home/vfarcic/code/dot-ai-infra`.** Read its build/package files, task runners, scripts, and CI/CD configs to identify the real toolchain. Do NOT assume — derive everything from what's actually in the repo. Probe for:
    - **Build/package manifests**: `package.json`, `go.mod`, `pyproject.toml`, `Cargo.toml`, `pom.xml`, `Gemfile`, `build.gradle`, `Makefile`, etc.
    - **Task runners**: `Taskfile.yml`, `justfile`, `Makefile`, `package.json#scripts`, `pyproject.toml#tool.poe`, etc.
    - **Reproducible-environment manifests**: `devbox.json`, `flake.nix`, `shell.nix`, `.nvmrc`, `pyproject.toml` (poetry), `environment.yml` (conda), `.tool-versions` (asdf), `.envrc` (direnv), etc. — these drive `init_command`.
@@ -110,7 +110,7 @@ Whitelist (safe to mirror): read-only inspection — `status`, `log`, `diff`, `s
 
 5. **Present the full proposed config (modes + orchestration) to the user before writing it, with every pane, rule, and role numbered.** Numbering lets the user reference items concisely ("drop rule 2", "rename pane 1", "drop the auditor role"). Briefly explain why you chose each item. Make clear the orchestration is optional and can be dropped entirely while keeping the modes. Close with negative confirmation — e.g., "Tell me what to drop or change, otherwise I'll write the whole thing." Do NOT ask multiple-choice questions like "(a) modes-only or (b) include orchestration?" — those force an extra round-trip when the user could just say what to remove. Only write the file after the user confirms.
 
-6. Write the approved config to `{dir}/.dot-agent-deck.toml`. If an orchestration was kept, include `[[orchestrations]]` alongside `[[modes]]` in the same file.
+6. Write the approved config to `/home/vfarcic/code/dot-ai-infra/.dot-agent-deck.toml`. If an orchestration was kept, include `[[orchestrations]]` alongside `[[modes]]` in the same file.
 
 7. **After writing the file, tell the user the next steps:** "Config created! To use it, press Ctrl+w to close this pane, then Ctrl+n to create a new one. Select the same directory and choose your mode from the Mode field."
 
@@ -211,7 +211,49 @@ When proposing a `release` role, set `clear = false` on it so it can resume afte
 
 The following generic roles are pre-defined. Pick from these when composing an orchestration. For each entry: `description` is what the role does (use as the role's `description`), `clear` is the recommended default, and `prompt_template` is a starter you should tune to the project (substitute the actual test command, spec directory, release command name, etc.).
 
-{roles}
+### `coder`
+
+- **Description:** Implements features, fixes bugs, refactors code
+- **`clear` default:** `true`
+- **Suggested `prompt_template`:** Implement the requested change. Read referenced spec or task files first if any are mentioned. Run the project's test command before reporting completion. If critical context is missing from the task description, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context.
+
+### `reviewer`
+
+- **Description:** Reviews code changes for correctness, style, and edge cases
+- **`clear` default:** `true`
+- **Suggested `prompt_template`:** Review the change. Report findings only — do not modify code yourself. Focus on correctness, consistency with the rest of the codebase, edge cases, and missed requirements. If a spec or task file is referenced, verify the implementation matches it. If critical context is missing from the task (e.g. the diff to review, the spec path), surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context.
+
+### `auditor`
+
+- **Description:** Audits code for security vulnerabilities and unsafe patterns
+- **`clear` default:** `true`
+- **Suggested `prompt_template`:** Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context.
+
+### `tester`
+
+- **Description:** Writes and runs tests; useful for TDD-style flows
+- **`clear` default:** `true`
+- **Suggested `prompt_template`:** Own the project's test suite. Discover its test framework and conventions and follow the existing test layout and naming. In a RED/GREEN TDD chain, first write or extend a failing test and confirm it fails (RED) before the coder implements; after the coder makes it pass, re-run the same scoped test to confirm GREEN. Run tests after writing them and report results. If the task references a spec or behavior to test, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context.
+
+### `documenter`
+
+- **Description:** Writes and updates documentation only — never modifies source code
+- **`clear` default:** `true`
+- **Suggested `prompt_template`:** Update documentation only. Do not modify source code. Match the existing documentation style and structure of the project. If the task references files to document or a spec describing the new behavior, read them before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context.
+
+### `release`
+
+- **Description:** Runs the project's release/PR/merge workflow; never modifies code
+- **`clear` default:** `false`
+- **Suggested `prompt_template`:** Run the project's release flow in two phases, and NEVER modify source code. Phase 1: open the PR via the project's release flow, then WAIT for CI and any automated PR review to settle, report a categorised findings summary (PR URL, per-check CI conclusions, review findings), and STOP — do NOT merge. Phase 2: merge the PR and close the issue ONLY when the orchestrator re-delegates with an explicit go-ahead to continue. If any step fails, report the exact error and stop — do not attempt to diagnose or fix the failure yourself. If the task is missing context you need (e.g. PR title, release notes path, target branch), report that via work-done rather than improvising — the orchestrator will re-delegate with the missing context.
+
+### `researcher`
+
+- **Description:** Investigates the codebase or external sources to gather context
+- **`clear` default:** `true`
+- **Suggested `prompt_template`:** Investigate and report findings only. Do not modify any files. Useful for gathering context before larger changes. If the task references files or topics to investigate, read or query them before reporting. If the question is too vague to answer well, surface that in your work-done summary rather than guessing — the orchestrator will re-delegate with a sharper question.
+
+
 
 ## Quality Guidelines
 
@@ -220,3 +262,158 @@ The following generic roles are pre-defined. Pick from these when composing an o
 - **Only use installed tools.** Every command in the config must work on this system right now.
 - **Fewer is better.** The user can always add more panes or roles later.
 - **Always propose an orchestration.** Drop only if no role from the library plausibly applies.
+
+---
+
+## BASELINE CAPTURE MODE (PRD #116 — overrides the interactive steps above)
+
+You are being run **non-interactively** to capture a reproducible baseline. Apply these overrides to the instructions above:
+
+- **Filesystem and shell tools are DISABLED.** Do NOT read files, do NOT run `which`, do NOT write any file. The project has already been discovered for you and is laid out under "PROJECT LAYOUT" below — treat it as the complete result of step 1's discovery. Assume every binary in `devbox.json`/the listed toolchain is installed and on PATH, so **skip step 2's `which` validation**.
+- **Do NOT ask the user anything and do NOT wait for confirmation.** Skip step 5's negotiation/numbering and step 6's file write entirely.
+- **Output format:** first a short (≤1 paragraph) rationale of the project-specific signals you used, then the COMPLETE proposed `.dot-agent-deck.toml` (modes, plus an orchestration if one applies) in a **single fenced ```toml code block**. Output nothing after the code block.
+
+## PROJECT LAYOUT (result of discovery for /home/vfarcic/code/dot-ai-infra)
+
+# Project snapshot — `~/code/dot-ai-infra/` (PRD #116 baseline input)
+
+Captured for the baseline-regeneration procedure (M1.2). The deck's real config-gen
+flow lets the agent **explore** the project with its own tools; because the
+reproducible regeneration path runs the model **single-shot with filesystem tools
+disabled** (so it can never touch the user's repo), this snapshot is the "project laid
+out" that stands in for that exploration. It is the same set of signals the prompt's
+step 1 tells the agent to probe for (build/task manifests, reproducible-env manifest,
+agent launchers, slash commands/skills, spec dir, CI configs, infra).
+
+For Phase 1 this snapshot was captured by hand from the commands shown below; the
+standalone, fully-documented re-run procedure is a Phase-3 deliverable (M3.3, under
+`docs/develop/`). The exact reproduction steps live in
+[`analysis.md`](analysis.md#exact-reproduction).
+
+## Top-level entries
+
+```
+apps/              # Argo CD Application manifests (GCP/Crossplane/external-secrets/gateway)
+apps-youtube/      # Argo CD Application manifest for youtube-automation
+argocd/            # Argo CD self-management (app.yaml, app-youtube.yaml)
+argocd-values.yaml
+.claude/           # commands/, hooks/, skills/, settings.json
+CLAUDE.md
+devbox.json        # reproducible-env manifest  -> init_command
+devbox.lock
+.dot-agent-deck.toml   # (the user-improved config under analysis)
+dot.nu             # Nushell task-runner entry point
+.env.vals.yaml     # vals-managed secrets
+examples/
+gcloud/            # flake.nix (gcloud SDK)
+.github/workflows/ # create-solution.yaml
+kubeconfig.yaml
+.mcp.json, .mcp-kubernetes.json
+prds/              # spec directory (107-, 129-, done/21-)
+renovate.json
+scripts/           # *.nu Nushell modules
+```
+
+No `README`. No `package.json` / `go.mod` / `Cargo.toml` / `Makefile` / `Taskfile.yml` —
+this is **not** a code project; it is GitOps/Kubernetes infrastructure.
+
+## `devbox.json` (verbatim)
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
+  "packages": [
+    "nushell@0.113.1",
+    "kubernetes-helm@3.20.2",
+    "git@2.54.0",
+    "yq-go@4.53.2",
+    "vals@0.44.0",
+    "kubectl-tree@0.6.0",
+    "linode-cli@5.56.2",
+    "path:gcloud#google-cloud-sdk",
+    "viddy@1.3.0",
+    "kubectl@1.36.1"
+  ],
+  "shell": {
+    "init_hook": [
+      "export PATH=\"$HOME/.local/bin:$PATH\"",
+      "[ -n \"$USE_VALS\" ] && eval \"$(vals env -export -f .env.vals.yaml)\"",
+      "[ -f .env ] && source .env"
+    ],
+    "scripts": {
+      "agent": ["claude --continue"]
+    }
+  }
+}
+```
+
+**Toolchain (from devbox):** `nu` (nushell), `helm`, `git`, `yq`, `vals`,
+`kubectl-tree` (a.k.a. `kubectl tree`), `linode-cli`, `gcloud`, `viddy`, `kubectl`.
+**Agent launcher (the project's only one):** devbox script `agent` → `claude --continue`,
+i.e. invocation form `devbox run agent`.
+
+## `CLAUDE.md` (key sections)
+
+> GitOps infrastructure repository for deploying the **dot-ai** platform on GKE. Uses
+> Argo CD for continuous deployment. Key tech: Kubernetes/GKE, Argo CD, Helm, Nushell
+> (`.nu` files), External Secrets + vals, Gateway API, Grafana Cloud + Alloy.
+
+Common commands are all run via `dot.nu` with Nushell, e.g. `nu dot.nu setup`,
+`nu dot.nu destroy`.
+
+## `dot.nu` task-runner subcommands (discovered)
+
+```
+nu dot.nu setup
+nu dot.nu destroy
+nu dot.nu apply argocd | certmanager | clusterissuer | dot-ai | dot-ai-controller
+nu dot.nu create kubernetes_creds
+nu dot.nu destroy kubernetes
+nu dot.nu packages kubernetes
+nu dot.nu get provider | ingress
+nu dot.nu print source
+nu dot.nu delete temp_files
+```
+
+These are **infrastructure lifecycle / mutating** operations (create cluster, apply,
+destroy) — none is a read-only "test"/"build"/"lint" task suitable for a reactive rule
+or a CI gate.
+
+## `.claude/commands/`
+
+```
+trace-request-flow-dot-ai-ui.md
+```
+
+## `.claude/skills/` (coordination skills available to an orchestrator)
+
+```
+dot-ai, dot-ai-changelog-fragment, dot-ai-generate-cicd, dot-ai-generate-dockerfile,
+dot-ai-impact_analysis, dot-ai-manageKnowledge, dot-ai-manageOrgData, dot-ai-operate,
+dot-ai-prd-close, dot-ai-prd-create, dot-ai-prd-done, dot-ai-prd-full, dot-ai-prd-next,
+dot-ai-prds-get, dot-ai-prd-start, dot-ai-prd-update-decisions, dot-ai-prd-update-progress,
+dot-ai-process-feature-request, dot-ai-projectSetup, dot-ai-query, dot-ai-query-dot-ai,
+dot-ai-recommend, dot-ai-remediate, dot-ai-request-dot-ai-feature, dot-ai-tag-release,
+dot-ai-users, dot-ai-version, dot-ai-worktree-prd, dot-ai-write-docs
+```
+
+PRD/coordination skills present: `/dot-ai-prd-next`, `/dot-ai-prd-update-progress`,
+`/dot-ai-prds-get`, `/dot-ai-prd-done`, `/dot-ai-tag-release`,
+`/dot-ai-changelog-fragment`.
+
+## `.github/workflows/`
+
+```
+create-solution.yaml   # workflow_dispatch (manual, Port-triggered solution creation)
+```
+
+This is a **manual `workflow_dispatch`** workflow, **not** a PR/push CI gate and **not** a
+release workflow. There is no automated PR validation or release-CI signal in this repo.
+
+## Spec directory
+
+```
+prds/107-vpa-inplace-resizing.md
+prds/129-grafana-cloud-alloy-migration.md
+prds/done/21-gke-to-linode-migration.md
+```

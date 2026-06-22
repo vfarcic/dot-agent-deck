@@ -31,7 +31,7 @@ prompt_template = "Audit the change for security vulnerabilities, unsafe pattern
 name = "tester"
 description = "Writes and runs tests; useful for TDD-style flows"
 clear = true
-prompt_template = "Discover the project's test framework and conventions. When asked to write tests, follow existing test layout and naming. Run tests after writing them and report results. If the task references a spec or behavior to test, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
+prompt_template = "Own the project's test suite. Discover its test framework and conventions and follow the existing test layout and naming. In a RED/GREEN TDD chain, first write or extend a failing test and confirm it fails (RED) before the coder implements; after the coder makes it pass, re-run the same scoped test to confirm GREEN. Run tests after writing them and report results. If the task references a spec or behavior to test, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
 
 [[role]]
 name = "documenter"
@@ -43,7 +43,7 @@ prompt_template = "Update documentation only. Do not modify source code. Match t
 name = "release"
 description = "Runs the project's release/PR/merge workflow; never modifies code"
 clear = false
-prompt_template = "Your job is to run the project's release flow (e.g. open a PR, merge, tag). Do NOT modify source code. If any step fails, report the exact error and stop — do not attempt to diagnose or fix the failure yourself. If the task is missing context you need (e.g. PR title, release notes path, target branch), report that via work-done rather than improvising — the orchestrator will re-delegate with the missing context."
+prompt_template = "Run the project's release flow in two phases, and NEVER modify source code. Phase 1: open the PR via the project's release flow, then WAIT for CI and any automated PR review to settle, report a categorised findings summary (PR URL, per-check CI conclusions, review findings), and STOP — do NOT merge. Phase 2: merge the PR and close the issue ONLY when the orchestrator re-delegates with an explicit go-ahead to continue. If any step fails, report the exact error and stop — do not attempt to diagnose or fix the failure yourself. If the task is missing context you need (e.g. PR title, release notes path, target branch), report that via work-done rather than improvising — the orchestrator will re-delegate with the missing context."
 
 [[role]]
 name = "researcher"

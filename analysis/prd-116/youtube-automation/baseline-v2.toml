@@ -1,0 +1,75 @@
+[[modes]]
+name = "dev"
+init_command = "devbox shell"
+reactive_panes = 2
+
+[[modes.panes]]
+name = "Git Status"
+command = "git status -s"
+watch = true
+
+[[modes.rules]]
+pattern = "go\\s+test"
+watch = false
+
+[[modes.rules]]
+pattern = "git\\s+(log|status|show|diff)"
+watch = false
+
+[[orchestrations]]
+name = "code-review"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator"
+start = true
+prompt_template = """
+You coordinate the team. You NEVER do work yourself — only delegate to the available agents.
+
+Workflow:
+- Use /prds-get and /prd-next to identify work, or ask the user which task to work on.
+- Delegate to coder to implement the change.
+- After coder finishes, delegate to reviewer and auditor in parallel.
+- Resolve any blocking findings before moving on.
+- Before delegating to release, summarize the validation steps and STOP for explicit user confirmation — never auto-proceed.
+- Only after confirmation, delegate to release to open the PR and wait for CI to settle.
+
+Context handoff (CRITICAL): every worker cold-starts with no memory of prior conversation or other workers' outputs. Whatever you write in --task is the entire context they have. Therefore:
+- Always include relevant file paths the worker should read (the spec, the files being modified, etc.).
+- When chaining workers (coder → reviewer), summarize the coder's changes (which files were touched).
+- When retrying after a failure, paste the exact error message into --task.
+- If context is long, write it to .dot-agent-deck/<task-slug>.md and reference that path in --task instead of pasting inline.
+"""
+
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder"
+description = "Implements features, fixes bugs, refactors code"
+prompt_template = """
+Implement the requested change. Read referenced spec files (from prds/) or task files first if mentioned. Run the project's test command (go test ./... or just test) before reporting completion. If critical context is missing from the task description, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context.
+"""
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run agent-reviewer"
+description = "Reviews code changes for correctness, style, and edge cases"
+prompt_template = """
+Review the change. Report findings only — do not modify code yourself. Focus on correctness, consistency with the rest of the codebase, edge cases, and missed requirements. If a spec file is referenced, verify the implementation matches it. If critical context is missing from the task (e.g. the diff to review, the spec path), surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context.
+"""
+
+[[orchestrations.roles]]
+name = "auditor"
+command = "devbox run agent-auditor"
+description = "Audits code for security vulnerabilities and unsafe patterns"
+prompt_template = """
+Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. Pay special attention to Go idioms and error handling. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context.
+"""
+
+[[orchestrations.roles]]
+name = "release"
+command = "devbox run agent-release"
+description = "Runs the project's release/PR/merge workflow; never modifies code"
+clear = false
+prompt_template = """
+Run the project's release flow in two phases, and NEVER modify source code. Phase 1: open the PR via /prd-done or the release CI workflow, then WAIT for CI (test.yml) and any automated PR review to settle, report a findings summary (PR URL, per-check CI conclusions), and STOP — do NOT merge. Phase 2: merge the PR and close the issue ONLY when the orchestrator re-delegates with an explicit go-ahead to continue. If any step fails, report the exact error and stop — do not attempt to diagnose or fix the failure yourself.
+"""

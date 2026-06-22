@@ -69,7 +69,7 @@ Whitelist (safe to mirror): read-only inspection — `status`, `log`, `diff`, `s
 
 ## Your Task
 
-1. **Discover the project at `{dir}`.** Read its build/package files, task runners, scripts, and CI/CD configs to identify the real toolchain. Do NOT assume — derive everything from what's actually in the repo. Probe for:
+1. **Discover the project at `/home/vfarcic/code/dot-ai-cli`.** Read its build/package files, task runners, scripts, and CI/CD configs to identify the real toolchain. Do NOT assume — derive everything from what's actually in the repo. Probe for:
    - **Build/package manifests**: `package.json`, `go.mod`, `pyproject.toml`, `Cargo.toml`, `pom.xml`, `Gemfile`, `build.gradle`, `Makefile`, etc.
    - **Task runners**: `Taskfile.yml`, `justfile`, `Makefile`, `package.json#scripts`, `pyproject.toml#tool.poe`, etc.
    - **Reproducible-environment manifests**: `devbox.json`, `flake.nix`, `shell.nix`, `.nvmrc`, `pyproject.toml` (poetry), `environment.yml` (conda), `.tool-versions` (asdf), `.envrc` (direnv), etc. — these drive `init_command`.
@@ -110,7 +110,7 @@ Whitelist (safe to mirror): read-only inspection — `status`, `log`, `diff`, `s
 
 5. **Present the full proposed config (modes + orchestration) to the user before writing it, with every pane, rule, and role numbered.** Numbering lets the user reference items concisely ("drop rule 2", "rename pane 1", "drop the auditor role"). Briefly explain why you chose each item. Make clear the orchestration is optional and can be dropped entirely while keeping the modes. Close with negative confirmation — e.g., "Tell me what to drop or change, otherwise I'll write the whole thing." Do NOT ask multiple-choice questions like "(a) modes-only or (b) include orchestration?" — those force an extra round-trip when the user could just say what to remove. Only write the file after the user confirms.
 
-6. Write the approved config to `{dir}/.dot-agent-deck.toml`. If an orchestration was kept, include `[[orchestrations]]` alongside `[[modes]]` in the same file.
+6. Write the approved config to `/home/vfarcic/code/dot-ai-cli/.dot-agent-deck.toml`. If an orchestration was kept, include `[[orchestrations]]` alongside `[[modes]]` in the same file.
 
 7. **After writing the file, tell the user the next steps:** "Config created! To use it, press Ctrl+w to close this pane, then Ctrl+n to create a new one. Select the same directory and choose your mode from the Mode field."
 
@@ -211,7 +211,49 @@ When proposing a `release` role, set `clear = false` on it so it can resume afte
 
 The following generic roles are pre-defined. Pick from these when composing an orchestration. For each entry: `description` is what the role does (use as the role's `description`), `clear` is the recommended default, and `prompt_template` is a starter you should tune to the project (substitute the actual test command, spec directory, release command name, etc.).
 
-{roles}
+### `coder`
+
+- **Description:** Implements features, fixes bugs, refactors code
+- **`clear` default:** `true`
+- **Suggested `prompt_template`:** Implement the requested change. Read referenced spec or task files first if any are mentioned. Run the project's test command before reporting completion. If critical context is missing from the task description, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context.
+
+### `reviewer`
+
+- **Description:** Reviews code changes for correctness, style, and edge cases
+- **`clear` default:** `true`
+- **Suggested `prompt_template`:** Review the change. Report findings only — do not modify code yourself. Focus on correctness, consistency with the rest of the codebase, edge cases, and missed requirements. If a spec or task file is referenced, verify the implementation matches it. If critical context is missing from the task (e.g. the diff to review, the spec path), surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context.
+
+### `auditor`
+
+- **Description:** Audits code for security vulnerabilities and unsafe patterns
+- **`clear` default:** `true`
+- **Suggested `prompt_template`:** Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context.
+
+### `tester`
+
+- **Description:** Writes and runs tests; useful for TDD-style flows
+- **`clear` default:** `true`
+- **Suggested `prompt_template`:** Own the project's test suite. Discover its test framework and conventions and follow the existing test layout and naming. In a RED/GREEN TDD chain, first write or extend a failing test and confirm it fails (RED) before the coder implements; after the coder makes it pass, re-run the same scoped test to confirm GREEN. Run tests after writing them and report results. If the task references a spec or behavior to test, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context.
+
+### `documenter`
+
+- **Description:** Writes and updates documentation only — never modifies source code
+- **`clear` default:** `true`
+- **Suggested `prompt_template`:** Update documentation only. Do not modify source code. Match the existing documentation style and structure of the project. If the task references files to document or a spec describing the new behavior, read them before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context.
+
+### `release`
+
+- **Description:** Runs the project's release/PR/merge workflow; never modifies code
+- **`clear` default:** `false`
+- **Suggested `prompt_template`:** Run the project's release flow in two phases, and NEVER modify source code. Phase 1: open the PR via the project's release flow, then WAIT for CI and any automated PR review to settle, report a categorised findings summary (PR URL, per-check CI conclusions, review findings), and STOP — do NOT merge. Phase 2: merge the PR and close the issue ONLY when the orchestrator re-delegates with an explicit go-ahead to continue. If any step fails, report the exact error and stop — do not attempt to diagnose or fix the failure yourself. If the task is missing context you need (e.g. PR title, release notes path, target branch), report that via work-done rather than improvising — the orchestrator will re-delegate with the missing context.
+
+### `researcher`
+
+- **Description:** Investigates the codebase or external sources to gather context
+- **`clear` default:** `true`
+- **Suggested `prompt_template`:** Investigate and report findings only. Do not modify any files. Useful for gathering context before larger changes. If the task references files or topics to investigate, read or query them before reporting. If the question is too vague to answer well, surface that in your work-done summary rather than guessing — the orchestrator will re-delegate with a sharper question.
+
+
 
 ## Quality Guidelines
 

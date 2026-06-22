@@ -1,0 +1,82 @@
+[[modes]]
+name = "dev"
+init_command = "devbox shell"
+reactive_panes = 3
+
+[[modes.panes]]
+command = "git status -s"
+name = "Status"
+watch = true
+
+[[modes.rules]]
+pattern = "task\\s+(test|build|build-all|fetch-spec|checksums)"
+watch = false
+
+[[modes.rules]]
+pattern = "git\\s+(status|log|diff|show)"
+watch = false
+
+[[modes.rules]]
+pattern = "go\\s+(test|vet|build|fmt)"
+watch = false
+
+[[orchestrations]]
+name = "dev-flow"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator"
+start = true
+prompt_template = """
+You coordinate the team. You NEVER do work yourself — only delegate to available agents.
+
+Workflow:
+- Delegate implementation to coder.
+- After coder finishes, delegate to reviewer and auditor in parallel.
+- Resolve blocking findings before moving forward.
+- Before delegating to release, summarize what should be validated end-to-end and STOP for explicit user confirmation.
+
+Context handoff (CRITICAL): every worker cold-starts with no memory of prior conversation. Whatever you write in --task is their entire context. Therefore:
+- Always include relevant file paths (specs in prds/, files being modified).
+- When chaining workers (coder → reviewer), summarize prior worker's findings or changed files.
+- When retrying after failure, paste the exact error message.
+- If context is long, write it to .dot-agent-deck/<task-slug>.md and reference that path in --task.
+
+You may use coordination skills directly between delegations (e.g., /dot-ai-prd-next, /dot-ai-prd-update-progress) — do not delegate these.
+"""
+
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder"
+description = "Implements features, fixes bugs, refactors code"
+prompt_template = """
+Implement the requested change. Read referenced spec files (under prds/) first if mentioned. Always run `task test > tmp/test-output.txt 2>&1` and check the last 30 lines to verify tests pass before reporting completion. If critical context is missing, surface it in your work-done summary rather than guessing.
+"""
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run agent-reviewer"
+description = "Reviews code changes for correctness, style, and edge cases"
+prompt_template = """
+Review the change. Report findings only — do not modify code. Focus on correctness, consistency with the codebase, edge cases, and missed requirements. Verify implementation matches any referenced spec. If critical context is missing, surface it in your work-done summary.
+"""
+
+[[orchestrations.roles]]
+name = "auditor"
+command = "devbox run agent-auditor"
+description = "Audits code for security vulnerabilities and unsafe patterns"
+prompt_template = """
+Audit for security vulnerabilities, unsafe patterns, and OWASP top-10 issues. Report findings only — do not modify code. Read referenced files before starting. If critical context is missing, surface it in your work-done summary.
+"""
+
+[[orchestrations.roles]]
+name = "release"
+command = "devbox run agent-releaser"
+description = "Runs the project's release/PR/merge workflow; never modifies code"
+clear = false
+prompt_template = """
+Run the project's release flow in two phases, never modifying code.
+Phase 1: Open PR via the project's release flow (likely /dot-ai-prd-done), wait for CI and PR review to settle, report findings summary (PR URL, CI conclusions, review findings if any), and STOP — do NOT merge.
+Phase 2: Merge and close issue ONLY when orchestrator re-delegates with explicit go-ahead.
+If any step fails, report the exact error and stop — do not diagnose or fix yourself. If context is missing (PR title, release notes path, target branch), report that via work-done.
+"""
